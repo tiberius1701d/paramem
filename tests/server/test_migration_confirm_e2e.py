@@ -93,7 +93,6 @@ def _build_staging_state(tmp_path: Path) -> dict:
         "background_trainer": None,
         "consolidation_loop": loop_mock,
         "session_buffer": None,
-        "ha_context": None,
         "speaker_store": None,
     }
 

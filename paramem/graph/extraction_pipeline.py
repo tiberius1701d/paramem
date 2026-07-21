@@ -83,7 +83,6 @@ class ExtractionConfig:
     temperature: float = 0.0
     max_tokens: int = 8192
     plausibility_max_tokens: int = 8192
-    ha_validation: bool = True
     noise_filter: str = "anthropic"
     noise_filter_model: str = "claude-sonnet-4-6"
     noise_filter_endpoint: str | None = None
@@ -129,7 +128,7 @@ class ExtractionPipeline:
     ----
     - ``model`` + ``tokenizer`` (set once at construction; assumed not
       to change for the lifetime of the pipeline).
-    - ``config: ExtractionConfig`` (the 12 tunables).
+    - ``config: ExtractionConfig`` (the extraction tunables).
     - ``prompts_dir`` (override for ``configs/prompts/``; ``None`` falls
       back to the project default).
 
@@ -201,15 +200,9 @@ class ExtractionPipeline:
         schema-shape rules (speaker fragmentation NEGATIVE, concept
         POSITIVE) between the transcript and document variants.
 
-        Gate defaults still differ by ``source_type``:
-
-        * ``"transcript"`` (default) — ``ha_validation`` defaults to
-          the config value (typically ``True``).
-
-        * ``"document"`` — ``ha_validation`` defaults to ``False``
-          (Home Assistant entity grounding is a dialogue-context
-          concern). Operators may still override it explicitly via
-          *overrides*.
+        ``source_type`` no longer selects any gate default — it is
+        forwarded verbatim as the ``source_type`` kwarg and consumed
+        only by the document-only speaker rewrite named above.
 
         ``speaker_id`` is **required** in *overrides* and must be a
         non-empty string.  An absent or empty value raises
@@ -227,10 +220,6 @@ class ExtractionPipeline:
         # content at the caller layer — never via a parallel file pair.
         system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
         user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
-        if source_type == "document":
-            ha_validation_default = False
-        else:
-            ha_validation_default = cfg.ha_validation
 
         return dict(
             temperature=cfg.temperature,
@@ -241,8 +230,6 @@ class ExtractionPipeline:
             # extract_procedural_graph.  sota_* prompts are model-independent
             # by design and ignore this value.
             model_alias=self.model_name,
-            ha_context=overrides.get("ha_context"),
-            ha_validation=pick("ha_validation", ha_validation_default),
             noise_filter=pick("noise_filter", cfg.noise_filter),
             noise_filter_model=pick("noise_filter_model", cfg.noise_filter_model),
             noise_filter_endpoint=pick("noise_filter_endpoint", cfg.noise_filter_endpoint),
@@ -299,7 +286,7 @@ class ExtractionPipeline:
 
         See class docstring for invariants.  ``overrides`` accepts every
         kwarg :meth:`kwargs` returns plus the chokepoint-only fields
-        ``speaker_id``, ``speaker_name``, ``ha_context``.  A calibration
+        ``speaker_id``, ``speaker_name``.  A calibration
         caller wraps this call in
         :func:`paramem.graph.phase_trace.stop_at` to request an early
         return — that mechanism is independent of this method's kwargs.

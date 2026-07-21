@@ -6,11 +6,10 @@ Skip in CI: these tests are excluded by default (require --gpu flag).
 Tests cover:
 1. extract_procedural_graph
 2. SOTA noise filter (anonymize → filter → de-anonymize)
-3. get_home_context
-4. _extract_and_start_training (mocked HA)
-5. _consolidation_scheduler (async)
-6. BackgroundTrainer._train_adapter
-7. Batch consolidation end-to-end
+3. _extract_and_start_training (mocked HA)
+4. _consolidation_scheduler (async)
+5. BackgroundTrainer._train_adapter
+6. Batch consolidation end-to-end
 """
 
 import os
@@ -234,64 +233,6 @@ class TestSOTAFullFlow:
             assert isinstance(mapping, dict)
         assert isinstance(anon_transcript, str)
         assert isinstance(raw, str)
-
-
-# --- 4. get_home_context ---
-
-
-class TestGetHomeContext:
-    def _make_client(self, states=None):
-        from paramem.server.tools.ha_client import HAClient
-
-        client = HAClient.__new__(HAClient)
-        client._raw_states = states or []
-        client._client = None
-        client._rest_url = "http://fake:8123"
-        client._token = "fake"
-        client._timeout = 10
-        return client
-
-    def test_returns_context_with_mock_ha(self):
-        """Test get_home_context with mocked HA API."""
-        client = self._make_client(
-            states=[
-                {"entity_id": "zone.home", "attributes": {"friendly_name": "Home"}},
-                {"entity_id": "zone.work", "attributes": {"friendly_name": "Work"}},
-                {"entity_id": "light.living_room", "attributes": {"area_id": "living_room"}},
-            ]
-        )
-
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "location_name": "Millfield",
-            "time_zone": "Europe/Berlin",
-            "latitude": 50.1,
-            "longitude": 8.4,
-        }
-        mock_response.raise_for_status = MagicMock()
-        mock_http = MagicMock()
-        mock_http.get.return_value = mock_response
-
-        client._get_client = lambda: mock_http
-        context = client.get_home_context()
-
-        assert context["location_name"] == "Millfield"
-        assert context["timezone"] == "Europe/Berlin"
-        assert "Home" in context["zones"]
-        assert "Work" in context["zones"]
-
-    def test_graceful_on_connection_failure(self):
-        """Test get_home_context when HA is unreachable."""
-        import httpx
-
-        client = self._make_client()
-        mock_http = MagicMock()
-        mock_http.get.side_effect = httpx.ConnectError("Connection refused")
-        client._get_client = lambda: mock_http
-
-        context = client.get_home_context()
-        assert context["location_name"] == ""
-        assert context["zones"] == []
 
 
 # --- 5 & 6. Training scheduler and extract_and_start_training ---
@@ -792,7 +733,6 @@ class TestRunExtractGraphHelper:
             save_cycle_snapshots=False,
             prompts_dir=server_config.prompts_dir,
             extraction_max_tokens=cc.extraction_max_tokens,
-            extraction_ha_validation=cc.extraction_ha_validation,
             extraction_noise_filter=cc.extraction_noise_filter,
             extraction_noise_filter_model=cc.extraction_noise_filter_model,
             extraction_noise_filter_endpoint=cc.extraction_noise_filter_endpoint or None,

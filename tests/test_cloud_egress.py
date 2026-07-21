@@ -374,8 +374,13 @@ class TestCloudScopeObservedScoping:
 
 
 class TestDeanonymizeFactsTotalityGate:
+    """``deanonymize_facts`` takes NO graph and mutates nothing — both of
+    the totality gate's findings (``verdict`` and ``collisions``) come
+    back on ``DeanonResult``.  Diagnostics are the caller's business (see
+    ``paramem.graph.extractor._record_binding_diagnostics``).
+    """
+
     def test_orphan_token_rejects_whole_delta(self):
-        graph = _graph()
         payload = AnonymizedPayload(
             status="ok",
             forward={"Alex": "Person_1"},
@@ -397,12 +402,13 @@ class TestDeanonymizeFactsTotalityGate:
                 "confidence": 0.9,
             }
         ]
-        result = deanonymize_facts(scope, facts, graph)
+        result = deanonymize_facts(scope, facts)
         assert result.verdict, "expected a non-empty verdict"
         assert result.facts == []
+        # No sota_bindings on this scope -> the collision scan never ran.
+        assert result.collisions == []
 
     def test_clean_delta_substitutes(self):
-        graph = _graph()
         payload = AnonymizedPayload(
             status="ok",
             forward={"Alex": "Person_1"},
@@ -424,8 +430,9 @@ class TestDeanonymizeFactsTotalityGate:
                 "confidence": 0.9,
             }
         ]
-        result = deanonymize_facts(scope, facts, graph)
+        result = deanonymize_facts(scope, facts)
         assert result.verdict == []
+        assert result.collisions == []
         assert result.facts == [
             {
                 "subject": "Alex",
@@ -435,6 +442,85 @@ class TestDeanonymizeFactsTotalityGate:
                 "confidence": 0.9,
             }
         ]
+
+    def test_collisions_surface_on_the_result_when_scoped(self):
+        """An ``observed``-scoped collision (SOTA rebinding a token it was
+        already shown as a CORE reference) surfaces BOTH as a rejection
+        verdict and as a ``collisions`` entry — the second is what the
+        caller writes to ``sota_binding_collisions``.
+
+        Mutation: drop ``collisions`` from the rejected-exit
+        ``DeanonResult`` (returning ``[]``) -> the caller stops recording
+        the collision diagnostic -> this test fails.
+        """
+        payload = AnonymizedPayload(
+            status="ok",
+            forward={"Alex": "Person_1"},
+            reverse={"Person_1": "Alex"},
+            anon_transcript="",
+            anon_facts=[],
+            declared=frozenset({"Person_1"}),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+        )
+        scope = CloudScope.for_response(
+            payload,
+            # SOTA rebinds Person_1 — a token it WAS shown (``sent``).
+            sota_bindings={"Person_1": "someone else entirely"},
+            sent=("Person_1",),
+        )
+        assert "Person_1" in scope.observed
+        result = deanonymize_facts(scope, [])
+        assert result.verdict == ["Person_1"]
+        assert result.collisions == ["Person_1"]
+        assert result.facts == []
+
+    def test_accepted_exit_carries_the_collision_scan_result(self):
+        """The accepted exit also carries ``collisions`` — it is the scan
+        result, not a hardcoded ``[]``.
+
+        Through ``deanonymize_facts`` a NON-empty ``collisions`` implies a
+        non-empty ``verdict``: ``CloudScope.observed`` is always a
+        ``frozenset`` (never ``None``), and under the observed-scoped
+        branch every collision is folded into the verdict.  So the
+        accepted exit can only ever carry ``[]`` in production — the
+        informational, not-folded collision shape exists only when
+        ``_check_mapping_totality`` is called directly with
+        ``observed=None`` (pinned in ``test_extraction_pipeline.py``).
+
+        Here SOTA mints a binding for a token it was NEVER shown
+        (``Org_9`` is not in ``observed``), which is the legitimate mint
+        case: no collision, no verdict, and the mint resolves.
+        """
+        payload = AnonymizedPayload(
+            status="ok",
+            forward={"Alex": "Person_1"},
+            reverse={"Person_1": "Alex"},
+            anon_transcript="",
+            anon_facts=[],
+            declared=frozenset({"Person_1"}),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+        )
+        scope = CloudScope.for_response(
+            payload, sota_bindings={"Org_9": "Acme"}, sent=("Person_1",)
+        )
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "works_at",
+                "object": "Org_9",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            }
+        ]
+        result = deanonymize_facts(scope, facts)
+        assert result.verdict == []
+        assert result.collisions == []
+        assert result.facts[0]["subject"] == "Alex"
+        assert result.facts[0]["object"] == "Acme"
 
 
 class TestDeanonymizeResponseText:

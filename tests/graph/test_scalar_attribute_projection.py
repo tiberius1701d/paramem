@@ -10,10 +10,10 @@ concatenated with digits in the source transcript).
 
 import pytest
 
-from paramem.graph.extractor import (
-    _is_scalar_value,
-    _partition_scalar_facts,
-    _project_scalar_facts_to_attributes,
+from paramem.graph.relation_build import (
+    is_scalar_value,
+    partition_scalar_facts,
+    project_scalar_facts_to_attributes,
 )
 from paramem.graph.schema import Entity, SessionGraph
 
@@ -36,7 +36,7 @@ class TestIsScalarValue:
         ],
     )
     def test_recognises_scalar_shapes(self, value):
-        assert _is_scalar_value(value) is True
+        assert is_scalar_value(value) is True
 
     @pytest.mark.parametrize(
         "value",
@@ -62,7 +62,7 @@ class TestIsScalarValue:
         ],
     )
     def test_rejects_concept_phrases(self, value):
-        assert _is_scalar_value(value) is False
+        assert is_scalar_value(value) is False
 
 
 class TestPartitionScalarFacts:
@@ -81,7 +81,7 @@ class TestPartitionScalarFacts:
                 "object": "safety-critical autonomous systems",
             },
         ]
-        scalar, non_scalar = _partition_scalar_facts(facts)
+        scalar, non_scalar = partition_scalar_facts(facts)
         assert len(scalar) == 2
         assert len(non_scalar) == 2
         assert {f["object"] for f in scalar} == {
@@ -99,7 +99,7 @@ class TestPartitionScalarFacts:
         facts = [
             {"subject": "Alex", "predicate": "has_email", "object": "x@y.com", "synthetic": True},
         ]
-        scalar, non_scalar = _partition_scalar_facts(facts)
+        scalar, non_scalar = partition_scalar_facts(facts)
         assert scalar == []
         assert non_scalar == facts
 
@@ -116,7 +116,7 @@ class TestProjectScalarFactsToAttributes:
             {"subject": "Alex", "predicate": "uses_tool", "object": "ROS2"},
             {"subject": "Alex", "predicate": "has_email", "object": "x@y.com"},
         ]
-        _project_scalar_facts_to_attributes(graph, scalar_facts)
+        project_scalar_facts_to_attributes(graph, scalar_facts)
         ent = next(e for e in graph.entities if e.name == "Alex")
         # has_email → "email" (leading "has_" stripped to avoid double-prefixing
         # by _flatten_entity_attributes).
@@ -136,7 +136,7 @@ class TestProjectScalarFactsToAttributes:
                 "object": "github.com/example/myrepo",
             },
         ]
-        _project_scalar_facts_to_attributes(graph, scalar_facts)
+        project_scalar_facts_to_attributes(graph, scalar_facts)
         assert len(graph.entities) == 1
         ent = graph.entities[0]
         assert ent.name == "Paper"
@@ -155,5 +155,5 @@ class TestProjectScalarFactsToAttributes:
             {"subject": "Alex", "predicate": "", "object": "ROS2"},
             {"subject": "Alex", "predicate": "x", "object": ""},
         ]
-        _project_scalar_facts_to_attributes(graph, scalar_facts)
+        project_scalar_facts_to_attributes(graph, scalar_facts)
         assert graph.entities == []

@@ -36,7 +36,7 @@ import logging
 import re
 from collections.abc import Iterable
 
-from paramem.graph.schema import Relation, SessionGraph
+from paramem.graph.schema import Relation
 from paramem.graph.schema_config import anonymizer_prefix_to_type, anonymizer_type_to_prefix
 from paramem.utils.identity import canonical, is_speaker_id
 
@@ -73,9 +73,11 @@ PLACEHOLDER_SHAPE_RE = re.compile(rf"^{_BARE_PLACEHOLDER_SHAPE}$")
 # the only producer of the braced form and doesn't always comply with
 # PascalCase) OR a bare token (``Person_2``, strict PascalCase,
 # word-boundary anchored). Used to scan facts/transcript text for
-# placeholder tokens: :func:`_check_mapping_totality`'s orphan scan, the
-# residual sweep in :func:`_apply_bindings`, and the ``observed``
-# legality-domain scan in :func:`~paramem.graph.extractor._sota_pipeline`.
+# placeholder tokens: :func:`_check_mapping_totality`'s orphan scan and
+# the residual sweep in :func:`_apply_bindings` — the only two users.
+# (The ``observed`` legality domain is computed by
+# :meth:`~paramem.graph.cloud_egress.CloudScope.for_response` from the
+# DECLARED vocabulary by substring containment, never by this pattern.)
 PLACEHOLDER_TOKEN_RE = re.compile(rf"\{{(\w+_\d+)\}}|\b({_BARE_PLACEHOLDER_SHAPE})\b")
 
 
@@ -305,7 +307,8 @@ def prefix_to_entity_type(prefix: str) -> str:
 
     THE only place a placeholder prefix resolves to an entity type.
     Collapses two implementations that disagreed on policy: the
-    entity-rebuild loop in :func:`~paramem.graph.extractor._sota_pipeline`
+    entity-rebuild loop in
+    :func:`~paramem.graph.relation_build.apply_rebuild`
     already derived the open-vocabulary type from the prefix;
     :func:`~paramem.graph.entity_correction.correct_entity_surfaces`
     instead skipped the placeholder entirely on an unrecognised prefix
@@ -337,9 +340,9 @@ def placeholder_entity_type(token: str) -> str:
     ("_")[0]`` is ``"{Person"``, which is not in the closed vocabulary and
     passes through open-vocabulary as its own (wrong) type ``"{person"`` —
     corrupting every live consumer of the derived type: SOTA-minted-entity
-    type inference in :func:`~paramem.graph.extractor._sota_pipeline`
-    (``:2660``) and entity-surface correction in
-    :mod:`paramem.graph.entity_correction` (``:276``). Stripping braces
+    type inference in :func:`~paramem.graph.relation_build.apply_rebuild`
+    and entity-surface correction in
+    :mod:`paramem.graph.entity_correction`. Stripping braces
     first means this function survives that flip unchanged.
     """
     t = (token or "").strip()
@@ -521,14 +524,12 @@ def _resolution_map(
 
 
 def _check_mapping_totality(
-    graph: SessionGraph,
     anon_facts: list[dict],
     reverse_mapping: dict,
     *,
     sota_bindings: dict | None = None,
     observed: set[str] | None = None,
-    diagnostic_key: str = "totality_orphans",
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Diagnostic check: every placeholder in any anonymized fact must
     resolve against :func:`_resolution_map` (``reverse_mapping`` plus
     ``sota_bindings``, scoped to ``observed`` — see that function) — the
@@ -536,23 +537,37 @@ def _check_mapping_totality(
     deanon time.  Checked against the reverse map — not the forward map —
     because a placeholder present only in the forward map's values still
     fails to translate at deanon time.  Surfaces violations to ``logger``
-    and ``graph.diagnostics[diagnostic_key]`` so prompt regressions are
-    visible rather than silently shedding facts.
+    and, via the RETURN VALUE, to whatever diagnostics the caller keeps —
+    so prompt regressions are visible rather than silently shedding
+    facts.
 
-    Returns the sorted list of offending tokens (orphans, plus conflicts
-    when ``observed`` is given — see below); ``[]`` when the mapping is
-    total.  ONE exit point for a non-empty verdict — whether the orphans
-    came from the collision scan (``sota_bindings`` vs. ``observed``/
-    ``reverse_mapping``) or the per-fact placeholder scan — so
-    ``graph.diagnostics[diagnostic_key]`` is written on every non-empty
-    verdict, never silently dropped because ``anon_facts`` happened to be
-    empty (a real regression this function's caller-side counter,
-    ``totality_rejected_chunks``, depends on to be observable at all: an
-    empty-``anon_facts`` chunk whose SOTA response still collided would
-    otherwise be silently under-counted as "no rejection").  Every other
-    exit (no orphans at all) also ``return []``, so callers can do a
-    plain truthiness test on the result without a falsy-``None``-vs-falsy-
-    ``[]`` trap.
+    Returns ``(verdict, collisions)``:
+
+    * ``verdict`` — the sorted list of offending tokens (orphans, plus
+      conflicts when ``observed`` is given — see below); ``[]`` when the
+      mapping is total.  ONE exit point for a non-empty verdict —
+      whether the orphans came from the collision scan (``sota_bindings``
+      vs. ``observed``/``reverse_mapping``) or the per-fact placeholder
+      scan — so a verdict is returned on every violation, never silently
+      dropped because ``anon_facts`` happened to be empty (a real
+      regression the caller-side counter ``totality_rejected_chunks``
+      depends on to be observable at all: an empty-``anon_facts`` chunk
+      whose SOTA response still collided would otherwise be silently
+      under-counted as "no rejection").  Every other exit (no orphans at
+      all) also returns ``[]``, so callers can do a plain truthiness test
+      without a falsy-``None``-vs-falsy-``[]`` trap.
+    * ``collisions`` — the sorted collision-scan result described below;
+      ``[]`` when the scan found nothing or did not run.
+
+    This function writes NOTHING: it has no ``graph`` parameter and no
+    side effect on any caller-owned object.  A caller that wants the two
+    findings persisted writes them onto its own graph's ``diagnostics``
+    (``"sota_binding_collisions"`` / ``"sota_pending_orphans"``) from
+    these two return values — see the three call sites in
+    :mod:`paramem.graph.extractor`.  The previous shape took a
+    ``SessionGraph`` purely as a diagnostics SINK and mutated it deep
+    inside this primitive, which a caller two levels up then read back;
+    that implicit channel is gone.
 
     Only ONE production caller remains:
     :func:`~paramem.graph.cloud_egress.deanonymize_facts`, which runs
@@ -563,15 +578,14 @@ def _check_mapping_totality(
     REJECTS THE WHOLE DELTA on a non-empty verdict, returning
     ``DeanonResult(facts=[], verdict=verdict, ...)`` without substituting
     anything — the caller decides the fallback (e.g. the pre-enrichment
-    local-extract facts).  The ``sota_bindings=None``, ``observed=None``,
-    default ``diagnostic_key`` shape (kept as this function's default
-    parameters for direct/unit-test use) has no production caller:
-    anonymized facts are built by
-    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud` directly from
-    ``graph.relations`` and the CORE map, so an orphan placeholder in a
-    local fact is structurally impossible, not merely diagnosed and
-    logged.  Matches both braced (``{Event_1}``) and bare (``Event_1``)
-    placeholder forms via :data:`PLACEHOLDER_TOKEN_RE`.
+    local-extract facts).  The ``sota_bindings=None``, ``observed=None``
+    shape (kept as this function's default parameters for
+    direct/unit-test use) has no production caller: anonymized facts are
+    built by :func:`~paramem.graph.cloud_egress.anonymize_for_cloud`
+    directly from ``graph.relations`` and the CORE map, so an orphan
+    placeholder in a local fact is structurally impossible, not merely
+    diagnosed and logged.  Matches both braced (``{Event_1}``) and bare
+    (``Event_1``) placeholder forms via :data:`PLACEHOLDER_TOKEN_RE`.
 
     When ``sota_bindings`` is given and ``observed`` is a set, any
     ``sota_bindings`` KEY that is also in ``observed`` is a CONFLICT
@@ -581,12 +595,13 @@ def _check_mapping_totality(
     conflict scan instead flags any KEY present in both ``sota_bindings``
     and ``reverse_mapping`` with a DIFFERING value — informational only,
     NOT folded into the verdict, since :func:`_resolution_map`'s
-    CORE-wins tie-break already resolves it safely.  Both are recorded
-    (sorted) to ``graph.diagnostics["sota_binding_collisions"]``.
+    CORE-wins tie-break already resolves it safely.  Both are returned
+    (sorted) as ``collisions``.
 
     Does not mutate inputs and does not change the data flow.
     """
     orphans: set[str] = set()
+    collisions: list[str] = []
     if sota_bindings:
         if observed is not None:
             collisions = sorted(k for k in sota_bindings if k in observed)
@@ -604,7 +619,6 @@ def _check_mapping_totality(
                 len(collisions),
                 collisions[:5],
             )
-            graph.diagnostics["sota_binding_collisions"] = collisions
             if observed is not None:
                 orphans |= set(collisions)
     # Per-fact placeholder scan — skipped (not an early RETURN) when
@@ -646,9 +660,8 @@ def _check_mapping_totality(
             len(ordered),
             ordered[:5],
         )
-        graph.diagnostics[diagnostic_key] = ordered
-        return ordered
-    return []
+        return ordered, collisions
+    return [], collisions
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +723,7 @@ def invert_forward_mapping(mapping: dict) -> dict[str, str]:
     THE only forward -> reverse inversion of the CORE anonymization table
     in this module — scoped precisely: a caller elsewhere inverting a
     DIFFERENT map for a DIFFERENT purpose (e.g.
-    :func:`~paramem.graph.extractor._sota_pipeline` inverting
+    :func:`~paramem.graph.relation_build.apply_rebuild` inverting
     ``scope.resolution`` — a placeholder -> real map, already the
     OUTPUT of :func:`~paramem.graph.cloud_egress.CloudScope.for_response`,
     not a raw forward table — for its own entity-type lookup) is not a
@@ -849,7 +862,7 @@ def _build_anonymization_mapping(
 
 # The fields of a fact dict that constitute a `Relation` — exactly the
 # keys read at the `Relation(**fact)`-equivalent construction site in
-# `_sota_pipeline` (subject/predicate/object/relation_type/confidence/
+# `relation_build.build_relations` (subject/predicate/object/relation_type/confidence/
 # symmetric; `speaker_id` is stamped separately from the session, never
 # read off the fact). Any OTHER key on a fact dict (e.g. an `evidence`
 # field an LLM invents) never reaches `Relation` and therefore cannot
@@ -936,8 +949,10 @@ def _apply_bindings(
             anonymizer mapping (anonymizer leak).
          c. Composite strings where one of multiple placeholders
             couldn't be resolved.
-       Inside the full pipeline (:func:`~paramem.graph.extractor._sota_pipeline`),
-       causes (a) and (b) are now intercepted upstream by
+       Inside the full session flow
+       (``paramem.graph.extractor.SESSION_EXTRACT``, whose
+       ``deanonymize`` stage is where this sweep actually runs), causes
+       (a) and (b) are now intercepted upstream by
        :func:`_check_mapping_totality`'s SOTA-enrichment-stage rejection
        gate — a bad mint rejects the WHOLE delta before it reaches this
        function, rather than shedding just the one fact.  This sweep

@@ -246,7 +246,6 @@ def run_gpu_phases(out_dir: Path) -> dict:
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
-        extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
         # Same 5-category default the server config ships

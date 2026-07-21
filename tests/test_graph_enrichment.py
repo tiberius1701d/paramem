@@ -249,6 +249,7 @@ class TestEnrichmentAddsEdgesWithSourceTag:
             ],
             [],  # no same_as
             "raw",
+            [],  # accepted: empty totality verdict
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -309,6 +310,7 @@ class TestEnrichmentInheritsSourceWindow:
             ],
             [],  # no same_as
             "raw",
+            [],  # accepted: empty totality verdict
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -366,6 +368,7 @@ class TestLowConfidenceDropped:
             ],
             [],
             "raw",
+            [],  # accepted: empty totality verdict
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -432,6 +435,7 @@ class TestSameAsContractsNodes:
             [],  # no new relations
             [["Alice", "Alicia"]],  # same_as
             "raw",
+            [],  # accepted: empty totality verdict
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -499,7 +503,7 @@ class TestSameAsSurnameMismatchRejected:
                 last_seen="s020",
             )
 
-        canned_result = ([], [["Zhang Min", "Wang Min"]], "raw")
+        canned_result = ([], [["Zhang Min", "Wang Min"]], "raw", [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
@@ -530,7 +534,7 @@ def _same_as_per_chunk(*per_chunk: list[list[str]]):
         i = calls["n"]
         calls["n"] += 1
         pairs = list(per_chunk[i]) if i < len(per_chunk) else []
-        return ([], pairs, "raw")
+        return ([], pairs, "raw", [])
 
     return _side_effect
 
@@ -689,6 +693,7 @@ class TestSameAsDedupAcrossChunks:
             [],
             [["Yang Ming", "Mr. Yang"], ["Mr. Yang", "Yang Ming"]],
             "raw",
+            [],
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -744,7 +749,7 @@ class TestSymmetricPredicateCanonicalized:
                 last_seen="s040",
             )
 
-        canned_result = (rels, [], "raw")
+        canned_result = (rels, [], "raw", [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
@@ -803,7 +808,7 @@ class TestSymmetricPredicateCanonicalized:
                 last_seen="s041",
             )
 
-        canned_result = (rels, [], "raw")
+        canned_result = (rels, [], "raw", [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
@@ -879,7 +884,7 @@ class TestCorefRemapBeforeEdgeInsert:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(canned_rels, canned_same_as, "raw"),
+            return_value=(canned_rels, canned_same_as, "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -978,6 +983,7 @@ class TestPartitionRoutesEnrichedEdges:
             ],
             [],
             "raw",
+            [],  # accepted: empty totality verdict
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -1051,7 +1057,7 @@ class TestChunkCapRespected:
 
         def _spy_call(triples, *args, **kwargs):
             call_args_list.append(list(triples))
-            return ([], [], "raw")
+            return ([], [], "raw", [])
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch("paramem.training.graph_enrich._graph_enrich_with_sota", side_effect=_spy_call):
@@ -1192,7 +1198,7 @@ class TestEmptyMappingProceeds:
             "paramem.graph.cloud_egress.anonymize_with_local_model",
             lambda *args, **kwargs: ({}, "", "stub-raw"),
         )
-        canned_result = ([], [], "raw")
+        canned_result = ([], [], "raw", [])
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
             return_value=canned_result,
@@ -1250,7 +1256,7 @@ class TestEmptyMappingProceeds:
             "paramem.graph.cloud_egress.anonymize_with_local_model",
             lambda *args, **kwargs: ({}, "", "stub-raw"),
         )
-        canned_result = ([], [], "raw")
+        canned_result = ([], [], "raw", [])
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
             return_value=canned_result,
@@ -1512,7 +1518,7 @@ class TestGuardDomainSeparation:
             "paramem.graph.cloud_egress.anonymize_with_local_model",
             _stub,
         )
-        canned_result = ([], [], "raw")
+        canned_result = ([], [], "raw", [])
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
             return_value=canned_result,
@@ -1546,7 +1552,7 @@ class TestScrubEmptyOptsOutWithoutModelCall:
 
         def _capture(triples, payload, graph, *args, **kwargs):
             captured_mapping.append(dict(payload.forward))
-            return [], [], "raw"
+            return [], [], "raw", []
 
         with (
             patch("paramem.graph.cloud_egress.anonymize_with_local_model", anonymizer_spy),
@@ -1604,6 +1610,54 @@ class TestTotalityRejectedChunks:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         canned_raw = '{"relations": [], "same_as": []}'
         with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert result["totality_rejected_chunks"] == 0
+
+    def test_counter_reads_the_returned_verdict_not_a_graph_mutation(self, tmp_path, monkeypatch):
+        """The counter is driven by the VERDICT ``_graph_enrich_with_sota``
+        returns (its fourth tuple element), not by reading
+        ``sota_pending_orphans`` back off the throwaway per-chunk graph.
+
+        The stub below returns a rejection verdict while touching no
+        graph at all — under the old readback the counter would stay 0.
+
+        Mutation: go back to
+        ``if _chunk_session_graph.diagnostics.get("sota_pending_orphans")``
+        -> this test fails while the two live-path tests above still
+        pass, which is exactly why it exists.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            return_value=([], [], "raw", ["Person_99"]),
+        ):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert result["totality_rejected_chunks"] == result["chunks"] >= 1
+        assert result["new_edges"] == 0
+
+    def test_empty_verdict_with_empty_delta_is_not_counted_as_a_rejection(
+        self, tmp_path, monkeypatch
+    ):
+        """The inverse discrimination: a legitimately EMPTY delta returns
+        the same ``([], [], raw, ...)`` shape as a rejected one — only the
+        verdict tells them apart, and an empty verdict must not count."""
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            return_value=([], [], "raw", []),
+        ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -1714,7 +1768,7 @@ class TestGraphEnrichWithSotaUnit:
             )
 
         assert result is not None
-        new_rels, same_as, raw = result
+        new_rels, same_as, raw, _verdict = result
         assert len(new_rels) == 1
         assert new_rels[0]["predicate"] == "knows"
         assert len(same_as) == 1
@@ -1789,7 +1843,7 @@ class TestGraphEnrichWithSotaUnit:
             )
 
         assert result is not None
-        new_rels, same_as, _ = result
+        new_rels, same_as, _, _verdict = result
         assert len(new_rels) == 1
         assert same_as == []
 
@@ -1826,9 +1880,84 @@ class TestGraphEnrichWithSotaUnit:
             )
 
         assert result is not None
-        _, same_as, _ = result
+        _, same_as, _, _verdict = result
         # Only the valid [Alice, Alicia] entry survives; ["bad", [1,2]] are skipped
         assert same_as == [["Alice", "Alicia"]]
+
+    def test_totality_verdict_is_returned_and_also_recorded_on_the_graph(self):
+        """A rejected chunk delta surfaces TWO ways, and both must hold:
+        the verdict is the fourth element of the returned tuple (what the
+        caller counts on), AND it still lands under
+        ``graph.diagnostics["sota_pending_orphans"]`` for calibration
+        inspection — written by the CALLER-side
+        ``_record_binding_diagnostics``, not from inside the gate."""
+        from paramem.graph.extractor import _graph_enrich_with_sota
+
+        triples = [
+            {
+                "subject": "Alex",
+                "predicate": "works_at",
+                "object": "Corp",
+                "relation_type": "factual",
+            }
+        ]
+        # "Person_99" is never declared for this chunk -> orphan -> the
+        # whole delta is rejected.
+        canned_raw = (
+            '{"relations": [{"subject": "Person_1", "predicate": "knows", '
+            '"object": "Person_99", "relation_type": "social", "confidence": 0.9}], '
+            '"same_as": []}'
+        )
+        payload, graph = _payload_and_graph_for(triples, {"Alex": "Person_1"})
+        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+            result = _graph_enrich_with_sota(
+                triples,
+                payload,
+                graph,
+                api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+            )
+
+        assert result is not None
+        new_rels, same_as, _raw, verdict = result
+        assert verdict == ["Person_99"]
+        assert new_rels == []
+        assert same_as == []
+        assert graph.diagnostics["sota_pending_orphans"] == ["Person_99"]
+        # No sota_bindings in the response -> the collision scan found
+        # nothing -> no key at all (never a present-but-empty list).
+        assert "sota_binding_collisions" not in graph.diagnostics
+
+    def test_accepted_chunk_writes_no_totality_diagnostics(self):
+        """The guard conditions are preserved end-to-end: an accepted
+        delta leaves both keys ABSENT rather than writing empty lists."""
+        from paramem.graph.extractor import _graph_enrich_with_sota
+
+        triples = [
+            {
+                "subject": "Alex",
+                "predicate": "works_at",
+                "object": "Corp",
+                "relation_type": "factual",
+            }
+        ]
+        canned_raw = '{"relations": [], "same_as": []}'
+        payload, graph = _payload_and_graph_for(triples, {"Alex": "Person_1"})
+        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+            result = _graph_enrich_with_sota(
+                triples,
+                payload,
+                graph,
+                api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+            )
+
+        assert result is not None
+        assert result[3] == []
+        assert "sota_pending_orphans" not in graph.diagnostics
+        assert "sota_binding_collisions" not in graph.diagnostics
 
 
 class TestInterimEnrichmentHook:
@@ -2750,6 +2879,7 @@ class TestEnrichmentRemovalLedger:
             [],
             [["Alice", "Alicia"]],  # keep=alice, drop=alicia
             "raw",
+            [],
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -2815,6 +2945,7 @@ class TestEnrichmentRemovalLedger:
             [],
             [["BadKeep", "BadDrop"]],
             "raw",
+            [],
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
@@ -3171,7 +3302,7 @@ class TestEnrichmentThroughMergerComposition:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3232,7 +3363,7 @@ class TestEnrichmentThroughMergerComposition:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3373,7 +3504,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3465,7 +3596,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3548,7 +3679,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         with (
             patch(
                 "paramem.training.graph_enrich._graph_enrich_with_sota",
-                return_value=(rels, same_as, "raw"),
+                return_value=(rels, same_as, "raw", []),
             ),
             patch(
                 "paramem.training.graph_enrich._safe_to_merge_surface",
@@ -3694,7 +3825,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3790,7 +3921,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3855,7 +3986,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels_a, [], "raw"),
+            return_value=(rels_a, [], "raw", []),
         ):
             _refiner_for(loop).run_enrichment()
 
@@ -3958,7 +4089,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=(rels, [], "raw"),
+            return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -4161,7 +4292,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        new_rels, same_as, _raw = result
+        new_rels, same_as, _raw, _verdict = result
         assert len(new_rels) == 1
         assert new_rels[0]["subject"] == "alice"
         assert new_rels[0]["object"] == "speaker0"
@@ -4208,7 +4339,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        new_rels, _same_as, _raw = result
+        new_rels, _same_as, _raw, _verdict = result
         assert new_rels == [], (
             f"Relation naming an unresolved token must be dropped; got {new_rels!r}"
         )
@@ -4324,7 +4455,7 @@ class TestGraphTierAnonymizationContract:
         assert "Person_7" in rendered, (
             f"the model's own placeholder must reach the payload verbatim: {rendered}"
         )
-        new_rels, _same_as, _raw = result
+        new_rels, _same_as, _raw, _verdict = result
         assert len(new_rels) == 1
         assert new_rels[0]["subject"] == "yang ming", (
             "Person_7 must round-trip to the real name via the caller's own "
@@ -4410,7 +4541,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        _new_rels, same_as, _raw = result
+        _new_rels, same_as, _raw, _verdict = result
         assert len(same_as) == 1
         keep, drop = same_as[0]
         assert is_speaker_id(keep) and is_speaker_id(drop), (

@@ -704,7 +704,7 @@ class TestReverseMapInversionAgreement:
             )
 
         assert result is not None
-        new_rels, _same_as, _raw = result
+        new_rels, _same_as, _raw, _verdict = result
         assert len(new_rels) == 1
         assert new_rels[0]["subject"] == "Alice"
         assert new_rels[0]["object"] == "Alice"

@@ -1,4 +1,4 @@
-"""Tests for the extraction pipeline — HA validation, noise filter, JSON parsing."""
+"""Tests for the extraction pipeline — noise filter, JSON parsing."""
 
 import json
 from pathlib import Path
@@ -6,10 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.graph.extractor import (
-    _extract_json_block,
-    _validate_with_ha_context,
-)
+from paramem.graph.extractor import _extract_json_block
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -38,89 +35,6 @@ def _make_graph(relations, entities=None):
         entities=entities,
         relations=rels,
     )
-
-
-# --- HA Context Validation ---
-
-
-class TestHAContextValidation:
-    def test_home_location_boosts_confidence(self):
-        graph = _make_graph([("Alex", "lives_in", "Millfield", "factual", 0.7)])
-        ha_context = {
-            "location_name": "Millfield",
-            "timezone": "Europe/Berlin",
-            "latitude": 50.1,
-            "longitude": 8.4,
-            "zones": ["Home"],
-            "areas": ["Living Room", "Office"],
-        }
-        result = _validate_with_ha_context(graph, ha_context)
-        assert result.relations[0].confidence == 1.0
-
-    def test_partial_match_boosts(self):
-        graph = _make_graph([("Alex", "lives_in", "Millfield/Greenshire", "factual", 0.7)])
-        ha_context = {
-            "location_name": "Millfield",
-            "timezone": "",
-            "latitude": 0,
-            "longitude": 0,
-            "zones": [],
-            "areas": [],
-        }
-        result = _validate_with_ha_context(graph, ha_context)
-        assert result.relations[0].confidence == 1.0
-
-    def test_zone_match_boosts(self):
-        graph = _make_graph([("Alex", "lives_near", "Home", "factual", 0.5)])
-        ha_context = {
-            "location_name": "",
-            "timezone": "",
-            "latitude": 0,
-            "longitude": 0,
-            "zones": ["Home", "Work"],
-            "areas": [],
-        }
-        result = _validate_with_ha_context(graph, ha_context)
-        assert result.relations[0].confidence >= 0.9
-
-    def test_no_match_unchanged(self):
-        graph = _make_graph([("Alex", "lives_in", "Tokyo", "factual", 0.7)])
-        ha_context = {
-            "location_name": "Millfield",
-            "timezone": "",
-            "latitude": 0,
-            "longitude": 0,
-            "zones": [],
-            "areas": [],
-        }
-        result = _validate_with_ha_context(graph, ha_context)
-        assert result.relations[0].confidence == 0.7
-
-    def test_non_location_predicate_unchanged(self):
-        graph = _make_graph([("Alex", "works_at", "Millfield", "factual", 0.7)])
-        ha_context = {
-            "location_name": "Millfield",
-            "timezone": "",
-            "latitude": 0,
-            "longitude": 0,
-            "zones": [],
-            "areas": [],
-        }
-        result = _validate_with_ha_context(graph, ha_context)
-        assert result.relations[0].confidence == 0.7
-
-    def test_empty_context(self):
-        graph = _make_graph([("Alex", "lives_in", "Millfield", "factual", 0.7)])
-        ha_context = {
-            "location_name": "",
-            "timezone": "",
-            "latitude": 0,
-            "longitude": 0,
-            "zones": [],
-            "areas": [],
-        }
-        result = _validate_with_ha_context(graph, ha_context)
-        assert result.relations[0].confidence == 0.7
 
 
 # --- JSON Block Extraction ---
@@ -1064,7 +978,7 @@ class TestPipelinePromptsDirThreading:
         """Stage 1 (anonymize): without this the pipeline silently loads the
         shipped anonymization prompt while the caller believes its override
         is in effect."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1092,7 +1006,7 @@ class TestPipelinePromptsDirThreading:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1111,7 +1025,7 @@ class TestPipelinePromptsDirThreading:
         """Stage 2 (sota_enrich): ``_filter_with_sota`` had neither a
         ``prompts_dir`` parameter nor a forwarded value — the override never
         reached the enrichment prompt at all."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1139,7 +1053,7 @@ class TestPipelinePromptsDirThreading:
                 side_effect=fake_filter_with_sota,
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1157,7 +1071,7 @@ class TestPipelinePromptsDirThreading:
     def test_anon_plausibility_receives_prompts_dir(self, tmp_path):
         """Stage 3a (anon_plausibility, SOTA judge): ``_plausibility_filter_with_sota``
         had neither a ``prompts_dir`` parameter nor a forwarded value."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1189,7 +1103,7 @@ class TestPipelinePromptsDirThreading:
                 side_effect=fake_plaus,
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1210,7 +1124,7 @@ class TestPipelinePromptsDirThreading:
     def test_deanon_plausibility_receives_prompts_dir(self, tmp_path):
         """Stage 3d (deanon_plausibility, local judge): ``local_plausibility_filter``
         already accepted ``prompts_dir`` but the call site never passed it."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1242,7 +1156,7 @@ class TestPipelinePromptsDirThreading:
                 side_effect=fake_local_plaus,
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -1264,7 +1178,7 @@ class TestPipelinePromptsDirThreading:
         pass ``prompts_dir`` (production default), every downstream call
         still receives ``None`` — byte-identical to pre-fix behaviour, never
         a surprise override."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1304,7 +1218,7 @@ class TestPipelinePromptsDirThreading:
                 side_effect=fake_plaus,
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1325,7 +1239,7 @@ class TestPipelinePromptsDirThreading:
     def test_default_prompts_dir_is_none_at_deanon_stage_call_sites(self):
         """Parity check (plausibility_stage="deanon"): same as above for the
         local-judge deanon-plausibility call site."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1365,7 +1279,7 @@ class TestPipelinePromptsDirThreading:
                 side_effect=fake_local_plaus,
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -1530,7 +1444,7 @@ class TestSOTANoiseFilter:
         assert callable(_filter_with_sota)
 
     def test_filter_with_sota_no_api_key(self):
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1541,7 +1455,7 @@ class TestSOTANoiseFilter:
         )
         # No ANTHROPIC_API_KEY → skips gracefully
         with patch.dict("os.environ", {}, clear=True):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "transcript",
                 None,
@@ -1588,7 +1502,7 @@ class TestSOTANoiseFilter:
         The new behavior runs _fallback_plausibility_on_raw so that tautologies,
         role leaks, and other noise are still filtered even without SOTA.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1606,7 +1520,7 @@ class TestSOTANoiseFilter:
             # Pass model=None/tokenizer=None → local_plausibility_filter skipped inside fallback
         ):
             # Transcript "Alex lives in Millfield" grounds both entities.
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -1634,7 +1548,8 @@ class TestSOTANoiseFilter:
         the per-session loop in ``app.py`` leaves the session pending
         for retry.
         """
-        from paramem.graph.extractor import ExtractionFailed, _sota_pipeline
+        from paramem.graph.extractor import ExtractionFailed
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1657,7 +1572,7 @@ class TestSOTANoiseFilter:
             ),
         ):
             with pytest.raises(ExtractionFailed) as excinfo:
-                _sota_pipeline(
+                run_sota_stages(
                     graph,
                     "transcript",
                     None,
@@ -1670,7 +1585,7 @@ class TestSOTANoiseFilter:
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
         """Enrichment output flows through de-anonymization to real names."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1696,7 +1611,7 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "transcript",
                 None,
@@ -1716,7 +1631,7 @@ class TestSOTANoiseFilter:
 
     def test_pipeline_deanonymizes_composite_placeholders(self):
         """Composite strings like 'Person_1's family' get substring-replaced."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         transcript = "Alex lives in downtown Millfield with Alex's family"
         graph = _make_graph(
@@ -1745,7 +1660,7 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 transcript,
                 None,
@@ -1877,7 +1792,7 @@ class TestSOTANoiseFilter:
         ``_filter_with_sota`` happy-path mocking pattern as the sibling
         tests in this class.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1931,7 +1846,7 @@ class TestSOTANoiseFilter:
                 side_effect=fake_correct_entity_surfaces,
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "transcript",
                 None,
@@ -2014,7 +1929,7 @@ class TestAnonymizerMappingOnlyContract:
         building them from ``graph.relations`` -> the dropped/reworded
         fact slips through -> fails.  The owner's rule, pinned.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [
@@ -2053,7 +1968,7 @@ class TestAnonymizerMappingOnlyContract:
             patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield and works at Acme.",
                 MagicMock(),
@@ -2078,7 +1993,7 @@ class TestAnonymizerMappingOnlyContract:
         ``_substitute_whole_words(r.predicate, mapping)``) -> the
         predicate gets scrubbed to ``"asked about Person_1"`` -> fails.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "asked about Alex", "Bob")],
@@ -2103,7 +2018,7 @@ class TestAnonymizerMappingOnlyContract:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex asked about Alex and Bob.",
                 None,
@@ -2386,7 +2301,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
         ``Bill`` -> the cycle blocks/skips SOTA, or the object is wrongly
         scrubbed -> this test fails.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Bill", "received", "electricity bill")],
@@ -2409,7 +2324,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 transcript,
                 None,
@@ -2453,7 +2368,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         ``_apply_bindings`` -> the poisoned fact reaches
         ``graph.relations`` -> this test fails.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "works_at", "Acme")],
@@ -2493,7 +2408,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 transcript,
                 None,
@@ -2506,6 +2421,16 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         # The poisoned fact never reaches the merged graph.
         assert all(r.predicate != "language_proficiency_Language_3" for r in result.relations)
         assert graph.diagnostics["predicate_placeholder_dropped"] == 1
+        # It was the ONLY fact, so the substitution emptied the working
+        # set and the all-dropped net fired. That is a mechanical
+        # BREAKAGE, not a judge's verdict — and the gate now records
+        # which of the two it was. Recorded only: the outcome (fallback
+        # to the pre-enrichment facts) is unchanged by the cause.
+        assert result.diagnostics["all_dropped_cause"] == {
+            "cause": "deanon_substitution_dropped_all",
+            "kind": "breakage",
+        }
+        assert result.diagnostics.get("fallback_path") == "all_dropped"
 
 
 class TestApplyBindings:
@@ -3444,7 +3369,7 @@ class TestPlausibilityAnon:
     def test_anon_stage_plausibility_filters_subset(self):
         """When plausibility_stage="anon" and a SOTA validator is configured, it runs
         on the anonymized facts before de-anonymization and drops flagged entries."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [
@@ -3481,7 +3406,7 @@ class TestPlausibilityAnon:
                 return_value=(kept_anon, "raw"),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -3509,7 +3434,7 @@ class TestPlausibilityAnon:
         Mutation: revert the call site to pass `anon_transcript=anon_transcript`
         -> this test fails.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "authored", "Attention Is All You Need")],
@@ -3553,7 +3478,7 @@ class TestPlausibilityAnon:
                 side_effect=fake_plaus,
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex wrote a well-known paper.",
                 None,
@@ -3578,7 +3503,7 @@ class TestPlausibilityDeanon:
 
     def test_deanon_stage_plausibility_drops_tautology(self):
         """Deanon-stage local plausibility receives real names and drops tautologies."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [
@@ -3620,7 +3545,7 @@ class TestPlausibilityDeanon:
                 side_effect=fake_local_plaus,
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -3653,7 +3578,7 @@ class TestAnonFailureFallback:
 
     def test_anon_failure_triggers_fallback(self):
         """_sota_pipeline calls _fallback_plausibility_on_raw when anonymization fails."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3683,7 +3608,7 @@ class TestAnonFailureFallback:
                 side_effect=fake_fallback,
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "transcript",
                 None,
@@ -3713,7 +3638,8 @@ class TestSotaEnrichmentFailureRaises:
 
     def test_sota_enrich_failure_raises_extraction_failed(self):
         """_filter_with_sota returning (None, ...) → ExtractionFailed."""
-        from paramem.graph.extractor import ExtractionFailed, _sota_pipeline
+        from paramem.graph.extractor import ExtractionFailed
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3740,7 +3666,7 @@ class TestSotaEnrichmentFailureRaises:
             ),
         ):
             try:
-                _sota_pipeline(
+                run_sota_stages(
                     graph,
                     "transcript",
                     None,
@@ -3776,7 +3702,7 @@ class TestAllDroppedSafetyNet:
         """When plausibility drops every surviving fact, the all-dropped
         safety net invokes _fallback_plausibility_on_raw with reason
         'all_dropped' so the session does not yield zero facts."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3816,7 +3742,7 @@ class TestAllDroppedSafetyNet:
                 side_effect=fake_fallback,
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),  # non-None model so deanon-stage plausibility runs
@@ -3830,6 +3756,14 @@ class TestAllDroppedSafetyNet:
 
         assert "all_dropped" in fallback_calls, f"Expected all_dropped, got: {fallback_calls}"
         assert result.diagnostics.get("fallback_path") == "all_dropped"
+        # The gate fires on a SYMPTOM (no relations survived); the cause
+        # tells the three situations that reach it apart. Here the
+        # deanon-stage judge dropped everything — a judgment, not a
+        # mechanical breakage. Recorded only: nothing branches on it.
+        assert result.diagnostics.get("all_dropped_cause") == {
+            "cause": "deanon_judge_dropped_all",
+            "kind": "judgment",
+        }
 
 
 class TestEntityTypePreservation:
@@ -3840,7 +3774,7 @@ class TestEntityTypePreservation:
     def test_preserved_entity_types_pass_through(self):
         """Entities pre-typed by _normalize_extraction keep their original types
         after the pipeline even when mocked SOTA returns same facts."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [
@@ -3870,7 +3804,7 @@ class TestEntityTypePreservation:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Frankfurt and listens to Music.",
                 None,
@@ -3890,7 +3824,7 @@ class TestEntityTypePreservation:
 
     def test_sota_introduced_country_entity_typed_location(self):
         """SOTA-introduced entity with Country_ placeholder is typed 'location', not 'person'."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "born_in", "Germany")],
@@ -3913,7 +3847,7 @@ class TestEntityTypePreservation:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex was born in Germany.",
                 None,
@@ -3944,7 +3878,7 @@ class TestEntityTypePreservation:
         reverse_mapping entry exists. The entity-type-preservation rule ensures the
         fallback type is 'concept', never 'person'.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         # Original graph has only Alex — no China entity
         graph = _make_graph(
@@ -3969,7 +3903,7 @@ class TestEntityTypePreservation:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex visited China.",
                 None,
@@ -4007,7 +3941,7 @@ class TestSotaMintedEntityTypeDerivation:
         ``reverse_mapping`` has no "Attention Is All You Need" key (it is
         keyed by placeholder), so the entity falls back to "concept".
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "has_plans", "Alex")],  # placeholder relation; SOTA will override
@@ -4032,7 +3966,7 @@ class TestSotaMintedEntityTypeDerivation:
                 return_value=(enriched_anon, None, sota_bindings, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex authored Attention Is All You Need.",
                 None,
@@ -4054,7 +3988,7 @@ class TestSotaMintedEntityTypeDerivation:
         maps through the schema's ``anonymizer_prefix_to_type()`` to
         "person" — the closed-vocabulary branch of the same derivation.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "has_plans", "Alex")],
@@ -4077,7 +4011,7 @@ class TestSotaMintedEntityTypeDerivation:
                 return_value=(enriched_anon, None, sota_bindings, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex met Jordan Rivers.",
                 None,
@@ -4165,12 +4099,16 @@ class TestExtractGraphNewKwargs:
         """extract_graph forwards plausibility_judge, plausibility_stage to
         _sota_pipeline."""
         from paramem.graph.extractor import extract_graph
+        from paramem.graph.flow import StageState
 
         captured = {}
 
         def fake_sota_pipeline(graph, transcript, model, tokenizer, **kwargs):
+            # The composite returns a StageState now — an empty ``facts``
+            # is its ``terminal_when``, so the deanonymize/rebuild
+            # siblings do not run on this stub's output.
             captured.update(kwargs)
-            return graph
+            return StageState(graph=graph)
 
         graph_raw = json.dumps(
             {
@@ -4273,7 +4211,7 @@ class TestDiagnosticsKeys:
 
     def test_diagnostics_contains_plausibility_keys(self):
         """After a deanon-stage plausibility run, diagnostics contains the expected keys."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4303,7 +4241,7 @@ class TestDiagnosticsKeys:
                 side_effect=fake_local_plaus,
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -4316,13 +4254,13 @@ class TestDiagnosticsKeys:
             )
 
         assert "plausibility" in result.diagnostics, "diagnostics must contain 'plausibility'"
-        assert "plausibility_dropped" in result.diagnostics
+        assert "plausibility_dropped_deanon" in result.diagnostics
         assert "plausibility_judge_actual" in result.diagnostics
         assert "anonymize" in result.diagnostics
 
     def test_diagnostics_anonymize_key_populated_on_success(self):
         """diagnostics['anonymize']='ok' when anonymization succeeds."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4345,7 +4283,7 @@ class TestDiagnosticsKeys:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -4373,7 +4311,7 @@ class TestDiagnosticsKeys:
         Mutation: reintroduce a second (now-dead) normalize call before
         the diagnostic is set -> ``dropped`` reads 0 -> this test fails.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4398,7 +4336,7 @@ class TestDiagnosticsKeys:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -4514,46 +4452,44 @@ class TestCheckMappingTotality:
     time.  Under the open-vocabulary anonymizer prompt the LLM is
     expected to produce a total mapping by construction (see live probe
     at the prompt-pivot commit); this helper surfaces violations to
-    ``logger`` and ``graph.diagnostics`` so prompt regressions are
-    visible rather than silently shedding facts.  Orphan-placeholder
-    facts get dropped downstream by :func:`_apply_bindings`'s residual
-    sweep — fail-closed.
+    ``logger`` and, as RETURN VALUES, to whatever diagnostics its caller
+    keeps, so prompt regressions are visible rather than silently
+    shedding facts.  Orphan-placeholder facts get dropped downstream by
+    :func:`_apply_bindings`'s residual sweep — fail-closed.
+
+    The function takes no ``SessionGraph`` and writes nothing: it returns
+    ``(verdict, collisions)``.  Every assertion below is on the returned
+    tuple; the caller-side diagnostics writes those two values feed are
+    pinned separately (``_record_binding_diagnostics`` in
+    ``paramem.graph.extractor``).
     """
 
-    @staticmethod
-    def _graph() -> "SessionGraph":
-        return _make_graph(
-            [],
-            entities=[Entity(name="Alex", entity_type="person")],
-        )
-
     def test_total_mapping_records_no_orphans(self):
-        """Every fact placeholder resolves via the reverse map → no
-        diagnostic emitted."""
+        """Every fact placeholder resolves via the reverse map → empty
+        verdict."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
         ]
         reverse_mapping = {"Person_1": "Alex", "City_1": "Berlin"}
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert "totality_orphans" not in graph.diagnostics
+        verdict, collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == []
+        assert collisions == []
 
     def test_orphan_placeholder_recorded(self):
         """A fact placeholder absent from ``reverse_mapping`` (the keys
-        deanon actually looks up) is recorded as an orphan in
-        ``graph.diagnostics`` for monitoring.  No mutation of inputs."""
+        deanon actually looks up) comes back in the verdict.  No mutation
+        of inputs."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
         ]
         # University_1 is missing from reverse_mapping — a totality violation.
         reverse_mapping = {"Person_1": "Alex"}
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert graph.diagnostics.get("totality_orphans") == ["University_1"]
+        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == ["University_1"]
         # Inputs must not be mutated.
         assert reverse_mapping == {"Person_1": "Alex"}
 
@@ -4562,7 +4498,6 @@ class TestCheckMappingTotality:
         diagnostic output."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Org_1", "predicate": "made", "object": "Product_1"},
             {"subject": "Person_1", "predicate": "speaks", "object": "Language_1"},
@@ -4570,8 +4505,8 @@ class TestCheckMappingTotality:
         ]
         # Person_1 is in reverse_mapping but Org_1, Product_1, Language_1 are not.
         reverse_mapping = {"Person_1": "Alex"}
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert graph.diagnostics.get("totality_orphans") == [
+        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == [
             "Language_1",
             "Org_1",
             "Product_1",
@@ -4582,7 +4517,6 @@ class TestCheckMappingTotality:
         an orphan when missing from ``reverse_mapping``."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {
                 "subject": "Person_1",
@@ -4591,17 +4525,15 @@ class TestCheckMappingTotality:
             },
         ]
         reverse_mapping = {"Person_1": "Alex"}
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert graph.diagnostics.get("totality_orphans") == ["Product_1"]
+        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == ["Product_1"]
 
     def test_empty_facts_short_circuits(self):
-        """No facts → no diagnostic, regardless of reverse_mapping shape."""
+        """No facts → empty verdict, regardless of reverse_mapping shape."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
-        _check_mapping_totality(graph, [], {})
-        _check_mapping_totality(graph, [], {"Person_1": "Alex"})
-        assert "totality_orphans" not in graph.diagnostics
+        assert _check_mapping_totality([], {}) == ([], [])
+        assert _check_mapping_totality([], {"Person_1": "Alex"}) == ([], [])
 
     def test_placeholder_in_forward_values_but_absent_from_reverse_keys_flagged(self):
         """The check must key off the reverse map, not the forward map.
@@ -4614,7 +4546,6 @@ class TestCheckMappingTotality:
         """
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
         ]
@@ -4624,32 +4555,30 @@ class TestCheckMappingTotality:
         forward_map = {"Alex": "Person_1", "SomeoneElse": "Person_4"}
         reverse_mapping = {"Person_1": "Alex"}
         assert "Person_4" in set(forward_map.values())
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert graph.diagnostics.get("totality_orphans") == ["Person_4"]
+        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == ["Person_4"]
 
     def test_placeholder_present_in_reverse_keys_passes(self):
         """Once the placeholder is a key in the reverse map, the same
-        fact passes with no orphan recorded."""
+        fact passes with an empty verdict."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
         ]
         reverse_mapping = {"Person_1": "Alex", "Person_4": "Alex"}
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert "totality_orphans" not in graph.diagnostics
+        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == []
 
     def test_post_sota_missing_binding_predicted_before_drop(self, caplog):
         """A fact referencing a braced placeholder absent from BOTH
-        ``sota_bindings`` and ``reverse_mapping`` is recorded under the
-        SOTA-stage diagnostic key and logged BEFORE :func:`_apply_bindings`
-        drops the fact."""
+        ``sota_bindings`` and ``reverse_mapping`` comes back in the
+        verdict and is logged BEFORE :func:`_apply_bindings` drops the
+        fact."""
         import logging
 
         from paramem.graph.placeholders import _apply_bindings, _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "works_at", "object": "{Org_9}"},
         ]
@@ -4664,17 +4593,15 @@ class TestCheckMappingTotality:
         placeholders_logger.setLevel(logging.WARNING)
         placeholders_logger.addHandler(caplog.handler)
         try:
-            _check_mapping_totality(
-                graph,
+            verdict, _collisions = _check_mapping_totality(
                 anon_facts,
                 reverse_mapping,
                 sota_bindings=sota_bindings,
-                diagnostic_key="sota_pending_orphans",
             )
         finally:
             placeholders_logger.removeHandler(caplog.handler)
             placeholders_logger.setLevel(prior_level)
-        assert graph.diagnostics.get("sota_pending_orphans") == ["Org_9"]
+        assert verdict == ["Org_9"]
         assert any("binding-totality violation" in r.getMessage().lower() for r in caplog.records)
         kept, predicate_dropped, residual_dropped = _apply_bindings(
             anon_facts, reverse_mapping, sota_bindings
@@ -4689,32 +4616,28 @@ class TestCheckMappingTotality:
         though no fact directly references ``Org_9``."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "held_role", "object": "{Role_1}"},
         ]
         reverse_mapping: dict = {}
         sota_bindings = {"Role_1": "Senior Engineer at Org_9"}
-        _check_mapping_totality(
-            graph,
+        verdict, _collisions = _check_mapping_totality(
             anon_facts,
             reverse_mapping,
             sota_bindings=sota_bindings,
-            diagnostic_key="sota_pending_orphans",
         )
-        assert "Org_9" in graph.diagnostics.get("sota_pending_orphans", [])
+        assert "Org_9" in verdict
 
     def test_collision_between_sota_bindings_and_reverse_recorded(self, caplog):
         """A key present in BOTH ``sota_bindings`` and ``reverse_mapping``
-        with differing values is recorded to
-        ``graph.diagnostics["sota_binding_collisions"]`` and warned about —
-        the reverse-wins tie-break in :func:`_apply_bindings` would
-        otherwise silently resolve to the wrong real name."""
+        with differing values comes back as a ``collisions`` entry and is
+        warned about — the reverse-wins tie-break in
+        :func:`_apply_bindings` would otherwise silently resolve to the
+        wrong real name."""
         import logging
 
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Org_1", "predicate": "based_in", "object": "Germany"},
         ]
@@ -4729,35 +4652,34 @@ class TestCheckMappingTotality:
         placeholders_logger.setLevel(logging.WARNING)
         placeholders_logger.addHandler(caplog.handler)
         try:
-            _check_mapping_totality(
-                graph,
+            verdict, collisions = _check_mapping_totality(
                 anon_facts,
                 reverse_mapping,
                 sota_bindings=sota_bindings,
-                diagnostic_key="sota_pending_orphans",
             )
         finally:
             placeholders_logger.removeHandler(caplog.handler)
             placeholders_logger.setLevel(prior_level)
-        assert graph.diagnostics.get("sota_binding_collisions") == ["Org_1"]
+        assert collisions == ["Org_1"]
+        # CORE-unscoped: a collision is informational only, never folded
+        # into the verdict.
+        assert verdict == []
         assert any("collision" in r.getMessage().lower() for r in caplog.records)
 
     def test_pre_sota_positional_calls_unaffected_by_generalization(self):
         """The existing positional pre-SOTA call sites (this class's
         earlier tests) keep passing unchanged — defaults preserve
-        behaviour: ``sota_bindings=None`` skips the collision scan and
-        the diagnostic key stays ``"totality_orphans"``."""
+        behaviour: ``sota_bindings=None`` skips the collision scan, so
+        ``collisions`` comes back empty."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
         ]
         reverse_mapping = {"Person_1": "Alex"}
-        _check_mapping_totality(graph, anon_facts, reverse_mapping)
-        assert graph.diagnostics.get("totality_orphans") == ["University_1"]
-        assert "sota_binding_collisions" not in graph.diagnostics
-        assert "sota_pending_orphans" not in graph.diagnostics
+        verdict, collisions = _check_mapping_totality(anon_facts, reverse_mapping)
+        assert verdict == ["University_1"]
+        assert collisions == []
 
     # -- Explicit-return contract, verdict content --------
 
@@ -4767,12 +4689,13 @@ class TestCheckMappingTotality:
         plain truthiness test safe for callers."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
         reverse_mapping = {"Person_1": "Alex"}
-        verdict = _check_mapping_totality(graph, anon_facts, reverse_mapping)
+        verdict, collisions = _check_mapping_totality(anon_facts, reverse_mapping)
         assert verdict == []
         assert verdict is not None
+        assert collisions == []
+        assert collisions is not None
 
     def test_returns_empty_list_not_none_on_empty_facts(self):
         """The totality check's second explicit exit: the early ``if not anon_facts``
@@ -4781,78 +4704,125 @@ class TestCheckMappingTotality:
         verdict:``."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
-        verdict = _check_mapping_totality(graph, [], {"Person_1": "Alex"})
+        verdict, collisions = _check_mapping_totality([], {"Person_1": "Alex"})
         assert verdict == []
         assert verdict is not None
+        assert collisions == []
 
     def test_returns_token_list_on_poisoned_delta(self):
-        """The verdict IS the sorted offending-token list — not just a
-        ``graph.diagnostics`` side effect."""
+        """The verdict IS the sorted offending-token list — the function
+        has no side effect to observe it through."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
         ]
         reverse_mapping = {"Person_1": "Alex"}
-        verdict = _check_mapping_totality(graph, anon_facts, reverse_mapping)
+        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
         assert verdict == ["University_1"]
 
     def test_conflict_key_folded_into_verdict_when_observed_scoped(self):
         """When ``observed`` is a set, a ``sota_bindings`` key colliding
-        with it is folded into the RETURNED verdict (not just the
-        diagnostics) so the caller's plain truthiness gate rejects it."""
+        with it is folded into the RETURNED verdict AND surfaces
+        separately as a ``collisions`` entry."""
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
         reverse_mapping = {"Person_1": "Alex"}
         sota_bindings = {"Person_1": "someone else entirely"}
         observed = {"Person_1"}
-        verdict = _check_mapping_totality(
-            graph,
+        verdict, collisions = _check_mapping_totality(
             anon_facts,
             reverse_mapping,
             sota_bindings=sota_bindings,
             observed=observed,
-            diagnostic_key="sota_pending_orphans",
         )
         assert verdict == ["Person_1"]
-        assert graph.diagnostics.get("sota_binding_collisions") == ["Person_1"]
+        assert collisions == ["Person_1"]
 
-    def test_collision_verdict_written_to_diagnostic_even_with_empty_anon_facts(self):
-        """A non-empty verdict from the collision scan
-        ALONE — ``anon_facts`` is empty, so there is nothing for the
-        per-fact scan to find — must still be written to
-        ``graph.diagnostics[diagnostic_key]``.  This is the exact shape
-        ``graph_enrich.run_graph_enrichment``'s ``totality_rejected_chunks`` counter
-        reads back (``_chunk_session_graph.diagnostics.get(
-        "sota_pending_orphans")``) to detect a rejected chunk; a verdict
-        that is non-empty but never written is silently under-counted as
-        "no rejection" — worse than no gate at all.
+    def test_collision_verdict_returned_even_with_empty_anon_facts(self):
+        """A non-empty verdict from the collision scan ALONE —
+        ``anon_facts`` is empty, so there is nothing for the per-fact scan
+        to find — must still reach the caller.  This is the exact shape
+        ``graph_enrich.run_graph_enrichment``'s ``totality_rejected_chunks``
+        counter reads (now off the verdict ``_graph_enrich_with_sota``
+        returns); a verdict that is non-empty but never surfaced is
+        silently under-counted as "no rejection" — worse than no gate at
+        all.
 
         Mutation: return the collision-only verdict via an early
-        ``return`` that bypasses the diagnostic write (the shape this
-        function had before the fix) -> ``graph.diagnostics`` stays empty
-        even though ``verdict`` is non-empty -> this test fails.
+        ``return []`` that bypasses the ``if orphans:`` exit (the shape
+        this function had before the fix) -> ``verdict`` comes back empty
+        -> this test fails.
         """
         from paramem.graph.placeholders import _check_mapping_totality
 
-        graph = self._graph()
         reverse_mapping = {"Person_1": "Alex"}
         sota_bindings = {"Person_1": "someone else entirely"}
         observed = {"Person_1"}
-        verdict = _check_mapping_totality(
-            graph,
+        verdict, collisions = _check_mapping_totality(
             [],  # no facts -- the early-return path the bug lived in
             reverse_mapping,
             sota_bindings=sota_bindings,
             observed=observed,
-            diagnostic_key="sota_pending_orphans",
         )
         assert verdict == ["Person_1"]
-        assert graph.diagnostics.get("sota_pending_orphans") == ["Person_1"]
+        assert collisions == ["Person_1"]
+
+
+class TestRecordBindingDiagnostics:
+    """``_record_binding_diagnostics`` — the CALLER side of the totality
+    gate, and the only place in the extractor that turns a
+    ``DeanonResult`` into ``graph.diagnostics`` entries.
+
+    The two keys used to be written by ``_check_mapping_totality`` itself,
+    from inside ``deanonymize_facts``, onto a ``SessionGraph`` passed
+    purely as a sink.  These tests pin the guard conditions that move
+    with them: an EMPTY list writes NO key, so ``"key" not in
+    diagnostics`` keeps meaning "the scan found nothing".
+    """
+
+    @staticmethod
+    def _result(verdict: list[str], collisions: list[str]):
+        from paramem.graph.cloud_egress import DeanonResult
+
+        return DeanonResult(
+            facts=[],
+            verdict=verdict,
+            collisions=collisions,
+            predicate_dropped=[],
+            residual_dropped=[],
+        )
+
+    def test_empty_findings_write_no_keys(self):
+        """Mutation: drop the ``if`` guards -> an accepted delta starts
+        writing two empty-list keys, and every ``"..." not in
+        diagnostics`` assertion in the suite flips meaning."""
+        from paramem.graph.extractor import _record_binding_diagnostics
+
+        graph = _make_graph([])
+        _record_binding_diagnostics(graph, self._result([], []))
+        assert "sota_pending_orphans" not in graph.diagnostics
+        assert "sota_binding_collisions" not in graph.diagnostics
+
+    def test_verdict_and_collisions_land_under_their_keys(self):
+        from paramem.graph.extractor import _record_binding_diagnostics
+
+        graph = _make_graph([])
+        _record_binding_diagnostics(graph, self._result(["Org_1"], ["Person_2"]))
+        assert graph.diagnostics["sota_pending_orphans"] == ["Org_1"]
+        assert graph.diagnostics["sota_binding_collisions"] == ["Person_2"]
+
+    def test_collisions_without_a_verdict_still_recorded(self):
+        """CORE-unscoped shape: a collision is informational only and is
+        NOT folded into the verdict, so it must not depend on the verdict
+        being non-empty to be recorded."""
+        from paramem.graph.extractor import _record_binding_diagnostics
+
+        graph = _make_graph([])
+        _record_binding_diagnostics(graph, self._result([], ["Person_2"]))
+        assert graph.diagnostics["sota_binding_collisions"] == ["Person_2"]
+        assert "sota_pending_orphans" not in graph.diagnostics
 
 
 class TestResolutionMap:
@@ -4949,8 +4919,8 @@ class TestBindingTotalityRejection:
         is logged naming the offending tokens."""
         import logging
 
-        from paramem.graph.extractor import _sota_pipeline
         from paramem.graph.phase_trace import extraction_trace
+        from tests._sota_flow import run_sota_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = [
@@ -5008,7 +4978,7 @@ class TestBindingTotalityRejection:
                         return_value=(enriched_anon, None, {}, None, {}),
                     ),
                 ):
-                    result = _sota_pipeline(
+                    result = run_sota_stages(
                         graph,
                         "Alex lives in Millfield",
                         None,
@@ -5044,7 +5014,7 @@ class TestBindingTotalityRejection:
         an ORPHAN → reject.  Pre-fix this would silently emit a
         fabricated fact bound for adapter weights; post-fix the local
         facts survive."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         # Person_3 is bare-minted by SOTA but was never shown to it (not
@@ -5069,7 +5039,7 @@ class TestBindingTotalityRejection:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -5088,8 +5058,8 @@ class TestBindingTotalityRejection:
         subject of a NEW triple, minting nothing, is ACCEPTED.  This test
         and ``test_misattribution_orphan_rejected`` differ ONLY in
         observed-membership."""
-        from paramem.graph.extractor import _sota_pipeline
         from paramem.graph.phase_trace import extraction_trace
+        from tests._sota_flow import run_sota_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = anon_facts + [
@@ -5113,7 +5083,7 @@ class TestBindingTotalityRejection:
                     return_value=(enriched_anon, None, {}, None, {}),
                 ),
             ):
-                result = _sota_pipeline(
+                result = run_sota_stages(
                     graph,
                     "Alex lives in Millfield",
                     None,
@@ -5132,7 +5102,7 @@ class TestBindingTotalityRejection:
         an OBSERVED token (Person_1 — already shown as a core reference)
         is a CONFLICT → rejected, even though it would resolve cleanly
         under the old flat-union design (reverse wins silently)."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = list(anon_facts)
@@ -5148,7 +5118,7 @@ class TestBindingTotalityRejection:
                 return_value=(enriched_anon, None, bindings, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -5166,7 +5136,7 @@ class TestBindingTotalityRejection:
         """Mint happy path.  SOTA mints a placeholder BOUND to a
         descriptor span ("my father", ∉ observed) → ACCEPTED; the
         relation de-anonymizes to the bound text."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = anon_facts + [
@@ -5190,7 +5160,7 @@ class TestBindingTotalityRejection:
                 return_value=(enriched_anon, None, bindings, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -5220,7 +5190,7 @@ class TestBindingTotalityRejection:
         fixture would need in production for either place to be a CORE
         placeholder at all.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         # Springfield -> City_2 appears ONLY inside a compound PREDICATE
         # string here, never as a subject/object anywhere in the local
@@ -5264,7 +5234,7 @@ class TestBindingTotalityRejection:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Alex moved from Springfield to Millfield.",
                 None,
@@ -5311,7 +5281,7 @@ class TestSpeakerAnchorPipeline:
         ``City_1`` — the model decision this test's fixture would need
         in production.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("speaker0", "lives_in", "Millfield")],
@@ -5334,7 +5304,7 @@ class TestSpeakerAnchorPipeline:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "speaker0 lives in Millfield",
                 None,
@@ -5355,7 +5325,7 @@ class TestSpeakerAnchorPipeline:
         pipeline must not require a speaker fact to function correctly —
         nothing about the anonymizer/deanon machinery depends on the
         speaker being referenced THIS session."""
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Acme", "located_in", "Millfield")],
@@ -5377,7 +5347,7 @@ class TestSpeakerAnchorPipeline:
                 return_value=(list(anon_facts), None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 "Acme located in Millfield",
                 None,
@@ -5408,7 +5378,7 @@ class TestObservedDerivation:
         (copied verbatim out of the transcript) enters ``observed`` as if it
         were a declared placeholder -> this test fails.
         """
-        from paramem.graph.extractor import _sota_pipeline
+        from tests._sota_flow import run_sota_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -5445,7 +5415,7 @@ class TestObservedDerivation:
                 return_value=(list(anon_facts), None, {}, None, {}),
             ),
         ):
-            _sota_pipeline(
+            run_sota_stages(
                 graph,
                 "Alex lives in Millfield and flew on a Boeing_747",
                 None,

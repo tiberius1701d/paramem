@@ -972,9 +972,9 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # The 30-epoch value was anchored on Mistral 7B; future base models
     # may converge sooner. Lower this only with evidence.
     #
-    # Development harnesses (e.g. scripts/dev/e2e_artifact_smoke.py) may
-    # set this to a small value to skip the full validated budget when
-    # testing layout/encryption invariants rather than recall quality.
+    # Development harnesses may set this to a small value to skip the full
+    # validated budget when testing layout/encryption invariants rather
+    # than recall quality.
     max_epochs: int | None = None
     # LoRA training hyperparameters (Test 17 recipe).
     # num_epochs is the ceiling max_epochs above (None → 30); not repeated here.
@@ -1052,7 +1052,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # production. Server short-circuits with 503 when a real consolidation
     # cycle is running so calibration calls cannot race against the model.
     calibrate_endpoint_enabled: bool = False
-    extraction_ha_validation: bool = True  # validate locations against HA home context
     extraction_noise_filter: str = ""  # SOTA provider for noise filtering ("" = disabled)
     extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering
     extraction_noise_filter_endpoint: str = ""  # custom endpoint for OpenAI-compatible providers

@@ -1,19 +1,30 @@
 """Tests for knowledge graph extraction."""
 
+import dataclasses
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from paramem.graph.cloud_egress import CloudScope
 from paramem.graph.extractor import (
     _extract_json_block,
+    _fallback_plausibility_on_raw,
     _normalize_extraction,
-    _partition_scalar_facts,
+    _stage_deanonymize,
+    _stage_rebuild,
     _stamp_speaker_entity,
     extract_graph,
     extract_procedural_graph,
 )
-from paramem.graph.phase_trace import get_phases, stop_at
+from paramem.graph.flow import StageContext, StageState
+from paramem.graph.phase_trace import extraction_trace, get_phases, stop_at
+from paramem.graph.relation_build import (
+    CAUSE_DEANON_JUDGE,
+    CAUSE_SCALAR_PARTITION,
+    cause_kind,
+    partition_scalar_facts,
+)
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -148,7 +159,7 @@ class TestPartitionScalarFacts:
     """Object-is-a-known-entity-node gates scalar folding, not object shape.
 
     A digit-bearing entity name (``speaker1``, a droid-style person name
-    like ``R2D2``) matches ``_is_scalar_value``'s version-tagged-identifier
+    like ``R2D2``) matches ``is_scalar_value``'s version-tagged-identifier
     branch. Without the entity-node check, such a fact would be folded onto
     ``Entity.attributes`` as a string, destroying the edge.
     """
@@ -168,7 +179,7 @@ class TestPartitionScalarFacts:
             Entity(name="speaker0", entity_type="person"),
             Entity(name="speaker1", entity_type="person"),
         ]
-        scalar, non_scalar = _partition_scalar_facts(facts, entities)
+        scalar, non_scalar = partition_scalar_facts(facts, entities)
         assert scalar == []
         assert non_scalar == facts
 
@@ -188,7 +199,7 @@ class TestPartitionScalarFacts:
             Entity(name="speaker0", entity_type="person"),
             Entity(name="R2D2", entity_type="person"),
         ]
-        scalar, non_scalar = _partition_scalar_facts(facts, entities)
+        scalar, non_scalar = partition_scalar_facts(facts, entities)
         assert scalar == []
         assert non_scalar == facts
 
@@ -205,7 +216,7 @@ class TestPartitionScalarFacts:
             }
         ]
         entities = [Entity(name="speaker0", entity_type="person")]
-        scalar, non_scalar = _partition_scalar_facts(facts, entities)
+        scalar, non_scalar = partition_scalar_facts(facts, entities)
         assert scalar == facts
         assert non_scalar == []
 
@@ -220,7 +231,7 @@ class TestPartitionScalarFacts:
                 "confidence": 0.8,
             }
         ]
-        scalar, non_scalar = _partition_scalar_facts(facts)
+        scalar, non_scalar = partition_scalar_facts(facts)
         assert scalar == facts
         assert non_scalar == []
 
@@ -998,7 +1009,7 @@ class TestSecondOrderExtractPhase:
 
     def test_stop_phase_second_order_extract_returns_after_union(self):
         """``stop_at("second_order_extract")`` returns immediately after
-        the union, before ha_validation (or any later phase) fires."""
+        the union, before any later phase fires."""
         with patch(
             "paramem.graph.extractor._generate_extraction",
             side_effect=self._fake_generate(
@@ -1012,7 +1023,6 @@ class TestSecondOrderExtractPhase:
                     transcript="My brother Nadeem lives in Porto.",
                     session_id="s001",
                     speaker_id="speaker0",
-                    ha_context={"location_name": "", "zones": [], "areas": []},
                     scrub={"person name"},
                 )
         phase_names = [p.name for p in get_phases(graph)]
@@ -1099,7 +1109,7 @@ class TestExtractGraphTimestampPropagation:
 class TestEmptyRelationsTerminal:
     """``local_extract``'s empty-relations terminal: when the pass-1 graph
     has no relations, extract_graph returns immediately — no
-    second_order_extract, no ha_validation, no sota_pipeline — even when
+    second_order_extract, no sota_pipeline — even when
     those later phases are otherwise enabled/configured to fire."""
 
     def _empty_output(self) -> str:
@@ -1119,8 +1129,6 @@ class TestEmptyRelationsTerminal:
                 scrub={"person name"},
                 # Later phases are configured ON; the empty-relations
                 # terminal must still short-circuit before any of them.
-                ha_context={"location_name": "", "zones": [], "areas": []},
-                ha_validation=True,
                 validate=True,
                 sota_enabled=True,
                 noise_filter="anthropic",
@@ -1128,3 +1136,257 @@ class TestEmptyRelationsTerminal:
         assert graph.relations == []
         phase_names = [p.name for p in get_phases(graph)]
         assert phase_names == ["local_extract"]
+
+
+class TestScalarOnlySessionIsNotARecovery:
+    """A session whose every surviving fact has a scalar object empties the
+    relation set LEGITIMATELY — the facts moved to the entity-attribute
+    surface, none was lost.
+
+    The two flow stages are driven directly (no cloud call, no model): the
+    ``deanonymize`` stage runs the partition and records the cause, the
+    ``rebuild`` stage consults the recovery gate. Before the ``routing``
+    cause existed, the gate fired here and returned BEFORE
+    ``apply_rebuild`` — the only caller of
+    ``project_scalar_facts_to_attributes`` — so the projection never
+    landed and the fallback re-materialized the same facts as relations,
+    silently reversing the partition.
+    """
+
+    def _scope(self):
+        return CloudScope(
+            reverse={},
+            sota_bindings={},
+            observed=frozenset(),
+            resolution={},
+            core_resolution={},
+            declared=frozenset(),
+        )
+
+    def _ctx(self) -> StageContext:
+        return StageContext(
+            model=None,
+            tokenizer=None,
+            transcript="[user] My email is alex@example.com and I use ROS2.",
+            session_id="s0",
+            speaker_id="speaker0",
+            speaker_name=None,
+            temperature=0.0,
+            max_tokens=64,
+            plausibility_max_tokens=64,
+            prompts_dir=None,
+            system_prompt_filename="extraction_system.txt",
+            user_prompt_filename="extraction.txt",
+            model_alias=None,
+            seed=None,
+            timestamp=None,
+            source_type="transcript",
+            validate=True,
+            sota_enabled=True,
+            noise_filter="anthropic",
+            noise_filter_model="claude-sonnet-4-6",
+            noise_filter_endpoint=None,
+            plausibility_judge="off",
+            plausibility_stage="deanon",
+            scrub=frozenset({"person name"}),
+            correction_entity_types=None,
+        )
+
+    def _scalar_facts(self) -> list[dict]:
+        return [
+            {
+                "subject": "Alex",
+                "predicate": "has_email",
+                "object": "alex@example.com",
+                "relation_type": "factual",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "uses",
+                "object": "ROS2",
+                "relation_type": "factual",
+            },
+        ]
+
+    def _state(self, graph: SessionGraph) -> StageState:
+        return StageState(
+            graph=graph,
+            facts=self._scalar_facts(),
+            scope=self._scope(),
+            original_relation_count=len(graph.relations),
+        )
+
+    def _graph(self) -> SessionGraph:
+        return SessionGraph(
+            session_id="s0",
+            timestamp="2026-07-21T00:00:00Z",
+            entities=[Entity(name="Alex", entity_type="person")],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="has_email",
+                    object="alex@example.com",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="speaker0",
+                ),
+                Relation(
+                    subject="Alex",
+                    predicate="uses",
+                    object="ROS2",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="speaker0",
+                ),
+            ],
+        )
+
+    def _run(self):
+        ctx = self._ctx()
+        graph = self._graph()
+        with extraction_trace():
+            state = _stage_deanonymize(ctx, self._state(graph))
+            state = _stage_rebuild(ctx, state)
+        return state
+
+    def test_partition_absorbs_every_fact_and_records_the_routing_cause(self):
+        state = self._run()
+        assert state.facts == []
+        assert len(state.scalar_facts) == 2
+        assert state.empty_cause == CAUSE_SCALAR_PARTITION
+        assert cause_kind(state.empty_cause) == "routing"
+
+    def test_relations_are_empty_and_scalars_land_as_attributes(self):
+        state = self._run()
+        assert state.graph.relations == []
+        alex = next(e for e in state.graph.entities if e.name == "Alex")
+        # ``has_`` stripped so relation_prep's re-prefixing cannot produce
+        # ``has_has_email``.
+        assert alex.attributes == {"email": "alex@example.com", "uses": "ROS2"}
+
+    def test_no_fallback_is_invoked(self):
+        with patch("paramem.graph.extractor._fallback_plausibility_on_raw") as fallback:
+            state = self._run()
+        fallback.assert_not_called()
+        assert state.graph.diagnostics["all_dropped_cause"] == {
+            "cause": CAUSE_SCALAR_PARTITION,
+            "kind": "routing",
+        }
+        assert "fallback_path" not in state.graph.diagnostics
+
+    def test_a_mixed_emptying_still_fires_the_recovery_net(self):
+        """The cause is the discriminator, not the empty relation set: when
+        a judge or a mechanical step ALSO emptied the fact set, the case is
+        mixed and the net keeps its normal behaviour."""
+        ctx = self._ctx()
+        graph = self._graph()
+        state = dataclasses.replace(
+            self._state(graph),
+            facts=[],
+            scalar_facts=self._scalar_facts(),
+            empty_cause=CAUSE_DEANON_JUDGE,
+        )
+        with patch(
+            "paramem.graph.extractor._fallback_plausibility_on_raw",
+            return_value=graph,
+        ) as fallback:
+            _stage_rebuild(ctx, state)
+        fallback.assert_called_once()
+
+
+class TestFallbackRebuildRecordsValidationDrops:
+    """The all-dropped / anon-failed recovery path builds its relations
+    through the SAME ``build_relations`` the ``rebuild`` stage uses, so a
+    schema-validation failure there is RECORDED.
+
+    It used to have its own construction loop with a bare
+    ``except: continue`` — two standing violations at once (a second
+    implementation of the same logic, and error suppression), and a
+    validation failure on the recovery path was invisible.
+    """
+
+    def _graph(self) -> SessionGraph:
+        return SessionGraph(
+            session_id="s0",
+            timestamp="2026-07-21T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Millfield",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="speaker0",
+                ),
+                Relation(
+                    subject="Alex",
+                    predicate="born_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="speaker0",
+                ),
+            ],
+        )
+
+    def test_out_of_schema_relation_type_is_dropped_and_recorded(self):
+        """A judge that hands back a fact with a ``relation_type`` outside
+        the schema's Literal set: the fact cannot become a ``Relation``,
+        and the drop lands in diagnostics instead of vanishing."""
+        graph = self._graph()
+        judged = [
+            {
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "relation_type": "factual",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "born_in",
+                "object": "Berlin",
+                "relation_type": "not_a_real_type",
+            },
+        ]
+        with patch(
+            "paramem.graph.extractor.local_plausibility_filter",
+            return_value=(judged, "raw"),
+        ):
+            out = _fallback_plausibility_on_raw(
+                graph,
+                "[user] I live in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                "all_dropped",
+                speaker_id="speaker0",
+            )
+        assert [(r.subject, r.object) for r in out.relations] == [("Alex", "Millfield")]
+        dropped = out.diagnostics["pydantic_validation_dropped"]
+        assert len(dropped) == 1
+        assert dropped[0]["object"] == "Berlin"
+        assert dropped[0]["relation_type"] == "not_a_real_type"
+        assert dropped[0]["reason"]
+        # Entities are pruned to the surviving endpoints, as before.
+        assert {e.name for e in out.entities} == {"Alex", "Millfield"}
+        assert out.diagnostics["fallback_path"] == "all_dropped"
+
+    def test_no_drops_records_nothing(self):
+        """The recording is drop-triggered: a clean rebuild leaves the
+        diagnostics key absent rather than writing an empty list."""
+        graph = self._graph()
+        out = _fallback_plausibility_on_raw(
+            graph,
+            "[user] I live in Millfield.",
+            None,
+            None,
+            "anon_failed",
+            speaker_id="speaker7",
+        )
+        assert len(out.relations) == 2
+        assert {r.speaker_id for r in out.relations} == {"speaker7"}
+        assert "pydantic_validation_dropped" not in out.diagnostics

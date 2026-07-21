@@ -8622,7 +8622,6 @@ async def _run_trial_consolidation() -> None:
                     ),
                 )
 
-                ha_context = _state.get("ha_context")
                 speaker_store = _state.get("speaker_store")
 
                 # Closure dict used by _run() to pass graph stash results back to
@@ -8640,29 +8639,9 @@ async def _run_trial_consolidation() -> None:
                     # session_buffer, then restore _state after the call.
                     # Trial keeps its own loop (separate adapter/graph dirs).
                     prior_config = _state.get("config")
-                    prior_ha_client = _state.get("ha_client")
                     prior_speaker_store = _state.get("speaker_store")
                     _state["config"] = trial_config
-                    # ha_context and speaker_store are passed implicitly through _state
-                    # ha_client.get_home_context() is called inside _run_extraction_phase;
-                    # inject the pre-fetched context via a shim that returns it directly.
-                    if ha_context is not None:
-
-                        class _HAContextShim:
-                            """Stub used by trial-migration when no live HA client is available.
-
-                            Mirrors only the surface that ``_run_extraction_phase`` reads via
-                            ``ha_client.get_home_context()``.  The pre-fetched ``ha_context``
-                            is returned directly so no real HA API call is issued during the
-                            trial run.
-                            """
-
-                            def get_home_context(self):
-                                return ha_context
-
-                        _state["ha_client"] = _HAContextShim()
-                    else:
-                        _state["ha_client"] = None
+                    # speaker_store is passed implicitly through _state.
                     _state["speaker_store"] = speaker_store
                     try:
                         with gpu_lock_sync():
@@ -8738,7 +8717,6 @@ async def _run_trial_consolidation() -> None:
                             return _extraction_result
                     finally:
                         _state["config"] = prior_config
-                        _state["ha_client"] = prior_ha_client
                         _state["speaker_store"] = prior_speaker_store
 
                 try:
@@ -13134,11 +13112,6 @@ def _run_extraction_phase(
     speaker_ids = []
     total_relations = 0
 
-    ha_context = None
-    ha_client = _state.get("ha_client")
-    if ha_client is not None:
-        ha_context = ha_client.get_home_context()
-
     for session in pending:
         session_id = session["session_id"]
         transcript = session["transcript"]
@@ -13155,8 +13128,6 @@ def _run_extraction_phase(
                 session_id,
                 speaker_id=session_speaker_id,
                 speaker_name=speaker_name,
-                ha_context=ha_context,
-                ha_validation=config.consolidation.extraction_ha_validation,
                 noise_filter=config.consolidation.extraction_noise_filter,
                 noise_filter_model=config.consolidation.extraction_noise_filter_model,
                 noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
@@ -13724,11 +13695,6 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
     }
     pending = [s for s in session_buffer.get_pending() if s["session_id"] in named_ids]
 
-    ha_context = None
-    ha_client = _state.get("ha_client")
-    if ha_client is not None:
-        ha_context = ha_client.get_home_context()
-
     result = _PendingExtraction(
         episodic_rels=[],
         procedural_rels=[],
@@ -13773,8 +13739,6 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                         session_id,
                         speaker_id=session_speaker_id,
                         speaker_name=speaker_name,
-                        ha_context=ha_context,
-                        ha_validation=config.consolidation.extraction_ha_validation,
                         noise_filter=config.consolidation.extraction_noise_filter,
                         noise_filter_model=config.consolidation.extraction_noise_filter_model,
                         noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint

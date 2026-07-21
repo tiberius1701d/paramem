@@ -2,7 +2,7 @@
 
 Specifically targets the _as_count inner helper, which normalises drop-counter
 values that may be lists (residual_dropped_facts) or ints
-(plausibility_dropped, etc.) or None.
+(plausibility_dropped_deanon, etc.) or None.
 
 Before _as_count was introduced, computing raw_fact_count via
 ``post_plausibility_count + sum(drops.values())`` raised:
@@ -122,14 +122,27 @@ class TestAsCountCoercesListToLength:
         assert diag["extraction"]["drops"]["residual_dropped_facts"] == 2
 
     def test_int_valued_drop_passes_through_unchanged(self):
-        """An integer drop counter (plausibility_dropped=3) stays 3."""
-        graph = _make_graph({"plausibility_dropped": 3})
+        """An integer drop counter (plausibility_dropped_deanon=3) stays 3."""
+        graph = _make_graph({"plausibility_dropped_deanon": 3})
         diag = _call_diag(_make_session(), graph)
         assert diag["extraction"]["drops"]["plausibility_dropped"] == 3
 
+    def test_per_judge_drop_keys_are_summed(self):
+        """Each judge records its own key; the probe reports their sum as
+        the one aggregate ``plausibility_dropped`` figure."""
+        graph = _make_graph(
+            {
+                "plausibility_dropped_anon": 2,
+                "plausibility_dropped_deanon": 3,
+                "plausibility_dropped_fallback": 1,
+            }
+        )
+        diag = _call_diag(_make_session(), graph)
+        assert diag["extraction"]["drops"]["plausibility_dropped"] == 6
+
     def test_none_valued_drop_becomes_zero(self):
         """A None value for any drop counter is coerced to 0."""
-        graph = _make_graph({"plausibility_dropped": None})
+        graph = _make_graph({"plausibility_dropped_deanon": None})
         diag = _call_diag(_make_session(), graph)
         assert diag["extraction"]["drops"]["plausibility_dropped"] == 0
 
@@ -154,7 +167,7 @@ class TestRawFactCountRegression:
         graph = _make_graph(
             {
                 "residual_dropped_facts": [{"text": "x"}],  # list
-                "plausibility_dropped": 3,  # int
+                "plausibility_dropped_deanon": 3,  # int
             }
         )
         episodic_rels = [{"q": "Q1", "a": "A1"}, {"q": "Q2", "a": "A2"}]
@@ -167,7 +180,7 @@ class TestRawFactCountRegression:
         graph = _make_graph(
             {
                 "residual_dropped_facts": [{"text": "x"}, {"text": "y"}],  # 2
-                "plausibility_dropped": 5,  # 5
+                "plausibility_dropped_deanon": 5,  # 5
                 "mapping_ambiguous_dropped": 1,  # 1
             }
         )

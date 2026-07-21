@@ -7,30 +7,34 @@ This module is flow TOPOLOGY, not extraction: it defines the shapes
 (``StageContext``, ``StageState``, ``StageSpec``) and the single walk
 function (:func:`run_flow`) that any linear, gated pipeline of stages
 can be expressed against. It must NOT import any extraction primitive
-(``_run_local_extraction``, ``_sota_pipeline``, ``_validate_with_ha_context``,
-etc.) — that would collapse the topology/primitive boundary this module
+(``_run_local_extraction``, ``_sota_pipeline``, etc.) — that would
+collapse the topology/primitive boundary this module
 exists to keep, and would make the runner untestable without a model.
 The one exception is :func:`~paramem.graph.phase_trace.chain_stopped`,
 which is a control-flow signal (a contextvar read), not an extraction
 primitive.
 
 The first (and, at present, only) consumer is
-``paramem.graph.extractor.SESSION_EXTRACT`` — the four-phase
-``local_extract`` -> ``second_order_extract`` -> ``ha_validation`` ->
-``sota_pipeline`` flow that used to be an imperative if-cascade inside
-``extract_graph``. See that module for the concrete stage specs; this
-module never references them.
+``paramem.graph.extractor.SESSION_EXTRACT`` — the
+``local_extract`` -> ``second_order_extract`` -> ``sota_pipeline`` ->
+``deanonymize`` -> ``rebuild`` flow that used to be an imperative
+if-cascade inside ``extract_graph``. See that module for the concrete
+stage specs; this module never references them.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from paramem.graph.phase_trace import chain_stopped
 
 if TYPE_CHECKING:
+    # Type-only, and data SHAPES rather than extraction primitives — the
+    # boundary this module keeps is "no primitive may be imported here",
+    # not "no domain type may be named in an annotation".
+    from paramem.graph.cloud_egress import CloudScope
     from paramem.graph.schema import SessionGraph
 
 
@@ -62,8 +66,6 @@ class StageContext:
     seed: int | None
     timestamp: str | None
     source_type: str
-    ha_context: dict | None
-    ha_validation: bool
     validate: bool
     sota_enabled: bool
     noise_filter: str
@@ -79,12 +81,59 @@ class StageContext:
 class StageState:
     """The mutable-across-stages part of a flow run.
 
-    Holds only ``graph`` — the one value ``extract_graph``'s stages
-    thread and rebind today. Grow this shell only when a concrete stage
-    needs a new field to consume or produce; no speculative fields.
+    ``graph`` is the only field the INITIAL state carries, and the only
+    one without a default: every other field is the OUTPUT of some stage
+    and is meaningless before that stage has run. That split is what the
+    well-formedness check in ``tests/graph/test_flow.py`` keys on — it
+    seeds "available" with the defaultless fields and then unions each
+    spec's ``produces`` in order, so a stage ordered ahead of its
+    producer fails mechanically.
+
+    Grow this shell only when a concrete stage needs a new field to
+    consume or produce; no speculative fields.
+
+    Attributes:
+        graph: The session graph under construction. Threaded and rebound
+            by every stage.
+        facts: The working fact set — dicts, not ``Relation`` objects.
+            Anonymized (placeholder-bearing) as the ``sota_pipeline``
+            composite hands them over; de-anonymized after the
+            ``deanonymize`` stage substitutes real names back in. Empty
+            means "no facts survived", which is how the composite's
+            ``terminal_when`` stops the walk before its tail siblings.
+        scalar_facts: Facts routed off the relation surface because their
+            object is a verbatim identifier (URL, email, DOI,
+            version-tagged tool name). Partitioned inside the
+            ``deanonymize`` span — deliberately BEFORE the deanon
+            plausibility judge, whose drop rule targets URI-shaped
+            tokens — and projected onto entity attributes by ``rebuild``.
+        scope: The one anonymize/de-anonymize round-trip scope for the
+            cloud response — the resolution map every substitution and
+            the entity-type rebuild are keyed on.
+        sota_raw: The cloud enricher's raw response string, recorded to
+            diagnostics by ``deanonymize``.
+        updated_anon_transcript: The cloud's rewritten anonymized
+            transcript, or ``None`` when it returned none (or its delta
+            was rejected).
+        original_relation_count: Relation count captured before the SOTA
+            pipeline ran — the ``rebuild`` recovery gate's second term.
+        empty_cause: Which site emptied ``facts``, from the ``CAUSE_*``
+            vocabulary in ``paramem.graph.relation_build``, or ``None``
+            while facts survive. Diagnostic for the ``judgment`` and
+            ``breakage`` kinds; load-bearing for the ``routing`` kind,
+            which tells ``rebuild``'s recovery gate that the empty
+            relation set is legitimate (the facts moved to the entity-
+            attribute surface) and no recovery is due.
     """
 
     graph: "SessionGraph"
+    facts: list[dict] = field(default_factory=list)
+    scalar_facts: list[dict] = field(default_factory=list)
+    scope: "CloudScope | None" = None
+    sota_raw: str | None = None
+    updated_anon_transcript: str | None = None
+    original_relation_count: int = 0
+    empty_cause: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,16 +142,27 @@ class StageSpec:
 
     Attributes:
         stage: Concept name for the stage (e.g. ``"local_extract"``).
-        trace_name: Informational label naming the ``phase_trace`` name
-            the stage's body opens. Not used by :func:`run_flow` to open
-            a phase itself — each stage body still opens its own
-            ``phase_trace`` scope (or none, for a gate with no LLM
-            call) exactly as it did before this runner existed.
+        trace_names: Every ``phase_trace`` phase the stage's body opens,
+            in the order it opens them — transitively, so a stage whose
+            body delegates to a composite primitive declares the phases
+            that primitive opens too. ``()`` for a stage that opens none
+            (a pure gate or a pure data transform). This is a
+            DECLARATION, not a label: :func:`run_flow` never opens a
+            phase itself (each stage body opens its own scopes exactly
+            as it did before this runner existed), so the field's only
+            job is to be checkable — a well-formedness check
+            (``tests/graph/test_flow.py``) asserts every declared name is
+            a :data:`~paramem.graph.phase_trace.PHASE_NAMES` member, and
+            a reader can see which phases a run can produce without
+            entering the stage bodies. A stage that opens two phases
+            declares two: one name per phase, never a stand-in for the
+            others.
         run: Callable invoked when the stage is enabled and applies.
             Receives ``(ctx, state)`` and returns the next ``StageState``.
         enabled_when: Predicate over ``ctx`` gating whether the stage
-            runs at all (an operator/config toggle — e.g. ``ha_validation``
-            being off). ``None`` means always enabled. A disabled stage
+            runs at all (an operator/config toggle — e.g.
+            ``sota_pipeline``'s ``sota_enabled`` master gate being off).
+            ``None`` means always enabled. A disabled stage
             is skipped with no call to ``run`` and therefore opens no
             phase trace record — mirrors an ``if <config flag>:`` gate
             that was never entered.
@@ -133,7 +193,7 @@ class StageSpec:
     """
 
     stage: str
-    trace_name: str | None
+    trace_names: tuple[str, ...]
     run: Callable[[StageContext, StageState], StageState]
     requires: frozenset[str]
     produces: frozenset[str]

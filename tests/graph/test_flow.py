@@ -12,6 +12,7 @@ Covers:
 - a stage raising propagates unchanged (no swallow)
 - SESSION_EXTRACT's declared ``requires``/``produces`` contract is
   well-formed (order-consistent with the actual StageState)
+- SESSION_EXTRACT's declared ``trace_names`` are real PHASE_NAMES members
 """
 
 from __future__ import annotations
@@ -59,8 +60,6 @@ def _make_ctx(**overrides) -> StageContext:
         seed=None,
         timestamp=None,
         source_type="transcript",
-        ha_context=None,
-        ha_validation=False,
         validate=False,
         sota_enabled=False,
         noise_filter="",
@@ -90,7 +89,7 @@ class TestRunFlowGating:
         flow = [
             StageSpec(
                 stage="never_runs",
-                trace_name="never_runs",
+                trace_names=(),
                 run=_run_stage("never_runs"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -98,7 +97,7 @@ class TestRunFlowGating:
             ),
             StageSpec(
                 stage="always_runs",
-                trace_name="always_runs",
+                trace_names=(),
                 run=_run_stage("always_runs"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -113,7 +112,7 @@ class TestRunFlowGating:
         flow = [
             StageSpec(
                 stage="never_applies",
-                trace_name="never_applies",
+                trace_names=(),
                 run=_run_stage("never_applies"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -121,7 +120,7 @@ class TestRunFlowGating:
             ),
             StageSpec(
                 stage="always_runs",
-                trace_name="always_runs",
+                trace_names=(),
                 run=_run_stage("always_runs"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -136,7 +135,7 @@ class TestRunFlowGating:
         flow = [
             StageSpec(
                 stage="first",
-                trace_name="first",
+                trace_names=(),
                 run=_run_stage("first"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -144,7 +143,7 @@ class TestRunFlowGating:
             ),
             StageSpec(
                 stage="second",
-                trace_name="second",
+                trace_names=(),
                 run=_run_stage("second"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -160,14 +159,14 @@ class TestRunFlowGating:
         flow = [
             StageSpec(
                 stage="first",
-                trace_name="first",
+                trace_names=(),
                 run=_run_stage("first"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
             ),
             StageSpec(
                 stage="second",
-                trace_name="second",
+                trace_names=(),
                 run=_run_stage("second"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -191,14 +190,14 @@ class TestRunFlowGating:
         flow = [
             StageSpec(
                 stage="first",
-                trace_name="local_extract",
+                trace_names=("local_extract",),
                 run=_first,
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
             ),
             StageSpec(
                 stage="second",
-                trace_name="second",
+                trace_names=(),
                 run=_run_stage("second"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -220,14 +219,14 @@ class TestRunFlowGating:
         flow = [
             StageSpec(
                 stage="boom",
-                trace_name="boom",
+                trace_names=(),
                 run=_boom,
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
             ),
             StageSpec(
                 stage="never_runs",
-                trace_name="never_runs",
+                trace_names=(),
                 run=_run_stage("never_runs"),
                 requires=_INERT_REQUIRES,
                 produces=_INERT_PRODUCES,
@@ -247,15 +246,22 @@ class TestSessionExtractWellFormed:
     — and every spec must ``produces`` something (a stage with no
     observable output is a modeling error).
 
-    Currently ``StageState`` holds only ``graph``, so every stage in
-    SESSION_EXTRACT either requires nothing (``local_extract``, whose input
-    is on ``StageContext``) or requires ``graph`` (already produced by
-    ``local_extract``) — the check is trivially satisfied. It becomes
-    load-bearing the moment ``StageState`` grows a second field and some
-    stage is ordered ahead of the stage that is supposed to produce it —
-    exactly the class of bug this test exists to catch mechanically
-    instead of at runtime.
+    The INITIAL fields are the ones ``StageState`` declares without a
+    default — ``extract_graph`` constructs the seed state from exactly
+    those, and everything else is some stage's output, meaningless before
+    that stage has run. Seeding ``available`` with every declared field
+    instead would make the check vacuous: any ``requires`` would be
+    satisfied by the dataclass definition alone, whatever the order.
     """
+
+    @staticmethod
+    def _initial_fields() -> set[str]:
+        """``StageState`` fields the seed state supplies (no default)."""
+        return {
+            f.name
+            for f in dataclasses.fields(StageState)
+            if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING
+        }
 
     def test_requires_satisfied_by_prior_produces_in_order(self):
         # Deferred import: SESSION_EXTRACT lives in paramem.graph.extractor,
@@ -265,7 +271,7 @@ class TestSessionExtractWellFormed:
         # in this file.
         from paramem.graph.extractor import SESSION_EXTRACT
 
-        available = {f.name for f in dataclasses.fields(StageState)}
+        available = self._initial_fields()
         for spec in SESSION_EXTRACT:
             missing = spec.requires - available
             assert not missing, (
@@ -274,3 +280,70 @@ class TestSessionExtractWellFormed:
             )
             assert spec.produces, f"{spec.stage!r} must produce something"
             available |= spec.produces
+
+    def test_declared_names_are_real_stage_state_fields(self):
+        """Every ``requires``/``produces`` name must be an actual
+        ``StageState`` field — a typo would otherwise sail through the
+        order check as an unsatisfiable requirement or a phantom
+        producer."""
+        from paramem.graph.extractor import SESSION_EXTRACT
+
+        known = {f.name for f in dataclasses.fields(StageState)}
+        for spec in SESSION_EXTRACT:
+            unknown = (spec.requires | spec.produces) - known
+            assert not unknown, f"{spec.stage!r} names non-existent StageState field(s): {unknown}"
+
+    def test_declared_trace_names_are_real_phase_names(self):
+        """``trace_names`` declares the phases a stage's body opens, so
+        every declared name must be a PHASE_NAMES member — the same
+        whitelist ``phase_trace`` itself enforces at runtime. A stage
+        declaring a name ``phase_trace`` would reject is a declaration
+        that could never come true."""
+        from paramem.graph.extractor import SESSION_EXTRACT
+        from paramem.graph.phase_trace import PHASE_NAMES
+
+        for spec in SESSION_EXTRACT:
+            unknown = set(spec.trace_names) - set(PHASE_NAMES)
+            assert not unknown, f"{spec.stage!r} declares non-PHASE_NAMES trace(s): {unknown}"
+
+    def test_every_stage_declares_the_phases_it_opens(self):
+        """The declaration is honest for the stages whose bodies open
+        more than one phase: ``deanonymize`` opens BOTH the substitution
+        phase and the local judge, and ``sota_pipeline`` opens the four
+        its composite primitive runs. A single-name field could not say
+        either."""
+        from paramem.graph.extractor import SESSION_EXTRACT
+
+        declared = {spec.stage: spec.trace_names for spec in SESSION_EXTRACT}
+        assert declared["deanonymize"] == ("deanon", "deanon_plausibility")
+        assert declared["sota_pipeline"] == (
+            "anonymize",
+            "entity_correction",
+            "sota_enrich",
+            "anon_plausibility",
+        )
+        assert declared["rebuild"] == ()
+
+    def test_out_of_order_stage_fails_the_check(self):
+        """The check is load-bearing: a stage requiring a field no
+        predecessor produces must fail it."""
+        consumer = StageSpec(
+            stage="consumer",
+            trace_names=(),
+            run=_run_stage("consumer"),
+            requires=frozenset({"facts"}),
+            produces=frozenset({"graph"}),
+        )
+        producer = StageSpec(
+            stage="producer",
+            trace_names=(),
+            run=_run_stage("producer"),
+            requires=frozenset(),
+            produces=frozenset({"facts"}),
+        )
+        available = self._initial_fields()
+        # consumer BEFORE producer — unsatisfiable.
+        assert consumer.requires - available
+        # producer first — satisfiable.
+        available |= producer.produces
+        assert not (consumer.requires - available)

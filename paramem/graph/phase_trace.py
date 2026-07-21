@@ -14,8 +14,8 @@ Architecture
 
 The trace is **decoupled from any particular** :class:`SessionGraph`
 **instance**.  Pipeline helpers freely rebind ``graph = ...`` (e.g.
-:func:`_parse_extraction`, :func:`_validate_with_ha_context` both
-return new ``SessionGraph`` objects) — the trace survives because it lives in a
+:func:`_parse_extraction` returns a new ``SessionGraph``
+object) — the trace survives because it lives in a
 :class:`contextvars.ContextVar` set up by an outer
 :func:`extraction_trace` scope, not on the graph.
 
@@ -51,10 +51,13 @@ Chain-stop signal
 :data:`PHASE_NAMES` after which the pipeline should stop.
 :func:`phase_trace` flips the internal "stopped" contextvar to ``True``
 the moment that phase finishes with a non-``"failed"`` outcome; the
-pipeline (:func:`paramem.graph.extractor.extract_graph` /
-:func:`~paramem.graph.extractor._sota_pipeline`) checks
-:func:`chain_stopped` — never a phase-name string — after each phase
-block and returns early when it is set.  Because the flag lives in a
+pipeline checks :func:`chain_stopped` — never a phase-name string —
+after each phase block and returns early when it is set.  Three sites
+check it: the stage-flow runner
+(:func:`paramem.graph.flow.run_flow`, after every stage that ran), the
+``deanonymize`` stage body between its two phases, and
+:func:`~paramem.graph.extractor._sota_pipeline` between its own
+sub-phases.  Because the flag lives in a
 :class:`contextvars.ContextVar` rather than being threaded as a
 parameter, it is reachable from arbitrarily nested helpers with no
 signature changes down the call chain.  Production opens no
@@ -113,8 +116,6 @@ Phase                       Notes
                             surfaced. Gated on the pass-1 graph containing
                             such an entity; skipped entirely (no record)
                             otherwise.
-``ha_validation``           Pure-Python location validation against HA
-                            home context. ``raw_output=None``.
 ``anonymize``               Mistral runs the anonymizer; emits ONLY the
                             real->placeholder mapping.  The script builds
                             the anonymized facts + transcript from
@@ -181,7 +182,6 @@ if TYPE_CHECKING:
 PHASE_NAMES: tuple[str, ...] = (
     "local_extract",
     "second_order_extract",
-    "ha_validation",
     "anonymize",
     "entity_correction",
     "sota_enrich",
@@ -442,8 +442,9 @@ def chain_stopped() -> bool:
     branch the moment the requested phase records with a
     non-``"failed"`` outcome.  Pipeline functions check this (never a
     phase-name string comparison) after each phase block to decide
-    whether to return early — see :func:`paramem.graph.extractor.
-    extract_graph` and :func:`paramem.graph.extractor._sota_pipeline`.
+    whether to return early — see :func:`paramem.graph.flow.run_flow`,
+    ``paramem.graph.extractor._stage_deanonymize`` and
+    :func:`paramem.graph.extractor._sota_pipeline`.
     """
     return _STOPPED.get()
 

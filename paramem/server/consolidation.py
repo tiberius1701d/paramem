@@ -177,7 +177,6 @@ def create_consolidation_loop(
         extraction_correction_entity_types=set(
             config.consolidation.extraction_correction_entity_types
         ),
-        extraction_ha_validation=config.consolidation.extraction_ha_validation,
         extraction_noise_filter=config.consolidation.extraction_noise_filter,
         extraction_noise_filter_model=config.consolidation.extraction_noise_filter_model,
         extraction_noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint,

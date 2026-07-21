@@ -330,9 +330,13 @@ def _build_session_diagnostics(
         except (TypeError, ValueError):
             return 0
 
-    # plausibility_dropped can be negative when SOTA enrichment adds more
-    # facts than plausibility removes.  Split into actual drops (≥0) and
-    # enrichment additions (≥0) so raw_fact_count stays sane.
+    # Every drop figure summed here is ≥ 0 by construction, so the total
+    # cannot be negative: each plausibility writer records `pre - post`
+    # around ONE judge, and every judge applies its verdict through
+    # `_apply_drop_set`, which returns a SUBSET of the facts it was given
+    # (`paramem/graph/extractor.py::_apply_drop_set`).  A judge can never
+    # hand back more facts than it received, and SOTA enrichment's
+    # additions are counted by no key read here.
     #
     # `residual_dropped_facts` (deanon-stage residual sweep, step 3 of
     # `_apply_bindings`) and `predicate_placeholder_dropped_facts` (the
@@ -341,25 +345,31 @@ def _build_session_diagnostics(
     # facts are script-built from `graph.relations`, never the model) are
     # disjoint by construction — see `_apply_bindings`'s return contract —
     # so summing both here cannot double-count the same dropped fact.
-    plaus_raw = _as_count(diag.get("plausibility_dropped"))
+    # Each plausibility judge records its own drop count under its own
+    # key (``_anon`` = cloud judge on anonymized facts, ``_deanon`` =
+    # local judge on de-anonymized facts, ``_fallback`` = local judge on
+    # the raw pre-enrichment facts in the recovery path). They are
+    # summed here because this probe wants ONE aggregate "facts a judge
+    # removed" figure to reconstruct ``raw_fact_count`` from; the keys
+    # stay separate on the graph so each writer's number remains
+    # interpretable on its own.
     drops = {
         "residual_dropped_facts": _as_count(diag.get("residual_dropped_facts")),
         "predicate_placeholder_dropped_facts": _as_count(
             diag.get("predicate_placeholder_dropped_facts")
         ),
-        "plausibility_dropped": max(plaus_raw, 0),
+        "plausibility_dropped": (
+            _as_count(diag.get("plausibility_dropped_anon"))
+            + _as_count(diag.get("plausibility_dropped_deanon"))
+            + _as_count(diag.get("plausibility_dropped_fallback"))
+        ),
         "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
     }
-    enrichment_added = max(-plaus_raw, 0)
 
     # raw_fact_count: facts from the original extraction (before SOTA enrichment).
     # post_plausibility_count: facts surviving all filtering (including enriched).
     post_plausibility_count = len(episodic_rels)
-    raw_fact_count = post_plausibility_count + sum(drops.values()) - enrichment_added
-    # When SOTA adds more than the original extraction produced, raw can go
-    # below zero arithmetically. Floor at 0 — the real pre-enrichment count
-    # is not tracked by the extractor, so this is the best reconstruction.
-    raw_fact_count = max(raw_fact_count, 0)
+    raw_fact_count = post_plausibility_count + sum(drops.values())
 
     # Entity and relation type distributions from the session graph.
     entity_type_dist: dict[str, int] = {}
@@ -921,8 +931,6 @@ def main() -> None:
                     session_id=session.session_id,
                     speaker_id=session.speaker_id,
                     speaker_name=session.speaker_name,
-                    ha_context=None,
-                    ha_validation=False,
                     noise_filter=noise_filter,
                     noise_filter_model="claude-sonnet-4-6",
                     noise_filter_endpoint=None,

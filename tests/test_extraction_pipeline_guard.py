@@ -464,7 +464,6 @@ def test_server_yaml_extraction_flags_round_trip(tmp_path):
 
     flipped = {
         "extraction_max_tokens": 4096,
-        "extraction_ha_validation": False,
         "extraction_noise_filter": "anthropic",
         "extraction_noise_filter_model": "claude-other",
         "extraction_noise_filter_endpoint": "http://custom:8080/v1",
@@ -523,7 +522,6 @@ def test_server_extract_session_kwargs_map_to_consolidation_config():
     known_non_extraction_kwargs = {
         "speaker_id",
         "speaker_name",
-        "ha_context",
         # Session-metadata-derived; no extraction_<kwarg> field in
         # ConsolidationScheduleConfig because it is resolved per call,
         # not stored as a loop-level default.
@@ -602,7 +600,6 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     flipped = {
         "extraction_temperature": 0.7,
         "extraction_max_tokens": 4096,
-        "extraction_ha_validation": False,
         "extraction_noise_filter": "claude",
         "extraction_noise_filter_model": "claude-other",
         "extraction_noise_filter_endpoint": "http://custom:8080/v1",
@@ -791,24 +788,6 @@ def test_run_uses_default_prompts_for_document(monkeypatch):
     assert got_user == DEFAULT_USER_PROMPT_FILENAME, (
         f"Expected user_prompt_filename={DEFAULT_USER_PROMPT_FILENAME!r}, got {got_user!r}"
     )
-
-
-def test_run_document_flips_gate_defaults(monkeypatch):
-    """``source_type='document'`` survives as a runtime distinction for
-    gate defaults — ``ha_validation`` defaults to ``False`` because HA
-    grounding is dialogue-only.  Prompt selection no longer differs.
-    """
-    captured = {}
-
-    def spy(model, tokenizer, transcript, session_id, **kwargs):
-        captured["kwargs"] = kwargs
-        return MagicMock()
-
-    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
-
-    pipeline = _make_pipeline()
-    pipeline.run("doc text", "doc-001", source_type="document", speaker_id="speaker0")
-    assert captured["kwargs"]["ha_validation"] is False
 
 
 def test_run_honors_prompt_filename_overrides(monkeypatch):

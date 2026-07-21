@@ -839,10 +839,22 @@ class DeanonResult:
     already-partitioned survivors).  ``verdict`` non-empty == REJECT THE
     WHOLE DELTA — ``facts`` is ``[]`` and nothing was substituted; the
     caller decides the fallback (never a partial application).
+
+    ``collisions`` is the totality gate's collision scan
+    (:func:`~paramem.graph.placeholders._check_mapping_totality`'s second
+    return value) — SOTA-binding keys that clash with the CORE reverse
+    map or with the ``observed`` scope.  It is populated on BOTH exits
+    (rejected and accepted): under an ``observed``-scoped call every
+    collision is also folded into ``verdict``, but under the CORE-unscoped
+    shape a collision is informational only and would otherwise be
+    invisible to the caller.  Callers that keep diagnostics write it to
+    ``graph.diagnostics["sota_binding_collisions"]`` themselves — this
+    primitive mutates nothing.
     """
 
     facts: list[dict]
     verdict: list[str]
+    collisions: list[str]
     predicate_dropped: list[dict]
     residual_dropped: list[dict]
 
@@ -850,7 +862,6 @@ class DeanonResult:
 def deanonymize_facts(
     scope: CloudScope,
     facts: list[dict],
-    graph: SessionGraph,
 ) -> DeanonResult:
     """De-anonymize a cloud-returned fact delta — the single deanon exit
     gate for facts, run in fixed order:
@@ -858,34 +869,34 @@ def deanonymize_facts(
     1. :func:`~paramem.graph.placeholders._check_mapping_totality` —
        unconditionally, as step 1.  A caller cannot skip the totality
        gate because it is inside this primitive, not something the
-       caller opts into.  ``diagnostic_key`` is a fixed literal here
-       (``"sota_pending_orphans"``) rather than a parameter — no caller
-       has ever needed a different value; a future caller that
-       legitimately does is a signal to reintroduce the parameter, not
-       to speculatively carry it now.
+       caller opts into.
     2. A non-empty verdict rejects the WHOLE delta: returns
-       ``DeanonResult(facts=[], verdict=verdict, [], [])`` without
-       substituting anything.  The caller decides the fallback (e.g.
-       reverting to pre-enrichment local facts).
+       ``DeanonResult(facts=[], verdict=verdict, collisions=..., [], [])``
+       without substituting anything.  The caller decides the fallback
+       (e.g. reverting to pre-enrichment local facts).
     3. :func:`~paramem.graph.placeholders._apply_bindings` — predicate
        invariant, substitute, residual sweep, fail-closed.
 
-    ``graph`` is required because :func:`_check_mapping_totality` writes
-    ``graph.diagnostics["sota_pending_orphans"]`` — every caller passes
-    the graph the delta is being applied to (the session graph for
-    session-tier extraction, the throwaway per-chunk graph for graph-tier
-    enrichment).
+    Takes NO graph: the totality gate's two findings — ``verdict`` and
+    ``collisions`` — come back on :class:`DeanonResult` as values.  A
+    caller that keeps diagnostics writes them onto its own graph
+    (``"sota_pending_orphans"`` / ``"sota_binding_collisions"``) right
+    after this call; nothing here reaches into caller-owned state.
     """
-    verdict = _check_mapping_totality(
-        graph,
+    verdict, collisions = _check_mapping_totality(
         facts,
         scope.reverse,
         sota_bindings=scope.sota_bindings,
         observed=scope.observed,
-        diagnostic_key="sota_pending_orphans",
     )
     if verdict:
-        return DeanonResult(facts=[], verdict=verdict, predicate_dropped=[], residual_dropped=[])
+        return DeanonResult(
+            facts=[],
+            verdict=verdict,
+            collisions=collisions,
+            predicate_dropped=[],
+            residual_dropped=[],
+        )
 
     kept, predicate_dropped, residual_dropped = _apply_bindings(
         facts, scope.reverse, scope.sota_bindings, scope.observed
@@ -893,6 +904,7 @@ def deanonymize_facts(
     return DeanonResult(
         facts=kept,
         verdict=[],
+        collisions=collisions,
         predicate_dropped=predicate_dropped,
         residual_dropped=residual_dropped,
     )

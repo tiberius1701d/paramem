@@ -1,9 +1,9 @@
 """Extraction pipeline alignment smoke test — CPU-safe, all SOTA mocked.
 
-Feeds a realistic conversational transcript through the full _sota_pipeline
+Feeds a realistic conversational transcript through the full cloud arc
 with mocked SOTA enrichment and mocked SOTA plausibility. Verifies:
 - No entity has entity_type == "person" unless it actually is a person.
-- plausibility_dropped is recorded when the mock plausibility drops facts.
+- plausibility_dropped_deanon is recorded when the mock plausibility drops facts.
 - fallback_path is None on the happy path.
 - Regression guard: music/device/media entities are not typed "person".
 
@@ -14,8 +14,8 @@ unexpected fallback path fires.
 
 from unittest.mock import patch
 
-from paramem.graph.extractor import _sota_pipeline
 from paramem.graph.schema import Entity, SessionGraph
+from tests._sota_flow import run_sota_stages
 
 
 def _make_graph_from_spec(
@@ -124,7 +124,7 @@ class TestAlignmentSmoke:
         ):
             from unittest.mock import MagicMock
 
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
@@ -151,7 +151,7 @@ class TestAlignmentSmoke:
                 assert etype != "person", f"{name!r} must NOT be typed 'person'; got {etype!r}"
 
     def test_plausibility_dropped_recorded(self):
-        """plausibility_dropped is > 0 when the mock plausibility drops facts."""
+        """plausibility_dropped_deanon is > 0 when the mock plausibility drops facts."""
         graph, anon_facts, mapping = self._build_smoke_graph()
 
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
@@ -175,7 +175,7 @@ class TestAlignmentSmoke:
         ):
             from unittest.mock import MagicMock
 
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
@@ -187,8 +187,10 @@ class TestAlignmentSmoke:
                 scrub={"person name"},
             )
 
-        dropped = result.diagnostics.get("plausibility_dropped", 0)
-        assert dropped > 0, f"plausibility_dropped must be > 0 when mock drops facts; got {dropped}"
+        dropped = result.diagnostics.get("plausibility_dropped_deanon", 0)
+        assert dropped > 0, (
+            f"plausibility_dropped_deanon must be > 0 when mock drops facts; got {dropped}"
+        )
 
     def test_no_fallback_path_on_happy_path(self):
         """On the happy path (no failures), fallback_path must not be set."""
@@ -205,7 +207,7 @@ class TestAlignmentSmoke:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(
+            result = run_sota_stages(
                 graph,
                 _SMOKE_TRANSCRIPT,
                 None,

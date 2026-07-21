@@ -16,6 +16,7 @@ from paramem.graph.cloud_egress import (
     _DEFAULT_FILTER_TIMEOUT_SECONDS,
     AnonymizedPayload,
     CloudScope,
+    DeanonResult,
     _extract_json_block,
     anonymize_for_cloud,
     deanonymize_facts,
@@ -29,10 +30,21 @@ from paramem.graph.placeholders import (
     _normalize_anonymization_mapping,
     _substitute_whole_words,
     braced,
-    placeholder_entity_type,
 )
 from paramem.graph.prompts import _load_prompt
-from paramem.graph.schema import Entity, SessionGraph
+from paramem.graph.relation_build import (
+    CAUSE_ANON_JUDGE,
+    CAUSE_CLOUD_EMPTY,
+    CAUSE_DEANON_JUDGE,
+    CAUSE_DEANON_SUBSTITUTION,
+    CAUSE_SCALAR_PARTITION,
+    CAUSE_SCHEMA_VALIDATION,
+    apply_rebuild,
+    build_relations,
+    partition_scalar_facts,
+    recovery_gate,
+)
+from paramem.graph.schema import SessionGraph
 from paramem.graph.schema_config import (
     fallback_entity_type,
     fallback_relation_type,
@@ -615,15 +627,17 @@ def _has_named_non_speaker_person(graph: SessionGraph) -> bool:
 #
 # This is flow TOPOLOGY co-located with the primitives it calls (rather than
 # a dedicated ``flows.py``) to avoid a circular import: the stage bodies below
-# call ``_run_local_extraction`` / ``_validate_with_ha_context`` /
-# ``_sota_pipeline``, all defined in this module. Move this to a dedicated
+# call ``_run_local_extraction`` / ``_sota_pipeline``, both defined in
+# this module. Move this to a dedicated
 # flow module once a second flow (beyond this one and the still-imperative
 # ``extract_procedural_graph``) exists to justify the split.
 #
 # Each stage body is a VERBATIM lift of the corresponding block that used to
-# live inline in ``extract_graph`` — same primitives, same arguments, same
-# ``phase_trace`` scopes. ``run_flow`` does not open phases itself; every
-# ``phase_trace`` call below is exactly the one the imperative version made.
+# live inline in ``extract_graph`` (``local_extract``, ``second_order_extract``,
+# ``sota_pipeline``) or in the tail of ``_sota_pipeline`` (``deanonymize``,
+# ``rebuild``) — same primitives, same arguments, same ``phase_trace`` scopes.
+# ``run_flow`` does not open phases itself; every ``phase_trace`` call below is
+# exactly the one the imperative version made.
 # ---------------------------------------------------------------------------
 
 
@@ -702,37 +716,31 @@ def _stage_second_order_extract(ctx: StageContext, state: StageState) -> StageSt
     return StageState(graph=graph)
 
 
-def _stage_ha_validation(ctx: StageContext, state: StageState) -> StageState:
-    """``ha_validation`` stage body — pure-Python; no LLM call.
-
-    Gated by ``ctx.ha_validation and ctx.ha_context is not None`` (the
-    flow's ``enabled_when``).
-    """
-    graph = state.graph
-    with phase_trace("ha_validation") as t:
-        before = _summarise_graph(graph)
-        graph = _validate_with_ha_context(graph, ctx.ha_context)
-        after = _summarise_graph(graph)
-        t.set_parsed({"before": before, "after": after})
-    return StageState(graph=graph)
-
-
 def _stage_sota_pipeline(ctx: StageContext, state: StageState) -> StageState:
-    """``sota_pipeline`` stage body.
+    """``sota_pipeline`` stage body — the composite front of the cloud arc.
 
     Each sub-phase (anonymize, entity_correction, sota_enrich,
-    anon_plausibility, deanon, deanon_plausibility) records its own block
-    via phase_trace from inside ``_sota_pipeline``. ``_sota_pipeline`` reads
-    ``chain_stopped()`` off the same contextvar a calibration caller's
-    ``stop_at`` scope set, so it can short-circuit at any sub-phase
-    boundary with no parameter threaded into it.
+    anon_plausibility) records its own block via phase_trace from inside
+    ``_sota_pipeline``. ``_sota_pipeline`` reads ``chain_stopped()`` off the
+    same contextvar a calibration caller's ``stop_at`` scope set, so it can
+    short-circuit at any sub-phase boundary with no parameter threaded into
+    it.
+
+    Produces the seam the ``deanonymize`` and ``rebuild`` siblings consume:
+    the surviving anonymized fact set, the cloud round-trip scope, the raw
+    cloud response, the cloud's updated anonymized transcript, and the
+    pre-pipeline relation count. Every early exit inside ``_sota_pipeline``
+    (config bail, anonymize-failure divert, the empty-fact-set exit) hands
+    back a state with an EMPTY ``facts``, which is exactly the spec's
+    ``terminal_when`` — so the siblings do not run, matching the plain
+    ``return graph`` those paths used to perform.
 
     Gated by ``ctx.validate and ctx.sota_enabled and ctx.noise_filter``
     (``sota_enabled`` is the master gate; ``noise_filter`` is the provider
     identity — the flow's ``enabled_when``) and ``state.graph.relations``
     being non-empty (the flow's ``applies_when``).
     """
-    graph = _sota_pipeline(
+    return _sota_pipeline(
         state.graph,
         ctx.transcript,
         ctx.model,
@@ -752,13 +760,280 @@ def _stage_sota_pipeline(ctx: StageContext, state: StageState) -> StageState:
         plausibility_max_tokens=ctx.plausibility_max_tokens,
         seed=ctx.seed,
     )
-    return StageState(graph=graph)
+
+
+def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
+    """``deanonymize`` stage body — placeholders back to real names.
+
+    Three things, in this order, because the order is load-bearing:
+
+    1. The ``deanon`` phase: pure dict substitution restoring real names
+       from placeholders (no LLM call, so ``raw_output`` stays ``None``).
+       Facts still carrying an unresolved placeholder, and facts with a
+       placeholder glued into the predicate, are dropped and recorded.
+    2. The scalar partition. It is OWNED by ``rebuild``
+       (``paramem.graph.relation_build``) but INVOKED here, before the
+       judge below, and that placement is deliberate: scalars are URLs,
+       emails, DOIs and version-tagged tool names, and the judge's drop
+       rule R6 targets a "dot-separated or URI-shaped namespaced token"
+       (``configs/prompts/sota_plausibility.txt``). Partitioning after
+       the judge would expose exactly the values the partition protects.
+       When the partition absorbs EVERY surviving fact (a scalar-only
+       session) it records ``CAUSE_SCALAR_PARTITION`` — the ``routing``
+       kind, which tells ``rebuild``'s recovery gate the resulting empty
+       relation set is legitimate rather than a loss.
+    3. The deanon-stage plausibility judge (local model, real names),
+       which receives the ORIGINAL real-name transcript — it runs
+       locally on de-anonymized facts, so there is no reason to hand it
+       the anonymized text.
+
+    The mid-stage ``chain_stopped()`` check after the ``deanon`` phase is
+    the one the imperative version made: a calibration caller stopping at
+    ``deanon`` must not get the partition or the judge.
+    """
+    graph = state.graph
+    scope = state.scope
+    facts = state.facts
+    empty_cause = state.empty_cause
+
+    # This is the SUBSTITUTION half of the two-call structure — the
+    # ``sota_enrich`` phase's ``deanonymize_facts`` call was the GATE
+    # (accept/reject decision, run before any plausibility filter could
+    # shrink the fact set); this call substitutes whatever survived to
+    # this point (post accept/reject AND post anon-stage plausibility, if
+    # it ran).  Re-running the unconditional totality gate here is a
+    # structurally guaranteed no-op on an already-accepted (and possibly
+    # further-filtered, never further-expanded) subset — dropping facts
+    # can only shrink the placeholder surface, never introduce a new
+    # orphan — it is not a second privacy gap; it exists only because
+    # ``deanonymize_facts`` is the ONE way to reach ``_apply_bindings``
+    # (the structural guard).
+    with phase_trace("deanon") as t:
+        deanon_input_count = len(facts)
+        deanon_result = deanonymize_facts(scope, facts)
+        _record_binding_diagnostics(graph, deanon_result)
+        deanon_facts = deanon_result.facts
+        predicate_dropped = deanon_result.predicate_dropped
+        residual_dropped = deanon_result.residual_dropped
+        # predicate_dropped: facts SOTA returned with a placeholder glued
+        # into the predicate field (_apply_bindings' step 1, pre-
+        # substitution).  residual_dropped: facts still carrying an
+        # unresolved placeholder after substitution (step 3).  The two
+        # categories are returned already partitioned — no caller-side
+        # recomputation.
+        if predicate_dropped:
+            graph.diagnostics["predicate_placeholder_dropped_facts"] = (
+                graph.diagnostics.get("predicate_placeholder_dropped_facts", []) + predicate_dropped
+            )
+            graph.diagnostics["predicate_placeholder_dropped"] = graph.diagnostics.get(
+                "predicate_placeholder_dropped", 0
+            ) + len(predicate_dropped)
+        if residual_dropped:
+            graph.diagnostics["residual_dropped_facts"] = residual_dropped
+        dropped_facts = predicate_dropped + residual_dropped
+        if dropped_facts:
+            logger.warning(
+                "Dropped %d fact(s) post-substitution (%d predicate-invariant, "
+                "%d residual placeholder sweep — composite string with an "
+                "unresolved placeholder; a missing-binding orphan is rejected "
+                "upstream by the whole-delta totality gate before reaching "
+                "here).",
+                len(dropped_facts),
+                len(predicate_dropped),
+                len(residual_dropped),
+            )
+        deanon_dropped = deanon_input_count - len(deanon_facts)
+        if deanon_dropped:
+            logger.info(
+                "De-anon: %d → %d facts (%d dropped)",
+                deanon_input_count,
+                len(deanon_facts),
+                deanon_dropped,
+            )
+        if deanon_input_count and not deanon_facts:
+            empty_cause = CAUSE_DEANON_SUBSTITUTION
+        t.set_parsed(
+            {
+                "input_count": deanon_input_count,
+                "output_count": len(deanon_facts),
+                "dropped_count": deanon_dropped,
+                "dropped_facts": dropped_facts,
+            }
+        )
+    if chain_stopped():
+        # Calibration short-circuit: deanon recorded.  graph.relations
+        # remains the local-extract output; deanonymized facts list is
+        # in phases[deanon].parsed.
+        return dataclasses.replace(state, graph=graph, facts=deanon_facts, empty_cause=empty_cause)
+
+    # Route scalar-valued objects (URLs, emails, phone numbers, DOIs,
+    # version-tagged tool names like "ROS2") off the relation surface and
+    # onto Entity.attributes of the subject.  Scalars are verbatim
+    # identifiers that flow through to plausibility and downstream filters
+    # without modification.  Routing them to attributes mirrors the
+    # email/phone/linkedin path the local extractor already populates and
+    # which ``relation_prep._flatten_entity_attributes`` mints into keyed
+    # pairs for indexed-key distillation.  The projection itself is applied
+    # by the ``rebuild`` stage, after its entity rebuild, so the subject
+    # entity survives pruning.
+    scalar_facts, deanon_facts = partition_scalar_facts(deanon_facts, graph.entities)
+    if scalar_facts:
+        graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
+        if not deanon_facts and empty_cause is None:
+            # Scalar-only session: every surviving fact moved to the
+            # attribute surface. ``empty_cause is None`` is what makes
+            # this unambiguous — the substitution's own emptying is
+            # recorded above and runs BEFORE the partition (so it would
+            # leave nothing to partition), and the deanon judge below is
+            # skipped on an empty fact set. A cause already recorded
+            # means the emptying was mixed, and the recovery net keeps
+            # its normal behaviour.
+            empty_cause = CAUSE_SCALAR_PARTITION
+
+    if state.sota_raw:
+        graph.diagnostics["sota_raw_response"] = state.sota_raw
+    if state.updated_anon_transcript:
+        graph.diagnostics["sota_updated_transcript"] = state.updated_anon_transcript
+
+    # Plausibility on de-anonymized data (local judge, stage="deanon").
+    # Runs when plausibility_judge != "off" AND plausibility_stage == "deanon"
+    # AND model/tokenizer are available (guard against tests that pass None).
+    # "auto" resolves to the local model.
+    if (
+        ctx.plausibility_stage == "deanon"
+        and ctx.plausibility_judge != "off"
+        and deanon_facts
+        and ctx.model is not None
+        and ctx.tokenizer is not None
+    ):
+        with phase_trace("deanon_plausibility") as t:
+            _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
+            filtered_deanon, plaus_raw = local_plausibility_filter(
+                deanon_facts,
+                ctx.transcript,  # original real-name transcript — intentional, see docstring
+                ctx.model,
+                ctx.tokenizer,
+                max_tokens=ctx.plausibility_max_tokens,
+                temperature=_DEFAULT_FILTER_TEMPERATURE,
+                seed=ctx.seed,
+                prompts_dir=ctx.prompts_dir,
+            )
+            t.set_raw(plaus_raw)
+            if filtered_deanon is not None:
+                pre_deanon = len(deanon_facts)
+                deanon_facts = filtered_deanon
+                dropped_deanon = pre_deanon - len(deanon_facts)
+                graph.diagnostics["plausibility"] = "deanon"
+                # Own key: the three plausibility writers (anon judge,
+                # this one, and the raw-fallback judge) used to share
+                # ``plausibility_dropped`` with three different
+                # semantics, making its final value order-dependent.
+                graph.diagnostics["plausibility_dropped_deanon"] = dropped_deanon
+                graph.diagnostics["plausibility_judge_actual"] = (
+                    ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
+                )
+                if pre_deanon and not deanon_facts:
+                    empty_cause = CAUSE_DEANON_JUDGE
+                t.set_parsed(
+                    {
+                        "judge": (
+                            ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
+                        ),
+                        "input_count": pre_deanon,
+                        "kept_count": len(deanon_facts),
+                        "dropped_count": dropped_deanon,
+                    }
+                )
+                logger.info(
+                    "Deanon-stage plausibility (local): %d → %d facts (%d dropped)",
+                    pre_deanon,
+                    len(deanon_facts),
+                    dropped_deanon,
+                )
+            else:
+                t.set_outcome("failed", reason="plausibility parse returned None")
+                t.set_parsed(
+                    {
+                        "judge": (
+                            ctx.plausibility_judge if ctx.plausibility_judge != "auto" else "local"
+                        ),
+                        "input_count": len(deanon_facts),
+                        "kept_count": len(deanon_facts),
+                        "dropped_count": 0,
+                    }
+                )
+                logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
+
+    return dataclasses.replace(
+        state,
+        graph=graph,
+        facts=deanon_facts,
+        scalar_facts=scalar_facts,
+        empty_cause=empty_cause,
+    )
+
+
+def _stage_rebuild(ctx: StageContext, state: StageState) -> StageState:
+    """``rebuild`` stage body — facts back to a ``SessionGraph``.
+
+    Schema-validates the surviving fact dicts into ``Relation`` objects
+    (recording every drop), consults the all-dropped recovery gate, and —
+    when the gate does not fire — installs the relations together with
+    their entity surface and the scalar-attribute projection. The pure
+    half lives in :mod:`paramem.graph.relation_build`; what stays here is
+    the recovery ACTION, which needs the model and tokenizer that module
+    deliberately never sees.
+
+    A scalar-only session reaches here with no relations and a
+    ``routing`` cause: the gate declines, so ``apply_rebuild`` runs and
+    the scalar projection lands on the entity surface. Suppressing the
+    gate is what makes that possible — the recovery path returns before
+    ``apply_rebuild``, and ``apply_rebuild`` is the only caller of the
+    projection.
+    """
+    graph = state.graph
+    kept_relations = build_relations(graph, state.facts, speaker_id=ctx.speaker_id)
+    empty_cause = state.empty_cause
+    if state.facts and not kept_relations:
+        empty_cause = CAUSE_SCHEMA_VALIDATION
+
+    # All-dropped safety net — if every relation was dropped and the
+    # original extraction had facts, fall back to raw plausibility so the
+    # session does not yield zero facts due to anonymizer inconsistency.
+    if recovery_gate(graph, kept_relations, state.original_relation_count, empty_cause):
+        return dataclasses.replace(
+            state,
+            graph=_fallback_plausibility_on_raw(
+                graph,
+                ctx.transcript,
+                ctx.model,
+                ctx.tokenizer,
+                "all_dropped",
+                speaker_name=ctx.speaker_name,
+                speaker_id=ctx.speaker_id,
+                max_tokens=ctx.max_tokens,
+                plausibility_max_tokens=ctx.plausibility_max_tokens,
+                seed=ctx.seed,
+            ),
+            empty_cause=empty_cause,
+        )
+
+    apply_rebuild(graph, kept_relations, state.scalar_facts, state.scope.resolution)
+
+    added = len(kept_relations) - state.original_relation_count
+    logger.info(
+        "SOTA enrichment: %d → %d relations (%+d)",
+        state.original_relation_count,
+        len(kept_relations),
+        added,
+    )
+    return dataclasses.replace(state, graph=graph, empty_cause=empty_cause)
 
 
 SESSION_EXTRACT: list[StageSpec] = [
     StageSpec(
         stage="local_extract",
-        trace_name="local_extract",
+        trace_names=("local_extract",),
         run=_stage_local_extract,
         requires=frozenset(),
         produces=frozenset({"graph"}),
@@ -766,31 +1041,75 @@ SESSION_EXTRACT: list[StageSpec] = [
     ),
     StageSpec(
         stage="second_order_extract",
-        trace_name="second_order_extract",
+        trace_names=("second_order_extract",),
         run=_stage_second_order_extract,
         requires=frozenset({"graph"}),
         produces=frozenset({"graph"}),
         applies_when=lambda s: _has_named_non_speaker_person(s.graph),
     ),
     StageSpec(
-        stage="ha_validation",
-        trace_name="ha_validation",
-        run=_stage_ha_validation,
-        requires=frozenset({"graph"}),
-        produces=frozenset({"graph"}),
-        # Truthiness test — matches the original inline gate
-        # `if ha_validation and ha_context:` byte-for-byte: an empty dict
-        # (falsy) skips the stage, same as `None`.
-        enabled_when=lambda c: bool(c.ha_validation and c.ha_context),
-    ),
-    StageSpec(
         stage="sota_pipeline",
-        trace_name=None,
+        # The composite opens four phases from inside ``_sota_pipeline``;
+        # which of them fire depends on config (``anon_plausibility``
+        # only when ``plausibility_stage == "anon"``).
+        trace_names=("anonymize", "entity_correction", "sota_enrich", "anon_plausibility"),
         run=_stage_sota_pipeline,
         requires=frozenset({"graph"}),
-        produces=frozenset({"graph"}),
+        produces=frozenset(
+            {
+                "graph",
+                "facts",
+                "scope",
+                "sota_raw",
+                "updated_anon_transcript",
+                "original_relation_count",
+                "empty_cause",
+            }
+        ),
         enabled_when=lambda c: bool(c.validate and c.sota_enabled and c.noise_filter),
         applies_when=lambda s: bool(s.graph.relations),
+        # Every exit that does NOT reach the hand-over point leaves
+        # ``facts`` empty: the unsupported-provider and missing-config
+        # bails, the anonymize-failure divert into the raw-plausibility
+        # fallback, and the "nothing survived the anon-stage judge" exit
+        # (which clears the graph itself before returning). All four used
+        # to be a plain ``return graph`` from the middle of one long
+        # function; here they stop the walk so the tail siblings never
+        # run on a state that was never produced.
+        terminal_when=lambda s: not s.facts,
+    ),
+    StageSpec(
+        stage="deanonymize",
+        # Two phases: the substitution itself, then the local judge at the
+        # end of the same span (config-gated on ``plausibility_stage``).
+        trace_names=("deanon", "deanon_plausibility"),
+        run=_stage_deanonymize,
+        requires=frozenset({"graph", "facts", "scope", "sota_raw", "updated_anon_transcript"}),
+        produces=frozenset({"graph", "facts", "scalar_facts", "empty_cause"}),
+        # A round-trip scope exists only once the composite reached its
+        # hand-over. Without one there was no cloud egress at all — the
+        # composite was disabled by config, or skipped because the graph
+        # had no relations — and there is nothing to de-anonymize. The
+        # composite's own ``terminal_when`` covers the other case (it RAN
+        # but produced no surviving facts); ``applies_when`` cannot,
+        # because a SKIPPED stage never stops the walk.
+        applies_when=lambda s: s.scope is not None,
+    ),
+    StageSpec(
+        stage="rebuild",
+        # Pure post-processing plus the recovery action — no LLM phase of
+        # its own. The fallback's plausibility call runs outside any
+        # phase_trace scope, as it did before this runner existed.
+        trace_names=(),
+        run=_stage_rebuild,
+        requires=frozenset(
+            {"graph", "facts", "scalar_facts", "scope", "original_relation_count", "empty_cause"}
+        ),
+        produces=frozenset({"graph", "empty_cause"}),
+        # Same gate as ``deanonymize``, and deliberately NOT ``bool(facts)``:
+        # an empty fact set here is precisely the all-dropped case the
+        # recovery gate inside this stage exists to catch.
+        applies_when=lambda s: s.scope is not None,
     ),
 ]
 
@@ -806,8 +1125,6 @@ def extract_graph(
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     prompts_dir: str | Path | None = None,
     validate: bool = True,
-    ha_context: dict | None = None,
-    ha_validation: bool = True,
     noise_filter: str = "",
     noise_filter_model: str = "claude-sonnet-4-6",
     noise_filter_endpoint: str | None = None,
@@ -836,8 +1153,11 @@ def extract_graph(
        re-extracts facts ABOUT each named non-speaker person the first
        pass surfaced and unions them in; predicate drift or redundant
        re-emits are left to the existing merger dedup and normalization.
-    3. Validate with HA context — location ground truth (configurable)
-    4. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
+    3. SOTA pipeline (anonymize → enrich → anon-stage plausibility, configurable)
+    4. De-anonymize (substitute real names back, scalar partition,
+       deanon-stage plausibility)
+    5. Rebuild (schema-validate relations, all-dropped recovery gate,
+       entity surface + scalar-attribute projection)
 
     All filters fail gracefully — extraction result is preserved on any failure.
 
@@ -855,10 +1175,7 @@ def extract_graph(
         temperature: Sampling temperature for extraction (default 0.0 for determinism).
         max_tokens: Max output tokens for extraction (default 2048).
         prompts_dir: Optional override for prompt config directory.
-        validate: Run SOTA pipeline pass 3 (default True). Pass 2 has
-            its own flag (ha_validation).
-        ha_context: HA home config for location validation (from get_home_context).
-        ha_validation: Validate locations against HA home context.
+        validate: Run SOTA pipeline pass 3 (default True).
         noise_filter: SOTA provider for noise filtering ("" = disabled).
         plausibility_judge: Plausibility filter judge ("auto"=local, "off"=disabled,
             or a SOTA provider name like "claude" for cloud judging at anon stage).
@@ -918,8 +1235,8 @@ def extract_graph(
     # additionally wrap this whole call in `with stop_at(phase):` (see
     # that function's docstring) to request an early return.
     #
-    # The four-phase control flow (local_extract -> second_order_extract
-    # -> ha_validation -> sota_pipeline) is expressed declaratively as
+    # The control flow (local_extract -> second_order_extract ->
+    # sota_pipeline -> deanonymize -> rebuild) is expressed declaratively as
     # SESSION_EXTRACT and walked by paramem.graph.flow.run_flow — see that
     # module and the _stage_* functions above for the per-phase bodies.
     # This function's job is: build the run-constant StageContext once,
@@ -950,8 +1267,6 @@ def extract_graph(
                 seed=seed,
                 timestamp=timestamp,
                 source_type=source_type,
-                ha_context=ha_context,
-                ha_validation=ha_validation,
                 validate=validate,
                 sota_enabled=sota_enabled,
                 noise_filter=noise_filter,
@@ -1141,7 +1456,6 @@ def extract_and_anonymize_for_cloud(
                 # regardless of the configured model.
                 prompts_dir=prompts_dir,
                 validate=False,
-                ha_validation=False,
                 noise_filter="",
                 scrub=scrub,
             )
@@ -1649,69 +1963,6 @@ def _normalize_extraction(data: dict) -> dict:
     return data
 
 
-def _validate_with_ha_context(graph: SessionGraph, ha_context: dict) -> SessionGraph:
-    """Validate and boost extracted location facts using HA home context.
-
-    - Location matching HA's configured home → boost confidence to 1.0
-    - Location matching a zone (home, work) → boost confidence to 0.9
-    - Location with no HA connection → leave as-is (let LLM validator decide)
-
-    This is a mechanical check — no LLM call.
-    """
-    location_name = ha_context.get("location_name", "").lower()
-    zones = {z.lower() for z in ha_context.get("zones", [])}
-    areas = {a.lower() for a in ha_context.get("areas", [])}
-    all_known = zones | areas
-    if location_name:
-        all_known.add(location_name)
-
-    if not all_known:
-        return graph
-
-    # Canonical on both sides: the set literals and the extracted predicate
-    # share one surface-form contract, so a model emitting "lives in" matches
-    # the "lives_in" member.
-    location_predicates = {
-        canonical(p)
-        for p in (
-            "lives_in",
-            "lives_near",
-            "born_in",
-            "located_in",
-            "home_location",
-        )
-    }
-
-    for relation in graph.relations:
-        if canonical(relation.predicate) not in location_predicates:
-            continue
-
-        obj_lower = relation.object.lower()
-
-        # Check if extracted location matches HA home
-        if location_name and (location_name in obj_lower or obj_lower in location_name):
-            logger.info(
-                "HA validation: %s matches home location '%s' → confidence 1.0",
-                relation.object,
-                ha_context["location_name"],
-            )
-            relation.confidence = 1.0
-            continue
-
-        # Check zones and areas
-        for known in all_known:
-            if known in obj_lower or obj_lower in known:
-                logger.info(
-                    "HA validation: %s matches known location '%s' → confidence 0.9",
-                    relation.object,
-                    known,
-                )
-                relation.confidence = max(relation.confidence, 0.9)
-                break
-
-    return graph
-
-
 # Two-stage SOTA pipeline: enrichment first, then plausibility filtering.
 # Each stage has a single responsibility and a separate prompt — combining
 # them in one call (the previous "noise_filter" prompt) led to the LLM
@@ -1759,8 +2010,17 @@ def _fallback_plausibility_on_raw(
        vocabulary exists at this point (nothing was ever anonymized on
        this path), so there is nothing to sweep here.
     2. If non-empty, run local plausibility filter; keep raw on None return.
-    3. Rebuild Relations, canonicalize symmetric predicates, filter entities.
+    3. Rebuild Relations via :func:`~paramem.graph.relation_build.build_relations`
+       — the ONE ``Relation``-construction site — and filter entities down
+       to the surviving endpoints.
     4. Record fallback_path in diagnostics.
+
+    Step 3 shares ``build_relations`` with the ``rebuild`` stage, so a
+    schema-validation failure on this path lands in
+    ``graph.diagnostics["pydantic_validation_dropped"]`` like anywhere
+    else. This path used to swallow those failures with a bare
+    ``except: continue``, which made a recovery-path validation failure
+    invisible.
 
     Args:
         speaker_id: Speaker store ID stamped onto every reconstructed
@@ -1769,8 +2029,6 @@ def _fallback_plausibility_on_raw(
 
     Returns the modified graph in-place (graph.relations / graph.entities replaced).
     """
-    from paramem.graph.schema import Relation
-
     raw_facts = [
         {
             "subject": r.subject,
@@ -1799,26 +2057,15 @@ def _fallback_plausibility_on_raw(
             raw_facts = filtered
             dropped_count = pre - len(raw_facts)
             if dropped_count:
-                graph.diagnostics["plausibility_dropped"] = dropped_count
+                # Own key: this judge, the anon-stage judge and the
+                # deanon-stage judge used to share
+                # ``plausibility_dropped``, so whichever ran last decided
+                # what the number meant.
+                graph.diagnostics["plausibility_dropped_fallback"] = dropped_count
                 graph.diagnostics["plausibility_judge_actual"] = "local_fallback"
 
     # Rebuild Relations from surviving raw facts.
-    kept_relations = []
-    for fact in raw_facts:
-        try:
-            kept_relations.append(
-                Relation(
-                    subject=fact.get("subject", ""),
-                    predicate=fact.get("predicate", ""),
-                    object=fact.get("object", ""),
-                    relation_type=fact.get("relation_type", "factual"),
-                    confidence=float(fact.get("confidence", 1.0)),
-                    speaker_id=speaker_id,
-                    symmetric=bool(fact.get("symmetric")),
-                )
-            )
-        except Exception:
-            continue
+    kept_relations = build_relations(graph, raw_facts, speaker_id=speaker_id)
     kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
     graph.relations = kept_relations
@@ -1831,6 +2078,38 @@ def _fallback_plausibility_on_raw(
         len(kept_relations),
     )
     return graph
+
+
+def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> None:
+    """Persist a :func:`~paramem.graph.cloud_egress.deanonymize_facts`
+    verdict onto ``graph.diagnostics`` — the CALLER side of the totality
+    gate.
+
+    The gate primitive
+    (:func:`~paramem.graph.placeholders._check_mapping_totality`) used to
+    write these two keys itself, from inside ``deanonymize_facts``, onto a
+    ``SessionGraph`` it took purely as a diagnostics sink; a caller two
+    levels up then read the mutation back off the graph. Both findings are
+    return values now, and this is the ONE place in the extractor that
+    turns them into diagnostics, shared by all three
+    ``deanonymize_facts`` call sites (the ``sota_enrich`` gate, the
+    ``deanon`` substitution, and :func:`_graph_enrich_with_sota`).
+
+    Writes are guarded exactly as the primitive's were: an EMPTY list
+    writes no key at all, so ``"key" not in graph.diagnostics`` keeps its
+    established meaning ("the scan found nothing"), distinct from a
+    present-but-empty value.
+
+    Args:
+        graph: The graph the delta is being applied to — the session graph
+            for session-tier extraction, the caller's throwaway per-chunk
+            graph for graph-tier enrichment.
+        result: The ``DeanonResult`` just returned for that delta.
+    """
+    if result.collisions:
+        graph.diagnostics["sota_binding_collisions"] = result.collisions
+    if result.verdict:
+        graph.diagnostics["sota_pending_orphans"] = result.verdict
 
 
 def _sota_pipeline(
@@ -1853,8 +2132,8 @@ def _sota_pipeline(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     seed: int | None = None,
-) -> SessionGraph:
-    """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
+) -> StageState:
+    """Enrich extraction via local anonymization → SOTA enrichment → anon-stage plausibility.
 
     ``scrub`` (required — no implicit default) is the operator's
     PII-vocabulary hint list, rendered into the anonymizer prompt's
@@ -1882,12 +2161,20 @@ def _sota_pipeline(
         attributes`` values; forward map + transcript are untouched (see
         ``entity_correction.py`` for the full two-locus contract).
     2. SOTA enrichment    → coreference resolution + compound splitting + symmetric dedup
-    3a. Plausibility on anonymized data (plausibility_stage="anon", SOTA judge)
-    3b. De-anonymize + preserve pre-sweep snapshot
-    3c. Residual placeholder sweep
-    3d. Plausibility on de-anonymized data (plausibility_stage="deanon", local judge)
-    4. Build Relations + entity type rebuild + symmetric canonicalization
-    5. All-dropped safety net → fallback to raw plausibility
+    3. Plausibility on anonymized data (plausibility_stage="anon", SOTA judge)
+
+    De-anonymization, the deanon-stage judge and the relation/entity
+    rebuild are NOT here: they are the ``deanonymize`` and ``rebuild``
+    stages of ``SESSION_EXTRACT``, siblings of this composite. This
+    function's job ends at the hand-over.
+
+    Returns a :class:`~paramem.graph.flow.StageState` carrying what those
+    siblings consume: the surviving anonymized ``facts``, the cloud
+    round-trip ``scope``, ``sota_raw``, ``updated_anon_transcript`` and
+    ``original_relation_count``. Every early exit returns a state with an
+    EMPTY ``facts`` — the composite spec's ``terminal_when`` — so the
+    siblings do not run, which is exactly what the plain ``return graph``
+    on those paths used to achieve.
 
     Falls back gracefully at every stage. Endpoint is forwarded for self-hosted
     OpenAI-compatible providers.
@@ -1910,7 +2197,7 @@ def _sota_pipeline(
     key_env_name = PROVIDER_KEY_ENV.get(provider)
     if key_env_name is None:
         logger.warning("Unsupported SOTA provider %r — skipping enrichment", provider)
-        return graph
+        return StageState(graph=graph)
     api_key = _resolve_sota_api_key(provider) or ""
     # Collect ALL config gaps before returning so a single warning surfaces
     # everything missing — avoids the "fix the key, then discover the endpoint
@@ -1926,9 +2213,13 @@ def _sota_pipeline(
         gaps.append(f"endpoint for provider {provider!r}")
     if gaps:
         logger.info("Skipping SOTA enrichment — missing config: %s", ", ".join(gaps))
-        return graph
+        return StageState(graph=graph)
 
     original_count = len(graph.relations)
+    # Which site emptied the working fact set, if any. Recorded onto the
+    # returned state for the recovery gate's diagnostics; nothing branches
+    # on it. See paramem.graph.relation_build for the vocabulary.
+    empty_cause: str | None = None
 
     _vram_snapshot(f"sota_pipeline_entry session={graph.session_id}")
     if not scrub:
@@ -1990,24 +2281,27 @@ def _sota_pipeline(
             # egress at all).
             logger.warning("Anonymization failed — falling back to raw plausibility")
             graph.diagnostics["anonymize"] = "failed"
-            return _fallback_plausibility_on_raw(
-                graph,
-                transcript,
-                model,
-                tokenizer,
-                "anon_failed",
-                speaker_name=speaker_name,
-                speaker_id=speaker_id,
-                max_tokens=max_tokens,
-                plausibility_max_tokens=plausibility_max_tokens,
-                seed=seed,
+            return StageState(
+                graph=_fallback_plausibility_on_raw(
+                    graph,
+                    transcript,
+                    model,
+                    tokenizer,
+                    "anon_failed",
+                    speaker_name=speaker_name,
+                    speaker_id=speaker_id,
+                    max_tokens=max_tokens,
+                    plausibility_max_tokens=plausibility_max_tokens,
+                    seed=seed,
+                ),
+                original_relation_count=original_count,
             )
         if chain_stopped():
             # Calibration short-circuit: anonymize completed; downstream
             # phases (sota_enrich, anon_plausibility, deanon, …) are skipped.  graph.relations
             # remains the local-extract output; the anonymize result lives in
             # graph.diagnostics["phases"][anonymize].parsed.
-            return graph
+            return StageState(graph=graph, original_relation_count=original_count)
         # ``payload.norm_stats`` is the LIVE signal — reaches
         # ``mapping_ambiguous_dropped`` unconditionally now (this is the
         # only normalize call in the chain; see cloud_egress.py).
@@ -2083,7 +2377,7 @@ def _sota_pipeline(
         # graph.diagnostics["entity_corrections"] (applied only) /
         # graph.diagnostics["entity_correction_verdicts"] (every evaluated
         # target) / phases[entity_correction].
-        return graph
+        return StageState(graph=graph, original_relation_count=original_count)
 
     # The fact array — ``payload.anon_facts``, built inside
     # ``anonymize_for_cloud`` (THE one construction, shared with the graph
@@ -2194,7 +2488,8 @@ def _sota_pipeline(
         scope = CloudScope.for_response(
             payload, sota_bindings=sota_bindings, sent=(_facts_text, _transcript_text)
         )
-        gate = deanonymize_facts(scope, enriched_anon, graph)
+        gate = deanonymize_facts(scope, enriched_anon)
+        _record_binding_diagnostics(graph, gate)
         if gate.verdict:
             discarded_count = len(enriched_anon)
             retained_count = len(anon_facts)
@@ -2247,12 +2542,13 @@ def _sota_pipeline(
             )
             if not enriched_anon:
                 logger.info("SOTA enrichment removed all relations")
+                empty_cause = CAUSE_CLOUD_EMPTY
     if chain_stopped():
         # Calibration short-circuit: SOTA enrichment block recorded,
         # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.
         # graph.relations stays at the local-extract output; enrichment result
         # is in phases[sota_enrich].
-        return graph
+        return StageState(graph=graph, original_relation_count=original_count)
 
     # Step 3a: Plausibility on anonymized data (SOTA judge, stage="anon").
     # Only runs when: explicit SOTA provider, plausibility_stage=="anon",
@@ -2296,8 +2592,16 @@ def _sota_pipeline(
                     enriched_anon = plaus_facts
                     dropped_plaus = pre_plaus - len(enriched_anon)
                     graph.diagnostics["plausibility"] = "anon"
-                    graph.diagnostics["plausibility_dropped"] = dropped_plaus
+                    # Own key: the three plausibility writers (this one,
+                    # the deanon judge, and the raw-fallback judge) used
+                    # to share ``plausibility_dropped`` with three
+                    # different semantics — a plain overwrite here, an
+                    # accumulate there — so its final value was
+                    # order-dependent and uninterpretable.
+                    graph.diagnostics["plausibility_dropped_anon"] = dropped_plaus
                     graph.diagnostics["plausibility_judge_actual"] = plausibility_judge
+                    if not enriched_anon:
+                        empty_cause = CAUSE_ANON_JUDGE
                     if plaus_raw:
                         graph.diagnostics["sota_plausibility_raw_response"] = plaus_raw
                     t.set_parsed(
@@ -2328,432 +2632,45 @@ def _sota_pipeline(
                     logger.warning("Anon-stage plausibility call failed — keeping enriched facts")
         if chain_stopped():
             # Calibration short-circuit after the optional anon-stage judge.
-            return graph
+            return StageState(graph=graph, original_relation_count=original_count)
 
-    # Empty-check guard (compare L1019-1028): if enriched_anon is empty after
-    # anon-stage plausibility (or was already empty), return early.
+    # Empty-check guard: if enriched_anon is empty after the anon-stage
+    # judge (or was already empty), clear the graph and hand back a state
+    # whose empty ``facts`` is the composite spec's ``terminal_when`` — the
+    # deanonymize/rebuild siblings must not run.
     if not enriched_anon:
         logger.info("No facts remain after anon-stage plausibility — returning empty graph")
         graph.relations = []
         graph.entities = []
-        return graph
-
-    # Step 3b: De-anonymize via state-machine substitution.
-    #
-    # Uses the anonymizer mapping (real_name -> placeholder) plus SOTA's
-    # explicit ``new_entity_bindings`` (placeholder -> real_text) for any
-    # entities SOTA introduced. Pure dict substitution — no LLM call,
-    # no transcript diff, no regex. Replaces the previous regex chain
-    # (``_brace_placeholders_in_text/_in_facts`` + ``_extract_sota_bindings``
-    # + ``_strip_placeholder_braces`` + reverse-mapping substitution).
-    from paramem.graph.schema import Entity, Relation
-
-    # ``reverse_mapping`` (placeholder -> entity name) is produced by
-    # :func:`_build_anonymization_mapping`; it is consumed by the deanon
-    # dict-substitution and by the entity-rebuild loop below.
-
-    # Phase — deanon.  Pure dict substitution restoring real names from
-    # placeholders.  No LLM call; raw_output stays None.  Dropped facts
-    # (those with residual unresolved placeholders) land in parsed for
-    # calibration inspection.
-    #
-    # This is the SUBSTITUTION half of the two-call structure — the
-    # ``sota_enrich`` phase's ``deanonymize_facts`` call above was the
-    # GATE (accept/reject decision, run before any plausibility filter
-    # could shrink ``enriched_anon``); this call substitutes whatever
-    # ``enriched_anon`` survived to this point (post accept/reject AND
-    # post anon-stage plausibility, if it ran).  Re-running the
-    # unconditional totality gate here is a structurally guaranteed
-    # no-op on an already-accepted (and possibly further-filtered, never
-    # further-expanded) subset — dropping facts can only shrink the
-    # placeholder surface, never introduce a new orphan — it is not a
-    # second privacy gap; it exists only because ``deanonymize_facts`` is
-    # the ONE way to reach ``_apply_bindings`` (the structural guard).
-    with phase_trace("deanon") as t:
-        deanon_input_count = len(enriched_anon)
-        deanon_result = deanonymize_facts(scope, enriched_anon, graph)
-        deanon_facts = deanon_result.facts
-        predicate_dropped = deanon_result.predicate_dropped
-        residual_dropped = deanon_result.residual_dropped
-        # predicate_dropped: facts SOTA returned with a placeholder glued
-        # into the predicate field (_apply_bindings' step 1, pre-
-        # substitution).  residual_dropped: facts still carrying an
-        # unresolved placeholder after substitution (step 3).  The two
-        # categories are returned already partitioned — no caller-side
-        # recomputation.
-        if predicate_dropped:
-            graph.diagnostics["predicate_placeholder_dropped_facts"] = (
-                graph.diagnostics.get("predicate_placeholder_dropped_facts", []) + predicate_dropped
-            )
-            graph.diagnostics["predicate_placeholder_dropped"] = graph.diagnostics.get(
-                "predicate_placeholder_dropped", 0
-            ) + len(predicate_dropped)
-        if residual_dropped:
-            graph.diagnostics["residual_dropped_facts"] = residual_dropped
-        dropped_facts = predicate_dropped + residual_dropped
-        if dropped_facts:
-            logger.warning(
-                "Dropped %d fact(s) post-substitution (%d predicate-invariant, "
-                "%d residual placeholder sweep — composite string with an "
-                "unresolved placeholder; a missing-binding orphan is rejected "
-                "upstream by the whole-delta totality gate before reaching "
-                "here).",
-                len(dropped_facts),
-                len(predicate_dropped),
-                len(residual_dropped),
-            )
-        deanon_dropped = deanon_input_count - len(deanon_facts)
-        if deanon_dropped:
-            logger.info(
-                "De-anon: %d → %d facts (%d dropped)",
-                deanon_input_count,
-                len(deanon_facts),
-                deanon_dropped,
-            )
-        t.set_parsed(
-            {
-                "input_count": deanon_input_count,
-                "output_count": len(deanon_facts),
-                "dropped_count": deanon_dropped,
-                "dropped_facts": dropped_facts,
-            }
-        )
-    if chain_stopped():
-        # Calibration short-circuit: deanon recorded.  graph.relations
-        # remains the local-extract output; deanonymized facts list is
-        # in phases[deanon].parsed.
-        return graph
-
-    # Step 3c+: Route scalar-valued objects (URLs, emails, phone numbers,
-    # DOIs, version-tagged tool names like "ROS2") off the relation surface
-    # and onto Entity.attributes of the subject.  Scalars are verbatim
-    # identifiers that flow through to plausibility and downstream filters
-    # without modification.  Routing them to attributes mirrors the
-    # email/phone/linkedin path the local extractor already populates and
-    # which ``relation_prep._flatten_entity_attributes`` mints into keyed
-    # pairs for indexed-key distillation.  The projection is applied after
-    # the entity rebuild step below
-    # so the subject entity survives pruning.
-    scalar_facts, deanon_facts = _partition_scalar_facts(deanon_facts, graph.entities)
-    if scalar_facts:
-        graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
-
-    if _sota_raw:
-        graph.diagnostics["sota_raw_response"] = _sota_raw
-    if updated_anon_transcript:
-        graph.diagnostics["sota_updated_transcript"] = updated_anon_transcript
-
-    # Step 3e: Plausibility on de-anonymized data (local judge, stage="deanon").
-    # Runs when plausibility_judge != "off" AND plausibility_stage == "deanon"
-    # AND model/tokenizer are available (guard against tests that pass None).
-    # "auto" resolves to the local model. Receives the ORIGINAL real-name
-    # transcript (NOT anon_transcript) — this judge runs locally on
-    # de-anonymized facts, so there is no reason to hand it the anonymized
-    # text at all.
-    if (
-        plausibility_stage == "deanon"
-        and plausibility_judge != "off"
-        and deanon_facts
-        and model is not None
-        and tokenizer is not None
-    ):
-        with phase_trace("deanon_plausibility") as t:
-            _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
-            filtered_deanon, plaus_raw = local_plausibility_filter(
-                deanon_facts,
-                transcript,  # original real-name transcript — intentional, see docstring
-                model,
-                tokenizer,
-                max_tokens=plausibility_max_tokens,
-                temperature=_DEFAULT_FILTER_TEMPERATURE,
-                seed=seed,
-                prompts_dir=prompts_dir,
-            )
-            t.set_raw(plaus_raw)
-            if filtered_deanon is not None:
-                pre_deanon = len(deanon_facts)
-                deanon_facts = filtered_deanon
-                dropped_deanon = pre_deanon - len(deanon_facts)
-                graph.diagnostics["plausibility"] = "deanon"
-                graph.diagnostics["plausibility_dropped"] = (
-                    graph.diagnostics.get("plausibility_dropped", 0) + dropped_deanon
-                )
-                graph.diagnostics["plausibility_judge_actual"] = (
-                    plausibility_judge if plausibility_judge != "auto" else "local"
-                )
-                t.set_parsed(
-                    {
-                        "judge": plausibility_judge if plausibility_judge != "auto" else "local",
-                        "input_count": pre_deanon,
-                        "kept_count": len(deanon_facts),
-                        "dropped_count": dropped_deanon,
-                    }
-                )
-                logger.info(
-                    "Deanon-stage plausibility (local): %d → %d facts (%d dropped)",
-                    pre_deanon,
-                    len(deanon_facts),
-                    dropped_deanon,
-                )
-            else:
-                t.set_outcome("failed", reason="plausibility parse returned None")
-                t.set_parsed(
-                    {
-                        "judge": plausibility_judge if plausibility_judge != "auto" else "local",
-                        "input_count": len(deanon_facts),
-                        "kept_count": len(deanon_facts),
-                        "dropped_count": 0,
-                    }
-                )
-                logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
-        if chain_stopped():
-            # Calibration short-circuit: skip the kept_relations rebuild.
-            # graph.relations stays at the local-extract output; the
-            # plausibility-filtered deanon facts are in phases[deanon_plausibility].
-            return graph
-
-    kept_relations = []
-    validation_dropped: list[dict] = []
-    for fact in deanon_facts:
-        try:
-            kept_relations.append(
-                Relation(
-                    subject=fact.get("subject", ""),
-                    predicate=fact.get("predicate", ""),
-                    object=fact.get("object", ""),
-                    relation_type=fact.get("relation_type", "factual"),
-                    confidence=float(fact.get("confidence", 1.0)),
-                    speaker_id=speaker_id,
-                    symmetric=bool(fact.get("symmetric")),
-                )
-            )
-        except Exception as exc:
-            validation_dropped.append(
-                {
-                    "subject": fact.get("subject", ""),
-                    "predicate": fact.get("predicate", ""),
-                    "object": fact.get("object", ""),
-                    "relation_type": fact.get("relation_type", ""),
-                    "reason": f"{type(exc).__name__}: {exc}"[:200],
-                }
-            )
-            continue
-    if validation_dropped:
-        graph.diagnostics["pydantic_validation_dropped"] = validation_dropped
-        logger.warning(
-            "Dropped %d fact(s) at Relation schema validation "
-            "(commonly: relation_type outside Literal set)",
-            len(validation_dropped),
+        return StageState(
+            graph=graph,
+            original_relation_count=original_count,
+            empty_cause=empty_cause,
         )
 
-    # All-dropped safety net — if every relation was dropped and the
-    # original extraction had facts, fall back to raw plausibility so the
-    # session does not yield zero facts due to anonymizer inconsistency.
-    if not kept_relations and original_count > 0:
-        logger.warning(
-            "All %d relation(s) dropped by pipeline — triggering all_dropped fallback",
-            original_count,
-        )
-        return _fallback_plausibility_on_raw(
-            graph,
-            transcript,
-            model,
-            tokenizer,
-            "all_dropped",
-            speaker_name=speaker_name,
-            speaker_id=speaker_id,
-            max_tokens=max_tokens,
-            plausibility_max_tokens=plausibility_max_tokens,
-            seed=seed,
-        )
-
-    # Rebuild entity list from surviving + new relations.
-    # Every relation endpoint must have a corresponding Entity record.
-    # Entity type inference goes through :func:`placeholder_entity_type`
-    # (open vocabulary): known prefixes (Person, Org, City, ...) use the
-    # configured closed mapping; novel prefixes that SOTA introduces
-    # (Project_1, Program_1, Paper_1, Certification_1, ...) derive the
-    # type from the prefix itself — the prefix name IS the type name in
-    # SOTA's brace-binding protocol. entity_type is open (no Literal), so
-    # the derived type passes through.
-    #
-    # ``name`` here is a de-anonymized real name (a ``kept_relations``
-    # subject/object), so it must be looked up in the INVERTED resolution
-    # map (real name -> placeholder) — ``reverse_mapping`` itself is keyed
-    # by placeholder and would never match. ``scope.resolution`` is the
-    # SAME map :func:`deanonymize_facts` just substituted with, so
-    # inverting it preserves CORE-LAST precedence with no new tie-break
-    # rule: a real name that collides across a core and a SOTA entry
-    # resolves to whichever placeholder the resolution map itself holds
-    # for that key.
-    kept_names = (
-        {r.subject for r in kept_relations}
-        | {r.object for r in kept_relations}
-        | {str(f.get("subject", "")) for f in scalar_facts if str(f.get("subject", "")).strip()}
+    # Hand-over to the ``deanonymize`` sibling: de-anonymization via
+    # state-machine substitution, the deanon-stage judge and the
+    # relation/entity rebuild all live in their own stages now.  ``scope``
+    # is the ONE anonymize/de-anonymize round-trip scope for this response
+    # (rebuilt above when the enrichment delta was rejected, so a rejected
+    # mint can never be applied); the substitution and the entity-type
+    # rebuild are both keyed on it.
+    return StageState(
+        graph=graph,
+        facts=enriched_anon,
+        scope=scope,
+        sota_raw=_sota_raw,
+        updated_anon_transcript=updated_anon_transcript,
+        original_relation_count=original_count,
+        empty_cause=empty_cause,
     )
-    existing_names = {e.name for e in graph.entities}
-    graph.entities = [e for e in graph.entities if e.name in kept_names]
-    name_to_placeholder = {real: token for token, real in scope.resolution.items()}
-    for name in kept_names - existing_names:
-        entity_type = "concept"
-        placeholder = name_to_placeholder.get(name)
-        if placeholder:
-            entity_type = placeholder_entity_type(placeholder)
-        graph.entities.append(Entity(name=name, entity_type=entity_type))
-
-    # Project scalar-object facts onto subject Entity.attributes (see
-    # _partition_scalar_facts call above for rationale).
-    _project_scalar_facts_to_attributes(graph, scalar_facts)
-
-    graph.relations = kept_relations
-
-    added = len(kept_relations) - original_count
-    logger.info(
-        "SOTA enrichment: %d → %d relations (%+d)",
-        original_count,
-        len(kept_relations),
-        added,
-    )
-    return graph
 
 
-def _is_scalar_value(value: str) -> bool:
-    """True iff ``value`` is a verbatim identifier rather than a content phrase.
-
-    Scalars belong on ``Entity.attributes`` (alongside email/phone/linkedin
-    extracted by the local extractor), where
-    :func:`~paramem.graph.relation_prep._flatten_entity_attributes` mints
-    keyed pairs for indexed-key distillation without additional filtering.
-    Routing them through plausibility as relations is wrong: a
-    plausibility judge may reject values whose alpha portion lives
-    concatenated with digits in the source transcript
-    (``username1234``, ``ROS2``, ``H100``), even though the scalar is
-    verbatim in the text.
-
-    Detection is structural — no regex.  Recognised shapes:
-
-    * **Phone**: ≥7 digits, characters drawn only from
-      ``digits + " +()-."``.  Spaces are permitted only inside this class
-      (phone numbers are the one multi-token scalar).
-    * **Email**: contains ``@`` and a ``.`` after the ``@``, no whitespace.
-    * **URL with scheme**: starts with ``http://`` / ``https://`` /
-      ``ftp://``.
-    * **URL without scheme**: contains ``/`` and the part before the
-      first ``/`` looks like a domain (alphanumeric + dots/dashes,
-      contains at least one ``.``).
-    * **DOI**: starts with ``10.`` and contains ``/``.
-    * **Version-tagged identifier**: contains both letters and digits,
-      no spaces, characters drawn only from ``alnum + "/-_+."``
-      (e.g. ``ROS2``, ``H100``, ``IPv6``, ``ROS2/Gazebo``, ``x86_64``).
-    """
-    s = (value or "").strip()
-    if not s:
-        return False
-    digit_count = sum(c.isdigit() for c in s)
-    # Phone: ≥7 digits, only phone-shaped chars (the only multi-token scalar).
-    if digit_count >= 7 and all(c.isdigit() or c in "+()-. " for c in s):
-        return True
-    # After the phone exemption, multi-word means content phrase.
-    if any(c.isspace() for c in s):
-        return False
-    # Email: "@" with a domain ending in a TLD-like dot suffix.
-    if "@" in s:
-        domain = s.rsplit("@", 1)[-1]
-        if "." in domain and len(domain) > 2:
-            return True
-    lower = s.lower()
-    # URL with scheme.
-    if lower.startswith(("http://", "https://", "ftp://")):
-        return True
-    # URL without scheme: domain.tld[/path].
-    if "/" in s:
-        head = s.split("/", 1)[0]
-        if "." in head and head.replace(".", "").replace("-", "").isalnum():
-            return True
-    # DOI.
-    if s.startswith("10.") and "/" in s and digit_count > 0:
-        return True
-    # Version-tagged identifier.
-    if digit_count > 0 and any(c.isalpha() for c in s):
-        if all(c.isalnum() or c in "/-_+." for c in s):
-            return True
-    return False
-
-
-def _partition_scalar_facts(
-    facts: list[dict], entities: list[Entity] | None = None
-) -> tuple[list[dict], list[dict]]:
-    """Split facts by object-shape into ``(scalar, non_scalar)``.
-
-    Scalars are projected onto ``Entity.attributes`` of the subject and
-    flow through to plausibility and downstream filters without modification;
-    non-scalars are treated as concept-level claims.  Facts already marked
-    ``synthetic=True`` are passed through untouched.
-
-    ``entities`` is the graph's current entity list (local-extraction state,
-    read before this pipeline's own entity rebuild).  A fact's object is
-    forced to ``non_scalar`` whenever it already names an existing entity
-    node, regardless of what :func:`_is_scalar_value` would say — a
-    digit-bearing entity name (``speaker0``, ``speaker1``, a droid-style
-    person name like ``R2D2``) otherwise mis-triggers the version-tagged-
-    identifier heuristic and gets flattened into a string attribute instead
-    of staying a first-class edge. There is no dedicated "literal" entity
-    type in the schema (entity_type is open-vocabulary: person, place,
-    organization, event, preference, concept, or model-invented types), so
-    any existing node — not just ``person`` — qualifies: object-is-a-known-
-    entity-node is the gate; object shape is only consulted when no node
-    exists.
-    """
-    entity_names = {e.name for e in (entities or [])}
-    scalar: list[dict] = []
-    non_scalar: list[dict] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            non_scalar.append(f)
-            continue
-        if f.get("synthetic") is True:
-            non_scalar.append(f)
-            continue
-        obj = str(f.get("object", ""))
-        if obj in entity_names:
-            non_scalar.append(f)
-            continue
-        if _is_scalar_value(obj):
-            scalar.append(f)
-        else:
-            non_scalar.append(f)
-    return scalar, non_scalar
-
-
-def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[dict]) -> None:
-    """Fold scalar-object facts onto ``Entity.attributes`` of the subject.
-
-    Mutates ``graph.entities`` in place: ensures every scalar-fact subject
-    has an ``Entity`` record (creating one with type ``"concept"`` when
-    missing), then sets ``entity.attributes[<key>] = object``.  ``<key>``
-    is the relation predicate with a leading ``has_`` stripped so
-    :func:`~paramem.graph.relation_prep._flatten_entity_attributes` (which
-    re-prefixes attribute keys with ``has_`` when minting projected
-    relations for indexed-key distillation) does not produce
-    ``has_has_<key>``.
-    """
-    if not scalar_facts:
-        return
-    name_to_entity = {e.name: e for e in graph.entities}
-    for f in scalar_facts:
-        subj = str(f.get("subject", "")).strip()
-        pred = str(f.get("predicate", "")).strip()
-        obj = str(f.get("object", "")).strip()
-        if not (subj and pred and obj):
-            continue
-        ent = name_to_entity.get(subj)
-        if ent is None:
-            ent = Entity(name=subj, entity_type="concept")
-            graph.entities.append(ent)
-            name_to_entity[subj] = ent
-        attr_key = pred.removeprefix("has_") if pred.startswith("has_") else pred
-        ent.attributes[attr_key] = obj
-
+# _is_scalar_value / _partition_scalar_facts /
+# _project_scalar_facts_to_attributes now live in
+# paramem.graph.relation_build (imported above) — the scalar routing is
+# owned by the ``rebuild`` stage; the ``deanonymize`` stage only invokes
+# the partition, which must run before the deanon-stage judge.
 
 # load_anonymization_prompt / anonymize_with_local_model now live in
 # paramem.graph.cloud_egress (imported above) — the local-model
@@ -3134,8 +3051,14 @@ def _filter_with_sota(
     ``graph.diagnostics``:
 
     * ``parse_path``: ``"delta"`` (envelope parsed, delta applied),
-      ``"failed"`` (parse failure — caller fail-opens), or
-      ``"no_response"`` (provider returned nothing).
+      ``"failed"`` (parse failure), or ``"no_response"`` (provider
+      returned nothing). Both failure paths return ``None`` facts, and
+      the caller (:func:`_sota_pipeline`) raises
+      :class:`ExtractionFailed` on either — it does NOT fail open.
+      Failing open used to silently bake a degraded, un-enriched
+      snapshot into the cumulative graph, where the next cycle's
+      re-extraction deduped it and the missing relations were lost
+      permanently; see the call site for the full reasoning.
     * ``response_chars``: length of the raw response in characters.
     * ``add_count`` / ``modify_count`` / ``drop_count``: validated
       action counts; entries that fail per-entry validation (out-of-range
@@ -3180,7 +3103,7 @@ def _filter_with_sota(
         info["parse_path"] = "failed"
         logger.warning(
             "SOTA enrichment delta parse failed (response_chars=%d) — "
-            "caller will fail-open and keep pre-enrichment facts",
+            "caller will fail the extraction (ExtractionFailed)",
             info["response_chars"],
         )
     else:
@@ -3204,7 +3127,7 @@ def _graph_enrich_with_sota(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
-) -> tuple[list[dict], list[list[str]], str | None] | None:
+) -> tuple[list[dict], list[list[str]], str | None, list[str]] | None:
     """SOTA graph-level enrichment pass over a pre-merged cumulative graph.
 
     Sends a subgraph serialized as triples to a SOTA provider and requests
@@ -3246,8 +3169,9 @@ def _graph_enrich_with_sota(
     consumption logic (including the speaker-pair guard that rejects a same_as pair
     where both surfaces are speaker ids) already expects. A non-empty
     totality verdict REJECTS THE WHOLE CHUNK DELTA (relations AND
-    ``same_as`` both discarded) — the caller detects this via
-    ``graph.diagnostics`` and counts it in ``totality_rejected_chunks``.
+    ``same_as`` both discarded) — the caller detects this from the
+    verdict this function RETURNS (the fourth tuple element) and counts it
+    in ``totality_rejected_chunks``.
     Any ``bindings`` the response carries (SOTA-minted placeholders —
     normally empty, since the prompt forbids inventing new nodes) are
     normalized inside :meth:`~paramem.graph.cloud_egress.CloudScope.
@@ -3301,10 +3225,11 @@ def _graph_enrich_with_sota(
             inside it).
         payload: :class:`~paramem.graph.cloud_egress.AnonymizedPayload` —
             the caller's already-completed (A) result for this chunk.
-        graph: The caller's throwaway per-chunk ``SessionGraph`` — passed
-            through to :func:`~paramem.graph.cloud_egress.deanonymize_facts`
-            so its totality diagnostics land where the caller can read
-            them back.
+        graph: The caller's throwaway per-chunk ``SessionGraph`` — the
+            diagnostics sink this function writes the totality gate's
+            findings to (via :func:`_record_binding_diagnostics`).  It is
+            NOT how the caller learns of a rejection: that arrives as the
+            returned verdict.
         api_key: Provider API key.
         provider: SOTA provider name (e.g. ``"anthropic"``).
         filter_model: Model identifier for the provider.
@@ -3313,15 +3238,17 @@ def _graph_enrich_with_sota(
         temperature: Sampling temperature (0.0 for deterministic output).
 
     Returns:
-        ``(new_relations, same_as_pairs, raw_response)`` on success, or
-        ``None`` when the SOTA call fails or the response cannot be parsed.
-        ``new_relations`` is a list of relation dicts with real node names;
-        ``same_as_pairs`` is a list of ``[canonical, variant]`` pairs with
-        real node names / bare speaker ids.  A rejected totality verdict is
-        NOT ``None`` — it is ``([], [], raw_response)``, distinguishable
-        from a genuinely empty SOTA response only via
-        ``graph.diagnostics`` (see above); the caller relies on this to
-        tell "delta discarded" apart from "delta legitimately empty".
+        ``(new_relations, same_as_pairs, raw_response, totality_verdict)``
+        on success, or ``None`` when the SOTA call fails or the response
+        cannot be parsed.  ``new_relations`` is a list of relation dicts
+        with real node names; ``same_as_pairs`` is a list of
+        ``[canonical, variant]`` pairs with real node names / bare speaker
+        ids.  ``totality_verdict`` is the binding-totality gate's verdict —
+        ``[]`` on an accepted delta, the sorted offending tokens on a
+        rejected one.  A rejected totality verdict is NOT ``None`` — it is
+        ``([], [], raw_response, verdict)``; the non-empty verdict is what
+        tells the caller "delta discarded" apart from "delta legitimately
+        empty" (``([], [], raw_response, [])``).
 
     The prompt this function loads is external config — edit
     ``configs/prompts/sota_graph_enrichment.txt`` to tune; no code changes
@@ -3405,7 +3332,8 @@ def _graph_enrich_with_sota(
     # gated by the totality check as step 1 (unconditional — the graph
     # tier's binding-totality gate).  A non-empty verdict rejects the
     # WHOLE chunk delta.
-    deanon = deanonymize_facts(scope, new_relations, graph)
+    deanon = deanonymize_facts(scope, new_relations)
+    _record_binding_diagnostics(graph, deanon)
     if deanon.verdict:
         logger.warning(
             "graph_enrichment: binding-totality breach: %d offending token(s) %s — "
@@ -3414,7 +3342,7 @@ def _graph_enrich_with_sota(
             deanon.verdict[:5],
             len(new_relations),
         )
-        return [], [], raw
+        return [], [], raw, deanon.verdict
     if deanon.predicate_dropped or deanon.residual_dropped:
         logger.warning(
             "graph_enrichment: dropped %d relation(s) post-substitution "
@@ -3439,7 +3367,7 @@ def _graph_enrich_with_sota(
             continue
         deanon_same_as.append([d_canon, d_variant])
 
-    return deanon.facts, deanon_same_as, raw
+    return deanon.facts, deanon_same_as, raw, deanon.verdict
 
 
 def _render_indexed_facts(facts: list[dict]) -> str:
@@ -3563,8 +3491,11 @@ def _parse_enrichment_delta(
     """Parse the SOTA enrichment judge's delta-envelope output.
 
     Returns ``(add, modify, drop, bindings)`` on success; ``None`` on
-    parse failure (caller fail-opens — keep input facts unchanged, no
-    enrichment applied).
+    parse failure, which propagates through
+    :func:`_apply_enrichment_delta` and :func:`_filter_with_sota` to a
+    raised :class:`ExtractionFailed` at the ``sota_enrich`` call site —
+    an unparseable enrichment response fails the cycle, it does not fall
+    back to the pre-enrichment facts.
 
     * ``add``      — list of new fact dicts to append.
     * ``modify``   — list of ``(index, fields_dict)`` tuples; each entry
@@ -3775,10 +3706,12 @@ def _apply_enrichment_delta(
     """Apply the enrichment delta to input facts and reconstruct transcript.
 
     Returns ``(new_facts, updated_transcript, bindings, counts)``.  On
-    parse failure ``new_facts`` is ``None`` so the caller can fail-open
-    (matches the prior ``_filter_with_sota`` contract: when SOTA's
-    response is unparseable, ``_sota_pipeline`` keeps the pre-enrichment
-    facts and logs a warning).  ``counts`` is a small diagnostic dict
+    parse failure ``new_facts`` is ``None``, which :func:`_filter_with_sota`
+    reports to ``_sota_pipeline`` as a failed ``sota_enrich`` phase and
+    which that call site turns into a raised
+    :class:`ExtractionFailed` — an unparseable enrichment response fails
+    the cycle rather than keeping the pre-enrichment facts.
+    ``counts`` is a small diagnostic dict
     (``add_count`` / ``modify_count`` / ``drop_count`` / ``bindings_count``)
     that callers persist into ``graph.diagnostics``; on parse failure
     every count is zero.

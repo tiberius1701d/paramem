@@ -210,8 +210,10 @@ def run_graph_enrichment(
 
     Every cloud call this function makes runs through the SAME
     anonymize -> SOTA -> de-anonymize contract as session-tier
-    extraction (:func:`~paramem.graph.extractor._sota_pipeline`), via
-    the shared primitives in :mod:`paramem.graph.placeholders`. The
+    extraction (``paramem.graph.extractor.SESSION_EXTRACT``: the
+    ``sota_pipeline`` composite anonymizes and enriches, its
+    ``deanonymize`` sibling substitutes back), via the shared
+    primitives in :mod:`paramem.graph.placeholders`. The
     cumulative fold graph carries no entity types of its own (registry
     SPO triples have none; the merger's fallback for an untyped
     relation endpoint is ``entity_type="concept"``), so this function
@@ -611,14 +613,14 @@ def run_graph_enrichment(
             if result is None:
                 logger.warning("graph_enrichment: SOTA call returned None for chunk")
                 continue
-            new_rels, same_as_pairs, _raw = result
-            # A rejected totality verdict returns ([], [], raw) —
-            # indistinguishable from a legitimately empty response by
-            # shape alone.  ``_graph_enrich_with_sota`` wrote the
-            # rejection onto ``_chunk_session_graph.diagnostics`` (via
-            # ``deanonymize_facts`` -> ``_check_mapping_totality``) —
-            # read it back before the throwaway graph is discarded.
-            if _chunk_session_graph.diagnostics.get("sota_pending_orphans"):
+            new_rels, same_as_pairs, _raw, totality_verdict = result
+            # A rejected totality verdict returns ([], [], raw, verdict) —
+            # the relation/same_as lists alone are indistinguishable from
+            # a legitimately empty response, so the VERDICT is what
+            # discriminates the two.  It arrives as a returned value, not
+            # as a mutation on ``_chunk_session_graph.diagnostics`` read
+            # back before the throwaway graph is discarded.
+            if totality_verdict:
                 totality_rejected_chunks += 1
         except VramExhausted:
             # Not a chunk-level extraction failure — the caller (the

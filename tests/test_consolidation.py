@@ -213,7 +213,6 @@ class TestExtractionPathParity:
                 },
             ),
             (True, {"extraction_plausibility_stage": "anon"}),
-            (True, {"extraction_ha_validation": False}),
         ],
     )
     def test_parity_kwargs_identical(
@@ -12607,7 +12606,7 @@ class TestSameAsSpeakerPairGuard:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=([], [["speaker0", "speaker0"]], "raw"),
+            return_value=([], [["speaker0", "speaker0"]], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -12666,7 +12665,7 @@ class TestSameAsSpeakerPairGuard:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=([], [["speaker0", "speaker1"]], "raw"),
+            return_value=([], [["speaker0", "speaker1"]], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -12720,7 +12719,7 @@ class TestSameAsSpeakerPairGuard:
         # is allowed and same_as_merges == 1.
         with patch(
             "paramem.training.graph_enrich._graph_enrich_with_sota",
-            return_value=([], [["Alexander", "Alex"]], "raw"),
+            return_value=([], [["Alexander", "Alex"]], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
 

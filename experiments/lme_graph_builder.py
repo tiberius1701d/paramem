@@ -429,8 +429,6 @@ def main() -> None:
                     session_id=session.session_id,
                     speaker_id=session.speaker_id,
                     speaker_name=session.speaker_name,
-                    ha_context=None,
-                    ha_validation=False,
                     noise_filter=extraction_noise_filter,
                     noise_filter_model="claude-sonnet-4-6",
                     noise_filter_endpoint=None,

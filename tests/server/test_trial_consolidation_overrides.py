@@ -66,7 +66,6 @@ def _make_state(tmp_path: Path) -> dict:
         "background_trainer": None,
         "loop": None,
         "session_buffer": None,
-        "ha_context": None,
         "speaker_store": None,
     }
 

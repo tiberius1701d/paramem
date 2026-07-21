@@ -272,7 +272,6 @@ consolidation:
   extraction_max_tokens: 8192  # output-token budget — must match server.yaml.example to avoid silent truncation in simulate-mode probes (gated by tests/server/test_config_parity.py)
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap — must match server.yaml.example (parity-gated)
   calibrate_endpoint_enabled: false  # opt-in dev tool; off in tests by default
-  extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: anthropic  # dev-test posture: exercise SOTA enrichment code paths. Cloud calls fall through gracefully when ANTHROPIC_API_KEY is unset.
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
   extraction_noise_filter_endpoint: ""  # custom endpoint for OpenAI-compatible providers ("" = use the provider's default endpoint)

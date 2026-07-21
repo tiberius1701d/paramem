@@ -362,14 +362,14 @@ class TestBackwardCompat:
         list — same dict, additive only."""
         graph = _empty_graph()
         graph.diagnostics["anonymize"] = "ok"
-        graph.diagnostics["plausibility_dropped"] = 3
+        graph.diagnostics["plausibility_dropped_deanon"] = 3
         with extraction_trace() as trace:
             with phase_trace("anonymize"):
                 pass
             trace.attach_to(graph)
         # Flat keys preserved.
         assert graph.diagnostics["anonymize"] == "ok"
-        assert graph.diagnostics["plausibility_dropped"] == 3
+        assert graph.diagnostics["plausibility_dropped_deanon"] == 3
         # Phase list present.
         assert isinstance(graph.diagnostics["phases"], list)
         assert len(graph.diagnostics["phases"]) == 1
@@ -435,7 +435,6 @@ class TestExtractGraphStopPhase:
                 speaker_id="speaker0",
                 speaker_name="Alex",
                 validate=False,  # don't try the SOTA pipeline
-                ha_validation=False,
                 scrub={"person name"},
             )
 
@@ -482,7 +481,6 @@ class TestExtractGraphStopPhase:
                 speaker_id="speaker0",
                 speaker_name="Alex",
                 validate=False,
-                ha_validation=False,
                 scrub={"person name"},
             )
 
@@ -534,7 +532,6 @@ class TestExtractGraphStopPhase:
                 session_id="test-stop-phase-union",
                 speaker_id="speaker0",
                 validate=False,
-                ha_validation=False,
                 scrub={"person name"},
             )
 

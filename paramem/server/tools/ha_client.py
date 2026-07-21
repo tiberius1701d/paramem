@@ -376,61 +376,6 @@ class HAClient:
             logger.error("HA services query failed: %s", e)
             return None
 
-    def get_home_context(self) -> dict:
-        """Get HA home configuration for extraction validation.
-
-        Returns location name, timezone, coordinates, area names, and
-        zone entities (home, work, etc.). Used as ground truth to validate
-        extracted location facts.
-        """
-        context = {
-            "location_name": "",
-            "timezone": "",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "areas": [],
-            "zones": [],
-        }
-
-        # HA config — home location, timezone
-        try:
-            resp = self._get_client().get("/api/config")
-            resp.raise_for_status()
-            config = resp.json()
-            context["location_name"] = config.get("location_name", "")
-            context["timezone"] = config.get("time_zone", "")
-            context["latitude"] = config.get("latitude", 0.0)
-            context["longitude"] = config.get("longitude", 0.0)
-        except (httpx.HTTPError, httpx.RequestError) as e:
-            logger.warning("Failed to read HA config: %s", e)
-
-        # Zone entities (home, work, school, etc.)
-        if self._raw_states:
-            for state in self._raw_states:
-                entity_id = state.get("entity_id", "")
-                if entity_id.startswith("zone."):
-                    name = state.get("attributes", {}).get("friendly_name", "")
-                    if name:
-                        context["zones"].append(name)
-
-        # Area names from entity graph
-        if self._raw_states:
-            areas = set()
-            for state in self._raw_states:
-                area = state.get("attributes", {}).get("area_id", "")
-                if area:
-                    areas.add(area.replace("_", " ").title())
-            context["areas"] = sorted(areas)
-
-        logger.info(
-            "HA home context: location=%s, timezone=%s, %d zones, %d areas",
-            context["location_name"],
-            context["timezone"],
-            len(context["zones"]),
-            len(context["areas"]),
-        )
-        return context
-
     def close(self):
         """Close the pooled connection."""
         if self._client and not self._client.is_closed:
