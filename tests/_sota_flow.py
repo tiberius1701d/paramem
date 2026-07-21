@@ -55,6 +55,8 @@ def run_sota_stages(
     correction_entity_types: set[str] | frozenset[str] | None = None,
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
+    plausibility_model: str = "claude-sonnet-4-6",
+    plausibility_endpoint: str | None = None,
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     model_alias: str | None = None,
@@ -107,6 +109,8 @@ def run_sota_stages(
         noise_filter_endpoint=noise_filter_endpoint,
         plausibility_judge=plausibility_judge,
         plausibility_stage=plausibility_stage,
+        plausibility_model=plausibility_model,
+        plausibility_endpoint=plausibility_endpoint,
         scrub=scrub,
         correction_entity_types=correction_entity_types,
     )

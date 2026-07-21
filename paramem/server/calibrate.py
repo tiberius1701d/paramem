@@ -1085,9 +1085,13 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
 
     Thin wrapper around :func:`_run_calibration`: ``guard`` performs the
     turn-marking + prompt-file checks (zero inference cost on failure),
-    then resolves the SOTA provider config and API key — a missing
-    provider config or unset key surfaces as HTTP 400 before any cloud
-    call is made. ``dispatch`` runs
+    then asks the shared cloud-admission component
+    (:func:`~paramem.utils.cloud_admission.evaluate_cloud_egress`) whether
+    egress is allowed at all — the ``sota_enabled`` master switch being
+    off, a missing provider/model, an unset key or a missing endpoint each
+    surface as HTTP 400 naming every unmet term, before any cloud call is
+    made.  This endpoint is operator-triggered, so it fails LOUDLY where
+    the consolidation-cycle sites skip silently. ``dispatch`` runs
     :func:`~paramem.graph.extractor._filter_with_sota` (the SAME function
     :func:`~paramem.graph.extractor._sota_pipeline` calls every
     consolidation cycle) directly — no mirrored cloud-call
@@ -1107,11 +1111,8 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
     snapshot) for response-shape consistency with every other calibration
     stage, even though the call itself is cloud-side and touches no VRAM.
     """
-    from paramem.graph.extractor import (
-        _DEFAULT_FILTER_MAX_TOKENS,
-        _filter_with_sota,
-        _resolve_sota_api_key,
-    )
+    from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, _filter_with_sota
+    from paramem.utils.cloud_admission import evaluate_cloud_egress
 
     filename = req.enrichment_prompt_filename or "sota_enrichment.txt"
     max_tokens = (
@@ -1125,24 +1126,27 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
         _require_turn_marked_transcript(req.transcript)
         _ensure_prompt_exists(req.prompts_dir, filename)
         cfg = state["config"]
-        provider = cfg.consolidation.extraction_noise_filter
-        if not provider:
+        verdict = evaluate_cloud_egress(
+            sota_enabled=cfg.consolidation.sota_enabled,
+            provider=cfg.consolidation.extraction_noise_filter,
+            model=cfg.consolidation.extraction_noise_filter_model,
+            endpoint=cfg.consolidation.extraction_noise_filter_endpoint or None,
+        )
+        if not verdict.permitted:
             raise HTTPException(
                 status_code=400,
-                detail="SOTA enrichment provider not configured — set "
-                "consolidation.extraction_noise_filter in server.yaml.",
+                detail=(
+                    "Cloud egress refused for SOTA enrichment: "
+                    + "; ".join(verdict.gaps)
+                    + ". Fix consolidation.sota_enabled / "
+                    "consolidation.extraction_noise_filter* in server.yaml, or set "
+                    "the provider's key env var."
+                ),
             )
-        api_key = _resolve_sota_api_key(provider)
-        if not api_key:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No API key for SOTA provider {provider!r} "
-                f"(set the provider's key env var).",
-            )
-        resolved["provider"] = provider
-        resolved["filter_model"] = cfg.consolidation.extraction_noise_filter_model
-        resolved["endpoint"] = cfg.consolidation.extraction_noise_filter_endpoint or None
-        resolved["api_key"] = api_key
+        resolved["provider"] = verdict.provider
+        resolved["filter_model"] = verdict.model
+        resolved["endpoint"] = verdict.endpoint
+        resolved["api_key"] = verdict.api_key
 
     def dispatch() -> tuple[Any, dict]:
         facts, updated_transcript, bindings, raw, info = _filter_with_sota(

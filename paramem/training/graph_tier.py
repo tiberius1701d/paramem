@@ -20,9 +20,10 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Protocol
 
-from paramem.graph.extractor import _resolve_sota_api_key, normalize_predicates
+from paramem.graph.extractor import normalize_predicates
 from paramem.graph.merger import GraphMerger, min_nonempty
 from paramem.training import graph_enrich
+from paramem.utils.cloud_admission import evaluate_cloud_egress
 from paramem.utils.identity import canonical
 
 if TYPE_CHECKING:
@@ -122,8 +123,10 @@ class GraphTierRefiner:
                 evaluated by the caller before any guard in this class can
                 run. So the caller hands over the *read*, not its result, and
                 each pass invokes it only past its own guards
-                (:meth:`run_normalization` inside the ``sota_enabled``
-                branch; :meth:`run_enrichment` threads it unresolved into
+                (:meth:`run_normalization` past its ``no_model``/``floor``
+                skips, immediately before the cloud-admission verdict that
+                selects the SOTA or local engine; :meth:`run_enrichment`
+                threads it unresolved into
                 :func:`~paramem.training.graph_enrich.run_graph_enrichment`,
                 which resolves it past its own ``no_model``/``floor`` skips).
                 This holds for a refiner constructed once and reused across
@@ -206,11 +209,12 @@ class GraphTierRefiner:
         Engine selection (resolved once before the primitive call):
 
         * **Local** (default): ``model`` + ``tokenizer`` from this refiner.
-        * **SOTA**: when ``sota_enabled`` is ``True`` AND the extraction
-          config's ``noise_filter`` is set AND
-          :func:`~paramem.graph.extractor._resolve_sota_api_key` resolves a
-          non-empty API key for that provider. Falls back to local
-          silently when credentials are absent; normalization still runs.
+        * **SOTA**: when
+          :func:`~paramem.utils.cloud_admission.evaluate_cloud_egress` —
+          the one shared cloud-admission component — permits egress for
+          ``sota_enabled`` plus the extraction config's ``noise_filter``
+          provider/model/endpoint. Falls back to local silently when it
+          refuses; normalization still runs.
 
         The model receives the predicate list for each candidate group via the
         ``{predicates_json}`` slot in ``predicate_normalization.txt`` and returns the
@@ -310,28 +314,34 @@ class GraphTierRefiner:
             _flat_relations.append({"subject": _u, "predicate": _pred, "object": _v})
             _so_groups.setdefault((_can_s, _can_o), {}).setdefault(_can_pred, []).append(_info)
 
-        # Resolve which backend to use: SOTA when sota_enabled + provider + api_key
-        # are all present; fall back to local silently when credentials are absent
-        # (local model is always present; normalization still runs on the knob).
+        # Resolve which backend to use via the shared cloud-admission verdict;
+        # fall back to local SILENTLY (info-level) when it refuses.  The
+        # fallback is deliberate: the local model is always present, so
+        # normalization still runs on the operator's knob rather than being
+        # skipped because a cloud credential is absent.
         engine_kwargs: dict = {"model": self.model, "tokenizer": self.tokenizer}
-        if self._sota_enabled:
-            ext_cfg = self._extraction_config_provider()
-            provider = ext_cfg.noise_filter
-            api_key = _resolve_sota_api_key(provider) or ""
-            if provider and api_key:
-                engine_kwargs = {
-                    "sota": {
-                        "api_key": api_key,
-                        "provider": provider,
-                        "filter_model": ext_cfg.noise_filter_model,
-                        "endpoint": ext_cfg.noise_filter_endpoint or None,
-                    }
+        ext_cfg = self._extraction_config_provider()
+        verdict = evaluate_cloud_egress(
+            sota_enabled=self._sota_enabled,
+            provider=ext_cfg.noise_filter,
+            model=ext_cfg.noise_filter_model,
+            endpoint=ext_cfg.noise_filter_endpoint or None,
+        )
+        if verdict.permitted:
+            engine_kwargs = {
+                "sota": {
+                    "api_key": verdict.api_key,
+                    "provider": verdict.provider,
+                    "filter_model": verdict.model,
+                    "endpoint": verdict.endpoint,
                 }
-                logger.info("graph_normalization: engine=SOTA provider=%s", provider)
-            else:
-                logger.info(
-                    "graph_normalization: sota_enabled but no provider/api_key -- engine=local"
-                )
+            }
+            logger.info("graph_normalization: engine=SOTA provider=%s", verdict.provider)
+        else:
+            logger.info(
+                "graph_normalization: engine=local — cloud egress refused (%s)",
+                "; ".join(verdict.gaps),
+            )
 
         # Delegate model calls to normalize_predicates.
         # GC disable/enable is handled inside normalize_predicates.

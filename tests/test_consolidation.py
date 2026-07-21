@@ -4660,6 +4660,16 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop._indexed_ep_interim = {}
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
+        # ``GraphTierRefiner`` reads the live ExtractionConfig through
+        # ``loop._current_extraction_config`` to answer the cloud-admission
+        # question, so an ``object.__new__`` stub must carry the attribute
+        # that method reads.
+        from types import SimpleNamespace as _SNS
+
+        from paramem.graph.extraction_pipeline import ExtractionConfig as _ExtCfg
+
+        loop.extraction = _SNS(config=_ExtCfg(scrub=set()))
+
         return loop
 
     @staticmethod
@@ -12534,6 +12544,10 @@ class TestSameAsSpeakerPairGuard:
             extraction_noise_filter="anthropic",
             extraction_noise_filter_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
+            # Graph-tier enrichment is cloud egress: the shared cloud-admission
+            # verdict's first term is the master switch, so it must be ON for
+            # this test to reach a (mocked) SOTA call.
+            sota_enabled=True,
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
         for tier in ("episodic", "semantic", "procedural"):
@@ -13710,6 +13724,16 @@ class TestRunGraphNormalizationApply:
         for tier in ("episodic", "semantic", "procedural"):
             store.load_registry(tier, KeyRegistry())
         loop.store = store
+        # ``GraphTierRefiner`` reads the live ExtractionConfig through
+        # ``loop._current_extraction_config`` to answer the cloud-admission
+        # question, so an ``object.__new__`` stub must carry the attribute
+        # that method reads.
+        from types import SimpleNamespace as _SNS
+
+        from paramem.graph.extraction_pipeline import ExtractionConfig as _ExtCfg
+
+        loop.extraction = _SNS(config=_ExtCfg(scrub=set()))
+
         return loop
 
     # ---------------------------------------------------------------------------

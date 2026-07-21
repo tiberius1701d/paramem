@@ -53,6 +53,12 @@ from paramem.graph.schema_config import (
 from paramem.models.loader import adapt_messages, base_model_inference
 from paramem.server.session_buffer import SessionBuffer
 from paramem.server.vram_guard import vram_scope
+from paramem.utils.cloud_admission import (
+    OPENAI_COMPAT_ENDPOINTS,
+    OPENAI_COMPAT_PROVIDERS,
+    PROVIDER_KEY_ENV,
+    evaluate_cloud_egress,
+)
 from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
@@ -716,6 +722,34 @@ def _stage_second_order_extract(ctx: StageContext, state: StageState) -> StageSt
     return StageState(graph=graph)
 
 
+def _session_egress_permitted(ctx: StageContext) -> bool:
+    """``sota_pipeline``'s cloud-admission gate, as a flow predicate.
+
+    Routes the session-tier question through the one shared component
+    (:func:`~paramem.utils.cloud_admission.evaluate_cloud_egress`) rather
+    than restating its terms as a boolean expression in the stage spec.
+    Logs every unmet term in a single line when the answer is no — a flow
+    ``enabled_when`` skip is otherwise silent, and the operator whose
+    ``sota_enabled`` is on but whose key is unset needs to be told which
+    term failed.
+
+    Args:
+        ctx: The run-constant flow context.
+
+    Returns:
+        ``True`` when a cloud enrichment call may be placed for this run.
+    """
+    verdict = evaluate_cloud_egress(
+        sota_enabled=ctx.sota_enabled,
+        provider=ctx.noise_filter,
+        model=ctx.noise_filter_model,
+        endpoint=ctx.noise_filter_endpoint,
+    )
+    if not verdict.permitted:
+        logger.info("Skipping SOTA enrichment — %s", "; ".join(verdict.gaps))
+    return verdict.permitted
+
+
 def _stage_sota_pipeline(ctx: StageContext, state: StageState) -> StageState:
     """``sota_pipeline`` stage body — the composite front of the cloud arc.
 
@@ -735,10 +769,11 @@ def _stage_sota_pipeline(ctx: StageContext, state: StageState) -> StageState:
     ``terminal_when`` — so the siblings do not run, matching the plain
     ``return graph`` those paths used to perform.
 
-    Gated by ``ctx.validate and ctx.sota_enabled and ctx.noise_filter``
-    (``sota_enabled`` is the master gate; ``noise_filter`` is the provider
-    identity — the flow's ``enabled_when``) and ``state.graph.relations``
-    being non-empty (the flow's ``applies_when``).
+    Gated by ``ctx.validate`` plus :func:`_session_egress_permitted` (the
+    shared cloud-admission verdict over ``sota_enabled`` / provider /
+    model / key / endpoint — the flow's ``enabled_when``) and
+    ``state.graph.relations`` being non-empty (the flow's
+    ``applies_when``).
     """
     return _sota_pipeline(
         state.graph,
@@ -750,6 +785,8 @@ def _stage_sota_pipeline(ctx: StageContext, state: StageState) -> StageState:
         endpoint=ctx.noise_filter_endpoint,
         plausibility_judge=ctx.plausibility_judge,
         plausibility_stage=ctx.plausibility_stage,
+        plausibility_model=ctx.plausibility_model,
+        plausibility_endpoint=ctx.plausibility_endpoint,
         speaker_name=ctx.speaker_name,
         speaker_id=ctx.speaker_id,
         scrub=ctx.scrub,
@@ -1066,7 +1103,7 @@ SESSION_EXTRACT: list[StageSpec] = [
                 "empty_cause",
             }
         ),
-        enabled_when=lambda c: bool(c.validate and c.sota_enabled and c.noise_filter),
+        enabled_when=lambda c: bool(c.validate) and _session_egress_permitted(c),
         applies_when=lambda s: bool(s.graph.relations),
         # Every exit that does NOT reach the hand-over point leaves
         # ``facts`` empty: the unsupported-provider and missing-config
@@ -1132,6 +1169,8 @@ def extract_graph(
     speaker_name: str | None = None,
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
+    plausibility_model: str = "claude-sonnet-4-6",
+    plausibility_endpoint: str | None = None,
     *,
     scrub: set[str] | frozenset[str],
     correction_entity_types: set[str] | frozenset[str] | None = None,
@@ -1178,9 +1217,16 @@ def extract_graph(
         validate: Run SOTA pipeline pass 3 (default True).
         noise_filter: SOTA provider for noise filtering ("" = disabled).
         plausibility_judge: Plausibility filter judge ("auto"=local, "off"=disabled,
-            or a SOTA provider name like "claude" for cloud judging at anon stage).
+            or a provider name from
+            :data:`~paramem.utils.cloud_admission.PROVIDER_KEY_ENV` — e.g.
+            "anthropic" — for cloud judging at anon stage).
         plausibility_stage: When to run plausibility ("deanon"=after de-anon,
             "anon"=on anonymized data with SOTA judge).
+        plausibility_model: Model id the cloud judge runs. Ignored when
+            ``plausibility_judge`` is "auto" or "off".
+        plausibility_endpoint: Endpoint override for a self-hosted
+            OpenAI-compatible judge. ``None`` accepts the provider's
+            default; ignored for native-SDK providers.
         scrub: PII-vocabulary hints (``SanitizationConfig.scrub``) forwarded
             to the SOTA pipeline's local anonymizer call — the prompt is the
             sole scope authority (see :func:`anonymize_with_local_model`).
@@ -1274,6 +1320,8 @@ def extract_graph(
                 noise_filter_endpoint=noise_filter_endpoint,
                 plausibility_judge=plausibility_judge,
                 plausibility_stage=plausibility_stage,
+                plausibility_model=plausibility_model,
+                plausibility_endpoint=plausibility_endpoint,
                 scrub=scrub,
                 correction_entity_types=correction_entity_types,
             )
@@ -1969,21 +2017,15 @@ def _normalize_extraction(data: dict) -> dict:
 # expanding scope at the same time as filtering, producing inflated counts
 # and self-referential schema artifacts.
 
-# Registry of SOTA plausibility validators that see only anonymized data.
-# Keyed by the provider name callers pass as `plausibility_judge`.
-# "auto" and "off" are NOT in this registry — they are handled by the
-# deanon-stage (local judge) path; checking `judge in _PLAUSIBILITY_VALIDATORS`
-# before dispatching to the cloud prevents the "auto" crash on
-# `PROVIDER_KEY_ENV.get("auto")`.
-#
-_PLAUSIBILITY_VALIDATORS: dict[str, dict] = {
-    "claude": {
-        "type": "cloud",
-        "provider": "anthropic",
-        "model_id": "claude-sonnet-4-6",
-        "key_env": "ANTHROPIC_API_KEY",
-    },
-}
+# The cloud plausibility judge — a judge that only ever sees anonymized
+# data — dispatches on the SAME provider registry as enrichment
+# (PROVIDER_KEY_ENV in paramem.utils.cloud_admission).  ``plausibility_judge``
+# names a provider from that registry; ``plausibility_model`` and
+# ``plausibility_endpoint`` name the model and (for a self-hosted
+# OpenAI-compatible host) the URL.  "auto" and "off" are deliberately NOT
+# providers — they select the local deanon-stage judge and no judge
+# respectively, and membership in PROVIDER_KEY_ENV is what keeps them from
+# ever reaching a key lookup.
 
 
 def _fallback_plausibility_on_raw(
@@ -2123,6 +2165,8 @@ def _sota_pipeline(
     endpoint: str | None = None,
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
+    plausibility_model: str = "claude-sonnet-4-6",
+    plausibility_endpoint: str | None = None,
     speaker_name: str | None = None,
     *,
     scrub: set[str] | frozenset[str],
@@ -2182,9 +2226,13 @@ def _sota_pipeline(
     Plausibility judges:
     - "auto"  → local model at deanon stage (zero cloud cost, privacy-safe)
     - "off"   → disable plausibility entirely
-    - any SOTA provider name (e.g. "claude") → cloud judge at anon stage
-    - "anthropic", "openai", "google", etc. → cloud judge at anon stage
-      (must be combined with plausibility_stage="anon" to avoid PII exfiltration)
+    - any provider name in
+      :data:`~paramem.utils.cloud_admission.PROVIDER_KEY_ENV`
+      (``"anthropic"``, ``"openai"``, ``"google"``, …) → cloud judge at
+      anon stage, running ``plausibility_model`` at
+      ``plausibility_endpoint`` (must be combined with
+      ``plausibility_stage="anon"`` to avoid PII exfiltration — the server
+      config rejects the ``"deanon"`` pairing at load time)
 
     A calibration :func:`~paramem.graph.phase_trace.stop_at` request is
     read off :func:`~paramem.graph.phase_trace.chain_stopped` — a
@@ -2192,28 +2240,21 @@ def _sota_pipeline(
     scope around this call, rather than a parameter threaded into this
     function.
     """
-    import os
-
-    key_env_name = PROVIDER_KEY_ENV.get(provider)
-    if key_env_name is None:
-        logger.warning("Unsupported SOTA provider %r — skipping enrichment", provider)
+    # Admission gate — shared with graph-tier enrichment, predicate
+    # normalization and /calibrate/enrich.  ``sota_enabled=True`` is the
+    # literal truth at this point: the master switch is the flow's
+    # ``enabled_when`` term (:func:`_session_egress_permitted`), which is
+    # the only way this function is reached in production.  Re-checking
+    # the remaining terms here keeps the composite safe for a direct
+    # caller that has no StageContext.
+    verdict = evaluate_cloud_egress(
+        sota_enabled=True, provider=provider, model=filter_model, endpoint=endpoint
+    )
+    if not verdict.permitted:
+        logger.info("Skipping SOTA enrichment — %s", "; ".join(verdict.gaps))
         return StageState(graph=graph)
-    api_key = _resolve_sota_api_key(provider) or ""
-    # Collect ALL config gaps before returning so a single warning surfaces
-    # everything missing — avoids the "fix the key, then discover the endpoint
-    # was also missing on the next run" loop.
-    gaps = []
-    if not api_key:
-        gaps.append(f"{key_env_name} env var")
-    if (
-        provider in OPENAI_COMPAT_PROVIDERS
-        and not endpoint
-        and not OPENAI_COMPAT_ENDPOINTS.get(provider)
-    ):
-        gaps.append(f"endpoint for provider {provider!r}")
-    if gaps:
-        logger.info("Skipping SOTA enrichment — missing config: %s", ", ".join(gaps))
-        return StageState(graph=graph)
+    api_key = verdict.api_key
+    endpoint = verdict.endpoint
 
     original_count = len(graph.relations)
     # Which site emptied the working fact set, if any. Recorded onto the
@@ -2553,30 +2594,30 @@ def _sota_pipeline(
     # Step 3a: Plausibility on anonymized data (SOTA judge, stage="anon").
     # Only runs when: explicit SOTA provider, plausibility_stage=="anon",
     # and enriched_anon is non-empty.
-    # Guard: use `plausibility_judge in _PLAUSIBILITY_VALIDATORS` (NOT != "off") —
-    # "auto" is not in the registry and would crash PROVIDER_KEY_ENV.get("auto").
-    if (
-        plausibility_stage == "anon"
-        and plausibility_judge in _PLAUSIBILITY_VALIDATORS
-        and enriched_anon
-    ):
+    # Guard: use `plausibility_judge in PROVIDER_KEY_ENV` (NOT != "off") —
+    # "auto" is not a provider and would crash PROVIDER_KEY_ENV.get("auto").
+    if plausibility_stage == "anon" and plausibility_judge in PROVIDER_KEY_ENV and enriched_anon:
         with phase_trace("anon_plausibility") as t:
-            pv_info = _PLAUSIBILITY_VALIDATORS[plausibility_judge]
-            pv_key = os.environ.get(pv_info["key_env"], "")
-            if not pv_key:
-                t.set_outcome("skipped", reason=f"no API key for {plausibility_judge!r}")
+            judge_verdict = evaluate_cloud_egress(
+                sota_enabled=True,
+                provider=plausibility_judge,
+                model=plausibility_model,
+                endpoint=plausibility_endpoint,
+            )
+            if not judge_verdict.permitted:
+                reason = "; ".join(judge_verdict.gaps)
+                t.set_outcome("skipped", reason=reason)
                 logger.warning(
-                    "Anon-stage plausibility: no API key for %r — skipping",
-                    plausibility_judge,
+                    "Anon-stage plausibility (%s) skipped — %s", plausibility_judge, reason
                 )
             else:
                 plaus_facts, plaus_raw = _plausibility_filter_with_sota(
                     enriched_anon,
-                    pv_key,
-                    provider=pv_info["provider"],
-                    filter_model=pv_info["model_id"],
+                    judge_verdict.api_key,
+                    provider=judge_verdict.provider,
+                    filter_model=judge_verdict.model,
                     anon_transcript=updated_anon_transcript or anon_transcript,
-                    endpoint=pv_info.get("endpoint"),
+                    endpoint=judge_verdict.endpoint,
                     max_tokens=max_tokens,
                     temperature=_DEFAULT_FILTER_TEMPERATURE,
                     prompts_dir=prompts_dir,
@@ -2678,48 +2719,12 @@ def _sota_pipeline(
 # cloud_egress.anonymize_for_cloud; nothing in this module calls it
 # directly any more.
 
-# Public provider metadata — single source of truth, reused by the
-# production server so callers dispatch by provider consistently with
-# this module.
-OPENAI_COMPAT_ENDPOINTS = {
-    "openai": "https://api.openai.com/v1/chat/completions",
-    "groq": "https://api.groq.com/openai/v1/chat/completions",
-    "mistral": "https://api.mistral.ai/v1/chat/completions",
-}
-OPENAI_COMPAT_PROVIDERS = set(OPENAI_COMPAT_ENDPOINTS) | {"ollama"}
-
-# Env var holding the API key for each supported provider. Extended whenever
-# a new provider is added to _filter_with_sota.
-PROVIDER_KEY_ENV = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "google": "GOOGLE_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "mistral": "MISTRAL_API_KEY",
-    "ollama": "OLLAMA_API_KEY",
-}
-
-
-def _resolve_sota_api_key(provider: str) -> str | None:
-    """Resolve the API key for a SOTA provider from its configured env var.
-
-    Looks ``provider`` up in :data:`PROVIDER_KEY_ENV` for the env var name,
-    then reads that var from the environment.  Returns ``None`` when the
-    provider is not in the registry OR its env var is unset/empty — the
-    two cases are indistinguishable from this return value alone.
-    :func:`_sota_pipeline` still branches on
-    ``PROVIDER_KEY_ENV.get(provider) is None`` directly where it needs to
-    log a distinct "unsupported provider" warning; this helper only does
-    the env lookup, shared so the resolution logic is not duplicated at
-    each call site (:func:`_sota_pipeline`,
-    :func:`~paramem.server.calibrate.calibrate_enrich`).
-    """
-    import os
-
-    key_env_name = PROVIDER_KEY_ENV.get(provider)
-    if key_env_name is None:
-        return None
-    return os.environ.get(key_env_name) or None
+# The provider tables (PROVIDER_KEY_ENV, OPENAI_COMPAT_ENDPOINTS,
+# OPENAI_COMPAT_PROVIDERS) and the key resolver now live in
+# paramem.utils.cloud_admission (imported above), alongside
+# evaluate_cloud_egress — the one place the "may we reach a cloud LLM,
+# and with what credentials?" decision is computed.  They are imported
+# here for dispatch (_sota_call / _filter_openai_compat), not owned here.
 
 
 # The three SOTA system prompts below (``sota_enrichment_system.txt``,

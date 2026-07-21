@@ -16,7 +16,7 @@ Two public objects::
 
     @dataclass
     class ExtractionConfig:
-        # 12 tunables, sourced from configs/server.yaml::consolidation.extraction_*
+        # tunables, sourced from configs/server.yaml::consolidation.extraction_*
 
     class ExtractionPipeline:
         def __init__(self, model, tokenizer, *, config, prompts_dir): ...
@@ -89,6 +89,11 @@ class ExtractionConfig:
     sota_enabled: bool = False  # master gate for ALL SOTA; mirrors ConsolidationConfig.sota_enabled
     plausibility_judge: str = "auto"
     plausibility_stage: str = "deanon"
+    # Model + endpoint the cloud plausibility judge runs, when
+    # ``plausibility_judge`` names a provider rather than "auto"/"off".
+    # ``None`` endpoint accepts the provider's default.
+    plausibility_model: str = "claude-sonnet-4-6"
+    plausibility_endpoint: str | None = None
     # Required, no default (kw_only so it can sit after defaulted fields
     # without violating dataclass field ordering) — the model's
     # anonymizer prompt is the sole scope authority and the single
@@ -237,6 +242,8 @@ class ExtractionPipeline:
             speaker_name=overrides.get("speaker_name"),
             plausibility_judge=pick("plausibility_judge", cfg.plausibility_judge),
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),
+            plausibility_model=pick("plausibility_model", cfg.plausibility_model),
+            plausibility_endpoint=pick("plausibility_endpoint", cfg.plausibility_endpoint),
             scrub=pick("scrub", cfg.scrub),
             correction_entity_types=pick("correction_entity_types", cfg.correction_entity_types),
             speaker_id=_require_speaker_id(overrides),

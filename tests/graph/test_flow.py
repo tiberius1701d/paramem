@@ -67,6 +67,8 @@ def _make_ctx(**overrides) -> StageContext:
         noise_filter_endpoint=None,
         plausibility_judge="off",
         plausibility_stage="deanon",
+        plausibility_model="",
+        plausibility_endpoint=None,
         scrub=frozenset(),
         correction_entity_types=None,
     )

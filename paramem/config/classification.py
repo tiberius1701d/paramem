@@ -106,6 +106,8 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.extraction_noise_filter_endpoint": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_plausibility_judge": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_plausibility_stage": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_plausibility_model": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_plausibility_endpoint": Tier.PIPELINE_ALTERING,
     "consolidation.training_temp_limit": Tier.PIPELINE_ALTERING,
     "consolidation.training_temp_check_interval": Tier.PIPELINE_ALTERING,
     "consolidation.quiet_hours_mode": Tier.PIPELINE_ALTERING,

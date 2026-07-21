@@ -182,6 +182,10 @@ def create_consolidation_loop(
         extraction_noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint,
         extraction_plausibility_judge=config.consolidation.extraction_plausibility_judge,
         extraction_plausibility_stage=config.consolidation.extraction_plausibility_stage,
+        extraction_plausibility_model=config.consolidation.extraction_plausibility_model,
+        extraction_plausibility_endpoint=(
+            config.consolidation.extraction_plausibility_endpoint or None
+        ),
         state_provider=state_provider,
         # Thermal fields live on ConsolidationScheduleConfig
         # (config.consolidation), NOT on ConsolidationConfig (which the loop

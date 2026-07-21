@@ -279,7 +279,7 @@ consolidation:
   #   * Zero cloud cost. Privacy-safe (real names stay local).
   #   * Cross-family by construction (local model != cloud enricher).
   #
-  # Alternative: SOTA judge at the `anon` stage (e.g. `claude`).
+  # Alternative: SOTA judge at the `anon` stage (e.g. `anthropic`).
   #   * Higher judgment quality. Paid.
   #   * Runs on anonymized facts + anonymized transcript — cloud-safe.
   #   * IMPORTANT: pick a family DIFFERENT from the enricher to avoid
@@ -288,8 +288,12 @@ consolidation:
   #
   # `auto` => use the same local model that performed extraction.
   # `off`  => disable plausibility entirely (not recommended).
+  # The judge names a cloud PROVIDER (anthropic|openai|google|groq|mistral|ollama),
+  # not a model — the model and endpoint are the two keys below.
   extraction_plausibility_judge: auto
   extraction_plausibility_stage: deanon         # "anon" | "deanon"
+  extraction_plausibility_model: claude-sonnet-4-6  # model the cloud judge runs; ignored when the judge is auto|off
+  extraction_plausibility_endpoint: ""  # custom endpoint for a self-hosted OpenAI-compatible judge ("" = use the provider's default endpoint)
 
   # Local, privacy-preserving STT spelling repair (paramem/graph/entity_correction.py).
   # Runs entirely on-device on the anonymization *reverse map*: misheard real names

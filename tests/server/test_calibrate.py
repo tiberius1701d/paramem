@@ -946,6 +946,7 @@ class TestCalibrateEnrich:
         import unittest.mock as _mock
 
         state = _state_enabled()
+        state["config"].consolidation.sota_enabled = True
         state["config"].consolidation.extraction_noise_filter = "anthropic"
         state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_noise_filter_endpoint = ""
@@ -965,6 +966,7 @@ class TestCalibrateEnrich:
         import unittest.mock as _mock
 
         state = _state_enabled()
+        state["config"].consolidation.sota_enabled = True
         state["config"].consolidation.extraction_noise_filter = ""
         state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_noise_filter_endpoint = ""
@@ -975,15 +977,25 @@ class TestCalibrateEnrich:
         ):
             calibrate_enrich(state, req)
         assert exc.value.status_code == 400
-        assert "not configured" in exc.value.detail.lower()
+        assert "no cloud provider configured" in exc.value.detail.lower()
         assert not helper.called
 
-    def test_missing_api_key_400(self, monkeypatch: pytest.MonkeyPatch):
-        """Provider configured but its key env var is unset -> 400, no cloud call."""
+    def test_master_switch_off_400(self, monkeypatch: pytest.MonkeyPatch):
+        """``sota_enabled: false`` -> 400, no cloud call.
+
+        This endpoint used to egress with the master switch OFF: it checked
+        the provider and the key but never ``sota_enabled``. It now asks the
+        same cloud-admission component every other egress site asks, and —
+        being operator-triggered — fails loudly rather than skipping.
+
+        Mutation: drop the ``sota_enabled`` term from the verdict -> this
+        test sees a successful call instead of a 400.
+        """
         import unittest.mock as _mock
 
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
+        state["config"].consolidation.sota_enabled = False
         state["config"].consolidation.extraction_noise_filter = "anthropic"
         state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_noise_filter_endpoint = ""
@@ -994,7 +1006,27 @@ class TestCalibrateEnrich:
         ):
             calibrate_enrich(state, req)
         assert exc.value.status_code == 400
-        assert "no api key" in exc.value.detail.lower()
+        assert "sota_enabled is off" in exc.value.detail.lower()
+        assert not helper.called
+
+    def test_missing_api_key_400(self, monkeypatch: pytest.MonkeyPatch):
+        """Provider configured but its key env var is unset -> 400, no cloud call."""
+        import unittest.mock as _mock
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        state = _state_enabled()
+        state["config"].consolidation.sota_enabled = True
+        state["config"].consolidation.extraction_noise_filter = "anthropic"
+        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
+        with (
+            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            pytest.raises(HTTPException) as exc,
+        ):
+            calibrate_enrich(state, req)
+        assert exc.value.status_code == 400
+        assert "anthropic_api_key env var is unset" in exc.value.detail.lower()
         assert not helper.called
 
     def test_success(self, monkeypatch: pytest.MonkeyPatch):
@@ -1004,6 +1036,7 @@ class TestCalibrateEnrich:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
+        state["config"].consolidation.sota_enabled = True
         state["config"].consolidation.extraction_noise_filter = "anthropic"
         state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_noise_filter_endpoint = ""
@@ -1037,6 +1070,7 @@ class TestCalibrateEnrich:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
+        state["config"].consolidation.sota_enabled = True
         state["config"].consolidation.extraction_noise_filter = "anthropic"
         state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_noise_filter_endpoint = ""

@@ -6,6 +6,8 @@ the test suite does not make any network requests.
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import networkx as nx
@@ -87,6 +89,10 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         extraction_noise_filter="anthropic",
         extraction_noise_filter_model="claude-sonnet-4-6",
         extraction_scrub={"person name"},
+        # Graph-tier enrichment is cloud egress and now routes through the
+        # shared cloud-admission verdict, whose first term is the master
+        # switch — so it must be ON for any enrichment test to reach a call.
+        sota_enabled=True,
     )
     defaults.update(kwargs)
 
@@ -1076,10 +1082,36 @@ class TestChunkCapRespected:
             )
 
 
-class TestNoApiKeySkipsGracefully:
-    """When provider env var is absent, skip with no crash."""
+@contextmanager
+def _capture_enrich_logs(caplog):
+    """Capture ``paramem.training.graph_enrich`` records into *caplog*.
 
-    def test_missing_key_skip(self, tmp_path, monkeypatch):
+    ``caplog.at_level`` alone is silent here — the module logger does not
+    propagate to root under this suite's configuration — so the fixture's
+    handler is attached to the specific logger, as
+    ``tests/test_intent.py`` does for the same reason.
+    """
+    enrich_logger = logging.getLogger("paramem.training.graph_enrich")
+    prior_level = enrich_logger.level
+    enrich_logger.setLevel(logging.WARNING)
+    enrich_logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        enrich_logger.removeHandler(caplog.handler)
+        enrich_logger.setLevel(prior_level)
+
+
+class TestCloudEgressRefusedSkipsGracefully:
+    """Every unmet cloud-admission term skips this pass with no crash.
+
+    The three terms are checked by the ONE shared component
+    (:func:`paramem.utils.cloud_admission.evaluate_cloud_egress`), so they
+    share one ``skip_reason`` token; the individual unmet terms go to the
+    log, which is what these tests assert on.
+    """
+
+    def test_missing_key_skip(self, tmp_path, monkeypatch, caplog):
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
@@ -1088,29 +1120,48 @@ class TestNoApiKeySkipsGracefully:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
-            result = _refiner_for(loop).run_enrichment()
+        with _capture_enrich_logs(caplog):
+            with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+                result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
-        assert result["skip_reason"] == "no_api_key"
+        assert result["skip_reason"] == "cloud_egress_blocked"
+        assert "ANTHROPIC_API_KEY env var is unset" in caplog.text
         call_spy.assert_not_called()
 
-
-class TestNoProviderSkipsGracefully:
-    """When extraction_noise_filter is empty, skip with no crash."""
-
-    def test_no_provider_skip(self, tmp_path, monkeypatch):
+    def test_no_provider_skip(self, tmp_path, monkeypatch, caplog):
         loop = _make_loop(tmp_path, extraction_noise_filter="")
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
-            result = _refiner_for(loop).run_enrichment()
+        with _capture_enrich_logs(caplog):
+            with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+                result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
-        assert result["skip_reason"] == "no_provider"
+        assert result["skip_reason"] == "cloud_egress_blocked"
+        assert "no cloud provider configured" in caplog.text
+        call_spy.assert_not_called()
+
+    def test_master_switch_off_skip(self, tmp_path, monkeypatch, caplog):
+        """``sota_enabled: false`` alone blocks graph-tier cloud egress —
+        the master switch is a term of the shared verdict, so this pass can
+        no longer egress behind the operator's back."""
+        loop = _make_loop(tmp_path, sota_enabled=False)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        call_spy = MagicMock()
+        with _capture_enrich_logs(caplog):
+            with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+                result = _refiner_for(loop).run_enrichment()
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "cloud_egress_blocked"
+        assert "sota_enabled is off" in caplog.text
         call_spy.assert_not_called()
 
 

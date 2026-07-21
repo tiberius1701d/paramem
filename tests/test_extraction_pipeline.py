@@ -1109,7 +1109,7 @@ class TestPipelinePromptsDirThreading:
                 None,
                 None,
                 speaker_id="speaker0",
-                plausibility_judge="claude",
+                plausibility_judge="anthropic",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
                 scrub={"person name"},
@@ -1224,7 +1224,7 @@ class TestPipelinePromptsDirThreading:
                 None,
                 None,
                 speaker_id="speaker0",
-                plausibility_judge="claude",
+                plausibility_judge="anthropic",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
                 scrub={"person name"},
@@ -3412,7 +3412,7 @@ class TestPlausibilityAnon:
                 None,
                 None,
                 speaker_id="speaker0",
-                plausibility_judge="claude",
+                plausibility_judge="anthropic",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
                 scrub={"person name", "physical address"},
@@ -3484,7 +3484,7 @@ class TestPlausibilityAnon:
                 None,
                 None,
                 speaker_id="speaker0",
-                plausibility_judge="claude",
+                plausibility_judge="anthropic",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
                 scrub={"person name"},
@@ -4171,12 +4171,12 @@ class TestExtractGraphNewKwargs:
                 speaker_id="speaker0",
                 sota_enabled=True,
                 noise_filter="anthropic",
-                plausibility_judge="claude",
+                plausibility_judge="anthropic",
                 plausibility_stage="anon",
                 scrub={"person name"},
             )
 
-        assert captured.get("plausibility_judge") == "claude"
+        assert captured.get("plausibility_judge") == "anthropic"
         assert captured.get("plausibility_stage") == "anon"
 
     def test_extract_graph_default_temperature_zero(self):
@@ -4372,10 +4372,10 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         from paramem.server.config import ConsolidationScheduleConfig
 
         cfg = ConsolidationScheduleConfig(
-            extraction_plausibility_judge="claude",
+            extraction_plausibility_judge="anthropic",
             extraction_plausibility_stage="anon",
         )
-        assert cfg.extraction_plausibility_judge == "claude"
+        assert cfg.extraction_plausibility_judge == "anthropic"
         assert cfg.extraction_plausibility_stage == "anon"
 
     def test_auto_judge_any_stage_ok(self):

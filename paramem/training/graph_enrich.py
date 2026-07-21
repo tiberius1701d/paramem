@@ -21,12 +21,13 @@ from typing import TYPE_CHECKING, Callable
 import networkx as nx
 
 from paramem.graph.cloud_egress import anonymize_for_cloud
-from paramem.graph.extractor import _graph_enrich_with_sota, _resolve_sota_api_key
+from paramem.graph.extractor import _graph_enrich_with_sota
 from paramem.graph.merger import GraphMerger, min_nonempty
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.persistence import _IK_KEY_ATTR
 from paramem.server.vram_guard import VramExhausted
+from paramem.utils.cloud_admission import evaluate_cloud_egress
 from paramem.utils.identity import canonical, is_speaker_id
 
 if TYPE_CHECKING:
@@ -355,7 +356,10 @@ def run_graph_enrichment(
               scoping silently rejecting enrichment deltas — see
               ``benchmarking.md``.
             - ``skipped`` (bool): ``True`` when enrichment was bypassed.
-            - ``skip_reason`` (str | None): reason token when skipped.
+            - ``skip_reason`` (str | None): reason token when skipped —
+              ``"no_model"``, ``"floor"``, or ``"cloud_egress_blocked"``
+              (the shared cloud-admission verdict said no; the individual
+              unmet terms are in the accompanying warning, not the token).
     """
     _noop = lambda: None  # noqa: E731
     _gc_disable = gc_disable or _noop
@@ -391,21 +395,20 @@ def run_graph_enrichment(
     # Resolved HERE, past both guards above: the provider read must never be
     # hoisted above the ``no_model`` skip (see the parameter's docstring).
     ext_cfg = extraction_config_provider()
-    provider = ext_cfg.noise_filter
-    if not provider:
-        logger.info("graph_enrichment: no SOTA provider configured — skipping")
-        return {**_empty, "skipped": True, "skip_reason": "no_provider"}
+    verdict = evaluate_cloud_egress(
+        sota_enabled=ext_cfg.sota_enabled,
+        provider=ext_cfg.noise_filter,
+        model=ext_cfg.noise_filter_model,
+        endpoint=ext_cfg.noise_filter_endpoint or None,
+    )
+    if not verdict.permitted:
+        logger.warning("graph_enrichment: cloud egress refused — %s", "; ".join(verdict.gaps))
+        return {**_empty, "skipped": True, "skip_reason": "cloud_egress_blocked"}
 
-    api_key = _resolve_sota_api_key(provider) or ""
-    if not api_key:
-        logger.warning(
-            "graph_enrichment: provider=%r has no resolvable API key — skipping",
-            provider,
-        )
-        return {**_empty, "skipped": True, "skip_reason": "no_api_key"}
-
-    filter_model = ext_cfg.noise_filter_model
-    endpoint = ext_cfg.noise_filter_endpoint or None
+    provider = verdict.provider
+    api_key = verdict.api_key
+    filter_model = verdict.model
+    endpoint = verdict.endpoint
     # Same cloud-egress scrub categories as session-tier extraction
     # (``sanitization.scrub`` -> ``ExtractionConfig.scrub`` at
     # bootstrap) — feeds the per-chunk ``anonymize_with_local_model``

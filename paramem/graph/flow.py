@@ -73,6 +73,8 @@ class StageContext:
     noise_filter_endpoint: str | None
     plausibility_judge: str
     plausibility_stage: str
+    plausibility_model: str
+    plausibility_endpoint: str | None
     scrub: set[str] | frozenset[str]
     correction_entity_types: set[str] | frozenset[str] | None
 
@@ -161,7 +163,7 @@ class StageSpec:
             Receives ``(ctx, state)`` and returns the next ``StageState``.
         enabled_when: Predicate over ``ctx`` gating whether the stage
             runs at all (an operator/config toggle — e.g.
-            ``sota_pipeline``'s ``sota_enabled`` master gate being off).
+            ``sota_pipeline``'s cloud-admission gate refusing egress).
             ``None`` means always enabled. A disabled stage
             is skipped with no call to ``run`` and therefore opens no
             phase trace record — mirrors an ``if <config flag>:`` gate

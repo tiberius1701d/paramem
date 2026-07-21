@@ -1074,12 +1074,20 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # Plausibility filter: final quality gate on extracted facts.
     #   "auto" → local judge at deanon stage (zero cloud cost, privacy-safe)
     #   "off"  → disable plausibility entirely (not recommended)
-    #   SOTA provider name (e.g. "claude") → cloud judge at anon stage (paid,
-    #     runs on anonymized data only). IMPORTANT: use stage="anon" with any
+    #   a provider name from paramem.utils.cloud_admission.PROVIDER_KEY_ENV
+    #     (e.g. "anthropic") → cloud judge at anon stage (paid, runs on
+    #     anonymized data only, model/endpoint from the two keys below).
+    #     IMPORTANT: use stage="anon" with any
     #     cloud provider — stage="deanon" with a cloud provider sends real names
     #     to the cloud and is rejected at server start.
     extraction_plausibility_judge: str = "auto"
     extraction_plausibility_stage: str = "deanon"  # "anon" | "deanon"
+    # Model + endpoint the cloud plausibility judge runs.  Both are ignored
+    # when the judge is "auto" or "off".  The endpoint is only consulted for
+    # a self-hosted OpenAI-compatible judge; "" accepts the provider's
+    # default (and native-SDK providers such as anthropic need none).
+    extraction_plausibility_model: str = "claude-sonnet-4-6"
+    extraction_plausibility_endpoint: str = ""
     # Anonymizer entity types eligible for local misspelling correction on
     # the reverse map (see paramem.graph.entity_correction). "person" is
     # excluded by default — private-name spelling is owned by the

@@ -1188,6 +1188,8 @@ class TestScalarOnlySessionIsNotARecovery:
             noise_filter_endpoint=None,
             plausibility_judge="off",
             plausibility_stage="deanon",
+            plausibility_model="claude-sonnet-4-6",
+            plausibility_endpoint=None,
             scrub=frozenset({"person name"}),
             correction_entity_types=None,
         )
