@@ -14,9 +14,11 @@ the reverse map never reaches). That single judgement is implemented ONCE
 in :func:`_verdict`, which is the only place the prompt is loaded, the model
 is called, the JSON response is parsed, and the ``kind`` enum is normalized.
 Everything else in :func:`correct_entity_surfaces` is source-specific
-GATHER (collecting correctable values from the two loci) and WRITE-BACK
-(applying an accepted correction to its origin) around that one primitive,
-under one uniform gate.
+GATHER (collecting correctable values from the two loci) around that one
+primitive, under one uniform gate. The function does not mutate its
+inputs: it returns the accepted corrections as data (``"applied"``), and
+the caller (:mod:`paramem.graph.extractor`) applies them to
+``reverse_mapping`` and ``graph.entities`` itself.
 
 ``person`` is structurally excluded from correction: the model's own
 ``kind`` classification routes any person's name (famous or not) to
@@ -54,9 +56,12 @@ _DEFAULT_CORRECTION_MAX_TOKENS = 128
 
 # One gathered correction candidate: a value living at some locus (a
 # reverse-mapping placeholder or an entity attribute), with enough
-# provenance to write an accepted correction back and to describe the
-# change in the returned diagnostics list.
-_Target = namedtuple("_Target", ["value", "context", "meta", "write_back"])
+# provenance for the caller to apply an accepted correction and to
+# describe the change in the returned diagnostics list. The attribute
+# locus's meta carries "entity_index" (its position in the ``entities``
+# list) rather than relying on ``entity.name``, which is not guaranteed
+# unique — the caller addresses ``entities[entity_index]`` exactly.
+_Target = namedtuple("_Target", ["value", "context", "meta"])
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -201,10 +206,14 @@ def correct_entity_surfaces(
     placeholder_entity_type` — open vocabulary, so a novel prefix's own
     name still passes through as its type) and (b)
     ``entities[*].attributes`` values (only when ``"attributes"`` is a
-    member of ``correction_entity_types``), classifies each with the one
-    :func:`_verdict` primitive, and applies an accepted correction via the
-    matching write-back — mutating ``reverse_mapping`` values (never keys)
-    and/or ``entity.attributes`` values (never keys) in place.
+    member of ``correction_entity_types``), and classifies each with the
+    one :func:`_verdict` primitive. This function does NOT mutate either
+    input — ``reverse_mapping`` and ``entities`` are read-only gather
+    sources. It returns every accepted correction as data; the caller is
+    responsible for applying them (placeholder locus: ``reverse_mapping
+    [entry["placeholder"]] = entry["after"]``; attribute locus:
+    ``entities[entry["entity_index"]].attributes[entry["key"]] =
+    entry["after"]``).
 
     The apply gate is UNIFORM across both loci: ``vd["kind"] in
     correctable_kinds AND vd["is_known_entity"] AND vd["corrected"] and
@@ -219,10 +228,10 @@ def correct_entity_surfaces(
     Args:
         reverse_mapping: ``{placeholder: real_surface}`` produced by
             :func:`paramem.graph.placeholders._build_anonymization_mapping`.
-            Mutated in place for every applied placeholder-locus correction.
-        entities: ``graph.entities`` — mutated in place (attribute values
-            only) for every applied attribute-locus correction. Only read
-            when ``"attributes"`` is a member of ``correction_entity_types``.
+            Read-only — never mutated by this function.
+        entities: ``graph.entities`` — read-only, never mutated by this
+            function. Only read when ``"attributes"`` is a member of
+            ``correction_entity_types``.
         model: Local model used for the per-target correction call.
         tokenizer: Tokenizer paired with ``model``.
         correction_entity_types: The operator scope-and-enable knob. A
@@ -246,19 +255,24 @@ def correct_entity_surfaces(
     Returns:
         ``{"applied": [...], "verdicts": [...]}``.
 
-        ``"applied"`` carries only the accepted corrections: each dict has
-        ``"locus"`` (``"placeholder"`` or ``"attribute"``), the
-        locus-specific provenance (``"placeholder"``/``"type"`` or
-        ``"entity"``/``"key"``), plus ``"kind"``, ``"before"``, ``"after"``.
-        Empty when the stage is disabled, no target is in scope, or every
-        gathered target was rejected by the gate or failed to parse.
+        ``"applied"`` carries only the accepted corrections, as data for
+        the caller to apply: each dict has ``"locus"`` (``"placeholder"``
+        or ``"attribute"``), the locus-specific provenance
+        (``"placeholder"``/``"type"`` for the placeholder locus, or
+        ``"entity"``/``"key"``/``"entity_index"`` for the attribute
+        locus — ``"entity_index"`` is the entry's position in the
+        ``entities`` list, since ``entity.name`` is not guaranteed unique),
+        plus ``"kind"``, ``"before"``, ``"after"``. Empty when the stage is
+        disabled, no target is in scope, or every gathered target was
+        rejected by the gate or failed to parse.
 
         ``"verdicts"`` carries one entry per evaluated target regardless of
         gate outcome: the target's ``meta`` (``"locus"`` + locus-specific
-        provenance) merged with ``"kind"``, ``"is_known_entity"``,
-        ``"proposed"`` (the verdict's ``corrected`` value), ``"applied"``
-        (bool), and ``"reject_reason"`` — ``None`` when applied, else one
-        of ``"kind_not_correctable"``, ``"not_known_entity"``,
+        provenance, including ``"entity_index"`` for the attribute locus)
+        merged with ``"kind"``, ``"is_known_entity"``, ``"proposed"`` (the
+        verdict's ``corrected`` value), ``"applied"`` (bool), and
+        ``"reject_reason"`` — ``None`` when applied, else one of
+        ``"kind_not_correctable"``, ``"not_known_entity"``,
         ``"empty_correction"``, ``"no_change"`` (the same four gate clauses
         that drive the apply decision), or ``"parse_error"`` when
         :func:`_verdict` raised. A target that fails to parse has no
@@ -279,33 +293,30 @@ def correct_entity_surfaces(
         if entity_type not in correctable_kinds:
             continue
 
-        def _write_placeholder(corrected: str, _ph: str = placeholder) -> None:
-            reverse_mapping[_ph] = corrected
-
         targets.append(
             _Target(
                 value=surface,
                 context=entity_type,
                 meta={"locus": "placeholder", "placeholder": placeholder, "type": entity_type},
-                write_back=_write_placeholder,
             )
         )
 
     if attr_on:
-        for entity in entities:
+        for i, entity in enumerate(entities):
             for key, value in (entity.attributes or {}).items():
                 if not isinstance(value, str) or not value.strip():
                     continue
-
-                def _write_attribute(corrected: str, _entity=entity, _key: str = key) -> None:
-                    _entity.attributes[_key] = corrected
 
                 targets.append(
                     _Target(
                         value=value,
                         context=key,
-                        meta={"locus": "attribute", "entity": entity.name, "key": key},
-                        write_back=_write_attribute,
+                        meta={
+                            "locus": "attribute",
+                            "entity": entity.name,
+                            "key": key,
+                            "entity_index": i,
+                        },
                     )
                 )
 
@@ -347,7 +358,6 @@ def correct_entity_surfaces(
                 reject_reason = None
             is_applied = reject_reason is None
             if is_applied:
-                target.write_back(verdict["corrected"])
                 applied.append(
                     {
                         **target.meta,

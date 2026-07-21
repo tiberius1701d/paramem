@@ -1094,3 +1094,37 @@ class TestExtractGraphTimestampPropagation:
         assert graph.relations, "fake output must parse successfully, not fall back"
         parsed = datetime.fromisoformat(graph.timestamp)
         assert before <= parsed <= after
+
+
+class TestEmptyRelationsTerminal:
+    """``local_extract``'s empty-relations terminal: when the pass-1 graph
+    has no relations, extract_graph returns immediately — no
+    second_order_extract, no ha_validation, no sota_pipeline — even when
+    those later phases are otherwise enabled/configured to fire."""
+
+    def _empty_output(self) -> str:
+        return json.dumps({"entities": [], "relations": []})
+
+    def test_no_relations_yields_only_local_extract_phase(self):
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            return_value=self._empty_output(),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="Just saying hello.",
+                session_id="s001",
+                speaker_id="speaker0",
+                scrub={"person name"},
+                # Later phases are configured ON; the empty-relations
+                # terminal must still short-circuit before any of them.
+                ha_context={"location_name": "", "zones": [], "areas": []},
+                ha_validation=True,
+                validate=True,
+                sota_enabled=True,
+                noise_filter="anthropic",
+            )
+        assert graph.relations == []
+        phase_names = [p.name for p in get_phases(graph)]
+        assert phase_names == ["local_extract"]

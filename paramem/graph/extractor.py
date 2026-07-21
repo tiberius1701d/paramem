@@ -22,6 +22,7 @@ from paramem.graph.cloud_egress import (
     deanonymize_response_text,
 )
 from paramem.graph.entity_correction import correct_entity_surfaces
+from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
 from paramem.graph.phase_trace import chain_stopped, extraction_trace, phase_trace
 from paramem.graph.placeholders import (
     _FACT_FIELDS,
@@ -608,6 +609,192 @@ def _has_named_non_speaker_person(graph: SessionGraph) -> bool:
     return any(e.entity_type == "person" and not is_speaker_id(e.name) for e in graph.entities)
 
 
+# ---------------------------------------------------------------------------
+# SESSION_EXTRACT — the declarative flow ``extract_graph`` walks via
+# ``paramem.graph.flow.run_flow``.
+#
+# This is flow TOPOLOGY co-located with the primitives it calls (rather than
+# a dedicated ``flows.py``) to avoid a circular import: the stage bodies below
+# call ``_run_local_extraction`` / ``_validate_with_ha_context`` /
+# ``_sota_pipeline``, all defined in this module. Move this to a dedicated
+# flow module once a second flow (beyond this one and the still-imperative
+# ``extract_procedural_graph``) exists to justify the split.
+#
+# Each stage body is a VERBATIM lift of the corresponding block that used to
+# live inline in ``extract_graph`` — same primitives, same arguments, same
+# ``phase_trace`` scopes. ``run_flow`` does not open phases itself; every
+# ``phase_trace`` call below is exactly the one the imperative version made.
+# ---------------------------------------------------------------------------
+
+
+def _stage_local_extract(ctx: StageContext, state: StageState) -> StageState:
+    """``local_extract`` stage body — always runs.
+
+    Local-model extraction step. Raw output is the canonical isolation
+    point for the extraction prompt (calibration/debugging diffs prompt
+    variants by comparing this raw_output, before any downstream phase
+    has had a chance to mutate the result).
+    """
+    graph = _run_local_extraction(
+        ctx.model,
+        ctx.tokenizer,
+        ctx.transcript,
+        ctx.session_id,
+        ctx.speaker_id,
+        ctx.temperature,
+        ctx.max_tokens,
+        ctx.prompts_dir,
+        ctx.speaker_name,
+        ctx.system_prompt_filename,
+        ctx.user_prompt_filename,
+        ctx.model_alias,
+        ctx.seed,
+        ctx.timestamp,
+        ctx.source_type,
+        phase_name="local_extract",
+    )
+    return StageState(graph=graph)
+
+
+def _stage_second_order_extract(ctx: StageContext, state: StageState) -> StageState:
+    """``second_order_extract`` stage body — gated by
+    :func:`_has_named_non_speaker_person` (the flow's ``applies_when``).
+
+    Extracts facts ABOUT the named entities ``local_extract`` (first-order)
+    surfaced, recovering a named relative's own attribute (location, job,
+    trait) when local_extract collapsed a single-relative clause ("my
+    brother Nadeem lives in Porto") into ONE relation instead of two
+    (measured Mistral 7B failure mode).
+    """
+    graph = state.graph
+    second_order_graph = _run_local_extraction(
+        ctx.model,
+        ctx.tokenizer,
+        ctx.transcript,
+        ctx.session_id,
+        ctx.speaker_id,
+        ctx.temperature,
+        ctx.max_tokens,
+        ctx.prompts_dir,
+        ctx.speaker_name,
+        ctx.system_prompt_filename,
+        DEFAULT_SECOND_ORDER_USER_PROMPT_FILENAME,
+        ctx.model_alias,
+        ctx.seed,
+        ctx.timestamp,
+        ctx.source_type,
+        phase_name="second_order_extract",
+    )
+    # Plain union: the second-order pass contributes recovered facts
+    # (recall) — it is not a dedup boundary. Predicate-surface drift for a
+    # fact both passes capture (e.g. "picked_up" vs "picks_up") is a
+    # PRE-EXISTING pipeline phenomenon (the same drift already happens
+    # across sessions) and is handled downstream exactly as cross-session
+    # drift is: triple-identity dedup at GraphMerger._upsert_relation Case 1
+    # (paramem/graph/merger.py:580) and, when enabled,
+    # refinement_normalization's (subject, object)-grouped predicate-synonym
+    # fold. A redundant near-dup key is benign — not a wrong answer, at
+    # worst a redundant indexed key — so it is deliberately NOT special-cased
+    # here; filtering on (subject, object) identity would also destroy
+    # genuinely distinct same-(s,o) facts (e.g. born_in + lives_in).
+    graph.relations.extend(second_order_graph.relations)
+    graph.entities.extend(second_order_graph.entities)
+    return StageState(graph=graph)
+
+
+def _stage_ha_validation(ctx: StageContext, state: StageState) -> StageState:
+    """``ha_validation`` stage body — pure-Python; no LLM call.
+
+    Gated by ``ctx.ha_validation and ctx.ha_context is not None`` (the
+    flow's ``enabled_when``).
+    """
+    graph = state.graph
+    with phase_trace("ha_validation") as t:
+        before = _summarise_graph(graph)
+        graph = _validate_with_ha_context(graph, ctx.ha_context)
+        after = _summarise_graph(graph)
+        t.set_parsed({"before": before, "after": after})
+    return StageState(graph=graph)
+
+
+def _stage_sota_pipeline(ctx: StageContext, state: StageState) -> StageState:
+    """``sota_pipeline`` stage body.
+
+    Each sub-phase (anonymize, entity_correction, sota_enrich,
+    anon_plausibility, deanon, deanon_plausibility) records its own block
+    via phase_trace from inside ``_sota_pipeline``. ``_sota_pipeline`` reads
+    ``chain_stopped()`` off the same contextvar a calibration caller's
+    ``stop_at`` scope set, so it can short-circuit at any sub-phase
+    boundary with no parameter threaded into it.
+
+    Gated by ``ctx.validate and ctx.sota_enabled and ctx.noise_filter``
+    (``sota_enabled`` is the master gate; ``noise_filter`` is the provider
+    identity — the flow's ``enabled_when``) and ``state.graph.relations``
+    being non-empty (the flow's ``applies_when``).
+    """
+    graph = _sota_pipeline(
+        state.graph,
+        ctx.transcript,
+        ctx.model,
+        ctx.tokenizer,
+        provider=ctx.noise_filter,
+        filter_model=ctx.noise_filter_model,
+        endpoint=ctx.noise_filter_endpoint,
+        plausibility_judge=ctx.plausibility_judge,
+        plausibility_stage=ctx.plausibility_stage,
+        speaker_name=ctx.speaker_name,
+        speaker_id=ctx.speaker_id,
+        scrub=ctx.scrub,
+        correction_entity_types=ctx.correction_entity_types,
+        prompts_dir=ctx.prompts_dir,
+        model_alias=ctx.model_alias,
+        max_tokens=ctx.max_tokens,
+        plausibility_max_tokens=ctx.plausibility_max_tokens,
+        seed=ctx.seed,
+    )
+    return StageState(graph=graph)
+
+
+SESSION_EXTRACT: list[StageSpec] = [
+    StageSpec(
+        stage="local_extract",
+        trace_name="local_extract",
+        run=_stage_local_extract,
+        requires=frozenset(),
+        produces=frozenset({"graph"}),
+        terminal_when=lambda s: not s.graph.relations,
+    ),
+    StageSpec(
+        stage="second_order_extract",
+        trace_name="second_order_extract",
+        run=_stage_second_order_extract,
+        requires=frozenset({"graph"}),
+        produces=frozenset({"graph"}),
+        applies_when=lambda s: _has_named_non_speaker_person(s.graph),
+    ),
+    StageSpec(
+        stage="ha_validation",
+        trace_name="ha_validation",
+        run=_stage_ha_validation,
+        requires=frozenset({"graph"}),
+        produces=frozenset({"graph"}),
+        # Truthiness test — matches the original inline gate
+        # `if ha_validation and ha_context:` byte-for-byte: an empty dict
+        # (falsy) skips the stage, same as `None`.
+        enabled_when=lambda c: bool(c.ha_validation and c.ha_context),
+    ),
+    StageSpec(
+        stage="sota_pipeline",
+        trace_name=None,
+        run=_stage_sota_pipeline,
+        requires=frozenset({"graph"}),
+        produces=frozenset({"graph"}),
+        enabled_when=lambda c: bool(c.validate and c.sota_enabled and c.noise_filter),
+        applies_when=lambda s: bool(s.graph.relations),
+    ),
+]
+
+
 def extract_graph(
     model,
     tokenizer,
@@ -730,137 +917,58 @@ def extract_graph(
     # records on the final graph's diagnostics.  A calibration caller may
     # additionally wrap this whole call in `with stop_at(phase):` (see
     # that function's docstring) to request an early return.
+    #
+    # The four-phase control flow (local_extract -> second_order_extract
+    # -> ha_validation -> sota_pipeline) is expressed declaratively as
+    # SESSION_EXTRACT and walked by paramem.graph.flow.run_flow — see that
+    # module and the _stage_* functions above for the per-phase bodies.
+    # This function's job is: build the run-constant StageContext once,
+    # seed the initial StageState, walk the flow, and keep the
+    # extraction_trace lifecycle (open/attach) exactly as before.
     with extraction_trace() as trace:
-        graph = SessionGraph(
-            session_id=session_id,
-            timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
+        state = StageState(
+            graph=SessionGraph(
+                session_id=session_id,
+                timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
+            )
         )
         try:
-            # Local-model extraction step.  Raw output is the canonical
-            # isolation point for the extraction prompt (calibration /
-            # debugging diffs prompt variants by comparing this raw_output,
-            # before any downstream phase has had a chance to mutate the
-            # result).
-            graph = _run_local_extraction(
-                model,
-                tokenizer,
-                transcript,
-                session_id,
-                speaker_id,
-                temperature,
-                max_tokens,
-                prompts_dir,
-                speaker_name,
-                system_prompt_filename,
-                user_prompt_filename,
-                model_alias,
-                seed,
-                timestamp,
-                source_type,
-                phase_name="local_extract",
+            ctx = StageContext(
+                model=model,
+                tokenizer=tokenizer,
+                transcript=transcript,
+                session_id=session_id,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                plausibility_max_tokens=plausibility_max_tokens,
+                prompts_dir=prompts_dir,
+                system_prompt_filename=system_prompt_filename,
+                user_prompt_filename=user_prompt_filename,
+                model_alias=model_alias,
+                seed=seed,
+                timestamp=timestamp,
+                source_type=source_type,
+                ha_context=ha_context,
+                ha_validation=ha_validation,
+                validate=validate,
+                sota_enabled=sota_enabled,
+                noise_filter=noise_filter,
+                noise_filter_model=noise_filter_model,
+                noise_filter_endpoint=noise_filter_endpoint,
+                plausibility_judge=plausibility_judge,
+                plausibility_stage=plausibility_stage,
+                scrub=scrub,
+                correction_entity_types=correction_entity_types,
             )
-            if chain_stopped():
-                return graph
-
-            if not graph.relations:
-                return graph
-
-            # Second-order extraction: extracts facts ABOUT the named
-            # entities local_extract (first-order) surfaced, recovering a
-            # named relative's own attribute (location, job, trait) when
-            # local_extract collapsed a single-relative clause ("my brother
-            # Nadeem lives in Porto") into ONE relation instead of two
-            # (measured Mistral 7B failure mode). Unconditional except for
-            # the gate: nothing to recover when the pass-1 graph has no
-            # named non-speaker person, so the phase is skipped entirely
-            # (no LLM call, no phase_trace record) rather than firing on
-            # every session.
-            if _has_named_non_speaker_person(graph):
-                second_order_graph = _run_local_extraction(
-                    model,
-                    tokenizer,
-                    transcript,
-                    session_id,
-                    speaker_id,
-                    temperature,
-                    max_tokens,
-                    prompts_dir,
-                    speaker_name,
-                    system_prompt_filename,
-                    DEFAULT_SECOND_ORDER_USER_PROMPT_FILENAME,
-                    model_alias,
-                    seed,
-                    timestamp,
-                    source_type,
-                    phase_name="second_order_extract",
-                )
-                # Plain union: the second-order pass contributes recovered
-                # facts (recall) — it is not a dedup boundary.
-                # Predicate-surface drift for a fact both passes capture
-                # (e.g. "picked_up" vs "picks_up") is a PRE-EXISTING
-                # pipeline phenomenon (the same drift already happens
-                # across sessions) and is handled downstream exactly as
-                # cross-session drift is: triple-identity dedup at
-                # GraphMerger._upsert_relation Case 1 (paramem/graph/
-                # merger.py:580) and, when enabled,
-                # refinement_normalization's (subject, object)-grouped
-                # predicate-synonym fold. A redundant near-dup key is benign
-                # — not a wrong answer, at worst a redundant indexed key —
-                # so it is deliberately NOT special-cased here; filtering on
-                # (subject, object) identity would also destroy genuinely
-                # distinct same-(s,o) facts (e.g. born_in + lives_in).
-                graph.relations.extend(second_order_graph.relations)
-                graph.entities.extend(second_order_graph.entities)
-                if chain_stopped():
-                    return graph
-
-            # HA validation (pure-Python; no LLM call).
-            if ha_validation and ha_context:
-                with phase_trace("ha_validation") as t:
-                    before = _summarise_graph(graph)
-                    graph = _validate_with_ha_context(graph, ha_context)
-                    after = _summarise_graph(graph)
-                    t.set_parsed({"before": before, "after": after})
-                if chain_stopped():
-                    return graph
-
-            # SOTA pipeline.  Each sub-phase (anonymize, entity_correction,
-            # sota_enrich, anon_plausibility, deanon, deanon_plausibility)
-            # records its own block via phase_trace from inside
-            # _sota_pipeline.  ``_sota_pipeline`` reads ``chain_stopped()``
-            # off the same contextvar this scope's (optional) ``stop_at``
-            # caller set, so it can short-circuit at any sub-phase boundary
-            # with no parameter threaded into it.
-            # ``sota_enabled`` is the master gate; ``noise_filter`` is the
-            # provider identity.  Both must be set for the SOTA pipeline.
-            if validate and sota_enabled and noise_filter and graph.relations:
-                graph = _sota_pipeline(
-                    graph,
-                    transcript,
-                    model,
-                    tokenizer,
-                    provider=noise_filter,
-                    filter_model=noise_filter_model,
-                    endpoint=noise_filter_endpoint,
-                    plausibility_judge=plausibility_judge,
-                    plausibility_stage=plausibility_stage,
-                    speaker_name=speaker_name,
-                    speaker_id=speaker_id,
-                    scrub=scrub,
-                    correction_entity_types=correction_entity_types,
-                    prompts_dir=prompts_dir,
-                    model_alias=model_alias,
-                    max_tokens=max_tokens,
-                    plausibility_max_tokens=plausibility_max_tokens,
-                    seed=seed,
-                )
-
-            return graph
+            state = run_flow(SESSION_EXTRACT, ctx, state)
+            return state.graph
         finally:
             # Materialise the trace on whatever graph we're about to
             # return — covers every return path including early returns
             # on parse failure and empty-relations short-circuit.
-            trace.attach_to(graph)
+            trace.attach_to(state.graph)
 
 
 def extract_and_anonymize_for_cloud(
@@ -1927,18 +2035,19 @@ def _sota_pipeline(
     reverse_mapping = payload.reverse
     anon_transcript = payload.anon_transcript
 
-    # Phase — entity_correction.  Local model corrects misspelled real
-    # place/organization/concept surfaces at two loci: the reverse map
+    # Phase — entity_correction.  Local model classifies+corrects misspelled
+    # real place/organization/concept surfaces at two loci: the reverse map
     # VALUES ONLY (not keys — the forward map used to anonymize the
     # transcript below, and every downstream identity check keyed on
     # placeholders, are unaffected) and, when the "attributes" knob member
-    # is set, graph.entities[*].attributes values in place (e.g.
-    # current_location) — the same graph object this function returns, so
-    # the mutation reaches keyed-entry assembly (indexed-key distillation)
-    # downstream. Correction is
-    # independent of cloud enrichment and safely precedes the
-    # fact-construction block below (placeholder keys are untouched). See
-    # paramem.graph.entity_correction for the full contract.
+    # is set, graph.entities[*].attributes values (e.g. current_location).
+    # correct_entity_surfaces() is read-only over its inputs — it returns
+    # accepted corrections as data, applied below onto reverse_mapping and
+    # graph.entities (the same graph object this function returns, so the
+    # applied change reaches keyed-entry assembly/indexed-key distillation
+    # downstream). Correction is independent of cloud enrichment and safely
+    # precedes the fact-construction block below (placeholder keys are
+    # untouched). See paramem.graph.entity_correction for the full contract.
     with phase_trace("entity_correction") as t:
         correction_result = correct_entity_surfaces(
             reverse_mapping,
@@ -1952,6 +2061,15 @@ def _sota_pipeline(
         )
         applied = correction_result["applied"]
         verdicts = correction_result["verdicts"]
+        # correct_entity_surfaces is read-only over its inputs — it returns
+        # accepted corrections as data; apply them here so the mutation
+        # reaches reverse_mapping (used below for anonymized-transcript
+        # substitution) and graph.entities (feeds keyed-entry assembly).
+        for entry in applied:
+            if entry["locus"] == "placeholder":
+                reverse_mapping[entry["placeholder"]] = entry["after"]
+            elif entry["locus"] == "attribute":
+                graph.entities[entry["entity_index"]].attributes[entry["key"]] = entry["after"]
         if applied:
             graph.diagnostics["entity_corrections"] = applied
         graph.diagnostics["entity_correction_verdicts"] = verdicts

@@ -4,6 +4,13 @@ All model calls are mocked (patch ``generate_answer``) — this is a pure
 gate/scope/parse unit test suite exercising the two gather loci
 (reverse-mapping placeholders, entity attributes) against the ONE
 ``_verdict`` primitive's uniform apply gate.
+
+``correct_entity_surfaces`` does not mutate ``reverse_mapping`` or
+``entities`` — it returns accepted corrections as data in
+``result["applied"]``. Tests that exercise an applied correction assert the
+inputs are unchanged immediately after the call, then apply the returned
+corrections via :func:`_apply_corrections` (which mirrors the caller in
+``paramem/graph/extractor.py``) and assert the resulting state.
 """
 
 from __future__ import annotations
@@ -27,6 +34,22 @@ def _model_tokenizer():
     tokenizer.apply_chat_template.return_value = "formatted-prompt"
     model = MagicMock()
     return model, tokenizer
+
+
+def _apply_corrections(reverse_mapping: dict, entities: list, applied: list[dict]) -> None:
+    """Apply ``result["applied"]`` exactly as the caller does.
+
+    Mirrors the apply loop in ``paramem/graph/extractor.py``'s
+    ``entity_correction`` phase: placeholder-locus entries write
+    ``reverse_mapping[placeholder] = after``; attribute-locus entries write
+    ``entities[entity_index].attributes[key] = after``, addressed by list
+    index since ``entity.name`` is not guaranteed unique.
+    """
+    for entry in applied:
+        if entry["locus"] == "placeholder":
+            reverse_mapping[entry["placeholder"]] = entry["after"]
+        elif entry["locus"] == "attribute":
+            entities[entry["entity_index"]].attributes[entry["key"]] = entry["after"]
 
 
 class TestScopeGating:
@@ -130,7 +153,8 @@ class TestPlaceholderLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert reverse_mapping["City_1"] == "Frankfurt"
+        # The function does not mutate its inputs.
+        assert reverse_mapping == {"City_1": "Frankfrut"}
         assert result["applied"] == [
             {
                 "locus": "placeholder",
@@ -153,6 +177,9 @@ class TestPlaceholderLocus:
                 "reject_reason": None,
             }
         ]
+
+        _apply_corrections(reverse_mapping, [], result["applied"])
+        assert reverse_mapping["City_1"] == "Frankfurt"
 
     def test_placeholder_verdict_kind_person_is_a_cross_check_rejection(self, monkeypatch):
         """(b) A placeholder gathered as place-eligible (by anonymizer prefix)
@@ -321,7 +348,7 @@ class TestPlaceholderLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert reverse_mapping["Thing_1"] == "Pytorch"
+        assert reverse_mapping == {"Thing_1": "Pyttorch"}
         assert result["applied"] == [
             {
                 "locus": "placeholder",
@@ -332,6 +359,9 @@ class TestPlaceholderLocus:
                 "after": "Pytorch",
             }
         ]
+
+        _apply_corrections(reverse_mapping, [], result["applied"])
+        assert reverse_mapping["Thing_1"] == "Pytorch"
 
     def test_parse_failure_skips_target_without_raising(self, monkeypatch):
         """A malformed model response for one target is skipped (leaves that
@@ -398,7 +428,7 @@ class TestPlaceholderLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert reverse_mapping == {"City_1": "Frankfurt", "Org_1": "Wobbleco"}
+        assert reverse_mapping == {"City_1": "Frankfrut", "Org_1": "Wobbleco"}
         assert result["applied"] == [
             {
                 "locus": "placeholder",
@@ -409,6 +439,9 @@ class TestPlaceholderLocus:
                 "after": "Frankfurt",
             }
         ]
+
+        _apply_corrections(reverse_mapping, [], result["applied"])
+        assert reverse_mapping == {"City_1": "Frankfurt", "Org_1": "Wobbleco"}
 
     def test_custom_scope_restricts_placeholder_selection(self, monkeypatch):
         """Passing an explicit scope narrower than the default restricts
@@ -467,17 +500,22 @@ class TestAttributeLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert entity.attributes == {"current_location": "Frankfurt"}
+        # The function does not mutate the entity's attributes.
+        assert entity.attributes == {"current_location": "Frankfrut"}
         assert result["applied"] == [
             {
                 "locus": "attribute",
                 "entity": "speaker0",
                 "key": "current_location",
+                "entity_index": 0,
                 "kind": "place",
                 "before": "Frankfrut",
                 "after": "Frankfurt",
             }
         ]
+
+        _apply_corrections({}, [entity], result["applied"])
+        assert entity.attributes == {"current_location": "Frankfurt"}
 
     def test_attribute_kind_person_not_applied(self, monkeypatch):
         """(d) An attribute value the model classifies as kind=person (e.g.
@@ -597,7 +635,12 @@ class TestAttributeLocus:
 
     def test_both_loci_return_list_carries_locus_field(self, monkeypatch):
         """(j) The returned list carries "locus" for both the placeholder and
-        attribute sources when both fire in the same call."""
+        attribute sources when both fire in the same call. Also the
+        returns-and-caller-applies contract: the function itself mutates
+        neither ``reverse_mapping`` nor ``entities``, and applying the
+        returned ``applied`` list (placeholder by key, attribute by
+        ``entity_index``) reproduces the exact corrected state the old
+        in-place implementation produced."""
         model, tokenizer = _model_tokenizer()
         reverse_mapping = {"City_1": "Frankfrut"}
         entity = Entity(
@@ -605,6 +648,7 @@ class TestAttributeLocus:
             entity_type="person",
             attributes={"current_location": "Novatek Systams"},
         )
+        entities = [entity]
 
         responses = iter(
             [
@@ -625,7 +669,7 @@ class TestAttributeLocus:
 
         result = correct_entity_surfaces(
             reverse_mapping,
-            [entity],
+            entities,
             model,
             tokenizer,
             correction_entity_types=_DEFAULT_SCOPE,
@@ -633,5 +677,16 @@ class TestAttributeLocus:
 
         loci = {r["locus"] for r in result["applied"]}
         assert loci == {"placeholder", "attribute"}
+
+        # (a) Inputs are unchanged by the call itself.
+        assert reverse_mapping == {"City_1": "Frankfrut"}
+        assert entity.attributes == {"current_location": "Novatek Systams"}
+
+        attribute_entry = next(r for r in result["applied"] if r["locus"] == "attribute")
+        assert attribute_entry["entity_index"] == 0
+
+        # (b) Applying the returned corrections reproduces the old in-place
+        # result exactly.
+        _apply_corrections(reverse_mapping, entities, result["applied"])
         assert reverse_mapping["City_1"] == "Frankfurt"
         assert entity.attributes["current_location"] == "Novatek Systems"
