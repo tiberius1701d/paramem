@@ -12635,7 +12635,7 @@ class TestSameAsSpeakerPairGuard:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=([], [["speaker0", "speaker0"]], "raw", []),
+            return_value=([], [["speaker0", "speaker0"]], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -12694,7 +12694,7 @@ class TestSameAsSpeakerPairGuard:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=([], [["speaker0", "speaker1"]], "raw", []),
+            return_value=([], [["speaker0", "speaker1"]], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -12748,7 +12748,7 @@ class TestSameAsSpeakerPairGuard:
         # is allowed and same_as_merges == 1.
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=([], [["Alexander", "Alex"]], "raw", []),
+            return_value=([], [["Alexander", "Alex"]], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 

@@ -402,14 +402,94 @@ class TestCloudScopeObservedScoping:
         assert scope.declared == frozenset({"Person_1", "Person_2"})
 
 
-class TestDeanonymizeFactsTotalityGate:
-    """``deanonymize_facts`` takes NO graph and mutates nothing — both of
-    the totality gate's findings (``verdict`` and ``collisions``) come
-    back on ``DeanonResult``.  Diagnostics are the caller's business (see
+class TestCloudScopeBindingValuePruning:
+    """``CloudScope.response`` (2026-07-22 cloud-admission redesign):
+    a binding whose own VALUE still carries an unresolvable placeholder
+    token is pruned entirely, ONE pass — replacing the fatal binding-value
+    scan that used to live in ``_check_mapping_totality``.
+    """
+
+    def _payload(self, reverse: dict[str, str], declared: frozenset[str]) -> AnonymizedContract:
+        return AnonymizedContract(
+            status="ok",
+            forward={v: k for k, v in reverse.items()},
+            reverse=reverse,
+            anon_transcript="",
+            declared=declared,
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+        )
+
+    def test_binding_value_with_unresolvable_placeholder_is_pruned(self):
+        """``{"Role_1": "Senior Engineer at Org_9"}`` — Org_9 is never
+        declared anywhere, so the WHOLE binding is dropped, not just its
+        unresolvable fragment."""
+        payload = self._payload({}, frozenset())
+        scope = CloudScope.response(
+            payload,
+            cloud_bindings={"Role_1": "Senior Engineer at Org_9"},
+            sent=("some payload",),
+        )
+        assert "Role_1" not in scope.cloud_bindings
+        assert "Role_1" not in scope.resolution
+
+    def test_binding_value_resolvable_against_core_is_kept(self):
+        """A binding value referencing a token that DOES resolve (via the
+        CORE reverse map) is kept whole — pruning is targeted, not a
+        blanket rejection of any value containing placeholder-shaped
+        text."""
+        payload = self._payload({"Org_9": "Acme"}, frozenset({"Org_9"}))
+        scope = CloudScope.response(
+            payload,
+            cloud_bindings={"Role_1": "Senior Engineer at Org_9"},
+            sent=("some payload mentioning Org_9",),
+        )
+        assert scope.cloud_bindings["Role_1"] == "Senior Engineer at Org_9"
+        assert scope.resolution["Role_1"] == "Senior Engineer at Org_9"
+
+    def test_pruning_is_one_pass_not_a_fixpoint(self):
+        """A chain of two bindings (Role_1's value references Role_2,
+        which is itself unresolvable via Org_9) is only pruned ONE level —
+        documented, deliberate behaviour (see the docstring), not a bug.
+        Each binding's value is checked against the resolvability domain
+        computed ONCE from the ORIGINAL, unpruned bindings — Role_2 is
+        still a valid binding KEY at the moment Role_1 is checked, so
+        Role_1 survives even though Role_2 itself gets pruned in the SAME
+        pass (no second pass re-checks Role_1 against the now-smaller,
+        post-pruning domain)."""
+        payload = self._payload({}, frozenset())
+        scope = CloudScope.response(
+            payload,
+            cloud_bindings={
+                "Role_1": "the person known as Role_2",
+                "Role_2": "Senior Engineer at Org_9",
+            },
+            sent=("some payload",),
+        )
+        # Role_2's value carries an unresolvable Org_9 -> pruned.
+        assert "Role_2" not in scope.cloud_bindings
+        # Role_1's value names Role_2 — a valid binding key in the
+        # ORIGINAL (pre-pruning) domain used for this single pass — so it
+        # survives, even though Role_2 no longer resolves post-pruning.
+        assert scope.cloud_bindings["Role_1"] == "the person known as Role_2"
+
+
+class TestDeanonymizeFactsAlwaysSubstitutes:
+    """``deanonymize_facts`` takes NO graph and mutates nothing.  Always
+    substitutes now (2026-07-22 cloud-admission redesign retired the
+    whole-delta accept/reject ``verdict`` ``DeanonResult`` used to carry) —
+    the fail-closed residual sweep (surfaced as ``predicate_dropped`` /
+    ``residual_dropped``) is what still sheds an individual fact, and
+    ``collisions`` is always an informational diagnostic. Diagnostics are
+    the caller's business (see
     ``paramem.graph.extractor._record_binding_diagnostics``).
     """
 
-    def test_orphan_token_rejects_whole_delta(self):
+    def test_orphan_token_dropped_via_residual_sweep(self):
+        """An unresolvable token (never declared -> orphan) is dropped
+        individually by the fail-closed residual sweep, not by rejecting
+        the whole delta."""
         payload = AnonymizedContract(
             status="ok",
             forward={"Alex": "Person_1"},
@@ -431,8 +511,8 @@ class TestDeanonymizeFactsTotalityGate:
             }
         ]
         result = deanonymize_facts(scope, facts)
-        assert result.verdict, "expected a non-empty verdict"
         assert result.facts == []
+        assert len(result.residual_dropped) == 1
         # No cloud_bindings on this scope -> the collision scan never ran.
         assert result.collisions == []
 
@@ -458,7 +538,6 @@ class TestDeanonymizeFactsTotalityGate:
             }
         ]
         result = deanonymize_facts(scope, facts)
-        assert result.verdict == []
         assert result.collisions == []
         assert result.facts == [
             {
@@ -470,15 +549,14 @@ class TestDeanonymizeFactsTotalityGate:
             }
         ]
 
-    def test_collisions_surface_on_the_result_when_scoped(self):
+    def test_binding_collision_is_inert_fact_still_substitutes(self):
         """An ``observed``-scoped collision (cloud rebinding a token it was
-        already shown as a CORE reference) surfaces BOTH as a rejection
-        verdict and as a ``collisions`` entry — the second is what the
-        caller writes to ``cloud_binding_collisions``.
-
-        Mutation: drop ``collisions`` from the rejected-exit
-        ``DeanonResult`` (returning ``[]``) -> the caller stops recording
-        the collision diagnostic -> this test fails.
+        already shown as a CORE reference) surfaces as a ``collisions``
+        entry — the diagnostic the caller writes to
+        ``cloud_binding_collisions`` — but is otherwise INERT: CORE-LAST
+        precedence resolves the fact via the CORE reverse map regardless,
+        never rejecting anything. Inverts the pre-redesign expectation
+        (used to reject the whole delta).
         """
         payload = AnonymizedContract(
             status="ok",
@@ -497,27 +575,34 @@ class TestDeanonymizeFactsTotalityGate:
             sent=("Person_1",),
         )
         assert "Person_1" in scope.observed
-        result = deanonymize_facts(scope, [])
-        assert result.verdict == ["Person_1"]
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "likes",
+                "object": "coffee",
+                "relation_type": "preference",
+                "confidence": 0.9,
+            }
+        ]
+        result = deanonymize_facts(scope, facts)
         assert result.collisions == ["Person_1"]
-        assert result.facts == []
+        assert result.facts == [
+            {
+                "subject": "Alex",
+                "predicate": "likes",
+                "object": "coffee",
+                "relation_type": "preference",
+                "confidence": 0.9,
+            }
+        ]
 
-    def test_accepted_exit_carries_the_collision_scan_result(self):
-        """The accepted exit also carries ``collisions`` — it is the scan
-        result, not a hardcoded ``[]``.
-
-        Through ``deanonymize_facts`` a NON-empty ``collisions`` implies a
-        non-empty ``verdict``: ``CloudScope.observed`` is always a
-        ``frozenset`` (never ``None``), and under the observed-scoped
-        branch every collision is folded into the verdict.  So the
-        accepted exit can only ever carry ``[]`` in production — the
-        informational, not-folded collision shape exists only when
-        ``_check_mapping_totality`` is called directly with
-        ``observed=None`` (pinned in ``test_extraction_pipeline.py``).
+    def test_no_collision_carries_empty_collisions(self):
+        """The accepted-shape exit also carries ``collisions`` — it is the
+        scan result, not a hardcoded ``[]``.
 
         Here cloud mints a binding for a token it was NEVER shown
         (``Org_9`` is not in ``observed``), which is the legitimate mint
-        case: no collision, no verdict, and the mint resolves.
+        case: no collision, and the mint resolves.
         """
         payload = AnonymizedContract(
             status="ok",
@@ -540,7 +625,6 @@ class TestDeanonymizeFactsTotalityGate:
             }
         ]
         result = deanonymize_facts(scope, facts)
-        assert result.verdict == []
         assert result.collisions == []
         assert result.facts[0]["subject"] == "Alex"
         assert result.facts[0]["object"] == "Acme"

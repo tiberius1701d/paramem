@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from paramem.cloud.deanonymize import (
 )
 from paramem.cloud.placeholders import (
     _FACT_FIELDS,
+    _fact_orphans,
+    _fact_tokens,
     _normalize_anonymization_mapping,
     _substitute_whole_words,
     braced,
@@ -1164,23 +1167,31 @@ def _fallback_plausibility_on_raw(
 
 def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> None:
     """Persist a :func:`~paramem.cloud.deanonymize.deanonymize_facts`
-    verdict onto ``graph.diagnostics`` — the CALLER side of the totality
-    gate.
+    result's collision findings onto ``graph.diagnostics``.
 
     The gate primitive
-    (:func:`~paramem.cloud.placeholders._check_mapping_totality`) used to
-    write these two keys itself, from inside ``deanonymize_facts``, onto a
+    (:func:`~paramem.cloud.placeholders._binding_collisions`) used to
+    write these keys itself, from inside ``deanonymize_facts``, onto a
     ``SessionGraph`` it took purely as a diagnostics sink; a caller two
-    levels up then read the mutation back off the graph. Both findings are
-    return values now, and this is the ONE place in the extractor that
-    turns them into diagnostics, shared by all three
-    ``deanonymize_facts`` call sites (the ``cloud_enrich`` gate, the
-    ``deanon`` substitution, and :func:`request_graph_enrichment`).
+    levels up then read the mutation back off the graph. The finding is a
+    return value now, and this is the ONE place in the extractor that
+    turns it into a diagnostic, shared by both remaining
+    ``deanonymize_facts`` call sites (the ``deanon`` substitution and
+    :func:`request_graph_enrichment`; the former ``cloud_enrich`` gate
+    call site was retired along with the whole-delta rejection it existed
+    for — see :func:`_apply_enrichment_delta`).
+
+    **``cloud_pending_orphans`` is retired (2026-07-22 cloud-admission
+    redesign).** ``DeanonResult`` no longer carries a ``verdict`` field —
+    nothing gates on a whole-delta orphan list any more, so there is
+    nothing left to write under that key. Only ``collisions`` survives:
+    always informational (a binding for a token cloud was shown is inert
+    under CORE-LAST precedence), never a rejection signal.
 
     Writes are guarded exactly as the primitive's were: an EMPTY list
-    writes no key at all, so ``"key" not in graph.diagnostics`` keeps its
-    established meaning ("the scan found nothing"), distinct from a
-    present-but-empty value.
+    writes no key at all, so ``"cloud_binding_collisions" not in
+    graph.diagnostics`` keeps its established meaning ("the scan found
+    nothing"), distinct from a present-but-empty value.
 
     Args:
         graph: The graph the delta is being applied to — the session graph
@@ -1190,8 +1201,6 @@ def _record_binding_diagnostics(graph: SessionGraph, result: DeanonResult) -> No
     """
     if result.collisions:
         graph.diagnostics["cloud_binding_collisions"] = result.collisions
-    if result.verdict:
-        graph.diagnostics["cloud_pending_orphans"] = result.verdict
 
 
 # The provider tables (PROVIDER_KEY_ENV, OPENAI_COMPAT_ENDPOINTS,
@@ -1503,44 +1512,50 @@ def request_enrichment(
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
     prompts_dir: str | Path | None = None,
     prompt_filename: str = "cloud_enrichment.txt",
-) -> tuple[list[dict] | None, str | None, dict[str, str], str | None, dict]:
-    """Cloud enrichment pass — coreference + compound splitting + safe reification.
+) -> tuple["EnrichmentDelta | None", str | None, dict]:
+    """Cloud enrichment call — coreference + compound splitting + safe
+    reification.
 
-    Returns ``(facts, updated_transcript, bindings, raw_response, info)``.
+    Returns ``(delta, raw_response, info)``. This function only calls the
+    cloud and PARSES the response into an :class:`EnrichmentDelta` — it no
+    longer applies the delta, merges facts, or reconstructs the updated
+    transcript (2026-07-22 cloud-admission redesign). The caller applies
+    the delta itself via :func:`_apply_enrichment_delta`, once it has built
+    the :class:`~paramem.cloud.deanonymize.CloudScope` the delta's
+    ``bindings`` need to be checked against.
 
     The cloud emits a delta envelope ``{"add": [...], "modify": [...],
     "drop": [...], "bindings": {...}}`` describing what to change against
     the indexed input facts. KEEP is the default; unnamed input facts pass
-    through unchanged. The transcript is rendered locally from
-    ``anon_transcript`` plus ``bindings`` — never carried back on the
-    wire — so output bandwidth is bounded by the size of the change set,
-    not by the size of the input.
+    through unchanged.
 
-    ``bindings`` maps each new braced placeholder cloud introduced (key
-    without braces, e.g. ``"Event_1"``) to the exact transcript span it
-    stands for. Cloud already knows the binding the moment it mints each
-    placeholder, so emitting it explicitly removes the transcript-diff
-    reconstruction step the previous "echo every fact" protocol relied on.
+    ``delta.bindings`` maps each new braced placeholder cloud introduced
+    (key without braces, e.g. ``"Event_1"``) to the exact transcript span
+    it stands for. Cloud already knows the binding the moment it mints
+    each placeholder, so emitting it explicitly removes the
+    transcript-diff reconstruction step the previous "echo every fact"
+    protocol relied on.
 
     ``info`` is a dict with diagnostic flags the caller persists into
     ``graph.diagnostics``:
 
-    * ``parse_path``: ``"delta"`` (envelope parsed, delta applied),
-      ``"failed"`` (parse failure), or ``"no_response"`` (provider
-      returned nothing). Both failure paths return ``None`` facts, and
-      the caller (the ``enrich`` stage,
-      :func:`~paramem.graph.stage_enrich._stage_enrich`) raises
+    * ``parse_path``: ``"delta"`` (envelope parsed), ``"failed"`` (parse
+      failure), or ``"no_response"`` (provider returned nothing). Both
+      failure paths return ``delta=None``, and the caller (the ``enrich``
+      stage, :func:`~paramem.graph.stage_enrich._stage_enrich`) raises
       :class:`ExtractionFailed` on either — it does NOT fail open.
       Failing open used to silently bake a degraded, un-enriched
       snapshot into the cumulative graph, where the next cycle's
       re-extraction deduped it and the missing relations were lost
-      permanently; see the call site for the full reasoning.
+      permanently; see the call site for the full reasoning. This is the
+      ONE remaining whole-response failure mode — per-triple
+      resolvability inside an otherwise-parseable delta is no longer one.
     * ``response_chars``: length of the raw response in characters.
-    * ``add_count`` / ``modify_count`` / ``drop_count``: validated
-      action counts; entries that fail per-entry validation (out-of-range
-      indices, non-dict fields) are not counted.
-    * ``bindings_count``: number of cloud-introduced placeholders for
-      which the response carried an explicit binding.
+
+    The action counts (``add_count`` / ``modify_count`` / ``drop_count`` /
+    ``bindings_count``) that used to live in this dict moved to
+    :func:`_apply_enrichment_delta`'s ``report`` — they depend on
+    resolvability, which this function no longer decides.
 
     The prompt this function loads is external config — edit
     ``configs/prompts/cloud_enrichment.txt`` to tune; no code changes are
@@ -1571,12 +1586,10 @@ def request_enrichment(
         timeout_seconds=timeout_seconds,
     )
     if raw is None:
-        return None, None, {}, None, {"parse_path": "no_response"}
-    surviving, updated_transcript, bindings, counts = _apply_enrichment_delta(
-        anon_facts, raw, anon_transcript
-    )
-    info: dict = {"response_chars": len(raw), **counts}
-    if surviving is None:
+        return None, None, {"parse_path": "no_response"}
+    delta = _parse_enrichment_delta(raw, len(anon_facts))
+    info: dict = {"response_chars": len(raw)}
+    if delta is None:
         info["parse_path"] = "failed"
         logger.warning(
             "cloud enrichment delta parse failed (response_chars=%d) — "
@@ -1585,7 +1598,7 @@ def request_enrichment(
         )
     else:
         info["parse_path"] = "delta"
-    return surviving, updated_transcript, bindings, raw, info
+    return delta, raw, info
 
 
 # ---------------------------------------------------------------------------
@@ -1604,7 +1617,7 @@ def request_graph_enrichment(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
-) -> tuple[list[dict], list[list[str]], str | None, list[str]] | None:
+) -> tuple[list[dict], list[list[str]], str | None, int] | None:
     """Cloud graph-level enrichment pass over a pre-merged cumulative graph.
 
     Sends a subgraph serialized as triples to a cloud provider and requests
@@ -1642,16 +1655,18 @@ def request_graph_enrichment(
 
     After the cloud call, the response's ``relations`` are de-anonymized via
     :func:`~paramem.cloud.deanonymize.deanonymize_facts` (the single exit
-    gate: totality gate, THEN predicate invariant, substitute, residual
-    sweep, fail-closed) — returning real node names and bare ``speaker{N}``
-    ids, exactly what
+    gate: predicate invariant, substitute, residual sweep, fail-closed) —
+    returning real node names and bare ``speaker{N}`` ids, exactly what
     :func:`~paramem.training.graph_enrich.enrich_graph`'s existing
     consumption logic (including the speaker-pair guard that rejects a same_as pair
-    where both surfaces are speaker ids) already expects. A non-empty
-    totality verdict REJECTS THE WHOLE CHUNK DELTA (relations AND
-    ``same_as`` both discarded) — the caller detects this from the
-    verdict this function RETURNS (the fourth tuple element) and counts it
-    in ``totality_rejected_chunks``.
+    where both surfaces are speaker ids) already expects. There is no
+    whole-chunk rejection: every ``relations`` entry is effectively an
+    ``add`` (this tier has no local baseline to preserve), so an
+    individually-unresolvable relation is simply dropped by the residual
+    sweep — the caller reads how many were dropped from the fourth tuple
+    element and accumulates it into its own ``dropped_relations`` stat
+    (see :func:`~paramem.training.graph_enrich.enrich_graph`'s
+    docstring).
     Any ``bindings`` the response carries (cloud-minted placeholders —
     normally empty, since the prompt forbids inventing new nodes) are
     normalized inside :meth:`~paramem.cloud.deanonymize.CloudScope.
@@ -1708,10 +1723,8 @@ def request_graph_enrichment(
         graph: The caller's throwaway per-chunk ``SessionGraph`` (carries
             no relations of its own — this function never reads
             ``graph.relations``) — the diagnostics sink this function
-            writes the totality gate's findings to (via
-            :func:`_record_binding_diagnostics`).  It is NOT how the
-            caller learns of a rejection: that arrives as the returned
-            verdict.
+            writes the collision findings to (via
+            :func:`_record_binding_diagnostics`).
         api_key: Provider API key.
         provider: Cloud provider name (e.g. ``"anthropic"``).
         filter_model: Model identifier for the provider.
@@ -1720,17 +1733,18 @@ def request_graph_enrichment(
         temperature: Sampling temperature (0.0 for deterministic output).
 
     Returns:
-        ``(new_relations, same_as_pairs, raw_response, totality_verdict)``
+        ``(new_relations, same_as_pairs, raw_response, dropped_relations)``
         on success, or ``None`` when the cloud call fails or the response
         cannot be parsed.  ``new_relations`` is a list of relation dicts
         with real node names; ``same_as_pairs`` is a list of
         ``[canonical, variant]`` pairs with real node names / bare speaker
-        ids.  ``totality_verdict`` is the binding-totality gate's verdict —
-        ``[]`` on an accepted delta, the sorted offending tokens on a
-        rejected one.  A rejected totality verdict is NOT ``None`` — it is
-        ``([], [], raw_response, verdict)``; the non-empty verdict is what
-        tells the caller "delta discarded" apart from "delta legitimately
-        empty" (``([], [], raw_response, [])``).
+        ids.  ``dropped_relations`` is the count of relations the
+        fail-closed residual sweep individually dropped post-substitution
+        (predicate-invariant drops plus residual-placeholder drops) — ``0``
+        when every relation survived.  A legitimately empty response
+        (``([], [], raw_response, 0)``) is indistinguishable from "nothing
+        was dropped" by design — there is no whole-chunk rejection left to
+        discriminate from an empty delta.
 
     The prompt this function loads is external config — edit
     ``configs/prompts/cloud_graph_enrichment.txt`` to tune; no code changes
@@ -1807,26 +1821,22 @@ def request_graph_enrichment(
     # triples_json string sent to cloud (never a shape scrape).
     scope = CloudScope.response(payload, cloud_bindings=raw_bindings, sent=(triples_json,))
 
-    # De-anonymize relations — the SAME exit gate the session tier uses,
-    # gated by the totality check as step 1 (unconditional — the graph
-    # tier's binding-totality gate).  A non-empty verdict rejects the
-    # WHOLE chunk delta.
+    # De-anonymize relations — the SAME exit gate the session tier uses.
+    # Every ``new_relations`` entry here is effectively an ``add`` (this
+    # tier has no local baseline to preserve — ``graph`` carries no
+    # relations of its own), so there is no whole-chunk gate any more: an
+    # individually-unresolvable relation is simply dropped by
+    # ``_apply_bindings``'s fail-closed residual sweep (predicate
+    # invariant + residual placeholder check), never a reason to discard
+    # every OTHER relation and ``same_as`` pair in the same response.
     deanon = deanonymize_facts(scope, new_relations)
     _record_binding_diagnostics(graph, deanon)
-    if deanon.verdict:
-        logger.warning(
-            "graph_enrichment: binding-totality breach: %d offending token(s) %s — "
-            "rejecting the whole chunk delta (%d relation(s) discarded).",
-            len(deanon.verdict),
-            deanon.verdict[:5],
-            len(new_relations),
-        )
-        return [], [], raw, deanon.verdict
-    if deanon.predicate_dropped or deanon.residual_dropped:
+    dropped_relation_count = len(deanon.predicate_dropped) + len(deanon.residual_dropped)
+    if dropped_relation_count:
         logger.warning(
             "graph_enrichment: dropped %d relation(s) post-substitution "
             "(%d predicate-invariant, %d residual placeholder sweep).",
-            len(deanon.predicate_dropped) + len(deanon.residual_dropped),
+            dropped_relation_count,
             len(deanon.predicate_dropped),
             len(deanon.residual_dropped),
         )
@@ -1846,7 +1856,7 @@ def request_graph_enrichment(
             continue
         deanon_same_as.append([d_canon, d_variant])
 
-    return deanon.facts, deanon_same_as, raw, deanon.verdict
+    return deanon.facts, deanon_same_as, raw, dropped_relation_count
 
 
 def _render_indexed_facts(facts: list[dict]) -> str:
@@ -1965,14 +1975,39 @@ def _apply_drop_set(facts: list[dict], raw: str | None) -> list[dict] | None:
     return [f for i, f in enumerate(facts) if i not in drop]
 
 
-def _parse_enrichment_delta(
-    raw: str | None, n_facts: int
-) -> tuple[list[dict], list[tuple[int, dict]], set[int], dict[str, str]] | None:
+@dataclass(frozen=True)
+class EnrichmentDelta:
+    """The cloud enrichment judge's parsed delta-envelope output.
+
+    Exactly what :func:`_parse_enrichment_delta` already computed as a
+    bare 4-tuple, named so :func:`_apply_enrichment_delta` and its callers
+    (:func:`~paramem.graph.stage_enrich._stage_enrich`,
+    :func:`~paramem.server.calibrate.calibrate_enrich`) can pass it around
+    as one value instead of four positional ones.
+
+    Attributes:
+        add: New fact dicts to append (each already restricted to
+            :data:`_FACT_FIELDS`).
+        modify: ``(index, fields)`` pairs — a partial update for the
+            indexed input fact (``fields`` already restricted to
+            :data:`_FACT_FIELDS`).
+        drop: Zero-based indices to remove from the input.
+        bindings: New braced placeholders cloud introduced (key without
+            braces, e.g. ``"Event_1"``) mapped to the exact
+            anonymized-transcript span they stand for.
+    """
+
+    add: list[dict]
+    modify: list[tuple[int, dict]]
+    drop: set[int]
+    bindings: dict[str, str]
+
+
+def _parse_enrichment_delta(raw: str | None, n_facts: int) -> EnrichmentDelta | None:
     """Parse the cloud enrichment judge's delta-envelope output.
 
-    Returns ``(add, modify, drop, bindings)`` on success; ``None`` on
-    parse failure, which propagates through
-    :func:`_apply_enrichment_delta` and :func:`request_enrichment` to a
+    Returns an :class:`EnrichmentDelta` on success; ``None`` on parse
+    failure, which propagates through :func:`request_enrichment` to a
     raised :class:`ExtractionFailed` at the ``cloud_enrich`` call site —
     an unparseable enrichment response fails the cycle, it does not fall
     back to the pre-enrichment facts.
@@ -2145,7 +2180,7 @@ def _parse_enrichment_delta(
             type(raw_bindings).__name__,
         )
 
-    return add, modify, drop, bindings
+    return EnrichmentDelta(add=add, modify=modify, drop=drop, bindings=bindings)
 
 
 def _reconstruct_updated_transcript(
@@ -2180,62 +2215,137 @@ def _reconstruct_updated_transcript(
 
 def _apply_enrichment_delta(
     facts: list[dict],
-    raw: str | None,
-    anon_transcript: str | None,
-) -> tuple[list[dict] | None, str | None, dict[str, str], dict]:
-    """Apply the enrichment delta to input facts and reconstruct transcript.
+    delta: EnrichmentDelta,
+    scope: CloudScope | None,
+    anon_transcript: str | None = None,
+) -> tuple[list[dict], str | None, dict]:
+    """Apply a parsed enrichment delta to input facts — per-triple
+    accept/drop/revert, then reconstruct the updated transcript from the
+    surviving bindings.
 
-    Returns ``(new_facts, updated_transcript, bindings, counts)``.  On
-    parse failure ``new_facts`` is ``None``, which :func:`request_enrichment`
-    reports to its caller (the ``enrich`` stage,
-    :func:`~paramem.graph.stage_enrich._stage_enrich`) as a failed
-    ``cloud_enrich`` phase and which that call site turns into a raised
-    :class:`ExtractionFailed` — an unparseable enrichment response fails
-    the cycle rather than keeping the pre-enrichment facts.
-    ``counts`` is a small diagnostic dict
-    (``add_count`` / ``modify_count`` / ``drop_count`` / ``bindings_count``)
-    that callers persist into ``graph.diagnostics``; on parse failure
-    every count is zero.
+    Returns ``(facts, updated_transcript, report)``.  Unlike the retired
+    whole-delta gate, this function ALWAYS returns a fact list — there is
+    no parse-failure branch here: ``delta`` is already a parsed
+    :class:`EnrichmentDelta`, and a parse failure is handled one level up
+    by :func:`request_enrichment` (returning ``delta=None`` before this
+    function is ever called; the caller — the ``enrich`` stage,
+    :func:`~paramem.graph.stage_enrich._stage_enrich` — raises
+    :class:`ExtractionFailed` on that ``None``, never calling this
+    function at all).
 
-    Application order:
-      1. ``modify`` — shallow-merge ``fields`` into a copy of each
-         indexed input fact.
-      2. ``drop`` — remove dropped indices.
-      3. ``add`` — append new facts.
-      4. Reconstruct ``updated_transcript`` from ``anon_transcript`` +
-         ``bindings`` (longest-span-first single pass).
+    ``scope`` supplies the resolvability domain — ``set(scope.resolution)``
+    when given.  ``scope is None`` is a deliberate sentinel (the
+    calibration / unit-test shape, mirroring
+    :func:`~paramem.cloud.placeholders._apply_bindings`'s own
+    ``observed=None`` convention): NOTHING is gated and every action
+    applies exactly as written, since there is no
+    :class:`~paramem.cloud.anonymize.AnonymizedContract` to resolve
+    against.
 
-    The transcript-on-the-wire is gone: Cloud emits only the bindings,
-    and the substitution is deterministic.  Downstream diagnostics that
-    used ``cloud_updated_transcript`` continue to work because the
-    reconstruction lives at the same call site.
+    Per-action rules (owner-decided 2026-07-21/22 cloud-admission
+    redesign — replaces the whole-delta totality gate that used to live in
+    :func:`~paramem.cloud.deanonymize.deanonymize_facts`):
+
+    1. ``add`` — a fact carrying any orphan token
+       (:func:`~paramem.cloud.placeholders._fact_orphans`, scanning
+       ``subject``/``object``) is DROPPED.  No loss: it never existed
+       locally.
+    2. ``modify`` — ``fields`` is shallow-merged into a COPY of the
+       indexed input fact; if the RESULT carries any orphan, the fields
+       are DISCARDED and the original input fact is kept UNCHANGED — the
+       unit of rejection is cloud's CHANGE, not the fact itself.
+    3. ``drop`` — honored UNCONDITIONALLY.  The spec's alternative
+       (revert every drop in a delta that also had an add/modify
+       rejection, preferring redundancy over loss) is explicitly NOT
+       implemented here — the owner chose to measure the co-occurrence
+       first (``report["drop_with_rejection"]``) before building that
+       safety net.
+
+    Application order mirrors the original: ``modify``, then ``drop``,
+    then ``add``.
+
+    ``updated_transcript`` excludes a binding ONLY when it is referenced
+    EXCLUSIVELY by rejected content — an ``add``/``modify`` binding whose
+    only referencing fact was rejected must not leak into the transcript.
+    A binding referenced by nothing at all (never tied to any fact — a
+    legal, if unusual, cloud mint) is NOT excluded; a binding referenced by
+    both a rejected candidate and something that survived is NOT excluded
+    either. Computed by scanning every rejected ``add``/``modify``
+    candidate's tokens against the final surviving fact list's tokens
+    AFTER every accept/drop/revert decision is made.
+
+    ``report`` carries:
+
+    * ``add_count`` / ``modify_count`` / ``drop_count`` / ``bindings_count``
+      — the RAW counts from the parsed delta (same names
+      :func:`request_enrichment` used to report before this split — kept
+      for ``graph.diagnostics`` and ``tests/server/test_calibrate.py``
+      consumers), before any rejection.
+    * ``rejected_adds`` — count of ``add`` entries dropped for carrying an
+      orphan.
+    * ``reverted_modifies`` — count of ``modify`` entries whose fields
+      were discarded for producing an orphan.
+    * ``rejected_tokens`` — sorted list of the distinct orphan tokens
+      found across every rejected ``add``/``modify``.
+    * ``drop_with_rejection`` — ``True`` when this delta had a non-empty
+      ``drop`` set AND at least one ``add``/``modify`` rejection — the
+      measurement the owner asked for, to decide later whether reverting
+      every drop on any rejection (spec rule 3, not implemented) is worth
+      adding.
     """
-    parsed = _parse_enrichment_delta(raw, len(facts))
-    if parsed is None:
-        zero_counts = {
-            "add_count": 0,
-            "modify_count": 0,
-            "drop_count": 0,
-            "bindings_count": 0,
-        }
-        return None, None, {}, zero_counts
-    add, modify, drop, bindings = parsed
+    resolvable: set[str] | None = set(scope.resolution) if scope is not None else None
+
     working = [dict(f) for f in facts]
-    for idx, fields in modify:
-        working[idx].update(fields)
-    surviving = [f for i, f in enumerate(working) if i not in drop]
-    surviving.extend(add)
-    counts = {
-        "add_count": len(add),
-        "modify_count": len(modify),
-        "drop_count": len(drop),
-        "bindings_count": len(bindings),
+    rejected_tokens: set[str] = set()
+    # Tokens referenced by a REJECTED add/modify candidate — used below to
+    # scrub a binding from the transcript reconstruction ONLY when it is
+    # referenced EXCLUSIVELY by rejected content (never by anything that
+    # survived, and never left standalone/unreferenced-by-any-fact, which
+    # is legitimate — a cloud mint need not be tied to a fact at all).
+    rejected_reference_tokens: set[str] = set()
+    reverted_modifies = 0
+    for idx, fields in delta.modify:
+        candidate = {**working[idx], **fields}
+        orphans = _fact_orphans(candidate, resolvable) if resolvable is not None else set()
+        if orphans:
+            reverted_modifies += 1
+            rejected_tokens |= orphans
+            rejected_reference_tokens |= _fact_tokens(candidate)
+            continue
+        working[idx] = candidate
+
+    surviving = [f for i, f in enumerate(working) if i not in delta.drop]
+
+    rejected_adds = 0
+    for fact in delta.add:
+        orphans = _fact_orphans(fact, resolvable) if resolvable is not None else set()
+        if orphans:
+            rejected_adds += 1
+            rejected_tokens |= orphans
+            rejected_reference_tokens |= _fact_tokens(fact)
+            continue
+        surviving.append(fact)
+
+    surviving_tokens: set[str] = set()
+    for f in surviving:
+        surviving_tokens |= _fact_tokens(f)
+    rejected_only_tokens = rejected_reference_tokens - surviving_tokens
+    surviving_bindings = {k: v for k, v in delta.bindings.items() if k not in rejected_only_tokens}
+
+    report = {
+        "add_count": len(delta.add),
+        "modify_count": len(delta.modify),
+        "drop_count": len(delta.drop),
+        "bindings_count": len(delta.bindings),
+        "rejected_adds": rejected_adds,
+        "reverted_modifies": reverted_modifies,
+        "rejected_tokens": sorted(rejected_tokens),
+        "drop_with_rejection": bool(delta.drop) and bool(rejected_adds or reverted_modifies),
     }
     return (
         surviving,
-        _reconstruct_updated_transcript(anon_transcript, bindings),
-        bindings,
-        counts,
+        _reconstruct_updated_transcript(anon_transcript, surviving_bindings),
+        report,
     )
 
 

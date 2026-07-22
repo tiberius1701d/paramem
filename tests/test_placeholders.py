@@ -25,7 +25,10 @@ from paramem.cloud.placeholders import (
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
     _build_anonymization_mapping,
+    _fact_orphans,
+    _fact_tokens,
     _normalize_anonymization_mapping,
+    _placeholder_tokens,
     _substitute_whole_words,
     braced,
     invert_forward_mapping,
@@ -465,8 +468,8 @@ class TestMultiSegmentPlaceholderShape:
     def test_in_text_detector_matches_multi_segment_placeholder(self):
         """The unanchored in-text detector (:data:`PLACEHOLDER_TOKEN_RE`)
         must find a multi-segment placeholder embedded in surrounding
-        text — the same net :func:`_check_mapping_totality` and the
-        deanon residual sweep rely on."""
+        text — the same net :func:`_placeholder_tokens` and the deanon
+        residual sweep rely on."""
         text = "Please confirm Home_Address_1 is correct before shipping Car_Plate_1."
         found = [t[0] or t[1] for t in PLACEHOLDER_TOKEN_RE.findall(text)]
         assert found == ["Home_Address_1", "Car_Plate_1"]
@@ -477,6 +480,118 @@ class TestMultiSegmentPlaceholderShape:
         text = "Person_1 Home_Address_1"
         found = [t[0] or t[1] for t in PLACEHOLDER_TOKEN_RE.findall(text)]
         assert found == ["Person_1", "Home_Address_1"]
+
+
+class TestPlaceholderTokens:
+    """``_placeholder_tokens`` — THE ``PLACEHOLDER_TOKEN_RE.findall`` +
+    braced/bare name-extraction site (2026-07-22 cloud-admission
+    redesign de-duplication follow-up). Every other primitive that needs
+    "which placeholder tokens appear in this string" (``_fact_tokens``,
+    ``CloudScope.response``'s binding-value pruning) routes through this
+    function — these tests pin the primitive directly.
+    """
+
+    def test_bare_token_found(self):
+        assert _placeholder_tokens("Person_1 lives in City_1.") == {"Person_1", "City_1"}
+
+    def test_braced_token_found(self):
+        assert _placeholder_tokens("Person_1 works at {Org_9}.") == {"Person_1", "Org_9"}
+
+    def test_no_tokens_is_empty_set(self):
+        assert _placeholder_tokens("Alex lives in Berlin.") == set()
+
+    def test_empty_string_is_empty_set(self):
+        assert _placeholder_tokens("") == set()
+
+    def test_duplicate_occurrences_deduplicated(self):
+        """A token mentioned twice contributes ONE set member — this is a
+        SET, not a list of occurrences."""
+        assert _placeholder_tokens("Person_1 met Person_1 again.") == {"Person_1"}
+
+    def test_token_embedded_in_compound_string_found(self):
+        """A token embedded in a larger compound string, but still
+        word-boundary separated (e.g. a possessive), still surfaces."""
+        found = _placeholder_tokens("software for Product_1's Legend")
+        assert found == {"Product_1"}
+
+    def test_token_glued_onto_a_longer_identifier_is_not_found(self):
+        """Deliberately NOT caught: the ``\\b`` word-boundary anchor
+        misses a token GLUED onto a longer identifier with no separating
+        non-word character (``_`` is itself a word character) — e.g. a
+        placeholder glued into a predicate
+        (``language_proficiency_Language_3``). This is why
+        ``_declared_placeholder_tokens`` exists as a SEPARATE,
+        substring-based check for that class of bug — not a defect in
+        this function."""
+        assert _placeholder_tokens("language_proficiency_Language_3") == set()
+
+    def test_multi_segment_prefix_token_found(self):
+        assert _placeholder_tokens("See Home_Address_1 for details.") == {"Home_Address_1"}
+
+
+class TestFactTokens:
+    """``_fact_tokens`` — union of :func:`_placeholder_tokens` over a
+    fact dict's ``subject``/``object`` fields ONLY. ``predicate`` is a
+    SEPARATE invariant (owned by ``_apply_bindings`` step 1), never
+    scanned here.
+    """
+
+    def test_subject_and_object_both_scanned(self):
+        fact = {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}
+        assert _fact_tokens(fact) == {"Person_1", "City_1"}
+
+    def test_predicate_is_never_scanned(self):
+        """A placeholder glued into the predicate (the motivating bug,
+        ``language_proficiency_Language_3``) is invisible to this
+        function — it is a real name and a real place, no token at all
+        in subject/object."""
+        fact = {
+            "subject": "Alex",
+            "predicate": "language_proficiency_Language_3",
+            "object": "Advanced",
+        }
+        assert _fact_tokens(fact) == set()
+
+    def test_missing_fields_treated_as_empty(self):
+        """A fact dict missing ``subject``/``object`` entirely does not
+        crash — treated as an empty string, contributing no tokens."""
+        assert _fact_tokens({}) == set()
+
+    def test_no_placeholder_present_is_empty(self):
+        fact = {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}
+        assert _fact_tokens(fact) == set()
+
+    def test_braced_and_bare_both_contribute(self):
+        fact = {"subject": "Person_1", "predicate": "child_of", "object": "{Person_2}"}
+        assert _fact_tokens(fact) == {"Person_1", "Person_2"}
+
+
+class TestFactOrphans:
+    """``_fact_orphans`` — :func:`_fact_tokens` minus ``resolvable``. THE
+    per-fact orphan predicate consumed by
+    ``paramem.graph.extractor._apply_enrichment_delta``'s per-``add``/
+    ``modify`` accept/reject test.
+    """
+
+    def test_all_tokens_resolvable_is_empty(self):
+        fact = {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}
+        assert _fact_orphans(fact, {"Person_1", "City_1"}) == set()
+
+    def test_unresolvable_token_returned(self):
+        fact = {"subject": "Person_1", "predicate": "married_to", "object": "Person_9"}
+        assert _fact_orphans(fact, {"Person_1"}) == {"Person_9"}
+
+    def test_empty_resolvable_set_makes_every_token_an_orphan(self):
+        fact = {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}
+        assert _fact_orphans(fact, set()) == {"Person_1", "City_1"}
+
+    def test_no_tokens_at_all_is_empty_regardless_of_resolvable(self):
+        fact = {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}
+        assert _fact_orphans(fact, set()) == set()
+
+    def test_partial_resolution_returns_only_the_unresolved_subset(self):
+        fact = {"subject": "Person_1", "predicate": "knows", "object": "Person_9"}
+        assert _fact_orphans(fact, {"Person_1", "Person_2"}) == {"Person_9"}
 
 
 class TestSpeakerAnchorReverseSkip:

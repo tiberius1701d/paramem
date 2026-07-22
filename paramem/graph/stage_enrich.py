@@ -15,15 +15,15 @@ import dataclasses
 import logging
 
 from paramem.cloud.admission import PROVIDER_KEY_ENV, evaluate_cloud_egress
-from paramem.cloud.deanonymize import CloudScope, deanonymize_facts
+from paramem.cloud.deanonymize import CloudScope
 from paramem.cloud.placeholders import insert_placeholders
 from paramem.graph.empty_cause import CAUSE_ANON_JUDGE, CAUSE_CLOUD_EMPTY
 from paramem.graph.entity_correction import correct_entity_surfaces
 from paramem.graph.extractor import (
     _DEFAULT_FILTER_TEMPERATURE,
     ExtractionFailed,
+    _apply_enrichment_delta,
     _cloud_facing_payload,
-    _record_binding_diagnostics,
     _wait_for_gpu_ready,
     request_enrichment,
     request_plausibility,
@@ -203,13 +203,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
         # minted, so de-anonymization is pure dict substitution
         # downstream — no transcript diff, no LLM call, no regex
         # post-processing.
-        (
-            enriched_anon,
-            updated_anon_transcript,
-            cloud_bindings,
-            _cloud_raw,
-            _cloud_info,
-        ) = request_enrichment(
+        delta, _cloud_raw, _cloud_info = request_enrichment(
             anon_facts,
             api_key,
             ctx.enrichment_provider,
@@ -223,7 +217,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
         if _cloud_info:
             graph.diagnostics["cloud_call_info"] = _cloud_info
             t.add("cloud_call_info", _cloud_info)
-        if enriched_anon is None:
+        if delta is None:
             # FAIL the cycle.  Previously fell back to anon_facts, which
             # silently baked a degraded (un-enriched) snapshot into the
             # cumulative graph — the same triples re-extracted in the
@@ -234,7 +228,10 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
             # not yet merged this session's graph), and let the
             # per-session loop in app.py treat this session like a
             # ``VramExhausted`` chunk — leave it pending and retry on
-            # the next cycle.
+            # the next cycle.  This is the ONE remaining whole-response
+            # failure mode (the envelope itself is unparseable/absent) —
+            # per-triple resolvability inside an otherwise-parseable
+            # delta is handled below and never raises.
             t.set_parsed(
                 {
                     "input_count": len(anon_facts),
@@ -249,80 +246,49 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
                 "cloud_enrich",
                 "cloud enrichment call failed or response unparseable",
             )
-        # Binding-totality gate — the ONE anonymize/deanonymize round-trip
-        # scope for this response.  ``CloudScope.response`` computes
-        # ``observed`` from the DECLARED vocabulary and the rendered
-        # payload (never a shape scrape — see its docstring); a non-empty
-        # verdict means an orphan mint or a CORE/cloud conflict, and the
-        # delta is REJECTED AS A WHOLE (not partially applied) so a bad
-        # mint can never shed the local facts its ``drop`` action
-        # replaced.  ``deanonymize_facts`` runs the gate unconditionally
-        # as step 1 — it cannot be skipped from this call site.  This
-        # call's ``.facts`` is intentionally NOT the final substituted
-        # output: the anon-stage plausibility filter below may still
-        # shrink ``enriched_anon`` before the "deanon" phase performs the
-        # actual substitution (mirroring the pre-unification two-call
-        # structure — check here, substitute later, exactly as
-        # ``_check_mapping_totality`` then ``_apply_bindings`` used to be
-        # two separate call sites).
+        # The ONE anonymize/deanonymize round-trip scope for this
+        # response.  ``CloudScope.response`` computes ``observed`` from
+        # the DECLARED vocabulary and the rendered payload (never a shape
+        # scrape — see its docstring) and prunes any binding whose own
+        # value carries an unresolvable placeholder.
         scope = CloudScope.response(
-            payload, cloud_bindings=cloud_bindings, sent=(_facts_text, _transcript_text)
+            payload, cloud_bindings=delta.bindings, sent=(_facts_text, _transcript_text)
         )
-        gate = deanonymize_facts(scope, enriched_anon)
-        _record_binding_diagnostics(graph, gate)
-        if gate.verdict:
-            discarded_count = len(enriched_anon)
-            retained_count = len(anon_facts)
-            logger.error(
-                "cloud enrichment binding-totality breach: %d offending token(s) %s — "
-                "rejecting the whole delta (%d enriched fact(s) discarded), falling "
-                "back to %d local-extract fact(s).",
-                len(gate.verdict),
-                gate.verdict[:5],
-                discarded_count,
-                retained_count,
+        # Apply the delta — per-triple accept/drop/revert against
+        # ``scope.resolution``, never a whole-delta rejection (retired
+        # 2026-07-22): an unresolvable ``add`` is dropped, an
+        # unresolvable ``modify`` is reverted to its original fact, and
+        # ``drop`` is honored unconditionally. See
+        # ``_apply_enrichment_delta``'s own docstring for the full
+        # per-action contract and the ``report`` keys below.
+        enriched_anon, updated_anon_transcript, report = _apply_enrichment_delta(
+            anon_facts, delta, scope, anon_transcript
+        )
+        graph.diagnostics["cloud_enrichment_report"] = report
+        if report["rejected_adds"] or report["reverted_modifies"]:
+            logger.warning(
+                "cloud enrichment: %d add(s) dropped, %d modify(ies) reverted "
+                "(unresolvable token(s): %s)%s.",
+                report["rejected_adds"],
+                report["reverted_modifies"],
+                report["rejected_tokens"][:5],
+                " — co-occurred with a non-empty drop set" if report["drop_with_rejection"] else "",
             )
-            # The rejection: exactly three assignments.  ``anon_facts``
-            # (the local-extract facts) is what saves the data — the
-            # enrichment delta never touches it.  A rejected delta must be
-            # indistinguishable downstream from a no-op delta; these three
-            # assignments achieve exactly that.
-            enriched_anon = anon_facts
-            cloud_bindings = {}
-            updated_anon_transcript = None
-            graph.diagnostics["cloud_enrichment_rejected"] = gate.verdict
-            t.set_outcome("rejected", reason=f"binding-totality breach: {gate.verdict[:5]}")
-            t.set_parsed(
-                {
-                    "input_count": len(anon_facts),
-                    "output_count": len(enriched_anon),
-                    "new_bindings_count": 0,
-                    "new_bindings": {},
-                    "updated_anon_transcript_len": 0,
-                    "observed_count": len(scope.observed),
-                    "mapped_count": len(scope.core_resolution),
-                }
-            )
-            # The scope for the "deanon" phase below must reflect the
-            # reset ``cloud_bindings`` — never apply a rejected mint.
-            scope = CloudScope.response(
-                payload, cloud_bindings={}, sent=(_facts_text, _transcript_text)
-            )
-        else:
-            t.set_parsed(
-                {
-                    "input_count": len(anon_facts),
-                    "output_count": len(enriched_anon),
-                    "new_bindings_count": len(cloud_bindings or {}),
-                    "new_bindings": dict(cloud_bindings) if cloud_bindings else {},
-                    "updated_anon_transcript_len": len(updated_anon_transcript or ""),
-                    "observed_count": len(scope.observed),
-                    "mapped_count": len(scope.resolution),
-                }
-            )
-            if not enriched_anon:
-                logger.info("cloud enrichment removed all relations")
-                empty_cause = CAUSE_CLOUD_EMPTY
+        t.set_parsed(
+            {
+                "input_count": len(anon_facts),
+                "output_count": len(enriched_anon),
+                "new_bindings_count": len(delta.bindings or {}),
+                "new_bindings": dict(delta.bindings) if delta.bindings else {},
+                "updated_anon_transcript_len": len(updated_anon_transcript or ""),
+                "observed_count": len(scope.observed),
+                "mapped_count": len(scope.resolution),
+                **report,
+            }
+        )
+        if not enriched_anon:
+            logger.info("cloud enrichment removed all relations")
+            empty_cause = CAUSE_CLOUD_EMPTY
     if chain_stopped():
         # Calibration short-circuit: Cloud enrichment block recorded,
         # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.
@@ -436,10 +402,9 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
     # Hand-over to the ``deanonymize`` sibling: de-anonymization via
     # state-machine substitution, the deanon-stage judge and the
     # relation/entity rebuild all live in their own stages now.  ``scope``
-    # is the ONE anonymize/de-anonymize round-trip scope for this response
-    # (rebuilt above when the enrichment delta was rejected, so a rejected
-    # mint can never be applied); the substitution and the entity-type
-    # rebuild are both keyed on it.
+    # is the ONE anonymize/de-anonymize round-trip scope for this
+    # response — the substitution and the entity-type rebuild are both
+    # keyed on it.
     return dataclasses.replace(
         state,
         graph=graph,

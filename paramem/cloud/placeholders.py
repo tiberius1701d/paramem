@@ -79,10 +79,12 @@ PLACEHOLDER_SHAPE_RE = re.compile(rf"^{_BARE_PLACEHOLDER_SHAPE}$")
 # (``{Event_1}``, prefix laxly ``\w+`` since the cloud's own mint protocol
 # is the only producer of the braced form and doesn't always comply with
 # PascalCase) OR a bare token (``Person_2``, strict PascalCase,
-# word-boundary anchored). Used to scan facts/transcript text for
-# placeholder tokens: :func:`_check_mapping_totality`'s orphan scan and
-# the residual sweep in :func:`_apply_bindings` — the only two users.
-# (The ``observed`` legality domain is computed by
+# word-boundary anchored). Consumed via :func:`_placeholder_tokens` (the
+# ONE ``findall`` + name-extraction site) by :func:`_fact_tokens` and
+# :meth:`~paramem.cloud.deanonymize.CloudScope.response`'s binding-value
+# pruning; the residual sweep in :func:`_apply_bindings` uses the pattern
+# directly for a boolean presence check (``.search``), not name
+# extraction. (The ``observed`` legality domain is computed by
 # :meth:`~paramem.cloud.deanonymize.CloudScope.response` from the
 # DECLARED vocabulary by substring containment, never by this pattern.)
 PLACEHOLDER_TOKEN_RE = re.compile(rf"\{{(\w+_\d+)\}}|\b({_BARE_PLACEHOLDER_SHAPE})\b")
@@ -357,9 +359,11 @@ def _resolution_map(
     cloud_bindings: dict[str, str],
     observed: set[str] | None,
 ) -> dict[str, str]:
-    """The ONE legality/resolution map — built once, consumed by both
-    :func:`_check_mapping_totality` (as its legality domain) and
-    :func:`_apply_bindings` (as its substitution map).
+    """The ONE legality/resolution map — built once, consumed by
+    :meth:`~paramem.cloud.deanonymize.CloudScope.response` (to compute
+    ``resolution``/``core_resolution`` and to scope the binding-value
+    pruning check) and by :func:`_apply_bindings` (as its substitution
+    map).
 
     ``observed`` is ``None`` -> **CORE UNSCOPED** (today's behaviour;
     every deanon call that has no cloud-observed scope to pass — e.g. a
@@ -375,10 +379,11 @@ def _resolution_map(
     (``key in observed`` — a token in the rendered facts cloud saw, or in
     the anonymized transcript). Every ``cloud_bindings`` entry whose key
     is NOT in ``observed`` is cloud's own mint and resolves too. A key
-    present in both domains is a CONFLICT, caught upstream by
-    :func:`_check_mapping_totality` before an accepted delta ever reaches
-    this scoped branch — the map still reflects the tie-break if asked to
-    resolve one directly (unit-tested).
+    present in both domains is a CONFLICT — surfaced separately, purely
+    informationally, by :func:`_binding_collisions` — but never gated on
+    here: this map resolves it via CORE-LAST precedence regardless (the
+    tie-break below), so a conflict is harmless whether or not the caller
+    even runs the collision scan.
 
     **CORE PRECEDENCE (named invariant) — CORE-LAST BY CONSTRUCTION.**
     In both branches ``reverse`` entries are applied AFTER
@@ -413,168 +418,91 @@ def _resolution_map(
     return resolved
 
 
-def _check_mapping_totality(
-    anon_facts: list[dict],
+def _placeholder_tokens(text: str) -> set[str]:
+    """THE placeholder-token scan: every token name found in ``text``,
+    braced (``{Event_1}``) or bare (``Event_1``).
+
+    THE ONLY place :data:`PLACEHOLDER_TOKEN_RE.findall` plus the ``t[0] or
+    t[1]`` braced/bare name-extraction pattern appears in the codebase.
+    Every "which placeholder tokens appear in this string" question —
+    whether over a fact field (:func:`_fact_tokens`), a cloud binding's
+    own value (:meth:`~paramem.cloud.deanonymize.CloudScope.response`), or
+    anything else — routes through this function. Never re-implement the
+    ``findall`` + name-extraction loop at a second call site.
+    """
+    return {t[0] or t[1] for t in PLACEHOLDER_TOKEN_RE.findall(str(text))}
+
+
+def _fact_tokens(fact: dict) -> set[str]:
+    """Union of :func:`_placeholder_tokens` over ``fact``'s ``subject``/
+    ``object`` fields.
+
+    Only ``subject``/``object`` are scanned — a placeholder glued into
+    ``predicate`` is a SEPARATE invariant, enforced by
+    :func:`_apply_bindings` step 1, not this scan.
+    """
+    tokens: set[str] = set()
+    for field in ("subject", "object"):
+        tokens |= _placeholder_tokens(fact.get(field, ""))
+    return tokens
+
+
+def _fact_orphans(fact: dict, resolvable: set[str]) -> set[str]:
+    """The set of unresolvable placeholder token names found in ``fact``'s
+    ``subject``/``object`` fields — :func:`_fact_tokens` minus
+    ``resolvable``.
+
+    THE per-fact orphan predicate — used by
+    :func:`~paramem.graph.extractor._apply_enrichment_delta` as the
+    per-``add``/``modify`` accept/reject test, one fact at a time. Never
+    duplicate this at a second call site.
+    """
+    return _fact_tokens(fact) - resolvable
+
+
+def _binding_collisions(
     reverse_mapping: dict,
     *,
     cloud_bindings: dict | None = None,
     observed: set[str] | None = None,
-    resolution: dict[str, str] | None = None,
-) -> tuple[list[str], list[str]]:
-    """Diagnostic check: every placeholder in any anonymized fact must
-    resolve against :func:`_resolution_map` (``reverse_mapping`` plus
-    ``cloud_bindings``, scoped to ``observed`` — see that function) — the
-    SAME legality domain :func:`_apply_bindings` substitutes with at
-    deanon time.  Checked against the reverse map — not the forward map —
-    because a placeholder present only in the forward map's values still
-    fails to translate at deanon time.  Surfaces violations to ``logger``
-    and, via the RETURN VALUE, to whatever diagnostics the caller keeps —
-    so prompt regressions are visible rather than silently shedding
-    facts.
-
-    Returns ``(verdict, collisions)``:
-
-    * ``verdict`` — the sorted list of offending tokens (orphans, plus
-      conflicts when ``observed`` is given — see below); ``[]`` when the
-      mapping is total.  ONE exit point for a non-empty verdict —
-      whether the orphans came from the collision scan (``cloud_bindings``
-      vs. ``observed``/``reverse_mapping``) or the per-fact placeholder
-      scan — so a verdict is returned on every violation, never silently
-      dropped because ``anon_facts`` happened to be empty (a real
-      regression the caller-side counter ``totality_rejected_chunks``
-      depends on to be observable at all: an empty-``anon_facts`` chunk
-      whose cloud response still collided would otherwise be silently
-      under-counted as "no rejection").  Every other exit (no orphans at
-      all) also returns ``[]``, so callers can do a plain truthiness test
-      without a falsy-``None``-vs-falsy-``[]`` trap.
-    * ``collisions`` — the sorted collision-scan result described below;
-      ``[]`` when the scan found nothing or did not run.
-
-    This function writes NOTHING: it has no ``graph`` parameter and no
-    side effect on any caller-owned object.  A caller that wants the two
-    findings persisted writes them onto its own diagnostics from these
-    two return values — see the call sites in :mod:`paramem.graph.extractor`.
-
-    Only ONE production caller remains:
-    :func:`~paramem.cloud.deanonymize.deanonymize_facts`, which runs
-    this check UNCONDITIONALLY as step 1 (the primitive cannot be skipped
-    from any of the three fact-deanonymizing paths — session-tier
-    extraction, graph-tier enrichment, or their calibration harnesses —
-    since none of them can reach ``_apply_bindings`` any other way) and
-    REJECTS THE WHOLE DELTA on a non-empty verdict, returning
-    ``DeanonResult(facts=[], verdict=verdict, ...)`` without substituting
-    anything — the caller decides the fallback (e.g. the pre-enrichment
-    local-extract facts).  The ``cloud_bindings=None``, ``observed=None``
-    shape (kept as this function's default parameters for
-    direct/unit-test use) has no production caller: anonymized facts are
-    built by :func:`~paramem.cloud.anonymize.anonymize` directly from the
-    caller's fact list and the CORE map, so an orphan placeholder in a
-    local fact is structurally impossible, not merely diagnosed and
-    logged.  Matches both braced (``{Event_1}``) and bare (``Event_1``)
-    placeholder forms via :data:`PLACEHOLDER_TOKEN_RE`.
+) -> list[str]:
+    """Collision scan: a ``cloud_bindings`` key that clashes with the CORE
+    reverse map, or with the ``observed`` scope — ALWAYS informational,
+    never a rejection signal.  A binding for a token cloud was SHOWN is
+    inert under CORE-LAST precedence (:func:`_resolution_map` always
+    resolves such a key to the CORE value); see that function's
+    docstring for why a collision cannot corrupt resolution.
 
     When ``cloud_bindings`` is given and ``observed`` is a set, any
     ``cloud_bindings`` KEY that is also in ``observed`` is a CONFLICT
     (cloud referencing/rebinding something it was already shown as a core
-    reference) and is folded into the returned verdict.  When
-    ``observed`` is ``None`` (CORE unscoped — today's behaviour), the
-    conflict scan instead flags any KEY present in both ``cloud_bindings``
-    and ``reverse_mapping`` with a DIFFERING value — informational only,
-    NOT folded into the verdict, since :func:`_resolution_map`'s
-    CORE-wins tie-break already resolves it safely.  Both are returned
-    (sorted) as ``collisions``.
+    reference).  When ``observed`` is ``None`` (CORE unscoped), the scan
+    instead flags any KEY present in both ``cloud_bindings`` and
+    ``reverse_mapping`` with a DIFFERING value.
 
-    ``resolution`` — when the caller already holds the exact
-    ``_resolution_map(reverse_mapping, cloud_bindings, observed)`` result
-    (in production, :attr:`~paramem.cloud.deanonymize.CloudScope.resolution`),
-    pass it here to skip recomputing it a second time in this function's
-    own body.  ``None`` (default) preserves the original behaviour —
-    computed fresh from ``reverse_mapping``/``cloud_bindings``/``observed``
-    — for the direct/unit-test callers that have no ``CloudScope`` to
-    hand.  :func:`~paramem.cloud.deanonymize.deanonymize_facts` is the one
-    production caller and always passes ``scope.resolution`` — the
-    resolution map used to be rebuilt up to three times per deanonymize
-    call from the same three inputs (once here, once again in
-    :func:`_apply_bindings`, having already been computed once in
-    :meth:`~paramem.cloud.deanonymize.CloudScope.response`); this
-    parameter collapses that to one.
-
-    Does not mutate inputs and does not change the data flow.
+    Returns the sorted list of colliding keys, ``[]`` when the scan found
+    nothing or ``cloud_bindings`` is empty/``None``.  Writes NOTHING to
+    any caller-owned object: the ONE production caller,
+    :func:`~paramem.cloud.deanonymize.deanonymize_facts`, writes the
+    result onto its own ``DeanonResult.collisions``.
     """
-    orphans: set[str] = set()
-    collisions: list[str] = []
-    if cloud_bindings:
-        if observed is not None:
-            collisions = sorted(k for k in cloud_bindings if k in observed)
-        else:
-            collisions = sorted(
-                k
-                for k, v in cloud_bindings.items()
-                if k in reverse_mapping and reverse_mapping[k] != v
-            )
-        if collisions:
-            logger.warning(
-                "cloud binding collision: %d placeholder(s) present in both "
-                "cloud_bindings and reverse_mapping with differing values "
-                "(reverse_mapping wins): %s.",
-                len(collisions),
-                collisions[:5],
-            )
-            if observed is not None:
-                orphans |= set(collisions)
-    # ``resolvable`` is needed by BOTH scans below and must be computed
-    # whenever EITHER has something to scan — not nested inside the
-    # per-fact scan's own ``if anon_facts:`` gate.  Defect fixed
-    # 2026-07-21: the binding-VALUE scan used to sit inside that same
-    # ``if anon_facts:`` block, so an empty-``anon_facts`` cloud response
-    # that still carried a bogus ``cloud_bindings`` value (e.g. "Senior
-    # Engineer at Org_9" with an unresolvable ``Org_9``) skipped the scan
-    # entirely — silently dropping exactly the violation this function's
-    # own docstring says can "never silently dropped because anon_facts
-    # happened to be empty".
-    if anon_facts or cloud_bindings:
-        resolvable = (
-            set(resolution)
-            if resolution is not None
-            else set(_resolution_map(reverse_mapping, cloud_bindings or {}, observed))
+    if not cloud_bindings:
+        return []
+    if observed is not None:
+        collisions = sorted(k for k in cloud_bindings if k in observed)
+    else:
+        collisions = sorted(
+            k for k, v in cloud_bindings.items() if k in reverse_mapping and reverse_mapping[k] != v
         )
-        # Per-fact placeholder scan.
-        for f in anon_facts:
-            if not isinstance(f, dict):
-                continue
-            for field in ("subject", "object"):
-                for t in PLACEHOLDER_TOKEN_RE.findall(str(f.get(field, ""))):
-                    name = t[0] or t[1]
-                    if name not in resolvable:
-                        orphans.add(name)
-        # Q3 completeness: a binding value may itself contain a bare
-        # placeholder (e.g. "Senior Engineer at Org_9") that never
-        # resolves — the braced pass exposes it but nothing substitutes
-        # it, so it drops silently.  Runs whenever ``cloud_bindings`` is
-        # non-empty, regardless of whether ``anon_facts`` is.
-        for value in (cloud_bindings or {}).values():
-            if not isinstance(value, str):
-                continue
-            for t in PLACEHOLDER_TOKEN_RE.findall(value):
-                name = t[0] or t[1]
-                if name not in resolvable:
-                    orphans.add(name)
-    if orphans:
-        ordered = sorted(orphans)
-        # A single message: the only production caller
-        # (``deanonymize_facts``) always rejects the WHOLE delta on a
-        # non-empty verdict, so "the enrichment delta will be rejected"
-        # is accurate for every caller that reaches this branch in
-        # practice; a direct/unit-test caller exercising the
-        # ``cloud_bindings=None`` default shape gets the same message.
+    if collisions:
         logger.warning(
-            "Binding-totality violation: %d orphan/conflict placeholder(s) in "
-            "anon_facts not resolvable: %s. The delta will be rejected.",
-            len(ordered),
-            ordered[:5],
+            "cloud binding collision: %d placeholder(s) present in both "
+            "cloud_bindings and reverse_mapping with differing values "
+            "(reverse_mapping wins): %s.",
+            len(collisions),
+            collisions[:5],
         )
-        return ordered, collisions
-    return [], collisions
+    return collisions
 
 
 # ---------------------------------------------------------------------------
@@ -800,9 +728,8 @@ def _apply_bindings(
        substitution target below, so checking it after substitution
        would find nothing wrong with an already-corrupted predicate.
     2. **Substitute** subject/object with :func:`_resolution_map`
-       (``reverse``, ``cloud_bindings``, ``observed``) — the SAME
-       legality domain :func:`_check_mapping_totality` checks, rendered
-       in both braced and bare form:
+       (``reverse``, ``cloud_bindings``, ``observed``), rendered in both
+       braced and bare form:
 
        * **Anonymizer reverse map** (``reverse`` arg) —
          ``placeholder -> entity_name`` produced by
@@ -851,16 +778,20 @@ def _apply_bindings(
        Inside the full session flow
        (``paramem.graph.flows.SESSION_EXTRACT``, whose
        ``deanonymize`` stage is where this sweep actually runs), causes
-       (a) and (b) are now intercepted upstream by
-       :func:`_check_mapping_totality`'s cloud-enrichment-stage rejection
-       gate — a bad mint rejects the WHOLE delta before it reaches this
-       function, rather than shedding just the one fact.  This sweep
-       remains the fail-closed backstop for cause (c). An anonymizer-stage
-       leak is not among the live causes any more: :func:`insert_placeholders`
-       constructs the anon-stage fact array directly from the caller's
-       relations and the mapping, so an orphan placeholder in a LOCAL
-       fact is structurally impossible — the only source reaching this
-       sweep is cloud's *returned* facts.
+       (a) and (b) are now mostly pre-empted upstream by
+       :func:`~paramem.graph.extractor._apply_enrichment_delta`, which
+       drops an unresolvable ``add`` and reverts an unresolvable
+       ``modify`` individually (per-triple, not a whole-delta rejection)
+       BEFORE the fact ever reaches this function — so a bad mint sheds
+       only the one action that carried it.  This sweep remains the
+       fail-closed backstop for whatever slips past that per-triple gate
+       (in particular cause (c), and any fact this function is invoked on
+       directly, outside the full session flow — e.g. its own unit
+       tests). An anonymizer-stage leak is not among the live causes any
+       more: :func:`insert_placeholders` constructs the anon-stage fact
+       array directly from the caller's relations and the mapping, so an
+       orphan placeholder in a LOCAL fact is structurally impossible — the
+       only source reaching this sweep is cloud's *returned* facts.
 
     Non-dict entries in ``facts`` are silently skipped — never counted
     in any returned list.
@@ -878,8 +809,7 @@ def _apply_bindings(
     (``_extract_cloud_bindings``) which produced bogus mappings under
     multi-token replace blocks (bug 5).
 
-    ``resolution`` — same parameter as
-    :func:`_check_mapping_totality`'s: when the caller already holds
+    ``resolution`` — when the caller already holds
     :attr:`~paramem.cloud.deanonymize.CloudScope.resolution` (the ONE
     production shape, via :func:`~paramem.cloud.deanonymize.
     deanonymize_facts`), pass it here instead of letting step 2 recompute

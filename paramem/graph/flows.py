@@ -248,18 +248,16 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
     facts = state.facts
     empty_cause = state.empty_cause
 
-    # This is the SUBSTITUTION half of the two-call structure — the
-    # ``cloud_enrich`` phase's ``deanonymize_facts`` call was the GATE
-    # (accept/reject decision, run before any plausibility filter could
-    # shrink the fact set); this call substitutes whatever survived to
-    # this point (post accept/reject AND post anon-stage plausibility, if
-    # it ran).  Re-running the unconditional totality gate here is a
-    # structurally guaranteed no-op on an already-accepted (and possibly
-    # further-filtered, never further-expanded) subset — dropping facts
-    # can only shrink the placeholder surface, never introduce a new
-    # orphan — it is not a second privacy gap; it exists only because
-    # ``deanonymize_facts`` is the ONE way to reach ``_apply_bindings``
-    # (the structural guard).
+    # THE ONE call to ``deanonymize_facts`` for this response (the
+    # ``cloud_enrich`` phase's own call was retired along with the
+    # whole-delta totality gate — see
+    # ``paramem.graph.extractor._apply_enrichment_delta``, which now
+    # decides per-triple resolvability before this stage ever runs).  This
+    # call is where the actual substitution happens: whatever survived to
+    # this point (post per-triple accept/drop/revert AND post anon-stage
+    # plausibility, if it ran) has its placeholders resolved to real
+    # names, then the fail-closed residual sweep in ``_apply_bindings``
+    # sheds any fact still carrying an unresolved token.
     with phase_trace("deanon") as t:
         deanon_input_count = len(facts)
         deanon_result = deanonymize_facts(scope, facts)
@@ -287,9 +285,9 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
             logger.warning(
                 "Dropped %d fact(s) post-substitution (%d predicate-invariant, "
                 "%d residual placeholder sweep — composite string with an "
-                "unresolved placeholder; a missing-binding orphan is rejected "
-                "upstream by the whole-delta totality gate before reaching "
-                "here).",
+                "unresolved placeholder; a bare missing-binding orphan on an "
+                "add/modify is already dropped/reverted upstream by "
+                "_apply_enrichment_delta before reaching here).",
                 len(dropped_facts),
                 len(predicate_dropped),
                 len(residual_dropped),

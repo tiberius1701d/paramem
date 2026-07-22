@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS
+from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, EnrichmentDelta
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
 from paramem.graph.flows import SESSION_EXTRACT
 from paramem.graph.schema import SessionGraph
@@ -115,3 +115,57 @@ def run_cloud_stages(
         correction_entity_types=correction_entity_types,
     )
     return run_flow(cloud_arc_specs(), ctx, StageState(graph=graph)).graph
+
+
+def enrichment_side_effect(
+    facts: list[dict],
+    *,
+    bindings: dict[str, str] | None = None,
+    raw: str | None = None,
+    info: dict | None = None,
+):
+    """Build a ``request_enrichment`` ``side_effect`` reproducing the
+    RETIRED 5-tuple mock contract's final fact list.
+
+    Before the cloud-admission redesign (2026-07-22), tests patched
+    ``request_enrichment`` directly with a ``(facts, updated_transcript,
+    bindings, raw, info)`` 5-tuple that fully overrode the stage's
+    enriched output — ``request_enrichment`` no longer applies a delta at
+    all (:func:`~paramem.graph.extractor._apply_enrichment_delta`, called
+    by the ``enrich`` stage itself, does that now), so a bare
+    ``return_value`` can no longer express "this is the final fact list"
+    directly.
+
+    ``facts`` here is that OLD mock's first tuple element — the desired
+    FINAL surviving fact list. This helper reconstructs it as an
+    :class:`~paramem.graph.extractor.EnrichmentDelta`, computed at CALL
+    TIME (needs the real ``anon_facts`` the pipeline built, which a bare
+    ``return_value`` cannot see):
+
+    * If ``anon_facts`` is a PREFIX of ``facts`` (the common shape — cloud
+      left the local facts untouched and only appended), the prefix is
+      treated as unmodified (KEEP-by-default; ``drop=set()``) and
+      whatever ``facts`` adds beyond that prefix becomes ``add``.
+    * Otherwise (``facts`` does not extend ``anon_facts`` — the old mock
+      fixture replaced the fact set wholesale), every input index is
+      ``drop``ped and every entry of ``facts`` becomes an ``add``.
+
+    Tests exercising ``modify`` (a partial field update on an existing
+    index) or a ``drop`` NOT paired with a full replace build an
+    :class:`~paramem.graph.extractor.EnrichmentDelta` directly instead —
+    this helper only reproduces the two shapes every pre-redesign fixture
+    in this test suite actually used.
+    """
+
+    def _fake(anon_facts, *_args, **_kwargs):
+        n = len(anon_facts)
+        if facts[:n] == anon_facts:
+            add = list(facts[n:])
+            drop: set[int] = set()
+        else:
+            add = list(facts)
+            drop = set(range(n))
+        delta = EnrichmentDelta(add=add, modify=[], drop=drop, bindings=dict(bindings or {}))
+        return delta, raw, info or {}
+
+    return _fake

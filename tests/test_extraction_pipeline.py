@@ -528,47 +528,60 @@ class TestEnrichmentDelta:
     The judge emits a small ``{"add": [...], "modify": [...], "drop":
     [...], "bindings": {...}}`` envelope; every key is optional.  The
     parser is permissive about wrapping (markdown fences / inline-code /
-    prose preamble) via the shared envelope finder.  The applier
+    prose preamble) via the shared envelope finder and returns an
+    :class:`~paramem.graph.extractor.EnrichmentDelta`.  The applier
     composes modify → drop → add and reconstructs ``updated_transcript``
     locally from ``bindings`` + ``anon_transcript`` (no transcript echo
     on the wire).
+
+    ``scope=None`` throughout this class — the direct/unit-test sentinel
+    under which nothing is resolvability-gated and every action applies
+    verbatim (mirroring ``_apply_bindings``'s own ``observed=None``
+    convention); these tests pin the STRUCTURAL apply mechanics, not
+    per-triple rejection (see ``TestBindingTotalityRejection`` for that).
     """
 
     @staticmethod
     def _facts(n: int) -> list[dict]:
         return [{"subject": f"S{i}", "predicate": "p", "object": f"O{i}"} for i in range(n)]
 
+    @staticmethod
+    def _apply(facts, raw, anon_transcript=None):
+        """Parse ``raw`` then apply — the two steps ``request_enrichment``
+        used to fuse into one ``_apply_enrichment_delta(facts, raw, ...)``
+        call before the 2026-07-22 cloud-admission redesign split parsing
+        (``_parse_enrichment_delta``) from application."""
+        from paramem.graph.extractor import _apply_enrichment_delta, _parse_enrichment_delta
+
+        delta = _parse_enrichment_delta(raw, len(facts))
+        assert delta is not None, f"expected a parseable delta for {raw!r}"
+        return _apply_enrichment_delta(facts, delta, None, anon_transcript)
+
     def test_empty_envelope_is_noop(self):
         """``{}`` — model emitted nothing to do.  Surviving facts equal
-        input; transcript unchanged; bindings empty."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
+        input; transcript unchanged; no bindings."""
         facts = self._facts(3)
-        out, transcript, bindings, _ = _apply_enrichment_delta(facts, "{}", "hello")
+        out, transcript, report = self._apply(facts, "{}", "hello")
         assert out == facts
         assert transcript == "hello"
-        assert bindings == {}
+        assert report["bindings_count"] == 0
 
     def test_drop_only(self):
         """Pure subtractive delta — same shape as a plausibility output;
         applier still works (drop is shared between protocols)."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(4)
-        out, _, _, _ = _apply_enrichment_delta(facts, '{"drop": [1, 3]}', None)
+        out, _, _ = self._apply(facts, '{"drop": [1, 3]}', None)
         assert out is not None
         assert [f["subject"] for f in out] == ["S0", "S2"]
 
     def test_add_only(self):
         """Append-only — coreference resolution case."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(2)
         raw = (
             '{"add": [{"subject": "Person_1", "predicate": "married_to",'
             ' "object": "Person_2", "relation_type": "social", "confidence": 0.9}]}'
         )
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert len(out) == 3
         assert out[2]["predicate"] == "married_to"
@@ -576,14 +589,12 @@ class TestEnrichmentDelta:
     def test_modify_partial_field_update(self):
         """Synonym normalization — replace ``employed_by`` with ``worked_for``
         on a single indexed fact."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = [
             {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
             {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
         ]
         raw = '{"modify": [{"index": 0, "fields": {"predicate": "worked_for"}}]}'
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert out[0]["predicate"] == "worked_for"
         # Other fields untouched (shallow merge).
@@ -596,8 +607,6 @@ class TestEnrichmentDelta:
         """``likes(P, "hiking and cooking")`` → drop the compound, add
         two atomic facts.  Documents the canonical compound-split shape
         in the new protocol."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = [
             {"subject": "P", "predicate": "likes", "object": "hiking and cooking"},
             {"subject": "P", "predicate": "lives_in", "object": "Berlin"},
@@ -607,7 +616,7 @@ class TestEnrichmentDelta:
             ' "add": [{"subject":"P","predicate":"likes","object":"hiking"},'
             ' {"subject":"P","predicate":"likes","object":"cooking"}]}'
         )
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         objs = [f["object"] for f in out]
         assert "hiking and cooking" not in objs
@@ -619,15 +628,13 @@ class TestEnrichmentDelta:
         """All three actions together — exercises the full pipeline.
         Indices in ``modify`` and ``drop`` reference the *original*
         input list, regardless of application order."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(4)
         raw = (
             '{"modify": [{"index": 0, "fields": {"object": "O0_modified"}}],'
             ' "drop": [2],'
             ' "add": [{"subject":"S_new","predicate":"p","object":"O_new"}]}'
         )
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         # S0 modified, S2 dropped, S_new appended → [S0, S1, S3, S_new]
         subjects = [f["subject"] for f in out]
@@ -638,35 +645,30 @@ class TestEnrichmentDelta:
         """Reconstruction must replace longest spans first so a longer
         span wins over a shorter one that would otherwise consume part
         of it."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts: list[dict] = []
         anon = "Person_1 was a Senior Software Engineer at Org_1."
         # Both bindings share the substring "Software Engineer".  Without
         # longest-first ordering, "Software Engineer" would replace first
         # and corrupt the longer span.
         raw = '{"bindings": {"Role_1": "Senior Software Engineer", "Role_2": "Software Engineer"}}'
-        _, transcript, bindings, _ = _apply_enrichment_delta(facts, raw, anon)
+        _, transcript, report = self._apply(facts, raw, anon)
         assert "{Role_1}" in transcript
         # "Software Engineer" should not survive because it was inside
         # the longer span that got replaced first.
         assert "Software Engineer" not in transcript
         # Role_2's span no longer appears, so its placeholder isn't
         # written into the transcript — that's expected, the binding
-        # just sits unused.
-        assert bindings == {
-            "Role_1": "Senior Software Engineer",
-            "Role_2": "Software Engineer",
-        }
+        # just sits unused (never referenced by any fact — with no
+        # ``add``/``modify`` at all here, neither binding is "rejected",
+        # so both are counted).
+        assert report["bindings_count"] == 2
 
     def test_bindings_replace_all_occurrences(self):
         """Entities mentioned more than once in the transcript get one
         placeholder consistently — every occurrence replaced."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         anon = "Person_1 led Event. Later, Person_2 joined Event."
         raw = '{"bindings": {"Event_1": "Event"}}'
-        _, transcript, _, _ = _apply_enrichment_delta([], raw, anon)
+        _, transcript, _ = self._apply([], raw, anon)
         assert transcript.count("{Event_1}") == 2
         assert "Event " not in transcript or transcript.count("Event ") == 0
 
@@ -690,11 +692,9 @@ class TestEnrichmentDelta:
 
     def test_code_fenced_envelope_unwrapped(self):
         """Markdown fences handled by the shared envelope finder."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(2)
         raw = '```json\n{"drop": [0]}\n```'
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert [f["subject"] for f in out] == ["S1"]
 
@@ -702,12 +702,10 @@ class TestEnrichmentDelta:
         """``new_entity_bindings`` is accepted as a synonym of
         ``bindings`` so older response shapes don't lose the binding
         payload silently during the transition."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         anon = "Person_1 led the agile transformation initiative."
         raw = '{"new_entity_bindings": {"Event_1": "the agile transformation initiative"}}'
-        _, transcript, bindings, _ = _apply_enrichment_delta([], raw, anon)
-        assert bindings == {"Event_1": "the agile transformation initiative"}
+        _, transcript, report = self._apply([], raw, anon)
+        assert report["bindings_count"] == 1
         assert "{Event_1}" in transcript
 
     def test_inverted_binding_is_corrected_not_passed_through(self):
@@ -718,12 +716,10 @@ class TestEnrichmentDelta:
         passed straight into the substitution map. Confirmed by transcript
         reconstruction: the real-text span is replaced by the placeholder,
         which only happens when the binding resolves in the right direction."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         anon = "Person_1 works at Acme."
         raw = '{"bindings": {"Acme": "Org_9"}}'
-        _, transcript, bindings, _ = _apply_enrichment_delta([], raw, anon)
-        assert bindings == {"Org_9": "Acme"}
+        _, transcript, report = self._apply([], raw, anon)
+        assert report["bindings_count"] == 1
         assert "{Org_9}" in transcript
         assert "Acme" not in transcript.replace("{Org_9}", "")
 
@@ -734,61 +730,47 @@ class TestEnrichmentDelta:
         the tie, so the binding is kept as-is rather than the whole
         delta losing the entry. Dropping here was a real regression:
         the same case previously survived at HEAD."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         raw = '{"bindings": {"Org_9": "Person_2"}}'
-        _, _, bindings, counts = _apply_enrichment_delta([], raw, "text")
-        assert bindings == {"Org_9": "Person_2"}
-        assert counts["bindings_count"] == 1
+        _, _, report = self._apply([], raw, "text")
+        assert report["bindings_count"] == 1
 
     def test_ambiguous_binding_neither_shaped_is_dropped(self):
         """A binding where NEITHER side is placeholder-shaped is not a
         real cloud mint binding and is dropped rather than accepted
         verbatim."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         raw = '{"bindings": {"my company": "Acme Corp"}}'
-        _, _, bindings, counts = _apply_enrichment_delta([], raw, "text")
-        assert bindings == {}
-        assert counts["bindings_count"] == 0
+        _, _, report = self._apply([], raw, "text")
+        assert report["bindings_count"] == 0
 
     def test_out_of_range_modify_skipped(self):
         """Modify index outside ``[0, n_facts)`` is dropped with a
         warning, not failed — single bad index shouldn't void the
         whole delta."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(2)
         raw = '{"modify": [{"index": 99, "fields": {"object": "X"}}]}'
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert out == facts  # nothing applied
 
     def test_out_of_range_drop_skipped(self):
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(2)
         raw = '{"drop": [99]}'
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert out == facts
 
     def test_modify_with_non_dict_fields_skipped(self):
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(2)
         raw = '{"modify": [{"index": 0, "fields": "not a dict"}]}'
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert out == facts
 
     def test_add_entries_must_be_dicts(self):
         """Non-dict entries in ``add`` are skipped, not failed."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(1)
         raw = '{"add": ["not a fact", null, {"subject":"X","predicate":"p","object":"Y"}]}'
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert len(out) == 2  # 1 input + 1 valid add
         assert out[1]["subject"] == "X"
@@ -799,14 +781,12 @@ class TestEnrichmentDelta:
         boundary, so it never enters ``enriched_anon`` (and therefore
         can never sink a valid fact at the residual sweep downstream).
         The fact itself is kept, only the extra key is dropped."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         raw = (
             '{"add": [{"subject": "Person_1", "predicate": "works_at",'
             ' "object": "Org_1", "relation_type": "factual", "confidence": 0.9,'
             ' "evidence": "Person_1 said they work at Org_1"}]}'
         )
-        out, _, _, _ = _apply_enrichment_delta([], raw, None)
+        out, _, _ = self._apply([], raw, None)
         assert out is not None
         assert len(out) == 1
         assert "evidence" not in out[0]
@@ -817,61 +797,170 @@ class TestEnrichmentDelta:
         """A ``modify`` entry's ``fields`` dict is
         restricted the same way: ``relation_type``/``confidence``
         updates apply normally, a stray ``evidence`` key does not."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = [{"subject": "Alex", "predicate": "employed_by", "object": "Acme"}]
         raw = (
             '{"modify": [{"index": 0, "fields": {"predicate": "worked_for",'
             ' "evidence": "she confirmed this"}}]}'
         )
-        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        out, _, _ = self._apply(facts, raw, None)
         assert out is not None
         assert out[0]["predicate"] == "worked_for"
         assert "evidence" not in out[0]
 
     def test_malformed_envelope_returns_none(self):
-        """Caller fail-opens — applier returns ``None`` for new_facts so
-        the caller (the ``enrich`` stage) treats it as a failed
-        ``cloud_enrich`` phase."""
-        from paramem.graph.extractor import _apply_enrichment_delta
+        """Caller fail-opens — the PARSER (not the applier, which is never
+        even called) returns ``None`` so the caller (the ``enrich`` stage)
+        treats it as a failed ``cloud_enrich`` phase."""
+        from paramem.graph.extractor import _parse_enrichment_delta
 
         facts = self._facts(2)
-        out, _, _, _ = _apply_enrichment_delta(facts, "I cannot process this.", None)
-        assert out is None
+        delta = _parse_enrichment_delta("I cannot process this.", len(facts))
+        assert delta is None
 
     def test_none_raw_returns_none(self):
-        from paramem.graph.extractor import _apply_enrichment_delta
+        from paramem.graph.extractor import _parse_enrichment_delta
 
-        out, _, _, _ = _apply_enrichment_delta(self._facts(1), None, "transcript")
-        assert out is None
+        delta = _parse_enrichment_delta(None, len(self._facts(1)))
+        assert delta is None
 
     def test_null_keys_treated_as_empty(self):
         """Model emits ``"add": null`` instead of ``[]`` — must not crash."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         facts = self._facts(2)
         raw = '{"add": null, "modify": null, "drop": null, "bindings": null}'
-        out, transcript, bindings, _ = _apply_enrichment_delta(facts, raw, "anon")
+        out, transcript, report = self._apply(facts, raw, "anon")
         assert out == facts
         assert transcript == "anon"
-        assert bindings == {}
+        assert report["bindings_count"] == 0
 
     def test_bindings_with_missing_span_in_transcript_skipped(self):
         """Hallucinated binding (span not in transcript) leaves the
         transcript untouched.  No crash, no replacement."""
-        from paramem.graph.extractor import _apply_enrichment_delta
-
         anon = "Person_1 said hello."
         raw = '{"bindings": {"Event_1": "this span is not here"}}'
-        _, transcript, bindings, _ = _apply_enrichment_delta([], raw, anon)
+        _, transcript, report = self._apply([], raw, anon)
         assert transcript == anon
-        assert bindings == {"Event_1": "this span is not here"}
+        assert report["bindings_count"] == 1
 
     def test_none_transcript_returns_none_transcript(self):
-        from paramem.graph.extractor import _apply_enrichment_delta
-
-        _, transcript, _, _ = _apply_enrichment_delta([], '{"add": []}', None)
+        _, transcript, _ = self._apply([], '{"add": []}', None)
         assert transcript is None
+
+
+class TestApplyEnrichmentDeltaResolvability:
+    """``_apply_enrichment_delta``'s per-triple resolvability contract
+    (2026-07-22 cloud-admission redesign) — unlike ``TestEnrichmentDelta``
+    (structural mechanics only, ``scope=None``), these tests exercise a
+    REAL :class:`~paramem.cloud.deanonymize.CloudScope`, so an ``add``/
+    ``modify`` referencing a token outside the resolvable domain is
+    actually rejected/reverted.
+    """
+
+    @staticmethod
+    def _scope(reverse: dict[str, str], sent: str, cloud_bindings: dict | None = None):
+        from paramem.cloud.anonymize import AnonymizedContract
+        from paramem.cloud.deanonymize import CloudScope
+
+        payload = AnonymizedContract(
+            status="ok",
+            forward={v: k for k, v in reverse.items()},
+            reverse=reverse,
+            anon_transcript=sent,
+            declared=frozenset(reverse),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+        )
+        return CloudScope.response(payload, cloud_bindings=cloud_bindings, sent=(sent,))
+
+    def test_unresolvable_add_is_dropped_not_the_whole_delta(self):
+        """An ``add`` referencing a token never declared anywhere is
+        dropped individually — the local fact (untouched by the delta)
+        survives."""
+        from paramem.graph.extractor import EnrichmentDelta, _apply_enrichment_delta
+
+        scope = self._scope({"Person_1": "Alex"}, "Person_1 lives in Berlin.")
+        facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
+        delta = EnrichmentDelta(
+            add=[
+                {
+                    "subject": "Person_2",
+                    "predicate": "married_to",
+                    "object": "Person_3",
+                    "relation_type": "social",
+                    "confidence": 0.9,
+                }
+            ],
+            modify=[],
+            drop=set(),
+            bindings={},
+        )
+        out, _, report = _apply_enrichment_delta(facts, delta, scope, "Person_1 lives in Berlin.")
+        assert out == facts
+        assert report["rejected_adds"] == 1
+        assert report["rejected_tokens"] == ["Person_2", "Person_3"]
+
+    def test_unresolvable_modify_reverts_to_original_fact(self):
+        """A ``modify`` whose result carries an unresolvable token is
+        DISCARDED — the fact reverts to its untouched original, it is not
+        dropped from the fact list."""
+        from paramem.graph.extractor import EnrichmentDelta, _apply_enrichment_delta
+
+        scope = self._scope({"Person_1": "Alex"}, "Person_1 works at Acme.")
+        facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Acme"}]
+        delta = EnrichmentDelta(
+            add=[],
+            modify=[(0, {"object": "Person_9"})],  # Person_9 never declared/bound
+            drop=set(),
+            bindings={},
+        )
+        out, _, report = _apply_enrichment_delta(facts, delta, scope, "Person_1 works at Acme.")
+        # Reverted to the exact original — not dropped.
+        assert out == facts
+        assert report["reverted_modifies"] == 1
+        assert report["rejected_tokens"] == ["Person_9"]
+
+    def test_drop_with_rejection_recorded_when_both_occur(self):
+        """The owner's "measure first" diagnostic:
+        ``drop_with_rejection`` is ``True`` exactly when a delta carries
+        BOTH a non-empty ``drop`` and at least one rejected ``add``/
+        ``modify`` — the drop is still honored unconditionally (spec rule
+        3 — revert every drop on any rejection — is NOT implemented)."""
+        from paramem.graph.extractor import EnrichmentDelta, _apply_enrichment_delta
+
+        scope = self._scope({"Person_1": "Alex"}, "Person_1 lives in Berlin.")
+        facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
+        delta = EnrichmentDelta(
+            add=[
+                {
+                    "subject": "Person_2",
+                    "predicate": "profession",
+                    "object": "teacher",
+                    "relation_type": "factual",
+                    "confidence": 0.9,
+                }
+            ],
+            modify=[],
+            drop={0},
+            bindings={},
+        )
+        out, _, report = _apply_enrichment_delta(facts, delta, scope, "Person_1 lives in Berlin.")
+        # drop honored unconditionally -> the only local fact is gone;
+        # the add was rejected -> nothing replaces it.
+        assert out == []
+        assert report["drop_with_rejection"] is True
+
+    def test_drop_without_any_rejection_is_not_flagged(self):
+        """A clean drop (no co-occurring rejection) leaves
+        ``drop_with_rejection`` ``False`` — the flag measures the
+        CO-OCCURRENCE, not the mere presence of a drop."""
+        from paramem.graph.extractor import EnrichmentDelta, _apply_enrichment_delta
+
+        scope = self._scope({"Person_1": "Alex"}, "Person_1 lives in Berlin.")
+        facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
+        delta = EnrichmentDelta(add=[], modify=[], drop={0}, bindings={})
+        out, _, report = _apply_enrichment_delta(facts, delta, scope, "Person_1 lives in Berlin.")
+        assert out == []
+        assert report["drop_with_rejection"] is False
 
 
 class TestPipelineMaxTokensThreading:
@@ -985,7 +1074,7 @@ class TestPipelinePromptsDirThreading:
         reach, not a kwarg on ``anonymize`` itself.
         """
         from paramem.cloud.anonymize import AnonymizedContract
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1025,7 +1114,7 @@ class TestPipelinePromptsDirThreading:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
         ):
             run_cloud_stages(
@@ -1048,7 +1137,7 @@ class TestPipelinePromptsDirThreading:
         """Stage 2 (cloud_enrich): ``request_enrichment`` had neither a
         ``prompts_dir`` parameter nor a forwarded value — the override never
         reached the enrichment prompt at all."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1063,7 +1152,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_request_enrichment(*args, **kwargs):
             captured.append(kwargs.get("prompts_dir"))
-            return anon_facts, None, {}, None, {}
+            return enrichment_side_effect(anon_facts)(*args, **kwargs)
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1094,7 +1183,7 @@ class TestPipelinePromptsDirThreading:
     def test_anon_plausibility_receives_prompts_dir(self, tmp_path):
         """Stage 3a (anon_plausibility, cloud judge): ``request_plausibility``
         had neither a ``prompts_dir`` parameter nor a forwarded value."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1119,7 +1208,7 @@ class TestPipelinePromptsDirThreading:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.stage_enrich.request_plausibility",
@@ -1146,7 +1235,7 @@ class TestPipelinePromptsDirThreading:
     def test_deanon_plausibility_receives_prompts_dir(self, tmp_path):
         """Stage 3d (deanon_plausibility, local judge): ``judge_plausibility``
         already accepted ``prompts_dir`` but the call site never passed it."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1171,7 +1260,7 @@ class TestPipelinePromptsDirThreading:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
@@ -1200,7 +1289,7 @@ class TestPipelinePromptsDirThreading:
         pass ``prompts_dir`` (production default), every downstream call
         still receives ``None`` — byte-identical to pre-fix behaviour, never
         a surprise override."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1219,7 +1308,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_request_enrichment(*args, **kwargs):
             captured["cloud_enrich"] = kwargs.get("prompts_dir")
-            return anon_facts, None, {}, None, {}
+            return enrichment_side_effect(anon_facts)(*args, **kwargs)
 
         def fake_plaus(facts, api_key, **kwargs):
             captured["anon_plausibility"] = kwargs.get("prompts_dir")
@@ -1261,7 +1350,7 @@ class TestPipelinePromptsDirThreading:
     def test_default_prompts_dir_is_none_at_deanon_stage_call_sites(self):
         """Parity check (plausibility_stage="deanon"): same as above for the
         local-judge deanon-plausibility call site."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1280,7 +1369,7 @@ class TestPipelinePromptsDirThreading:
 
         def fake_request_enrichment(*args, **kwargs):
             captured["cloud_enrich"] = kwargs.get("prompts_dir")
-            return anon_facts, None, {}, None, {}
+            return enrichment_side_effect(anon_facts)(*args, **kwargs)
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
             captured["deanon_plausibility"] = kwargs.get("prompts_dir")
@@ -1596,7 +1685,8 @@ class TestCloudEnrichmentProvider:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(None, None, {}, None, {}),
+                # ``delta=None`` -- parse failure/no-response shape.
+                return_value=(None, None, {}),
             ),
         ):
             with pytest.raises(ExtractionFailed) as excinfo:
@@ -1613,7 +1703,7 @@ class TestCloudEnrichmentProvider:
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
         """Enrichment output flows through de-anonymization to real names."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1636,7 +1726,7 @@ class TestCloudEnrichmentProvider:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon),
             ),
         ):
             result = run_cloud_stages(
@@ -1659,7 +1749,7 @@ class TestCloudEnrichmentProvider:
 
     def test_pipeline_deanonymizes_composite_placeholders(self):
         """Composite strings like 'Person_1's family' get substring-replaced."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         transcript = "Alex lives in downtown Millfield with Alex's family"
         graph = _make_graph(
@@ -1685,7 +1775,7 @@ class TestCloudEnrichmentProvider:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon),
             ),
         ):
             result = run_cloud_stages(
@@ -1821,7 +1911,7 @@ class TestCloudEnrichmentProvider:
         ``request_enrichment`` happy-path mocking pattern as the sibling
         tests in this class.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1868,7 +1958,7 @@ class TestCloudEnrichmentProvider:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.stage_enrich.correct_entity_surfaces",
@@ -1966,7 +2056,7 @@ class TestAnonymizerMappingOnlyContract:
         building them from ``graph.relations`` -> the dropped/reworded
         fact slips through -> fails.  The owner's rule, pinned.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [
@@ -1997,7 +2087,7 @@ class TestAnonymizerMappingOnlyContract:
 
         def fake_cloud(facts, *args, **kwargs):
             cloud_calls.append(list(facts))
-            return facts, None, {}, None, {}
+            return enrichment_side_effect(facts)(facts, *args, **kwargs)
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -2030,7 +2120,7 @@ class TestAnonymizerMappingOnlyContract:
         ``_substitute_whole_words(r.predicate, mapping)``) -> the
         predicate gets scrubbed to ``"asked about Person_1"`` -> fails.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "asked about Alex", "Bob")],
@@ -2045,7 +2135,7 @@ class TestAnonymizerMappingOnlyContract:
 
         def fake_cloud(facts, *args, **kwargs):
             cloud_calls.append(list(facts))
-            return facts, None, {}, None, {}
+            return enrichment_side_effect(facts)(facts, *args, **kwargs)
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -2363,7 +2453,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
         ``Bill`` -> the cycle blocks/skips cloud, or the object is wrongly
         scrubbed -> this test fails.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Bill", "received", "electricity bill")],
@@ -2376,7 +2466,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
 
         def fake_cloud(facts, *args, **kwargs):
             cloud_calls.append(list(facts))
-            return facts, None, {}, None, {}
+            return enrichment_side_effect(facts)(facts, *args, **kwargs)
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -2430,7 +2520,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         ``_apply_bindings`` -> the poisoned fact reaches
         ``graph.relations`` -> this test fails.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "works_at", "Acme")],
@@ -2445,10 +2535,11 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         transcript = "Alex works at Acme. Alex speaks French at an advanced level."
 
         # cloud's returned delta — NOT the anonymizer — carries the
-        # poisoned predicate.  `_check_mapping_totality` (the cloud-stage
-        # binding-totality gate) scans subject/object only, so this fact
-        # sails through it untouched and reaches the deanon-stage
-        # predicate invariant, which is what this test pins.
+        # poisoned predicate.  ``_apply_enrichment_delta``'s per-triple
+        # orphan check (`_fact_orphans`/`_fact_tokens`) scans
+        # subject/object only, so this fact sails through it untouched
+        # and reaches the deanon-stage predicate invariant, which is
+        # what this test pins.
         enriched_anon = [
             {
                 "subject": "Person_1",
@@ -2467,7 +2558,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon),
             ),
         ):
             result = run_cloud_stages(
@@ -2774,7 +2865,7 @@ class TestApplyBindings:
         """When a key collides between ``cloud_bindings`` and ``reverse``
         with differing values, ``reverse`` wins (deterministic entity
         name over a freshly-minted cloud value) — the collision itself is
-        surfaced by :func:`_check_mapping_totality`, not here."""
+        surfaced by :func:`_binding_collisions`, not here."""
         from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
@@ -3433,7 +3524,7 @@ class TestPlausibilityAnon:
     def test_anon_stage_plausibility_filters_subset(self):
         """When plausibility_stage="anon" and a cloud validator is configured, it runs
         on the anonymized facts before de-anonymization and drops flagged entries."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [
@@ -3463,7 +3554,7 @@ class TestPlausibilityAnon:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.stage_enrich.request_plausibility",
@@ -3498,6 +3589,7 @@ class TestPlausibilityAnon:
         Mutation: revert the call site to pass `anon_transcript=anon_transcript`
         -> this test fails.
         """
+        from paramem.graph.extractor import EnrichmentDelta
         from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
@@ -3506,14 +3598,19 @@ class TestPlausibilityAnon:
                 Entity(name="Alex", entity_type="person"),
             ],
         )
-        # Pre-enrichment: local extraction never saw the paper title, so
-        # neither the input facts nor the input transcript mention
-        # "Paper_1" — it is introduced by cloud's enrichment delta below.
-        enriched_anon_facts = [
-            {"subject": "Person_1", "predicate": "authored", "object": "Paper_1"}
-        ]
+        # Pre-enrichment: local extraction never saw the paper title as a
+        # placeholder — "Attention Is All You Need" reaches the anon
+        # transcript verbatim (no mapping entry).  Cloud's delta below
+        # MODIFIES the one local fact's object to reference a new
+        # placeholder it mints, bound to that same span — real-world
+        # equivalent of "cloud reified a bare object into a named entity".
         mapping = {"Alex": "Person_1"}
-        post_enrichment_transcript = "Person_1 wrote {Paper_1} (Attention Is All You Need)."
+        anon_transcript = "Person_1 authored Attention Is All You Need."
+        # The reconstructed post-enrichment transcript
+        # (``_reconstruct_updated_transcript``, run for real by
+        # ``_apply_enrichment_delta`` inside the ``enrich`` stage) —
+        # substitutes the bound span with the braced placeholder.
+        post_enrichment_transcript = "Person_1 authored {Paper_1}."
 
         plaus_calls = []
 
@@ -3525,14 +3622,17 @@ class TestPlausibilityAnon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.cloud.anonymize.anonymize_transcript",
-                return_value=(mapping, "anonymized transcript", ""),
+                return_value=(mapping, anon_transcript, ""),
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(
-                    enriched_anon_facts,
-                    post_enrichment_transcript,
-                    {"Paper_1": "Attention Is All You Need"},
+                    EnrichmentDelta(
+                        add=[],
+                        modify=[(0, {"object": "Paper_1"})],
+                        drop=set(),
+                        bindings={"Paper_1": "Attention Is All You Need"},
+                    ),
                     None,
                     {},
                 ),
@@ -3568,7 +3668,7 @@ class TestPlausibilityDeanon:
 
     def test_deanon_stage_plausibility_drops_tautology(self):
         """Deanon-stage local plausibility receives real names and drops tautologies."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [
@@ -3603,7 +3703,7 @@ class TestPlausibilityDeanon:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
@@ -3728,7 +3828,7 @@ class TestCloudEnrichmentFailureRaises:
                 # Pre-fix this silently fell back to anon_facts.  Post-fix
                 # this MUST raise so the per-session loop in app.py marks
                 # the chunk failed and leaves the session pending.
-                return_value=(None, None, {}, None, {"parse_path": "no_response"}),
+                return_value=(None, None, {"parse_path": "no_response"}),
             ),
         ):
             try:
@@ -3771,7 +3871,7 @@ class TestAllDroppedSafetyNet:
         """When plausibility drops every surviving fact, the all-dropped
         safety net invokes _fallback_plausibility_on_raw with reason
         'all_dropped' so the session does not yield zero facts."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3800,7 +3900,7 @@ class TestAllDroppedSafetyNet:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(cloud_enriched, None, {}, None, {}),
+                side_effect=enrichment_side_effect(cloud_enriched),
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
@@ -3843,7 +3943,7 @@ class TestEntityTypePreservation:
     def test_preserved_entity_types_pass_through(self):
         """Entities pre-typed by _normalize_extraction keep their original types
         after the pipeline even when mocked cloud returns same facts."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [
@@ -3870,7 +3970,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
         ):
             result = run_cloud_stages(
@@ -3893,7 +3993,7 @@ class TestEntityTypePreservation:
 
     def test_cloud_introduced_country_entity_typed_location(self):
         """Cloud-introduced entity with Country_ placeholder is typed 'location', not 'person'."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "born_in", "Germany")],
@@ -3913,7 +4013,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
         ):
             result = run_cloud_stages(
@@ -3948,7 +4048,7 @@ class TestEntityTypePreservation:
         reverse_mapping entry exists. The entity-type-preservation rule ensures the
         fallback type is 'concept', never 'person'.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         # Original graph has only Alex — no China entity
         graph = _make_graph(
@@ -3970,7 +4070,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon),
             ),
         ):
             result = run_cloud_stages(
@@ -4011,7 +4111,7 @@ class TestCloudMintedEntityTypeDerivation:
         ``reverse_mapping`` has no "Attention Is All You Need" key (it is
         keyed by placeholder), so the entity falls back to "concept".
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "has_plans", "Alex")],  # placeholder relation; cloud will override
@@ -4033,7 +4133,7 @@ class TestCloudMintedEntityTypeDerivation:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, cloud_bindings, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon, bindings=cloud_bindings),
             ),
         ):
             result = run_cloud_stages(
@@ -4058,7 +4158,7 @@ class TestCloudMintedEntityTypeDerivation:
         maps through the schema's ``anonymizer_prefix_to_type()`` to
         "person" — the closed-vocabulary branch of the same derivation.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "has_plans", "Alex")],
@@ -4078,7 +4178,7 @@ class TestCloudMintedEntityTypeDerivation:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, cloud_bindings, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon, bindings=cloud_bindings),
             ),
         ):
             result = run_cloud_stages(
@@ -4236,7 +4336,7 @@ class TestDiagnosticsKeys:
 
     def test_diagnostics_contains_plausibility_keys(self):
         """After a deanon-stage plausibility run, diagnostics contains the expected keys."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4259,7 +4359,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
@@ -4285,7 +4385,7 @@ class TestDiagnosticsKeys:
 
     def test_diagnostics_anonymize_key_populated_on_success(self):
         """diagnostics['anonymize']='ok' when anonymization succeeds."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4305,7 +4405,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
         ):
             result = run_cloud_stages(
@@ -4336,7 +4436,7 @@ class TestDiagnosticsKeys:
         Mutation: reintroduce a second (now-dead) normalize call before
         the diagnostic is set -> ``dropped`` reads 0 -> this test fails.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4358,7 +4458,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
         ):
             result = run_cloud_stages(
@@ -4461,211 +4561,41 @@ class TestConsolidationScheduleConfigPrivacyGuard:
 
 
 # ---------------------------------------------------------------------------
-# Mapping totality — diagnostic check post-anonymization
+# Binding collisions — diagnostic check post-anonymization
 # ---------------------------------------------------------------------------
 
 
-class TestCheckMappingTotality:
-    """Unit tests for ``_check_mapping_totality``.
+class TestBindingCollisions:
+    """Unit tests for ``_binding_collisions`` — the collision-only scan
+    that replaced ``_check_mapping_totality`` (2026-07-22 cloud-admission
+    redesign retired the per-fact orphan scan and the whole-delta verdict
+    it used to also compute alongside collisions; that per-fact predicate
+    survives as ``_fact_orphans``/``_fact_tokens``/``_placeholder_tokens``
+    — see their coverage in ``tests/test_placeholders.py``).
 
-    The diagnostic replaces the retired
-    ``_recover_missing_placeholder_mappings`` helper.  It is checked
-    against the REVERSE map (``{placeholder: real_name}``) rather than
-    the forward map's values, because deanonymization consumes the
-    reverse map (:func:`_apply_bindings`) — a placeholder present only
-    in the forward map's values still fails to translate at deanon
-    time.  Under the open-vocabulary anonymizer prompt the LLM is
-    expected to produce a total mapping by construction (see live probe
-    at the prompt-pivot commit); this helper surfaces violations to
-    ``logger`` and, as RETURN VALUES, to whatever diagnostics its caller
-    keeps, so prompt regressions are visible rather than silently
-    shedding facts.  Orphan-placeholder facts get dropped downstream by
-    :func:`_apply_bindings`'s residual sweep — fail-closed.
-
-    The function takes no ``SessionGraph`` and writes nothing: it returns
-    ``(verdict, collisions)``.  Every assertion below is on the returned
-    tuple; the caller-side diagnostics writes those two values feed are
-    pinned separately (``_record_binding_diagnostics`` in
-    ``paramem.graph.extractor``).
+    ALWAYS informational: a binding for a token cloud was SHOWN is inert
+    under CORE-LAST precedence (:func:`_resolution_map`), so nothing
+    gates on this function's result — it is a diagnostic only, pinned
+    separately at the caller side by
+    ``_record_binding_diagnostics``/``DeanonResult.collisions``.
     """
 
-    def test_total_mapping_records_no_orphans(self):
-        """Every fact placeholder resolves via the reverse map → empty
-        verdict."""
-        from paramem.cloud.placeholders import _check_mapping_totality
+    def test_no_cloud_bindings_returns_empty(self):
+        from paramem.cloud.placeholders import _binding_collisions
 
-        anon_facts = [
-            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
-        ]
-        reverse_mapping = {"Person_1": "Alex", "City_1": "Berlin"}
-        verdict, collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == []
-        assert collisions == []
+        assert _binding_collisions({"Person_1": "Alex"}, cloud_bindings=None) == []
+        assert _binding_collisions({"Person_1": "Alex"}, cloud_bindings={}) == []
 
-    def test_orphan_placeholder_recorded(self):
-        """A fact placeholder absent from ``reverse_mapping`` (the keys
-        deanon actually looks up) comes back in the verdict.  No mutation
-        of inputs."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
-        ]
-        # University_1 is missing from reverse_mapping — a totality violation.
-        reverse_mapping = {"Person_1": "Alex"}
-        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == ["University_1"]
-        # Inputs must not be mutated.
-        assert reverse_mapping == {"Person_1": "Alex"}
-
-    def test_multiple_orphans_sorted(self):
-        """Multiple orphans are deduplicated and sorted for stable
-        diagnostic output."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Org_1", "predicate": "made", "object": "Product_1"},
-            {"subject": "Person_1", "predicate": "speaks", "object": "Language_1"},
-            {"subject": "Person_1", "predicate": "uses", "object": "Product_1"},
-        ]
-        # Person_1 is in reverse_mapping but Org_1, Product_1, Language_1 are not.
-        reverse_mapping = {"Person_1": "Alex"}
-        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == [
-            "Language_1",
-            "Org_1",
-            "Product_1",
-        ]
-
-    def test_embedded_placeholder_caught(self):
-        """Placeholder embedded in a compound string still surfaces as
-        an orphan when missing from ``reverse_mapping``."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {
-                "subject": "Person_1",
-                "predicate": "led",
-                "object": "software for Product_1's Legend",
-            },
-        ]
-        reverse_mapping = {"Person_1": "Alex"}
-        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == ["Product_1"]
-
-    def test_empty_facts_short_circuits(self):
-        """No facts → empty verdict, regardless of reverse_mapping shape."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        assert _check_mapping_totality([], {}) == ([], [])
-        assert _check_mapping_totality([], {"Person_1": "Alex"}) == ([], [])
-
-    def test_placeholder_in_forward_values_but_absent_from_reverse_keys_flagged(self):
-        """The check must key off the reverse map, not the forward map.
-        A placeholder that exists as a forward-map VALUE (so the old
-        ``mapping.values()`` check would have passed it) but is absent
-        from the reverse map's KEYS is still flagged — this is exactly
-        the shape the incident produced: the LLM's placeholder made it
-        into the forward map's conflict-losing value but never reached
-        the reverse map.
-        """
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
-        ]
-        # Forward map has "Alex": "Person_4" as a value (would have
-        # passed the old, wrong check), but the reverse map only knows
-        # the deterministic winner Person_1 — Person_4 is unresolved.
-        forward_map = {"Alex": "Person_1", "SomeoneElse": "Person_4"}
-        reverse_mapping = {"Person_1": "Alex"}
-        assert "Person_4" in set(forward_map.values())
-        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == ["Person_4"]
-
-    def test_placeholder_present_in_reverse_keys_passes(self):
-        """Once the placeholder is a key in the reverse map, the same
-        fact passes with an empty verdict."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
-        ]
-        reverse_mapping = {"Person_1": "Alex", "Person_4": "Alex"}
-        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == []
-
-    def test_post_cloud_missing_binding_predicted_before_drop(self, caplog):
-        """A fact referencing a braced placeholder absent from BOTH
-        ``cloud_bindings`` and ``reverse_mapping`` comes back in the
-        verdict and is logged BEFORE :func:`_apply_bindings` drops the
-        fact."""
-        import logging
-
-        from paramem.cloud.placeholders import _apply_bindings, _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Person_1", "predicate": "works_at", "object": "{Org_9}"},
-        ]
-        reverse_mapping = {"Person_1": "Alex"}
-        cloud_bindings: dict = {}
-        # caplog.at_level() silently fails here because the logger is not
-        # propagating to the root; attach the handler to the specific
-        # logger directly (see test_skips_unrecognised_class_filenames pattern
-        # in test_intent.py).
-        placeholders_logger = logging.getLogger("paramem.cloud.placeholders")
-        prior_level = placeholders_logger.level
-        placeholders_logger.setLevel(logging.WARNING)
-        placeholders_logger.addHandler(caplog.handler)
-        try:
-            verdict, _collisions = _check_mapping_totality(
-                anon_facts,
-                reverse_mapping,
-                cloud_bindings=cloud_bindings,
-            )
-        finally:
-            placeholders_logger.removeHandler(caplog.handler)
-            placeholders_logger.setLevel(prior_level)
-        assert verdict == ["Org_9"]
-        assert any("binding-totality violation" in r.getMessage().lower() for r in caplog.records)
-        kept, predicate_dropped, residual_dropped = _apply_bindings(
-            anon_facts, reverse_mapping, cloud_bindings
-        )
-        dropped = predicate_dropped + residual_dropped
-        assert kept == []
-        assert len(dropped) == 1
-
-    def test_post_cloud_nested_binding_value_unbound_predicted(self):
-        """A binding value that itself contains an unresolved bare
-        placeholder (``"... at Org_9"``) is predicted as an orphan even
-        though no fact directly references ``Org_9``."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Person_1", "predicate": "held_role", "object": "{Role_1}"},
-        ]
-        reverse_mapping: dict = {}
-        cloud_bindings = {"Role_1": "Senior Engineer at Org_9"}
-        verdict, _collisions = _check_mapping_totality(
-            anon_facts,
-            reverse_mapping,
-            cloud_bindings=cloud_bindings,
-        )
-        assert "Org_9" in verdict
-
-    def test_collision_between_cloud_bindings_and_reverse_recorded(self, caplog):
-        """A key present in BOTH ``cloud_bindings`` and ``reverse_mapping``
-        with differing values comes back as a ``collisions`` entry and is
-        warned about — the reverse-wins tie-break in
+    def test_unscoped_conflicting_value_is_a_collision(self, caplog):
+        """``observed=None`` (CORE unscoped): a ``cloud_bindings`` key
+        present in ``reverse_mapping`` with a DIFFERING value is a
+        collision, and is warned about — the reverse-wins tie-break in
         :func:`_apply_bindings` would otherwise silently resolve to the
         wrong real name."""
         import logging
 
-        from paramem.cloud.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _binding_collisions
 
-        anon_facts = [
-            {"subject": "Org_1", "predicate": "based_in", "object": "Germany"},
-        ]
         reverse_mapping = {"Org_1": "Acme"}
         cloud_bindings = {"Org_1": "Wrong Corp"}
         # caplog.at_level() silently fails here because the logger is not
@@ -4677,176 +4607,116 @@ class TestCheckMappingTotality:
         placeholders_logger.setLevel(logging.WARNING)
         placeholders_logger.addHandler(caplog.handler)
         try:
-            verdict, collisions = _check_mapping_totality(
-                anon_facts,
-                reverse_mapping,
-                cloud_bindings=cloud_bindings,
-            )
+            collisions = _binding_collisions(reverse_mapping, cloud_bindings=cloud_bindings)
         finally:
             placeholders_logger.removeHandler(caplog.handler)
             placeholders_logger.setLevel(prior_level)
         assert collisions == ["Org_1"]
-        # CORE-unscoped: a collision is informational only, never folded
-        # into the verdict.
-        assert verdict == []
         assert any("collision" in r.getMessage().lower() for r in caplog.records)
 
-    def test_pre_cloud_positional_calls_unaffected_by_generalization(self):
-        """The existing positional pre-cloud call sites (this class's
-        earlier tests) keep passing unchanged — defaults preserve
-        behaviour: ``cloud_bindings=None`` skips the collision scan, so
-        ``collisions`` comes back empty."""
-        from paramem.cloud.placeholders import _check_mapping_totality
+    def test_unscoped_matching_value_is_not_a_collision(self):
+        """Same key, SAME value in both maps is not a conflict — only a
+        DIFFERING value counts."""
+        from paramem.cloud.placeholders import _binding_collisions
 
-        anon_facts = [
-            {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
-        ]
-        reverse_mapping = {"Person_1": "Alex"}
-        verdict, collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == ["University_1"]
+        reverse_mapping = {"Org_1": "Acme"}
+        cloud_bindings = {"Org_1": "Acme"}
+        assert _binding_collisions(reverse_mapping, cloud_bindings=cloud_bindings) == []
+
+    def test_scoped_key_in_observed_is_a_collision(self):
+        """``observed`` given: any ``cloud_bindings`` key that is ALSO in
+        ``observed`` is a conflict, regardless of value equality — cloud
+        is rebinding something it was already shown as a core
+        reference."""
+        from paramem.cloud.placeholders import _binding_collisions
+
+        collisions = _binding_collisions(
+            {"Person_1": "Alex"},
+            cloud_bindings={"Person_1": "someone else entirely"},
+            observed={"Person_1"},
+        )
+        assert collisions == ["Person_1"]
+
+    def test_scoped_key_not_in_observed_is_not_a_collision(self):
+        """A cloud mint for a token never shown to cloud (not in
+        ``observed``) is a legitimate new entity, not a collision."""
+        from paramem.cloud.placeholders import _binding_collisions
+
+        collisions = _binding_collisions(
+            {"Person_1": "Alex"},
+            cloud_bindings={"Org_9": "Acme"},
+            observed={"Person_1"},
+        )
         assert collisions == []
 
-    # -- Explicit-return contract, verdict content --------
+    def test_multiple_collisions_sorted(self):
+        from paramem.cloud.placeholders import _binding_collisions
 
-    def test_returns_empty_list_not_none_on_clean_input(self):
-        """The totality check returns ``[]`` (not ``None``) when the
-        mapping is total — the explicit-return contract that makes a
-        plain truthiness test safe for callers."""
-        from paramem.cloud.placeholders import _check_mapping_totality
+        collisions = _binding_collisions(
+            {},
+            cloud_bindings={"Zeta_1": "z", "Alpha_1": "a"},
+            observed={"Zeta_1", "Alpha_1"},
+        )
+        assert collisions == ["Alpha_1", "Zeta_1"]
 
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
-        reverse_mapping = {"Person_1": "Alex"}
-        verdict, collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == []
-        assert verdict is not None
+    def test_returns_list_not_none(self):
+        """Explicit-return contract: never ``None``, always a (possibly
+        empty) list — safe for a plain truthiness test."""
+        from paramem.cloud.placeholders import _binding_collisions
+
+        collisions = _binding_collisions({"Person_1": "Alex"}, cloud_bindings=None)
         assert collisions == []
         assert collisions is not None
 
-    def test_returns_empty_list_not_none_on_empty_facts(self):
-        """The totality check's second explicit exit: the early ``if not anon_facts``
-        guard returns ``[]``, not the implicit ``None`` a bare ``return``
-        would give — invisible to a caller that only writes ``if
-        verdict:``."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        verdict, collisions = _check_mapping_totality([], {"Person_1": "Alex"})
-        assert verdict == []
-        assert verdict is not None
-        assert collisions == []
-
-    def test_returns_token_list_on_poisoned_delta(self):
-        """The verdict IS the sorted offending-token list — the function
-        has no side effect to observe it through."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [
-            {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
-        ]
-        reverse_mapping = {"Person_1": "Alex"}
-        verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
-        assert verdict == ["University_1"]
-
-    def test_conflict_key_folded_into_verdict_when_observed_scoped(self):
-        """When ``observed`` is a set, a ``cloud_bindings`` key colliding
-        with it is folded into the RETURNED verdict AND surfaces
-        separately as a ``collisions`` entry."""
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
-        reverse_mapping = {"Person_1": "Alex"}
-        cloud_bindings = {"Person_1": "someone else entirely"}
-        observed = {"Person_1"}
-        verdict, collisions = _check_mapping_totality(
-            anon_facts,
-            reverse_mapping,
-            cloud_bindings=cloud_bindings,
-            observed=observed,
-        )
-        assert verdict == ["Person_1"]
-        assert collisions == ["Person_1"]
-
-    def test_collision_verdict_returned_even_with_empty_anon_facts(self):
-        """A non-empty verdict from the collision scan ALONE —
-        ``anon_facts`` is empty, so there is nothing for the per-fact scan
-        to find — must still reach the caller.  This is the exact shape
-        ``graph_enrich.enrich_graph``'s ``totality_rejected_chunks``
-        counter reads (now off the verdict ``request_graph_enrichment``
-        returns); a verdict that is non-empty but never surfaced is
-        silently under-counted as "no rejection" — worse than no gate at
-        all.
-
-        Mutation: return the collision-only verdict via an early
-        ``return []`` that bypasses the ``if orphans:`` exit (the shape
-        this function had before the fix) -> ``verdict`` comes back empty
-        -> this test fails.
-        """
-        from paramem.cloud.placeholders import _check_mapping_totality
-
-        reverse_mapping = {"Person_1": "Alex"}
-        cloud_bindings = {"Person_1": "someone else entirely"}
-        observed = {"Person_1"}
-        verdict, collisions = _check_mapping_totality(
-            [],  # no facts -- the early-return path the bug lived in
-            reverse_mapping,
-            cloud_bindings=cloud_bindings,
-            observed=observed,
-        )
-        assert verdict == ["Person_1"]
-        assert collisions == ["Person_1"]
-
 
 class TestRecordBindingDiagnostics:
-    """``_record_binding_diagnostics`` — the CALLER side of the totality
-    gate, and the only place in the extractor that turns a
+    """``_record_binding_diagnostics`` — the CALLER side of the collision
+    diagnostic, and the only place in the extractor that turns a
     ``DeanonResult`` into ``graph.diagnostics`` entries.
 
-    The two keys used to be written by ``_check_mapping_totality`` itself,
-    from inside ``deanonymize_facts``, onto a ``SessionGraph`` passed
-    purely as a sink.  These tests pin the guard conditions that move
-    with them: an EMPTY list writes NO key, so ``"key" not in
+    ``DeanonResult`` no longer carries a ``verdict`` field (retired
+    2026-07-22 cloud-admission redesign — nothing gates on a whole-delta
+    orphan list any more), so ``cloud_pending_orphans`` is never written.
+    Only ``cloud_binding_collisions`` survives, guarded exactly as before:
+    an EMPTY list writes NO key, so ``"cloud_binding_collisions" not in
     diagnostics`` keeps meaning "the scan found nothing".
     """
 
     @staticmethod
-    def _result(verdict: list[str], collisions: list[str]):
+    def _result(collisions: list[str]):
         from paramem.cloud.deanonymize import DeanonResult
 
         return DeanonResult(
             facts=[],
-            verdict=verdict,
             collisions=collisions,
             predicate_dropped=[],
             residual_dropped=[],
         )
 
-    def test_empty_findings_write_no_keys(self):
-        """Mutation: drop the ``if`` guards -> an accepted delta starts
-        writing two empty-list keys, and every ``"..." not in
+    def test_empty_collisions_writes_no_key(self):
+        """Mutation: drop the ``if`` guard -> an accepted delta starts
+        writing an empty-list key, and every ``"..." not in
         diagnostics`` assertion in the suite flips meaning."""
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
-        _record_binding_diagnostics(graph, self._result([], []))
-        assert "cloud_pending_orphans" not in graph.diagnostics
+        _record_binding_diagnostics(graph, self._result([]))
         assert "cloud_binding_collisions" not in graph.diagnostics
 
-    def test_verdict_and_collisions_land_under_their_keys(self):
+    def test_collisions_land_under_their_key(self):
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
-        _record_binding_diagnostics(graph, self._result(["Org_1"], ["Person_2"]))
-        assert graph.diagnostics["cloud_pending_orphans"] == ["Org_1"]
+        _record_binding_diagnostics(graph, self._result(["Person_2"]))
         assert graph.diagnostics["cloud_binding_collisions"] == ["Person_2"]
 
-    def test_collisions_without_a_verdict_still_recorded(self):
-        """CORE-unscoped shape: a collision is informational only and is
-        NOT folded into the verdict, so it must not depend on the verdict
-        being non-empty to be recorded."""
+    def test_no_cloud_pending_orphans_key_exists_any_more(self):
+        """``cloud_pending_orphans`` is retired — a collision (or anything
+        else on ``DeanonResult``) never writes it, regardless of content."""
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
-        _record_binding_diagnostics(graph, self._result([], ["Person_2"]))
-        assert graph.diagnostics["cloud_binding_collisions"] == ["Person_2"]
+        _record_binding_diagnostics(graph, self._result(["Person_2"]))
         assert "cloud_pending_orphans" not in graph.diagnostics
 
 
@@ -4905,9 +4775,15 @@ class TestResolutionMap:
 
 
 class TestBindingTotalityRejection:
-    """Reject invalid cloud-enrichment deltas instead of applying
-    them partially, and fall back to the local-extract facts.  These are
-    the pipeline-level tests the binding-totality contract requires.
+    """Per-triple accept/drop/revert of an invalid cloud-enrichment delta
+    (2026-07-22 cloud-admission redesign) — replaces the retired
+    whole-delta rejection this class used to pin.  An unresolvable ``add``
+    is dropped individually; an unresolvable ``modify`` is reverted to its
+    original fact; ``drop`` is honored unconditionally (even when another
+    action in the same delta was rejected — the owner's "measure first"
+    decision, tracked via ``report["drop_with_rejection"]``, not a
+    revert-all safety net). These are the pipeline-level tests the
+    per-triple contract requires.
 
     FIXTURE MECHANICS (post cloud-egress-PII redesign): ``anon_transcript``
     is the MODEL's own rewrite — the 2nd element of the
@@ -4934,21 +4810,40 @@ class TestBindingTotalityRejection:
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
         return graph, anon_facts, mapping
 
-    def test_poisoned_delta_rejected_local_facts_survive(self, caplog):
-        """The observed 5-in-1 collapse.  A poisoned delta that
-        drops the local fact and adds 5 facts over bare, unbound
-        Person_2/Person_3 (``bindings={}``) must be REJECTED as a whole:
-        the local-extract facts survive de-anonymized, no residual
-        placeholder remains, ``cloud_enrichment_rejected`` is recorded,
-        the ``cloud_enrich`` phase outcome is ``"rejected"``, and an ERROR
-        is logged naming the offending tokens."""
+    def test_poisoned_delta_5in1_collapse_untouched_fact_survives(self, caplog):
+        """The observed 5-in-1 collapse.  Cloud DROPS the ``lives_in``
+        fact (index 0) and ADDS 5 facts over bare, unbound
+        Person_2/Person_3 (``bindings={}``) as its "reformation" — a
+        SEPARATE, untouched local fact (``works_at``, index 1, never named
+        by the delta) sits alongside it.
+
+        New end state (per-triple, not whole-delta): all 5 adds are
+        individually dropped (unresolvable orphans); the explicit
+        ``drop`` on index 0 is honored UNCONDITIONALLY regardless of
+        those rejections (owner decision: measure the co-occurrence via
+        ``report["drop_with_rejection"]`` rather than reverting drops as
+        a safety net) — so ``lives_in`` does NOT survive.  The untouched
+        ``works_at`` fact (never named by ``add``/``modify``/``drop``)
+        survives via KEEP-by-default — that is the "local fact survives"
+        property this test pins now: survival comes from being OUTSIDE
+        the delta entirely, not from a reverted drop.
+        """
         import logging
 
+        from paramem.graph.extractor import EnrichmentDelta
         from paramem.graph.phase_trace import extraction_trace
         from tests._cloud_flow import run_cloud_stages
 
-        graph, anon_facts, mapping = self._graph_and_mapping()
-        enriched_anon = [
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield"), ("Alex", "works_at", "Acme")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                Entity(name="Acme", entity_type="organization"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1", "Acme": "Org_1"}
+        poisoned_adds = [
             {
                 "subject": "Person_2",
                 "predicate": "married_to",
@@ -4985,8 +4880,9 @@ class TestBindingTotalityRejection:
                 "confidence": 0.8,
             },
         ]
+        delta = EnrichmentDelta(add=poisoned_adds, modify=[], drop={0}, bindings={})
 
-        # The binding-totality-breach ERROR log now originates in
+        # The per-triple rejection WARNING now originates in
         # paramem.graph.stage_enrich (carved out of extractor.py's
         # _cloud_pipeline) — attach to that logger, not extractor's.
         extractor_logger = logging.getLogger("paramem.graph.stage_enrich")
@@ -5003,7 +4899,7 @@ class TestBindingTotalityRejection:
                     ),
                     patch(
                         "paramem.graph.stage_enrich.request_enrichment",
-                        return_value=(enriched_anon, None, {}, None, {}),
+                        return_value=(delta, None, {}),
                     ),
                 ):
                     result = run_cloud_stages(
@@ -5019,43 +4915,54 @@ class TestBindingTotalityRejection:
             extractor_logger.removeHandler(caplog.handler)
             extractor_logger.setLevel(prior_level)
 
-        # Local facts survive de-anonymized — the data-saving property.
+        # Only the untouched fact survives — dropped index 0 stays
+        # dropped (unconditional), the 5 orphan adds are each rejected.
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
-        assert result.relations[0].object == "Millfield"
+        assert result.relations[0].predicate == "works_at"
+        assert result.relations[0].object == "Acme"
         # No residual placeholder anywhere in the surviving relation.
         assert "Person_" not in result.relations[0].subject
         assert "Person_" not in result.relations[0].object
-        # Rejection recorded, loudly.
-        rejected = result.diagnostics.get("cloud_enrichment_rejected")
-        assert rejected, "cloud_enrichment_rejected diagnostic must be recorded"
-        assert any("Person_2" in t or "Person_3" in t for t in rejected)
+        # The measurement the owner asked for: this delta had a non-empty
+        # drop AND a rejection, in the same response.
+        report = result.diagnostics["cloud_enrichment_report"]
+        assert report["rejected_adds"] == 5
+        assert set(report["rejected_tokens"]) >= {"Person_2", "Person_3"}
+        assert report["drop_with_rejection"] is True
         phases = {p.name: p for p in trace.records}
-        assert phases["cloud_enrich"].outcome == "rejected"
-        assert any(r.levelname == "ERROR" for r in caplog.records), (
-            "A binding-totality breach must log at ERROR, not just warn."
+        assert phases["cloud_enrich"].outcome == "ok"
+        assert any(r.levelname == "WARNING" for r in caplog.records), (
+            "A per-triple rejection must be logged (WARNING, not ERROR — this "
+            "is expected traffic under the redesign, not a breach)."
         )
 
-    def test_misattribution_orphan_rejected(self):
+    def test_misattribution_orphan_add_dropped_local_fact_survives(self):
         """The misattribution regression (headline).  A placeholder
-        NOT in ``observed`` (never shown to cloud) that cloud bare-mints is
-        an ORPHAN → reject.  Pre-fix this would silently emit a
-        fabricated fact bound for adapter weights; post-fix the local
-        facts survive."""
+        NOT in ``observed`` (never shown to cloud) that cloud bare-mints
+        as an ``add`` is an ORPHAN → that one add is dropped; the
+        untouched local fact survives via KEEP-by-default (a DIFFERENT
+        mechanism than the poisoned-delta test above, same end state)."""
+        from paramem.graph.extractor import EnrichmentDelta
         from tests._cloud_flow import run_cloud_stages
 
-        graph, anon_facts, mapping = self._graph_and_mapping()
+        graph, _anon_facts, mapping = self._graph_and_mapping()
         # Person_3 is bare-minted by cloud but was never shown to it (not
         # in the rendered facts, not in the transcript, not bound).
-        enriched_anon = anon_facts + [
-            {
-                "subject": "Person_3",
-                "predicate": "profession",
-                "object": "engineer",
-                "relation_type": "factual",
-                "confidence": 0.9,
-            },
-        ]
+        delta = EnrichmentDelta(
+            add=[
+                {
+                    "subject": "Person_3",
+                    "predicate": "profession",
+                    "object": "engineer",
+                    "relation_type": "factual",
+                    "confidence": 0.9,
+                },
+            ],
+            modify=[],
+            drop=set(),
+            bindings={},
+        )
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
@@ -5064,7 +4971,7 @@ class TestBindingTotalityRejection:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                return_value=(delta, None, {}),
             ),
         ):
             result = run_cloud_stages(
@@ -5078,16 +4985,19 @@ class TestBindingTotalityRejection:
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
-        assert "cloud_enrichment_rejected" in result.diagnostics
+        report = result.diagnostics["cloud_enrichment_report"]
+        assert report["rejected_adds"] == 1
+        assert "Person_3" in report["rejected_tokens"]
+        assert report["drop_with_rejection"] is False
 
     def test_bare_observed_placeholder_as_new_subject_accepted(self):
         """Rule 1 must not regress.  A delta referencing a bare
         OBSERVED placeholder (Person_1 — already shown to cloud) as the
         subject of a NEW triple, minting nothing, is ACCEPTED.  This test
-        and ``test_misattribution_orphan_rejected`` differ ONLY in
-        observed-membership."""
+        and ``test_misattribution_orphan_add_dropped_local_fact_survives``
+        differ ONLY in observed-membership."""
         from paramem.graph.phase_trace import extraction_trace
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = anon_facts + [
@@ -5108,7 +5018,7 @@ class TestBindingTotalityRejection:
                 ),
                 patch(
                     "paramem.graph.stage_enrich.request_enrichment",
-                    return_value=(enriched_anon, None, {}, None, {}),
+                    side_effect=enrichment_side_effect(enriched_anon),
                 ),
             ):
                 result = run_cloud_stages(
@@ -5121,16 +5031,20 @@ class TestBindingTotalityRejection:
                     scrub={"person name", "physical address"},
                 )
         assert len(result.relations) == 2
-        assert "cloud_enrichment_rejected" not in result.diagnostics
+        assert result.diagnostics["cloud_enrichment_report"]["rejected_adds"] == 0
         phases = {p.name: p for p in trace.records}
         assert phases["cloud_enrich"].outcome == "ok"
 
-    def test_binding_key_colliding_with_observed_rejected(self):
-        """Conflict rejection.  A ``bindings`` key that is itself
-        an OBSERVED token (Person_1 — already shown as a core reference)
-        is a CONFLICT → rejected, even though it would resolve cleanly
-        under the old flat-union design (reverse wins silently)."""
-        from tests._cloud_flow import run_cloud_stages
+    def test_binding_key_colliding_with_observed_is_inert_fact_kept(self):
+        """Conflict is now INERT, not a rejection.  A ``bindings`` key that
+        is itself an OBSERVED token (Person_1 — already shown as a core
+        reference) is a CONFLICT recorded as a diagnostic collision, but
+        CORE-LAST precedence (:func:`~paramem.cloud.placeholders._resolution_map`)
+        makes it harmless: the fact is KEPT, resolved via the CORE
+        reverse map, exactly as if the bogus binding had never been sent.
+        Inverts the pre-redesign expectation (used to reject the whole
+        delta)."""
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = list(anon_facts)
@@ -5143,7 +5057,7 @@ class TestBindingTotalityRejection:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, bindings, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon, bindings=bindings),
             ),
         ):
             result = run_cloud_stages(
@@ -5155,16 +5069,18 @@ class TestBindingTotalityRejection:
                 correction_entity_types=set(),
                 scrub={"person name"},
             )
-        assert "cloud_enrichment_rejected" in result.diagnostics
-        assert "Person_1" in result.diagnostics["cloud_enrichment_rejected"]
+        # The collision is still recorded (informational) ...
+        assert result.diagnostics["cloud_binding_collisions"] == ["Person_1"]
+        # ... but the fact is KEPT, not dropped.
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
+        assert result.relations[0].object == "Millfield"
 
     def test_mint_bound_to_descriptor_accepted(self):
         """Mint happy path.  Cloud mints a placeholder BOUND to a
         descriptor span ("my father", ∉ observed) → ACCEPTED; the
         relation de-anonymizes to the bound text."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = anon_facts + [
@@ -5185,7 +5101,7 @@ class TestBindingTotalityRejection:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, bindings, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon, bindings=bindings),
             ),
         ):
             result = run_cloud_stages(
@@ -5197,7 +5113,7 @@ class TestBindingTotalityRejection:
                 correction_entity_types=set(),
                 scrub={"person name", "physical address"},
             )
-        assert "cloud_enrichment_rejected" not in result.diagnostics
+        assert result.diagnostics["cloud_enrichment_report"]["rejected_adds"] == 0
         subjects_objects = {(r.subject, r.object) for r in result.relations}
         assert ("Alex", "my father") in subjects_objects
 
@@ -5218,7 +5134,7 @@ class TestBindingTotalityRejection:
         fixture would need in production for either place to be a CORE
         placeholder at all.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         # Springfield -> City_2 appears ONLY inside a compound PREDICATE
         # string here, never as a subject/object anywhere in the local
@@ -5259,7 +5175,7 @@ class TestBindingTotalityRejection:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon),
             ),
         ):
             result = run_cloud_stages(
@@ -5271,7 +5187,7 @@ class TestBindingTotalityRejection:
                 correction_entity_types=set(),
                 scrub={"person name", "physical address"},
             )
-        assert "cloud_enrichment_rejected" not in result.diagnostics, (
+        assert result.diagnostics["cloud_enrichment_report"]["rejected_adds"] == 0, (
             "City_2/Springfield appears only in a predicate but is still "
             "observed — a field-scan-only `observed` would false-reject."
         )
@@ -5309,7 +5225,7 @@ class TestSpeakerAnchorPipeline:
         ``City_1`` — the model decision this test's fixture would need
         in production.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("speaker0", "lives_in", "Millfield")],
@@ -5329,7 +5245,7 @@ class TestSpeakerAnchorPipeline:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(enriched_anon, None, {}, None, {}),
+                side_effect=enrichment_side_effect(enriched_anon),
             ),
         ):
             result = run_cloud_stages(
@@ -5345,7 +5261,7 @@ class TestSpeakerAnchorPipeline:
         assert result.relations[0].subject == "speaker0"
         assert result.relations[0].object == "Millfield"
         assert "residual_dropped_facts" not in result.diagnostics
-        assert "cloud_enrichment_rejected" not in result.diagnostics
+        assert result.diagnostics["cloud_enrichment_report"]["rejected_adds"] == 0
 
     def test_anchor_independent_of_speaker_relation_presence(self):
         """The anchor holds even in a session with NO speaker
@@ -5353,7 +5269,7 @@ class TestSpeakerAnchorPipeline:
         pipeline must not require a speaker fact to function correctly —
         nothing about the anonymizer/deanon machinery depends on the
         speaker being referenced THIS session."""
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Acme", "located_in", "Millfield")],
@@ -5372,7 +5288,7 @@ class TestSpeakerAnchorPipeline:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(list(anon_facts), None, {}, None, {}),
+                side_effect=enrichment_side_effect(list(anon_facts)),
             ),
         ):
             result = run_cloud_stages(
@@ -5387,7 +5303,7 @@ class TestSpeakerAnchorPipeline:
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Acme"
         assert result.relations[0].object == "Millfield"
-        assert "cloud_enrichment_rejected" not in result.diagnostics
+        assert result.diagnostics["cloud_enrichment_report"]["rejected_adds"] == 0
 
 
 class TestObservedDerivation:
@@ -5406,7 +5322,7 @@ class TestObservedDerivation:
         (copied verbatim out of the transcript) enters ``observed`` as if it
         were a declared placeholder -> this test fails.
         """
-        from tests._cloud_flow import run_cloud_stages
+        from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -5424,12 +5340,12 @@ class TestObservedDerivation:
         captured: list = []
         from paramem.cloud import deanonymize as _cloud_deanonymize
 
-        real_totality = _cloud_deanonymize._check_mapping_totality
+        real_collisions = _cloud_deanonymize._binding_collisions
 
         def _spy(*args, **kwargs):
             if "observed" in kwargs:
                 captured.append(kwargs["observed"])
-            return real_totality(*args, **kwargs)
+            return real_collisions(*args, **kwargs)
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -5437,10 +5353,10 @@ class TestObservedDerivation:
                 "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
-            patch("paramem.cloud.deanonymize._check_mapping_totality", side_effect=_spy),
+            patch("paramem.cloud.deanonymize._binding_collisions", side_effect=_spy),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(list(anon_facts), None, {}, None, {}),
+                side_effect=enrichment_side_effect(list(anon_facts)),
             ),
         ):
             run_cloud_stages(
@@ -5453,7 +5369,7 @@ class TestObservedDerivation:
                 scrub={"person name", "physical address"},
             )
 
-        assert captured, "the cloud_enrich totality check must run with an observed scope"
+        assert captured, "the deanon stage's collision scan must run with an observed scope"
         observed = captured[-1]
         # Declared AND in the payload.
         assert observed == {"Person_1", "City_1"}

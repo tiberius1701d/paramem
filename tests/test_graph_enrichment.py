@@ -255,7 +255,7 @@ class TestEnrichmentAddsEdgesWithSourceTag:
             ],
             [],  # no same_as
             "raw",
-            [],  # accepted: empty totality verdict
+            0,  # accepted: no relations dropped
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -316,7 +316,7 @@ class TestEnrichmentInheritsSourceWindow:
             ],
             [],  # no same_as
             "raw",
-            [],  # accepted: empty totality verdict
+            0,  # accepted: no relations dropped
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -374,7 +374,7 @@ class TestLowConfidenceDropped:
             ],
             [],
             "raw",
-            [],  # accepted: empty totality verdict
+            0,  # accepted: no relations dropped
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -441,7 +441,7 @@ class TestSameAsContractsNodes:
             [],  # no new relations
             [["Alice", "Alicia"]],  # same_as
             "raw",
-            [],  # accepted: empty totality verdict
+            0,  # accepted: no relations dropped
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -509,7 +509,7 @@ class TestSameAsSurnameMismatchRejected:
                 last_seen="s020",
             )
 
-        canned_result = ([], [["Zhang Min", "Wang Min"]], "raw", [])
+        canned_result = ([], [["Zhang Min", "Wang Min"]], "raw", 0)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
@@ -540,7 +540,7 @@ def _same_as_per_chunk(*per_chunk: list[list[str]]):
         i = calls["n"]
         calls["n"] += 1
         pairs = list(per_chunk[i]) if i < len(per_chunk) else []
-        return ([], pairs, "raw", [])
+        return ([], pairs, "raw", 0)
 
     return _side_effect
 
@@ -699,7 +699,7 @@ class TestSameAsDedupAcrossChunks:
             [],
             [["Yang Ming", "Mr. Yang"], ["Mr. Yang", "Yang Ming"]],
             "raw",
-            [],
+            0,
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -755,7 +755,7 @@ class TestSymmetricPredicateCanonicalized:
                 last_seen="s040",
             )
 
-        canned_result = (rels, [], "raw", [])
+        canned_result = (rels, [], "raw", 0)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
@@ -814,7 +814,7 @@ class TestSymmetricPredicateCanonicalized:
                 last_seen="s041",
             )
 
-        canned_result = (rels, [], "raw", [])
+        canned_result = (rels, [], "raw", 0)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
@@ -890,7 +890,7 @@ class TestCorefRemapBeforeEdgeInsert:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(canned_rels, canned_same_as, "raw", []),
+            return_value=(canned_rels, canned_same_as, "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -989,7 +989,7 @@ class TestPartitionRoutesEnrichedEdges:
             ],
             [],
             "raw",
-            [],  # accepted: empty totality verdict
+            0,  # accepted: no relations dropped
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -1063,7 +1063,7 @@ class TestChunkCapRespected:
 
         def _spy_call(triples, *args, **kwargs):
             call_args_list.append(list(triples))
-            return ([], [], "raw", [])
+            return ([], [], "raw", 0)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch("paramem.training.graph_enrich.request_graph_enrichment", side_effect=_spy_call):
@@ -1249,7 +1249,7 @@ class TestEmptyMappingProceeds:
             "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: ({}, "", "stub-raw"),
         )
-        canned_result = ([], [], "raw", [])
+        canned_result = ([], [], "raw", 0)
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
@@ -1307,7 +1307,7 @@ class TestEmptyMappingProceeds:
             "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: ({}, "", "stub-raw"),
         )
-        canned_result = ([], [], "raw", [])
+        canned_result = ([], [], "raw", 0)
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
@@ -1570,7 +1570,7 @@ class TestGuardDomainSeparation:
             "paramem.cloud.anonymize.anonymize_transcript",
             _stub,
         )
-        canned_result = ([], [], "raw", [])
+        canned_result = ([], [], "raw", 0)
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
@@ -1604,7 +1604,7 @@ class TestScrubEmptyOptsOutWithoutModelCall:
 
         def _capture(triples, payload, graph, *args, **kwargs):
             captured_mapping.append(dict(payload.forward))
-            return [], [], "raw", []
+            return [], [], "raw", 0
 
         with (
             patch("paramem.cloud.anonymize.anonymize_transcript", anonymizer_spy),
@@ -1619,14 +1619,16 @@ class TestScrubEmptyOptsOutWithoutModelCall:
         assert all(m == {} for m in captured_mapping)
 
 
-class TestTotalityRejectedChunks:
-    """Graph-tier enrichment's binding-totality gate — a cloud response
-    naming an orphan/unresolvable token REJECTS THE WHOLE CHUNK DELTA,
-    counted in ``totality_rejected_chunks`` (parallel to the existing
-    ``privacy_skipped_chunks`` / ``mapping_rekey_dropped`` counters).
-    Distinct from ``privacy_skipped_chunks``, which fires BEFORE any cloud
-    call is made; this counter fires AFTER a real cloud response was
-    rejected by the deanonymize gate.
+class TestDroppedRelations:
+    """Graph-tier enrichment's per-relation drop count (``dropped_relations``
+    — replaces the retired ``totality_rejected_chunks`` whole-chunk gate,
+    2026-07-22 cloud-admission redesign): a cloud response naming an
+    orphan/unresolvable token now sheds only the offending relation(s),
+    counted here (parallel to the existing ``privacy_skipped_chunks`` /
+    ``mapping_rekey_dropped`` counters). Distinct from
+    ``privacy_skipped_chunks``, which fires BEFORE any cloud call is made;
+    this counter fires AFTER a real cloud response was individually
+    filtered by the deanonymize residual sweep.
     """
 
     def test_orphan_token_in_cloud_response_increments_the_counter(self, tmp_path, monkeypatch):
@@ -1639,7 +1641,8 @@ class TestTotalityRejectedChunks:
         # "person" (Person_N) — person0 becomes Person_1 (sorted-name
         # order). The cloud response below names an orphan token
         # ("Person_99") never declared anywhere in this chunk's mapping —
-        # the totality gate must reject the WHOLE delta.
+        # that ONE relation is individually dropped by the fail-closed
+        # residual sweep.
         canned_raw = (
             '{"relations": [{"subject": "Person_1", "predicate": "knows", '
             '"object": "Person_99", "relation_type": "social", "confidence": 0.9}], '
@@ -1650,7 +1653,7 @@ class TestTotalityRejectedChunks:
 
         assert not result["skipped"]
         assert result["chunks"] == 1
-        assert result["totality_rejected_chunks"] == 1
+        assert result["dropped_relations"] == 1
         assert result["privacy_skipped_chunks"] == 0
         assert result["new_edges"] == 0
 
@@ -1665,20 +1668,15 @@ class TestTotalityRejectedChunks:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert result["totality_rejected_chunks"] == 0
+        assert result["dropped_relations"] == 0
 
-    def test_counter_reads_the_returned_verdict_not_a_graph_mutation(self, tmp_path, monkeypatch):
-        """The counter is driven by the VERDICT ``request_graph_enrichment``
-        returns (its fourth tuple element), not by reading
-        ``cloud_pending_orphans`` back off the throwaway per-chunk graph.
+    def test_counter_reads_the_returned_count_not_a_graph_mutation(self, tmp_path, monkeypatch):
+        """The counter is driven by the COUNT ``request_graph_enrichment``
+        returns (its fourth tuple element), not by reading a diagnostic
+        back off the throwaway per-chunk graph.
 
-        The stub below returns a rejection verdict while touching no
-        graph at all — under the old readback the counter would stay 0.
-
-        Mutation: go back to
-        ``if _chunk_session_graph.diagnostics.get("cloud_pending_orphans")``
-        -> this test fails while the two live-path tests above still
-        pass, which is exactly why it exists.
+        The stub below returns a non-zero count while touching no graph
+        at all — under a readback-based counter this would stay 0.
         """
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
@@ -1687,20 +1685,18 @@ class TestTotalityRejectedChunks:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=([], [], "raw", ["Person_99"]),
+            return_value=([], [], "raw", 1),
         ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert result["totality_rejected_chunks"] == result["chunks"] >= 1
+        assert result["dropped_relations"] == result["chunks"] >= 1
         assert result["new_edges"] == 0
 
-    def test_empty_verdict_with_empty_delta_is_not_counted_as_a_rejection(
-        self, tmp_path, monkeypatch
-    ):
-        """The inverse discrimination: a legitimately EMPTY delta returns
-        the same ``([], [], raw, ...)`` shape as a rejected one — only the
-        verdict tells them apart, and an empty verdict must not count."""
+    def test_zero_count_with_empty_delta_is_not_counted_as_a_drop(self, tmp_path, monkeypatch):
+        """A legitimately EMPTY delta returns the same ``([], [], raw,
+        ...)`` shape as one that dropped relations — only the count tells
+        them apart, and a zero count must not increment the stat."""
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
@@ -1708,12 +1704,12 @@ class TestTotalityRejectedChunks:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=([], [], "raw", []),
+            return_value=([], [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert result["totality_rejected_chunks"] == 0
+        assert result["dropped_relations"] == 0
 
 
 class TestSameAsUndeclaredOrphanShapeBackstop:
@@ -1743,7 +1739,7 @@ class TestSameAsUndeclaredOrphanShapeBackstop:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert result["totality_rejected_chunks"] == 0
+        assert result["dropped_relations"] == 0
         assert result["same_as_merges"] == 0
 
 
@@ -1812,7 +1808,7 @@ class TestGraphEnrichWithCloudUnit:
             )
 
         assert result is not None
-        new_rels, same_as, raw, _verdict = result
+        new_rels, same_as, raw, _dropped_count = result
         assert len(new_rels) == 1
         assert new_rels[0]["predicate"] == "knows"
         assert len(same_as) == 1
@@ -1887,7 +1883,7 @@ class TestGraphEnrichWithCloudUnit:
             )
 
         assert result is not None
-        new_rels, same_as, _, _verdict = result
+        new_rels, same_as, _, _dropped_count = result
         assert len(new_rels) == 1
         assert same_as == []
 
@@ -1924,17 +1920,16 @@ class TestGraphEnrichWithCloudUnit:
             )
 
         assert result is not None
-        _, same_as, _, _verdict = result
+        _, same_as, _, _dropped_count = result
         # Only the valid [Alice, Alicia] entry survives; ["bad", [1,2]] are skipped
         assert same_as == [["Alice", "Alicia"]]
 
-    def test_totality_verdict_is_returned_and_also_recorded_on_the_graph(self):
-        """A rejected chunk delta surfaces TWO ways, and both must hold:
-        the verdict is the fourth element of the returned tuple (what the
-        caller counts on), AND it still lands under
-        ``graph.diagnostics["cloud_pending_orphans"]`` for calibration
-        inspection — written by the CALLER-side
-        ``_record_binding_diagnostics``, not from inside the gate."""
+    def test_dropped_relation_count_is_returned_and_orphan_relation_is_shed(self):
+        """An individually-unresolvable relation (its object references a
+        token never declared for this chunk) is dropped by the fail-closed
+        residual sweep, and the caller's dropped-relation count (the
+        fourth tuple element) reflects it — replacing the retired
+        whole-chunk rejection this test used to pin."""
         from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
@@ -1945,8 +1940,8 @@ class TestGraphEnrichWithCloudUnit:
                 "relation_type": "factual",
             }
         ]
-        # "Person_99" is never declared for this chunk -> orphan -> the
-        # whole delta is rejected.
+        # "Person_99" is never declared for this chunk -> orphan -> that
+        # ONE relation is dropped by the residual sweep.
         canned_raw = (
             '{"relations": [{"subject": "Person_1", "predicate": "knows", '
             '"object": "Person_99", "relation_type": "social", "confidence": 0.9}], '
@@ -1964,18 +1959,19 @@ class TestGraphEnrichWithCloudUnit:
             )
 
         assert result is not None
-        new_rels, same_as, _raw, verdict = result
-        assert verdict == ["Person_99"]
+        new_rels, same_as, _raw, dropped_count = result
+        assert dropped_count == 1
         assert new_rels == []
         assert same_as == []
-        assert graph.diagnostics["cloud_pending_orphans"] == ["Person_99"]
         # No cloud_bindings in the response -> the collision scan found
         # nothing -> no key at all (never a present-but-empty list).
         assert "cloud_binding_collisions" not in graph.diagnostics
 
-    def test_accepted_chunk_writes_no_totality_diagnostics(self):
+    def test_accepted_chunk_reports_zero_dropped_relations(self):
         """The guard conditions are preserved end-to-end: an accepted
-        delta leaves both keys ABSENT rather than writing empty lists."""
+        delta reports a zero dropped-relation count and leaves the
+        collision diagnostic key ABSENT rather than writing an empty
+        list."""
         from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
@@ -1999,8 +1995,8 @@ class TestGraphEnrichWithCloudUnit:
             )
 
         assert result is not None
-        assert result[3] == []
-        assert "cloud_pending_orphans" not in graph.diagnostics
+        assert result[3] == 0
+        assert "cloud_binding_collisions" not in graph.diagnostics
         assert "cloud_binding_collisions" not in graph.diagnostics
 
 
@@ -2924,7 +2920,7 @@ class TestEnrichmentRemovalLedger:
             [],
             [["Alice", "Alicia"]],  # keep=alice, drop=alicia
             "raw",
-            [],
+            0,
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
@@ -2990,7 +2986,7 @@ class TestEnrichmentRemovalLedger:
             [],
             [["BadKeep", "BadDrop"]],
             "raw",
-            [],
+            0,
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
@@ -3347,7 +3343,7 @@ class TestEnrichmentThroughMergerComposition:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3408,7 +3404,7 @@ class TestEnrichmentThroughMergerComposition:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3549,7 +3545,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3641,7 +3637,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3724,7 +3720,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         with (
             patch(
                 "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=(rels, same_as, "raw", []),
+                return_value=(rels, same_as, "raw", 0),
             ),
             patch(
                 "paramem.training.graph_enrich._safe_to_merge_surface",
@@ -3870,7 +3866,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -3966,7 +3962,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -4031,7 +4027,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels_a, [], "raw", []),
+            return_value=(rels_a, [], "raw", 0),
         ):
             _refiner_for(loop).run_enrichment()
 
@@ -4134,7 +4130,7 @@ class TestSpeakerPredecessorInheritance:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.graph_enrich.request_graph_enrichment",
-            return_value=(rels, [], "raw", []),
+            return_value=(rels, [], "raw", 0),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -4337,7 +4333,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        new_rels, same_as, _raw, _verdict = result
+        new_rels, same_as, _raw, _dropped_count = result
         assert len(new_rels) == 1
         assert new_rels[0]["subject"] == "alice"
         assert new_rels[0]["object"] == "speaker0"
@@ -4355,9 +4351,11 @@ class TestGraphTierAnonymizationContract:
         from paramem.graph.extractor import request_graph_enrichment
 
         # "alice" is shown to cloud (declared AND observed); "Person_99" is
-        # never declared anywhere — the totality gate rejects the WHOLE
-        # delta (not a per-fact residual drop) once the gate is unified,
-        # but the observable outcome (no surviving relation) is unchanged.
+        # never declared anywhere — this ONE relation is dropped by
+        # ``_apply_bindings``'s fail-closed residual sweep (2026-07-22
+        # cloud-admission redesign retired the whole-delta rejection this
+        # test used to exercise); the observable outcome (no surviving
+        # relation) is unchanged.
         triples = [
             {
                 "subject": "alice",
@@ -4384,7 +4382,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        new_rels, _same_as, _raw, _verdict = result
+        new_rels, _same_as, _raw, _dropped_count = result
         assert new_rels == [], (
             f"Relation naming an unresolved token must be dropped; got {new_rels!r}"
         )
@@ -4500,7 +4498,7 @@ class TestGraphTierAnonymizationContract:
         assert "Person_7" in rendered, (
             f"the model's own placeholder must reach the payload verbatim: {rendered}"
         )
-        new_rels, _same_as, _raw, _verdict = result
+        new_rels, _same_as, _raw, _dropped_count = result
         assert len(new_rels) == 1
         assert new_rels[0]["subject"] == "yang ming", (
             "Person_7 must round-trip to the real name via the caller's own "
@@ -4577,7 +4575,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        _new_rels, same_as, _raw, _verdict = result
+        _new_rels, same_as, _raw, _dropped_count = result
         assert len(same_as) == 1
         keep, drop = same_as[0]
         assert is_speaker_id(keep) and is_speaker_id(drop), (
@@ -5149,7 +5147,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
     # ``insert_placeholders`` is deliberately NOT in this set (moved out
     # when ``AnonymizedContract.anon_facts`` was removed as a stored
     # field): it carries no privacy-guard logic of its own — no
-    # speaker-value guard, no totality gate, no observed scoping, just a
+    # speaker-value guard, no binding-collision scan, no observed scoping, just a
     # mechanical substitution over the forward map — so, unlike the four
     # primitives below, straying from the ``cloud/`` package does not
     # bypass anything SAFETY-critical. Every production reader now
@@ -5166,7 +5164,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
     _CLOUD_ROUNDTRIP_ONLY_PRIMITIVES = frozenset(
         {
             "_build_anonymization_mapping",
-            "_check_mapping_totality",
+            "_binding_collisions",
             "_apply_bindings",
             "_resolution_map",
         }
@@ -5225,7 +5223,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
 
     def test_placeholders_primitives_reached_only_via_cloud_roundtrip(self):
         """Every one of the four primitives that make the anon/deanon
-        contract SAFE (speaker-value guard, totality gate, observed
+        contract SAFE (speaker-value guard, binding-collision scan, observed
         scoping) is imported/called, within ``paramem/``, ONLY from
         ``paramem/cloud/anonymize.py`` / ``paramem/cloud/deanonymize.py``
         (the one round-trip contract, split into its two composed halves)
@@ -5256,7 +5254,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
         assert not offenders, (
             "anon/deanon primitives reached outside paramem/cloud/{anonymize,"
             "deanonymize}.py (the structural guard that makes the speaker-value "
-            "guard, totality gate, and observed scoping unbypassable):\n"
+            "guard, binding-collision scan, and observed scoping unbypassable):\n"
             + "\n".join(f"  {path}:{line} [{name}] — {src}" for path, line, src, name in offenders)
         )
 

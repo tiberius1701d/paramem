@@ -350,16 +350,18 @@ def enrich_graph(
               ambiguous multiple) in their chunk once reconciled
               against the chunk's actual node keys via ``canonical()``
               — see the ``anonymize(identity_domain=...)`` call below.
-            - ``totality_rejected_chunks`` (int): chunks whose cloud
-              response was REJECTED AS A WHOLE by the binding-totality
-              gate (:func:`~paramem.cloud.deanonymize.deanonymize_facts`,
-              the first totality check this tier has ever had) — an
-              orphan mint or CORE/cloud conflict, distinct from
-              ``privacy_skipped_chunks`` (which fires before any cloud
-              call is made). A non-zero value with unchanged
-              ``privacy_skipped_chunks`` is the signature of ``observed``
-              scoping silently rejecting enrichment deltas — see
-              ``benchmarking.md``.
+            - ``dropped_relations`` (int): relations
+              :func:`~paramem.graph.extractor.request_graph_enrichment`
+              individually dropped post-substitution (predicate-invariant
+              plus residual-placeholder drops in
+              :func:`~paramem.cloud.placeholders._apply_bindings`) —
+              summed across every chunk's cloud call.  Replaces the
+              retired ``totality_rejected_chunks`` (2026-07-22
+              cloud-admission redesign): a cloud response naming an
+              orphan/unresolvable token used to reject the WHOLE chunk
+              delta; it now sheds only the offending relation(s), counted
+              here. Distinct from ``privacy_skipped_chunks`` (which fires
+              before any cloud call is made).
             - ``skipped`` (bool): ``True`` when enrichment was bypassed.
             - ``skip_reason`` (str | None): reason token when skipped —
               ``"no_model"``, ``"floor"``, or ``"cloud_egress_blocked"``
@@ -376,7 +378,7 @@ def enrich_graph(
         "same_as_merges": 0,
         "privacy_skipped_chunks": 0,
         "mapping_rekey_dropped": 0,
-        "totality_rejected_chunks": 0,
+        "dropped_relations": 0,
     }
 
     if model is None:
@@ -467,7 +469,7 @@ def enrich_graph(
     calls_made = 0
     privacy_skipped_chunks = 0
     mapping_rekey_dropped = 0
-    totality_rejected_chunks = 0
+    dropped_relations = 0
     # Accumulates ik_keys from edges dropped by successful same_as contractions.
     # Keys are written to merger.removal_ledger after the loop completes
     # so the classifier can distinguish intended enrichment-driven removals from
@@ -535,9 +537,9 @@ def enrich_graph(
             #
             # ``_chunk_session_graph`` carries no relations of its own —
             # it exists ONLY as the diagnostics sink
-            # ``request_graph_enrichment`` writes the binding-totality
-            # gate's findings to below; it is NOT how this chunk's facts
-            # reach that call (``triples`` is passed directly).
+            # ``request_graph_enrichment`` writes the binding-collision
+            # findings to below; it is NOT how this chunk's facts reach
+            # that call (``triples`` is passed directly).
             _chunk_session_graph = SessionGraph(session_id="__graph_enrichment__", timestamp="")
             # anonymize calls model.generate() internally (CLAUDE.md:
             # gradient checkpointing must be disabled around ANY
@@ -621,15 +623,13 @@ def enrich_graph(
             if result is None:
                 logger.warning("graph_enrichment: Cloud call returned None for chunk")
                 continue
-            new_rels, same_as_pairs, _raw, totality_verdict = result
-            # A rejected totality verdict returns ([], [], raw, verdict) —
-            # the relation/same_as lists alone are indistinguishable from
-            # a legitimately empty response, so the VERDICT is what
-            # discriminates the two.  It arrives as a returned value, not
-            # as a mutation on ``_chunk_session_graph.diagnostics`` read
-            # back before the throwaway graph is discarded.
-            if totality_verdict:
-                totality_rejected_chunks += 1
+            new_rels, same_as_pairs, _raw, dropped_relation_count = result
+            # The count of relations this chunk's cloud response had
+            # individually dropped post-substitution — arrives as a
+            # returned value, not as a mutation on
+            # ``_chunk_session_graph.diagnostics`` read back before the
+            # throwaway graph is discarded.
+            dropped_relations += dropped_relation_count
         except VramExhausted:
             # Not a chunk-level extraction failure — the caller (the
             # per-cycle loop in app.py) must see this and retry rather
@@ -825,14 +825,14 @@ def enrich_graph(
 
     logger.info(
         "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d "
-        "privacy_skipped_chunks=%d mapping_rekey_dropped=%d totality_rejected_chunks=%d",
+        "privacy_skipped_chunks=%d mapping_rekey_dropped=%d dropped_relations=%d",
         provider,
         calls_made,
         total_new,
         total_merges,
         privacy_skipped_chunks,
         mapping_rekey_dropped,
-        totality_rejected_chunks,
+        dropped_relations,
     )
     # Write enrichment-collapsed ik_keys to the merger's removal ledger so the
     # drift classifier can route them to drift_intended_removal rather than
@@ -849,7 +849,7 @@ def enrich_graph(
         "same_as_merges": total_merges,
         "privacy_skipped_chunks": privacy_skipped_chunks,
         "mapping_rekey_dropped": mapping_rekey_dropped,
-        "totality_rejected_chunks": totality_rejected_chunks,
+        "dropped_relations": dropped_relations,
         "skipped": False,
         "skip_reason": None,
     }

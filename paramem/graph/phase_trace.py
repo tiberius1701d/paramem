@@ -216,10 +216,14 @@ class PhaseRecord:
         ``"no_input"`` (phase had nothing to do), ``"failed"`` (an
         exception propagated through the scope; ``reason`` is set), or
         ``"rejected"`` (the phase produced output but the caller rejected
-        it as a unit and fell back to a prior-stage input — e.g.
-        ``cloud_enrich``'s binding-totality gate rejecting an enrichment
-        delta that references an orphan or CORE-conflicting placeholder;
-        ``reason`` is set). No consumer branches on the value.
+        it as a unit and fell back to a prior-stage input; ``reason`` is
+        set) — no current phase writer produces ``"rejected"`` (the
+        ``cloud_enrich`` binding-totality gate this example used to name
+        was retired in the 2026-07-22 cloud-admission redesign in favour
+        of per-triple accept/drop/revert, which never discards a whole
+        phase's output as a unit); the value remains part of the generic
+        vocabulary for a future phase that needs it. No consumer branches
+        on the value.
     wall_clock_seconds:
         Time inside the ``with phase_trace(...)`` block, including all
         nested work.  Captured automatically by the context manager.

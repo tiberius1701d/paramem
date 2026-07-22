@@ -1130,11 +1130,18 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
     :func:`~paramem.graph.extractor.request_enrichment` (the SAME function
     the ``enrich`` stage, :func:`~paramem.graph.stage_enrich._stage_enrich`,
     calls every consolidation cycle) directly — no mirrored cloud-call
-    reimplementation. Prompt provenance and ``n_input_tokens`` come from
-    the ``cloud_enrich`` phase record :func:`_run_calibration` opens around
-    ``dispatch`` (``request_enrichment`` loads its user prompt at call time
-    via ``_load_prompt``, which records onto that phase) — never a
-    hand-built ``prompts=[...]`` literal.
+    reimplementation — and then applies the parsed delta via the SAME
+    :func:`~paramem.graph.extractor._apply_enrichment_delta` the ``enrich``
+    stage calls, rather than re-merging the delta itself: this endpoint's
+    whole purpose is to hook into the production path, never to mirror
+    it. It has no :class:`~paramem.cloud.anonymize.AnonymizedContract`
+    (a bare fact list, no anonymize step), so it passes ``scope=None`` —
+    the sentinel under which nothing is gated and every ``add``/``modify``/
+    ``drop`` action applies verbatim. Prompt provenance and
+    ``n_input_tokens`` come from the ``cloud_enrich`` phase record
+    :func:`_run_calibration` opens around ``dispatch`` (``request_enrichment``
+    loads its user prompt at call time via ``_load_prompt``, which records
+    onto that phase) — never a hand-built ``prompts=[...]`` literal.
 
     Makes a BILLED cloud call to the configured cloud provider
     (``consolidation.extraction_enrichment_provider`` in ``server.yaml``).
@@ -1147,7 +1154,11 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
     stage, even though the call itself is cloud-side and touches no VRAM.
     """
     from paramem.cloud.admission import evaluate_cloud_egress
-    from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, request_enrichment
+    from paramem.graph.extractor import (
+        _DEFAULT_FILTER_MAX_TOKENS,
+        _apply_enrichment_delta,
+        request_enrichment,
+    )
 
     filename = req.enrichment_prompt_filename or "cloud_enrichment.txt"
     max_tokens = (
@@ -1184,7 +1195,16 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
         resolved["api_key"] = verdict.api_key
 
     def dispatch() -> tuple[Any, dict]:
-        facts, updated_transcript, bindings, raw, info = request_enrichment(
+        # ``request_enrichment`` only parses the delta now (2026-07-22
+        # cloud-admission redesign) — this endpoint's whole purpose is to
+        # hook into the production path, never to mirror it, so it calls
+        # the SAME ``_apply_enrichment_delta`` the ``enrich`` stage calls
+        # rather than re-merging the delta itself.  There is no
+        # ``AnonymizedContract`` here (this endpoint takes a bare fact
+        # list, no anonymize step), so ``scope=None`` — the sentinel under
+        # which nothing is gated and every action applies verbatim, same
+        # as any other direct/unit-test caller of ``_apply_enrichment_delta``.
+        delta, raw, info = request_enrichment(
             req.facts,
             resolved["api_key"],
             resolved["provider"],
@@ -1196,11 +1216,22 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
             prompts_dir=req.prompts_dir,
             prompt_filename=filename,
         )
-        parsed: dict[str, Any] = {
-            "facts": facts if facts is not None else [],
+        if delta is None:
+            parsed: dict[str, Any] = {
+                "facts": [],
+                "updated_transcript": None,
+                "bindings": {},
+                "info": info,
+            }
+            return raw or "", parsed
+        facts, updated_transcript, report = _apply_enrichment_delta(
+            req.facts, delta, scope=None, anon_transcript=req.transcript
+        )
+        parsed = {
+            "facts": facts,
             "updated_transcript": updated_transcript,
-            "bindings": bindings,
-            "info": info,
+            "bindings": delta.bindings,
+            "info": {**info, **report},
         }
         return raw or "", parsed
 

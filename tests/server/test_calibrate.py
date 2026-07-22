@@ -1042,8 +1042,12 @@ class TestCalibrateEnrich:
 
     def test_success(self, monkeypatch: pytest.MonkeyPatch):
         """Provider configured + key present -> ``request_enrichment`` runs;
-        its returned facts surface at ``result["parsed"]["facts"]``."""
+        ``calibrate_enrich`` applies the parsed delta itself (via the SAME
+        ``_apply_enrichment_delta`` the ``enrich`` stage calls), so its
+        surviving facts surface at ``result["parsed"]["facts"]``."""
         import unittest.mock as _mock
+
+        from paramem.graph.extractor import EnrichmentDelta
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
@@ -1055,15 +1059,18 @@ class TestCalibrateEnrich:
             facts=[{"subject": "speaker0", "predicate": "likes", "object": "coffee"}],
             transcript="[user] I like coffee.",
         )
-        enriched_facts = [{"subject": "speaker0", "predicate": "likes", "object": "coffee"}]
+        # An empty delta (KEEP-by-default) — the input facts survive
+        # ``_apply_enrichment_delta`` unchanged, mirroring the old mock's
+        # "enrichment left this fact as-is" shape.
+        empty_delta = EnrichmentDelta(add=[], modify=[], drop=set(), bindings={})
         with _mock.patch(
             "paramem.graph.extractor.request_enrichment",
-            return_value=(enriched_facts, "anon transcript", {}, "raw", {}),
+            return_value=(empty_delta, "raw", {}),
         ) as helper:
             result = calibrate_enrich(state, req)
         assert helper.called
         assert result["stage"] == "enrich"
-        assert result["parsed"]["facts"] == enriched_facts
+        assert result["parsed"]["facts"] == req.facts
 
     def test_prompt_override_reaches_model(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
         """A prompts_dir + filename override actually drives the cloud call.

@@ -2,8 +2,9 @@
 the scope object every response is checked and substituted against.
 
 ``paramem.cloud.placeholders`` is the primitive kit: mint, substitute,
-normalize, invert, resolution map, totality, apply-bindings — model-free,
-IO-free. This module is the composed exit gate every cloud-returned
+normalize, invert, resolution map, placeholder-token scan, binding
+collisions, apply-bindings — model-free, IO-free. This module is the
+composed exit gate every cloud-returned
 artifact (facts OR prose) passes through: :class:`CloudScope` (the one
 legality/resolution scope for a response), :func:`deanonymize_facts` (the
 fact-list exit), :func:`deanonymize_text` (the prose exit).
@@ -26,10 +27,11 @@ from typing import TYPE_CHECKING
 
 from paramem.cloud.placeholders import (
     _apply_bindings,
-    _check_mapping_totality,
+    _binding_collisions,
     _contains_declared_token,
     _declared_placeholder_tokens,
     _normalize_anonymization_mapping,
+    _placeholder_tokens,
     _resolution_map,
     _substitute_whole_words,
 )
@@ -300,6 +302,30 @@ class CloudScope:
         — the ONE call, not one per caller — and non-``str`` pairs are
         filtered as a side effect of that normalize.
 
+        **Binding-value pruning (2026-07-22 cloud-admission redesign).**
+        After normalizing, any binding whose own VALUE still carries an
+        unresolvable placeholder token (the ``{"Role_1": "Senior Engineer
+        at Org_9"}`` case, where ``Org_9`` is never declared anywhere) is
+        dropped from ``cloud_bindings`` entirely — ONE pass, not a
+        fixpoint: a value that itself references another cloud-minted
+        binding chain (``Role_1``'s value naming ``Org_9``, whose own
+        value in turn names a THIRD unresolved token) only has its
+        outermost link checked here.  Deliberate: this scope has already
+        computed ``resolution``/``declared`` from ``cloud_bindings``
+        before any transitive chain could be walked, and a fixpoint loop
+        over a cloud-controlled dict is an unbounded-iteration surface for
+        no observed benefit (the prompt's own contract mints one binding
+        per new entity, not chains of them).  A pruned binding is simply
+        absent from ``resolution``, so any fact whose subject/object
+        referenced it becomes unresolvable and is dropped downstream by
+        the ordinary per-fact rule (:func:`~paramem.graph.extractor.
+        _apply_enrichment_delta`'s orphan check on ``add``/``modify``, or
+        :func:`~paramem.cloud.placeholders._apply_bindings`'s residual
+        sweep) — this replaces the fatal binding-value scan that used to
+        live in the now-retired ``_check_mapping_totality`` (folded into
+        :func:`~paramem.cloud.placeholders._binding_collisions`, which no
+        longer scans binding values at all — that job moved here).
+
         ``declared`` on the returned scope is the UNION of ``contract``'s
         CORE vocabulary and the normalized ``cloud_bindings`` keys (the
         same union :func:`~paramem.cloud.placeholders._apply_bindings`
@@ -327,6 +353,27 @@ class CloudScope:
         )
         sent_tuple = tuple(sent)
         observed = frozenset(tok for tok in contract.declared if any(tok in s for s in sent_tuple))
+
+        # Binding-value pruning — see docstring. A binding whose VALUE
+        # still carries a placeholder token unresolvable against the
+        # CORE-plus-bindings domain is dropped entirely (ONE pass).
+        if normalized_bindings:
+            _prune_resolvable = set(
+                _resolution_map(contract.reverse, normalized_bindings, observed)
+            )
+            _pruned_bindings: dict[str, str] = {}
+            for _key, _value in normalized_bindings.items():
+                if _placeholder_tokens(_value) - _prune_resolvable:
+                    logger.warning(
+                        "cloud binding %r pruned — its value %r carries an "
+                        "unresolvable placeholder token",
+                        _key,
+                        _value,
+                    )
+                    continue
+                _pruned_bindings[_key] = _value
+            normalized_bindings = _pruned_bindings
+
         resolution = _resolution_map(contract.reverse, normalized_bindings, observed)
         core_resolution = _resolution_map(contract.reverse, {}, observed)
         declared = frozenset(_declared_placeholder_tokens(contract.reverse, normalized_bindings))
@@ -349,25 +396,27 @@ class CloudScope:
 class DeanonResult:
     """Result of :func:`deanonymize_facts`.
 
-    ``verdict`` empty == accepted (``facts`` holds the substituted,
-    already-partitioned survivors).  ``verdict`` non-empty == REJECT THE
-    WHOLE DELTA — ``facts`` is ``[]`` and nothing was substituted; the
-    caller decides the fallback (never a partial application).
+    ``facts`` holds the substituted, already-partitioned survivors —
+    ``deanonymize_facts`` always substitutes now (2026-07-22
+    cloud-admission redesign retired the whole-delta accept/reject
+    ``verdict`` this dataclass used to carry): per-triple resolvability is
+    decided earlier, at the point cloud's delta is applied
+    (:func:`~paramem.graph.extractor._apply_enrichment_delta`), and the
+    fail-closed residual sweep in :func:`~paramem.cloud.placeholders.
+    _apply_bindings` (surfaced here as ``predicate_dropped`` /
+    ``residual_dropped``) is what still sheds an individual fact this
+    call.
 
-    ``collisions`` is the totality gate's collision scan
-    (:func:`~paramem.cloud.placeholders._check_mapping_totality`'s second
-    return value) — cloud-binding keys that clash with the CORE reverse
-    map or with the ``observed`` scope.  It is populated on BOTH exits
-    (rejected and accepted): under an ``observed``-scoped call every
-    collision is also folded into ``verdict``, but under the CORE-unscoped
-    shape a collision is informational only and would otherwise be
-    invisible to the caller.  Callers that keep diagnostics write it to
-    their own diagnostics store themselves — this primitive mutates
-    nothing.
+    ``collisions`` is :func:`~paramem.cloud.placeholders._binding_collisions`'s
+    result — cloud-binding keys that clash with the CORE reverse map or
+    with the ``observed`` scope.  ALWAYS informational: a binding for a
+    token cloud was SHOWN is inert under CORE-LAST precedence
+    (:func:`~paramem.cloud.placeholders._resolution_map`), never a reason
+    to drop anything.  Callers that keep diagnostics write it to their own
+    diagnostics store themselves — this primitive mutates nothing.
     """
 
     facts: list[dict]
-    verdict: list[str]
     collisions: list[str]
     predicate_dropped: list[dict]
     residual_dropped: list[dict]
@@ -378,55 +427,38 @@ def deanonymize_facts(
     facts: list[dict],
 ) -> DeanonResult:
     """De-anonymize a cloud-returned fact delta — the single deanon exit
-    gate for facts, run in fixed order:
+    gate for facts.
 
-    1. :func:`~paramem.cloud.placeholders._check_mapping_totality` —
-       unconditionally, as step 1.  A caller cannot skip the totality
-       gate because it is inside this primitive, not something the
-       caller opts into.
-    2. A non-empty verdict rejects the WHOLE delta: returns
-       ``DeanonResult(facts=[], verdict=verdict, collisions=..., [], [])``
-       without substituting anything.  The caller decides the fallback
-       (e.g. reverting to pre-enrichment local facts).
-    3. :func:`~paramem.cloud.placeholders._apply_bindings` — predicate
-       invariant, substitute, residual sweep, fail-closed.
+    Always substitutes via :func:`~paramem.cloud.placeholders.
+    _apply_bindings` (predicate invariant, substitute, residual sweep,
+    fail-closed) — there is no whole-delta accept/reject step here any
+    more.  :func:`~paramem.cloud.placeholders._binding_collisions` still
+    runs, purely for its ``collisions`` diagnostic; per-triple
+    resolvability (dropping an unresolvable ``add``, reverting an
+    unresolvable ``modify``) is decided earlier, by
+    :func:`~paramem.graph.extractor._apply_enrichment_delta`, before this
+    function ever sees the fact list.
 
-    Takes NO graph/diagnostics sink: the totality gate's two findings —
-    ``verdict`` and ``collisions`` — come back on :class:`DeanonResult` as
-    values.  A caller that keeps diagnostics writes them onto its own
-    store right after this call; nothing here reaches into caller-owned
-    state.
+    Takes NO graph/diagnostics sink: ``collisions`` comes back on
+    :class:`DeanonResult` as a value.  A caller that keeps diagnostics
+    writes it onto its own store right after this call; nothing here
+    reaches into caller-owned state.
     """
-    # ``resolution=scope.resolution`` in both calls below: the scope
-    # already computed the resolution map once (in
-    # :meth:`CloudScope.response`) — passing it through here is what
-    # collapses the up-to-three-times-per-call recomputation
-    # (:func:`~paramem.cloud.placeholders._check_mapping_totality` and
-    # :func:`~paramem.cloud.placeholders._apply_bindings` each used to
-    # rebuild it fresh from the same ``reverse``/``cloud_bindings``/
-    # ``observed`` triple) down to the one this classmethod already did.
-    verdict, collisions = _check_mapping_totality(
-        facts,
+    collisions = _binding_collisions(
         scope.reverse,
         cloud_bindings=scope.cloud_bindings,
         observed=scope.observed,
-        resolution=scope.resolution,
     )
-    if verdict:
-        return DeanonResult(
-            facts=[],
-            verdict=verdict,
-            collisions=collisions,
-            predicate_dropped=[],
-            residual_dropped=[],
-        )
-
+    # ``resolution=scope.resolution``: the scope already computed the
+    # resolution map once (in :meth:`CloudScope.response`) — passing it
+    # through here avoids :func:`~paramem.cloud.placeholders._apply_bindings`
+    # rebuilding it fresh from the same ``reverse``/``cloud_bindings``/
+    # ``observed`` triple.
     kept, predicate_dropped, residual_dropped = _apply_bindings(
         facts, scope.reverse, scope.cloud_bindings, scope.observed, resolution=scope.resolution
     )
     return DeanonResult(
         facts=kept,
-        verdict=[],
         collisions=collisions,
         predicate_dropped=predicate_dropped,
         residual_dropped=residual_dropped,

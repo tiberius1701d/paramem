@@ -15,7 +15,7 @@ unexpected fallback path fires.
 from unittest.mock import patch
 
 from paramem.graph.schema import Entity, SessionGraph
-from tests._cloud_flow import run_cloud_stages
+from tests._cloud_flow import enrichment_side_effect, run_cloud_stages
 
 
 def _make_graph_from_spec(
@@ -115,7 +115,7 @@ class TestAlignmentSmoke:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
@@ -166,7 +166,7 @@ class TestAlignmentSmoke:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
             patch(
                 "paramem.graph.flows.judge_plausibility",
@@ -204,7 +204,7 @@ class TestAlignmentSmoke:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                return_value=(anon_facts, None, {}, None, {}),
+                side_effect=enrichment_side_effect(anon_facts),
             ),
         ):
             result = run_cloud_stages(
