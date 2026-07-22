@@ -1,10 +1,11 @@
 """Pydantic models for knowledge graph schema."""
 
+from collections.abc import Iterable
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from paramem.graph.schema_config import relation_types
+from paramem.config.taxonomy import relation_types
 
 _RelationType = Literal[relation_types()]  # type: ignore[valid-type]
 
@@ -118,7 +119,7 @@ class Relation(BaseModel):
     edge_source: str = Field(
         default="",
         description=(
-            "Transient provenance carry-slot. Set to 'graph_enrichment' for SOTA "
+            "Transient provenance carry-slot. Set to 'graph_enrichment' for cloud "
             "graph-enrichment relations so the merger can stamp _EDGE_SOURCE_ATTR on "
             "the inserted edge. Empty for extraction-time Relations. Never persisted "
             "to the registry, cumulative_graph.json, or adapter weights."
@@ -161,10 +162,44 @@ class SessionGraph(BaseModel):
         default_factory=dict,
         description=(
             "Pipeline audit trail — populated by extractor passes. Keys include: "
-            "sota_raw_response, residual_dropped_facts, sota_updated_transcript. "
+            "cloud_raw_response, residual_dropped_facts, cloud_updated_transcript. "
             "Only read by consolidation when dumping debug artefacts; never "
             "serialized to the cumulative graph.json or adapter weights. Always "
             "populated — callers who need to discard it should `model_copy` with "
             "`diagnostics={}` before persisting."
         ),
     )
+
+
+def facts_from_relations(relations: Iterable[Relation]) -> list[dict]:
+    """Render ``Relation`` objects into plain fact dicts — the CALLER-side
+    half of the cloud-egress anonymize render.
+
+    ``paramem.cloud`` (the anonymize/deanonymize round trip) must import
+    nothing from ``paramem.graph`` (see that package's docstring), so it
+    can never accept a ``Relation``/``SessionGraph`` — only plain
+    ``dict``/``str`` fact artifacts. This is the one place a ``Relation``
+    becomes a fact dict for that boundary: every cloud-egress caller
+    (the ``anonymize``/``enrich`` stages, ``enrich_graph``, the
+    ``/calibrate/anonymize`` handler) renders through this function, then
+    hands the plain dicts to :func:`~paramem.cloud.anonymize.anonymize` /
+    :func:`~paramem.cloud.placeholders.insert_placeholders`.
+
+    One dict per relation: ``subject``/``predicate``/``object``/
+    ``relation_type``/``confidence`` — the five fields
+    :func:`~paramem.cloud.placeholders.insert_placeholders` and the
+    anonymizer prompt's ``facts_json`` render both read. Values are
+    copied VERBATIM (no substitution here — that is
+    :func:`~paramem.cloud.placeholders.insert_placeholders`'s job, applied
+    by the caller after this render).
+    """
+    return [
+        {
+            "subject": r.subject,
+            "predicate": r.predicate,
+            "object": r.object,
+            "relation_type": r.relation_type,
+            "confidence": r.confidence,
+        }
+        for r in relations
+    ]

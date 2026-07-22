@@ -7,7 +7,7 @@ Everything here is a total function of its arguments: facts in, relations
 and entities out. There is no cloud call, no model, no tokenizer, no
 config and no prompt — the most testable unit of the extraction flow, and
 (before the split) the least tested one, because it lived buried in the
-middle of ``_sota_pipeline`` where reaching it required standing up the
+middle of ``_cloud_pipeline`` where reaching it required standing up the
 whole anonymize → enrich → judge chain first.
 
 It owns four things:
@@ -29,98 +29,25 @@ It owns four things:
   on the local model) stays with its caller: it needs the model and the
   tokenizer, which this module deliberately never sees.
 
-The ``CAUSE_*`` vocabulary is defined here because the gate is its only
-consumer; the flow stages that detect an emptied fact set import the
-constants from here and record them on ``StageState.empty_cause``.
+The ``CAUSE_*`` vocabulary (and its ``cause_kind`` classifier) used to be
+defined here on the reasoning that the gate was its only consumer; it now
+lives in :mod:`paramem.graph.empty_cause` because it describes FLOW STATE
+(the extraction flow's ``StageState.empty_cause``), not relation
+rebuilding, and has three consumers: :func:`recovery_gate` below, the flow
+tail stages (``paramem.graph.flows``), and the ``enrich`` stage
+(``paramem.graph.stage_enrich``). This module imports the pieces
+:func:`recovery_gate` needs back from there.
 """
 
 from __future__ import annotations
 
 import logging
 
-from paramem.graph.placeholders import placeholder_entity_type
+from paramem.config.taxonomy import placeholder_entity_type
+from paramem.graph.empty_cause import CAUSE_UNATTRIBUTED, cause_kind
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Why the working fact set emptied.
-#
-# An empty relation set is a SYMPTOM that structurally different
-# situations reach. These constants name the SITE at which the working
-# fact set actually went empty, and ``EMPTY_CAUSE_KIND`` classifies each
-# site into one of THREE kinds:
-#
-# * ``judgment``  — some judge decided the facts should not survive
-#                   (the cloud enricher returned nothing, a plausibility
-#                   judge dropped everything).
-# * ``breakage``  — a mechanical step could not carry the facts through
-#                   (placeholder substitution, ``Relation`` schema
-#                   validation).  Facts were LOST.
-# * ``routing``   — nothing was lost and nobody judged: the facts left
-#                   the relation surface for another surface of the same
-#                   graph.  Today the only site is the scalar partition,
-#                   which moves verbatim-identifier facts onto
-#                   ``Entity.attributes``; the attribute surface reaches
-#                   indexed-key distillation just as relations do (see
-#                   :func:`recovery_gate`).
-#
-# The kind is consulted in exactly ONE place: ``routing`` suppresses the
-# all-dropped recovery net in :func:`recovery_gate`, because there is
-# nothing to recover.  ``judgment`` and ``breakage`` are recorded only —
-# neither the gate nor the empty-result terminal nor the fallback
-# distinguishes them.
-# ---------------------------------------------------------------------------
-
-#: The cloud enricher returned an empty surviving fact set.
-CAUSE_CLOUD_EMPTY = "cloud_returned_empty"
-#: The anon-stage (cloud) plausibility judge dropped every fact.
-CAUSE_ANON_JUDGE = "anon_judge_dropped_all"
-#: Placeholder substitution dropped every fact (predicate-invariant
-#: violations plus the residual-placeholder sweep).
-CAUSE_DEANON_SUBSTITUTION = "deanon_substitution_dropped_all"
-#: The deanon-stage (local) plausibility judge dropped every fact.
-CAUSE_DEANON_JUDGE = "deanon_judge_dropped_all"
-#: Every surviving fact failed ``Relation`` schema validation.
-CAUSE_SCHEMA_VALIDATION = "schema_validation_dropped_all"
-#: :func:`partition_scalar_facts` routed every surviving fact onto the
-#: entity-attribute surface — a scalar-only session (all objects are
-#: URLs, emails, phone numbers, DOIs, version-tagged tool names).
-CAUSE_SCALAR_PARTITION = "scalar_partition_absorbed_all"
-
-#: judgment = a judge decided; breakage = a mechanical step failed;
-#: routing = the facts moved surface, nothing was lost.
-EMPTY_CAUSE_KIND: dict[str, str] = {
-    CAUSE_CLOUD_EMPTY: "judgment",
-    CAUSE_ANON_JUDGE: "judgment",
-    CAUSE_DEANON_SUBSTITUTION: "breakage",
-    CAUSE_DEANON_JUDGE: "judgment",
-    CAUSE_SCHEMA_VALIDATION: "breakage",
-    CAUSE_SCALAR_PARTITION: "routing",
-}
-
-#: Recorded when the gate fires with no site having claimed the emptying.
-CAUSE_UNATTRIBUTED = "unattributed"
-
-
-def cause_kind(cause: str | None) -> str:
-    """Classify an ``EMPTY_CAUSE`` value as judgment / breakage / routing.
-
-    See the vocabulary comment above for the three-way distinction.
-
-    Args:
-        cause: One of the ``CAUSE_*`` constants, or ``None`` when no site
-            claimed responsibility for the emptied fact set.
-
-    Returns:
-        ``"judgment"``, ``"breakage"``, ``"routing"``, or
-        ``"unattributed"`` for ``None`` / any value outside the
-        vocabulary.
-    """
-    if cause is None:
-        return CAUSE_UNATTRIBUTED
-    return EMPTY_CAUSE_KIND.get(cause, CAUSE_UNATTRIBUTED)
 
 
 def build_relations(
@@ -223,7 +150,7 @@ def recovery_gate(
     Args:
         graph: Session graph whose diagnostics receive the trigger record.
         kept_relations: Relations surviving schema validation.
-        original_count: Relation count before the SOTA pipeline ran.
+        original_count: Relation count before the cloud pipeline ran.
         cause: The ``CAUSE_*`` site that emptied the working fact set, or
             ``None`` if no site claimed it.
 
@@ -264,7 +191,7 @@ def apply_rebuild(
 
     Every relation endpoint must have a corresponding ``Entity`` record.
     Entity-type inference goes through
-    :func:`~paramem.graph.placeholders.placeholder_entity_type` (open
+    :func:`~paramem.config.taxonomy.placeholder_entity_type` (open
     vocabulary): known prefixes (``Person``, ``Org``, ``City``, ...) use
     the configured closed mapping; novel prefixes the cloud introduces
     (``Project_1``, ``Paper_1``, ...) derive the type from the prefix

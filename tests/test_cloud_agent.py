@@ -2,11 +2,10 @@
 
 from unittest.mock import MagicMock, patch
 
+from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig, CloudResponse, ToolCall
+from paramem.cloud.providers.openai_compat import OpenAICompatAgent
+from paramem.cloud.providers.registry import get_cloud_agent
 from paramem.memory.store import MemoryStore as _MS
-from paramem.server.cloud.base import CloudAgent, CloudResponse, ToolCall
-from paramem.server.cloud.openai_compat import OpenAICompatAgent
-from paramem.server.cloud.registry import get_cloud_agent
-from paramem.server.config import CloudAgentConfig
 
 
 def _stub_grouped_recall(fact_text: str):
@@ -142,7 +141,7 @@ class TestOpenAICompatAdapter:
         resp = agent._parse_response(data)
         assert resp.tool_calls[0].arguments == {}
 
-    @patch("paramem.server.cloud.openai_compat.httpx.Client")
+    @patch("paramem.cloud.providers.openai_compat.httpx.Client")
     def test_call_success(self, mock_client_cls):
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -165,7 +164,7 @@ class TestOpenAICompatAdapter:
         assert resp.text == "42 degrees"
         assert not resp.requires_tool_execution
 
-    @patch("paramem.server.cloud.openai_compat.httpx.Client")
+    @patch("paramem.cloud.providers.openai_compat.httpx.Client")
     def test_call_timeout_returns_error(self, mock_client_cls):
         import httpx
 
@@ -227,7 +226,7 @@ class TestRegistry:
             # Force reimport so the adapter picks up the mock
             import sys
 
-            mod_name = "paramem.server.cloud.anthropic_adapter"
+            mod_name = "paramem.cloud.providers.anthropic_adapter"
             sys.modules.pop(mod_name, None)
 
             config = CloudAgentConfig(
@@ -236,7 +235,7 @@ class TestRegistry:
             agent = get_cloud_agent(config)
             assert agent is not None
 
-            from paramem.server.cloud.anthropic_adapter import AnthropicAgent
+            from paramem.cloud.providers.anthropic_adapter import AnthropicAgent
 
             assert isinstance(agent, AnthropicAgent)
 
@@ -338,7 +337,7 @@ class TestPrivacyRouting:
         Production rule under the new state-signal model: PA enrollment does
         NOT short-circuit intent; the encoder decides.  When the encoder says
         PERSONAL even though HA also matched, the privacy invariant applies:
-        SOTA must never be reached for this query.
+        Cloud must never be reached for this query.
         """
         from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
@@ -419,7 +418,7 @@ class TestPrivacyRouting:
         assert "Berlin" in result.text
 
     def test_non_personal_query_goes_to_cloud(self):
-        """Query with no entity match → HA first (None) → SOTA fallback."""
+        """Query with no entity match → HA first (None) → cloud fallback."""
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
@@ -448,13 +447,13 @@ class TestPrivacyRouting:
             config=config,
             router=router,
             ha_client=ha_client,
-            sota_agent=cloud_agent,
+            cloud_agent=cloud_agent,
             memory_store=_MS(replay_enabled=False),
         )
 
         # HA was attempted first and returned None
         ha_client.conversation_process.assert_called_once()
-        # SOTA agent called as fallback
+        # cloud agent called as fallback
         cloud_agent.call.assert_called_once()
         assert result.escalated is True
         assert result.text == "cloud answer"
@@ -465,9 +464,9 @@ class TestPrivacyRouting:
         Without an ``IntentConfig`` (or below the confidence margin),
         ``classify_intent`` returns ``Intent.UNKNOWN``.  The privacy gate in
         ``handle_chat`` must treat that identically to ``PERSONAL`` — an
-        unclassifiable query is never escalated to the external SOTA
+        unclassifiable query is never escalated to the external cloud
         provider, even though the routing plan carries no probe steps and
-        falls through the same HA-first/SOTA-fallback branch a GENERAL
+        falls through the same HA-first/cloud-fallback branch a GENERAL
         query would use.
         """
         from paramem.server.inference import handle_chat
@@ -484,12 +483,12 @@ class TestPrivacyRouting:
         config.sanitization.mode = "off"
 
         # Mock HA client that returns None (simulates HA unavailable) so the
-        # SOTA fallback is the next stop — same shape as the GENERAL case
+        # cloud fallback is the next stop — same shape as the GENERAL case
         # in test_non_personal_query_goes_to_cloud.
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None
 
-        # HA fails and SOTA is blocked (is_personal), so handle_chat falls
+        # HA fails and cloud is blocked (is_personal), so handle_chat falls
         # through to the local base-model answer as the last resort — mock
         # its generation the same way test_no_cloud_falls_back_to_local
         # does so the assertions below exercise the routing/privacy gate,
@@ -515,13 +514,13 @@ class TestPrivacyRouting:
                 config=config,
                 router=router,
                 ha_client=ha_client,
-                sota_agent=cloud_agent,
+                cloud_agent=cloud_agent,
                 memory_store=_MS(replay_enabled=False),
             )
 
         # HA (local) is still reachable as a tool fallback for UNKNOWN...
         ha_client.conversation_process.assert_called_once()
-        # ...but SOTA (external cloud) must NOT have been called.
+        # ...but cloud (external cloud) must NOT have been called.
         cloud_agent.call.assert_not_called()
         assert result.escalated is False
 
@@ -573,8 +572,8 @@ class TestPrivacyRouting:
 
         assert result.escalated is False
 
-    def test_imperative_ha_command_sota_fallback(self):
-        """COMMAND intent + HA fails → SOTA fallback (imperative shape)."""
+    def test_imperative_ha_command_cloud_fallback(self):
+        """COMMAND intent + HA fails → cloud fallback (imperative shape)."""
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
@@ -602,7 +601,7 @@ class TestPrivacyRouting:
             config=config,
             router=router,
             ha_client=ha_client,
-            sota_agent=cloud_agent,
+            cloud_agent=cloud_agent,
             memory_store=_MS(replay_enabled=False),
         )
 
@@ -611,8 +610,8 @@ class TestPrivacyRouting:
         assert result.escalated is True
         assert result.text == "cloud answer"
 
-    def test_ha_nonimperative_match_sota_fallback(self):
-        """COMMAND intent + HA fails → SOTA fallback (interrogative shape)."""
+    def test_ha_nonimperative_match_cloud_fallback(self):
+        """COMMAND intent + HA fails → cloud fallback (interrogative shape)."""
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
@@ -640,7 +639,7 @@ class TestPrivacyRouting:
             config=config,
             router=router,
             ha_client=ha_client,
-            sota_agent=cloud_agent,
+            cloud_agent=cloud_agent,
             memory_store=_MS(replay_enabled=False),
         )
 
@@ -655,7 +654,7 @@ class TestPrivacyRouting:
         Under intent-keyed dispatch, intent=PERSONAL routes straight to the
         local PA probe.  The pre-flight HA call from the legacy cascade is
         gone — HA is reachable only via [ESCALATE] from the local model.
-        SOTA stays blocked by the privacy invariant.
+        Cloud stays blocked by the privacy invariant.
         """
         from paramem.server.inference import handle_chat
 
@@ -703,23 +702,23 @@ class TestPrivacyRouting:
                 config=config,
                 router=router,
                 ha_client=ha_client,
-                sota_agent=cloud_agent,
+                cloud_agent=cloud_agent,
                 memory_store=_MS(replay_enabled=False),
             )
 
         # HA was NOT pre-flighted (intent=PERSONAL → PA probe direct).
         ha_client.conversation_process.assert_not_called()
-        # SOTA blocked by privacy invariant regardless of HA outcome.
+        # cloud blocked by privacy invariant regardless of HA outcome.
         cloud_agent.call.assert_not_called()
         assert result.escalated is False
 
-    def test_personal_intent_blocks_sota_via_escalate(self):
-        """Privacy invariant: PERSONAL + local [ESCALATE] + HA failure → no SOTA.
+    def test_personal_intent_blocks_cloud_via_escalate(self):
+        """Privacy invariant: PERSONAL + local [ESCALATE] + HA failure → no cloud.
 
         The local model emits [ESCALATE] (a real production path when the
         local answer is unsure).  HA is reachable as a tool fallback but
         returns None.  Without the privacy invariant the next step would be
-        SOTA — the invariant must block that for personal-class queries.
+        Cloud — the invariant must block that for personal-class queries.
         """
         from paramem.server.inference import handle_chat
 
@@ -771,23 +770,23 @@ class TestPrivacyRouting:
                 config=config,
                 router=router,
                 ha_client=ha_client,
-                sota_agent=cloud_agent,
+                cloud_agent=cloud_agent,
                 memory_store=_MS(replay_enabled=False),
             )
 
         # HA was tried as a tool fallback (allowed for PERSONAL).
         ha_client.conversation_process.assert_called_once()
-        # SOTA blocked by the privacy invariant — this is the new guarantee.
+        # cloud blocked by the privacy invariant — this is the new guarantee.
         cloud_agent.call.assert_not_called()
         # Pre-[ESCALATE] portion of local response is returned when both
-        # HA and SOTA are unavailable.
+        # HA and cloud are unavailable.
         assert "I'm not sure" in result.text
 
 
 class TestCloudModePolicy:
     """Architecture #3: ``sanitization.cloud_mode`` selects the egress policy.
 
-    These tests pin the dispatch in ``_escalate_via_cloud_policy`` against
+    These tests pin the dispatch in ``answer_via_cloud`` against
     each (cloud_mode, is_personal) combination.  They mock the anonymizer
     surface (``anonymize_outbound``, ``deanonymize_inbound``) so the
     policy logic is exercised without invoking the local LLM.
@@ -827,9 +826,9 @@ class TestCloudModePolicy:
         return router
 
     def _run(self, *, router, config, cloud_agent, ha_client=None, history=None):
-        """Drive handle_chat with HA missing/None so SOTA is the next stop.
+        """Drive handle_chat with HA missing/None so cloud is the next stop.
 
-        Patches ``_base_model_answer`` so tests that get blocked at SOTA
+        Patches ``_base_model_answer`` so tests that get blocked at cloud
         (PERSONAL under block / both, leak-guard tripped under anonymize)
         still terminate cleanly without invoking the base-model path.
         """
@@ -858,13 +857,13 @@ class TestCloudModePolicy:
                 config=config,
                 router=router,
                 ha_client=ha_client,
-                sota_agent=cloud_agent,
+                cloud_agent=cloud_agent,
                 memory_store=_MS(replay_enabled=False),
             )
 
     # ---- block mode ----
 
-    def test_block_mode_personal_query_blocks_sota(self):
+    def test_block_mode_personal_query_blocks_cloud(self):
         cloud_agent = self._make_cloud_agent()
         result = self._run(
             router=self._personal_router(),
@@ -889,7 +888,7 @@ class TestCloudModePolicy:
 
     def test_block_mode_general_query_threads_speaker_id_to_history_sanitizer(self):
         """The ``cloud_mode=block`` + non-PERSONAL branch of
-        ``_escalate_via_cloud_policy`` must pass ``speaker_id`` through to
+        ``answer_via_cloud`` must pass ``speaker_id`` through to
         ``_sanitize_history`` — without it the first-person detector is dead
         on this channel, unlike the other three ``_sanitize_history`` call
         sites (the anonymizing branch here, and both ``app.py`` sites).
@@ -910,15 +909,14 @@ class TestCloudModePolicy:
 
     @staticmethod
     def _payload(*, status: str, anon_transcript: str = "", forward=None, reverse=None):
-        from paramem.graph.cloud_egress import AnonymizedPayload
+        from paramem.cloud.anonymize import AnonymizedContract
 
         reverse = reverse or {}
-        return AnonymizedPayload(
+        return AnonymizedContract(
             status=status,
             forward=forward or {},
             reverse=reverse,
             anon_transcript=anon_transcript,
-            anon_facts=[],
             declared=frozenset(reverse.keys()),
             norm_stats={"inverted": 0, "dropped": 0},
             rekey_dropped=0,
@@ -936,11 +934,11 @@ class TestCloudModePolicy:
         )
         with (
             patch(
-                "paramem.graph.extractor.extract_and_anonymize_for_cloud",
+                "paramem.graph.flows.anonymize_turn",
                 return_value=payload,
             ) as mock_anon,
             patch(
-                "paramem.graph.cloud_egress.deanonymize_response_text",
+                "paramem.cloud.deanonymize.deanonymize_text",
                 return_value="Alex is a useful placeholder here.",
             ) as mock_deanon,
         ):
@@ -959,10 +957,10 @@ class TestCloudModePolicy:
 
     def test_anonymize_mode_leak_guard_blocks_query(self):
         """A ``status="failed"`` payload (leak guard or model failure) =
-        per-query block, SOTA never called."""
+        per-query block, cloud never called."""
         cloud_agent = self._make_cloud_agent()
         with patch(
-            "paramem.graph.extractor.extract_and_anonymize_for_cloud",
+            "paramem.graph.flows.anonymize_turn",
             return_value=self._payload(status="failed"),
         ):
             self._run(
@@ -995,11 +993,11 @@ class TestCloudModePolicy:
         )
         with (
             patch(
-                "paramem.graph.extractor.extract_and_anonymize_for_cloud",
+                "paramem.graph.flows.anonymize_turn",
                 return_value=payload,
             ),
             patch(
-                "paramem.graph.cloud_egress.deanonymize_response_text",
+                "paramem.cloud.deanonymize.deanonymize_text",
                 return_value="<answer>",
             ),
         ):
@@ -1018,7 +1016,7 @@ class TestCloudModePolicy:
         self,
     ):
         """With ``cloud_mode="anonymize"`` and ``sanitization.mode="warn"``,
-        no history turn reaches ``sota_agent.call`` carrying a name present
+        no history turn reaches ``cloud_agent.call`` carrying a name present
         in ``payload.forward`` — the history channel is no longer governed
         by ``sanitization.mode`` (which would let it through verbatim at
         ``mode="warn"``) once the current turn is being placeholdered.
@@ -1038,11 +1036,11 @@ class TestCloudModePolicy:
         history = [{"role": "user", "text": "Did Alex call?"}]
         with (
             patch(
-                "paramem.graph.extractor.extract_and_anonymize_for_cloud",
+                "paramem.graph.flows.anonymize_turn",
                 return_value=payload,
             ),
             patch(
-                "paramem.graph.cloud_egress.deanonymize_response_text",
+                "paramem.cloud.deanonymize.deanonymize_text",
                 return_value="<answer>",
             ),
         ):
@@ -1069,7 +1067,7 @@ class TestCloudOnlyRouteSpeakerId:
     """``_cloud_only_route``'s ``speaker_id`` parameter
     must reach ``_sanitize_history`` — consistent with the other three
     ``_sanitize_history`` call sites (both branches of
-    ``inference._escalate_via_cloud_policy`` and the forced-routing debug
+    ``inference.answer_via_cloud`` and the forced-routing debug
     path in ``app.py``).
     """
 
@@ -1079,8 +1077,8 @@ class TestCloudOnlyRouteSpeakerId:
 
         config = MagicMock()
         config.sanitization.mode = "off"
-        sota_agent = MagicMock()
-        sota_agent.is_available.return_value = True
+        cloud_agent = MagicMock()
+        cloud_agent.is_available.return_value = True
 
         with (
             patch(
@@ -1089,7 +1087,7 @@ class TestCloudOnlyRouteSpeakerId:
             ),
             patch("paramem.server.app._sanitize_history", return_value=[]) as mock_sanitize,
             patch(
-                "paramem.server.app._escalate_to_sota",
+                "paramem.server.app._escalate_to_cloud",
                 return_value=ChatResult(text="Berlin has 3.7M people."),
             ),
         ):
@@ -1099,7 +1097,7 @@ class TestCloudOnlyRouteSpeakerId:
                 history=[{"role": "user", "text": "hi"}],
                 config=config,
                 ha_client=None,
-                sota_agent=sota_agent,
+                cloud_agent=cloud_agent,
                 speaker_id="spk-test",
             )
 

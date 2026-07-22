@@ -43,7 +43,7 @@ class TestPaVoicePromptFile:
         assert "never invent" in lower or "do not invent" in lower
 
     def test_escalation_sentinel_preserved(self, prompt_text: str):
-        """[ESCALATE] is how the PA path forwards to HA/SOTA when context
+        """[ESCALATE] is how the PA path forwards to HA/cloud when context
         is empty. A future rewrite that drops it would silently break
         routing — guard it here."""
         assert "[ESCALATE]" in prompt_text

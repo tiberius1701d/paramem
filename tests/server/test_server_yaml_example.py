@@ -42,13 +42,13 @@ def test_example_parses_without_env_vars(example_config):
     assert example_config is not None
 
 
-def test_sota_agent_disabled_by_default(example_config):
-    assert example_config.sota_agent.enabled is False
+def test_cloud_agent_disabled_by_default(example_config):
+    assert example_config.cloud_agent.enabled is False
 
 
-def test_all_sota_providers_disabled_by_default(example_config):
-    for name, provider in example_config.sota_providers.items():
-        assert provider.enabled is False, f"sota_providers[{name!r}] must default disabled"
+def test_all_cloud_providers_disabled_by_default(example_config):
+    for name, provider in example_config.cloud_providers.items():
+        assert provider.enabled is False, f"cloud_providers[{name!r}] must default disabled"
 
 
 def test_ha_agent_id_empty_by_default(example_config):
@@ -67,12 +67,12 @@ def test_tts_disabled_by_default(example_config):
     assert example_config.tts.enabled is False
 
 
-def test_extraction_noise_filter_empty_by_default(example_config):
-    assert example_config.consolidation.extraction_noise_filter == ""
+def test_extraction_enrichment_provider_empty_by_default(example_config):
+    assert example_config.consolidation.extraction_enrichment_provider == ""
 
 
-def test_sota_disabled_by_default(example_config):
-    assert example_config.consolidation.sota_enabled is False
+def test_cloud_disabled_by_default(example_config):
+    assert example_config.consolidation.cloud_enabled is False
 
 
 def test_refinement_enrichment_off_by_default(example_config):

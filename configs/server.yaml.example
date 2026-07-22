@@ -1,7 +1,7 @@
 # ============================================================================
 # CLOUD-ONLY INFERENCE — PRIVACY OPT-OUT
 # ============================================================================
-# When true, ParaMem routes EVERY query to the configured SOTA cloud agent
+# When true, ParaMem routes EVERY query to the configured cloud agent
 # instead of the local parametric-memory model.
 #
 # SECURITY IMPLICATIONS
@@ -20,7 +20,7 @@
 #
 # QUALITY CONSIDERATIONS (self-bias risk)
 # - If your extraction pipeline uses the SAME cloud model/provider that will
-#   answer inference queries, the LLM-judge stages (noise_filter,
+#   answer inference queries, the LLM-judge stages (enrichment_provider,
 #   plausibility) become "model-as-judge-for-itself": the judge rates its
 #   own outputs, confirming its own biases and systematically over- or
 #   under-filtering certain fact classes. Expected quality degradation.
@@ -28,7 +28,7 @@
 #   OR route them to a different provider than the inference agent.
 #
 # Default is false. Change to true ONLY if you have explicitly decided to
-# trust the configured SOTA provider with your household's personal data.
+# trust the configured cloud provider with your household's personal data.
 # Takes precedence over the `--cloud-only` CLI flag.
 # ============================================================================
 cloud_only: false
@@ -185,7 +185,7 @@ adapters:
 #   from parametric memory until the next tick boundary. In-conversation
 #   context still carries the fact via the conversation buffer;
 #   cross-conversation recall inside the refresh window falls back to the
-#   pending-queue or SOTA path.
+#   pending-queue or cloud path.
 # - Rationale: if the user immediately consumes the answer, they rarely ask
 #   again within the refresh window. Facts that matter ("my daughter's play
 #   is tomorrow", "I prefer jazz at dinner") are either already in
@@ -209,8 +209,8 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off). NOT a benign toggle: enabling egresses knowledge-graph content (subjects/objects) to the configured cloud provider. Anonymization is best-effort, scoped by sanitization.scrub, and depends on the LOCAL model's classification of each value against that scope — a misclassified value can leak real PII to the cloud with no downstream detection or repair. Keep false unless this risk is accepted.
-  refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire. Same cloud-egress risk as sota_enabled above — this is the flag that actually triggers the graph-content SOTA call.
+  cloud_enabled: false           # master gate for ALL cloud (transcript pipeline + graph enrichment). false = ship default (off). NOT a benign toggle: enabling egresses knowledge-graph content (subjects/objects) to the configured cloud provider. Anonymization is best-effort, scoped by sanitization.scrub, and depends on the LOCAL model's classification of each value against that scope — a misclassified value can leak real PII to the cloud with no downstream detection or repair. Keep false unless this risk is accepted.
+  refinement_enrichment: "off"  # graph-stage cloud enrichment pass. off|on. Requires cloud_enabled:true to fire. Same cloud-egress risk as cloud_enabled above — this is the flag that actually triggers the graph-content cloud call.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
@@ -265,12 +265,12 @@ consolidation:
                                     # in production conditions. Drop to 1 if VRAM
                                     # under training-residual pressure forces a
                                     # downgrade.
-  extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, SOTA enrich, deanon; 8192 sized for ~1500-word document chunks
+  extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, cloud enrich, deanon; 8192 sized for ~1500-word document chunks
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,anonymize,plausibility} for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.
-  extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)
-  extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
-  extraction_noise_filter_endpoint: ""  # custom endpoint for OpenAI-compatible providers ("" = use the provider's default endpoint)
+  extraction_enrichment_provider: ""  # cloud provider for enrichment ("" = disabled, ship default)
+  extraction_enrichment_provider_model: claude-sonnet-4-6  # model for the enrichment provider
+  extraction_enrichment_provider_endpoint: ""  # custom endpoint for OpenAI-compatible providers ("" = use the provider's default endpoint)
   # --- Extraction-pipeline stages (all configurable) ---
   #
   # Plausibility filter — final quality gate on extracted facts.
@@ -279,7 +279,7 @@ consolidation:
   #   * Zero cloud cost. Privacy-safe (real names stay local).
   #   * Cross-family by construction (local model != cloud enricher).
   #
-  # Alternative: SOTA judge at the `anon` stage (e.g. `anthropic`).
+  # Alternative: Cloud judge at the `anon` stage (e.g. `anthropic`).
   #   * Higher judgment quality. Paid.
   #   * Runs on anonymized facts + anonymized transcript — cloud-safe.
   #   * IMPORTANT: pick a family DIFFERENT from the enricher to avoid
@@ -354,9 +354,9 @@ consolidation:
   quiet_hours_start: "07:00"
   quiet_hours_end: "22:00"
   entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
-  # --- Graph-level SOTA enrichment neighborhood knobs ---
+  # --- Graph-level cloud enrichment neighborhood knobs ---
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
-  graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
+  graph_enrichment_max_entities_per_pass: 50 # max nodes per cloud chunk call
   # RAM-mode checkpointing: when > 0, train_adapter writes HF Trainer checkpoints
   # to /dev/shm (RAM-backed tmpfs) instead of the encrypted adapter slot.  At each
   # epoch boundary the latest checkpoint is copied to the caller's output_dir.
@@ -405,24 +405,24 @@ consolidation:
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.
-# SOTA is the fallback for general reasoning when HA cannot answer.
+# Cloud is the fallback for general reasoning when HA cannot answer.
 #
 # All cloud agents ship disabled. To enable, set the relevant API key env var
 # (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY) and flip enabled: true.
 # The ${VAR} placeholders below document the surface; they are resolved at
 # load time.
 agents:
-  sota:
+  cloud:
     enabled: false
     provider: anthropic
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
     endpoint: ""
     timeout_seconds: 90.0       # request timeout per call to this provider's API.
-                                # 30s was hit by document-mode SOTA enrichment at max_tokens=8192;
+                                # 30s was hit by document-mode cloud enrichment at max_tokens=8192;
                                 # 90s gives substantial margin without being silly. Tune per provider —
-                                # cloud agents and SOTA enrichment both honour this value.
-  sota_providers:
+                                # cloud agents and cloud enrichment both honour this value.
+  cloud_providers:
     anthropic:
       enabled: false
       provider: anthropic
@@ -469,13 +469,13 @@ tools:
 #                     block  : null-return personal-marker queries, suppressing
 #                              the cloud call at the first checkpoint
 #
-#   `cloud_mode`  — egress policy for direct SOTA escalation
-#                     block      : PERSONAL queries dropped before SOTA;
+#   `cloud_mode`  — egress policy for direct cloud escalation
+#                     block      : PERSONAL queries dropped before cloud;
 #                                  non-PERSONAL sent verbatim. Phase 2 default,
 #                                  zero anonymizer cost, smallest cloud surface.
 #                     anonymize  : cloud-bound text is anonymized via the
 #                                  local LLM (categories chosen by `scrub`),
-#                                  sent to SOTA as placeholders, and
+#                                  sent to cloud as placeholders, and
 #                                  de-anonymized on the way back. PERSONAL
 #                                  queries reach cloud as redacted text.
 #                     both       : strictest privacy posture — PERSONAL is
@@ -525,11 +525,11 @@ tools:
 # HA receives cleartext, gated by intent classification. Hardening the HA hop
 # is a planned follow-up package.
 #
-# SOTA reachability is independent: with `agents.sota.enabled: false` (or no
-# api_key), no queries reach SOTA regardless of `cloud_mode`.
+# Cloud reachability is independent: with `agents.cloud.enabled: false` (or no
+# api_key), no queries reach cloud regardless of `cloud_mode`.
 sanitization:
   mode: block            # off | warn | block — PII detection layer
-  cloud_mode: block      # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
+  cloud_mode: block      # block | anonymize | both — direct-cloud egress policy (ship-safe default)
   scrub:                 # PII-vocabulary hints anonymized when cloud_mode=anonymize|both ([] = off)
     - person name
     - full name

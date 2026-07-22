@@ -1,7 +1,7 @@
 """Round-trip render tests — verify extraction prompt files render without errors.
 
 Ensures that every placeholder resolves and no leftover ``{word}`` tokens
-remain after formatting with the values supplied by schema_config.
+remain after formatting with the values supplied by paramem.config.taxonomy.
 JSON literal braces are double-escaped in the prompt files (``{{`` / ``}}``)
 so they collapse to ``{`` / ``}`` after formatting and are not matched by the
 leftover-placeholder check.
@@ -11,16 +11,16 @@ from __future__ import annotations
 
 import re
 
-from paramem.graph.cloud_egress import load_anonymization_prompt
-from paramem.graph.extractor import (
-    DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
-    load_extraction_prompts,
-)
-from paramem.graph.schema_config import (
+from paramem.config.taxonomy import (
     entity_types,
     relation_types,
     reset_cache,
 )
+from paramem.graph.extractor import (
+    DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
+    load_extraction_prompts,
+)
+from paramem.graph.prompts import _load_prompt  # was load_anonymization_prompt
 
 # Matches single-brace placeholders like {transcript} that are NOT part of
 # a double-brace escape ({{ or }}).  After a successful .format() call all
@@ -151,7 +151,7 @@ class TestAnonymizationPromptRender:
     the config-driven ``sanitization.scrub`` scope authority."""
 
     def _render(self):
-        tmpl = load_anonymization_prompt()
+        tmpl = _load_prompt("anonymization.txt", required=True)
         return tmpl.format(
             scrub_categories="person name, email address, phone number",
             facts_json="[]",

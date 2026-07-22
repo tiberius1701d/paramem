@@ -24,12 +24,16 @@ from paramem.memory.store import MemoryStore as _MS
 from tests._guard_utils import tracked_python_files
 
 # Files allowed to call the extractors directly:
-# - extractor.py: the module defining them.
+# - extractor.py: the module defining extract_procedural_graph.
+# - flows.py: the module defining extract_graph (also the conversation-egress
+#   composite anonymize_turn, which calls extract_graph
+#   directly as part of its own body).
 # - extraction_pipeline.py: the chokepoint module that wraps them.
 # - tests/: may patch, import, or assert on their names.
 # - archive/: historical, not executed.
 _ALLOWED_SUFFIXES = (
     "paramem/graph/extractor.py",
+    "paramem/graph/flows.py",
     "paramem/graph/extraction_pipeline.py",
 )
 
@@ -151,7 +155,7 @@ def test_extraction_pipeline_kwargs_match_extract_graph_signature(source_type):
     This test fails first.  Parametrized over both source_type values so
     both the transcript and document kwarg sets are validated.
     """
-    from paramem.graph.extractor import extract_graph
+    from paramem.graph.flows import extract_graph
 
     pipeline = _make_pipeline()
     pipeline_keys = set(pipeline.kwargs(source_type=source_type, speaker_id="speaker0").keys())
@@ -321,7 +325,7 @@ def test_run_threads_positional_args(monkeypatch):
     pipeline = _make_pipeline(
         model=model_sentinel,
         tokenizer=tokenizer_sentinel,
-        noise_filter="claude",
+        enrichment_provider="claude",
     )
     pipeline.prompts_dir = "/custom/prompts"
 
@@ -332,7 +336,7 @@ def test_run_threads_positional_args(monkeypatch):
     assert captured["transcript"] == "alex lives here"
     assert captured["session_id"] == "s042"
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
-    assert captured["kwargs"]["noise_filter"] == "claude"
+    assert captured["kwargs"]["enrichment_provider"] == "claude"
 
 
 def _collect_extract_session_kwargs(py_file: Path) -> list[set[str]]:
@@ -375,7 +379,7 @@ def test_server_extract_session_callsites_pass_identical_kwargs():
     must pass the same kwarg names as every other server caller.
 
     Silently dropping flags on one path (as app.py:1276 did before this test
-    landed) means the same consolidation operation runs with different SOTA
+    landed) means the same consolidation operation runs with different cloud
     pipeline behavior depending on which code path triggered it.
 
     Scans the whole `paramem/server/` tree at call-site granularity.  Both
@@ -464,9 +468,9 @@ def test_server_yaml_extraction_flags_round_trip(tmp_path):
 
     flipped = {
         "extraction_max_tokens": 4096,
-        "extraction_noise_filter": "anthropic",
-        "extraction_noise_filter_model": "claude-other",
-        "extraction_noise_filter_endpoint": "http://custom:8080/v1",
+        "extraction_enrichment_provider": "anthropic",
+        "extraction_enrichment_provider_model": "claude-other",
+        "extraction_enrichment_provider_endpoint": "http://custom:8080/v1",
         "extraction_plausibility_judge": "off",
         "extraction_plausibility_stage": "anon",
     }
@@ -509,7 +513,7 @@ def test_server_extract_session_kwargs_map_to_consolidation_config():
     """Gap (b) sibling: every kwarg at a server-layer `extract_session(...)` call
     must be backed by a `config.consolidation.extraction_<kwarg>` field.
 
-    If a new SOTA flag is added at a server call site but the corresponding
+    If a new cloud flag is added at a server call site but the corresponding
     ConsolidationScheduleConfig field is missing, `config.consolidation...` on
     that line raises AttributeError the first time a session consolidates.
     This test catches it offline.
@@ -600,9 +604,9 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     flipped = {
         "extraction_temperature": 0.7,
         "extraction_max_tokens": 4096,
-        "extraction_noise_filter": "claude",
-        "extraction_noise_filter_model": "claude-other",
-        "extraction_noise_filter_endpoint": "http://custom:8080/v1",
+        "extraction_enrichment_provider": "claude",
+        "extraction_enrichment_provider_model": "claude-other",
+        "extraction_enrichment_provider_endpoint": "http://custom:8080/v1",
         "extraction_plausibility_judge": "off",
         "extraction_plausibility_stage": "anon",
         "extraction_scrub": {"email address"},
@@ -837,7 +841,7 @@ def test_kwargs_honors_prompts_dir_override():
 
     Regression guard: ``prompts_dir`` was hardcoded as
     ``prompts_dir=self.prompts_dir`` inside :meth:`ExtractionPipeline.kwargs`,
-    unlike every other tunable (``noise_filter``, ``system_prompt_filename``,
+    unlike every other tunable (``enrichment_provider``, ``system_prompt_filename``,
     etc.) which routes through the local ``pick`` helper. A caller passing
     ``prompts_dir=...`` into ``ExtractionPipeline.run(...)`` — e.g.
     ``POST /calibrate/extract`` swapping in a candidate prompt directory —
@@ -1022,7 +1026,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
         ],
         summary="Alice works at Acme.",
         diagnostics={
-            "sota_raw_response": "{'malformed': json}",
+            "cloud_raw_response": "{'malformed': json}",
             "fallback_path": "all_dropped",
             "residual_dropped_facts": [{"subject": "Person_1"}],
         },
@@ -1042,7 +1046,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     assert main_path.exists(), f"episodic dump missing at {main_path}"
     main_dump = json.loads(main_path.read_text())
     assert main_dump["diagnostics"]["fallback_path"] == "all_dropped"
-    assert main_dump["diagnostics"]["sota_raw_response"] == "{'malformed': json}"
+    assert main_dump["diagnostics"]["cloud_raw_response"] == "{'malformed': json}"
     assert main_dump["relations"][0]["predicate"] == "works_at"
 
     # --- Procedural chokepoint ---
@@ -1437,7 +1441,7 @@ def test_normalize_predicates_local_path_enters_base_model_inference():
 
     Predicate-normalization is structured extraction: the local path must run with the
     PA adapter disabled (it would otherwise bias synonym clustering) and with
-    gradient checkpointing restored to its entry state.  The SOTA path uses the
+    gradient checkpointing restored to its entry state.  The cloud path uses the
     cloud model and is wrapped in ``nullcontext`` instead — the guard only
     asserts the primitive is present in the function, mirroring the app.py
     enrollment guard.

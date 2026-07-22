@@ -76,9 +76,9 @@ def _make_config(mode="train", tmp_path=None):
     cfg = MagicMock()
     cfg.adapters.episodic.enabled = True
     cfg.consolidation.mode = mode
-    cfg.consolidation.extraction_noise_filter = False
-    cfg.consolidation.extraction_noise_filter_model = ""
-    cfg.consolidation.extraction_noise_filter_endpoint = ""
+    cfg.consolidation.extraction_enrichment_provider = False
+    cfg.consolidation.extraction_enrichment_provider_model = ""
+    cfg.consolidation.extraction_enrichment_provider_endpoint = ""
     cfg.consolidation.extraction_plausibility_judge = False
     cfg.consolidation.extraction_plausibility_stage = "post"
     cfg.debug = False
@@ -357,7 +357,7 @@ def test_interim_extraction_failed_abort_restores_voice_outside_lock(tmp_path):
         loop = _make_loop_no_qa()
         # Force the abort path: extract_session raises ExtractionFailed.
         loop.extract_session.side_effect = ExtractionFailed(
-            "sota_enrich", "cloud enrichment call failed or response unparseable"
+            "cloud_enrich", "cloud enrichment call failed or response unparseable"
         )
         with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
@@ -402,13 +402,13 @@ def test_extraction_stage_returns_abort_and_never_raises(tmp_path):
 
     with _patch_extraction_stage(pending, config) as (mock_profile, mock_buffer):
         loop = _make_loop_no_qa()
-        loop.extract_session.side_effect = ExtractionFailed("sota_enrich", "unparseable")
+        loop.extract_session.side_effect = ExtractionFailed("cloud_enrich", "unparseable")
 
         # No raise — the abort comes back on the result object.
         result = app_module._extract_pending_sessions(loop, lock_held=False)
 
     assert isinstance(result.aborted, ExtractionFailed)
-    assert result.aborted.phase == "sota_enrich"
+    assert result.aborted.phase == "cloud_enrich"
     assert result.evicted_voice is True, "caller needs this bit to restore voice on abort"
     # Abort on the FIRST chunk stops the batch — the second is never attempted.
     assert loop.extract_session.call_count == 1
@@ -465,7 +465,7 @@ def test_extraction_stage_does_not_reacquire_a_held_lock(tmp_path):
 def test_extraction_stage_failed_chunk_stays_pending_survivor_retires(tmp_path):
     """A VramExhausted chunk stays pending; the chunk that succeeded may retire."""
     import paramem.server.app as app_module
-    from paramem.server.vram_guard import VramExhausted
+    from paramem.utils.vram_guard import VramExhausted
 
     pending = _make_pending(source_type="document", n=2)
     config = _make_config(tmp_path=tmp_path)
@@ -562,7 +562,7 @@ def test_consume_pending_abort_restores_voice_and_returns_extraction_failed(tmp_
     config.consolidation.mode = "train"
 
     loop = _make_loop_no_qa()
-    loop.extract_session.side_effect = ExtractionFailed("sota_enrich", "unparseable")
+    loop.extract_session.side_effect = ExtractionFailed("cloud_enrich", "unparseable")
 
     outcome, profile_calls, mock_buffer = _run_consume_pending_cycle(config, loop)
 

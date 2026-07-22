@@ -1,6 +1,6 @@
 """Per-phase tracing for the extraction pipeline.
 
-Every prompt-touching phase of :func:`paramem.graph.extractor.extract_graph`
+Every prompt-touching phase of :func:`paramem.graph.flows.extract_graph`
 records a :class:`PhaseRecord` to the **active extraction trace** as it
 runs.  The trace is the canonical observation surface for:
 
@@ -54,9 +54,11 @@ the moment that phase finishes with a non-``"failed"`` outcome; the
 pipeline checks :func:`chain_stopped` — never a phase-name string —
 after each phase block and returns early when it is set.  Three sites
 check it: the stage-flow runner
-(:func:`paramem.graph.flow.run_flow`, after every stage that ran), the
-``deanonymize`` stage body between its two phases, and
-:func:`~paramem.graph.extractor._sota_pipeline` between its own
+(:func:`paramem.graph.flow.run_flow`, after every stage that ran — this
+is what stops the walk at the ``anonymize`` stage boundary now; that
+stage no longer checks the flag itself), the ``deanonymize`` stage body
+between its two phases, and the ``enrich`` stage body
+(:func:`~paramem.graph.stage_enrich._stage_enrich`) between its own
 sub-phases.  Because the flag lives in a
 :class:`contextvars.ContextVar` rather than being threaded as a
 parameter, it is reachable from arbitrarily nested helpers with no
@@ -90,7 +92,7 @@ it.  Each entry is ``{"path", "sha", "template"}``:
 raises.  This is deliberate, not an inconsistency: ``_load_prompt`` is a
 shared loader that cannot know whether it is being called from inside a
 phase; two real production call paths run it with no phase scope open
-(``anonymize_with_local_model`` from ``extract_and_anonymize_for_cloud``,
+(``anonymize_transcript`` from ``anonymize_turn``,
 reached from the live chat egress, and from
 ``paramem.training.consolidation``), so a raise there would break
 legitimate production behaviour. ``phase_trace``'s caller, by contrast,
@@ -123,10 +125,10 @@ Phase                       Notes
 ``entity_correction``       Mistral corrects misspelled real place /
                             organization / concept surfaces in the
                             reverse anonymization map (values only).
-``sota_enrich``             SOTA cloud (Anthropic by default) runs the
+``cloud_enrich``             cloud (Anthropic by default) runs the
                             enrichment prompt; emits enriched facts +
                             new_entity_bindings + updated_anon_transcript.
-``anon_plausibility``       Optional SOTA judge at anonymized stage.
+``anon_plausibility``       Optional cloud judge at anonymized stage.
 ``deanon``                  Pure-Python dict substitution restoring real
                             names from placeholders.  ``raw_output=None``.
 ``deanon_plausibility``     Local Mistral plausibility filter at
@@ -184,7 +186,7 @@ PHASE_NAMES: tuple[str, ...] = (
     "second_order_extract",
     "anonymize",
     "entity_correction",
-    "sota_enrich",
+    "cloud_enrich",
     "anon_plausibility",
     "deanon",
     "deanon_plausibility",
@@ -210,12 +212,12 @@ class PhaseRecord:
         Canonical phase name from :data:`PHASE_NAMES`.
     outcome:
         ``"ok"`` (phase produced its output normally), ``"skipped"`` (a
-        precondition didn't hold — e.g. SOTA missing API key),
+        precondition didn't hold — e.g. Cloud missing API key),
         ``"no_input"`` (phase had nothing to do), ``"failed"`` (an
         exception propagated through the scope; ``reason`` is set), or
         ``"rejected"`` (the phase produced output but the caller rejected
         it as a unit and fell back to a prior-stage input — e.g.
-        ``sota_enrich``'s binding-totality gate rejecting an enrichment
+        ``cloud_enrich``'s binding-totality gate rejecting an enrichment
         delta that references an orphan or CORE-conflicting placeholder;
         ``reason`` is set). No consumer branches on the value.
     wall_clock_seconds:
@@ -397,8 +399,8 @@ def stop_at(phase: str | None) -> Iterator[None]:
     Mirrors :func:`paramem.graph.prompts.prompt_overrides`: opened by the
     CALLER (calibration), never threaded as a parameter through
     :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline`,
-    :func:`paramem.graph.extractor.extract_graph`, or
-    :func:`~paramem.graph.extractor._sota_pipeline`.  Every
+    :func:`paramem.graph.flows.extract_graph`, or
+    :func:`~paramem.graph.stage_enrich._stage_enrich`.  Every
     :func:`phase_trace` call anywhere inside the ``with`` body sees the
     same requested phase via the contextvar, however deeply nested.
 
@@ -443,8 +445,8 @@ def chain_stopped() -> bool:
     non-``"failed"`` outcome.  Pipeline functions check this (never a
     phase-name string comparison) after each phase block to decide
     whether to return early — see :func:`paramem.graph.flow.run_flow`,
-    ``paramem.graph.extractor._stage_deanonymize`` and
-    :func:`paramem.graph.extractor._sota_pipeline`.
+    ``paramem.graph.flows._stage_deanonymize`` and
+    :func:`paramem.graph.stage_enrich._stage_enrich`.
     """
     return _STOPPED.get()
 
@@ -455,7 +457,7 @@ def extraction_trace() -> Iterator[ExtractionTrace]:
 
     Inside this scope, every :func:`phase_trace` call appends to the
     yielded :class:`ExtractionTrace`.  Helpers nested arbitrarily deep
-    (parsing, anonymization, SOTA enrichment, etc.) participate without
+    (parsing, anonymization, cloud enrichment, etc.) participate without
     any explicit threading.
 
     **Nesting is a no-op**: re-entering ``extraction_trace`` while a
@@ -546,7 +548,7 @@ def phase_trace(name: str) -> Iterator[_PhaseScope]:
             # lost.  Only a phase that finished normally can stop the
             # chain: a phase this block marked ``outcome="failed"`` (a
             # soft failure the caller handles without raising, e.g. a
-            # SOTA call returning ``None``) must NOT be mistaken for the
+            # cloud call returning ``None``) must NOT be mistaken for the
             # requested stop point, since the caller's own downstream
             # fallback/rejection logic still needs to run.  A phase that
             # raised never reaches this branch at all (see the ``except``
@@ -587,8 +589,8 @@ def record_prompt(*, path: str | None, content: str) -> None:
       reason a raise is not an option, independent of any call-time
       scoping question.
     * Two real production call paths also run it with no phase scope
-      open at CALL time — ``anonymize_with_local_model`` from
-      ``extract_and_anonymize_for_cloud`` (reached from the live chat
+      open at CALL time — ``anonymize_transcript`` from
+      ``anonymize_turn`` (reached from the live chat
       egress, ``paramem/server/inference.py:639``,
       ``extractor.py:1108``) and from
       ``paramem.training.consolidation`` (``consolidation.py:2739``).

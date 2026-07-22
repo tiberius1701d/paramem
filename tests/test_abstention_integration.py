@@ -174,7 +174,7 @@ class TestAbstentionEndToEnd:
         tokenizer = MagicMock()
 
         # Patch _base_model_answer to confirm it IS reached on the
-        # non-personal path. HA/SOTA agents are None (unavailable),
+        # non-personal path. HA/cloud agents are None (unavailable),
         # so the cloud escalation returns nothing and falls through.
         from unittest.mock import patch
 
@@ -191,7 +191,7 @@ class TestAbstentionEndToEnd:
                 tokenizer=tokenizer,
                 config=server_config,
                 router=empty_adapter_router,
-                sota_agent=None,
+                cloud_agent=None,
                 ha_client=None,
                 speaker_id="spk-integration-test",
             )

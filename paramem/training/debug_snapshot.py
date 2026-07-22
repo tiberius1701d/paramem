@@ -134,8 +134,8 @@ class DebugSnapshotWriter:
         Called immediately after every ``self.extraction.run`` /
         ``self.extraction.run_procedural`` invocation so every extractor
         output is captured before downstream merging strips per-session
-        diagnostics (``sota_raw_response``, ``residual_dropped_facts``,
-        ``sota_updated_transcript``, ``fallback_path``).
+        diagnostics (``cloud_raw_response``, ``residual_dropped_facts``,
+        ``cloud_updated_transcript``, ``fallback_path``).
 
         ``kind`` names the extractor that produced the graph
         (``"graph"`` / ``"procedural_graph"``), not the adapter the

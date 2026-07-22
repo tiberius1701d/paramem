@@ -60,9 +60,9 @@ class TestPipelineAlteringSamples:
         pipeline_paths = [
             "consolidation.refresh_cadence",
             "consolidation.mode",
-            "consolidation.extraction_noise_filter",
-            "agents.sota.provider",
-            "agents.sota_providers.anthropic.model",
+            "consolidation.extraction_enrichment_provider",
+            "agents.cloud.provider",
+            "agents.cloud_providers.anthropic.model",
             "debug",
         ]
         for path in pipeline_paths:
@@ -107,11 +107,11 @@ class TestWildcardMatchesAnyAdapterName:
 
 class TestWildcardMatchesAnyProviderName:
     def test_wildcard_matches_any_provider_name(self):
-        """Wildcard entry agents.sota_providers.*.enabled matches any provider."""
+        """Wildcard entry agents.cloud_providers.*.enabled matches any provider."""
         provider_paths = [
-            "agents.sota_providers.anthropic.enabled",
-            "agents.sota_providers.openai.enabled",
-            "agents.sota_providers.some_new_vendor.enabled",
+            "agents.cloud_providers.anthropic.enabled",
+            "agents.cloud_providers.openai.enabled",
+            "agents.cloud_providers.some_new_vendor.enabled",
         ]
         for path in provider_paths:
             assert classify(path) == Tier.PIPELINE_ALTERING, (

@@ -218,7 +218,7 @@ class TestSymlinkSkip:
     def test_enumerate_logs_warn_for_symlink(self, tmp_path, caplog):
         """enumerate_backups logs a WARNING when skipping a symlink slot.
 
-        Uses the pattern from test_schema_config.py: attach caplog's handler
+        Uses the pattern from test_taxonomy.py: attach caplog's handler
         directly to the named logger (since pytest's root-logger capture does
         not always intercept records from named loggers that have their own
         handlers or non-propagating ancestors).

@@ -21,12 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from paramem.server.vram_guard import safe_empty_cache
 from paramem.training.thermal_throttle import (
     ThermalPolicy,
 )
 from paramem.training.trainer import TrainingHooks
 from paramem.utils.config import AdapterConfig, TrainingConfig
+from paramem.utils.vram_guard import safe_empty_cache
 
 # TrainingHooks is re-exported so consolidation.py and other callers can
 # import it from this module (their existing import path).

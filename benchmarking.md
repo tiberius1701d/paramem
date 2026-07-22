@@ -2820,21 +2820,21 @@ fully isolated model loads — never switch adapters within a single model lifec
 ## 6-Model Extraction Comparison (2026-04-14)
 
 **Script:** a standalone dev comparison script (retired — superseded by
-the placeholder-contract refactor into `paramem/graph/placeholders.py`;
+the placeholder-contract refactor into `paramem/cloud/placeholders.py`;
 the script had drifted from the production pipeline and was deleted).
 **Session set:** `data/ha/debug/extraction_eval_perltqa_top5` — 5 curated
 PerLTQA sessions (Bao Jun quantum, Cai Xiuying finance, Ruan Wenting sports,
 Ye Jie cultural psychology, Ye Jie community fitness).
 **Models (extractors + own anonymizers):** Claude (cloud), Mistral 7B,
-Ministral 8B, Llama 3.1 8B, Qwen 2.5 7B, Gemma 4 E4B. Validator (SOTA
+Ministral 8B, Llama 3.1 8B, Qwen 2.5 7B, Gemma 4 E4B. Validator (cloud
 enricher + plausibility judge): Claude.
 **Full privacy-aware pipeline active:** extract → anonymize → leak guard +
-repair → SOTA enrichment with brace-binding protocol → de-anonymize +
+repair → cloud enrichment with brace-binding protocol → de-anonymize +
 residual sweep → plausibility filter → fallback on all-dropped.
 
 > Historical note: this sweep was recorded under a pipeline that included a
 > transcript-grounding gate as the final stage. The gate has since been
-> removed (it dropped legitimate SOTA enrichments at high recall cost
+> removed (it dropped legitimate cloud enrichments at high recall cost
 > without catching genuine world-knowledge fabrications); plausibility is
 > now the residual filter. Numbers below are preserved as recorded.
 
@@ -2856,14 +2856,14 @@ residual sweep → plausibility filter → fallback on all-dropped.
   ungrounded inferences (Qwen Speaker ×7, Mistral attribute-label
   summarizations ×5, Ministral ×1, Llama ×1). No world-knowledge leaks
   surfaced from these PerLTQA sessions (no CIA-from-Langley-style triggers).
-- **SOTA bindings captured** across the sweep: 14+ via transcript-diff
+- **Cloud bindings captured** across the sweep: 14+ via transcript-diff
   protocol (`{Event_1}`/`{Topic_1}` style reifications grounded back to real
   spans like "community fitness event" / "benefits of regular exercise").
 - **Fallback-path triggers:** Llama 3×, Gemma 4 1× residual-leak. All
   sessions produced final output (no zero-fact sessions when extraction
   had content).
 - **Round-trip diagnostics** (`transcripts.{original, anonymized,
-  sota_updated, recovered, length_ratio}`) captured for every session;
+  cloud_updated, recovered, length_ratio}`) captured for every session;
   enables per-model drift inspection.
 
 ### Regressions caught during iteration
@@ -2871,11 +2871,11 @@ residual sweep → plausibility filter → fallback on all-dropped.
 Two pipeline bugs were found via this sweep and fixed mid-iteration:
 
 1. **Enrichment prompt contract drift.** An edit to the enrichment prompt
-   told SOTA to brace ALL placeholders (existing + new). Claude complied;
+   told cloud to brace ALL placeholders (existing + new). Claude complied;
    the binding-diff then recorded junk self-referential entries
    (`Person_2 → Person_2`) that corrupted the reverse mapping. Fix: prompt
    reverted to "leave existing bare placeholders as-is, only brace new
-   entities" + defensive guard in `_extract_sota_bindings` to reject
+   entities" + defensive guard in `_extract_cloud_bindings` to reject
    placeholder-shaped spans.
 2. **Fallback-path known_names included hallucinations.** The
    `_fallback_plausibility_on_raw` gate used `extracted.entities` as
@@ -2897,7 +2897,7 @@ Two pipeline bugs were found via this sweep and fixed mid-iteration:
 
 ## Extraction Probe Sweep (2026-04-17)
 
-Large-scale extraction quality assessment across two datasets using the dataset-agnostic probe (`experiments/dataset_probe.py`). Mistral 7B NF4, SOTA enrichment enabled, `--no-train` (extraction diagnostics only).
+Large-scale extraction quality assessment across two datasets using the dataset-agnostic probe (`experiments/dataset_probe.py`). Mistral 7B NF4, cloud enrichment enabled, `--no-train` (extraction diagnostics only).
 
 ### Datasets
 
@@ -2927,7 +2927,7 @@ Same 100 stratified sessions (seed=42), paired comparison:
 | Ungrounded drops | 13 | 27 | +14 (expected) |
 | Zero-extraction sessions | 6 | 11 | +5 |
 
-**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are SOTA-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survived deanonymization but failed the (since-removed) grounding gate — the pipeline filtered more precisely under the prior architecture. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
+**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are cloud-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survived deanonymization but failed the (since-removed) grounding gate — the pipeline filtered more precisely under the prior architecture. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
 
 Per-session paired analysis: 17 sessions had residual drops eliminated, with individual recoveries of up to +10 QA pairs. 42 sessions gained QA, 33 lost, 25 unchanged.
 
@@ -2948,7 +2948,7 @@ Same 89 sessions across 3 characters (Deng Yu 31, Liang Xin 30, Xia Yu 28), pair
 | Plausibility drops | 42 | 44 | +2 |
 | Zero-extraction sessions | 5 | 4 | -1 |
 
-**Interpretation:** The composite-placeholder deanon fix barely moves PerLTQA (-1.2% residual drops) compared to LME (-46%). PerLTQA's first-person dialogue rarely triggers the SOTA enrichment patterns (`Person_1's cousin`, `downtown City_1`) that the bug affected — those constructions appear primarily in LME's assistant-style content. The fix is real and validated on LME; on PerLTQA it shows no regression.
+**Interpretation:** The composite-placeholder deanon fix barely moves PerLTQA (-1.2% residual drops) compared to LME (-46%). PerLTQA's first-person dialogue rarely triggers the cloud enrichment patterns (`Person_1's cousin`, `downtown City_1`) that the bug affected — those constructions appear primarily in LME's assistant-style content. The fix is real and validated on LME; on PerLTQA it shows no regression.
 
 The +7 net ungrounded drops are spread across 12 sessions (deltas ±1-2 each). Raw fact counts shift in both directions between runs — extraction is mildly non-deterministic at temperature=0, and the (since-removed) grounding gate dropped the new ungrounded subset each run. Entity and relation type distributions are essentially unchanged: pipeline already stable on this dataset. One session (`Xia Yu_119_10_4#13`) shows `leaked_repaired` in both runs with identical content (11 raw, 1 residual drop, 1 ungrounded) — a deterministic single-token leak that the (since-removed) repair path handled correctly at the time this run was recorded.
 
@@ -2971,7 +2971,7 @@ One LME session (Nadia, mid-century modern design conversation) produced 11 QA p
 
 ### Diagnostics accounting fix
 
-`raw_fact_count` in session diagnostics went negative when SOTA enrichment added more facts than the original extraction produced. Fixed by splitting `plausibility_dropped` into actual drops (floored at 0) and `enrichment_added`. All 5 run directories retroactively corrected (38 + 18 files).
+`raw_fact_count` in session diagnostics went negative when cloud enrichment added more facts than the original extraction produced. Fixed by splitting `plausibility_dropped` into actual drops (floored at 0) and `enrichment_added`. All 5 run directories retroactively corrected (38 + 18 files).
 
 ### Infrastructure findings
 
@@ -2985,10 +2985,10 @@ All 7 are generic assistant conversations with no personal information (NAS reco
 
 ### Open items
 
-- Location → place type inference: SOTA enrichment occasionally tags places as `concept` instead of `place` when no explicit "place" cue appears in the transcript. Low priority; `place` already accounts for ~5% of LME entities post-fix.
-- Case-dup normalization: SOTA produces `Bioinformatics` vs `bioinformatics` as distinct entities. Affects entity merging across sessions.
-- Subject/object inversion: SOTA occasionally inverts predicate direction (e.g. `lives_in(City, Person)` instead of `lives_in(Person, City)`).
-- First-session SOTA parse failure: JSON output uses double-quote escaping that occasionally breaks the parser; fallback path catches it.
+- Location → place type inference: cloud enrichment occasionally tags places as `concept` instead of `place` when no explicit "place" cue appears in the transcript. Low priority; `place` already accounts for ~5% of LME entities post-fix.
+- Case-dup normalization: cloud produces `Bioinformatics` vs `bioinformatics` as distinct entities. Affects entity merging across sessions.
+- Subject/object inversion: cloud occasionally inverts predicate direction (e.g. `lives_in(City, Person)` instead of `lives_in(Person, City)`).
+- First-session cloud parse failure: JSON output uses double-quote escaping that occasionally breaks the parser; fallback path catches it.
 
 ---
 
@@ -3000,7 +3000,7 @@ Outlines never worked in production — 0% success across all Tests 1-8 due to a
 
 ### Current privacy-aware pipeline
 
-Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with SOTA's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
+Extract → anonymize → leak-guard + repair → cloud enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by cloud-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with cloud's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
 
 ---
 
@@ -3070,11 +3070,11 @@ routing decision — pure substring + fuzzy matching against two entity graphs.
 |---|---|---|
 | PA knowledge graph | Local adapter probe + reasoning | Mistral 7B (local) |
 | HA entity graph | HA conversation agent | Groq + Llama 3.3 70B (via HA) |
-| Neither graph | HA first (tools), SOTA fallback (reasoning) | HA → Cloud |
-| Both graphs | PA first; [ESCALATE] → HA → SOTA | Local → HA → Cloud |
+| Neither graph | HA first (tools), cloud fallback (reasoning) | HA → Cloud |
+| Both graphs | PA first; [ESCALATE] → HA → cloud | Local → HA → Cloud |
 
 All escalation paths follow the same invariant: **HA first** (has tools for
-real-time data), **SOTA fallback** (reasoning). This applies to Path 3 (no
+real-time data), **cloud fallback** (reasoning). This applies to Path 3 (no
 graph match), `[ESCALATE]` from local model, and `_probe_and_reason` fallback
 when keyed recall fails.
 
@@ -3090,26 +3090,26 @@ does not replicate room resolution.
 
 ### Fallback Chain
 
-Local mode: local adapter → HA/Groq → SOTA → local base model.
-Cloud-only mode: HA/Groq → SOTA → static error.
+Local mode: local adapter → HA/Groq → cloud → local base model.
+Cloud-only mode: HA/Groq → cloud → static error.
 Every path terminates gracefully. No dead ends.
 
 ### Forced Routing
 
 The `route` parameter on `/chat` allows direct provider testing: `"ha"`,
-`"sota"`, `"sota:anthropic"`, `"sota:openai"`, `"sota:google"`. Requires
+`"cloud"`, `"cloud:anthropic"`, `"cloud:openai"`, `"cloud:google"`. Requires
 completed speaker identification (greeting flow) to prevent unauthenticated
 HA device control.
 
-### SOTA Persona Continuity
+### Cloud Persona Continuity
 
 Sanitized conversation history (PII-blocked turns dropped) + speaker name
-passed to the SOTA model. System prompt instructs the model to derive persona,
+passed to the cloud model. System prompt instructs the model to derive persona,
 tone, and style from the conversation context. No personal facts leak to cloud.
 
-### Multi-Provider SOTA (2026-03-30)
+### Multi-Provider Cloud (2026-03-30)
 
-Three SOTA providers with web search, configurable via `agents.sota_providers`
+Three cloud providers with web search, configurable via `agents.cloud_providers`
 in server.yaml. Web search is enabled by default but defers to caller-supplied
 tools when provided.
 
@@ -3138,15 +3138,15 @@ Also available via core httpx adapter: Groq, Mistral, Ollama.
 |---|---|---|---|---|
 | Time query | HA | Groq (via HA) | 635ms | PASS |
 | Weather query | HA | Groq (via HA) | 935ms | PASS |
-| Time query | SOTA | Anthropic | 12.2s | PASS |
-| Weather query | SOTA | Anthropic | 5.6s | PASS |
-| Time query | SOTA | OpenAI | 7.0s | PASS |
-| Weather query | SOTA | OpenAI | 9.4s | PASS |
-| Time query | SOTA | Gemini | 32.4s | FAIL (VPN timeout) |
-| Weather query | SOTA | Gemini | 32.4s | FAIL (VPN timeout) |
+| Time query | Cloud | Anthropic | 12.2s | PASS |
+| Weather query | Cloud | Anthropic | 5.6s | PASS |
+| Time query | Cloud | OpenAI | 7.0s | PASS |
+| Weather query | Cloud | OpenAI | 9.4s | PASS |
+| Time query | Cloud | Gemini | 32.4s | FAIL (VPN timeout) |
+| Weather query | Cloud | Gemini | 32.4s | FAIL (VPN timeout) |
 | Real-time escalation | Auto | HA→Anthropic | 11.8s | PASS |
-| Reasoning | Auto | SOTA | 2.2s | PASS |
-| Math | Auto | SOTA | 2.7s | PASS |
+| Reasoning | Auto | Cloud | 2.2s | PASS |
+| Math | Auto | Cloud | 2.7s | PASS |
 | Memory probe | Auto | Local | 2.7s | PASS |
 | Imperative HA | Auto | HA fallback | 2.6s | PASS |
 | HA graph refresh | /refresh-ha | — | — | PASS (238 entities) |
@@ -3592,7 +3592,7 @@ with the adapter file + base model can extract facts through differential analys
 Open research directions include training format hardening, selective access control,
 and multi-adapter compartmentalization.
 
-**Accepted result (2026-07-13):** Wiring the anonymize → SOTA → de-anonymize contract onto the graph-tier enrichment pass (`_graph_enrich_with_sota`) closes the previously-unprotected second cloud call site, but under the production `{"person"}` cloud-egress scope it costs person-level `same_as` coreference — two surface forms of the same person (e.g. an honorific variant) collapse to opaque, unrelated tokens before the cloud model ever sees the text, so cross-session person-identity merging via that path no longer fires. Organization/place/thing `same_as` is unaffected. Shipped as-is; no local candidate generator was built to recover the lost signal. The cumulative fold graph carries no reliable entity types of its own, so this pass derives each real name's type from the SAME local-model anonymizer session-tier extraction uses, rather than from graph node attributes — coverage is therefore best-effort and depends on the local model's classification accuracy, matching the session tier's existing residual: a person the local model misclassifies as an out-of-scope type — or simply omits from its mapping, in whole or in part (the empty-mapping guard below catches only the total case, never a partial one) — is sent to the cloud verbatim, undetectable and unrepairable downstream. Owner-accepted; not engineered around (no independent cross-check model, no totality check). The local anonymizer's mapping keys are independent surface strings, not the fold graph's own canonical node text, so a re-cased or separator-varied key from the local model can fail to substitute even when the model correctly identified the name. `run_graph_enrichment` (`paramem.training.graph_enrich`) reconciles the local anonymizer's mapping keys onto the chunk's actual node-key text via `canonical()` before building `chunk_entities`, dropping (and counting, `mapping_rekey_dropped`) any entry that names nothing in its chunk. `_substitute_whole_words` itself stays exact-match everywhere, including at the graph tier — identity reconciliation happens once, at this one call site, not inside the shared substitution primitive. Separately, a local mapping that comes back completely empty — or whose every entry this reconciliation drops — for a chunk with real (non-speaker) content is treated as a detected classification failure (fail-closed skip, counted in `privacy_skipped_chunks`), rather than silently sent unmasked.
+**Accepted result (2026-07-13):** Wiring the anonymize → cloud → de-anonymize contract onto the graph-tier enrichment pass (`request_graph_enrichment`) closes the previously-unprotected second cloud call site, but under the production `{"person"}` cloud-egress scope it costs person-level `same_as` coreference — two surface forms of the same person (e.g. an honorific variant) collapse to opaque, unrelated tokens before the cloud model ever sees the text, so cross-session person-identity merging via that path no longer fires. Organization/place/thing `same_as` is unaffected. Shipped as-is; no local candidate generator was built to recover the lost signal. The cumulative fold graph carries no reliable entity types of its own, so this pass derives each real name's type from the SAME local-model anonymizer session-tier extraction uses, rather than from graph node attributes — coverage is therefore best-effort and depends on the local model's classification accuracy, matching the session tier's existing residual: a person the local model misclassifies as an out-of-scope type — or simply omits from its mapping, in whole or in part (the empty-mapping guard below catches only the total case, never a partial one) — is sent to the cloud verbatim, undetectable and unrepairable downstream. Owner-accepted; not engineered around (no independent cross-check model, no totality check). The local anonymizer's mapping keys are independent surface strings, not the fold graph's own canonical node text, so a re-cased or separator-varied key from the local model can fail to substitute even when the model correctly identified the name. `enrich_graph` (`paramem.training.graph_enrich`) reconciles the local anonymizer's mapping keys onto the chunk's actual node-key text via `canonical()` before building `chunk_entities`, dropping (and counting, `mapping_rekey_dropped`) any entry that names nothing in its chunk. `_substitute_whole_words` itself stays exact-match everywhere, including at the graph tier — identity reconciliation happens once, at this one call site, not inside the shared substitution primitive. Separately, a local mapping that comes back completely empty — or whose every entry this reconciliation drops — for a chunk with real (non-speaker) content is treated as a detected classification failure (fail-closed skip, counted in `privacy_skipped_chunks`), rather than silently sent unmasked.
 
 ---
 

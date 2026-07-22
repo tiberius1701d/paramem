@@ -6,25 +6,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.graph.cloud_egress import CloudScope
+from paramem.cloud.deanonymize import CloudScope
+from paramem.graph.empty_cause import CAUSE_DEANON_JUDGE, CAUSE_SCALAR_PARTITION, cause_kind
 from paramem.graph.extractor import (
     _extract_json_block,
     _fallback_plausibility_on_raw,
     _normalize_extraction,
-    _stage_deanonymize,
-    _stage_rebuild,
     _stamp_speaker_entity,
-    extract_graph,
     extract_procedural_graph,
 )
 from paramem.graph.flow import StageContext, StageState
+from paramem.graph.flows import _stage_deanonymize, _stage_rebuild, extract_graph
 from paramem.graph.phase_trace import extraction_trace, get_phases, stop_at
-from paramem.graph.relation_build import (
-    CAUSE_DEANON_JUDGE,
-    CAUSE_SCALAR_PARTITION,
-    cause_kind,
-    partition_scalar_facts,
-)
+from paramem.graph.relation_build import partition_scalar_facts
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -65,7 +59,7 @@ class TestExtractJsonBlock:
             _extract_json_block("{unclosed")
 
     def test_skips_brace_quoted_placeholder_in_preamble(self):
-        """SOTA's preamble narration sometimes references placeholder names
+        """Cloud's preamble narration sometimes references placeholder names
         in brace notation like ``{Topic_1}`` — the parser must skip past
         those and find the real envelope further down."""
         text = (
@@ -1040,7 +1034,7 @@ class TestExtractGraphTimestampPropagation:
     relation, so ``_parse_extraction`` succeeds rather than falling back to
     the empty-graph exception handler. ``stop_at("local_extract")`` returns
     immediately after parsing succeeds, isolating the surface under test
-    (timestamp plumbing) from the unrelated STT/HA/SOTA phases.
+    (timestamp plumbing) from the unrelated STT/HA/cloud phases.
     """
 
     def _fake_raw_output(self) -> str:
@@ -1109,7 +1103,7 @@ class TestExtractGraphTimestampPropagation:
 class TestEmptyRelationsTerminal:
     """``local_extract``'s empty-relations terminal: when the pass-1 graph
     has no relations, extract_graph returns immediately — no
-    second_order_extract, no sota_pipeline — even when
+    second_order_extract, no cloud_pipeline — even when
     those later phases are otherwise enabled/configured to fire."""
 
     def _empty_output(self) -> str:
@@ -1130,8 +1124,8 @@ class TestEmptyRelationsTerminal:
                 # Later phases are configured ON; the empty-relations
                 # terminal must still short-circuit before any of them.
                 validate=True,
-                sota_enabled=True,
-                noise_filter="anthropic",
+                cloud_enabled=True,
+                enrichment_provider="anthropic",
             )
         assert graph.relations == []
         phase_names = [p.name for p in get_phases(graph)]
@@ -1156,7 +1150,7 @@ class TestScalarOnlySessionIsNotARecovery:
     def _scope(self):
         return CloudScope(
             reverse={},
-            sota_bindings={},
+            cloud_bindings={},
             observed=frozenset(),
             resolution={},
             core_resolution={},
@@ -1182,10 +1176,10 @@ class TestScalarOnlySessionIsNotARecovery:
             timestamp=None,
             source_type="transcript",
             validate=True,
-            sota_enabled=True,
-            noise_filter="anthropic",
-            noise_filter_model="claude-sonnet-4-6",
-            noise_filter_endpoint=None,
+            cloud_enabled=True,
+            enrichment_provider="anthropic",
+            enrichment_provider_model="claude-sonnet-4-6",
+            enrichment_provider_endpoint=None,
             plausibility_judge="off",
             plausibility_stage="deanon",
             plausibility_model="claude-sonnet-4-6",
@@ -1267,7 +1261,7 @@ class TestScalarOnlySessionIsNotARecovery:
         assert alex.attributes == {"email": "alex@example.com", "uses": "ROS2"}
 
     def test_no_fallback_is_invoked(self):
-        with patch("paramem.graph.extractor._fallback_plausibility_on_raw") as fallback:
+        with patch("paramem.graph.flows._fallback_plausibility_on_raw") as fallback:
             state = self._run()
         fallback.assert_not_called()
         assert state.graph.diagnostics["all_dropped_cause"] == {
@@ -1289,7 +1283,7 @@ class TestScalarOnlySessionIsNotARecovery:
             empty_cause=CAUSE_DEANON_JUDGE,
         )
         with patch(
-            "paramem.graph.extractor._fallback_plausibility_on_raw",
+            "paramem.graph.flows._fallback_plausibility_on_raw",
             return_value=graph,
         ) as fallback:
             _stage_rebuild(ctx, state)
@@ -1356,7 +1350,7 @@ class TestFallbackRebuildRecordsValidationDrops:
             },
         ]
         with patch(
-            "paramem.graph.extractor.local_plausibility_filter",
+            "paramem.graph.extractor.judge_plausibility",
             return_value=(judged, "raw"),
         ):
             out = _fallback_plausibility_on_raw(

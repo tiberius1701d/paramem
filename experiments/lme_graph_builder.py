@@ -17,8 +17,8 @@ Design:
   and ``--target-keys`` has not been raised, exit immediately.
 - Output dir is a SINGLE canonical directory (default
   ``outputs/lme_graph/``), not timestamped — this is a growing artifact.
-- SOTA enrichment is disabled by default (``--no-sota`` is the default
-  posture for graph building).  Pass ``--with-sota`` to enable cloud
+- Cloud enrichment is disabled by default (``--no-cloud`` is the default
+  posture for graph building).  Pass ``--with-cloud`` to enable cloud
   enrichment (incurs Anthropic API cost).
 
 CLI:
@@ -205,11 +205,11 @@ def parse_args() -> argparse.Namespace:
         help="Resume from existing graph_snapshot.json and build_state.json.",
     )
     parser.add_argument(
-        "--with-sota",
+        "--with-cloud",
         action="store_true",
-        dest="with_sota",
+        dest="with_cloud",
         help=(
-            "Enable SOTA cloud enrichment (noise_filter=anthropic + "
+            "Enable cloud enrichment (enrichment_provider=anthropic + "
             "plausibility_judge=auto). Disabled by default to avoid API cost."
         ),
     )
@@ -245,9 +245,9 @@ def main() -> None:
     done_path = output_dir / "graph_done.json"
     paused_path = output_dir / "paused.json"
 
-    # Extraction flags: default is no-SOTA to avoid API cost; --with-sota enables it.
-    extraction_noise_filter = "anthropic" if args.with_sota else ""
-    plausibility_judge = "auto" if args.with_sota else "off"
+    # Extraction flags: default is no-cloud to avoid API cost; --with-cloud enables it.
+    extraction_enrichment_provider = "anthropic" if args.with_cloud else ""
+    plausibility_judge = "auto" if args.with_cloud else "off"
 
     # --- Resume / done check ---
     sessions_done: list[str] = []
@@ -341,8 +341,8 @@ def main() -> None:
         cfg.adapters.semantic = dataclasses.replace(cfg.adapters.episodic)
         cfg.adapters.procedural.enabled = False
 
-        if not args.with_sota:
-            cfg.consolidation.extraction_noise_filter = ""
+        if not args.with_cloud:
+            cfg.consolidation.extraction_enrichment_provider = ""
             cfg.consolidation.extraction_plausibility_judge = "off"
 
         loop = create_consolidation_loop(
@@ -429,9 +429,9 @@ def main() -> None:
                     session_id=session.session_id,
                     speaker_id=session.speaker_id,
                     speaker_name=session.speaker_name,
-                    noise_filter=extraction_noise_filter,
-                    noise_filter_model="claude-sonnet-4-6",
-                    noise_filter_endpoint=None,
+                    enrichment_provider=extraction_enrichment_provider,
+                    enrichment_provider_model="claude-sonnet-4-6",
+                    enrichment_provider_endpoint=None,
                     plausibility_judge=plausibility_judge,
                     plausibility_stage="deanon",
                 )

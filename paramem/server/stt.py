@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from paramem.server.vram_guard import VramExhausted, safe_empty_cache, vram_measure
+from paramem.utils.vram_guard import VramExhausted, safe_empty_cache, vram_measure
 
 logger = logging.getLogger(__name__)
 

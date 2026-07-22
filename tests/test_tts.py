@@ -257,8 +257,8 @@ def test_personalize_prompt_no_id_in_prompt():
     assert "speaker" not in result.lower().split("you are speaking with alice.")[1]
 
 
-def test_personalize_prompt_sota_has_no_id():
-    """SOTA escalation path must NEVER contain a raw speaker{N} id.
+def test_personalize_prompt_cloud_has_no_id():
+    """Cloud escalation path must NEVER contain a raw speaker{N} id.
 
     Privacy invariant: resolved display names are used in the prefix;
     speaker id tokens never reach the cloud.  _build_speaker_prefix (shared
@@ -267,7 +267,7 @@ def test_personalize_prompt_sota_has_no_id():
     """
     from paramem.server.inference import _build_speaker_prefix
 
-    # Both local and SOTA paths use the same _build_speaker_prefix; neither
+    # Both local and cloud paths use the same _build_speaker_prefix; neither
     # contains a raw speaker id.
     prefix = _build_speaker_prefix("Alice", "en", None)
     assert "speaker0" not in prefix.lower()
@@ -910,17 +910,17 @@ def test_ha_supported_languages_default_empty():
 
 
 def test_escalation_language_filtering_integration():
-    """Integration: unsupported language falls through HA to SOTA.
+    """Integration: unsupported language falls through HA to cloud.
 
     Simulates the full escalation chain:
     1. Detected language = Tagalog (tl)
     2. HA supported_languages = [en, de, fr, es] — tl not supported
     3. ha_client.conversation_process receives language=None (filtered)
     4. HA responds (in its default language) — OR fails
-    5. SOTA fallback receives language="tl" (always passed)
+    5. Cloud fallback receives language="tl" (always passed)
 
     This verifies language filtering at the HA boundary while preserving
-    language for SOTA.
+    language for cloud.
     """
     from paramem.server.config import ServerConfig
     from paramem.server.inference import _escalate_to_ha_agent
@@ -1152,7 +1152,7 @@ def test_oneshot_synthesize_closes_without_stopped():
 
 class TestCloudSafetyInferenceIdentityGone:
     """INFERENCE-IDENTITY injection is deleted; no raw speaker{N} id appears in the
-    prompt prefix or in the SOTA system prompt.
+    prompt prefix or in the cloud system prompt.
     """
 
     def test_build_speaker_prefix_no_speaker_id_in_output(self) -> None:
@@ -1163,13 +1163,13 @@ class TestCloudSafetyInferenceIdentityGone:
         assert "speaker0" not in prefix.lower()
         assert "speaker9" not in prefix.lower()
 
-    def test_build_speaker_prefix_sota_path_same_as_local(self) -> None:
-        """Both paths (formerly local=True, SOTA=False) now use the same function;
+    def test_build_speaker_prefix_cloud_path_same_as_local(self) -> None:
+        """Both paths (formerly local=True, cloud=False) now use the same function;
         the result must never contain a raw id token regardless of caller.
         """
         from paramem.server.inference import _build_speaker_prefix
 
-        # Before: SOTA path was include_id_mapping=False; local=True.
+        # Before: Cloud path was include_id_mapping=False; local=True.
         # Now: single function, both produce the same clean prefix.
         prefix = _build_speaker_prefix("Alice", "en", None)
         assert "Alice" in prefix

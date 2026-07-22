@@ -1,8 +1,8 @@
-"""Tests for schema_config — single source of truth loader."""
+"""Tests for paramem.config.taxonomy — single source of truth loader."""
 
 from __future__ import annotations
 
-from paramem.graph.schema_config import (
+from paramem.config.taxonomy import (
     anonymizer_prefix_to_type,
     anonymizer_type_to_prefix,
     entity_types,
@@ -28,7 +28,7 @@ class TestLoadSchemaConfig:
         Uses a sentinel to prove the fallback path was taken rather than the
         real schema.yaml (which also contains 'concept').
         """
-        from paramem.graph import schema_config
+        from paramem.config import taxonomy
 
         sentinel = {
             "entity_types": {"SENTINEL_TYPE": {"anchor": "test"}},
@@ -36,7 +36,7 @@ class TestLoadSchemaConfig:
             "relation_types": ["SENTINEL_RELATION"],
             "fallback_relation_type": "SENTINEL_RELATION",
         }
-        monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", sentinel)
+        monkeypatch.setattr(taxonomy, "_HARDCODED_FALLBACK", sentinel)
         reset_cache()
         result = load_schema_config(str(tmp_path / "does_not_exist.yaml"))
         assert "SENTINEL_TYPE" in result["entity_types"]
@@ -97,22 +97,22 @@ class TestEmptyAndMalformedYaml:
     Note: The ROS launch package (loaded by the ament pytest plugins) overrides
     the logging.Logger class and sets ``propagate=False`` on every new logger.
     This prevents pytest's caplog handler (which lives on the root logger) from
-    capturing records from ``paramem.graph.schema_config``.  The workaround is to
+    capturing records from ``paramem.config.taxonomy``.  The workaround is to
     attach caplog's handler directly to the named logger and force propagation on
     before the call under test.
     """
 
     def _attach_caplog(self, caplog, level: int) -> tuple:
-        """Attach caplog's handler to the schema_config logger directly.
+        """Attach caplog's handler to the taxonomy logger directly.
 
         Returns ``(named_logger, orig_propagate)`` so the caller can restore state.
         """
         import logging
 
-        named = logging.getLogger("paramem.graph.schema_config")
+        named = logging.getLogger("paramem.config.taxonomy")
         orig_propagate = named.propagate
         named.propagate = True
-        caplog.set_level(level, logger="paramem.graph.schema_config")
+        caplog.set_level(level, logger="paramem.config.taxonomy")
         named.addHandler(caplog.handler)
         return named, orig_propagate
 
@@ -124,7 +124,7 @@ class TestEmptyAndMalformedYaml:
         """An empty YAML file (missing all required keys) must return the hardcoded fallback."""
         import logging
 
-        from paramem.graph import schema_config
+        from paramem.config import taxonomy
 
         sentinel = {
             "entity_types": {"SENTINEL_TYPE": {"anchor": "test"}},
@@ -132,7 +132,7 @@ class TestEmptyAndMalformedYaml:
             "relation_types": ["SENTINEL_RELATION"],
             "fallback_relation_type": "SENTINEL_RELATION",
         }
-        monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", sentinel)
+        monkeypatch.setattr(taxonomy, "_HARDCODED_FALLBACK", sentinel)
         reset_cache()
         empty = tmp_path / "empty.yaml"
         empty.write_text("")
@@ -149,7 +149,7 @@ class TestEmptyAndMalformedYaml:
         """An unparseable YAML file must log at ERROR and return the hardcoded fallback."""
         import logging
 
-        from paramem.graph import schema_config
+        from paramem.config import taxonomy
 
         sentinel = {
             "entity_types": {"SENTINEL_TYPE": {"anchor": "test"}},
@@ -157,7 +157,7 @@ class TestEmptyAndMalformedYaml:
             "relation_types": ["SENTINEL_RELATION"],
             "fallback_relation_type": "SENTINEL_RELATION",
         }
-        monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", sentinel)
+        monkeypatch.setattr(taxonomy, "_HARDCODED_FALLBACK", sentinel)
         reset_cache()
         bad = tmp_path / "bad.yaml"
         bad.write_text(":\n  -invalid\n")  # unparseable
@@ -256,7 +256,7 @@ class TestAnonymizerConfig:
 
     def test_type_to_prefix_values_match_prefix_list(self):
         """Every value must be a prefix token from the configured prefix list."""
-        from paramem.graph.schema_config import load_schema_config
+        from paramem.config.taxonomy import load_schema_config
 
         cfg = load_schema_config()
         all_prefixes = {e["prefix"] for e in cfg["anonymizer"]["prefixes"]}
@@ -305,7 +305,7 @@ class TestAnonymizerConfig:
         This is what the one-sided contract could not do: the raw key
         ``"Work Of Art"`` never matched the folded query.
         """
-        from paramem.graph.schema_config import reset_cache
+        from paramem.config.taxonomy import reset_cache
         from paramem.utils.identity import canonical
 
         schema = tmp_path / "schema.yaml"
@@ -340,9 +340,9 @@ class TestAnonymizerConfig:
 
     def test_fallback_when_anonymizer_key_missing(self, tmp_path, monkeypatch):
         """YAML missing 'anonymizer' key falls back to _HARDCODED_FALLBACK."""
-        from paramem.graph import schema_config
+        from paramem.config import taxonomy
 
-        monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", schema_config._HARDCODED_FALLBACK)
+        monkeypatch.setattr(taxonomy, "_HARDCODED_FALLBACK", taxonomy._HARDCODED_FALLBACK)
         reset_cache()
         # Write a YAML that is valid for the old required keys but lacks 'anonymizer'.
         minimal = tmp_path / "no_anon.yaml"

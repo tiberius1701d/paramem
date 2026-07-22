@@ -7,7 +7,7 @@ identically-shaped per-session diagnostics regardless of source corpus.
 Usage:
     python experiments/dataset_probe.py --dataset perltqa --limit 20
     python experiments/dataset_probe.py --dataset longmemeval --split longmemeval_oracle --limit 20
-    python experiments/dataset_probe.py --dataset perltqa --no-sota --limit 5
+    python experiments/dataset_probe.py --dataset perltqa --no-cloud --limit 5
     python experiments/dataset_probe.py --dataset perltqa --resume
     python experiments/dataset_probe.py --dataset longmemeval --model mistral --limit 5
     python experiments/dataset_probe.py --dataset longmemeval \
@@ -335,7 +335,7 @@ def _build_session_diagnostics(
     # around ONE judge, and every judge applies its verdict through
     # `_apply_drop_set`, which returns a SUBSET of the facts it was given
     # (`paramem/graph/extractor.py::_apply_drop_set`).  A judge can never
-    # hand back more facts than it received, and SOTA enrichment's
+    # hand back more facts than it received, and cloud enrichment's
     # additions are counted by no key read here.
     #
     # `residual_dropped_facts` (deanon-stage residual sweep, step 3 of
@@ -366,7 +366,7 @@ def _build_session_diagnostics(
         "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
     }
 
-    # raw_fact_count: facts from the original extraction (before SOTA enrichment).
+    # raw_fact_count: facts from the original extraction (before cloud enrichment).
     # post_plausibility_count: facts surviving all filtering (including enriched).
     post_plausibility_count = len(episodic_rels)
     raw_fact_count = post_plausibility_count + sum(drops.values())
@@ -572,7 +572,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the dataset probe.
 
     Returns:
-        Parsed Namespace with dataset, limit, resume, no_sota, model,
+        Parsed Namespace with dataset, limit, resume, no_cloud, model,
         character (perltqa-only), split, sample_strategy, sample_size, and
         sample_seed (all three longmemeval-only).
     """
@@ -583,7 +583,7 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  python experiments/dataset_probe.py --dataset perltqa --limit 20\n"
             "  python experiments/dataset_probe.py --dataset longmemeval --limit 20\n"
-            "  python experiments/dataset_probe.py --dataset perltqa --no-sota --limit 5\n"
+            "  python experiments/dataset_probe.py --dataset perltqa --no-cloud --limit 5\n"
             "  python experiments/dataset_probe.py --dataset perltqa --resume\n"
         ),
     )
@@ -608,10 +608,10 @@ def parse_args() -> argparse.Namespace:
         help="Resume the newest incomplete run for this model/dataset combination.",
     )
     parser.add_argument(
-        "--no-sota",
+        "--no-cloud",
         action="store_true",
         help=(
-            "Disable SOTA cloud enrichment (noise_filter='' + plausibility_judge=off). "
+            "Disable cloud enrichment (enrichment_provider='' + plausibility_judge=off). "
             "Zeros Anthropic API costs. Useful for debugging extraction prompts."
         ),
     )
@@ -823,12 +823,12 @@ def main() -> None:
         )
 
     # --- 4. Extraction flags ---
-    if args.no_sota:
-        noise_filter = ""
+    if args.no_cloud:
+        enrichment_provider = ""
         plausibility_judge = "off"
-        logger.info("--no-sota: noise_filter='' plausibility_judge='off'")
+        logger.info("--no-cloud: enrichment_provider='' plausibility_judge='off'")
     else:
-        noise_filter = "anthropic"
+        enrichment_provider = "anthropic"
         plausibility_judge = "auto"
 
     # --- 5. Acquire GPU + model ---
@@ -863,11 +863,11 @@ def main() -> None:
 
         cfg.consolidation.max_epochs = args.num_epochs
 
-        # --no-sota path: zero cloud cost for loop defaults. Per-call
-        # extract_session overrides (noise_filter=, plausibility_judge=) below
+        # --no-cloud path: zero cloud cost for loop defaults. Per-call
+        # extract_session overrides (enrichment_provider=, plausibility_judge=) below
         # continue to win regardless.
-        if args.no_sota:
-            cfg.consolidation.extraction_noise_filter = ""
+        if args.no_cloud:
+            cfg.consolidation.extraction_enrichment_provider = ""
             cfg.consolidation.extraction_plausibility_judge = "off"
 
         if args.debug:
@@ -931,9 +931,9 @@ def main() -> None:
                     session_id=session.session_id,
                     speaker_id=session.speaker_id,
                     speaker_name=session.speaker_name,
-                    noise_filter=noise_filter,
-                    noise_filter_model="claude-sonnet-4-6",
-                    noise_filter_endpoint=None,
+                    enrichment_provider=enrichment_provider,
+                    enrichment_provider_model="claude-sonnet-4-6",
+                    enrichment_provider_endpoint=None,
                     plausibility_judge=plausibility_judge,
                     plausibility_stage="deanon",
                 )

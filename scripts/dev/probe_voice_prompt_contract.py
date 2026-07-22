@@ -11,7 +11,7 @@ trained adapter to verify three contracts end-to-end:
   3. Escalation sentinel — real-time queries (time, weather) and
      general-knowledge off-domain queries emit `[ESCALATE]` somewhere
      in the response so paramem.server.escalation.detect_escalation
-     routes them to HA/SOTA.
+     routes them to HA/cloud.
 
 This is the live-GPU counterpart of tests/test_voice_prompt_contract.py
 (which is string-level only). It mirrors production exactly:
@@ -61,14 +61,14 @@ IN_DOMAIN_QUERIES = [
     "What movie did I watch recently?",
     "What am I interested in?",
 ]
-# Personal-but-off-domain — sanitizer would block SOTA escalation
+# Personal-but-off-domain — sanitizer would block cloud escalation
 OFF_DOMAIN_PERSONAL_QUERIES = [
     "Where do I live?",
     "What is my job?",
     "When was I born?",
     "Who is my spouse?",
 ]
-# Sanitizer-safe general knowledge — [ESCALATE] should fire so SOTA answers
+# Sanitizer-safe general knowledge — [ESCALATE] should fire so cloud answers
 SANITIZER_SAFE_GENERAL_QUERIES = [
     "What is the capital of France?",
     "Who wrote Hamlet?",
@@ -151,7 +151,7 @@ def main() -> int:
             "forwarded_query": forwarded,
         }
         results.append(row)
-        marker = "ESCALATE→SOTA" if escalated else "ANSWERED"
+        marker = "ESCALATE→cloud" if escalated else "ANSWERED"
         print(f"\n[{kind}] Q: {query}\n  → [{marker}] {response!r}")
 
     for q in IN_DOMAIN_QUERIES:

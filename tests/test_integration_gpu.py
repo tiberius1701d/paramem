@@ -5,7 +5,7 @@ Skip in CI: these tests are excluded by default (require --gpu flag).
 
 Tests cover:
 1. extract_procedural_graph
-2. SOTA noise filter (anonymize → filter → de-anonymize)
+2. Cloud noise filter (anonymize → filter → de-anonymize)
 3. _extract_and_start_training (mocked HA)
 4. _consolidation_scheduler (async)
 5. BackgroundTrainer._train_adapter
@@ -188,13 +188,13 @@ class TestExtractProceduralGraph:
         assert graph.session_id == "test_empty"
 
 
-# --- 3. SOTA noise filter full flow ---
+# --- 3. Cloud noise filter full flow ---
 
 
-class TestSOTAFullFlow:
-    def test_anonymize_with_local_model(self, model_and_tokenizer):
+class TestCloudFullFlow:
+    def test_anonymize_transcript(self, model_and_tokenizer):
         """Test that local model can anonymize extracted facts."""
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
         model, tokenizer = model_and_tokenizer
@@ -218,7 +218,7 @@ class TestSOTAFullFlow:
         )
         from paramem.server.config import SanitizationConfig
 
-        mapping, anon_transcript, raw = anonymize_with_local_model(
+        mapping, anon_transcript, raw = anonymize_transcript(
             graph,
             model,
             tokenizer,
@@ -688,7 +688,7 @@ class TestRunExtractGraphHelper:
     Unit tests (tests/test_extraction_pipeline_guard.py) prove the chokepoint
     threads args and guards PeftModel correctly; this test proves the whole
     chain — ``ExtractionPipeline.kwargs`` → ``extract_graph`` — executes on
-    real hardware without drift. SOTA gates are all disabled so the test
+    real hardware without drift. Cloud gates are all disabled so the test
     depends only on the local model.
     """
 
@@ -699,10 +699,10 @@ class TestRunExtractGraphHelper:
     def test_helper_runs_with_production_config(self, model_and_tokenizer, tmp_path):
         """Run ``loop.extraction.run`` with the exact flags from configs/server.yaml.
 
-        Mirrors production: noise_filter, plausibility_judge — all set
+        Mirrors production: enrichment_provider, plausibility_judge — all set
         to whatever ships in server.yaml today. Skips when
         prerequisites for the configured stack are missing (e.g.
-        ANTHROPIC_API_KEY for the cloud noise filter) rather than silently
+        ANTHROPIC_API_KEY for the cloud enrichment provider) rather than silently
         running a weaker configuration.
 
         Structured so a future @pytest.mark.parametrize can introduce other
@@ -718,8 +718,12 @@ class TestRunExtractGraphHelper:
         server_config = load_server_config("configs/server.yaml")
         cc = server_config.consolidation
 
-        if cc.extraction_noise_filter == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-            pytest.skip("ANTHROPIC_API_KEY not set; cannot exercise configured cloud noise filter")
+        if cc.extraction_enrichment_provider == "anthropic" and not os.environ.get(
+            "ANTHROPIC_API_KEY"
+        ):
+            pytest.skip(
+                "ANTHROPIC_API_KEY not set; cannot exercise configured cloud enrichment provider"
+            )
 
         loop = ConsolidationLoop(
             model=model,
@@ -733,9 +737,11 @@ class TestRunExtractGraphHelper:
             save_cycle_snapshots=False,
             prompts_dir=server_config.prompts_dir,
             extraction_max_tokens=cc.extraction_max_tokens,
-            extraction_noise_filter=cc.extraction_noise_filter,
-            extraction_noise_filter_model=cc.extraction_noise_filter_model,
-            extraction_noise_filter_endpoint=cc.extraction_noise_filter_endpoint or None,
+            extraction_enrichment_provider=cc.extraction_enrichment_provider,
+            extraction_enrichment_provider_model=cc.extraction_enrichment_provider_model,
+            extraction_enrichment_provider_endpoint=(
+                cc.extraction_enrichment_provider_endpoint or None
+            ),
             extraction_plausibility_judge=cc.extraction_plausibility_judge,
             extraction_plausibility_stage=cc.extraction_plausibility_stage,
             # Same wiring as production (paramem/server/consolidation.py):
@@ -785,8 +791,8 @@ class TestBatchConsolidationE2E:
             output_dir=tmp_path,
             save_cycle_snapshots=False,
             # Required kwarg (no code-side default — the anonymizer
-            # prompt is the sole scope authority). No SOTA provider is
-            # configured here (extraction_noise_filter defaults to ""), so
+            # prompt is the sole scope authority). No cloud provider is
+            # configured here (extraction_enrichment_provider defaults to ""), so
             # this never actually anonymizes — same 5-category default the
             # server config ships (SanitizationConfig.scrub).
             extraction_scrub=set(SanitizationConfig().scrub),
@@ -1031,7 +1037,7 @@ class TestVRAMBudget:
                 stt.unload()
             if tts_manager is not None:
                 tts_manager.unload_all()
-            from paramem.server.vram_guard import safe_empty_cache
+            from paramem.utils.vram_guard import safe_empty_cache
 
             safe_empty_cache()
 
@@ -1047,7 +1053,7 @@ class TestSimulateModePromptIteration:
     ------------
     The full pipeline up to and including `ExtractionPipeline.run` and
     `ExtractionPipeline.run_procedural` runs unchanged: chunking,
-    `extract_session`, the 8-stage SOTA chain (when configured), QA
+    `extract_session`, the 8-stage cloud chain (when configured), QA
     generation, dedup, key assignment.  `run_consolidation_cycle` runs
     with `mode="simulate"` — persistence venue is `graph.json` under
     `adapter_dir/<tier>/`, not LoRA weights.  No
@@ -1058,7 +1064,7 @@ class TestSimulateModePromptIteration:
     ---
     Prompt-engineering iteration on `extraction.txt` /
     `extraction_system.txt` / `extraction_procedural.txt` /
-    `sota_enrichment.txt` / `sota_plausibility.txt` only exercises
+    `cloud_enrichment.txt` / `cloud_plausibility.txt` only exercises
     upstream phases.  Paying the ~10-minute training cost per iteration
     is wasteful — the simulate path produces the same per-session graph
     snapshots and per-phase raw_outputs that the operator inspects to
@@ -1066,7 +1072,7 @@ class TestSimulateModePromptIteration:
 
     Use
     ---
-    Run with --gpu; SOTA-chain phases skip silently when
+    Run with --gpu; cloud-chain phases skip silently when
     `ANTHROPIC_API_KEY` is unset.  Adjust the chunk text to match the
     domain you're calibrating prompts for.
 
@@ -1138,14 +1144,16 @@ class TestSimulateModePromptIteration:
         # those snapshots; without debug, there is nothing to inspect.
         monkeypatch.setattr(cfg, "debug", True)
 
-        # SOTA chain: production pipeline hits Anthropic if configured.
+        # cloud chain: production pipeline hits Anthropic if configured.
         # Skip its activation when no API key is present so the test
         # still exercises local_extract + key assignment without depending
-        # on cloud.  Operators iterating on cloud prompts (sota_enrichment,
-        # sota_plausibility) set ANTHROPIC_API_KEY and the chain runs.
+        # on cloud.  Operators iterating on cloud prompts (cloud_enrichment,
+        # cloud_plausibility) set ANTHROPIC_API_KEY and the chain runs.
         cc = cfg.consolidation
-        if cc.extraction_noise_filter == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-            monkeypatch.setattr(cc, "extraction_noise_filter", "")
+        if cc.extraction_enrichment_provider == "anthropic" and not os.environ.get(
+            "ANTHROPIC_API_KEY"
+        ):
+            monkeypatch.setattr(cc, "extraction_enrichment_provider", "")
             monkeypatch.setattr(cc, "extraction_plausibility_judge", "off")
 
         model, tokenizer = model_and_tokenizer

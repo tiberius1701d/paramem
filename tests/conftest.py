@@ -139,7 +139,7 @@ def gpu_base_model():
 
     from paramem.models.loader import load_base_model
     from paramem.server.config import load_server_config
-    from paramem.server.vram_guard import safe_empty_cache
+    from paramem.utils.vram_guard import safe_empty_cache
 
     cfg = load_server_config("tests/fixtures/server.yaml")
     model, tokenizer = load_base_model(cfg.model_config)
@@ -206,8 +206,9 @@ def _extraction_trace_scope():
     every :func:`phase_trace` call to fire inside an active
     :func:`extraction_trace` — production runs through ``extract_graph``
     which establishes that scope.  Tests that exercise pipeline
-    internals (``_sota_pipeline``, ``anonymize_with_local_model``, etc.)
-    directly would otherwise trip the "outside an active trace" guard.
+    internals (the ``anonymize``/``enrich`` stage bodies,
+    ``anonymize_transcript``, etc.) directly would otherwise trip
+    the "outside an active trace" guard.
 
     The fixture is no-op when nesting (``extraction_trace`` is
     re-entrant by design — see its docstring), so tests that wrap their

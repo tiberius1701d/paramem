@@ -126,12 +126,12 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
     {
         # --- Test-mode posture: fixture intentionally exercises code paths
         # that the example ships disabled for ship-safety. ----------------
-        "agents.sota.enabled",  # cloud agent ON in tests, OFF in shipped default
-        "agents.sota_providers.anthropic.enabled",
-        "agents.sota_providers.google.enabled",
-        "agents.sota_providers.openai.enabled",
-        "consolidation.extraction_noise_filter",  # SOTA noise filter ON in tests
-        "consolidation.sota_enabled",  # SOTA master gate ON in tests, OFF in shipped default
+        "agents.cloud.enabled",  # cloud agent ON in tests, OFF in shipped default
+        "agents.cloud_providers.anthropic.enabled",
+        "agents.cloud_providers.google.enabled",
+        "agents.cloud_providers.openai.enabled",
+        "consolidation.extraction_enrichment_provider",  # cloud noise filter ON in tests
+        "consolidation.cloud_enabled",  # cloud master gate ON in tests, OFF in shipped default
         "consolidation.refinement_enrichment",  # enrichment ON in tests, OFF in shipped default
         "consolidation.refinement_contradiction",  # "on" in tests, "off" in shipped default
         # ON in tests + live deployment; example ships OFF (default-OFF rollout posture).
@@ -182,7 +182,7 @@ def test_pipeline_critical_values_match():
 
     This is the gate that catches drifts like
     ``extraction_max_tokens=2048`` in the fixture vs ``8192`` in the
-    example — the kind of drift that silently truncates the SOTA
+    example — the kind of drift that silently truncates the cloud
     extraction chain during simulate-mode prompt-engineering iteration
     and produces lower-quality output than production.
 

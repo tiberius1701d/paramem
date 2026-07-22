@@ -12,7 +12,7 @@ Stages:
 
 * ``extract``       — local Mistral.  POST /calibrate/extract
 * ``anonymize``     — local Mistral.  POST /calibrate/anonymize
-* ``enrich``        — SOTA cloud provider.  POST /calibrate/enrich
+* ``enrich``        — cloud provider.  POST /calibrate/enrich
 * ``plausibility``  — local Mistral.  POST /calibrate/plausibility
 
 Usage::
@@ -440,8 +440,8 @@ _STAGE_FILENAME = {
     "extract_user": "extraction.txt",
     "extract_system": "extraction_system.txt",
     "anonymize": "anonymization.txt",
-    "enrich": "sota_enrichment.txt",
-    "plausibility": "sota_plausibility.txt",
+    "enrich": "cloud_enrichment.txt",
+    "plausibility": "cloud_plausibility.txt",
     "normalize_filter": "predicate_normalization.txt",
     "name_user": "name_extraction.txt",
     "name_system": "name_extraction_system.txt",
@@ -539,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             "Forwarded to /calibrate/extract — pipeline returns immediately "
             "after the named phase completes (saves compute when only early "
             "phases need inspection). Valid names: local_extract, "
-            "second_order_extract, anonymize, entity_correction, sota_enrich, "
+            "second_order_extract, anonymize, entity_correction, cloud_enrich, "
             "anon_plausibility, deanon, deanon_plausibility. Default: run "
             "full pipeline."
         ),
@@ -764,7 +764,7 @@ def main(argv: list[str] | None = None) -> int:
                     "transcript": chunk["text"],
                     "session_id": f"calib-chunk-{chunk_idx}",
                     # Same runtime-known speaker name every production
-                    # caller of anonymize_for_cloud threads through — a
+                    # caller of anonymize threads through — a
                     # calibration run that never speaker-seeds diverges
                     # from production fidelity (see
                     # CalibrateAnonymizeRequest.speaker_name docstring).
@@ -782,15 +782,15 @@ def main(argv: list[str] | None = None) -> int:
         if "enrich" in stages and prior_extract is not None and prior_anonymize is not None:
             # /calibrate/anonymize now returns the FULLY-ASSEMBLED
             # artifacts from THE one anonymize chain
-            # (paramem.graph.cloud_egress.anonymize_for_cloud) —
+            # (paramem.cloud.anonymize.anonymize) —
             # status / mapping / anonymized_transcript / forward /
             # reverse / anon_facts / norm_stats.  Fed straight through to
             # /calibrate/enrich; no client-side re-derivation.
             anon_parsed = prior_anonymize.get("parsed") or {}
             # status == "failed" OR a missing/empty `anonymized_transcript`
             # is fail-closed — matches production's abort-on-failure
-            # (`_sota_pipeline`'s `status == "failed"` branch falls back
-            # without ever calling the cloud).  `status == "opted_out"`
+            # (the `anonymize` stage's `status == "failed"` branch falls
+            # back without ever calling the cloud).  `status == "opted_out"`
             # still proceeds to enrich (verbatim facts/transcript), same
             # as production.  Never a truthiness check on a mapping per
             # CLAUDE.md.

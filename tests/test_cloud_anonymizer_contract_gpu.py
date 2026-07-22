@@ -1,13 +1,13 @@
-"""LLM-compliance contract test for ``extract_and_anonymize_for_cloud``.
+"""LLM-compliance contract test for ``anonymize_turn``.
 
 Why this test exists: the helper calls ``extract_graph`` +
-``anonymize_with_local_model`` end-to-end on a real multi-turn
+``anonymize_transcript`` end-to-end on a real multi-turn
 **transcript** -- the same input shape ParaMem operates on in
 production.  Mocked tests cannot catch prompt-compliance regressions;
 only a live model run on production-shaped input can verify the contract.
 
 The cloud anonymizer is the privacy-critical seam between local memory
-and SOTA escalation: when ``sanitization.cloud_mode`` is ``"anonymize"``
+and cloud escalation: when ``sanitization.cloud_mode`` is ``"anonymize"``
 or ``"both"``, this primitive is the only thing standing between
 personal facts and the cloud.  A regression here is not a quality
 issue, it's a privacy breach.
@@ -90,8 +90,8 @@ _DEFAULT_SCRUB = set(_PRODUCTION_DEFAULT_SCRUB)
 
 
 # Fixture transcripts: single-turn user queries — the production input
-# shape ``_escalate_via_cloud_policy`` (paramem/server/inference.py:567)
-# passes to ``extract_and_anonymize_for_cloud`` (the cloud-egress entry
+# shape ``answer_via_cloud`` (paramem/server/inference.py:567)
+# passes to ``anonymize_turn`` (the cloud-egress entry
 # point anonymizes only the current-turn text; conversation history flows
 # separately through ``_sanitize_history``).  Earlier multi-turn
 # ``[user]/[assistant]`` fixtures here were testing a code path the
@@ -100,14 +100,14 @@ _DEFAULT_SCRUB = set(_PRODUCTION_DEFAULT_SCRUB)
 # Each entry carries the user query, the speaker_name and speaker_id the
 # chat handler would have resolved via voice enrollment
 # (``app.py:3593`` threads ``_resolved.speaker_id`` into ``handle_chat``,
-# which threads it unchanged into ``_escalate_via_cloud_policy`` at
-# ``inference.py:643`` and on into ``extract_and_anonymize_for_cloud``),
+# which threads it unchanged into ``answer_via_cloud`` at
+# ``inference.py:643`` and on into ``anonymize_turn``),
 # and the names that appear *in the query text* and MUST therefore be
 # anonymized before the cloud sees the query.
 #
 # ``speaker_id`` is NOT optional here even though the helper's own
 # signature defaults it to ``None`` for text-only requests with no
-# resolved speaker: ``extract_and_anonymize_for_cloud`` threads it into
+# resolved speaker: ``anonymize_turn`` threads it into
 # ``build_speaker_context`` (extractor.py:322), which formats it verbatim
 # into the extraction-prompt speaker directive
 # (configs/prompts/speaker_directive.txt) as "the current speaker's
@@ -139,7 +139,7 @@ _FIXTURE = [
         # Declarative, not interrogative: "What restaurants should I
         # recommend to Alex when they move to Berlin next month?" (the
         # original fixture text) is an interrogative that local_extract
-        # yields ZERO relations for, so extract_and_anonymize_for_cloud
+        # yields ZERO relations for, so anonymize_turn
         # fails closed at the zero-relations gate before the anonymizer
         # ever runs (extractor.py:938-939) — the test named for the
         # anonymizer never reached it. Verified live (2026-07-14,
@@ -224,8 +224,8 @@ def test_cloud_anonymizer_contract(loaded_model):
     personal markers must succeed.  No-personal-markers queries pass
     through (mapping may be empty) and contribute neutrally to the rate.
     """
-    from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
-    from paramem.graph.extractor import extract_and_anonymize_for_cloud
+    from paramem.cloud.deanonymize import CloudScope, deanonymize_text
+    from paramem.graph.flows import anonymize_turn
 
     model, tokenizer = loaded_model
 
@@ -240,7 +240,7 @@ def test_cloud_anonymizer_contract(loaded_model):
         if expected_names:
             expected_personal += 1
 
-        payload = extract_and_anonymize_for_cloud(
+        payload = anonymize_turn(
             transcript,
             model,
             tokenizer,
@@ -284,11 +284,11 @@ def test_cloud_anonymizer_contract(loaded_model):
             )
 
         # Round-trip contract: the production exit gate
-        # (deanonymize_response_text, observed-scoped against the exact
+        # (deanonymize_text, observed-scoped against the exact
         # text sent) restores the original transcript (modulo whitespace,
         # which the anonymizer LLM may reflow).
-        scope = CloudScope.for_response(payload, sota_bindings=None, sent=(anon_text,))
-        round_trip = deanonymize_response_text(scope, anon_text)
+        scope = CloudScope.response(payload, cloud_bindings=None, sent=(anon_text,))
+        round_trip = deanonymize_text(scope, anon_text)
         if round_trip is None or _normalise(round_trip) != _normalise(transcript):
             failures.append(
                 f"[{entry['id']}] Round-trip mismatch:\n"
@@ -331,15 +331,15 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     Operators picking the stricter posture (privacy over cloud-utility
     on places) need this guarantee to hold.
     """
-    from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
-    from paramem.graph.extractor import extract_and_anonymize_for_cloud
+    from paramem.cloud.deanonymize import CloudScope, deanonymize_text
+    from paramem.graph.flows import anonymize_turn
 
     model, tokenizer = loaded_model
 
     entry = next(e for e in _FIXTURE if e["id"] == "person_and_place")
     transcript = entry["transcript"]
 
-    payload = extract_and_anonymize_for_cloud(
+    payload = anonymize_turn(
         transcript,
         model,
         tokenizer,
@@ -353,7 +353,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
         # An empty forward mapping here is a compliance miss regardless
         # of the proceed-on-empty decision (an empty mapping with
         # status == "ok" no longer means "block" — see
-        # extract_and_anonymize_for_cloud): this test specifically
+        # anonymize_turn): this test specifically
         # verifies the wider scrub set actually widens what the model
         # classifies in scope, and it did not.
         reason = (
@@ -373,13 +373,13 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
             f"present in anon_text {anon_text!r}"
         )
 
-    # Round-trip: the production exit gate (deanonymize_response_text,
+    # Round-trip: the production exit gate (deanonymize_text,
     # observed-scoped against the exact text sent) restores the original
     # (modulo whitespace, which the anonymizer LLM may reflow).  Catches
     # a mapping/transcript inconsistency that would silently leave the
     # cloud's response with placeholders the user sees.
-    scope = CloudScope.for_response(payload, sota_bindings=None, sent=(anon_text,))
-    round_trip = deanonymize_response_text(scope, anon_text)
+    scope = CloudScope.response(payload, cloud_bindings=None, sent=(anon_text,))
+    round_trip = deanonymize_text(scope, anon_text)
     assert round_trip is not None and _normalise(round_trip) == _normalise(transcript), (
         f"[{entry['id']}, scrub=person_name+city] Round-trip mismatch:\n"
         f"  original:   {transcript!r}\n"

@@ -206,7 +206,7 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     # The materialize diagnostic is covered in TestMaterializeInterimExtraRelations.
     loop._materialize_consolidation_graph = lambda **kw: (set(), [])
 
-    # Enrichment is off by default (refinement_enrichment="off", sota_enabled=False
+    # Enrichment is off by default (refinement_enrichment="off", cloud_enabled=False
     # in ConsolidationConfig base defaults) — no attribute assignment needed.
     loop.full_consolidation_period_string = ""
 
@@ -967,7 +967,7 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
       - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
       - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
       - ``config`` — minimal ``ConsolidationConfig`` with base defaults
-        (sota_enabled=False, refinement_enrichment="off", refinement_normalization="off")
+        (cloud_enabled=False, refinement_enrichment="off", refinement_normalization="off")
         so enrichment and normalization are suppressed without explicit flags.
 
     All other attributes are left unset; any unintended access will raise
@@ -1326,9 +1326,9 @@ class TestConsolidateSimulateFold:
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
-        # refinement_enrichment="on" + sota_enabled=True so consolidate
+        # refinement_enrichment="on" + cloud_enabled=True so consolidate
         # calls GraphTierRefiner.run_enrichment; base defaults (off/False) would skip it.
-        loop.config = ConsolidationConfig(refinement_enrichment="on", sota_enabled=True)
+        loop.config = ConsolidationConfig(refinement_enrichment="on", cloud_enabled=True)
 
         # Seed one interim slot so there is merged content to coexist with.
         _write_interim_graph(
@@ -1937,7 +1937,7 @@ class TestGraphTierSkipsAfterRelease:
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.output_dir = tmp_path
-        loop.config = ConsolidationConfig(sota_enabled=True)
+        loop.config = ConsolidationConfig(cloud_enabled=True)
         loop.save_cycle_snapshots = False
         loop._debug_base = None
         loop.graph_enrichment_neighborhood_hops = 2
@@ -1959,7 +1959,7 @@ class TestGraphTierSkipsAfterRelease:
             model=loop.model,
             tokenizer=loop.tokenizer,
             extraction_config_provider=loop._current_extraction_config,
-            sota_enabled=loop.config.sota_enabled,
+            cloud_enabled=loop.config.cloud_enabled,
             neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
             max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
             gc_disable=loop._disable_gradient_checkpointing,
@@ -1970,7 +1970,7 @@ class TestGraphTierSkipsAfterRelease:
     def test_normalization_skips_on_released_loop(self, tmp_path):
         """Normalization returns the no_model skip, never touching extraction.
 
-        ``sota_enabled=True`` is deliberate: it is the only branch in the
+        ``cloud_enabled=True`` is deliberate: it is the only branch in the
         normalization pass that reads the extraction config, so a hoisted read
         cannot hide behind a False gate here.
         """

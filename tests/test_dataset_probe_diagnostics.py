@@ -203,7 +203,7 @@ class TestRawFactCountRegression:
         summed into ``raw_fact_count`` exactly once each, never
         overlapping. Anonymized facts are built by the script directly
         from ``graph.relations``, so a placeholder can never glue into a
-        predicate at the anonymize stage; only SOTA's returned delta can
+        predicate at the anonymize stage; only cloud's returned delta can
         introduce that drop, which is why the writer lives at the
         deanon stage."""
         graph = _make_graph(

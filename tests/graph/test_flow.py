@@ -61,10 +61,10 @@ def _make_ctx(**overrides) -> StageContext:
         timestamp=None,
         source_type="transcript",
         validate=False,
-        sota_enabled=False,
-        noise_filter="",
-        noise_filter_model="",
-        noise_filter_endpoint=None,
+        cloud_enabled=False,
+        enrichment_provider="",
+        enrichment_provider_model="",
+        enrichment_provider_endpoint=None,
         plausibility_judge="off",
         plausibility_stage="deanon",
         plausibility_model="",
@@ -266,12 +266,12 @@ class TestSessionExtractWellFormed:
         }
 
     def test_requires_satisfied_by_prior_produces_in_order(self):
-        # Deferred import: SESSION_EXTRACT lives in paramem.graph.extractor,
+        # Deferred import: SESSION_EXTRACT lives in paramem.graph.flows,
         # which (unlike this module) does pull in extraction primitives —
         # kept out of this file's top-level imports so the module docstring's
         # "no extraction primitive" claim stays true for every OTHER test
         # in this file.
-        from paramem.graph.extractor import SESSION_EXTRACT
+        from paramem.graph.flows import SESSION_EXTRACT
 
         available = self._initial_fields()
         for spec in SESSION_EXTRACT:
@@ -288,7 +288,7 @@ class TestSessionExtractWellFormed:
         ``StageState`` field — a typo would otherwise sail through the
         order check as an unsatisfiable requirement or a phantom
         producer."""
-        from paramem.graph.extractor import SESSION_EXTRACT
+        from paramem.graph.flows import SESSION_EXTRACT
 
         known = {f.name for f in dataclasses.fields(StageState)}
         for spec in SESSION_EXTRACT:
@@ -301,7 +301,7 @@ class TestSessionExtractWellFormed:
         whitelist ``phase_trace`` itself enforces at runtime. A stage
         declaring a name ``phase_trace`` would reject is a declaration
         that could never come true."""
-        from paramem.graph.extractor import SESSION_EXTRACT
+        from paramem.graph.flows import SESSION_EXTRACT
         from paramem.graph.phase_trace import PHASE_NAMES
 
         for spec in SESSION_EXTRACT:
@@ -311,17 +311,16 @@ class TestSessionExtractWellFormed:
     def test_every_stage_declares_the_phases_it_opens(self):
         """The declaration is honest for the stages whose bodies open
         more than one phase: ``deanonymize`` opens BOTH the substitution
-        phase and the local judge, and ``sota_pipeline`` opens the four
-        its composite primitive runs. A single-name field could not say
-        either."""
-        from paramem.graph.extractor import SESSION_EXTRACT
+        phase and the local judge, and ``enrich`` opens the three its
+        stage body runs. A single-name field could not say either."""
+        from paramem.graph.flows import SESSION_EXTRACT
 
         declared = {spec.stage: spec.trace_names for spec in SESSION_EXTRACT}
+        assert declared["anonymize"] == ("anonymize",)
         assert declared["deanonymize"] == ("deanon", "deanon_plausibility")
-        assert declared["sota_pipeline"] == (
-            "anonymize",
+        assert declared["enrich"] == (
             "entity_correction",
-            "sota_enrich",
+            "cloud_enrich",
             "anon_plausibility",
         )
         assert declared["rebuild"] == ()

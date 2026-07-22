@@ -162,10 +162,10 @@ def create_consolidation_loop(
         prompts_dir=config.prompts_dir,
         model_name=config.model_name,
         graph_config=config.graph_config,
-        sota_enabled=config.consolidation.sota_enabled,
+        cloud_enabled=config.consolidation.cloud_enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
-        # Same `scrub` knob as inference-time cloud egress: the SOTA
+        # Same `scrub` knob as inference-time cloud egress: the cloud
         # enrichment cycle sends placeholders to the cloud just like the
         # cloud_anonymizer egress path, so the privacy policy must match.
         # The model's anonymizer prompt is the sole scope authority —
@@ -177,9 +177,9 @@ def create_consolidation_loop(
         extraction_correction_entity_types=set(
             config.consolidation.extraction_correction_entity_types
         ),
-        extraction_noise_filter=config.consolidation.extraction_noise_filter,
-        extraction_noise_filter_model=config.consolidation.extraction_noise_filter_model,
-        extraction_noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint,
+        extraction_enrichment_provider=config.consolidation.extraction_enrichment_provider,
+        extraction_enrichment_provider_model=config.consolidation.extraction_enrichment_provider_model,
+        extraction_enrichment_provider_endpoint=config.consolidation.extraction_enrichment_provider_endpoint,
         extraction_plausibility_judge=config.consolidation.extraction_plausibility_judge,
         extraction_plausibility_stage=config.consolidation.extraction_plausibility_stage,
         extraction_plausibility_model=config.consolidation.extraction_plausibility_model,

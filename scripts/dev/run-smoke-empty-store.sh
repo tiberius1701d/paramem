@@ -71,7 +71,7 @@ sed -E \
   -e "s|^(  debug:) +data/ha/debug.*|\1 $STORE_ROOT/debug|" \
   configs/server.yaml > "$TEMP_CONFIG"
 # procedural OFF (smoke facts are episodic); refresh_cadence "" (no full cycle —
-# both stages stay interim); port 8421 (isolation).  debug/early-stop/SOTA stay
+# both stages stay interim); port 8421 (isolation).  debug/early-stop/cloud stay
 # as the shipped config has them.
 "$PY" - "$TEMP_CONFIG" "$PORT" <<'PY'
 import re, sys, pathlib

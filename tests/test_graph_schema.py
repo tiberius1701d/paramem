@@ -23,7 +23,7 @@ class TestEntity:
 
     def test_novel_entity_type_accepted(self):
         # entity_type is open (no Literal enforcement). Novel types from the
-        # SOTA enrichment path — product, certification, program, paper —
+        # cloud enrichment path — product, certification, program, paper —
         # pass through verbatim. The schema YAML's entity_types list is a
         # soft prior used for prompt examples, not closed-set enforcement.
         entity = Entity(name="Honda Legend", entity_type="product")
@@ -32,14 +32,14 @@ class TestEntity:
         assert entity.entity_type == "certification"
 
     def test_all_entity_types(self):
-        from paramem.graph.schema_config import entity_types
+        from paramem.config.taxonomy import entity_types
 
         for etype in entity_types():
             entity = Entity(name="test", entity_type=etype)
             assert entity.entity_type == etype
 
     def test_all_relation_types(self):
-        from paramem.graph.schema_config import relation_types
+        from paramem.config.taxonomy import relation_types
 
         for rtype in relation_types():
             rel = Relation(

@@ -2,7 +2,7 @@
 documented contract hasn't drifted from the algorithms that depend on it.
 
 The extraction pipeline's binding-recovery algorithm assumes a specific
-convention in the SOTA enrichment prompt (existing bare placeholders stay
+convention in the cloud enrichment prompt (existing bare placeholders stay
 bare; only NEW entities get braces). A prompt edit that inverts this — e.g.
 "always emit braced form" — silently breaks de-anonymization and is only
 observed in a full sweep. These tests catch that class of regression at
@@ -16,10 +16,9 @@ import re
 
 import pytest
 
-from paramem.graph.cloud_egress import load_anonymization_prompt
+from paramem.cloud.placeholders import PLACEHOLDER_TOKEN_RE
 from paramem.graph.extractor import build_speaker_context
 from paramem.graph.phase_trace import extraction_trace, phase_trace
-from paramem.graph.placeholders import PLACEHOLDER_TOKEN_RE
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt, prompt_overrides
 
 
@@ -144,13 +143,13 @@ class TestLoadPromptPhaseTraceRecording:
         That fallback must NOT be silent in the phase-trace record: the
         recorded ``path`` is the SHIPPED file and ``sha`` is the shipped
         text's sha — not the (nonexistent) operator-requested file."""
-        shipped_path = _DEFAULT_PROMPT_DIR / "sota_plausibility.txt"
+        shipped_path = _DEFAULT_PROMPT_DIR / "cloud_plausibility.txt"
         shipped_content = shipped_path.read_text().strip()
         expected_sha = hashlib.sha256(shipped_content.encode("utf-8")).hexdigest()[:12]
 
         with extraction_trace() as trace:
             with phase_trace("deanon_plausibility"):
-                _load_prompt("sota_plausibility.txt", prompts_dir=tmp_path)
+                _load_prompt("cloud_plausibility.txt", prompts_dir=tmp_path)
             record = trace.records[-1]
 
         assert record.prompts == [
@@ -171,17 +170,17 @@ class TestLoadPromptPhaseTraceRecording:
         unstripped re-read of the file would produce a different hash and
         fail here.
         """
-        (tmp_path / "sota_plausibility.txt").write_text("  variant text  \n")
+        (tmp_path / "cloud_plausibility.txt").write_text("  variant text  \n")
         expected_sha = hashlib.sha256(b"variant text").hexdigest()[:12]
 
         with extraction_trace() as trace:
             with phase_trace("deanon_plausibility"):
-                _load_prompt("sota_plausibility.txt", prompts_dir=tmp_path)
+                _load_prompt("cloud_plausibility.txt", prompts_dir=tmp_path)
             record = trace.records[-1]
 
         assert record.prompts == [
             {
-                "path": str(tmp_path / "sota_plausibility.txt"),
+                "path": str(tmp_path / "cloud_plausibility.txt"),
                 "sha": expected_sha,
                 "template": "variant text",
             }
@@ -762,7 +761,7 @@ class TestExtractionSecondOrderPromptContract:
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         # Must not raise KeyError — every literal brace pair escaped as
         # `{{` / `}}`.  ``str.format`` itself validates this.
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
@@ -771,17 +770,17 @@ class TestEnrichmentPromptContract:
         assert "{Event_1}" in rendered or "{Prefix_N}" in rendered
 
     def test_preserves_bare_placeholder_convention(self):
-        """The binding-recovery algorithm depends on SOTA leaving existing
+        """The binding-recovery algorithm depends on cloud leaving existing
         bare placeholders bare. Regressing the prompt to 'always emit braced'
         silently breaks de-anonymization.
         """
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         # Must instruct model to leave existing bare placeholders bare.
         # Specifically: not to re-brace incoming Person_1/City_1 tokens.
         keywords = ["bare", "leave", "existing", "NOT re-brace"]
         hits = sum(1 for k in keywords if k.lower() in tmpl.lower())
         assert hits >= 2, (
-            "Enrichment prompt must instruct SOTA to leave existing bare "
+            "Enrichment prompt must instruct cloud to leave existing bare "
             "placeholders bare — otherwise binding recovery records self-"
             "referential junk entries (Person_2 → Person_2) and corrupts "
             "the reverse mapping. Found only keywords: "
@@ -790,14 +789,14 @@ class TestEnrichmentPromptContract:
 
     def test_requires_grounding_of_new_placeholders(self):
         """HARD REQUIREMENT: every braced placeholder used in `add` must
-        have a matching entry in `bindings`. Without this clause, SOTA's
+        have a matching entry in `bindings`. Without this clause, cloud's
         reified entities are dropped wholesale by the residual sweep.
 
         Updated transcript is no longer carried on the wire (delta
         protocol — reconstructed locally from bindings + anon transcript)
         so the contract is now solely "facts ↔ bindings".
         """
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         # Bindings is the grounding contract; the prompt must name it.
         assert "bindings" in tmpl
         # Look for a hard requirement that braced placeholders appear in
@@ -821,7 +820,7 @@ class TestEnrichmentPromptContract:
         company, location, dates) onto a single bound entity rather
         than flattening them as independent triples on the speaker.
 
-        Without this teaching, SOTA emits the bound title once but
+        Without this teaching, cloud emits the bound title once but
         leaves dates / company / location as orphan triples on the
         speaker.  Downstream reasoning over multi-role chronology
         ("what title did the speaker hold in 2015?") then fails because
@@ -831,7 +830,7 @@ class TestEnrichmentPromptContract:
         production graph snapshots (data/ha/debug/run_*/), even though
         the brace-binding contract itself is honoured for ``Event_*``.
         """
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         # Structural assertion: a Role_N braced placeholder must appear
         # in a positive-example block alongside multiple bound facts —
         # at minimum a date attribute and a company/location attribute.
@@ -870,7 +869,7 @@ class TestEnrichmentPromptContract:
         placeholder.  Structural, phrasing-tolerant: the exact wording is
         free to evolve; the pre-return check binding minted tokens to
         ``bindings`` is not."""
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         assert "Before returning" in tmpl, (
             "Enrichment prompt must contain a 'Before returning' self-audit clause."
         )
@@ -898,7 +897,7 @@ class TestEnrichmentPromptContract:
         positional guess this plan retires.  A test that only checked
         the literal substring passed for months while three few-shots
         taught the opposite; this one cannot pass while any block does."""
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         blocks = re.split(r"\n\s*\n", tmpl)
         for block in blocks:
             if "speaker" not in block.lower():
@@ -921,7 +920,7 @@ class TestEnrichmentPromptContract:
         """The 'my wife' / 'my sister's husband' / 'my father' coreference
         few-shots must bind the speaker to 'speaker0' — not a Person_N —
         in the delta they actually emit."""
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         for anchor in (
             '"my wife is also a teacher"',
             '"my sister\'s husband"',
@@ -938,7 +937,7 @@ class TestEnrichmentPromptContract:
         """At least one few-shot must show Person_1 naming someone OTHER
         than the speaker, so the model cannot re-derive 'Person_1 = me'
         positionally even without an explicit rule saying so."""
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         idx = tmpl.index('"we went there last summer"')
         window = tmpl[idx : idx + 400]
         assert "speaker0" in window, "Example must still ground the speaker as speaker0."
@@ -954,11 +953,11 @@ class TestEnrichmentPromptContract:
         hardcoded list of anchors a human happened to think of.  A
         newly-added few-shot with an unbound mint fails this test
         automatically — the exact shape (bare unbound mint) that
-        produced the observed 5-in-1-out data loss: SOTA minting
+        produced the observed 5-in-1-out data loss: Cloud minting
         Person_2/Person_3 with no binding at all.  NEGATIVE/WRONG blocks
         are exempt — they deliberately demonstrate the unbound-mint
         failure as the thing NOT to do."""
-        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         rendered = tmpl.format(transcript="x", facts_json="[]")
         blocks = re.split(r"\n\s*\n", rendered)
         checked_any = False
@@ -971,7 +970,7 @@ class TestEnrichmentPromptContract:
                 # to bind.
                 continue
             # Braced mints only — a bare match here would be an existing
-            # anonymizer placeholder (Person_1), not a new SOTA mint.
+            # anonymizer placeholder (Person_1), not a new cloud mint.
             mints = {m[0] for m in PLACEHOLDER_TOKEN_RE.findall(block) if m[0]}
             for key in mints:
                 checked_any = True
@@ -987,7 +986,7 @@ class TestEnrichmentPromptContract:
 
 class TestPlausibilityPromptContract:
     def test_renders_without_format_errors(self):
-        tmpl = _load_prompt("sota_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
         assert "{transcript}" not in rendered
         assert "{facts_json}" not in rendered
@@ -1011,7 +1010,7 @@ class TestPlausibilityPromptContract:
         Verify each rule's identifying substring still exists so a
         prompt edit that removes a rule is caught at unit-test time.
         """
-        tmpl = _load_prompt("sota_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
         required_rules = [
             "self-loop",  # R1
             "name-swap",  # R2
@@ -1034,7 +1033,7 @@ class TestPlausibilityPromptContract:
         Surface wording — "Default action", "IGNORE", a "## KEEP" header — is
         free to evolve; the keep-by-default semantics and the ordering are not.
         """
-        tmpl = _load_prompt("sota_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
         lower = tmpl.lower()
         # The default action must KEEP the fact (IGNORE), not drop it.
         assert "default action" in lower, (
@@ -1069,7 +1068,7 @@ class TestPlausibilityPromptContract:
         Regressing to "echo every fact" silently re-introduces the
         truncation failure mode, so this assertion locks the contract.
         """
-        tmpl = _load_prompt("sota_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
         # Must specify the drop-index-set object shape.
         assert '"drop"' in tmpl, (
             'Plausibility prompt must specify the drop-set output shape ({"drop": [<index>, ...]}).'
@@ -1162,7 +1161,7 @@ class TestAnonymizationPrompt:
 
     def test_file_based_renders_without_format_errors(self):
         """File-based anonymization.txt must render with all expected kwargs without KeyError."""
-        tmpl = load_anonymization_prompt()
+        tmpl = _load_prompt("anonymization.txt", required=True)
         rendered = self._render(tmpl)
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
@@ -1191,7 +1190,7 @@ class TestAnonymizationPrompt:
         like ``University_1`` / ``Project_1`` and the recovery helper had to
         patch the gap).
         """
-        tmpl = load_anonymization_prompt()
+        tmpl = _load_prompt("anonymization.txt", required=True)
         rendered = self._render(tmpl)
         assert "PascalCase" in rendered or "Prefix" in rendered
         assert "UNIQUE" in rendered or "unique" in rendered
@@ -1571,8 +1570,8 @@ class TestSpeakerDirectiveFile:
         assert "{speaker_id}" not in ctx
         assert "{speaker_name}" not in ctx
 
-    def test_sota_graph_enrichment_contains_speaker_id_note(self):
-        """sota_graph_enrichment.txt must instruct the model that nodes IN
+    def test_cloud_graph_enrichment_contains_speaker_id_note(self):
+        """cloud_graph_enrichment.txt must instruct the model that nodes IN
         SCOPE for the operator's privacy policy are opaque placeholder
         tokens, forbid de-anonymizing/renaming/inventing one, and forbid a
         ``same_as`` pair between two ``speaker{N}`` identifiers.
@@ -1581,28 +1580,28 @@ class TestSpeakerDirectiveFile:
         session-tier anonymizer prompt, where the bare ``speaker{N}``
         anchor is left untouched (it is already anonymous and carries no
         identifying information; see ``graph_enrich.py``'s
-        ``run_graph_enrichment`` docstring and ``SECURITY.md``). Nodes
+        ``enrich_graph`` docstring and ``SECURITY.md``). Nodes
         outside the operator's ``scrub`` categories (e.g. organizations,
         which are not part of the default ``scrub`` — a load-bearing set
         of name / phone / address / online-identity sub-terms) also
         appear verbatim — the prompt must not claim every
         ``subject``/``object`` is a token.
         """
-        tmpl = _load_prompt("sota_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
         lower = tmpl.lower()
         # The note must reference speaker endpoints and the token/system framing.
         assert "speaker" in lower and ("identifier" in lower or "system" in lower), (
-            "sota_graph_enrichment.txt must note that speaker endpoints are "
+            "cloud_graph_enrichment.txt must note that speaker endpoints are "
             "system-generated tokens."
         )
         assert "token" in lower, (
-            "sota_graph_enrichment.txt must describe node names as placeholder tokens."
+            "cloud_graph_enrichment.txt must describe node names as placeholder tokens."
         )
         assert "do not" in lower or "never" in lower, (
-            "sota_graph_enrichment.txt must forbid de-anonymizing, renaming, or inventing tokens."
+            "cloud_graph_enrichment.txt must forbid de-anonymizing, renaming, or inventing tokens."
         )
 
-    def test_sota_graph_enrichment_part1_examples_use_tokens_not_real_names(self):
+    def test_cloud_graph_enrichment_part1_examples_use_tokens_not_real_names(self):
         """Part 1's worked examples must use placeholder tokens, not the
         example real names the prompt used before this contract was wired
         up (Alice/Bob/Acme/Stanford/Portland) — a live cloud call must
@@ -1612,17 +1611,17 @@ class TestSpeakerDirectiveFile:
         under the shipped ``{"person"}`` scope persons are always tokens
         by the time this pass runs, so a person-name example there would
         illustrate an unreachable task. See
-        ``TestSpeakerDirectiveFile::test_sota_graph_enrichment_part2_examples_are_not_person_names``.
+        ``TestSpeakerDirectiveFile::test_cloud_graph_enrichment_part2_examples_are_not_person_names``.
         """
-        tmpl = _load_prompt("sota_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
         part1 = tmpl.split("## Part 1")[1].split("## Part 2")[0]
         for leaked_name in ("Alice", "Bob", "Acme", "Stanford", "Portland"):
             assert leaked_name not in part1, (
-                f"sota_graph_enrichment.txt Part 1 must use placeholder tokens, "
+                f"cloud_graph_enrichment.txt Part 1 must use placeholder tokens, "
                 f"not the real example name {leaked_name!r}."
             )
 
-    def test_sota_graph_enrichment_part2_examples_are_not_person_names(self):
+    def test_cloud_graph_enrichment_part2_examples_are_not_person_names(self):
         """Part 2's SAME_AS examples must be drawn from surfaces this pass
         actually sees — organizations, places, things — never person
         names, since under the shipped ``{"person"}`` scope persons are
@@ -1635,7 +1634,7 @@ class TestSpeakerDirectiveFile:
         Mutation: reintroduce a person-name SAME_AS example (e.g. ``"Yang
         Ming"`` / ``"Mr. Yang"``) in Part 2 -> this test fails.
         """
-        tmpl = _load_prompt("sota_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
         part2 = tmpl.split("## Part 2")[1].split("## Input triples")[0]
         for leaked_person_name in (
             "Yang Ming",
@@ -1649,7 +1648,7 @@ class TestSpeakerDirectiveFile:
             "Sarah",
         ):
             assert leaked_person_name not in part2, (
-                f"sota_graph_enrichment.txt Part 2 must not use the person-name "
+                f"cloud_graph_enrichment.txt Part 2 must not use the person-name "
                 f"example {leaked_person_name!r} — persons are always tokens "
                 f"under the shipped scope; use org/place/thing surfaces instead."
             )

@@ -401,7 +401,7 @@ class TestAbstentionShortCircuit:
                 tokenizer=MagicMock(),
                 config=config,
                 router=self._make_none_match_router(intent=Intent.GENERAL),
-                sota_agent=None,  # no SOTA available either
+                cloud_agent=None,  # no cloud available either
                 speaker_id="spk-abc123",
                 memory_store=_MS(replay_enabled=False),
             )
@@ -428,7 +428,7 @@ class TestAbstentionShortCircuit:
         assert config.abstention.enabled is True
 
         # Make every probe miss so ``layers`` stays empty in _probe_and_reason.
-        # Sanitizer blocks (returns None) which prevents HA / SOTA escalation
+        # Sanitizer blocks (returns None) which prevents HA / cloud escalation
         # and previously dropped through to _base_model_answer.
         with (
             patch(

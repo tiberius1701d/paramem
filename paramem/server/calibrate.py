@@ -21,18 +21,21 @@ Endpoints:
   or /calibrate call); calibrate reaches it via ``loop.extraction`` so
   every flag the production cycle applies is applied here too.  Returns
   the local-only graph (pre-anonymization).
-* ``POST /calibrate/anonymize`` — runs ``anonymize_with_local_model`` on
-  the caller-supplied SessionGraph + transcript, returning the model's
+* ``POST /calibrate/anonymize`` — runs
+  :func:`~paramem.cloud.anonymize.anonymize_transcript` on the
+  caller-supplied SessionGraph + transcript, returning the model's
   ``real_name -> placeholder`` mapping AND its own ``anonymized_transcript``
   rewrite (the model is the sole scope authority) — no facts,
   the anonymizer never authors those.  ``scrub`` is sourced from the
   server's configured ``SanitizationConfig.scrub``, not a request field
   (see :func:`calibrate_anonymize`).
-* ``POST /calibrate/plausibility`` — runs ``local_plausibility_filter``
-  on the caller-supplied fact list + transcript.
-* ``POST /calibrate/enrich`` — runs ``_filter_with_sota`` (the production
-  ``sota_enrich`` stage) on the caller-supplied anonymized fact list +
-  anonymized transcript.  Makes a BILLED call to the configured SOTA
+* ``POST /calibrate/plausibility`` — runs
+  :func:`~paramem.graph.extractor.judge_plausibility` on the
+  caller-supplied fact list + transcript.
+* ``POST /calibrate/enrich`` — runs
+  :func:`~paramem.graph.extractor.request_enrichment` (the production
+  ``cloud_enrich`` stage) on the caller-supplied anonymized fact list +
+  anonymized transcript.  Makes a BILLED call to the configured cloud
   provider (see :func:`calibrate_enrich`).
 
 Returns a uniform shape:
@@ -63,7 +66,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from paramem.graph.phase_trace import PhaseRecord, extraction_trace, phase_trace, stop_at
-from paramem.graph.prompts import _DEFAULT_PROMPT_DIR
+from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 from paramem.server.gpu_lock import gpu_lock_sync
 from paramem.server.session_buffer import SessionBuffer
 
@@ -81,7 +84,7 @@ class CalibrateParams(BaseModel):
     All fields default to ``None`` — the underlying call site uses its
     configured production default for every unset field.  ``seed`` only
     applies to local stages (Anthropic does not accept a seed parameter;
-    SOTA stages report ``seed: null`` in ``params_effective``).  seed
+    Cloud stages report ``seed: null`` in ``params_effective``).  seed
     only affects output at temperature>0; at the default greedy
     temperature 0.0 it is a no-op.
     """
@@ -143,12 +146,13 @@ class CalibrateAnonymizeRequest(BaseModel):
     ``/calibrate/extract`` response.  The transcript is the original
     pre-anon text.
 
-    ``speaker_name`` is threaded straight through to
-    ``anonymize_for_cloud``'s speaker-name seeding (see
-    :func:`~paramem.graph.placeholders._build_anonymization_mapping`) —
+    ``speaker_name`` is threaded straight through to ``anonymize``'s
+    speaker-name seeding (see
+    :func:`~paramem.cloud.placeholders._build_anonymization_mapping`) —
     the same runtime-known speaker display name production always passes
-    (``_sota_pipeline`` at ``extractor.py``).  Omitting it here would
-    silently diverge calibration fidelity from production: a transcript
+    (the ``anonymize`` stage, ``paramem.graph.stage_anonymize``).  Omitting it
+    here would silently diverge calibration fidelity from production: a
+    transcript
     where the anonymizer didn't independently name the speaker would
     leave the speaker's real name un-scrubbed in the fact surface
     calibration then posts to ``/calibrate/enrich`` (a real cloud call).
@@ -167,7 +171,7 @@ class CalibratePlausibilityRequest(BaseModel):
     """Run the plausibility filter on an explicit fact list + transcript.
 
     Facts are real-named (the calibration client typically de-anonymizes
-    the SOTA enrichment output before sending here, mirroring the
+    the cloud enrichment output before sending here, mirroring the
     production deanon-stage call site).
     """
 
@@ -179,7 +183,7 @@ class CalibratePlausibilityRequest(BaseModel):
 
 
 class CalibrateEnrichRequest(BaseModel):
-    """Run the production SOTA enrichment stage on an explicit fact list + transcript.
+    """Run the production cloud enrichment stage on an explicit fact list + transcript.
 
     ``facts`` are the ANONYMIZED facts (the calibration client typically
     takes these — ``parsed["anon_facts"]`` — from a prior
@@ -188,17 +192,17 @@ class CalibrateEnrichRequest(BaseModel):
     transcript, turn-marked the same way every other ``/calibrate/*``
     transcript field is (see :func:`_require_turn_marked_transcript`).
 
-    Runs the PRODUCTION ``sota_enrich`` stage
-    (:func:`paramem.graph.extractor._filter_with_sota`) — the same
-    coreference-resolution + compound-splitting + reification call
-    :func:`~paramem.graph.extractor._sota_pipeline` makes every
-    consolidation cycle. This is a BILLED cloud call to the configured
-    SOTA provider.
+    Runs the PRODUCTION ``cloud_enrich`` stage
+    (:func:`paramem.graph.extractor.request_enrichment`) — the same
+    coreference-resolution + compound-splitting + reification call the
+    ``enrich`` stage (:func:`~paramem.graph.stage_enrich._stage_enrich`) makes
+    every consolidation cycle. This is a BILLED cloud call to the
+    configured cloud provider.
 
     This is the PER-SESSION enrichment stage only (facts + transcript
-    input). It is NOT the graph-level SOTA enrichment
-    (:func:`~paramem.graph.extractor._graph_enrich_with_sota`, prompt
-    ``sota_graph_enrichment.txt``), which runs on the accumulated graph
+    input). It is NOT the graph-level cloud enrichment
+    (:func:`~paramem.graph.extractor.request_graph_enrichment`, prompt
+    ``cloud_graph_enrichment.txt``), which runs on the accumulated graph
     with no transcript and has no calibrate endpoint of its own.
     """
 
@@ -645,7 +649,7 @@ def _run_calibration(
             :func:`_provenance_from_records`).
         state: The live server state dict.
         params: The request's :class:`CalibrateParams`.
-        supports_seed: ``True`` for local stages, ``False`` for SOTA
+        supports_seed: ``True`` for local stages, ``False`` for cloud
             stages (mirrors the existing ``_effective_params`` convention).
 
     Returns:
@@ -884,8 +888,8 @@ def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[s
 
 def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str, Any]:
     """Run THE one anonymize chain
-    (:func:`~paramem.graph.cloud_egress.anonymize_for_cloud`) on an
-    explicit graph + transcript.
+    (:func:`~paramem.cloud.anonymize.anonymize`) on an explicit graph +
+    transcript.
 
     Thin wrapper around :func:`_run_calibration`: ``guard`` performs the
     turn-marking + prompt-file checks (zero inference cost on failure),
@@ -893,9 +897,13 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
     stashes it in a closure-local dict so ``dispatch`` (called after
     ``guard``) can read it back.  Prompt provenance and ``n_input_tokens``
     come from the ``anonymize`` phase record :func:`_run_calibration`
-    opens around ``dispatch`` (the ``load_anonymization_prompt`` /
-    ``_load_prompt`` calls inside ``anonymize_for_cloud`` ->
-    ``anonymize_with_local_model`` record onto it) — never a hand-built
+    opens around ``dispatch`` — ``dispatch`` itself loads
+    ``anonymization.txt``/``anonymization_system.txt`` via
+    :func:`~paramem.graph.prompts._load_prompt` (``paramem.cloud`` loads no
+    prompt file itself — see that package's docstring) BEFORE calling
+    :func:`~paramem.cloud.anonymize.anonymize`, and those loads record
+    onto the same active phase (the contextvar-based provenance sink is
+    call-stack-position-independent) — never a hand-built
     ``prompts=[...]`` literal.
 
     ``scrub`` — the operator's PII-vocabulary hint list, the sole scope
@@ -903,12 +911,13 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
     server's live ``SanitizationConfig.scrub``
     (``state["config"].sanitization.scrub``), the SAME policy knob every
     production call site reads (``ExtractionPipeline.kwargs``,
-    ``extract_and_anonymize_for_cloud``, ``_sota_pipeline``,
-    :func:`~paramem.training.graph_enrich.run_graph_enrichment`).  It is
+    ``anonymize_turn``, the ``anonymize`` stage
+    (``paramem.graph.stage_anonymize``),
+    :func:`~paramem.training.graph_enrich.enrich_graph`).  It is
     deliberately NOT a request field:
     every other ``/calibrate/*`` request injects operator PROMPTS/PARAMS
     (filenames, seed, temperature, ...), never privacy POLICY —
-    :class:`CalibrateExtractRequest` exposes no ``sota_enabled``- or
+    :class:`CalibrateExtractRequest` exposes no ``cloud_enabled``- or
     ``scrub``-equivalent override either.  A per-request override here
     would let calibration silently anonymize against a scope the
     operator never configured on a security-critical egress path.  When
@@ -919,18 +928,18 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
     ``req.speaker_name`` — UNLIKE ``scrub`` — IS an operator-supplied
     request field (see :class:`CalibrateAnonymizeRequest`): it is
     calibration-run metadata (which speaker this transcript belongs to),
-    not privacy policy, and every production caller of ``anonymize_for_
-    cloud`` threads its own runtime-resolved speaker name the same way.
+    not privacy policy, and every production caller of ``anonymize``
+    threads its own runtime-resolved speaker name the same way.
     Omitting it would silently understate calibration fidelity: a
     transcript where the model didn't independently name the speaker
     would leave the speaker's real name un-scrubbed in the fact surface
     a downstream ``/calibrate/enrich`` call (a real cloud call) then
     posts verbatim.
 
-    Reports the full :class:`~paramem.graph.cloud_egress.AnonymizedPayload`
+    Reports the full :class:`~paramem.cloud.anonymize.AnonymizedContract`
     via ``parsed``: ``status`` / ``anonymized_transcript`` / ``forward``
     (the normalized, speaker-seeded table every production caller of
-    ``anonymize_for_cloud`` substitutes through, not the model's raw
+    ``anonymize`` substitutes through, not the model's raw
     pre-normalization guess; the genuinely raw model output is reported
     separately as ``raw_output``/``payload.raw``, so calibration can diff
     the two and see exactly what normalization changed) / ``reverse`` /
@@ -949,8 +958,9 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
       manufacture an apparent success.
     * ``"ok"`` — the model returned both artifacts.
     """
-    from paramem.graph.cloud_egress import anonymize_for_cloud
-    from paramem.graph.schema import SessionGraph
+    from paramem.cloud.anonymize import anonymize
+    from paramem.cloud.placeholders import insert_placeholders
+    from paramem.graph.schema import SessionGraph, facts_from_relations
     from paramem.models.loader import base_model_inference
 
     filename = req.anonymization_prompt_filename or "anonymization.txt"
@@ -974,10 +984,23 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
         tokenizer = state["tokenizer"]
         scrub = set(state["config"].sanitization.scrub)
         graph = resolved["graph"]
+        facts = facts_from_relations(graph.relations)
 
         with base_model_inference(model):
-            payload = anonymize_for_cloud(
-                graph,
+            # ``paramem.cloud`` loads no prompt file itself (see that
+            # package's docstring) — this endpoint is the caller, so it
+            # resolves the templates (honouring the calibration
+            # ``anonymization_prompt_filename`` override) and passes the
+            # text in.  Loaded INSIDE the active "anonymize" phase
+            # (``_run_calibration`` opens it around this whole closure),
+            # so provenance recording is unaffected by where the load
+            # happens in the call stack.
+            anon_prompt = _load_prompt(filename, prompts_dir=req.prompts_dir, required=True)
+            anon_system = _load_prompt(
+                "anonymization_system.txt", prompts_dir=req.prompts_dir, required=True
+            )
+            payload = anonymize(
+                facts,
                 model,
                 tokenizer,
                 transcript=req.transcript,
@@ -985,16 +1008,28 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
                 speaker_name=req.speaker_name,
                 max_tokens=max_tokens,
                 seed=req.params.seed,
-                prompts_dir=req.prompts_dir,
-                prompt_filename=filename,
+                user_prompt_template=anon_prompt,
+                system_prompt=anon_system,
             )
 
+        # Status-gated: ``AnonymizedContract`` carries no built-in
+        # ``anon_facts`` field (every production reader derives it on
+        # demand from its own facts + ``payload.forward``). On a
+        # failed payload ``forward`` is ``{}``, so an UNGATED derivation
+        # here would substitute nothing and put REAL-NAME facts straight
+        # into this REST response field — which previously (when the
+        # field was payload-native) always came back ``[]`` on failure.
+        # Gate on status explicitly rather than relying on ``forward``
+        # happening to be empty.
+        anon_facts = (
+            [] if payload.status == "failed" else insert_placeholders(facts, payload.forward)
+        )
         parsed: dict[str, Any] = {
             "status": payload.status,
             "anonymized_transcript": payload.anon_transcript,
             "forward": dict(payload.forward),
             "reverse": dict(payload.reverse),
-            "anon_facts": payload.anon_facts,
+            "anon_facts": anon_facts,
             "norm_stats": dict(payload.norm_stats),
         }
         return payload.raw, parsed
@@ -1017,18 +1052,18 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
 
     Thin wrapper around :func:`_run_calibration`: ``guard`` performs the
     turn-marking + prompt-file checks (zero inference cost on failure);
-    ``dispatch`` runs :func:`~paramem.graph.extractor.local_plausibility_filter`
+    ``dispatch`` runs :func:`~paramem.graph.extractor.judge_plausibility`
     under ``base_model_inference`` (base weights, matching production).
     Prompt provenance and ``n_input_tokens`` come from the
     ``deanon_plausibility`` phase record :func:`_run_calibration` opens
     around ``dispatch`` — never a hand-built ``prompts=[...]`` literal.
     """
-    from paramem.graph.extractor import local_plausibility_filter
+    from paramem.graph.extractor import judge_plausibility
     from paramem.models.loader import base_model_inference
 
     model = state.get("model")
     tokenizer = state.get("tokenizer")
-    filename = req.plausibility_prompt_filename or "sota_plausibility.txt"
+    filename = req.plausibility_prompt_filename or "cloud_plausibility.txt"
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
@@ -1038,7 +1073,7 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
 
     def dispatch() -> tuple[Any, dict]:
         with base_model_inference(model):
-            kept, raw_output = local_plausibility_filter(
+            kept, raw_output = judge_plausibility(
                 req.facts,
                 req.transcript,
                 model,
@@ -1073,37 +1108,37 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
 
 
 def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]:
-    """Run the production SOTA enrichment stage on an explicit fact list + transcript.
+    """Run the production cloud enrichment stage on an explicit fact list + transcript.
 
-    This calibrates the PER-SESSION ``sota_enrich`` stage
-    (:func:`~paramem.graph.extractor._filter_with_sota`) only — it does
-    NOT reach the separate graph-level SOTA enrichment
-    (:func:`~paramem.graph.extractor._graph_enrich_with_sota`, called
-    from :func:`~paramem.training.graph_enrich.run_graph_enrichment`,
-    prompt ``sota_graph_enrichment.txt``), which has no calibrate
+    This calibrates the PER-SESSION ``cloud_enrich`` stage
+    (:func:`~paramem.graph.extractor.request_enrichment`) only — it does
+    NOT reach the separate graph-level cloud enrichment
+    (:func:`~paramem.graph.extractor.request_graph_enrichment`, called
+    from :func:`~paramem.training.graph_enrich.enrich_graph`,
+    prompt ``cloud_graph_enrichment.txt``), which has no calibrate
     endpoint.
 
     Thin wrapper around :func:`_run_calibration`: ``guard`` performs the
     turn-marking + prompt-file checks (zero inference cost on failure),
     then asks the shared cloud-admission component
-    (:func:`~paramem.utils.cloud_admission.evaluate_cloud_egress`) whether
-    egress is allowed at all — the ``sota_enabled`` master switch being
+    (:func:`~paramem.cloud.admission.evaluate_cloud_egress`) whether
+    egress is allowed at all — the ``cloud_enabled`` master switch being
     off, a missing provider/model, an unset key or a missing endpoint each
     surface as HTTP 400 naming every unmet term, before any cloud call is
     made.  This endpoint is operator-triggered, so it fails LOUDLY where
     the consolidation-cycle sites skip silently. ``dispatch`` runs
-    :func:`~paramem.graph.extractor._filter_with_sota` (the SAME function
-    :func:`~paramem.graph.extractor._sota_pipeline` calls every
-    consolidation cycle) directly — no mirrored cloud-call
+    :func:`~paramem.graph.extractor.request_enrichment` (the SAME function
+    the ``enrich`` stage, :func:`~paramem.graph.stage_enrich._stage_enrich`,
+    calls every consolidation cycle) directly — no mirrored cloud-call
     reimplementation. Prompt provenance and ``n_input_tokens`` come from
-    the ``sota_enrich`` phase record :func:`_run_calibration` opens around
-    ``dispatch`` (``_filter_with_sota`` loads its user prompt at call time
+    the ``cloud_enrich`` phase record :func:`_run_calibration` opens around
+    ``dispatch`` (``request_enrichment`` loads its user prompt at call time
     via ``_load_prompt``, which records onto that phase) — never a
     hand-built ``prompts=[...]`` literal.
 
-    Makes a BILLED cloud call to the configured SOTA provider
-    (``consolidation.extraction_noise_filter`` in ``server.yaml``).
-    ``supports_seed=False`` — matching the SOTA-stage convention in
+    Makes a BILLED cloud call to the configured cloud provider
+    (``consolidation.extraction_enrichment_provider`` in ``server.yaml``).
+    ``supports_seed=False`` — matching the cloud-stage convention in
     :func:`_effective_params`, since the provider APIs this call reaches
     accept no seed parameter.
 
@@ -1111,10 +1146,10 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
     snapshot) for response-shape consistency with every other calibration
     stage, even though the call itself is cloud-side and touches no VRAM.
     """
-    from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, _filter_with_sota
-    from paramem.utils.cloud_admission import evaluate_cloud_egress
+    from paramem.cloud.admission import evaluate_cloud_egress
+    from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, request_enrichment
 
-    filename = req.enrichment_prompt_filename or "sota_enrichment.txt"
+    filename = req.enrichment_prompt_filename or "cloud_enrichment.txt"
     max_tokens = (
         req.params.max_tokens if req.params.max_tokens is not None else _DEFAULT_FILTER_MAX_TOKENS
     )
@@ -1127,19 +1162,19 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
         _ensure_prompt_exists(req.prompts_dir, filename)
         cfg = state["config"]
         verdict = evaluate_cloud_egress(
-            sota_enabled=cfg.consolidation.sota_enabled,
-            provider=cfg.consolidation.extraction_noise_filter,
-            model=cfg.consolidation.extraction_noise_filter_model,
-            endpoint=cfg.consolidation.extraction_noise_filter_endpoint or None,
+            cloud_enabled=cfg.consolidation.cloud_enabled,
+            provider=cfg.consolidation.extraction_enrichment_provider,
+            model=cfg.consolidation.extraction_enrichment_provider_model,
+            endpoint=cfg.consolidation.extraction_enrichment_provider_endpoint or None,
         )
         if not verdict.permitted:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Cloud egress refused for SOTA enrichment: "
+                    "Cloud egress refused for cloud enrichment: "
                     + "; ".join(verdict.gaps)
-                    + ". Fix consolidation.sota_enabled / "
-                    "consolidation.extraction_noise_filter* in server.yaml, or set "
+                    + ". Fix consolidation.cloud_enabled / "
+                    "consolidation.extraction_enrichment_provider* in server.yaml, or set "
                     "the provider's key env var."
                 ),
             )
@@ -1149,7 +1184,7 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
         resolved["api_key"] = verdict.api_key
 
     def dispatch() -> tuple[Any, dict]:
-        facts, updated_transcript, bindings, raw, info = _filter_with_sota(
+        facts, updated_transcript, bindings, raw, info = request_enrichment(
             req.facts,
             resolved["api_key"],
             resolved["provider"],
@@ -1172,10 +1207,10 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
     return _run_calibration(
         stage="enrich",
         entry="standalone",
-        phase="sota_enrich",
+        phase="cloud_enrich",
         guard=guard,
         dispatch=dispatch,
-        input_prompt_phase="sota_enrich",
+        input_prompt_phase="cloud_enrich",
         state=state,
         params=req.params,
         supports_seed=False,
@@ -1396,7 +1431,7 @@ def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
     """Return the params dict the call effectively applied.
 
     ``supports_seed`` distinguishes local stages (where seed is honoured
-    via a scoped torch.Generator) from SOTA stages (where Anthropic's API
+    via a scoped torch.Generator) from cloud stages (where Anthropic's API
     accepts no seed parameter and the field is silently dropped).  The
     response uses this to inform the operator which fields actually
     landed.
@@ -1404,7 +1439,7 @@ def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
     seed threads through all three local stages (extract, anonymize,
     plausibility) via the helpers' ``seed`` parameter forwarded to
     ``generate_answer``.  top_p / top_k are not yet threaded for these
-    stages (documented gap; SOTA stages follow the Anthropic API which
+    stages (documented gap; cloud stages follow the Anthropic API which
     omits them).  The field is reported as-requested for transparency.
     """
     out: dict = {}

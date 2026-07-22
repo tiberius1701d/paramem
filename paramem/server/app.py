@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from paramem.backup.backup import write as backup_write
 from paramem.backup.backup import write_bundle
 from paramem.backup.types import ArtifactKind
+from paramem.cloud.providers import get_cloud_agent
 from paramem.graph.extractor import ExtractionFailed
 from paramem.models.loader import (
     active_adapter_name,
@@ -53,7 +54,6 @@ from paramem.models.loader import (
 from paramem.server import calibrate as calibrate_module
 from paramem.server.active_store_migration import migrate
 from paramem.server.background_trainer import BackgroundTrainer
-from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import (
     DEFAULT_DATA_DIR,
     DEFAULT_SERVER_CONFIG_PATH,
@@ -71,7 +71,7 @@ from paramem.server.incidents import (
 )
 from paramem.server.inference import (
     ChatResult,
-    _escalate_to_sota,
+    _escalate_to_cloud,
     _sanitize_history,
     handle_chat,
 )
@@ -86,15 +86,6 @@ from paramem.server.trial_state import (
     write_trial_marker,
 )
 from paramem.server.voice_pipeline import process_utterance
-from paramem.server.vram_guard import (
-    VramExhausted,
-    apply_process_cap,
-    check_vram_headroom,
-    is_fatal_cuda_fault,
-    safe_empty_cache,
-    vram_measure,
-    vram_scope,
-)
 from paramem.server.vram_predict import predict_base_bytes
 from paramem.server.vram_validator import (
     assess_topology,
@@ -109,6 +100,15 @@ from paramem.utils.identity import canonical as _canonical
 from paramem.utils.identity import is_speaker_id as _is_speaker_id
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 from paramem.utils.paths import find_project_root
+from paramem.utils.vram_guard import (
+    VramExhausted,
+    apply_process_cap,
+    check_vram_headroom,
+    is_fatal_cuda_fault,
+    safe_empty_cache,
+    vram_measure,
+    vram_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +131,8 @@ _state = {
     "user_token_store": None,
     "session_buffer": None,
     "router": None,
-    "sota_agent": None,
-    "sota_providers": {},
+    "cloud_agent": None,
+    "cloud_providers": {},
     "ha_client": None,
     "consolidation_loop": None,
     "memory_store": None,
@@ -214,7 +214,7 @@ class ChatRequest(BaseModel):
     conversation_id: str = "default"
     speaker_embedding: list[float] | None = None  # Voice embedding from STT
     history: list[dict] | None = None
-    route: str | None = None  # Force routing: "ha", "sota", or None (auto)
+    route: str | None = None  # Force routing: "ha", "cloud", or None (auto)
 
 
 class ChatResponse(BaseModel):
@@ -1842,7 +1842,7 @@ def _cuda_liveness_canary() -> None:
     """Force the CUDA context to surface a latent sticky fault.
 
     Runs an UNGUARDED torch.cuda.synchronize() so a poisoned context raises
-    before the 'ready' log is emitted.  Unlike safe_empty_cache (vram_guard.py),
+    before the 'ready' log is emitted.  Unlike safe_empty_cache (paramem.utils.vram_guard),
     which swallows synchronize failures, this propagates the error so the
     lifespan fail-fast handler can act on it BEFORE advertising server-ready.
     No-op when CUDA is unavailable or no model is loaded.
@@ -2753,8 +2753,8 @@ async def chat(request: ChatRequest, http_request: Request):
     auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
 
     # Forced routing — bypass normal routing for direct provider testing.
-    # Supports: "ha", "sota", "sota:anthropic", "sota:openai", "sota:google"
-    if request.route and request.route.startswith(("ha", "sota")):
+    # Supports: "ha", "cloud", "cloud:anthropic", "cloud:openai", "cloud:google"
+    if request.route and request.route.startswith(("ha", "cloud")):
         _speaker_id, speaker = _resolve_speaker(
             request, buffer, _state.get("speaker_store"), auth_speaker_id=auth_speaker_id
         )
@@ -2770,12 +2770,12 @@ async def chat(request: ChatRequest, http_request: Request):
             )
             if response_text is not None:
                 result = ChatResult(text=response_text, escalated=True)
-        elif request.route.startswith("sota"):
+        elif request.route.startswith("cloud"):
             parts = request.route.split(":", 1)
             agent = (
-                _state.get("sota_providers", {}).get(parts[1])
+                _state.get("cloud_providers", {}).get(parts[1])
                 if len(parts) == 2
-                else _state.get("sota_agent")
+                else _state.get("cloud_agent")
             )
             if agent is not None:
                 # Direct provider testing — no anonymization/policy
@@ -2789,7 +2789,7 @@ async def chat(request: ChatRequest, http_request: Request):
                 )
                 result = await loop.run_in_executor(
                     None,
-                    lambda: _escalate_to_sota(
+                    lambda: _escalate_to_cloud(
                         request.text,
                         agent,
                         _state["config"],
@@ -3163,7 +3163,7 @@ async def _run_chat_turn(
     _state["last_chat_time"] = datetime.now(timezone.utc)
     _state["last_chat_monotonic"] = time.monotonic()
 
-    # Cloud-only mode — route via HA graph + SOTA, no local model.
+    # Cloud-only mode — route via HA graph + cloud, no local model.
     if _state["mode"] == "cloud-only":
         _cloud_speaker_store = _state.get("speaker_store")
         _cloud_known_entities: set[str] | None = None
@@ -3180,7 +3180,7 @@ async def _run_chat_turn(
             config=_state["config"],
             router=_state.get("router"),
             ha_client=_state.get("ha_client"),
-            sota_agent=_state.get("sota_agent"),
+            cloud_agent=_state.get("cloud_agent"),
             language=language,
             known_entities=_cloud_known_entities,
             speaker_id=speaker_id,
@@ -3238,7 +3238,7 @@ async def _run_chat_turn(
                 tokenizer=_state["tokenizer"],
                 config=_state["config"],
                 router=_state["router"],
-                sota_agent=_state.get("sota_agent"),
+                cloud_agent=_state.get("cloud_agent"),
                 ha_client=_state.get("ha_client"),
                 language=language,
                 # Active-store migration override: when a mode-switch is in
@@ -5070,7 +5070,7 @@ def _build_config_derived_state(
     2. speaker_store (+ embedding model)  — ``full_rebuild=True`` only.
     3. STT/TTS managers: construct fresh from ``config`` → flip voice_box
        — ``full_rebuild=True`` only.
-    4. sota_agent + sota_providers  — ``full_rebuild=True`` only.
+    4. cloud_agent + cloud_providers  — ``full_rebuild=True`` only.
     5. ha_client (close old → construct new) + ha_graph
        — ``full_rebuild=True`` only.
     6. memory store preload (``_preload_memory_store``) → assign
@@ -5100,7 +5100,7 @@ def _build_config_derived_state(
         components (steps 1–9 above).
         When ``False`` (plain ``/gpu/acquire`` + auto-reclaim same config):
         skip the expensive, potentially network-touching steps (speaker_store,
-        STT/TTS construction, sota_agent, ha_client reconnect, exemplar banks,
+        STT/TTS construction, cloud_agent, ha_client reconnect, exemplar banks,
         language_tracker).  Only steps 6 (memory-store probe, re-probe-gated) and 7
         (Router re-point) are run, plus ``set_classifier_model`` to register
         the freshly reloaded model handle (step 8 partial).  This avoids
@@ -5269,24 +5269,24 @@ def _build_config_derived_state(
         _state["voice_profile"] = "cpu" if cloud_only else "gpu"
         logger.info("Voice pipeline profile: %r", _state["voice_profile"])
 
-        # ── 4. SOTA agent + providers ─────────────────────────────────────────
-        _state["sota_agent"] = get_cloud_agent(config.sota_agent)
-        if _state["sota_agent"]:
+        # ── 4. Cloud agent + providers ─────────────────────────────────────────
+        _state["cloud_agent"] = get_cloud_agent(config.cloud_agent)
+        if _state["cloud_agent"]:
             logger.info(
-                "SOTA agent: %s (%s)",
-                config.sota_agent.provider,
-                config.sota_agent.model,
+                "cloud agent: %s (%s)",
+                config.cloud_agent.provider,
+                config.cloud_agent.model,
             )
         else:
-            logger.info("SOTA agent: not configured")
+            logger.info("cloud agent: not configured")
 
-        _state["sota_providers"] = {}
-        for name, provider_config in config.sota_providers.items():
+        _state["cloud_providers"] = {}
+        for name, provider_config in config.cloud_providers.items():
             agent = get_cloud_agent(provider_config)
             if agent:
-                _state["sota_providers"][name] = agent
-                logger.info("SOTA provider registered: %s (%s)", name, provider_config.model)
-        logger.info("SOTA providers available: %s", list(_state["sota_providers"].keys()))
+                _state["cloud_providers"][name] = agent
+                logger.info("cloud provider registered: %s (%s)", name, provider_config.model)
+        logger.info("cloud providers available: %s", list(_state["cloud_providers"].keys()))
 
         # ── 5. HA client + ha_graph ──────────────────────────────────────────
         # Mandatory teardown: HAClient holds an httpx.Client pool.
@@ -5326,7 +5326,7 @@ def _build_config_derived_state(
         # and ha_graph — config did not change, no network reconnect needed.
         ha_graph = _state.get("ha_graph")
         logger.info(
-            "_build_config_derived_state: plain reclaim — skipping STT/TTS/HA/SOTA/exemplar "
+            "_build_config_derived_state: plain reclaim — skipping STT/TTS/HA/cloud/exemplar "
             "rebuild (full_rebuild=False, same config)"
         )
 
@@ -5594,7 +5594,7 @@ def _live_reload_base_model(
       ``app.py:3196``) and keeps the default ``lock_held=False``.
     - Must accept ~25-30 s of model-load latency. Mode is flipped to
       cloud-only for the duration so any concurrent /chat handler
-      routes to SOTA rather than crashing on a None model.
+      routes to cloud rather than crashing on a None model.
 
     Parameters
     ----------
@@ -5805,7 +5805,7 @@ def _live_reload_base_model(
             # full_rebuild=False — plain reclaim rebuilds only the memory
             # store (re-probe-gated), Router (re-point at warm store), and
             # set_classifier_model (re-register the new model handle).
-            # STT/TTS construction, HA reconnect, sota_agent, exemplar banks,
+            # STT/TTS construction, HA reconnect, cloud_agent, exemplar banks,
             # and language_tracker are skipped (same config, no delta).
             _build_config_derived_state(
                 config,
@@ -6973,7 +6973,7 @@ async def debug_probe(request: DebugProbeRequest):
             config=config,
             router=_state.get("router"),
             ha_client=_state.get("ha_client"),
-            sota_agent=_state.get("sota_agent"),
+            cloud_agent=_state.get("cloud_agent"),
             language=detected_language,
             known_entities=_cloud_known_entities2,
             speaker_id=request.speaker_id,
@@ -7005,7 +7005,7 @@ async def debug_probe(request: DebugProbeRequest):
                 tokenizer=_state["tokenizer"],
                 config=config,
                 router=_state["router"],
-                sota_agent=_state.get("sota_agent"),
+                cloud_agent=_state.get("cloud_agent"),
                 ha_client=_state.get("ha_client"),
                 language=detected_language,
                 effective_mode=_state.get("effective_mode"),
@@ -11783,19 +11783,19 @@ def _cloud_only_route(
     config,
     router=None,
     ha_client=None,
-    sota_agent=None,
+    cloud_agent=None,
     language: str | None = None,
     known_entities: "set[str] | None" = None,
     speaker_id: str | None = None,
 ) -> ChatResult:
     """Route queries when the local model is unavailable (cloud-only mode).
 
-    HA first (has tools for weather, time, devices), SOTA as fallback
+    HA first (has tools for weather, time, devices), cloud as fallback
     for reasoning. Mutual fallback: if one fails, try the other.
 
     ``known_entities`` is the set of household display names in their stored
     (real) case — the sanitizer's known-entity scrub matches exact-case.
-    Passed to ``sanitize_for_cloud`` and ``_escalate_to_sota`` so that a
+    Passed to ``sanitize_for_cloud`` and ``_escalate_to_cloud`` so that a
     household name typed directly by the user (e.g. "Where does Alex live?")
     is recognised as personal content and redacted under ``cloud_mode=anonymize``.
 
@@ -11804,12 +11804,12 @@ def _cloud_only_route(
     first-person detector fires on this channel — consistent with the other
     three ``_sanitize_history`` call sites (``app.py``'s forced-routing
     debug path and both branches of ``inference.py``'s
-    ``_escalate_via_cloud_policy``).
+    ``answer_via_cloud``).
     """
     from paramem.server.sanitizer import sanitize_for_cloud
 
     # Cloud-only: no local model for PA probing.
-    # HA first (has tools for weather, time, devices), SOTA as fallback.
+    # HA first (has tools for weather, time, devices), cloud as fallback.
 
     # Try HA conversation agent — it has tools and real-time data
     # Language passed via HA's native conversation API parameter
@@ -11825,31 +11825,31 @@ def _cloud_only_route(
         if response_text is not None:
             logger.info("Cloud-only route: HA agent responded")
             return ChatResult(text=response_text, escalated=True)
-        logger.info("Cloud-only route: HA agent failed, trying SOTA")
+        logger.info("Cloud-only route: HA agent failed, trying cloud")
 
-    # HA failed or unavailable → try SOTA for reasoning
-    if sota_agent is not None:
+    # HA failed or unavailable → try cloud for reasoning
+    if cloud_agent is not None:
         sanitized, _ = sanitize_for_cloud(
             text, mode=config.sanitization.mode, known_entities=known_entities
         )
         if sanitized is not None:
-            logger.info("Cloud-only route: escalating to SOTA")
+            logger.info("Cloud-only route: escalating to cloud")
             sanitized_history = _sanitize_history(
                 history,
                 mode=config.sanitization.mode,
                 known_entities=known_entities,
                 speaker_id=speaker_id,
             )
-            result = _escalate_to_sota(
+            result = _escalate_to_cloud(
                 sanitized,
-                sota_agent,
+                cloud_agent,
                 config,
                 speaker=speaker,
                 sanitized_history=sanitized_history,
                 language=language,
             )
             if result.text:
-                logger.info("Cloud-only route: SOTA responded")
+                logger.info("Cloud-only route: Cloud responded")
                 return result
 
     logger.warning("Cloud-only route: all services failed")
@@ -13128,9 +13128,11 @@ def _run_extraction_phase(
                 session_id,
                 speaker_id=session_speaker_id,
                 speaker_name=speaker_name,
-                noise_filter=config.consolidation.extraction_noise_filter,
-                noise_filter_model=config.consolidation.extraction_noise_filter_model,
-                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
+                enrichment_provider=config.consolidation.extraction_enrichment_provider,
+                enrichment_provider_model=config.consolidation.extraction_enrichment_provider_model,
+                enrichment_provider_endpoint=(
+                    config.consolidation.extraction_enrichment_provider_endpoint or None
+                ),
                 plausibility_judge=config.consolidation.extraction_plausibility_judge,
                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
                 source_type=session.get("source_type", "transcript"),
@@ -13255,7 +13257,7 @@ def _run_extraction_phase(
         # phase label.  The trial-path outer lock already serialises GPU access
         # for this synchronous call, so vram_scope adds only the phase label and
         # empty_cache discipline — not a new lock.
-        from paramem.server.vram_guard import vram_scope as _vram_scope
+        from paramem.utils.vram_guard import vram_scope as _vram_scope
 
         with _vram_scope("training"):
             train_result = loop.run_consolidation_cycle(
@@ -13739,9 +13741,9 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                         session_id,
                         speaker_id=session_speaker_id,
                         speaker_name=speaker_name,
-                        noise_filter=config.consolidation.extraction_noise_filter,
-                        noise_filter_model=config.consolidation.extraction_noise_filter_model,
-                        noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
+                        enrichment_provider=config.consolidation.extraction_enrichment_provider,
+                        enrichment_provider_model=config.consolidation.extraction_enrichment_provider_model,
+                        enrichment_provider_endpoint=config.consolidation.extraction_enrichment_provider_endpoint
                         or None,
                         plausibility_judge=config.consolidation.extraction_plausibility_judge,
                         plausibility_stage=config.consolidation.extraction_plausibility_stage,

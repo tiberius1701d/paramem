@@ -16,7 +16,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from paramem.server.vram_guard import (
+from paramem.utils.vram_guard import (
     DEFAULT_PROCESS_FRACTION,
     VramExhausted,
     apply_process_cap,
@@ -28,25 +28,25 @@ from paramem.server.vram_guard import (
 
 class TestApplyProcessCap:
     def test_no_op_when_cuda_unavailable(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=False):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=False):
             with patch(
-                "paramem.server.vram_guard.torch.cuda.set_per_process_memory_fraction"
+                "paramem.utils.vram_guard.torch.cuda.set_per_process_memory_fraction"
             ) as cap:
                 apply_process_cap()
         cap.assert_not_called()
 
     def test_default_fraction_applied_on_cuda(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
             with patch(
-                "paramem.server.vram_guard.torch.cuda.set_per_process_memory_fraction"
+                "paramem.utils.vram_guard.torch.cuda.set_per_process_memory_fraction"
             ) as cap:
                 apply_process_cap()
         cap.assert_called_once_with(DEFAULT_PROCESS_FRACTION, device=0)
 
     def test_explicit_fraction_and_device_passed_through(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
             with patch(
-                "paramem.server.vram_guard.torch.cuda.set_per_process_memory_fraction"
+                "paramem.utils.vram_guard.torch.cuda.set_per_process_memory_fraction"
             ) as cap:
                 apply_process_cap(fraction=0.7, device=1)
         cap.assert_called_once_with(0.7, device=1)
@@ -54,22 +54,22 @@ class TestApplyProcessCap:
 
 class TestVramScope:
     def test_no_op_when_cuda_unavailable(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=False):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=False):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache") as empty:
                 with vram_scope("s001"):
                     pass
         empty.assert_not_called()
 
     def test_empty_cache_called_on_clean_exit(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache") as empty:
                 with vram_scope("s001"):
                     pass
         empty.assert_called_once_with()
 
     def test_oom_converted_to_vram_exhausted(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted) as info:
                     with vram_scope("s042"):
                         raise torch.cuda.OutOfMemoryError("simulated")
@@ -79,8 +79,8 @@ class TestVramScope:
         assert isinstance(info.value.__cause__, torch.cuda.OutOfMemoryError)
 
     def test_empty_cache_called_on_oom(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache") as empty:
                 with pytest.raises(VramExhausted):
                     with vram_scope("s042"):
                         raise torch.cuda.OutOfMemoryError("simulated")
@@ -90,8 +90,8 @@ class TestVramScope:
     def test_non_oom_exception_propagates_unchanged(self):
         # Use a plain RuntimeError whose message does NOT match any
         # CUDA-driver-fault marker — the widened catch must let it pass.
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache") as empty:
                 with pytest.raises(RuntimeError, match="not an OOM"):
                     with vram_scope("s003"):
                         raise RuntimeError("not an OOM")
@@ -113,8 +113,8 @@ class TestVramScope:
         so ``last_consolidation_error`` populates and the cycle aborts
         cleanly.
         """
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted) as info:
                     with vram_scope("plaus_filter"):
                         raise RuntimeError(marker_message)
@@ -122,8 +122,8 @@ class TestVramScope:
         assert isinstance(info.value.__cause__, RuntimeError)
 
     def test_empty_cache_called_on_cuda_driver_fault(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache") as empty:
                 with pytest.raises(VramExhausted):
                     with vram_scope("plaus_filter"):
                         raise RuntimeError("CUDA driver error: device not ready")
@@ -131,9 +131,9 @@ class TestVramScope:
         assert empty.call_count >= 1
 
     def test_empty_cache_failure_is_swallowed(self):
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
             with patch(
-                "paramem.server.vram_guard.torch.cuda.empty_cache",
+                "paramem.utils.vram_guard.torch.cuda.empty_cache",
                 side_effect=RuntimeError("boom"),
             ):
                 # Clean path: empty_cache failure must not break the context manager.
@@ -148,16 +148,16 @@ class TestCheckVramHeadroom:
 
     def test_no_op_when_cuda_unavailable(self):
         state: dict = {}
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=False):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=False):
             check_vram_headroom("s001", self._HEADROOM, state)
         assert "vram_low_headroom_warning" not in state
 
     def test_silent_when_free_above_threshold(self):
         state: dict = {}
         with (
-            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch(
-                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
                 return_value=(3 * 2**30, 8 * 2**30),
             ),
         ):
@@ -167,9 +167,9 @@ class TestCheckVramHeadroom:
     def test_populates_state_when_below_threshold(self):
         state: dict = {}
         with (
-            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch(
-                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
                 return_value=(1 * 2**30, 8 * 2**30),  # 1 GiB free < 1.5 GiB headroom
             ),
         ):
@@ -186,9 +186,9 @@ class TestCheckVramHeadroom:
         """The contract: warn, do NOT abort. vram_scope is the actual OOM catch."""
         state: dict = {}
         with (
-            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch(
-                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
                 return_value=(64 * 2**20, 8 * 2**30),  # 64 MiB free — well below
             ),
         ):
@@ -199,9 +199,9 @@ class TestCheckVramHeadroom:
         """Driver fault on mem_get_info is dropped — vram_scope handles real OOM."""
         state: dict = {}
         with (
-            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch(
-                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
                 side_effect=RuntimeError("driver unhealthy"),
             ),
         ):
@@ -211,9 +211,9 @@ class TestCheckVramHeadroom:
     def test_state_optional(self):
         """When no state dict is passed, function still runs (logs only, no state)."""
         with (
-            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
             patch(
-                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
                 return_value=(1 * 2**30, 8 * 2**30),
             ),
         ):
@@ -305,8 +305,8 @@ class TestConsolidationIntegration:
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, "conv-vram-1", "speaker7")
 
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted):
                     self._call_run_extraction_phase(loop, config, buffer)
 
@@ -325,8 +325,8 @@ class TestConsolidationIntegration:
         buffer.append("conv-vram-2b", "user", "Second session")
         buffer.append("conv-vram-2b", "assistant", "Reply")
 
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted):
                     self._call_run_extraction_phase(loop, config, buffer)
 
@@ -371,8 +371,8 @@ class TestConsolidationIntegration:
         config.consolidation.mode = "train"
         buffer = self._make_session_buffer(tmp_path, "conv-vram-train-1", "speaker7")
 
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted) as exc_info:
                     self._call_run_extraction_phase(loop, config, buffer)
 
@@ -399,8 +399,8 @@ class TestConsolidationIntegration:
         config.consolidation.mode = "train"
         buffer = self._make_session_buffer(tmp_path, "conv-vram-train", "speaker7")
 
-        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
-            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+        with patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.utils.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted) as exc_info:
                     self._call_run_extraction_phase(loop, config, buffer)
 
@@ -614,7 +614,7 @@ class TestPerChunkOOMSkip:
         loop.config = MagicMock()
         loop.config.indexed_key_replay = False
 
-        from paramem.server.vram_guard import VramExhausted as _Exh
+        from paramem.utils.vram_guard import VramExhausted as _Exh
 
         def _extract(transcript, sid, **kwargs):
             if sid == "doc-aaa":
@@ -716,7 +716,7 @@ class TestPerChunkOOMSkip:
 class TestExtractionFailedAbortsCycle:
     """ExtractionFailed in any chunk aborts the WHOLE cycle.
 
-    Extraction failure (including SOTA-enrichment HTTP 529) must FAIL the entire
+    Extraction failure (including cloud-enrichment HTTP 529) must FAIL the entire
     cycle — sessions/graph stay pending, retry scheduled; silently keeping
     pre-enrichment facts would bake degraded triples into the cumulative graph
     permanently.
@@ -763,7 +763,7 @@ class TestExtractionFailedAbortsCycle:
 
         def _extract(transcript, sid, **kwargs):
             if sid == "doc-bbb":
-                raise ExtractionFailed("sota_enrich", "cloud 529")
+                raise ExtractionFailed("cloud_enrich", "cloud 529")
             return ([], [])
 
         loop.extract_session = MagicMock(side_effect=_extract)
@@ -771,7 +771,7 @@ class TestExtractionFailedAbortsCycle:
         return config, buffer, loop
 
     def test_extraction_failed_aborts_remainder_and_keeps_all_sessions_pending(self, tmp_path):
-        """A SOTA-enrich ExtractionFailed on chunk #2 must:
+        """A cloud-enrich ExtractionFailed on chunk #2 must:
 
         - prevent chunk #3 from being extracted (cycle aborts mid-loop)
         - leave NO chunk marked consolidated, including chunk #1 which
@@ -847,7 +847,7 @@ class TestExtractionFailedAbortsCycle:
             assert "doc-bbb" in failure_ids
             for f in failures:
                 if f["session_id"] == "doc-bbb":
-                    assert f["phase"] == "sota_enrich"
+                    assert f["phase"] == "cloud_enrich"
                     assert "529" in f["reason"]
 
             # Extraction failure recorded as a durable incident.
@@ -861,7 +861,7 @@ class TestExtractionFailedAbortsCycle:
             inc = ef_incidents[0]
             assert inc.detail["type"] == "extraction_failed"
             assert inc.detail["session_id"] == "doc-bbb"
-            assert inc.detail["phase"] == "sota_enrich"
+            assert inc.detail["phase"] == "cloud_enrich"
 
             # Consolidating flag cleared.
             assert app_module._state["consolidating"] is False
@@ -919,7 +919,7 @@ class TestIsFatalCudaFault:
 
         Monkeypatches torch to simulate an older torch build without AcceleratorError.
         """
-        import paramem.server.vram_guard as vg
+        import paramem.utils.vram_guard as vg
 
         orig_getattr = getattr(torch, "AcceleratorError", None)
         try:

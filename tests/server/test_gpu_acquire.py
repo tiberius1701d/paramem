@@ -709,7 +709,7 @@ def test_plain_reclaim_does_not_rebuild_stt_tts_or_ha_client():
     kwargs = build_kwargs_log[0]
     assert kwargs["full_rebuild"] is False, (
         "plain reclaim must pass full_rebuild=False to _build_config_derived_state "
-        "so STT/TTS/HA/SOTA/exemplar rebuild is skipped (correction S1)"
+        "so STT/TTS/HA/cloud/exemplar rebuild is skipped (correction S1)"
     )
     assert kwargs["rebuild_session_buffer"] is False, (
         "plain reclaim must not rebuild the session buffer (no session-config delta)"

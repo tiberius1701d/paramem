@@ -10,7 +10,7 @@ Covers:
     T2b — fold workers (_run_interim_training / _run_full_cycle — source
            structural assertions, since both are nested closures)
     T2c — inference local-PA path (handle_chat PERSONAL branch)
-    T2c neg — HA/SOTA-routed request does NOT call the inference gate
+    T2c neg — HA/cloud-routed request does NOT call the inference gate
 
 All tests run CPU-only — no model loading or GPU required.
 """
@@ -343,7 +343,7 @@ class TestFoldWorkerCooldownOrder:
 
 
 class TestInferenceCooldownGate:
-    """Inference gate fires for PERSONAL-routed requests and is absent for HA/SOTA routes."""
+    """Inference gate fires for PERSONAL-routed requests and is absent for HA/cloud routes."""
 
     @staticmethod
     def _make_config(tmp_path):
@@ -461,8 +461,8 @@ class TestInferenceCooldownGate:
             f"got args={captured[0]}"
         )
 
-    def test_ha_sota_routed_request_does_not_call_inference_gate(self, tmp_path):
-        """HA/SOTA-routed (GENERAL intent) request must NOT call the inference cooldown gate."""
+    def test_ha_cloud_routed_request_does_not_call_inference_gate(self, tmp_path):
+        """HA/cloud-routed (GENERAL intent) request must NOT call the inference cooldown gate."""
         from paramem.server.inference import ChatResult, handle_chat
 
         config = self._make_config(tmp_path)
@@ -501,6 +501,6 @@ class TestInferenceCooldownGate:
             )
 
         assert not cooldown_calls, (
-            "Inference cooldown gate must NOT fire for HA/SOTA-routed (non-PERSONAL) requests; "
+            "Inference cooldown gate must NOT fire for HA/cloud-routed (non-PERSONAL) requests; "
             f"got {len(cooldown_calls)} call(s)"
         )

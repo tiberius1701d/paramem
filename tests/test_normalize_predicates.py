@@ -10,9 +10,9 @@ Verifies:
 - clusters with <2 grounded members are dropped
 - parse failure yields no clusters (never deletes)
 - gradient_checkpointing is always re-enabled even when generate_answer raises
-- SOTA branch: _sota_call receives raw (non-chat-templated) prompt
-- SOTA branch: None return from _sota_call is a no-op (no cluster, no deletion)
-- SOTA branch: apply_chat_template / generate_answer are NOT used on SOTA path
+- Cloud branch: _cloud_call receives raw (non-chat-templated) prompt
+- Cloud branch: None return from _cloud_call is a no-op (no cluster, no deletion)
+- Cloud branch: apply_chat_template / generate_answer are NOT used on cloud path
 """
 
 from __future__ import annotations
@@ -234,23 +234,23 @@ class TestGroundingGuard:
 
 
 # ---------------------------------------------------------------------------
-# SOTA branch tests
+# cloud branch tests
 # ---------------------------------------------------------------------------
 
 
-class TestSotaBranch:
-    """normalize_predicates SOTA path: _sota_call receives raw prompt,
+class TestCloudBranch:
+    """normalize_predicates cloud path: _cloud_call receives raw prompt,
     generate_answer/apply_chat_template are NOT used, None return is a no-op."""
 
-    _SOTA_CFG = {
+    _CLOUD_CFG = {
         "api_key": "sk-test",
         "provider": "anthropic",
         "filter_model": "claude-sonnet-4-6",
         "endpoint": None,
     }
 
-    def test_sota_call_receives_raw_prompt(self):
-        """On the SOTA branch _sota_call receives the RAW rendered prompt —
+    def test_cloud_call_receives_raw_prompt(self):
+        """On the cloud branch _cloud_call receives the RAW rendered prompt —
         no chat template wrapping, no [INST] markers."""
         import json
         from unittest.mock import patch
@@ -260,17 +260,17 @@ class TestSotaBranch:
             {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
         ]
         cluster_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
-        with patch("paramem.graph.extractor._sota_call", return_value=cluster_raw) as mock_sota:
+        with patch("paramem.graph.extractor._cloud_call", return_value=cluster_raw) as mock_cloud:
             clusters_by_so, diag = normalize_predicates(
                 relations,
-                sota=self._SOTA_CFG,
+                cloud=self._CLOUD_CFG,
             )
 
-        assert mock_sota.called, "_sota_call must be invoked on the SOTA path"
-        actual_prompt = mock_sota.call_args[0][0]
+        assert mock_cloud.called, "_cloud_call must be invoked on the cloud path"
+        actual_prompt = mock_cloud.call_args[0][0]
         # Raw rendered: the filter prompt with predicates_json substituted.
         assert "{predicates_json}" not in actual_prompt, (
-            "Slot must be filled before passing to _sota_call"
+            "Slot must be filled before passing to _cloud_call"
         )
         # No chat-template markers — this is a raw string, not a formatted chat.
         assert "[INST]" not in actual_prompt
@@ -282,8 +282,8 @@ class TestSotaBranch:
         assert key in clusters_by_so
         assert diag["model_calls"] == 1
 
-    def test_sota_none_return_is_noop(self):
-        """_sota_call returning None (network / parse failure) must leave
+    def test_cloud_none_return_is_noop(self):
+        """_cloud_call returning None (network / parse failure) must leave
         clusters_by_so empty and never trigger any deletion."""
         from unittest.mock import patch
 
@@ -291,10 +291,10 @@ class TestSotaBranch:
             {"subject": "Jordan", "predicate": "works_for", "object": "TechCo"},
             {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
         ]
-        with patch("paramem.graph.extractor._sota_call", return_value=None):
+        with patch("paramem.graph.extractor._cloud_call", return_value=None):
             clusters_by_so, diag = normalize_predicates(
                 relations,
-                sota=self._SOTA_CFG,
+                cloud=self._CLOUD_CFG,
             )
 
         assert clusters_by_so == {}, "None return must produce no clusters"
@@ -302,8 +302,8 @@ class TestSotaBranch:
         # model_calls is NOT incremented for a None return (raw_outputs gets "").
         assert diag["model_calls"] == 0
 
-    def test_sota_path_does_not_use_local_model(self):
-        """On the SOTA branch apply_chat_template and generate_answer must not
+    def test_cloud_path_does_not_use_local_model(self):
+        """On the cloud branch apply_chat_template and generate_answer must not
         be called — the local model is not consulted."""
         import json
         from unittest.mock import MagicMock, patch
@@ -315,16 +315,16 @@ class TestSotaBranch:
         fake_tokenizer = MagicMock()
         cluster_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
         with (
-            patch("paramem.graph.extractor._sota_call", return_value=cluster_raw),
+            patch("paramem.graph.extractor._cloud_call", return_value=cluster_raw),
             patch(
                 "paramem.graph.extractor.generate_answer",
-                side_effect=AssertionError("generate_answer must not be called on SOTA path"),
+                side_effect=AssertionError("generate_answer must not be called on cloud path"),
             ),
         ):
-            # Pass a tokenizer; the SOTA path must ignore it.
+            # Pass a tokenizer; the cloud path must ignore it.
             normalize_predicates(
                 relations,
-                sota=self._SOTA_CFG,
+                cloud=self._CLOUD_CFG,
             )
 
         fake_tokenizer.apply_chat_template.assert_not_called()

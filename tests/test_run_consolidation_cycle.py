@@ -82,9 +82,9 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
         config=ExtractionConfig(
             temperature=0.0,
             max_tokens=256,
-            noise_filter="",
-            noise_filter_model="",
-            noise_filter_endpoint=None,
+            enrichment_provider="",
+            enrichment_provider_model="",
+            enrichment_provider_endpoint=None,
             plausibility_judge="off",
             plausibility_stage="deanon",
             scrub={"person name"},
@@ -118,7 +118,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     _real_graph.add_edge("subject2", "object2", predicate="knows", relation_type="factual")
     loop.merger.graph = _real_graph
     # Graph-enrichment knobs. Default neighborhood hops for these unit tests.
-    # Enrichment is off by default (refinement_enrichment="off", sota_enabled=False in
+    # Enrichment is off by default (refinement_enrichment="off", cloud_enabled=False in
     # ConsolidationConfig base defaults) so GraphTierRefiner.run_enrichment is never reached.
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50

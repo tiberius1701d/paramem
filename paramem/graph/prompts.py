@@ -51,7 +51,7 @@ def prompt_overrides(mapping: dict[str, str]) -> Iterator[None]:
 
     Args:
         mapping: ``{basename: content}`` — e.g.
-            ``{"sota_enrichment_system.txt": "<calibration variant>"}``.
+            ``{"cloud_enrichment_system.txt": "<calibration variant>"}``.
             ``content`` is used verbatim, exactly as if it had been read
             from a file (slots such as ``{transcript}`` remain literal).
 
@@ -189,7 +189,7 @@ def _load_prompt(
 
     Single chokepoint for ALL prompt loading in the extraction pipeline
     (extraction.txt, extraction_system.txt, extraction_procedural.txt,
-    anonymization.txt, sota_enrichment.txt, sota_plausibility.txt, …).
+    anonymization.txt, cloud_enrichment.txt, cloud_plausibility.txt, …).
 
     Resolution is per-file, per-model.  When *model* is provided, the
     search order is::
@@ -204,9 +204,9 @@ def _load_prompt(
 
     The *model* parameter is intentionally only threaded into the
     local-model extraction prompts (``extraction.txt``,
-    ``extraction_system.txt``, ``extraction_procedural.txt``).  SOTA
-    cloud prompts (``sota_enrichment.txt``, ``sota_plausibility.txt``,
-    ``sota_graph_enrichment.txt``) and ``anonymization.txt`` are
+    ``extraction_system.txt``, ``extraction_procedural.txt``).  Cloud
+    cloud prompts (``cloud_enrichment.txt``, ``cloud_plausibility.txt``,
+    ``cloud_graph_enrichment.txt``) and ``anonymization.txt`` are
     model-independent by design and always call this function with
     ``model=None``.
 

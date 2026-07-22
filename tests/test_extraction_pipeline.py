@@ -189,7 +189,7 @@ class TestParseFactsResponseSalvage:
     closing ``]`` never arrives).
 
     Without the salvage path the plausibility filter's strict array parse
-    fails and ``local_plausibility_filter`` returns ``None`` — the gate
+    fails and ``judge_plausibility`` returns ``None`` — the gate
     fail-opens and 0 facts get filtered.  Salvage extracts the well-formed
     inner ``{…}`` blocks via depth-walk and returns those.
     """
@@ -265,7 +265,7 @@ class TestParseFactsResponseSalvage:
         assert out[0]["subject"] == "Alice"
 
     def test_dict_wrapped_clean_response(self):
-        """Non-strict mode: the SOTA enrichment legacy path accepts a
+        """Non-strict mode: the cloud enrichment legacy path accepts a
         dict-wrapped response with a ``facts``/``relations`` key.
         """
         from paramem.graph.extractor import _parse_facts_response
@@ -431,8 +431,8 @@ class TestPlausibilityDropSet:
     def test_malformed_output_returns_none(self):
         """Parse failure must return ``None`` — caller fail-opens by
         keeping all input facts.  This matches the prior contract:
-        ``filtered_list is None`` → ``_sota_pipeline`` logs a warning
-        and continues with the unfiltered input."""
+        ``filtered_list is None`` → the caller (e.g. the ``enrich`` stage)
+        logs a warning and continues with the unfiltered input."""
         from paramem.graph.extractor import _apply_drop_set
 
         facts = self._facts(3)
@@ -524,7 +524,7 @@ class TestRenderIndexedFacts:
 
 class TestEnrichmentDelta:
     """``_parse_enrichment_delta`` and ``_apply_enrichment_delta`` are the
-    SOTA enrichment counterpart of the plausibility drop-set helpers.
+    Cloud enrichment counterpart of the plausibility drop-set helpers.
     The judge emits a small ``{"add": [...], "modify": [...], "drop":
     [...], "bindings": {...}}`` envelope; every key is optional.  The
     parser is permissive about wrapping (markdown fences / inline-code /
@@ -712,7 +712,7 @@ class TestEnrichmentDelta:
 
     def test_inverted_binding_is_corrected_not_passed_through(self):
         """An inverted binding (key = real text, value = placeholder —
-        the exact shape the SOTA bindings validator was previously
+        the exact shape the cloud bindings validator was previously
         missing, per the placeholder-contract refactor) is corrected to
         canonical ``{placeholder: real_text}`` direction rather than
         passed straight into the substitution map. Confirmed by transcript
@@ -743,7 +743,7 @@ class TestEnrichmentDelta:
 
     def test_ambiguous_binding_neither_shaped_is_dropped(self):
         """A binding where NEITHER side is placeholder-shaped is not a
-        real SOTA mint binding and is dropped rather than accepted
+        real cloud mint binding and is dropped rather than accepted
         verbatim."""
         from paramem.graph.extractor import _apply_enrichment_delta
 
@@ -831,7 +831,8 @@ class TestEnrichmentDelta:
 
     def test_malformed_envelope_returns_none(self):
         """Caller fail-opens — applier returns ``None`` for new_facts so
-        ``_sota_pipeline`` keeps the pre-enrichment facts."""
+        the caller (the ``enrich`` stage) treats it as a failed
+        ``cloud_enrich`` phase."""
         from paramem.graph.extractor import _apply_enrichment_delta
 
         facts = self._facts(2)
@@ -875,27 +876,29 @@ class TestEnrichmentDelta:
 
 class TestPipelineMaxTokensThreading:
     """Verify the single ``extraction_max_tokens`` config flows through the
-    entire LLM pipeline (local extract → anonymize → SOTA enrich → deanon →
+    entire LLM pipeline (local extract → anonymize → cloud enrich → deanon →
     plausibility) instead of each stage carrying its own hardcoded budget."""
 
-    def test_sota_pipeline_signature_accepts_max_tokens(self):
-        """Stage 1: _sota_pipeline accepts max_tokens kwarg (the entry point
-        from extract_graph)."""
-        import inspect
+    def test_stage_context_carries_max_tokens_to_enrich(self):
+        """Stage 1: ``StageContext`` — the ``enrich`` stage's sole
+        parameter surface now that ``_cloud_pipeline`` no longer exists as
+        a directly-callable composite with its own ``max_tokens`` kwarg —
+        carries ``max_tokens`` through from ``extract_graph``."""
+        import dataclasses
 
-        from paramem.graph.extractor import _sota_pipeline
+        from paramem.graph.flow import StageContext
 
-        sig = inspect.signature(_sota_pipeline)
-        assert "max_tokens" in sig.parameters
+        assert "max_tokens" in {f.name for f in dataclasses.fields(StageContext)}
 
     def test_extract_graph_default_matches_filter_default(self):
-        """The single-budget invariant: extract_graph and the SOTA-side
+        """The single-budget invariant: extract_graph and the cloud-side
         filter calls must share the same default. Otherwise a user who
         sets only the loop-level config would get inconsistent budgets
         across stages."""
         import inspect
 
-        from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, extract_graph
+        from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS
+        from paramem.graph.flows import extract_graph
 
         default = inspect.signature(extract_graph).parameters["max_tokens"].default
         assert default == _DEFAULT_FILTER_MAX_TOKENS
@@ -910,34 +913,31 @@ class TestPipelineMaxTokensThreading:
         sig = inspect.signature(_fallback_plausibility_on_raw)
         assert "max_tokens" in sig.parameters
 
-    def test_extract_and_anonymize_for_cloud_pins_anonymizer_default(self):
-        """``extract_and_anonymize_for_cloud`` (chat
-        egress) must call ``anonymize_for_cloud`` with the anonymizer's
+    def test_extract_and_anonymize_pins_anonymizer_default(self):
+        """``anonymize_turn`` (chat
+        egress) must call ``anonymize`` with the anonymizer's
         own default budget (``_DEFAULT_ANONYMIZER_MAX_TOKENS`` = 2048), not
-        silently inherit ``anonymize_for_cloud``'s own default — which is
+        silently inherit ``anonymize``'s own default — which is
         ``_DEFAULT_FILTER_MAX_TOKENS`` (8192), sized for the graph-tier
         enrichment filter call. Chat egress is user-facing: a pathological
         non-terminating generation must not run 4x longer before the cap
         stops it.
         """
-        from paramem.graph.extractor import (
-            _DEFAULT_ANONYMIZER_MAX_TOKENS,
-            extract_and_anonymize_for_cloud,
-        )
+        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_MAX_TOKENS
+        from paramem.graph.flows import anonymize_turn
 
         graph = _make_graph([("Alex", "lives_in", "Millfield")])
         captured = {}
 
-        def fake_anonymize_for_cloud(*args, **kwargs):
+        def fake_anonymize(*args, **kwargs):
             captured.update(kwargs)
-            from paramem.graph.cloud_egress import AnonymizedPayload
+            from paramem.cloud.anonymize import AnonymizedContract
 
-            return AnonymizedPayload(
+            return AnonymizedContract(
                 status="ok",
                 forward={},
                 reverse={},
                 anon_transcript="anon",
-                anon_facts=[],
                 declared=frozenset(),
                 norm_stats={"inverted": 0, "dropped": 0},
                 rekey_dropped=0,
@@ -949,13 +949,13 @@ class TestPipelineMaxTokensThreading:
         tokenizer = MagicMock()
 
         with (
-            patch("paramem.graph.extractor.extract_graph", return_value=graph),
+            patch("paramem.graph.flows.extract_graph", return_value=graph),
             patch(
-                "paramem.graph.extractor.anonymize_for_cloud",
-                side_effect=fake_anonymize_for_cloud,
+                "paramem.graph.flows.anonymize",
+                side_effect=fake_anonymize,
             ),
         ):
-            extract_and_anonymize_for_cloud(
+            anonymize_turn(
                 "Alex lives in Millfield.",
                 model,
                 tokenizer,
@@ -967,18 +967,25 @@ class TestPipelineMaxTokensThreading:
 
 class TestPipelinePromptsDirThreading:
     """A ``prompts_dir`` override passed to ``extract_graph`` must reach
-    every prompt load ``_sota_pipeline`` performs, not just the anonymizer
-    call ``extract_and_anonymize_for_cloud`` already wired.  Each stage is
-    exercised through ``_sota_pipeline`` itself (never by calling the
-    downstream helper directly) so the assertion covers the exact call
-    site that was silently dropping the override.
+    every prompt load the ``anonymize``/``enrich`` stages perform, not
+    just the anonymizer call ``anonymize_turn`` already
+    wired.  Each stage is exercised through the real stage body itself
+    (never by calling the downstream helper directly) so the assertion
+    covers the exact call site that was silently dropping the override.
     """
 
     def test_anonymize_receives_prompts_dir(self, tmp_path):
-        """Stage 1 (anonymize): without this the pipeline silently loads the
+        """Stage 1 (anonymize): without this the stage silently loads the
         shipped anonymization prompt while the caller believes its override
-        is in effect."""
-        from tests._sota_flow import run_sota_stages
+        is in effect.
+
+        ``anonymize`` (the shared cloud component) takes rendered prompt
+        TEXT, not a directory — the stage body is the one that calls
+        ``_load_prompt``, so this is the call site the override must
+        reach, not a kwarg on ``anonymize`` itself.
+        """
+        from paramem.cloud.anonymize import AnonymizedContract
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -987,26 +994,41 @@ class TestPipelinePromptsDirThreading:
                 Entity(name="Millfield", entity_type="place"),
             ],
         )
-        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         captured = []
 
+        def fake_load_prompt(filename, *, prompts_dir=None, **kwargs):
+            captured.append(prompts_dir)
+            return "prompt text"
+
         def fake_anonymize(*args, **kwargs):
-            captured.append(kwargs.get("prompts_dir"))
-            return mapping, "anonymized transcript", ""
+            return AnonymizedContract(
+                status="ok",
+                forward={"Alex": "Person_1", "Millfield": "City_1"},
+                reverse={"Person_1": "Alex", "City_1": "Millfield"},
+                anon_transcript="anonymized transcript",
+                declared=frozenset(),
+                norm_stats={"inverted": 0, "dropped": 0},
+                rekey_dropped=0,
+                raw="",
+            )
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.graph.stage_anonymize._load_prompt",
+                side_effect=fake_load_prompt,
+            ),
+            patch(
+                "paramem.graph.stage_anonymize.anonymize",
                 side_effect=fake_anonymize,
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1017,15 +1039,16 @@ class TestPipelinePromptsDirThreading:
                 prompts_dir=tmp_path,
             )
 
-        assert captured == [tmp_path], (
-            f"anonymize_with_local_model must receive the caller's prompts_dir, got {captured!r}"
+        assert captured == [tmp_path, tmp_path], (
+            f"_load_prompt must receive the caller's prompts_dir for both anonymization "
+            f"prompts, got {captured!r}"
         )
 
-    def test_sota_enrich_receives_prompts_dir(self, tmp_path):
-        """Stage 2 (sota_enrich): ``_filter_with_sota`` had neither a
+    def test_cloud_enrich_receives_prompts_dir(self, tmp_path):
+        """Stage 2 (cloud_enrich): ``request_enrichment`` had neither a
         ``prompts_dir`` parameter nor a forwarded value — the override never
         reached the enrichment prompt at all."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1038,22 +1061,22 @@ class TestPipelinePromptsDirThreading:
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         captured = []
 
-        def fake_filter_with_sota(*args, **kwargs):
+        def fake_request_enrichment(*args, **kwargs):
             captured.append(kwargs.get("prompts_dir"))
             return anon_facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                side_effect=fake_filter_with_sota,
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=fake_request_enrichment,
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1065,13 +1088,13 @@ class TestPipelinePromptsDirThreading:
             )
 
         assert captured == [tmp_path], (
-            f"_filter_with_sota must receive the caller's prompts_dir, got {captured!r}"
+            f"request_enrichment must receive the caller's prompts_dir, got {captured!r}"
         )
 
     def test_anon_plausibility_receives_prompts_dir(self, tmp_path):
-        """Stage 3a (anon_plausibility, SOTA judge): ``_plausibility_filter_with_sota``
+        """Stage 3a (anon_plausibility, cloud judge): ``request_plausibility``
         had neither a ``prompts_dir`` parameter nor a forwarded value."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1091,19 +1114,19 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor._plausibility_filter_with_sota",
+                "paramem.graph.stage_enrich.request_plausibility",
                 side_effect=fake_plaus,
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1117,14 +1140,13 @@ class TestPipelinePromptsDirThreading:
             )
 
         assert captured == [tmp_path], (
-            f"_plausibility_filter_with_sota must receive the caller's prompts_dir, "
-            f"got {captured!r}"
+            f"request_plausibility must receive the caller's prompts_dir, got {captured!r}"
         )
 
     def test_deanon_plausibility_receives_prompts_dir(self, tmp_path):
-        """Stage 3d (deanon_plausibility, local judge): ``local_plausibility_filter``
+        """Stage 3d (deanon_plausibility, local judge): ``judge_plausibility``
         already accepted ``prompts_dir`` but the call site never passed it."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1144,19 +1166,19 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 side_effect=fake_local_plaus,
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -1170,7 +1192,7 @@ class TestPipelinePromptsDirThreading:
             )
 
         assert captured == [tmp_path], (
-            f"local_plausibility_filter must receive the caller's prompts_dir, got {captured!r}"
+            f"judge_plausibility must receive the caller's prompts_dir, got {captured!r}"
         )
 
     def test_default_prompts_dir_is_none_at_anon_stage_call_sites(self):
@@ -1178,7 +1200,7 @@ class TestPipelinePromptsDirThreading:
         pass ``prompts_dir`` (production default), every downstream call
         still receives ``None`` — byte-identical to pre-fix behaviour, never
         a surprise override."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1195,8 +1217,8 @@ class TestPipelinePromptsDirThreading:
             captured["anonymize"] = kwargs.get("prompts_dir")
             return mapping, "anonymized transcript", ""
 
-        def fake_filter_with_sota(*args, **kwargs):
-            captured["sota_enrich"] = kwargs.get("prompts_dir")
+        def fake_request_enrichment(*args, **kwargs):
+            captured["cloud_enrich"] = kwargs.get("prompts_dir")
             return anon_facts, None, {}, None, {}
 
         def fake_plaus(facts, api_key, **kwargs):
@@ -1206,19 +1228,19 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 side_effect=fake_anonymize,
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                side_effect=fake_filter_with_sota,
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=fake_request_enrichment,
             ),
             patch(
-                "paramem.graph.extractor._plausibility_filter_with_sota",
+                "paramem.graph.stage_enrich.request_plausibility",
                 side_effect=fake_plaus,
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -1232,14 +1254,14 @@ class TestPipelinePromptsDirThreading:
 
         assert captured == {
             "anonymize": None,
-            "sota_enrich": None,
+            "cloud_enrich": None,
             "anon_plausibility": None,
         }
 
     def test_default_prompts_dir_is_none_at_deanon_stage_call_sites(self):
         """Parity check (plausibility_stage="deanon"): same as above for the
         local-judge deanon-plausibility call site."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1256,8 +1278,8 @@ class TestPipelinePromptsDirThreading:
             captured["anonymize"] = kwargs.get("prompts_dir")
             return mapping, "anonymized transcript", ""
 
-        def fake_filter_with_sota(*args, **kwargs):
-            captured["sota_enrich"] = kwargs.get("prompts_dir")
+        def fake_request_enrichment(*args, **kwargs):
+            captured["cloud_enrich"] = kwargs.get("prompts_dir")
             return anon_facts, None, {}, None, {}
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
@@ -1267,19 +1289,19 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 side_effect=fake_anonymize,
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                side_effect=fake_filter_with_sota,
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=fake_request_enrichment,
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 side_effect=fake_local_plaus,
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -1293,14 +1315,14 @@ class TestPipelinePromptsDirThreading:
 
         assert captured == {
             "anonymize": None,
-            "sota_enrich": None,
+            "cloud_enrich": None,
             "deanon_plausibility": None,
         }
 
 
 class TestWaitForGpuReady:
     """Cover the WSL2 cloud-idle → local-LLM wake helper added after the
-    May 2 production crash where a 62s SOTA cloud round-trip left the GPU
+    May 2 production crash where a 62s cloud round-trip left the GPU
     in a low-power state and the next CUDA op hit "device not ready"."""
 
     def test_no_op_when_cuda_unavailable(self):
@@ -1434,17 +1456,17 @@ class TestWaitForGpuReady:
         sleep_mock.assert_not_called()
 
 
-# --- SOTA Noise Filter ---
+# --- Cloud Noise Filter ---
 
 
-class TestSOTANoiseFilter:
+class TestCloudEnrichmentProvider:
     def test_filter_function_exists(self):
-        from paramem.graph.extractor import _filter_with_sota
+        from paramem.graph.extractor import request_enrichment
 
-        assert callable(_filter_with_sota)
+        assert callable(request_enrichment)
 
-    def test_filter_with_sota_no_api_key(self):
-        from tests._sota_flow import run_sota_stages
+    def test_request_enrichment_no_api_key(self):
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1455,7 +1477,7 @@ class TestSOTANoiseFilter:
         )
         # No ANTHROPIC_API_KEY → skips gracefully
         with patch.dict("os.environ", {}, clear=True):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "transcript",
                 None,
@@ -1468,7 +1490,8 @@ class TestSOTANoiseFilter:
             assert len(result.relations) == 1
 
     def test_anonymize_graceful_on_bad_output(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
+        from paramem.graph.schema import facts_from_relations
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1482,15 +1505,20 @@ class TestSOTANoiseFilter:
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
             # ``generate_answer`` and ``adapt_messages`` are imported at
-            # module top in ``paramem.graph.extractor`` (no longer lazy).
+            # module top in ``paramem.cloud.anonymize`` (no longer lazy).
             # Patches must target the bound name in that module, not the
-            # source module — the rebound name is what ``extractor``
+            # source module — the rebound name is what ``anonymize_transcript``
             # actually calls.
-            patch("paramem.graph.extractor.generate_answer", return_value="not json"),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value="not json"),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            mapping, anon_transcript, _raw = anonymize_with_local_model(
-                graph, model, tokenizer, scrub={"person name"}
+            mapping, anon_transcript, _raw = anonymize_transcript(
+                facts_from_relations(graph.relations),
+                model,
+                tokenizer,
+                scrub={"person name"},
+                user_prompt_template="{facts_json} {transcript} {scrub_categories}",
+                system_prompt="system",
             )
         assert mapping is None
         assert anon_transcript == ""
@@ -1500,9 +1528,9 @@ class TestSOTANoiseFilter:
 
         The old behavior was to return the original graph unchanged.
         The new behavior runs _fallback_plausibility_on_raw so that tautologies,
-        role leaks, and other noise are still filtered even without SOTA.
+        role leaks, and other noise are still filtered even without cloud.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1514,13 +1542,13 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(None, "", ""),
             ),
-            # Pass model=None/tokenizer=None → local_plausibility_filter skipped inside fallback
+            # Pass model=None/tokenizer=None → judge_plausibility skipped inside fallback
         ):
             # Transcript "Alex lives in Millfield" grounds both entities.
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -1541,7 +1569,7 @@ class TestSOTANoiseFilter:
         """Enrichment failure must FAIL the cycle, not silently fall back.
 
         Previously this test asserted the silent-fallback behavior, which
-        was a load-bearing bug: a SOTA 5xx baked a degraded (un-enriched)
+        was a load-bearing bug: a cloud 5xx baked a degraded (un-enriched)
         snapshot into the cumulative graph; the next cycle deduped the
         same triples so the missing second-order relations were lost
         permanently.  The pipeline now raises ``ExtractionFailed`` so
@@ -1549,7 +1577,7 @@ class TestSOTANoiseFilter:
         for retry.
         """
         from paramem.graph.extractor import ExtractionFailed
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1563,16 +1591,16 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(None, None, {}, None, {}),
             ),
         ):
             with pytest.raises(ExtractionFailed) as excinfo:
-                run_sota_stages(
+                run_cloud_stages(
                     graph,
                     "transcript",
                     None,
@@ -1581,11 +1609,11 @@ class TestSOTANoiseFilter:
                     correction_entity_types=set(),
                     scrub={"person name"},
                 )
-        assert excinfo.value.phase == "sota_enrich"
+        assert excinfo.value.phase == "cloud_enrich"
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
         """Enrichment output flows through de-anonymization to real names."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1603,15 +1631,15 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "transcript",
                 None,
@@ -1631,7 +1659,7 @@ class TestSOTANoiseFilter:
 
     def test_pipeline_deanonymizes_composite_placeholders(self):
         """Composite strings like 'Person_1's family' get substring-replaced."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         transcript = "Alex lives in downtown Millfield with Alex's family"
         graph = _make_graph(
@@ -1642,7 +1670,7 @@ class TestSOTANoiseFilter:
             ],
         )
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
-        # SOTA produces composite strings with embedded placeholders
+        # cloud produces composite strings with embedded placeholders
         enriched_anon = anon_facts + [
             {"subject": "Person_1's family", "predicate": "lives_in", "object": "City_1"},
             {"subject": "Person_1", "predicate": "lives_in", "object": "downtown City_1"},
@@ -1652,15 +1680,15 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 transcript,
                 None,
@@ -1680,7 +1708,7 @@ class TestSOTANoiseFilter:
             assert "Person_1" not in r.subject
             assert "City_1" not in r.object
 
-    def test_local_plausibility_filter_round_trip(self):
+    def test_judge_plausibility_round_trip(self):
         """Local plausibility filter applies the drop-set to the input facts.
 
         Output contract is ``{"drop": [<index>, ...]}``; the helper indexes
@@ -1690,7 +1718,7 @@ class TestSOTANoiseFilter:
         inputs (see ``TestPlausibilityDropSet`` for the structural tests
         and the new prompt contract).
         """
-        from paramem.graph.extractor import local_plausibility_filter
+        from paramem.graph.extractor import judge_plausibility
 
         facts = [
             {"subject": "Alex", "predicate": "lives_in", "object": "Millfield"},
@@ -1706,7 +1734,7 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor.generate_answer", return_value=drop_response),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            result, raw = local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
+            result, raw = judge_plausibility(facts, "transcript", MagicMock(), tokenizer)
         assert result is not None
         assert len(result) == 1
         assert result[0] == facts[0]  # input fact returned unchanged
@@ -1714,7 +1742,7 @@ class TestSOTANoiseFilter:
 
     def test_normalize_anonymization_mapping_inverts_placeholder_keys(self):
         """Mapping with placeholder keys is inverted to {real: placeholder} canonical."""
-        from paramem.graph.placeholders import _normalize_anonymization_mapping
+        from paramem.cloud.placeholders import _normalize_anonymization_mapping
 
         wrong_direction = {"Person_1": "Alex", "City_1": "Millfield"}
         normalized, stats = _normalize_anonymization_mapping(wrong_direction)
@@ -1723,7 +1751,7 @@ class TestSOTANoiseFilter:
 
     def test_normalize_anonymization_mapping_keeps_canonical(self):
         """Mapping already in {real: placeholder} canonical form passes through."""
-        from paramem.graph.placeholders import _normalize_anonymization_mapping
+        from paramem.cloud.placeholders import _normalize_anonymization_mapping
 
         canonical = {"Alex": "Person_1", "Millfield": "City_1"}
         normalized, stats = _normalize_anonymization_mapping(canonical)
@@ -1731,7 +1759,7 @@ class TestSOTANoiseFilter:
         assert stats == {"inverted": 0, "dropped": 0}
 
     def test_normalize_anonymization_mapping_empty(self):
-        from paramem.graph.placeholders import _normalize_anonymization_mapping
+        from paramem.cloud.placeholders import _normalize_anonymization_mapping
 
         normalized, stats = _normalize_anonymization_mapping({})
         assert normalized == {}
@@ -1742,7 +1770,7 @@ class TestSOTANoiseFilter:
         common types map via schema.yaml's ``anonymizer_type_to_prefix()``;
         everything else is PascalCase-joined; empty input falls back to
         ``Entity``."""
-        from paramem.graph.placeholders import entity_type_to_prefix
+        from paramem.config.taxonomy import entity_type_to_prefix
 
         # Closed vocabulary — match anonymizer LLM conventions.
         assert entity_type_to_prefix("person") == "Person"
@@ -1767,9 +1795,9 @@ class TestSOTANoiseFilter:
         Real anonymizers sometimes emit a dict where some entries are
         `{real: placeholder}` and others are `{placeholder: real}`. Per-pair
         normalization independently canonicalizes each, enabling the pipeline
-        to proceed (SOTA call, de-anonymization) rather than aborting.
+        to proceed (cloud call, de-anonymization) rather than aborting.
         """
-        from paramem.graph.placeholders import _normalize_anonymization_mapping
+        from paramem.cloud.placeholders import _normalize_anonymization_mapping
 
         mixed = {
             "Alex": "Person_1",  # canonical
@@ -1783,16 +1811,17 @@ class TestSOTANoiseFilter:
     def test_entity_correction_call_site_wired_into_pipeline(self):
         """Integration coverage for the entity_correction phase call site.
 
-        Stubs ``paramem.graph.extractor.correct_entity_surfaces`` (the name
-        bound in extractor's own namespace via its top-of-file import) so
-        this proves the WIRING added to ``_sota_pipeline`` — the stub is
+        Stubs ``paramem.graph.stage_enrich.correct_entity_surfaces`` (the name
+        bound in the ``enrich`` module's own namespace via its top-of-file
+        import) so this proves the WIRING inside the ``enrich`` stage
+        (:func:`~paramem.graph.stage_enrich._stage_enrich`) — the stub is
         called exactly once and its ``"applied"`` list lands verbatim on
         ``graph.diagnostics["entity_corrections"]`` — without needing a
-        live model. Reuses the same ``anonymize_with_local_model`` /
-        ``_filter_with_sota`` happy-path mocking pattern as the sibling
+        live model. Reuses the same ``anonymize_transcript`` /
+        ``request_enrichment`` happy-path mocking pattern as the sibling
         tests in this class.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1834,19 +1863,19 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.correct_entity_surfaces",
+                "paramem.graph.stage_enrich.correct_entity_surfaces",
                 side_effect=fake_correct_entity_surfaces,
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "transcript",
                 None,
@@ -1871,7 +1900,7 @@ class TestAnonymizerMappingOnlyContract:
     """
 
     def test_anonymizer_returns_mapping_and_transcript_only(self):
-        """``anonymize_with_local_model`` returns exactly ``(mapping,
+        """``anonymize_transcript`` returns exactly ``(mapping,
         anonymized_transcript, raw)`` — even when the model's raw
         response still smuggles fact-array keys (a model that hasn't
         fully adopted the mapping-only-for-FACTS contract).
@@ -1881,7 +1910,8 @@ class TestAnonymizerMappingOnlyContract:
         -> the call returns more than ``(mapping, anonymized_transcript,
         raw)`` -> this test fails.
         """
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
+        from paramem.graph.schema import facts_from_relations
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1908,10 +1938,17 @@ class TestAnonymizerMappingOnlyContract:
             }
         )
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            result = anonymize_with_local_model(graph, model, tokenizer, scrub={"person name"})
+            result = anonymize_transcript(
+                facts_from_relations(graph.relations),
+                model,
+                tokenizer,
+                scrub={"person name"},
+                user_prompt_template="{scrub_categories} {facts_json} {transcript}",
+                system_prompt="system",
+            )
 
         assert result == (
             {"Alex": "Person_1", "Millfield": "City_1"},
@@ -1920,7 +1957,7 @@ class TestAnonymizerMappingOnlyContract:
         )
 
     def test_facts_are_built_from_graph_relations_not_the_model(self):
-        """The SOTA-facing fact array must equal ``graph.relations`` —
+        """The cloud-facing fact array must equal ``graph.relations`` —
         same count, byte-identical predicates — even when the model's raw
         response carries a SHORTER, REWORDED fact array alongside a valid
         mapping.
@@ -1929,7 +1966,7 @@ class TestAnonymizerMappingOnlyContract:
         building them from ``graph.relations`` -> the dropped/reworded
         fact slips through -> fails.  The owner's rule, pinned.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [
@@ -1956,19 +1993,19 @@ class TestAnonymizerMappingOnlyContract:
             }
         )
 
-        sota_calls: list[list[dict]] = []
+        cloud_calls: list[list[dict]] = []
 
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
+        def fake_cloud(facts, *args, **kwargs):
+            cloud_calls.append(list(facts))
             return facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.graph.stage_enrich.request_enrichment", side_effect=fake_cloud),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield and works at Acme.",
                 MagicMock(),
@@ -1978,8 +2015,8 @@ class TestAnonymizerMappingOnlyContract:
                 scrub={"person name"},
             )
 
-        assert len(sota_calls) == 1
-        anon_facts = sota_calls[0]
+        assert len(cloud_calls) == 1
+        anon_facts = cloud_calls[0]
         assert len(anon_facts) == len(graph.relations) == 2
         predicates = {f["predicate"] for f in anon_facts}
         assert predicates == {"lives_in", "works_at"}
@@ -1993,7 +2030,7 @@ class TestAnonymizerMappingOnlyContract:
         ``_substitute_whole_words(r.predicate, mapping)``) -> the
         predicate gets scrubbed to ``"asked about Person_1"`` -> fails.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "asked about Alex", "Bob")],
@@ -2004,21 +2041,21 @@ class TestAnonymizerMappingOnlyContract:
         )
         mapping = {"Alex": "Person_1", "Bob": "Person_2"}
 
-        sota_calls: list[list[dict]] = []
+        cloud_calls: list[list[dict]] = []
 
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
+        def fake_cloud(facts, *args, **kwargs):
+            cloud_calls.append(list(facts))
             return facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+            patch("paramem.graph.stage_enrich.request_enrichment", side_effect=fake_cloud),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex asked about Alex and Bob.",
                 None,
@@ -2028,8 +2065,8 @@ class TestAnonymizerMappingOnlyContract:
                 scrub={"person name"},
             )
 
-        assert len(sota_calls) == 1
-        assert sota_calls[0][0]["predicate"] == "asked about Alex"
+        assert len(cloud_calls) == 1
+        assert cloud_calls[0][0]["predicate"] == "asked about Alex"
 
     def test_parse_failure_is_none_and_empty_mapping_is_not(self):
         """``mapping is None`` (parse failure) and ``mapping == {}``
@@ -2041,7 +2078,8 @@ class TestAnonymizerMappingOnlyContract:
         or gate on ``not mapping`` instead of ``mapping is None``) ->
         this test fails.
         """
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
+        from paramem.graph.schema import facts_from_relations
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -2053,24 +2091,29 @@ class TestAnonymizerMappingOnlyContract:
         model = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        facts = facts_from_relations(graph.relations)
+        template_kwargs = {
+            "user_prompt_template": "{scrub_categories} {facts_json} {transcript}",
+            "system_prompt": "system",
+        }
 
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value="not json"),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value="not json"),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            parse_failure_mapping, _parse_failure_transcript, _ = anonymize_with_local_model(
-                graph, model, tokenizer, scrub={"person name"}
+            parse_failure_mapping, _parse_failure_transcript, _ = anonymize_transcript(
+                facts, model, tokenizer, scrub={"person name"}, **template_kwargs
             )
 
         with (
             patch(
-                "paramem.graph.cloud_egress.generate_answer",
+                "paramem.cloud.anonymize.generate_answer",
                 return_value='{"mapping": {}, "anonymized_transcript": "nothing to scrub here"}',
             ),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            empty_mapping, empty_mapping_transcript, _ = anonymize_with_local_model(
-                graph, model, tokenizer, scrub={"person name"}
+            empty_mapping, empty_mapping_transcript, _ = anonymize_transcript(
+                facts, model, tokenizer, scrub={"person name"}, **template_kwargs
             )
 
         assert parse_failure_mapping is None
@@ -2084,7 +2127,7 @@ class TestAnonymizerTranscriptArrayContract:
     ``configs/prompts/anonymization.txt`` contract (one element per turn)
     so a multi-turn rewrite can never contain a literal newline inside a
     JSON string value — the illegal-JSON shape that caused a measured
-    fail-closed parse failure.  ``anonymize_with_local_model`` joins the
+    fail-closed parse failure.  ``anonymize_transcript`` joins the
     array with ``"\\n"``; a plain ``str`` is still accepted unchanged for
     models that have not adopted the array contract.
 
@@ -2093,17 +2136,29 @@ class TestAnonymizerTranscriptArrayContract:
     """
 
     @staticmethod
-    def _graph():
-        return _make_graph(
+    def _facts():
+        graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
             entities=[
                 Entity(name="Alex", entity_type="person"),
                 Entity(name="Millfield", entity_type="place"),
             ],
         )
+        from paramem.graph.schema import facts_from_relations
+
+        return facts_from_relations(graph.relations)
+
+    #: Every call in this class supplies the same already-loaded prompt
+    #: text — the tests exercise ``anonymize_transcript``'s parsing
+    #: contract, not prompt rendering (see ``TestScrubCategoriesReachPrompt``
+    #: for that).
+    _TEMPLATE_KWARGS = {
+        "user_prompt_template": "{scrub_categories} {facts_json} {transcript}",
+        "system_prompt": "system",
+    }
 
     def test_array_of_turn_strings_is_joined_with_newline(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
         tokenizer = MagicMock()
@@ -2119,11 +2174,11 @@ class TestAnonymizerTranscriptArrayContract:
             }
         )
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            mapping, anon_transcript, _raw = anonymize_with_local_model(
-                self._graph(), model, tokenizer, scrub={"person name"}
+            mapping, anon_transcript, _raw = anonymize_transcript(
+                self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
         assert mapping == {"Alex": "Person_1", "Millfield": "City_1"}
@@ -2134,7 +2189,7 @@ class TestAnonymizerTranscriptArrayContract:
         )
 
     def test_plain_string_transcript_still_accepted_unchanged(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
         tokenizer = MagicMock()
@@ -2146,29 +2201,29 @@ class TestAnonymizerTranscriptArrayContract:
             }
         )
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            mapping, anon_transcript, _raw = anonymize_with_local_model(
-                self._graph(), model, tokenizer, scrub={"person name"}
+            mapping, anon_transcript, _raw = anonymize_transcript(
+                self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
         assert mapping == {"Alex": "Person_1"}
         assert anon_transcript == "[user] Person_1 lives in Millfield."
 
     def test_empty_array_fails_closed(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            mapping, anon_transcript, raw_output = anonymize_with_local_model(
-                self._graph(), model, tokenizer, scrub={"person name"}
+            mapping, anon_transcript, raw_output = anonymize_transcript(
+                self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
         assert mapping is None
@@ -2176,7 +2231,7 @@ class TestAnonymizerTranscriptArrayContract:
         assert raw_output == raw
 
     def test_array_with_non_string_element_fails_closed(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
         tokenizer = MagicMock()
@@ -2188,11 +2243,11 @@ class TestAnonymizerTranscriptArrayContract:
             }
         )
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            mapping, anon_transcript, raw_output = anonymize_with_local_model(
-                self._graph(), model, tokenizer, scrub={"person name"}
+            mapping, anon_transcript, raw_output = anonymize_transcript(
+                self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
         assert mapping is None
@@ -2200,18 +2255,18 @@ class TestAnonymizerTranscriptArrayContract:
         assert raw_output == raw
 
     def test_missing_anonymized_transcript_key_fails_closed(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         raw = json.dumps({"mapping": {"Alex": "Person_1"}})
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
-            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
         ):
-            mapping, anon_transcript, raw_output = anonymize_with_local_model(
-                self._graph(), model, tokenizer, scrub={"person name"}
+            mapping, anon_transcript, raw_output = anonymize_transcript(
+                self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
         assert mapping is None
@@ -2222,7 +2277,7 @@ class TestAnonymizerTranscriptArrayContract:
 class TestScrubCategoriesReachPrompt:
     """The config -> prompt flow for ``scrub``.  ``scrub_categories``
     is rendered as ``", ".join(sorted(scrub))`` into the anonymization
-    prompt's ``{scrub_categories}`` slot (``anonymize_with_local_model``).
+    prompt's ``{scrub_categories}`` slot (``anonymize_transcript``).
     No prior test drove a real, distinctive ``scrub`` set all the way
     through to the rendered prompt string handed to the model — a
     hardcoded/ignored ``scrub_categories`` slot would not be caught by any
@@ -2233,7 +2288,9 @@ class TestScrubCategoriesReachPrompt:
     """
 
     def test_distinctive_scrub_set_appears_sorted_in_rendered_prompt(self):
-        from paramem.graph.cloud_egress import anonymize_with_local_model
+        from paramem.cloud.anonymize import anonymize_transcript
+        from paramem.graph.prompts import _load_prompt
+        from paramem.graph.schema import facts_from_relations
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -2259,17 +2316,22 @@ class TestScrubCategoriesReachPrompt:
             return json.dumps({"mapping": {}, "anonymized_transcript": "nothing to scrub here"})
 
         with (
-            patch("paramem.graph.cloud_egress.generate_answer", side_effect=_fake_generate_answer),
+            patch("paramem.cloud.anonymize.generate_answer", side_effect=_fake_generate_answer),
             patch(
-                "paramem.graph.cloud_egress.adapt_messages",
+                "paramem.cloud.anonymize.adapt_messages",
                 side_effect=lambda messages, tok: messages,
             ),
         ):
-            anonymize_with_local_model(
-                graph,
+            anonymize_transcript(
+                facts_from_relations(graph.relations),
                 model,
                 tokenizer,
                 scrub={"custom_category_x", "another_y"},
+                # The real production prompt — the point of this test is
+                # that the ``{scrub_categories}`` slot in the SHIPPED
+                # template renders sorted, not a synthetic template.
+                user_prompt_template=_load_prompt("anonymization.txt", required=True),
+                system_prompt=_load_prompt("anonymization_system.txt", required=True),
             )
 
         assert "prompt" in captured, "generate_answer was never called with a prompt"
@@ -2291,17 +2353,17 @@ class TestNoPostHocLeakGuardCaseSensitivity:
     def test_bill_the_person_scrubbed_electricity_bill_untouched(self):
         """A person entity named ``Bill`` is scrubbed to its placeholder;
         the common noun ``bill`` in "electricity bill" is left untouched
-        — and SOTA IS called (nothing skips or blocks the cycle over the
+        — and cloud IS called (nothing skips or blocks the cycle over the
         case collision).
 
         Mutation: introduce any case-insensitive match over entity names
         (e.g. a case-insensitive substring/whole-word check on the
         anonymized payload, or make the substitution primitive
         case-insensitive) -> "electricity bill" is misread as a leak of
-        ``Bill`` -> the cycle blocks/skips SOTA, or the object is wrongly
+        ``Bill`` -> the cycle blocks/skips cloud, or the object is wrongly
         scrubbed -> this test fails.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Bill", "received", "electricity bill")],
@@ -2310,21 +2372,21 @@ class TestNoPostHocLeakGuardCaseSensitivity:
         mapping = {"Bill": "Person_1"}
         transcript = "Bill received the electricity bill yesterday."
 
-        sota_calls: list[list[dict]] = []
+        cloud_calls: list[list[dict]] = []
 
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
+        def fake_cloud(facts, *args, **kwargs):
+            cloud_calls.append(list(facts))
             return facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+            patch("paramem.graph.stage_enrich.request_enrichment", side_effect=fake_cloud),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 transcript,
                 None,
@@ -2334,10 +2396,10 @@ class TestNoPostHocLeakGuardCaseSensitivity:
                 scrub={"person name"},
             )
 
-        # SOTA IS called — nothing blocks or skips the cycle.
-        assert len(sota_calls) == 1
-        sent = sota_calls[0][0]
-        # "Bill" (the person) IS scrubbed to its placeholder in the SOTA payload.
+        # cloud IS called — nothing blocks or skips the cycle.
+        assert len(cloud_calls) == 1
+        sent = cloud_calls[0][0]
+        # "Bill" (the person) IS scrubbed to its placeholder in the cloud payload.
         assert sent["subject"] == "Person_1"
         # "bill" (the invoice, inside "electricity bill") is NOT scrubbed —
         # case is the only signal telling the two apart.
@@ -2351,15 +2413,15 @@ class TestNoPostHocLeakGuardCaseSensitivity:
 class TestDeanonStagePredicateInvariantEndToEnd:
     """The anonymizer never returns facts, so a placeholder gluing into a
     predicate at the anonymize stage is structurally impossible. The
-    ONLY stage a placeholder can still glue into a predicate is SOTA's
+    ONLY stage a placeholder can still glue into a predicate is cloud's
     own returned delta. This pins the end-to-end behaviour of the
     deanon-stage predicate invariant (:func:`_apply_bindings`): a fact
     whose predicate carries a glued placeholder is dropped before it
     reaches ``graph.relations``.
     """
 
-    def test_sota_returned_glued_predicate_dropped_end_to_end(self):
-        """A fact in SOTA's *returned* delta whose predicate glues a
+    def test_cloud_returned_glued_predicate_dropped_end_to_end(self):
+        """A fact in cloud's *returned* delta whose predicate glues a
         declared placeholder onto a static prefix
         (``language_proficiency_Language_3``) never reaches
         ``graph.relations``, and the drop is recorded in diagnostics.
@@ -2368,7 +2430,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         ``_apply_bindings`` -> the poisoned fact reaches
         ``graph.relations`` -> this test fails.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "works_at", "Acme")],
@@ -2377,13 +2439,13 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         # "French" -> "Language_3" is an LLM-hint mapping entry the
         # deterministic builder merges in verbatim (never minted by
         # graph.entities, which only covers Alex here) — this is what
-        # puts "Language_3" into the declared vocabulary SOTA's returned
+        # puts "Language_3" into the declared vocabulary cloud's returned
         # facts are checked against.
         mapping = {"Alex": "Person_1", "French": "Language_3"}
         transcript = "Alex works at Acme. Alex speaks French at an advanced level."
 
-        # SOTA's returned delta — NOT the anonymizer — carries the
-        # poisoned predicate.  `_check_mapping_totality` (the SOTA-stage
+        # cloud's returned delta — NOT the anonymizer — carries the
+        # poisoned predicate.  `_check_mapping_totality` (the cloud-stage
         # binding-totality gate) scans subject/object only, so this fact
         # sails through it untouched and reaches the deanon-stage
         # predicate invariant, which is what this test pins.
@@ -2400,15 +2462,15 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 transcript,
                 None,
@@ -2436,18 +2498,18 @@ class TestDeanonStagePredicateInvariantEndToEnd:
 class TestApplyBindings:
     """Unit tests for the state-machine de-anonymization helper that replaces
     the previous LLM-based deanon attempt and the regex-based binding
-    recovery (``_extract_sota_bindings``).
+    recovery (``_extract_cloud_bindings``).
 
     The LLM-deanon caused VRAM exhaustion on the largest chunk's prompt
     (mapping + 2 transcripts + facts JSON). The redesign moves binding
-    knowledge into SOTA's response (``new_entity_bindings``) and reduces
+    knowledge into cloud's response (``new_entity_bindings``) and reduces
     deanon to pure dict substitution — no LLM call, no transcript
     reconstruction, no regex."""
 
     def test_substitutes_anonymizer_placeholders(self):
         """Bare anonymizer placeholders (Person_1, Org_1) substitute via
         the reverse mapping."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2460,17 +2522,17 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "Acme"
 
-    def test_substitutes_braced_sota_bindings(self):
-        """SOTA-introduced braced placeholders ({Event_1}) substitute via
+    def test_substitutes_braced_cloud_bindings(self):
+        """Cloud-introduced braced placeholders ({Event_1}) substitute via
         explicit bindings without needing transcript reconstruction."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2493,7 +2555,7 @@ class TestApplyBindings:
         """Bare placeholder embedded in literal text — `Org_1 Hungary`
         becomes `Acme Hungary` (the failure mode that bug 5 produced
         bogus bindings for under the old regex pipeline)."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2506,7 +2568,7 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
@@ -2514,10 +2576,10 @@ class TestApplyBindings:
 
     def test_drops_facts_with_unresolved_placeholders(self):
         """Facts whose subject/object retain a placeholder pattern after
-        substitution get dropped (residual sweep). Causes: SOTA emitted a
+        substitution get dropped (residual sweep). Causes: Cloud emitted a
         braced placeholder without including it in bindings, anonymizer
         leak, etc."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2538,7 +2600,7 @@ class TestApplyBindings:
         reverse = {"Person_1": "Alice"}
         # No binding for Event_1; no mapping for Person_99.
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         dropped = predicate_dropped + residual_dropped
         assert kept == []
@@ -2547,7 +2609,7 @@ class TestApplyBindings:
     def test_handles_apostrophes_at_word_boundary(self):
         """`Person_2's cousin` substitutes Person_2 cleanly without breaking
         on the apostrophe (existing _substitute_whole_words behaviour)."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2560,7 +2622,7 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice", "Person_2": "Bob"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
@@ -2568,8 +2630,8 @@ class TestApplyBindings:
 
     def test_mixed_bare_and_braced_in_same_fact(self):
         """A single fact with both a bare anonymizer placeholder and a
-        braced SOTA placeholder substitutes both."""
-        from paramem.graph.placeholders import _apply_bindings
+        braced cloud placeholder substitutes both."""
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2589,7 +2651,7 @@ class TestApplyBindings:
         assert kept[0]["object"] == "the workshop at Acme"
 
     def test_empty_inputs_return_empty(self):
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         kept, predicate_dropped, residual_dropped = _apply_bindings([], {}, {})
 
@@ -2599,7 +2661,7 @@ class TestApplyBindings:
 
     def test_preserves_other_fact_fields(self):
         """relation_type, confidence, and any extra fields pass through."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2612,17 +2674,17 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice", "Person_2": "Bob"}
-        kept, _, _ = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, _, _ = _apply_bindings(facts, reverse, cloud_bindings={})
         assert kept[0]["relation_type"] == "social"
         assert kept[0]["confidence"] == 0.7
         assert kept[0]["synthetic"] is False
 
     def test_minted_placeholder_round_trips_bare(self):
-        """A SOTA-minted placeholder emitted BARE (not braced, contra the
+        """A cloud-minted placeholder emitted BARE (not braced, contra the
         prompt's contract) still round-trips via the union resolve map —
         today's two-channel design drops this because ``bare_map`` only
         ever contained ``reverse``."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2634,8 +2696,8 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice"}
-        sota_bindings = {"Event_1": "the quarterly retro"}
-        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        cloud_bindings = {"Event_1": "the quarterly retro"}
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, cloud_bindings)
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "the quarterly retro"
@@ -2643,7 +2705,7 @@ class TestApplyBindings:
     def test_minted_placeholder_round_trips_braced_regression(self):
         """Braced-form minted placeholder still resolves (regression
         guard for the union unification)."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2655,8 +2717,8 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice"}
-        sota_bindings = {"Event_1": "the quarterly retro"}
-        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        cloud_bindings = {"Event_1": "the quarterly retro"}
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, cloud_bindings)
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "the quarterly retro"
@@ -2666,7 +2728,7 @@ class TestApplyBindings:
         (contra the prompt's 'leave bare' contract) still resolves via
         the union — it is in ``reverse``, which is now tried in both
         the braced and bare pass."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2679,7 +2741,7 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alex"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
@@ -2690,7 +2752,7 @@ class TestApplyBindings:
         (``"Senior Engineer at Org_1"``) resolves fully: braced pass
         expands ``{Role_1}`` to the value, bare pass then resolves the
         exposed ``Org_1`` from the SAME union map."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2701,19 +2763,19 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        sota_bindings = {"Role_1": "Senior Engineer at Org_1"}
+        cloud_bindings = {"Role_1": "Senior Engineer at Org_1"}
         reverse = {"Person_1": "Alex", "Org_1": "Acme"}
-        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, cloud_bindings)
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "Senior Engineer at Acme"
 
     def test_collision_reverse_wins_in_resolved_output(self):
-        """When a key collides between ``sota_bindings`` and ``reverse``
+        """When a key collides between ``cloud_bindings`` and ``reverse``
         with differing values, ``reverse`` wins (deterministic entity
-        name over a freshly-minted SOTA value) — the collision itself is
+        name over a freshly-minted cloud value) — the collision itself is
         surfaced by :func:`_check_mapping_totality`, not here."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2725,8 +2787,8 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Org_1": "Acme"}
-        sota_bindings = {"Org_1": "Wrong Corp"}
-        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        cloud_bindings = {"Org_1": "Wrong Corp"}
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, cloud_bindings)
         dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Acme"
@@ -2752,7 +2814,7 @@ class TestApplyBindings:
         ``residual_dropped`` gains a post-substitution copy — so both
         assertions below fail together, not just one accidentally
         redundant with the other. (Verified live: see task report.)"""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2765,7 +2827,7 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         assert kept == []
         assert residual_dropped == []
@@ -2781,7 +2843,7 @@ class TestApplyBindings:
         ``\\b``-anchored :data:`_PLACEHOLDER_TOKEN_RE`) still drops the
         triple: the residual sweep tests every field against the
         declared vocabulary, not just subject."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2794,7 +2856,7 @@ class TestApplyBindings:
         ]
         reverse = {"Language_3": "French"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         dropped = predicate_dropped + residual_dropped
         assert kept == []
@@ -2809,7 +2871,7 @@ class TestApplyBindings:
         relation_type/confidence/symmetric). Before the fix, the sweep
         iterated ``f.values()`` unconditionally and would have dropped
         this fact over ``evidence`` alone."""
-        from paramem.graph.placeholders import _apply_bindings
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2823,7 +2885,7 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
+            facts, reverse, cloud_bindings={}
         )
         assert predicate_dropped == []
         assert residual_dropped == []
@@ -2844,8 +2906,8 @@ class TestResidualSweepCatchesEmbeddedPlaceholders:
         is retired) drops facts with any placeholder-shaped token, bare
         or composite, via the fail-closed :data:`_PLACEHOLDER_TOKEN_RE`
         backstop — even with an empty declared vocabulary (nothing in
-        ``reverse``/``sota_bindings`` here)."""
-        from paramem.graph.placeholders import _apply_bindings
+        ``reverse``/``cloud_bindings`` here)."""
+        from paramem.cloud.placeholders import _apply_bindings
 
         facts = [
             {"subject": "Alice", "predicate": "knows", "object": "Bob"},  # clean
@@ -2861,19 +2923,19 @@ class TestResidualSweepCatchesEmbeddedPlaceholders:
 
 
 class TestPlausibilityTupleReturn:
-    def test_plausibility_with_sota_returns_facts_and_raw(self):
-        """_plausibility_filter_with_sota returns (facts, raw_response).
+    def test_plausibility_with_cloud_returns_facts_and_raw(self):
+        """request_plausibility returns (facts, raw_response).
 
         Plausibility is now a drop-set protocol — the judge emits a small
         ``{"drop": [<index>, ...]}`` object instead of echoing kept facts.
         Empty drop set keeps every input fact unchanged.
         """
-        from paramem.graph.extractor import _plausibility_filter_with_sota
+        from paramem.graph.extractor import request_plausibility
 
         fake_raw = '{"drop": []}'
         input_fact = {"subject": "A", "predicate": "knows", "object": "B"}
-        with patch("paramem.graph.extractor._sota_call", return_value=fake_raw):
-            facts, raw = _plausibility_filter_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=fake_raw):
+            facts, raw = request_plausibility(
                 [input_fact],
                 api_key="k",
                 provider="anthropic",
@@ -2882,12 +2944,12 @@ class TestPlausibilityTupleReturn:
         assert facts == [input_fact]
         assert raw == fake_raw
 
-    def test_plausibility_with_sota_none_on_api_failure(self):
+    def test_plausibility_with_cloud_none_on_api_failure(self):
         """API failure returns (None, None) — callers must destructure both."""
-        from paramem.graph.extractor import _plausibility_filter_with_sota
+        from paramem.graph.extractor import request_plausibility
 
-        with patch("paramem.graph.extractor._sota_call", return_value=None):
-            facts, raw = _plausibility_filter_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=None):
+            facts, raw = request_plausibility(
                 [],
                 api_key="k",
                 provider="anthropic",
@@ -2896,26 +2958,26 @@ class TestPlausibilityTupleReturn:
         assert raw is None
 
 
-class TestFilterWithSotaPromptsDir:
-    """``_filter_with_sota`` had neither a ``prompts_dir`` parameter nor a
-    forwarded value — the ``sota_enrichment.txt`` load never honoured a
+class TestFilterWithCloudPromptsDir:
+    """``request_enrichment`` had neither a ``prompts_dir`` parameter nor a
+    forwarded value — the ``cloud_enrichment.txt`` load never honoured a
     calibration override at all."""
 
     def test_prompts_dir_override_reaches_enrichment_prompt(self, tmp_path):
-        from paramem.graph.extractor import _filter_with_sota
+        from paramem.graph.extractor import request_enrichment
 
-        sentinel = "SENTINEL-SOTA-ENRICH"
-        (tmp_path / "sota_enrichment.txt").write_text(
+        sentinel = "SENTINEL-cloud-ENRICH"
+        (tmp_path / "cloud_enrichment.txt").write_text(
             f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
         )
         captured_prompts = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured_prompts.append(prompt)
             return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
-            _filter_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
+            request_enrichment(
                 [{"subject": "A", "predicate": "knows", "object": "B"}],
                 api_key="k",
                 provider="anthropic",
@@ -2923,7 +2985,7 @@ class TestFilterWithSotaPromptsDir:
                 prompts_dir=tmp_path,
             )
 
-        assert captured_prompts, "_sota_call was never invoked"
+        assert captured_prompts, "_cloud_call was never invoked"
         assert sentinel in captured_prompts[0], (
             f"Enrichment call used the shipped prompt instead of the override: "
             f"{captured_prompts[0]!r}"
@@ -2932,16 +2994,16 @@ class TestFilterWithSotaPromptsDir:
     def test_default_prompts_dir_uses_shipped_template(self):
         """Parity check: omitting ``prompts_dir`` must keep loading the
         production template — the new parameter is additive only."""
-        from paramem.graph.extractor import _filter_with_sota
+        from paramem.graph.extractor import request_enrichment
 
         captured_prompts = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured_prompts.append(prompt)
             return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
-            _filter_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
+            request_enrichment(
                 [{"subject": "A", "predicate": "knows", "object": "B"}],
                 api_key="k",
                 provider="anthropic",
@@ -2952,25 +3014,25 @@ class TestFilterWithSotaPromptsDir:
         assert "SENTINEL" not in captured_prompts[0]
 
 
-class TestPlausibilityFilterWithSotaPromptsDir:
-    """``_plausibility_filter_with_sota`` had the same gap: no ``prompts_dir``
-    parameter, no forwarding, ``sota_plausibility.txt`` loaded unconditionally."""
+class TestPlausibilityFilterWithCloudPromptsDir:
+    """``request_plausibility`` had the same gap: no ``prompts_dir``
+    parameter, no forwarding, ``cloud_plausibility.txt`` loaded unconditionally."""
 
     def test_prompts_dir_override_reaches_plausibility_prompt(self, tmp_path):
-        from paramem.graph.extractor import _plausibility_filter_with_sota
+        from paramem.graph.extractor import request_plausibility
 
-        sentinel = "SENTINEL-SOTA-PLAUSIBILITY"
-        (tmp_path / "sota_plausibility.txt").write_text(
+        sentinel = "SENTINEL-cloud-PLAUSIBILITY"
+        (tmp_path / "cloud_plausibility.txt").write_text(
             f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
         )
         captured_prompts = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured_prompts.append(prompt)
             return '{"drop": []}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
-            _plausibility_filter_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
+            request_plausibility(
                 [{"subject": "A", "predicate": "knows", "object": "B"}],
                 api_key="k",
                 provider="anthropic",
@@ -2978,7 +3040,7 @@ class TestPlausibilityFilterWithSotaPromptsDir:
                 prompts_dir=tmp_path,
             )
 
-        assert captured_prompts, "_sota_call was never invoked"
+        assert captured_prompts, "_cloud_call was never invoked"
         assert sentinel in captured_prompts[0], (
             f"Plausibility call used the shipped prompt instead of the override: "
             f"{captured_prompts[0]!r}"
@@ -2987,16 +3049,16 @@ class TestPlausibilityFilterWithSotaPromptsDir:
     def test_default_prompts_dir_uses_shipped_template(self):
         """Parity check: omitting ``prompts_dir`` must keep loading the
         production template — the new parameter is additive only."""
-        from paramem.graph.extractor import _plausibility_filter_with_sota
+        from paramem.graph.extractor import request_plausibility
 
         captured_prompts = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured_prompts.append(prompt)
             return '{"drop": []}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
-            _plausibility_filter_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
+            request_plausibility(
                 [{"subject": "A", "predicate": "knows", "object": "B"}],
                 api_key="k",
                 provider="anthropic",
@@ -3007,38 +3069,40 @@ class TestPlausibilityFilterWithSotaPromptsDir:
         assert "SENTINEL" not in captured_prompts[0]
 
 
-class TestSotaSystemPromptCallTimeOverride:
-    """``sota_enrichment_system.txt`` / ``sota_plausibility_system.txt``
+class TestCloudSystemPromptCallTimeOverride:
+    """``cloud_enrichment_system.txt`` / ``cloud_plausibility_system.txt``
     used to bind ONCE at module-import time (``extractor.py`` module-level
-    constants ``_SOTA_ENRICHMENT_SYSTEM_PROMPT`` / ``_SOTA_PLAUSIBILITY_SYSTEM_PROMPT``)
+    constants ``_CLOUD_ENRICHMENT_SYSTEM_PROMPT`` / ``_CLOUD_PLAUSIBILITY_SYSTEM_PROMPT``)
     — long before any :func:`~paramem.graph.phase_trace.extraction_trace`
     scope or :func:`~paramem.graph.prompts.prompt_overrides` context could
     exist, so a calibration override could never reach them and
     ``record_prompt`` always no-opped for them.  They now load at CALL
     TIME inside each consuming function.  These tests pin BOTH halves of
     that fix: an import-time binding would make the override never reach
-    ``_sota_call``/``generate_answer`` (first two assertions per test) AND
+    ``_cloud_call``/``generate_answer`` (first two assertions per test) AND
     would leave ``record.prompts`` without the override entry (the
     provenance assertion) — a plain "does ``_load_prompt`` honour an
     override" unit test cannot tell these apart from the old broken state.
     """
 
-    def test_sota_enrichment_system_prompt_overridable_and_recorded(self):
-        from paramem.graph.extractor import _filter_with_sota
+    def test_cloud_enrichment_system_prompt_overridable_and_recorded(self):
+        from paramem.graph.extractor import request_enrichment
         from paramem.graph.phase_trace import extraction_trace, phase_trace
         from paramem.graph.prompts import prompt_overrides
 
         captured = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured.append(kwargs.get("system_prompt"))
             return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
             with extraction_trace() as trace:
-                with phase_trace("sota_enrich"):
-                    with prompt_overrides({"sota_enrichment_system.txt": "SENTINEL-ENRICH-SYSTEM"}):
-                        _filter_with_sota(
+                with phase_trace("cloud_enrich"):
+                    with prompt_overrides(
+                        {"cloud_enrichment_system.txt": "SENTINEL-ENRICH-SYSTEM"}
+                    ):
+                        request_enrichment(
                             [{"subject": "A", "predicate": "knows", "object": "B"}],
                             api_key="k",
                             provider="anthropic",
@@ -3047,31 +3111,31 @@ class TestSotaSystemPromptCallTimeOverride:
                 record = trace.records[-1]
 
         assert captured == ["SENTINEL-ENRICH-SYSTEM"], (
-            "the override must reach _sota_call's system_prompt kwarg"
+            "the override must reach _cloud_call's system_prompt kwarg"
         )
         paths = [p["path"] for p in (record.prompts or [])]
-        assert "<override:sota_enrichment_system.txt>" in paths, (
+        assert "<override:cloud_enrichment_system.txt>" in paths, (
             f"override must be recorded in phase-trace provenance, got paths={paths!r}"
         )
 
-    def test_sota_plausibility_system_prompt_overridable_and_recorded(self):
-        from paramem.graph.extractor import _plausibility_filter_with_sota
+    def test_cloud_plausibility_system_prompt_overridable_and_recorded(self):
+        from paramem.graph.extractor import request_plausibility
         from paramem.graph.phase_trace import extraction_trace, phase_trace
         from paramem.graph.prompts import prompt_overrides
 
         captured = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured.append(kwargs.get("system_prompt"))
             return '{"drop": []}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
             with extraction_trace() as trace:
                 with phase_trace("anon_plausibility"):
                     with prompt_overrides(
-                        {"sota_plausibility_system.txt": "SENTINEL-PLAUS-SYSTEM"}
+                        {"cloud_plausibility_system.txt": "SENTINEL-PLAUS-SYSTEM"}
                     ):
-                        _plausibility_filter_with_sota(
+                        request_plausibility(
                             [{"subject": "A", "predicate": "knows", "object": "B"}],
                             api_key="k",
                             provider="anthropic",
@@ -3080,18 +3144,18 @@ class TestSotaSystemPromptCallTimeOverride:
                 record = trace.records[-1]
 
         assert captured == ["SENTINEL-PLAUS-SYSTEM"], (
-            "the override must reach _sota_call's system_prompt kwarg"
+            "the override must reach _cloud_call's system_prompt kwarg"
         )
         paths = [p["path"] for p in (record.prompts or [])]
-        assert "<override:sota_plausibility_system.txt>" in paths, (
+        assert "<override:cloud_plausibility_system.txt>" in paths, (
             f"override must be recorded in phase-trace provenance, got paths={paths!r}"
         )
 
-    def test_local_plausibility_filter_system_prompt_overridable_and_recorded(self):
-        """``local_plausibility_filter`` reuses ``sota_plausibility_system.txt``
+    def test_judge_plausibility_system_prompt_overridable_and_recorded(self):
+        """``judge_plausibility`` reuses ``cloud_plausibility_system.txt``
         as the LOCAL model's system message — it builds the chat
-        ``messages`` list directly rather than calling ``_sota_call``."""
-        from paramem.graph.extractor import local_plausibility_filter
+        ``messages`` list directly rather than calling ``_cloud_call``."""
+        from paramem.graph.extractor import judge_plausibility
         from paramem.graph.phase_trace import extraction_trace, phase_trace
         from paramem.graph.prompts import prompt_overrides
 
@@ -3102,7 +3166,7 @@ class TestSotaSystemPromptCallTimeOverride:
             patch("paramem.graph.extractor.generate_answer", return_value='{"drop": []}'),
             # Identity passthrough so the real messages list (carrying the
             # override) reaches apply_chat_template unchanged — see the
-            # companion note on TestFilterWithSotaPromptsDir-style tests.
+            # companion note on TestFilterWithCloudPromptsDir-style tests.
             patch(
                 "paramem.graph.extractor.adapt_messages",
                 side_effect=lambda messages, tok: messages,
@@ -3111,9 +3175,9 @@ class TestSotaSystemPromptCallTimeOverride:
             with extraction_trace() as trace:
                 with phase_trace("deanon_plausibility"):
                     with prompt_overrides(
-                        {"sota_plausibility_system.txt": "SENTINEL-LOCAL-PLAUS-SYSTEM"}
+                        {"cloud_plausibility_system.txt": "SENTINEL-LOCAL-PLAUS-SYSTEM"}
                     ):
-                        local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
+                        judge_plausibility(facts, "transcript", MagicMock(), tokenizer)
                 record = trace.records[-1]
 
         called_messages = tokenizer.apply_chat_template.call_args.args[0]
@@ -3122,7 +3186,7 @@ class TestSotaSystemPromptCallTimeOverride:
             "the override must reach the local model's system message"
         )
         paths = [p["path"] for p in (record.prompts or [])]
-        assert "<override:sota_plausibility_system.txt>" in paths, (
+        assert "<override:cloud_plausibility_system.txt>" in paths, (
             f"override must be recorded in phase-trace provenance, got paths={paths!r}"
         )
 
@@ -3362,14 +3426,14 @@ class TestDebugArtifacts:
 
 
 class TestPlausibilityAnon:
-    """_sota_pipeline with plausibility_stage="anon": plausibility runs on
-    anonymized facts before de-anonymization.
+    """The ``enrich`` stage with plausibility_stage="anon": plausibility
+    runs on anonymized facts before de-anonymization.
     """
 
     def test_anon_stage_plausibility_filters_subset(self):
-        """When plausibility_stage="anon" and a SOTA validator is configured, it runs
+        """When plausibility_stage="anon" and a cloud validator is configured, it runs
         on the anonymized facts before de-anonymization and drops flagged entries."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [
@@ -3394,19 +3458,19 @@ class TestPlausibilityAnon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor._plausibility_filter_with_sota",
+                "paramem.graph.stage_enrich.request_plausibility",
                 return_value=(kept_anon, "raw"),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -3425,7 +3489,7 @@ class TestPlausibilityAnon:
 
     def test_anon_stage_plausibility_receives_post_enrichment_transcript(self):
         """FIX 2: the anon-stage judge must see `updated_anon_transcript`
-        (post-enrichment — carrying SOTA's minted `{Paper_1}`-style
+        (post-enrichment — carrying cloud's minted `{Paper_1}`-style
         tokens), not the pre-enrichment `anon_transcript`.  A judge shown
         the stale pre-enrichment transcript can never connect an
         enrichment-only fact's placeholder to its real-text span in the
@@ -3434,7 +3498,7 @@ class TestPlausibilityAnon:
         Mutation: revert the call site to pass `anon_transcript=anon_transcript`
         -> this test fails.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "authored", "Attention Is All You Need")],
@@ -3444,7 +3508,7 @@ class TestPlausibilityAnon:
         )
         # Pre-enrichment: local extraction never saw the paper title, so
         # neither the input facts nor the input transcript mention
-        # "Paper_1" — it is introduced by SOTA's enrichment delta below.
+        # "Paper_1" — it is introduced by cloud's enrichment delta below.
         enriched_anon_facts = [
             {"subject": "Person_1", "predicate": "authored", "object": "Paper_1"}
         ]
@@ -3460,11 +3524,11 @@ class TestPlausibilityAnon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(
                     enriched_anon_facts,
                     post_enrichment_transcript,
@@ -3474,11 +3538,11 @@ class TestPlausibilityAnon:
                 ),
             ),
             patch(
-                "paramem.graph.extractor._plausibility_filter_with_sota",
+                "paramem.graph.stage_enrich.request_plausibility",
                 side_effect=fake_plaus,
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex wrote a well-known paper.",
                 None,
@@ -3497,13 +3561,14 @@ class TestPlausibilityAnon:
 
 
 class TestPlausibilityDeanon:
-    """_sota_pipeline with plausibility_stage="deanon": plausibility runs on
-    de-anonymized facts using the original transcript.
+    """The ``deanonymize`` stage with plausibility_stage="deanon":
+    plausibility runs on de-anonymized facts using the original
+    transcript.
     """
 
     def test_deanon_stage_plausibility_drops_tautology(self):
         """Deanon-stage local plausibility receives real names and drops tautologies."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [
@@ -3533,19 +3598,19 @@ class TestPlausibilityDeanon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 side_effect=fake_local_plaus,
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -3572,13 +3637,14 @@ class TestPlausibilityDeanon:
 
 
 class TestAnonFailureFallback:
-    """When anonymization fails, _sota_pipeline runs raw (local) plausibility
-    instead of returning the original facts.
+    """When anonymization fails, the ``anonymize`` stage runs raw (local)
+    plausibility instead of returning the original facts.
     """
 
     def test_anon_failure_triggers_fallback(self):
-        """_sota_pipeline calls _fallback_plausibility_on_raw when anonymization fails."""
-        from tests._sota_flow import run_sota_stages
+        """The ``anonymize`` stage calls _fallback_plausibility_on_raw when
+        anonymization fails."""
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3600,15 +3666,15 @@ class TestAnonFailureFallback:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(None, "", ""),
             ),
             patch(
-                "paramem.graph.extractor._fallback_plausibility_on_raw",
+                "paramem.graph.stage_anonymize._fallback_plausibility_on_raw",
                 side_effect=fake_fallback,
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "transcript",
                 None,
@@ -3624,8 +3690,8 @@ class TestAnonFailureFallback:
         assert result.diagnostics.get("fallback_path") == "anon_failed"
 
 
-class TestSotaEnrichmentFailureRaises:
-    """When SOTA enrichment fails, raise ExtractionFailed instead of
+class TestCloudEnrichmentFailureRaises:
+    """When cloud enrichment fails, raise ExtractionFailed instead of
     silently falling back to pre-enrichment facts.
 
     Closes the regression that on 2026-05-13 baked a degraded snapshot
@@ -3636,10 +3702,10 @@ class TestSotaEnrichmentFailureRaises:
     the whole cycle to abort so sessions stay pending for a clean retry.
     """
 
-    def test_sota_enrich_failure_raises_extraction_failed(self):
-        """_filter_with_sota returning (None, ...) → ExtractionFailed."""
+    def test_cloud_enrich_failure_raises_extraction_failed(self):
+        """request_enrichment returning (None, ...) → ExtractionFailed."""
         from paramem.graph.extractor import ExtractionFailed
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3653,12 +3719,12 @@ class TestSotaEnrichmentFailureRaises:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                # First element None ⇒ SOTA call failed or unparseable.
+                "paramem.graph.stage_enrich.request_enrichment",
+                # First element None ⇒ cloud call failed or unparseable.
                 # Pre-fix this silently fell back to anon_facts.  Post-fix
                 # this MUST raise so the per-session loop in app.py marks
                 # the chunk failed and leaves the session pending.
@@ -3666,7 +3732,7 @@ class TestSotaEnrichmentFailureRaises:
             ),
         ):
             try:
-                run_sota_stages(
+                run_cloud_stages(
                     graph,
                     "transcript",
                     None,
@@ -3676,33 +3742,36 @@ class TestSotaEnrichmentFailureRaises:
                     scrub={"person name"},
                 )
             except ExtractionFailed as exc:
-                assert exc.phase == "sota_enrich"
+                assert exc.phase == "cloud_enrich"
                 assert exc.reason
             else:
-                raise AssertionError("_sota_pipeline must raise ExtractionFailed on SOTA failure")
+                raise AssertionError(
+                    "the enrich stage must raise ExtractionFailed on cloud failure"
+                )
 
     def test_extraction_failed_exposes_phase_and_reason(self):
         """Exception class contract used by the app.py per-chunk handler."""
         from paramem.graph.extractor import ExtractionFailed
 
-        exc = ExtractionFailed("sota_enrich", "timeout")
-        assert exc.phase == "sota_enrich"
+        exc = ExtractionFailed("cloud_enrich", "timeout")
+        assert exc.phase == "cloud_enrich"
         assert exc.reason == "timeout"
-        assert "sota_enrich" in str(exc)
+        assert "cloud_enrich" in str(exc)
         assert "timeout" in str(exc)
 
 
 class TestAllDroppedSafetyNet:
-    """All-dropped safety net (extractor.py:2528-2543) fires when the
-    pipeline empties out post-deanon. Original drop trigger was the
-    grounding gate (now removed); plausibility is now the final
-    discriminator that can empty the pipeline."""
+    """All-dropped safety net (the ``rebuild`` stage,
+    ``paramem.graph.flows._stage_rebuild``) fires when the pipeline
+    empties out post-deanon. Original drop trigger was the grounding gate
+    (now removed); plausibility is now the final discriminator that can
+    empty the pipeline."""
 
     def test_all_dropped_triggers_fallback(self):
         """When plausibility drops every surviving fact, the all-dropped
         safety net invokes _fallback_plausibility_on_raw with reason
         'all_dropped' so the session does not yield zero facts."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -3713,8 +3782,8 @@ class TestAllDroppedSafetyNet:
         )
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        # SOTA returns the same single fact; plausibility drops it (returns []).
-        sota_enriched = list(anon_facts)
+        # cloud returns the same single fact; plausibility drops it (returns []).
+        cloud_enriched = list(anon_facts)
 
         fallback_calls = []
 
@@ -3726,23 +3795,23 @@ class TestAllDroppedSafetyNet:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                return_value=(sota_enriched, None, {}, None, {}),
+                "paramem.graph.stage_enrich.request_enrichment",
+                return_value=(cloud_enriched, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 return_value=([], ""),
             ),
             patch(
-                "paramem.graph.extractor._fallback_plausibility_on_raw",
+                "paramem.graph.flows._fallback_plausibility_on_raw",
                 side_effect=fake_fallback,
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),  # non-None model so deanon-stage plausibility runs
@@ -3767,14 +3836,14 @@ class TestAllDroppedSafetyNet:
 
 
 class TestEntityTypePreservation:
-    """Entity types set by _normalize_extraction must survive the SOTA pipeline
+    """Entity types set by _normalize_extraction must survive the cloud pipeline
     unchanged; no "person" stampdown on non-person entities.
     """
 
     def test_preserved_entity_types_pass_through(self):
         """Entities pre-typed by _normalize_extraction keep their original types
-        after the pipeline even when mocked SOTA returns same facts."""
-        from tests._sota_flow import run_sota_stages
+        after the pipeline even when mocked cloud returns same facts."""
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [
@@ -3796,15 +3865,15 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Frankfurt and listens to Music.",
                 None,
@@ -3822,9 +3891,9 @@ class TestEntityTypePreservation:
             f"Music must be 'concept', not {entity_map.get('Music')!r}"
         )
 
-    def test_sota_introduced_country_entity_typed_location(self):
-        """SOTA-introduced entity with Country_ placeholder is typed 'location', not 'person'."""
-        from tests._sota_flow import run_sota_stages
+    def test_cloud_introduced_country_entity_typed_location(self):
+        """Cloud-introduced entity with Country_ placeholder is typed 'location', not 'person'."""
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "born_in", "Germany")],
@@ -3839,15 +3908,15 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex was born in Germany.",
                 None,
@@ -3861,49 +3930,50 @@ class TestEntityTypePreservation:
         entity_map = {e.name: e.entity_type for e in result.entities}
         # Germany already existed in the graph as "place"; the entity-type-preservation
         # rule keeps the original type. The Country_ → "location" mapping applies only
-        # to SOTA-introduced entities (names absent from the original graph).
+        # to cloud-introduced entities (names absent from the original graph).
         # "place" and "location" both express geographic entities — accept both values.
         assert entity_map.get("Germany") in ("place", "location"), (
             f"Germany (Country_1) must be typed 'place' or 'location', "
             f"not {entity_map.get('Germany')!r}"
         )
 
-    def test_sota_introduced_entity_no_placeholder_typed_concept(self):
-        """SOTA-introduced entity with no placeholder (bare name) gets type 'concept', not 'person'.
+    def test_cloud_introduced_entity_no_placeholder_typed_concept(self):
+        """Cloud-introduced entity with no placeholder (bare name) gets type
+        'concept', not 'person'.
 
         Regression guard: entity with no reverse_mapping entry must default to
         'concept', never 'person'.
-        China is NOT present in the original graph — only Alex is. SOTA enrichment
+        China is NOT present in the original graph — only Alex is. Cloud enrichment
         introduces China as a bare name (no anonymizer placeholder), so no
         reverse_mapping entry exists. The entity-type-preservation rule ensures the
         fallback type is 'concept', never 'person'.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         # Original graph has only Alex — no China entity
         graph = _make_graph(
-            [("Alex", "has_plans", "Alex")],  # placeholder relation; SOTA will override
+            [("Alex", "has_plans", "Alex")],  # placeholder relation; cloud will override
             entities=[
                 Entity(name="Alex", entity_type="person"),
             ],
         )
         # Alex → Person_1 only; China is absent from the anonymization mapping
         mapping = {"Alex": "Person_1"}
-        # SOTA enrichment introduces China as a bare name with no placeholder equivalent
+        # cloud enrichment introduces China as a bare name with no placeholder equivalent
         enriched_anon = [{"subject": "Person_1", "predicate": "visited", "object": "China"}]
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex visited China.",
                 None,
@@ -3918,21 +3988,21 @@ class TestEntityTypePreservation:
         # China has no reverse_mapping entry → safe fallback type is "concept", not "person"
         china_type = entity_map.get("China")
         assert china_type == "concept", (
-            f"SOTA-introduced bare entity must be typed 'concept', not {china_type!r}"
+            f"cloud-introduced bare entity must be typed 'concept', not {china_type!r}"
         )
 
 
-class TestSotaMintedEntityTypeDerivation:
+class TestCloudMintedEntityTypeDerivation:
     """The entity-rebuild loop (extractor.py, "Rebuild entity list from
-    surviving + new relations") must resolve a de-anonymized SOTA-minted
+    surviving + new relations") must resolve a de-anonymized cloud-minted
     entity's REAL NAME back to its placeholder via the inverted
     resolution map, not via ``reverse_mapping.get(name)`` — ``reverse_mapping``
     is keyed by placeholder, so looking it up with a real name always
     misses (dead code prior to the fix under test).
     """
 
-    def test_sota_minted_entity_gets_prefix_derived_type(self):
-        """A SOTA-minted entity bound via ``bindings`` with a novel prefix
+    def test_cloud_minted_entity_gets_prefix_derived_type(self):
+        """A cloud-minted entity bound via ``bindings`` with a novel prefix
         (``Paper_1``, absent from the closed anonymizer vocabulary) lands
         in graph.entities typed by its prefix ("paper"), not "concept".
 
@@ -3941,32 +4011,32 @@ class TestSotaMintedEntityTypeDerivation:
         ``reverse_mapping`` has no "Attention Is All You Need" key (it is
         keyed by placeholder), so the entity falls back to "concept".
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
-            [("Alex", "has_plans", "Alex")],  # placeholder relation; SOTA will override
+            [("Alex", "has_plans", "Alex")],  # placeholder relation; cloud will override
             entities=[
                 Entity(name="Alex", entity_type="person"),
             ],
         )
         mapping = {"Alex": "Person_1"}
-        # SOTA mints a novel-prefix entity via a braced placeholder plus an
+        # cloud mints a novel-prefix entity via a braced placeholder plus an
         # explicit binding — the documented brace-binding protocol.
         enriched_anon = [{"subject": "Person_1", "predicate": "authored", "object": "{Paper_1}"}]
-        sota_bindings = {"Paper_1": "Attention Is All You Need"}
+        cloud_bindings = {"Paper_1": "Attention Is All You Need"}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, sota_bindings, None, {}),
+                "paramem.graph.stage_enrich.request_enrichment",
+                return_value=(enriched_anon, None, cloud_bindings, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex authored Attention Is All You Need.",
                 None,
@@ -3980,15 +4050,15 @@ class TestSotaMintedEntityTypeDerivation:
         entity_map = {e.name: e.entity_type for e in result.entities}
         paper_type = entity_map.get("Attention Is All You Need")
         assert paper_type == "paper", (
-            f"SOTA-minted novel-prefix entity must be typed 'paper', not {paper_type!r}"
+            f"cloud-minted novel-prefix entity must be typed 'paper', not {paper_type!r}"
         )
 
-    def test_sota_minted_entity_known_prefix_uses_configured_type(self):
-        """A SOTA-minted entity with a KNOWN prefix (``Person_2``) still
+    def test_cloud_minted_entity_known_prefix_uses_configured_type(self):
+        """A cloud-minted entity with a KNOWN prefix (``Person_2``) still
         maps through the schema's ``anonymizer_prefix_to_type()`` to
         "person" — the closed-vocabulary branch of the same derivation.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "has_plans", "Alex")],
@@ -3998,20 +4068,20 @@ class TestSotaMintedEntityTypeDerivation:
         )
         mapping = {"Alex": "Person_1"}
         enriched_anon = [{"subject": "Person_1", "predicate": "met", "object": "{Person_2}"}]
-        sota_bindings = {"Person_2": "Jordan Rivers"}
+        cloud_bindings = {"Person_2": "Jordan Rivers"}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, sota_bindings, None, {}),
+                "paramem.graph.stage_enrich.request_enrichment",
+                return_value=(enriched_anon, None, cloud_bindings, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex met Jordan Rivers.",
                 None,
@@ -4025,7 +4095,7 @@ class TestSotaMintedEntityTypeDerivation:
         entity_map = {e.name: e.entity_type for e in result.entities}
         jordan_type = entity_map.get("Jordan Rivers")
         assert jordan_type == "person", (
-            f"SOTA-minted known-prefix entity must be typed 'person', not {jordan_type!r}"
+            f"cloud-minted known-prefix entity must be typed 'person', not {jordan_type!r}"
         )
 
 
@@ -4092,85 +4162,39 @@ class TestFallbackPlausibilityOnRawHelper:
 
 class TestExtractGraphNewKwargs:
     """extract_graph forwards plausibility kwargs (plausibility_judge,
-    plausibility_stage) to _sota_pipeline.
+    plausibility_stage) into the run-constant StageContext every stage
+    (including ``enrich``) reads from.
     """
 
     def test_extract_graph_plumbs_plausibility_kwargs(self):
-        """extract_graph forwards plausibility_judge, plausibility_stage to
-        _sota_pipeline."""
-        from paramem.graph.extractor import extract_graph
-        from paramem.graph.flow import StageState
+        """extract_graph forwards plausibility_judge, plausibility_stage
+        into the ``StageContext`` it builds.
+
+        ``_cloud_pipeline`` no longer exists as a directly-callable
+        composite whose kwargs could be captured — ``plausibility_judge``/
+        ``plausibility_stage`` now travel exclusively via ``StageContext``,
+        built once per call and read by whichever stage needs them
+        (``enrich``). Faking ``run_flow`` itself captures exactly that
+        ctx, with no real stage body (and therefore no model) involved.
+        """
+        from paramem.graph.flows import extract_graph
 
         captured = {}
 
-        def fake_sota_pipeline(graph, transcript, model, tokenizer, **kwargs):
-            # The composite returns a StageState now — an empty ``facts``
-            # is its ``terminal_when``, so the deanonymize/rebuild
-            # siblings do not run on this stub's output.
-            captured.update(kwargs)
-            return StageState(graph=graph)
+        def fake_run_flow(flow, ctx, state):
+            captured["plausibility_judge"] = ctx.plausibility_judge
+            captured["plausibility_stage"] = ctx.plausibility_stage
+            return state
 
-        graph_raw = json.dumps(
-            {
-                "entities": [{"name": "Alex", "entity_type": "person"}],
-                "relations": [],
-                "summary": "",
-            }
-        )
-
-        with (
-            patch(
-                "paramem.graph.extractor._generate_extraction",
-                return_value=graph_raw,
-            ),
-            patch(
-                "paramem.graph.extractor._sota_pipeline",
-                side_effect=fake_sota_pipeline,
-            ),
-        ):
-            # _sota_pipeline is only called when noise_filter is non-empty and
-            # there are relations — since our mock graph has no relations, we
-            # need to test the kwarg forwarding via a different approach.
-            pass
-
-        # Direct test: build a graph with relations and verify kwargs reach _sota_pipeline.
-        graph_with_rels = json.dumps(
-            {
-                "entities": [
-                    {"name": "Alex", "entity_type": "person"},
-                    {"name": "Millfield", "entity_type": "place"},
-                ],
-                "relations": [
-                    {
-                        "subject": "Alex",
-                        "predicate": "lives_in",
-                        "object": "Millfield",
-                        "relation_type": "factual",
-                        "confidence": 1.0,
-                    }
-                ],
-                "summary": "",
-            }
-        )
-        captured.clear()
-        with (
-            patch(
-                "paramem.graph.extractor._generate_extraction",
-                return_value=graph_with_rels,
-            ),
-            patch(
-                "paramem.graph.extractor._sota_pipeline",
-                side_effect=fake_sota_pipeline,
-            ),
-        ):
+        with patch("paramem.graph.flows.run_flow", side_effect=fake_run_flow):
             extract_graph(
                 None,
                 None,
                 "transcript",
                 "sess1",
                 speaker_id="speaker0",
-                sota_enabled=True,
-                noise_filter="anthropic",
+                cloud_enabled=True,
+                enrichment_provider="anthropic",
                 plausibility_judge="anthropic",
                 plausibility_stage="anon",
                 scrub={"person name"},
@@ -4186,7 +4210,7 @@ class TestExtractGraphNewKwargs:
         """
         import inspect
 
-        from paramem.graph.extractor import extract_graph
+        from paramem.graph.flows import extract_graph
 
         sig = inspect.signature(extract_graph)
         assert sig.parameters["temperature"].default == 0.0
@@ -4200,7 +4224,8 @@ class TestExtractGraphNewKwargs:
         truncated mid-string at the old budget."""
         import inspect
 
-        from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, extract_graph
+        from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS
+        from paramem.graph.flows import extract_graph
 
         sig = inspect.signature(extract_graph)
         assert sig.parameters["max_tokens"].default == _DEFAULT_FILTER_MAX_TOKENS
@@ -4211,7 +4236,7 @@ class TestDiagnosticsKeys:
 
     def test_diagnostics_contains_plausibility_keys(self):
         """After a deanon-stage plausibility run, diagnostics contains the expected keys."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4229,19 +4254,19 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 side_effect=fake_local_plaus,
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 MagicMock(),
@@ -4260,7 +4285,7 @@ class TestDiagnosticsKeys:
 
     def test_diagnostics_anonymize_key_populated_on_success(self):
         """diagnostics['anonymize']='ok' when anonymization succeeds."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4275,15 +4300,15 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -4298,12 +4323,12 @@ class TestDiagnosticsKeys:
 
     def test_mapping_ambiguous_dropped_is_live_and_reaches_diagnostics(self):
         """``payload.norm_stats["dropped"]`` is a LIVE signal now — the
-        ONE normalize call in the chain (inside ``anonymize_for_cloud``)
+        ONE normalize call in the chain (inside ``anonymize``)
         — reaching ``graph.diagnostics["mapping_ambiguous_dropped"]``.
 
-        Before this unification, ``_sota_pipeline`` ran a SECOND,
+        Before this unification, ``_cloud_pipeline`` ran a SECOND,
         redundant outer normalize on an already-canonical table (the
-        internal normalize inside ``anonymize_with_local_model`` had
+        internal normalize inside ``anonymize_transcript`` had
         already dropped every ambiguous pair), so
         ``mapping_ambiguous_dropped`` could structurally never be
         non-zero — this test would have failed against that code.
@@ -4311,7 +4336,7 @@ class TestDiagnosticsKeys:
         Mutation: reintroduce a second (now-dead) normalize call before
         the diagnostic is set -> ``dropped`` reads 0 -> this test fails.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -4328,15 +4353,15 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield.",
                 None,
@@ -4406,8 +4431,8 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         assert cfg.extraction_plausibility_judge == "auto"
         assert cfg.extraction_plausibility_stage == "deanon"
 
-    def test_extraction_noise_filter_defaults_to_disabled(self):
-        """Privacy invariant: a config that omits ``extraction_noise_filter``
+    def test_extraction_enrichment_provider_defaults_to_disabled(self):
+        """Privacy invariant: a config that omits ``extraction_enrichment_provider``
         must NOT default to a cloud provider. ``""`` is the disabled
         sentinel — a deployment whose YAML omits the key must not silently
         send extraction-pipeline content to the cloud (see SECURITY.md's
@@ -4416,7 +4441,7 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         from paramem.server.config import ConsolidationScheduleConfig
 
         cfg = ConsolidationScheduleConfig()
-        assert cfg.extraction_noise_filter == ""
+        assert cfg.extraction_enrichment_provider == ""
 
     def test_minimal_yaml_loads_with_defaults(self, tmp_path):
         """Back-compat: minimal yaml without new keys loads with all new defaults.
@@ -4467,7 +4492,7 @@ class TestCheckMappingTotality:
     def test_total_mapping_records_no_orphans(self):
         """Every fact placeholder resolves via the reverse map → empty
         verdict."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
@@ -4481,7 +4506,7 @@ class TestCheckMappingTotality:
         """A fact placeholder absent from ``reverse_mapping`` (the keys
         deanon actually looks up) comes back in the verdict.  No mutation
         of inputs."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
@@ -4496,7 +4521,7 @@ class TestCheckMappingTotality:
     def test_multiple_orphans_sorted(self):
         """Multiple orphans are deduplicated and sorted for stable
         diagnostic output."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Org_1", "predicate": "made", "object": "Product_1"},
@@ -4515,7 +4540,7 @@ class TestCheckMappingTotality:
     def test_embedded_placeholder_caught(self):
         """Placeholder embedded in a compound string still surfaces as
         an orphan when missing from ``reverse_mapping``."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {
@@ -4530,7 +4555,7 @@ class TestCheckMappingTotality:
 
     def test_empty_facts_short_circuits(self):
         """No facts → empty verdict, regardless of reverse_mapping shape."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         assert _check_mapping_totality([], {}) == ([], [])
         assert _check_mapping_totality([], {"Person_1": "Alex"}) == ([], [])
@@ -4544,7 +4569,7 @@ class TestCheckMappingTotality:
         into the forward map's conflict-losing value but never reached
         the reverse map.
         """
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
@@ -4561,7 +4586,7 @@ class TestCheckMappingTotality:
     def test_placeholder_present_in_reverse_keys_passes(self):
         """Once the placeholder is a key in the reverse map, the same
         fact passes with an empty verdict."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
@@ -4570,25 +4595,25 @@ class TestCheckMappingTotality:
         verdict, _collisions = _check_mapping_totality(anon_facts, reverse_mapping)
         assert verdict == []
 
-    def test_post_sota_missing_binding_predicted_before_drop(self, caplog):
+    def test_post_cloud_missing_binding_predicted_before_drop(self, caplog):
         """A fact referencing a braced placeholder absent from BOTH
-        ``sota_bindings`` and ``reverse_mapping`` comes back in the
+        ``cloud_bindings`` and ``reverse_mapping`` comes back in the
         verdict and is logged BEFORE :func:`_apply_bindings` drops the
         fact."""
         import logging
 
-        from paramem.graph.placeholders import _apply_bindings, _check_mapping_totality
+        from paramem.cloud.placeholders import _apply_bindings, _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_1", "predicate": "works_at", "object": "{Org_9}"},
         ]
         reverse_mapping = {"Person_1": "Alex"}
-        sota_bindings: dict = {}
+        cloud_bindings: dict = {}
         # caplog.at_level() silently fails here because the logger is not
         # propagating to the root; attach the handler to the specific
         # logger directly (see test_skips_unrecognised_class_filenames pattern
         # in test_intent.py).
-        placeholders_logger = logging.getLogger("paramem.graph.placeholders")
+        placeholders_logger = logging.getLogger("paramem.cloud.placeholders")
         prior_level = placeholders_logger.level
         placeholders_logger.setLevel(logging.WARNING)
         placeholders_logger.addHandler(caplog.handler)
@@ -4596,7 +4621,7 @@ class TestCheckMappingTotality:
             verdict, _collisions = _check_mapping_totality(
                 anon_facts,
                 reverse_mapping,
-                sota_bindings=sota_bindings,
+                cloud_bindings=cloud_bindings,
             )
         finally:
             placeholders_logger.removeHandler(caplog.handler)
@@ -4604,50 +4629,50 @@ class TestCheckMappingTotality:
         assert verdict == ["Org_9"]
         assert any("binding-totality violation" in r.getMessage().lower() for r in caplog.records)
         kept, predicate_dropped, residual_dropped = _apply_bindings(
-            anon_facts, reverse_mapping, sota_bindings
+            anon_facts, reverse_mapping, cloud_bindings
         )
         dropped = predicate_dropped + residual_dropped
         assert kept == []
         assert len(dropped) == 1
 
-    def test_post_sota_nested_binding_value_unbound_predicted(self):
+    def test_post_cloud_nested_binding_value_unbound_predicted(self):
         """A binding value that itself contains an unresolved bare
         placeholder (``"... at Org_9"``) is predicted as an orphan even
         though no fact directly references ``Org_9``."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_1", "predicate": "held_role", "object": "{Role_1}"},
         ]
         reverse_mapping: dict = {}
-        sota_bindings = {"Role_1": "Senior Engineer at Org_9"}
+        cloud_bindings = {"Role_1": "Senior Engineer at Org_9"}
         verdict, _collisions = _check_mapping_totality(
             anon_facts,
             reverse_mapping,
-            sota_bindings=sota_bindings,
+            cloud_bindings=cloud_bindings,
         )
         assert "Org_9" in verdict
 
-    def test_collision_between_sota_bindings_and_reverse_recorded(self, caplog):
-        """A key present in BOTH ``sota_bindings`` and ``reverse_mapping``
+    def test_collision_between_cloud_bindings_and_reverse_recorded(self, caplog):
+        """A key present in BOTH ``cloud_bindings`` and ``reverse_mapping``
         with differing values comes back as a ``collisions`` entry and is
         warned about — the reverse-wins tie-break in
         :func:`_apply_bindings` would otherwise silently resolve to the
         wrong real name."""
         import logging
 
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Org_1", "predicate": "based_in", "object": "Germany"},
         ]
         reverse_mapping = {"Org_1": "Acme"}
-        sota_bindings = {"Org_1": "Wrong Corp"}
+        cloud_bindings = {"Org_1": "Wrong Corp"}
         # caplog.at_level() silently fails here because the logger is not
         # propagating to the root; attach the handler to the specific
         # logger directly (see test_skips_unrecognised_class_filenames pattern
         # in test_intent.py).
-        placeholders_logger = logging.getLogger("paramem.graph.placeholders")
+        placeholders_logger = logging.getLogger("paramem.cloud.placeholders")
         prior_level = placeholders_logger.level
         placeholders_logger.setLevel(logging.WARNING)
         placeholders_logger.addHandler(caplog.handler)
@@ -4655,7 +4680,7 @@ class TestCheckMappingTotality:
             verdict, collisions = _check_mapping_totality(
                 anon_facts,
                 reverse_mapping,
-                sota_bindings=sota_bindings,
+                cloud_bindings=cloud_bindings,
             )
         finally:
             placeholders_logger.removeHandler(caplog.handler)
@@ -4666,12 +4691,12 @@ class TestCheckMappingTotality:
         assert verdict == []
         assert any("collision" in r.getMessage().lower() for r in caplog.records)
 
-    def test_pre_sota_positional_calls_unaffected_by_generalization(self):
-        """The existing positional pre-SOTA call sites (this class's
+    def test_pre_cloud_positional_calls_unaffected_by_generalization(self):
+        """The existing positional pre-cloud call sites (this class's
         earlier tests) keep passing unchanged — defaults preserve
-        behaviour: ``sota_bindings=None`` skips the collision scan, so
+        behaviour: ``cloud_bindings=None`` skips the collision scan, so
         ``collisions`` comes back empty."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
@@ -4687,7 +4712,7 @@ class TestCheckMappingTotality:
         """The totality check returns ``[]`` (not ``None``) when the
         mapping is total — the explicit-return contract that makes a
         plain truthiness test safe for callers."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
         reverse_mapping = {"Person_1": "Alex"}
@@ -4702,7 +4727,7 @@ class TestCheckMappingTotality:
         guard returns ``[]``, not the implicit ``None`` a bare ``return``
         would give — invisible to a caller that only writes ``if
         verdict:``."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         verdict, collisions = _check_mapping_totality([], {"Person_1": "Alex"})
         assert verdict == []
@@ -4712,7 +4737,7 @@ class TestCheckMappingTotality:
     def test_returns_token_list_on_poisoned_delta(self):
         """The verdict IS the sorted offending-token list — the function
         has no side effect to observe it through."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
@@ -4722,19 +4747,19 @@ class TestCheckMappingTotality:
         assert verdict == ["University_1"]
 
     def test_conflict_key_folded_into_verdict_when_observed_scoped(self):
-        """When ``observed`` is a set, a ``sota_bindings`` key colliding
+        """When ``observed`` is a set, a ``cloud_bindings`` key colliding
         with it is folded into the RETURNED verdict AND surfaces
         separately as a ``collisions`` entry."""
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
         reverse_mapping = {"Person_1": "Alex"}
-        sota_bindings = {"Person_1": "someone else entirely"}
+        cloud_bindings = {"Person_1": "someone else entirely"}
         observed = {"Person_1"}
         verdict, collisions = _check_mapping_totality(
             anon_facts,
             reverse_mapping,
-            sota_bindings=sota_bindings,
+            cloud_bindings=cloud_bindings,
             observed=observed,
         )
         assert verdict == ["Person_1"]
@@ -4744,8 +4769,8 @@ class TestCheckMappingTotality:
         """A non-empty verdict from the collision scan ALONE —
         ``anon_facts`` is empty, so there is nothing for the per-fact scan
         to find — must still reach the caller.  This is the exact shape
-        ``graph_enrich.run_graph_enrichment``'s ``totality_rejected_chunks``
-        counter reads (now off the verdict ``_graph_enrich_with_sota``
+        ``graph_enrich.enrich_graph``'s ``totality_rejected_chunks``
+        counter reads (now off the verdict ``request_graph_enrichment``
         returns); a verdict that is non-empty but never surfaced is
         silently under-counted as "no rejection" — worse than no gate at
         all.
@@ -4755,15 +4780,15 @@ class TestCheckMappingTotality:
         this function had before the fix) -> ``verdict`` comes back empty
         -> this test fails.
         """
-        from paramem.graph.placeholders import _check_mapping_totality
+        from paramem.cloud.placeholders import _check_mapping_totality
 
         reverse_mapping = {"Person_1": "Alex"}
-        sota_bindings = {"Person_1": "someone else entirely"}
+        cloud_bindings = {"Person_1": "someone else entirely"}
         observed = {"Person_1"}
         verdict, collisions = _check_mapping_totality(
             [],  # no facts -- the early-return path the bug lived in
             reverse_mapping,
-            sota_bindings=sota_bindings,
+            cloud_bindings=cloud_bindings,
             observed=observed,
         )
         assert verdict == ["Person_1"]
@@ -4784,7 +4809,7 @@ class TestRecordBindingDiagnostics:
 
     @staticmethod
     def _result(verdict: list[str], collisions: list[str]):
-        from paramem.graph.cloud_egress import DeanonResult
+        from paramem.cloud.deanonymize import DeanonResult
 
         return DeanonResult(
             facts=[],
@@ -4802,16 +4827,16 @@ class TestRecordBindingDiagnostics:
 
         graph = _make_graph([])
         _record_binding_diagnostics(graph, self._result([], []))
-        assert "sota_pending_orphans" not in graph.diagnostics
-        assert "sota_binding_collisions" not in graph.diagnostics
+        assert "cloud_pending_orphans" not in graph.diagnostics
+        assert "cloud_binding_collisions" not in graph.diagnostics
 
     def test_verdict_and_collisions_land_under_their_keys(self):
         from paramem.graph.extractor import _record_binding_diagnostics
 
         graph = _make_graph([])
         _record_binding_diagnostics(graph, self._result(["Org_1"], ["Person_2"]))
-        assert graph.diagnostics["sota_pending_orphans"] == ["Org_1"]
-        assert graph.diagnostics["sota_binding_collisions"] == ["Person_2"]
+        assert graph.diagnostics["cloud_pending_orphans"] == ["Org_1"]
+        assert graph.diagnostics["cloud_binding_collisions"] == ["Person_2"]
 
     def test_collisions_without_a_verdict_still_recorded(self):
         """CORE-unscoped shape: a collision is informational only and is
@@ -4821,8 +4846,8 @@ class TestRecordBindingDiagnostics:
 
         graph = _make_graph([])
         _record_binding_diagnostics(graph, self._result([], ["Person_2"]))
-        assert graph.diagnostics["sota_binding_collisions"] == ["Person_2"]
-        assert "sota_pending_orphans" not in graph.diagnostics
+        assert graph.diagnostics["cloud_binding_collisions"] == ["Person_2"]
+        assert "cloud_pending_orphans" not in graph.diagnostics
 
 
 class TestResolutionMap:
@@ -4830,18 +4855,18 @@ class TestResolutionMap:
     independent of the rejection gate.  Backstops need their own test: do
     not skip this because the rejection gate makes the collision unreachable
     in the full pipeline — a future refactor flipping the ``.update()``
-    order would otherwise silently let SOTA overwrite a real name with no
+    order would otherwise silently let cloud overwrite a real name with no
     test failing.
     """
 
     def test_core_wins_on_key_in_both_maps_unscoped(self):
         """observed=None (CORE unscoped): reverse wins on collision —
         today's behaviour, preserved."""
-        from paramem.graph.placeholders import _resolution_map
+        from paramem.cloud.placeholders import _resolution_map
 
         reverse = {"Org_1": "Acme"}
-        sota_bindings = {"Org_1": "Wrong Corp"}
-        resolved = _resolution_map(reverse, sota_bindings, observed=None)
+        cloud_bindings = {"Org_1": "Wrong Corp"}
+        resolved = _resolution_map(reverse, cloud_bindings, observed=None)
         assert resolved["Org_1"] == "Acme"
 
     def test_core_wins_on_key_in_both_maps_scoped(self):
@@ -4849,50 +4874,50 @@ class TestResolutionMap:
         CORE — vacuous under normal scoped construction (the rejection
         gate would have already rejected this delta) but must hold if
         the map is asked to resolve one directly."""
-        from paramem.graph.placeholders import _resolution_map
+        from paramem.cloud.placeholders import _resolution_map
 
         reverse = {"Org_1": "Acme"}
-        sota_bindings = {"Org_1": "Wrong Corp"}
-        resolved = _resolution_map(reverse, sota_bindings, observed={"Org_1"})
+        cloud_bindings = {"Org_1": "Wrong Corp"}
+        resolved = _resolution_map(reverse, cloud_bindings, observed={"Org_1"})
         assert resolved["Org_1"] == "Acme"
 
     def test_observed_none_is_core_unscoped_every_reverse_entry_legal(self):
-        from paramem.graph.placeholders import _resolution_map
+        from paramem.cloud.placeholders import _resolution_map
 
         reverse = {"Person_1": "Alex", "City_1": "Berlin"}
         resolved = _resolution_map(reverse, {}, observed=None)
         assert resolved == reverse
 
     def test_observed_scoped_excludes_reverse_entries_outside_observed(self):
-        from paramem.graph.placeholders import _resolution_map
+        from paramem.cloud.placeholders import _resolution_map
 
         reverse = {"Person_1": "Alex", "City_1": "Berlin"}
         resolved = _resolution_map(reverse, {}, observed={"Person_1"})
         assert resolved == {"Person_1": "Alex"}
 
-    def test_sota_mint_outside_observed_is_included(self):
-        from paramem.graph.placeholders import _resolution_map
+    def test_cloud_mint_outside_observed_is_included(self):
+        from paramem.cloud.placeholders import _resolution_map
 
         reverse = {"Person_1": "Alex"}
-        sota_bindings = {"Event_1": "the workshop"}
-        resolved = _resolution_map(reverse, sota_bindings, observed={"Person_1"})
+        cloud_bindings = {"Event_1": "the workshop"}
+        resolved = _resolution_map(reverse, cloud_bindings, observed={"Person_1"})
         assert resolved == {"Person_1": "Alex", "Event_1": "the workshop"}
 
 
 class TestBindingTotalityRejection:
-    """Reject invalid SOTA-enrichment deltas instead of applying
+    """Reject invalid cloud-enrichment deltas instead of applying
     them partially, and fall back to the local-extract facts.  These are
     the pipeline-level tests the binding-totality contract requires.
 
     FIXTURE MECHANICS (post cloud-egress-PII redesign): ``anon_transcript``
     is the MODEL's own rewrite — the 2nd element of the
-    ``anonymize_with_local_model`` mock's return tuple — never mechanically
+    ``anonymize_transcript`` mock's return tuple — never mechanically
     rebuilt from ``transcript`` + ``mapping`` (the deleted
     ``_anonymize_transcript`` forward-on-prose call).  ``observed`` is
     derived from the DECLARED token vocabulary intersected with the
     rendered payload (facts JSON + ``anon_transcript``), so a test
     controlling what is "observed" controls the mocked
-    ``anonymize_with_local_model`` transcript string and/or the facts the
+    ``anonymize_transcript`` transcript string and/or the facts the
     graph fixture carries — not a transcript-substitution side effect.
     """
 
@@ -4914,13 +4939,13 @@ class TestBindingTotalityRejection:
         drops the local fact and adds 5 facts over bare, unbound
         Person_2/Person_3 (``bindings={}``) must be REJECTED as a whole:
         the local-extract facts survive de-anonymized, no residual
-        placeholder remains, ``sota_enrichment_rejected`` is recorded,
-        the ``sota_enrich`` phase outcome is ``"rejected"``, and an ERROR
+        placeholder remains, ``cloud_enrichment_rejected`` is recorded,
+        the ``cloud_enrich`` phase outcome is ``"rejected"``, and an ERROR
         is logged naming the offending tokens."""
         import logging
 
         from paramem.graph.phase_trace import extraction_trace
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = [
@@ -4961,7 +4986,10 @@ class TestBindingTotalityRejection:
             },
         ]
 
-        extractor_logger = logging.getLogger("paramem.graph.extractor")
+        # The binding-totality-breach ERROR log now originates in
+        # paramem.graph.stage_enrich (carved out of extractor.py's
+        # _cloud_pipeline) — attach to that logger, not extractor's.
+        extractor_logger = logging.getLogger("paramem.graph.stage_enrich")
         prior_level = extractor_logger.level
         extractor_logger.setLevel(logging.WARNING)
         extractor_logger.addHandler(caplog.handler)
@@ -4970,15 +4998,15 @@ class TestBindingTotalityRejection:
                 with (
                     patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                     patch(
-                        "paramem.graph.cloud_egress.anonymize_with_local_model",
+                        "paramem.cloud.anonymize.anonymize_transcript",
                         return_value=(mapping, "anonymized transcript", ""),
                     ),
                     patch(
-                        "paramem.graph.extractor._filter_with_sota",
+                        "paramem.graph.stage_enrich.request_enrichment",
                         return_value=(enriched_anon, None, {}, None, {}),
                     ),
                 ):
-                    result = run_sota_stages(
+                    result = run_cloud_stages(
                         graph,
                         "Alex lives in Millfield",
                         None,
@@ -4999,25 +5027,25 @@ class TestBindingTotalityRejection:
         assert "Person_" not in result.relations[0].subject
         assert "Person_" not in result.relations[0].object
         # Rejection recorded, loudly.
-        rejected = result.diagnostics.get("sota_enrichment_rejected")
-        assert rejected, "sota_enrichment_rejected diagnostic must be recorded"
+        rejected = result.diagnostics.get("cloud_enrichment_rejected")
+        assert rejected, "cloud_enrichment_rejected diagnostic must be recorded"
         assert any("Person_2" in t or "Person_3" in t for t in rejected)
         phases = {p.name: p for p in trace.records}
-        assert phases["sota_enrich"].outcome == "rejected"
+        assert phases["cloud_enrich"].outcome == "rejected"
         assert any(r.levelname == "ERROR" for r in caplog.records), (
             "A binding-totality breach must log at ERROR, not just warn."
         )
 
     def test_misattribution_orphan_rejected(self):
         """The misattribution regression (headline).  A placeholder
-        NOT in ``observed`` (never shown to SOTA) that SOTA bare-mints is
+        NOT in ``observed`` (never shown to cloud) that cloud bare-mints is
         an ORPHAN → reject.  Pre-fix this would silently emit a
         fabricated fact bound for adapter weights; post-fix the local
         facts survive."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
-        # Person_3 is bare-minted by SOTA but was never shown to it (not
+        # Person_3 is bare-minted by cloud but was never shown to it (not
         # in the rendered facts, not in the transcript, not bound).
         enriched_anon = anon_facts + [
             {
@@ -5031,15 +5059,15 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -5050,16 +5078,16 @@ class TestBindingTotalityRejection:
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
-        assert "sota_enrichment_rejected" in result.diagnostics
+        assert "cloud_enrichment_rejected" in result.diagnostics
 
     def test_bare_observed_placeholder_as_new_subject_accepted(self):
         """Rule 1 must not regress.  A delta referencing a bare
-        OBSERVED placeholder (Person_1 — already shown to SOTA) as the
+        OBSERVED placeholder (Person_1 — already shown to cloud) as the
         subject of a NEW triple, minting nothing, is ACCEPTED.  This test
         and ``test_misattribution_orphan_rejected`` differ ONLY in
         observed-membership."""
         from paramem.graph.phase_trace import extraction_trace
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = anon_facts + [
@@ -5075,15 +5103,15 @@ class TestBindingTotalityRejection:
             with (
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                 patch(
-                    "paramem.graph.cloud_egress.anonymize_with_local_model",
+                    "paramem.cloud.anonymize.anonymize_transcript",
                     return_value=(mapping, "anonymized transcript", ""),
                 ),
                 patch(
-                    "paramem.graph.extractor._filter_with_sota",
+                    "paramem.graph.stage_enrich.request_enrichment",
                     return_value=(enriched_anon, None, {}, None, {}),
                 ),
             ):
-                result = run_sota_stages(
+                result = run_cloud_stages(
                     graph,
                     "Alex lives in Millfield",
                     None,
@@ -5093,16 +5121,16 @@ class TestBindingTotalityRejection:
                     scrub={"person name", "physical address"},
                 )
         assert len(result.relations) == 2
-        assert "sota_enrichment_rejected" not in result.diagnostics
+        assert "cloud_enrichment_rejected" not in result.diagnostics
         phases = {p.name: p for p in trace.records}
-        assert phases["sota_enrich"].outcome == "ok"
+        assert phases["cloud_enrich"].outcome == "ok"
 
     def test_binding_key_colliding_with_observed_rejected(self):
         """Conflict rejection.  A ``bindings`` key that is itself
         an OBSERVED token (Person_1 — already shown as a core reference)
         is a CONFLICT → rejected, even though it would resolve cleanly
         under the old flat-union design (reverse wins silently)."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = list(anon_facts)
@@ -5110,15 +5138,15 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, bindings, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -5127,16 +5155,16 @@ class TestBindingTotalityRejection:
                 correction_entity_types=set(),
                 scrub={"person name"},
             )
-        assert "sota_enrichment_rejected" in result.diagnostics
-        assert "Person_1" in result.diagnostics["sota_enrichment_rejected"]
+        assert "cloud_enrichment_rejected" in result.diagnostics
+        assert "Person_1" in result.diagnostics["cloud_enrichment_rejected"]
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
 
     def test_mint_bound_to_descriptor_accepted(self):
-        """Mint happy path.  SOTA mints a placeholder BOUND to a
+        """Mint happy path.  Cloud mints a placeholder BOUND to a
         descriptor span ("my father", ∉ observed) → ACCEPTED; the
         relation de-anonymizes to the bound text."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph, anon_facts, mapping = self._graph_and_mapping()
         enriched_anon = anon_facts + [
@@ -5152,15 +5180,15 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, bindings, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex lives in Millfield",
                 None,
@@ -5169,14 +5197,14 @@ class TestBindingTotalityRejection:
                 correction_entity_types=set(),
                 scrub={"person name", "physical address"},
             )
-        assert "sota_enrichment_rejected" not in result.diagnostics
+        assert "cloud_enrichment_rejected" not in result.diagnostics
         subjects_objects = {(r.subject, r.object) for r in result.relations}
         assert ("Alex", "my father") in subjects_objects
 
     def test_predicate_only_reference_still_observed_accepted(self):
         """A placeholder appearing ONLY in a predicate is still
         ∈ observed (the RENDERED payload, predicate included, is what
-        SOTA is actually shown), so a bare reference to it elsewhere is
+        Cloud is actually shown), so a bare reference to it elsewhere is
         ACCEPTED.  Guards the rendered-payload requirement: a
         subject/object-only field scan would under-include ``observed``
         and false-reject this.
@@ -5184,19 +5212,19 @@ class TestBindingTotalityRejection:
         Post cloud-egress-PII redesign: CORE placeholders come straight
         from the model's own anonymizer mapping (there is no
         code-side entity walk that mints for graph entities the model
-        didn't name).  So ``anonymize_with_local_model`` is mocked to
+        didn't name).  So ``anonymize_transcript`` is mocked to
         have already classified BOTH places (``Millfield`` -> ``City_1``,
         ``Springfield`` -> ``City_2``) — the model decision this test's
         fixture would need in production for either place to be a CORE
         placeholder at all.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         # Springfield -> City_2 appears ONLY inside a compound PREDICATE
         # string here, never as a subject/object anywhere in the local
         # extract.  `predicate` is never a substitution target, so the
         # graph relation's own predicate must already carry "City_2"
-        # verbatim for it to reach the SOTA-facing payload the script
+        # verbatim for it to reach the cloud-facing payload the script
         # builds — the same text the old model-authored ``anon_facts``
         # stub carried.
         graph = _make_graph(
@@ -5210,7 +5238,7 @@ class TestBindingTotalityRejection:
         anon_facts = [
             {"subject": "Person_1", "predicate": "moved from City_2 to", "object": "City_1"},
         ]
-        # SOTA bare-references City_2 as an object — legal: it is a real
+        # cloud bare-references City_2 as an object — legal: it is a real
         # CORE placeholder, and observed-scoping must find it via the
         # predicate occurrence above.
         enriched_anon = anon_facts + [
@@ -5226,15 +5254,15 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Alex moved from Springfield to Millfield.",
                 None,
@@ -5243,7 +5271,7 @@ class TestBindingTotalityRejection:
                 correction_entity_types=set(),
                 scrub={"person name", "physical address"},
             )
-        assert "sota_enrichment_rejected" not in result.diagnostics, (
+        assert "cloud_enrichment_rejected" not in result.diagnostics, (
             "City_2/Springfield appears only in a predicate but is still "
             "observed — a field-scan-only `observed` would false-reject."
         )
@@ -5251,7 +5279,7 @@ class TestBindingTotalityRejection:
         # `_apply_bindings`'s deanon-stage predicate invariant — its own
         # predicate contains a declared token — so it never reaches
         # `result.relations`.  This assertion rides ENTIRELY on the
-        # second, SOTA-added fact ("recently_visited"); it is not
+        # second, cloud-added fact ("recently_visited"); it is not
         # evidence the first fact survived.
         subjects_objects = {(r.subject, r.object) for r in result.relations}
         assert ("Alex", "Springfield") in subjects_objects
@@ -5269,7 +5297,7 @@ class TestSpeakerAnchorPipeline:
     """
 
     def test_speaker0_survives_end_to_end_not_swept(self):
-        """``speaker0`` survives extraction -> anonymize -> SOTA ->
+        """``speaker0`` survives extraction -> anonymize -> cloud ->
         deanon -> graph VERBATIM, and is never swept by
         :func:`_apply_bindings`'s residual sweep (it doesn't match the
         placeholder pattern at all — verified structurally, not
@@ -5281,7 +5309,7 @@ class TestSpeakerAnchorPipeline:
         ``City_1`` — the model decision this test's fixture would need
         in production.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("speaker0", "lives_in", "Millfield")],
@@ -5296,15 +5324,15 @@ class TestSpeakerAnchorPipeline:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "speaker0 lives in Millfield",
                 None,
@@ -5317,7 +5345,7 @@ class TestSpeakerAnchorPipeline:
         assert result.relations[0].subject == "speaker0"
         assert result.relations[0].object == "Millfield"
         assert "residual_dropped_facts" not in result.diagnostics
-        assert "sota_enrichment_rejected" not in result.diagnostics
+        assert "cloud_enrichment_rejected" not in result.diagnostics
 
     def test_anchor_independent_of_speaker_relation_presence(self):
         """The anchor holds even in a session with NO speaker
@@ -5325,7 +5353,7 @@ class TestSpeakerAnchorPipeline:
         pipeline must not require a speaker fact to function correctly —
         nothing about the anonymizer/deanon machinery depends on the
         speaker being referenced THIS session."""
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Acme", "located_in", "Millfield")],
@@ -5339,15 +5367,15 @@ class TestSpeakerAnchorPipeline:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(list(anon_facts), None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 "Acme located in Millfield",
                 None,
@@ -5359,11 +5387,11 @@ class TestSpeakerAnchorPipeline:
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Acme"
         assert result.relations[0].object == "Millfield"
-        assert "sota_enrichment_rejected" not in result.diagnostics
+        assert "cloud_enrichment_rejected" not in result.diagnostics
 
 
 class TestObservedDerivation:
-    """``observed`` — CORE's legality domain for a SOTA cycle — is derived
+    """``observed`` — CORE's legality domain for a cloud cycle — is derived
     from the DECLARED token vocabulary intersected with the payload we
     actually rendered, not scraped out of the payload with a shape regex.
 
@@ -5378,7 +5406,7 @@ class TestObservedDerivation:
         (copied verbatim out of the transcript) enters ``observed`` as if it
         were a declared placeholder -> this test fails.
         """
-        from tests._sota_flow import run_sota_stages
+        from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -5394,9 +5422,9 @@ class TestObservedDerivation:
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
         captured: list = []
-        from paramem.graph import cloud_egress as _cloud_egress
+        from paramem.cloud import deanonymize as _cloud_deanonymize
 
-        real_totality = _cloud_egress._check_mapping_totality
+        real_totality = _cloud_deanonymize._check_mapping_totality
 
         def _spy(*args, **kwargs):
             if "observed" in kwargs:
@@ -5406,16 +5434,16 @@ class TestObservedDerivation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
-            patch("paramem.graph.cloud_egress._check_mapping_totality", side_effect=_spy),
+            patch("paramem.cloud.deanonymize._check_mapping_totality", side_effect=_spy),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(list(anon_facts), None, {}, None, {}),
             ),
         ):
-            run_sota_stages(
+            run_cloud_stages(
                 graph,
                 "Alex lives in Millfield and flew on a Boeing_747",
                 None,
@@ -5425,7 +5453,7 @@ class TestObservedDerivation:
                 scrub={"person name", "physical address"},
             )
 
-        assert captured, "the sota_enrich totality check must run with an observed scope"
+        assert captured, "the cloud_enrich totality check must run with an observed scope"
         observed = captured[-1]
         # Declared AND in the payload.
         assert observed == {"Person_1", "City_1"}

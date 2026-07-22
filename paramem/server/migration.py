@@ -379,7 +379,7 @@ def _walk_leaves(node: object, prefix: str) -> list[tuple[str, Any]]:
     Thin wrapper around :func:`paramem.config.classification.walk_dict_leaves`
     that preserves the existing sorted-list return type expected by
     :func:`compute_tier_diff`.  The shared helper encapsulates the traversal
-    rules for dynamic containers (``adapters``, ``sota_providers``, ``voices``).
+    rules for dynamic containers (``adapters``, ``cloud_providers``, ``voices``).
 
     Parameters
     ----------

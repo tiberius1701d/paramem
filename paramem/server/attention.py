@@ -681,7 +681,7 @@ def _collect_local_recall_inactive_items(state: dict) -> list[AttentionItem]:
 
     summary = (
         f"Local recall INACTIVE — no trained personal memory "
-        f"({pending_sessions} pending session(s)); recall falls back to HA/SOTA"
+        f"({pending_sessions} pending session(s)); recall falls back to HA/cloud"
     )
     action = (
         "consolidate the pending sessions (POST /consolidate or wait for the "
@@ -790,7 +790,7 @@ def _collect_vram_post_load_budget_items(state: dict) -> list[AttentionItem]:
 def _collect_vram_low_headroom_items(state: dict) -> list[AttentionItem]:
     """Emit a warning when free VRAM has dropped below the configured headroom.
 
-    Written by :func:`paramem.server.vram_guard.check_vram_headroom` at the
+    Written by :func:`paramem.utils.vram_guard.check_vram_headroom` at the
     entry of each extraction chunk — drift detection, not a hard reject.
     Sticky for the session (cleared on restart) so a transient dip during one
     chunk stays visible after free recovers.

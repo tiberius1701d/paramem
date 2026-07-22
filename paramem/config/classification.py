@@ -53,8 +53,8 @@ EXTENSION_FIELDS: frozenset[str] = frozenset(
         "adapters.*.target_modules",
         "adapters.*.dropout",
         # Planned pipeline flag — not in the shipped server.yaml yet but
-        # documented in the consolidation block for future SOTA provider routing.
-        "consolidation.extraction_noise_filter_endpoint",
+        # documented in the consolidation block for future cloud provider routing.
+        "consolidation.extraction_enrichment_provider_endpoint",
         # Optional inline overrides for the abstention messages — opt-in,
         # commented out in shipped server.yaml so the file-based default
         # is used.  Classified because they ARE valid config keys when an
@@ -101,9 +101,9 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.decay_window": Tier.PIPELINE_ALTERING,
     "consolidation.max_interim_count": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_max_tokens": Tier.PIPELINE_ALTERING,
-    "consolidation.extraction_noise_filter": Tier.PIPELINE_ALTERING,
-    "consolidation.extraction_noise_filter_model": Tier.PIPELINE_ALTERING,
-    "consolidation.extraction_noise_filter_endpoint": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_enrichment_provider": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_enrichment_provider_model": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_enrichment_provider_endpoint": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_plausibility_judge": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_plausibility_stage": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_plausibility_model": Tier.PIPELINE_ALTERING,
@@ -116,24 +116,24 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.entity_similarity_threshold": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_neighborhood_hops": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_max_entities_per_pass": Tier.PIPELINE_ALTERING,
-    "consolidation.sota_enabled": Tier.PIPELINE_ALTERING,
+    "consolidation.cloud_enabled": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_enrichment": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_normalization": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_contradiction": Tier.PIPELINE_ALTERING,
-    # --- agents.sota ---
-    "agents.sota.enabled": Tier.PIPELINE_ALTERING,
-    "agents.sota.provider": Tier.PIPELINE_ALTERING,
-    "agents.sota.model": Tier.PIPELINE_ALTERING,
-    "agents.sota.api_key": Tier.PIPELINE_ALTERING,
-    "agents.sota.endpoint": Tier.PIPELINE_ALTERING,
-    "agents.sota.timeout_seconds": Tier.OPERATIONAL,
-    # --- agents.sota_providers (wildcard for any provider name) ---
-    "agents.sota_providers.*.enabled": Tier.PIPELINE_ALTERING,
-    "agents.sota_providers.*.provider": Tier.PIPELINE_ALTERING,
-    "agents.sota_providers.*.model": Tier.PIPELINE_ALTERING,
-    "agents.sota_providers.*.api_key": Tier.PIPELINE_ALTERING,
-    "agents.sota_providers.*.endpoint": Tier.PIPELINE_ALTERING,
-    "agents.sota_providers.*.timeout_seconds": Tier.OPERATIONAL,
+    # --- agents.cloud ---
+    "agents.cloud.enabled": Tier.PIPELINE_ALTERING,
+    "agents.cloud.provider": Tier.PIPELINE_ALTERING,
+    "agents.cloud.model": Tier.PIPELINE_ALTERING,
+    "agents.cloud.api_key": Tier.PIPELINE_ALTERING,
+    "agents.cloud.endpoint": Tier.PIPELINE_ALTERING,
+    "agents.cloud.timeout_seconds": Tier.OPERATIONAL,
+    # --- agents.cloud_providers (wildcard for any provider name) ---
+    "agents.cloud_providers.*.enabled": Tier.PIPELINE_ALTERING,
+    "agents.cloud_providers.*.provider": Tier.PIPELINE_ALTERING,
+    "agents.cloud_providers.*.model": Tier.PIPELINE_ALTERING,
+    "agents.cloud_providers.*.api_key": Tier.PIPELINE_ALTERING,
+    "agents.cloud_providers.*.endpoint": Tier.PIPELINE_ALTERING,
+    "agents.cloud_providers.*.timeout_seconds": Tier.OPERATIONAL,
     # --- agents.ha_agent_id ---
     "agents.ha_agent_id": Tier.PIPELINE_ALTERING,
     # --- tools ---
@@ -197,7 +197,7 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
 }
 
 
-_DEFAULT_DYNAMIC_CONTAINERS: frozenset[str] = frozenset({"adapters", "sota_providers", "voices"})
+_DEFAULT_DYNAMIC_CONTAINERS: frozenset[str] = frozenset({"adapters", "cloud_providers", "voices"})
 
 
 def walk_dict_leaves(
@@ -213,7 +213,7 @@ def walk_dict_leaves(
     (``iter_shipped_paths``).  Extracting the logic here means a single change
     keeps both consumers consistent.
 
-    Dynamic containers (``adapters``, ``sota_providers``, ``voices``) are
+    Dynamic containers (``adapters``, ``cloud_providers``, ``voices``) are
     traversed using their concrete child names — e.g.
     ``adapters.episodic.rank`` — not a wildcard form.  The :func:`classify`
     function handles wildcard expansion internally.
@@ -227,7 +227,7 @@ def walk_dict_leaves(
     dynamic_containers:
         Names of container keys whose children are concrete dynamic names
         (not sub-keys of the parent schema).  Defaults to
-        ``{"adapters", "sota_providers", "voices"}``.
+        ``{"adapters", "cloud_providers", "voices"}``.
 
     Yields
     ------
@@ -255,7 +255,7 @@ def classify(dotted_path: str) -> Tier:
     1. Exact match in :data:`CLASSIFICATION`.
     2. Wildcard match — rewrite the **middle** segment to ``*`` and retry.
        Middle-first because every current dynamic yaml shape
-       (``adapters.<name>.<subkey>``, ``agents.sota_providers.<name>.<subkey>``,
+       (``adapters.<name>.<subkey>``, ``agents.cloud_providers.<name>.<subkey>``,
        ``tts.voices.<name>.<subkey>``) places the dynamic segment in a middle
        position.  Last-first would always miss on the first attempt.
     3. Wildcard match — rewrite the **last** segment to ``*`` and retry.
@@ -308,7 +308,7 @@ def iter_shipped_paths(server_yaml_path: Path) -> Iterator[str]:
 
     - Leaf scalars and lists yield the containing dotted path.
     - Dicts recurse.
-    - ``adapters.*``, ``agents.sota_providers.*``, and ``tts.voices.*`` are
+    - ``adapters.*``, ``agents.cloud_providers.*``, and ``tts.voices.*`` are
       dynamic-key containers — the walker yields the concrete
       ``adapters.<name>.<subkey>`` form.  The test-side assertion verifies that
       the wildcard form classifies each concrete name, not that the concrete

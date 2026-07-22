@@ -461,7 +461,7 @@ def entry_fact_text(
     triple into human- and model-facing text.  Identity form and rendered form
     are different layers.  Identity is what gets stored, keyed, compared and
     trained; rendering is where a fact becomes prose.  Output reaches inference
-    context, SOTA prompts and TTS, so it must read as language.
+    context, cloud prompts and TTS, so it must read as language.
 
     The two sides are treated differently because they are stored differently:
 

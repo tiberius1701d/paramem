@@ -1,10 +1,10 @@
-"""Post-materialize graph-tier refinement: predicate normalization + SOTA enrichment.
+"""Post-materialize graph-tier refinement: predicate normalization + cloud enrichment.
 
 Owns the two passes that mutate the merged graph after the Materialize stage —
 whole-graph local-model predicate-synonym normalization
-(:meth:`GraphTierRefiner.run_normalization`) and cloud-SOTA ego-graph
+(:meth:`GraphTierRefiner.run_normalization`) and cloud-cloud ego-graph
 enrichment (:meth:`GraphTierRefiner.run_enrichment`, which dispatches into
-:func:`paramem.training.graph_enrich.run_graph_enrichment`) — behind the single
+:func:`paramem.training.graph_enrich.enrich_graph`) — behind the single
 entry point :meth:`GraphTierRefiner.refine`.
 
 Boundary: a :class:`GraphTierRefiner` mutates exactly the ``GraphMerger`` it is
@@ -20,10 +20,10 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Protocol
 
+from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.graph.extractor import normalize_predicates
 from paramem.graph.merger import GraphMerger, min_nonempty
 from paramem.training import graph_enrich
-from paramem.utils.cloud_admission import evaluate_cloud_egress
 from paramem.utils.identity import canonical
 
 if TYPE_CHECKING:
@@ -93,7 +93,7 @@ class GraphTierRefiner:
         model,
         tokenizer,
         extraction_config_provider: "Callable[[], ExtractionConfig]",
-        sota_enabled: bool,
+        cloud_enabled: bool,
         neighborhood_hops: int,
         max_entities_per_pass: int,
         gc_disable: "Callable[[], None] | None" = None,
@@ -112,8 +112,8 @@ class GraphTierRefiner:
                 :class:`~paramem.graph.extraction_pipeline.ExtractionConfig`
                 (not the owning ``ExtractionPipeline`` — the pipeline is a
                 second base-model holder this refiner has no business
-                reaching). Only ``noise_filter``, ``noise_filter_model``,
-                ``noise_filter_endpoint``, ``scrub``, and ``max_tokens`` are
+                reaching). Only ``enrichment_provider``, ``enrichment_provider_model``,
+                ``enrichment_provider_endpoint``, ``scrub``, and ``max_tokens`` are
                 read, across both passes.
 
                 Deferred, not a resolved value. Every one of this refiner's
@@ -125,14 +125,14 @@ class GraphTierRefiner:
                 each pass invokes it only past its own guards
                 (:meth:`run_normalization` past its ``no_model``/``floor``
                 skips, immediately before the cloud-admission verdict that
-                selects the SOTA or local engine; :meth:`run_enrichment`
+                selects the cloud or local engine; :meth:`run_enrichment`
                 threads it unresolved into
-                :func:`~paramem.training.graph_enrich.run_graph_enrichment`,
+                :func:`~paramem.training.graph_enrich.enrich_graph`,
                 which resolves it past its own ``no_model``/``floor`` skips).
                 This holds for a refiner constructed once and reused across
                 both passes, not just a per-call one.
-            sota_enabled: Whether the caller's consolidation config permits
-                cloud-SOTA engine selection for normalization. Passed as a
+            cloud_enabled: Whether the caller's consolidation config permits
+                cloud-cloud engine selection for normalization. Passed as a
                 bare bool rather than the owning config so this module never
                 needs to import ``ConsolidationConfig``.
             neighborhood_hops: Ego-graph radius for enrichment chunking.
@@ -155,7 +155,7 @@ class GraphTierRefiner:
         self.tokenizer = tokenizer
         self._merger = merger
         self._extraction_config_provider = extraction_config_provider
-        self._sota_enabled = sota_enabled
+        self._cloud_enabled = cloud_enabled
         self._neighborhood_hops = neighborhood_hops
         self._max_entities_per_pass = max_entities_per_pass
         self._gc_disable = gc_disable
@@ -177,7 +177,7 @@ class GraphTierRefiner:
         self._gc_enable = None
 
     def run_enrichment(self) -> dict:
-        """Dispatch into :func:`paramem.training.graph_enrich.run_graph_enrichment`.
+        """Dispatch into :func:`paramem.training.graph_enrich.enrich_graph`.
 
         Not a shim — this is where the tier's shared state (the merger, the
         model handle, the GC toggle pair, the pass-sizing scalars) lives; the
@@ -186,9 +186,9 @@ class GraphTierRefiner:
 
         Returns:
             The enrichment diagnostics dict produced by
-            :func:`~paramem.training.graph_enrich.run_graph_enrichment`.
+            :func:`~paramem.training.graph_enrich.enrich_graph`.
         """
-        return graph_enrich.run_graph_enrichment(
+        return graph_enrich.enrich_graph(
             self._merger,
             model=self.model,
             tokenizer=self.tokenizer,
@@ -209,10 +209,10 @@ class GraphTierRefiner:
         Engine selection (resolved once before the primitive call):
 
         * **Local** (default): ``model`` + ``tokenizer`` from this refiner.
-        * **SOTA**: when
-          :func:`~paramem.utils.cloud_admission.evaluate_cloud_egress` —
+        * **cloud**: when
+          :func:`~paramem.cloud.admission.evaluate_cloud_egress` —
           the one shared cloud-admission component — permits egress for
-          ``sota_enabled`` plus the extraction config's ``noise_filter``
+          ``cloud_enabled`` plus the extraction config's ``enrichment_provider``
           provider/model/endpoint. Falls back to local silently when it
           refuses; normalization still runs.
 
@@ -322,21 +322,21 @@ class GraphTierRefiner:
         engine_kwargs: dict = {"model": self.model, "tokenizer": self.tokenizer}
         ext_cfg = self._extraction_config_provider()
         verdict = evaluate_cloud_egress(
-            sota_enabled=self._sota_enabled,
-            provider=ext_cfg.noise_filter,
-            model=ext_cfg.noise_filter_model,
-            endpoint=ext_cfg.noise_filter_endpoint or None,
+            cloud_enabled=self._cloud_enabled,
+            provider=ext_cfg.enrichment_provider,
+            model=ext_cfg.enrichment_provider_model,
+            endpoint=ext_cfg.enrichment_provider_endpoint or None,
         )
         if verdict.permitted:
             engine_kwargs = {
-                "sota": {
+                "cloud": {
                     "api_key": verdict.api_key,
                     "provider": verdict.provider,
                     "filter_model": verdict.model,
                     "endpoint": verdict.endpoint,
                 }
             }
-            logger.info("graph_normalization: engine=SOTA provider=%s", verdict.provider)
+            logger.info("graph_normalization: engine=cloud provider=%s", verdict.provider)
         else:
             logger.info(
                 "graph_normalization: engine=local — cloud egress refused (%s)",

@@ -90,7 +90,7 @@ from paramem.server.trial_state import (  # noqa: E402
     TrialMarker,
     write_trial_marker,
 )
-from paramem.server.vram_guard import safe_empty_cache  # noqa: E402
+from paramem.utils.vram_guard import safe_empty_cache  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -911,7 +911,7 @@ def _recall_probe(apply_state: dict, config: Any) -> str:
             tokenizer=apply_state["tokenizer"],
             config=config,
             router=apply_state.get("router"),
-            sota_agent=None,
+            cloud_agent=None,
             ha_client=None,
             language=None,
             effective_mode=None,

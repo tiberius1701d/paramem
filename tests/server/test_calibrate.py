@@ -280,7 +280,7 @@ class TestCalibrateExtract:
         ``record_prompt`` call) — never a hand-built ``prompts=[...]``
         literal. Mirrors
         ``TestCalibratePlausibility::test_prompt_override_reaches_model``.
-        ``stop_phase="local_extract"`` keeps the run cheap (no SOTA/second-
+        ``stop_phase="local_extract"`` keeps the run cheap (no cloud/second-
         order passes).
         """
         import unittest.mock as _mock
@@ -531,7 +531,7 @@ class TestCalibrateAnonymize:
     def test_prompt_override_reaches_model(self, tmp_path):
         """A prompts_dir + filename override actually drives the model call.
 
-        Regression guard: anonymize_with_local_model previously ignored
+        Regression guard: anonymize_transcript previously ignored
         prompts_dir and always loaded configs/prompts/anonymization.txt, so
         the override was cosmetic (displayed but not executed).  This asserts
         the SENTINEL override template is what apply_chat_template receives.
@@ -563,8 +563,8 @@ class TestCalibrateAnonymize:
 
         valid_json = '{"mapping": {}, "anonymized_transcript": "[user] hello there"}'
         with (
-            _mock.patch("paramem.graph.cloud_egress.adapt_messages", side_effect=lambda m, t: m),
-            _mock.patch("paramem.graph.cloud_egress.generate_answer", return_value=valid_json),
+            _mock.patch("paramem.cloud.anonymize.adapt_messages", side_effect=lambda m, t: m),
+            _mock.patch("paramem.cloud.anonymize.generate_answer", return_value=valid_json),
         ):
             result = calibrate_anonymize(state, req)
 
@@ -592,7 +592,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             return_value=({}, "[user] hello", "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
@@ -606,7 +606,7 @@ class TestCalibrateAnonymize:
     def test_calibrate_anonymize_returns_mapping_and_transcript(self):
         """The ``parsed`` payload carries the model's two artifacts —
         ``forward`` AND ``anonymized_transcript`` — plus a ``status``
-        (current 3-tuple ``anonymize_with_local_model`` contract; facts
+        (current 3-tuple ``anonymize_transcript`` contract; facts
         are still never part of the anonymizer's response).
 
         Mutation: drop ``anonymized_transcript`` or ``status`` from
@@ -621,7 +621,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             return_value=({"Alex": "Person_1"}, "[user] Person_1 said hi", "raw"),
         ):
             result = calibrate_anonymize(state, req)
@@ -650,7 +650,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             return_value=(None, "", "raw"),
         ):
             result = calibrate_anonymize(state, req)
@@ -668,7 +668,7 @@ class TestCalibrateAnonymize:
         """An operator-configured empty ``scrub`` (operator opt-out) short-circuits
         before any model call — the passed-in transcript egresses verbatim.
 
-        Mutation: call ``anonymize_with_local_model`` unconditionally ->
+        Mutation: call ``anonymize_transcript`` unconditionally ->
         this test fails (``helper.called`` is True).
         """
         import unittest.mock as _mock
@@ -681,7 +681,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
         ) as helper:
             result = calibrate_anonymize(state, req)
 
@@ -696,7 +696,7 @@ class TestCalibrateAnonymize:
         }
 
     def test_scrub_sourced_from_config(self):
-        """``scrub`` reaches ``anonymize_with_local_model`` from
+        """``scrub`` reaches ``anonymize_transcript`` from
         ``state["config"].sanitization.scrub`` — the same policy knob
         every production call site reads — not a request field.
 
@@ -713,7 +713,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             return_value=({}, "[user] hello", "raw"),
         ) as helper:
             calibrate_anonymize(state, req)
@@ -722,7 +722,7 @@ class TestCalibrateAnonymize:
 
     def test_speaker_name_reaches_speaker_seeding(self):
         """``req.speaker_name`` reaches
-        ``anonymize_for_cloud``'s speaker-name seeding — the same
+        ``anonymize``'s speaker-name seeding — the same
         runtime-known speaker name every production caller threads
         through.  A transcript the model itself never named (empty
         mapping) still gets the speaker minted into ``forward``/``reverse``
@@ -730,7 +730,7 @@ class TestCalibrateAnonymize:
         builder, not merely accepted and dropped.
 
         Mutation: drop the ``speaker_name=req.speaker_name`` kwarg from
-        the ``anonymize_for_cloud`` call -> ``forward`` comes back empty
+        the ``anonymize`` call -> ``forward`` comes back empty
         -> this test fails.
         """
         import unittest.mock as _mock
@@ -743,7 +743,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             return_value=({}, "[user] hello", "raw"),
         ):
             result = calibrate_anonymize(state, req)
@@ -753,7 +753,7 @@ class TestCalibrateAnonymize:
 
     def test_unmarked_transcript_raises_400(self):
         """Mutation: remove the gate call from ``calibrate_anonymize`` ->
-        this test fails (no 400, or ``anonymize_with_local_model`` runs)."""
+        this test fails (no 400, or ``anonymize_transcript`` runs)."""
         import unittest.mock as _mock
 
         state = _state_enabled()
@@ -762,7 +762,7 @@ class TestCalibrateAnonymize:
             transcript="My friend Alex moved to Berlin.",
         )
         with (
-            _mock.patch("paramem.graph.cloud_egress.anonymize_with_local_model") as helper,
+            _mock.patch("paramem.cloud.anonymize.anonymize_transcript") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_anonymize(state, req)
@@ -772,7 +772,7 @@ class TestCalibrateAnonymize:
 
     def test_marked_transcript_reaches_model(self):
         """Mutation: make the gate reject marked transcripts too -> this
-        test fails because ``anonymize_with_local_model`` is never called."""
+        test fails because ``anonymize_transcript`` is never called."""
         import unittest.mock as _mock
 
         state = _state_enabled()
@@ -781,7 +781,7 @@ class TestCalibrateAnonymize:
             transcript="[user] My friend Alex moved to Berlin.",
         )
         with _mock.patch(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             return_value=({}, "[user] My friend Person_1 moved to City_1.", "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
@@ -799,8 +799,8 @@ class TestCalibratePlausibility:
     def test_prompt_override_reaches_model(self, tmp_path):
         """A prompts_dir + filename override actually drives the model call.
 
-        Regression guard: local_plausibility_filter previously ignored
-        prompts_dir and always loaded configs/prompts/sota_plausibility.txt,
+        Regression guard: judge_plausibility previously ignored
+        prompts_dir and always loaded configs/prompts/cloud_plausibility.txt,
         so the override was cosmetic.  This asserts the SENTINEL override
         template is what apply_chat_template receives.
         """
@@ -844,20 +844,20 @@ class TestCalibratePlausibility:
 
         # Reported provenance is sourced from the real
         # phase-trace record (populated by `_load_prompt`'s own
-        # `record_prompt` call inside `local_plausibility_filter`), not a
+        # `record_prompt` call inside `judge_plausibility`), not a
         # hand-built `_read_prompt` literal — its sha must match a live
         # `_load_prompt` computation of the same file.
         from paramem.graph.prompts import _load_prompt
 
         expected = _load_prompt("my_plaus.txt", prompts_dir=prompts_dir, required=True)
         expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        # ``local_plausibility_filter`` now also loads its SYSTEM prompt
-        # (``sota_plausibility_system.txt``) at call time — no longer a
+        # ``judge_plausibility`` now also loads its SYSTEM prompt
+        # (``cloud_plausibility_system.txt``) at call time — no longer a
         # module-import-time constant unreachable by provenance — so this
         # phase records TWO prompts: the (overridden) user template, then
         # the system prompt.  ``req`` carries no system-prompt override
         # here, so the second entry resolves the shipped default.
-        expected_system = _load_prompt("sota_plausibility_system.txt", required=True)
+        expected_system = _load_prompt("cloud_plausibility_system.txt", required=True)
         expected_system_sha = hashlib.sha256(expected_system.encode("utf-8")).hexdigest()[:12]
         assert len(result["prompts"]) == 2
         assert result["prompts"][0]["sha"] == expected_sha
@@ -878,7 +878,7 @@ class TestCalibratePlausibility:
         req = CalibratePlausibilityRequest(facts=[], transcript="[user] hello")
 
         with _mock.patch(
-            "paramem.graph.extractor.local_plausibility_filter",
+            "paramem.graph.extractor.judge_plausibility",
             return_value=([], "raw"),
         ) as helper:
             result = calibrate_plausibility(state, req)
@@ -891,13 +891,13 @@ class TestCalibratePlausibility:
 
     def test_unmarked_transcript_raises_400(self):
         """Mutation: remove the gate call from ``calibrate_plausibility`` ->
-        this test fails (no 400, or ``local_plausibility_filter`` runs)."""
+        this test fails (no 400, or ``judge_plausibility`` runs)."""
         import unittest.mock as _mock
 
         state = _state_enabled()
         req = CalibratePlausibilityRequest(facts=[], transcript="Should I call the vet?")
         with (
-            _mock.patch("paramem.graph.extractor.local_plausibility_filter") as helper,
+            _mock.patch("paramem.graph.extractor.judge_plausibility") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_plausibility(state, req)
@@ -907,13 +907,13 @@ class TestCalibratePlausibility:
 
     def test_marked_transcript_reaches_model(self):
         """Mutation: make the gate reject marked transcripts too -> this
-        test fails because ``local_plausibility_filter`` is never called."""
+        test fails because ``judge_plausibility`` is never called."""
         import unittest.mock as _mock
 
         state = _state_enabled()
         req = CalibratePlausibilityRequest(facts=[], transcript="[user] Should I call the vet?")
         with _mock.patch(
-            "paramem.graph.extractor.local_plausibility_filter",
+            "paramem.graph.extractor.judge_plausibility",
             return_value=([], "raw"),
         ) as helper:
             result = calibrate_plausibility(state, req)
@@ -926,9 +926,9 @@ class TestCalibrateEnrich:
 
     Mirrors ``TestCalibratePlausibility`` — ``calibrate_enrich`` is the
     same ``_run_calibration(entry="standalone")`` shape, wrapping
-    ``_filter_with_sota`` (the production ``sota_enrich`` stage) instead
-    of ``local_plausibility_filter``.  The SOTA provider config
-    (``extraction_noise_filter`` / ``_model`` / ``_endpoint``) is not on
+    ``request_enrichment`` (the production ``cloud_enrich`` stage) instead
+    of ``judge_plausibility``.  The cloud provider config
+    (``extraction_enrichment_provider`` / ``_model`` / ``_endpoint``) is not on
     the shared ``_state_enabled()`` fixture's ``consolidation``
     ``SimpleNamespace`` by default, so each test sets the attributes it
     needs directly (``SimpleNamespace`` accepts arbitrary attributes).
@@ -942,17 +942,17 @@ class TestCalibrateEnrich:
 
     def test_unmarked_transcript_raises_400(self):
         """Mutation: remove the gate call from ``calibrate_enrich`` ->
-        this test fails (no 400, or ``_filter_with_sota`` runs)."""
+        this test fails (no 400, or ``request_enrichment`` runs)."""
         import unittest.mock as _mock
 
         state = _state_enabled()
-        state["config"].consolidation.sota_enabled = True
-        state["config"].consolidation.extraction_noise_filter = "anthropic"
-        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        state["config"].consolidation.cloud_enabled = True
+        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
+        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
         req = CalibrateEnrichRequest(facts=[], transcript="Should I call the vet?")
         with (
-            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_enrich(state, req)
@@ -961,18 +961,18 @@ class TestCalibrateEnrich:
         assert not helper.called
 
     def test_provider_not_configured_400(self):
-        """Empty ``extraction_noise_filter`` (production default) -> 400,
+        """Empty ``extraction_enrichment_provider`` (production default) -> 400,
         no cloud call."""
         import unittest.mock as _mock
 
         state = _state_enabled()
-        state["config"].consolidation.sota_enabled = True
-        state["config"].consolidation.extraction_noise_filter = ""
-        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        state["config"].consolidation.cloud_enabled = True
+        state["config"].consolidation.extraction_enrichment_provider = ""
+        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
         req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
         with (
-            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_enrich(state, req)
@@ -981,32 +981,32 @@ class TestCalibrateEnrich:
         assert not helper.called
 
     def test_master_switch_off_400(self, monkeypatch: pytest.MonkeyPatch):
-        """``sota_enabled: false`` -> 400, no cloud call.
+        """``cloud_enabled: false`` -> 400, no cloud call.
 
         This endpoint used to egress with the master switch OFF: it checked
-        the provider and the key but never ``sota_enabled``. It now asks the
+        the provider and the key but never ``cloud_enabled``. It now asks the
         same cloud-admission component every other egress site asks, and —
         being operator-triggered — fails loudly rather than skipping.
 
-        Mutation: drop the ``sota_enabled`` term from the verdict -> this
+        Mutation: drop the ``cloud_enabled`` term from the verdict -> this
         test sees a successful call instead of a 400.
         """
         import unittest.mock as _mock
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
-        state["config"].consolidation.sota_enabled = False
-        state["config"].consolidation.extraction_noise_filter = "anthropic"
-        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        state["config"].consolidation.cloud_enabled = False
+        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
+        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
         req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
         with (
-            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_enrich(state, req)
         assert exc.value.status_code == 400
-        assert "sota_enabled is off" in exc.value.detail.lower()
+        assert "cloud_enabled is off" in exc.value.detail.lower()
         assert not helper.called
 
     def test_missing_api_key_400(self, monkeypatch: pytest.MonkeyPatch):
@@ -1015,13 +1015,13 @@ class TestCalibrateEnrich:
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         state = _state_enabled()
-        state["config"].consolidation.sota_enabled = True
-        state["config"].consolidation.extraction_noise_filter = "anthropic"
-        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        state["config"].consolidation.cloud_enabled = True
+        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
+        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
         req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
         with (
-            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_enrich(state, req)
@@ -1030,23 +1030,23 @@ class TestCalibrateEnrich:
         assert not helper.called
 
     def test_success(self, monkeypatch: pytest.MonkeyPatch):
-        """Provider configured + key present -> ``_filter_with_sota`` runs;
+        """Provider configured + key present -> ``request_enrichment`` runs;
         its returned facts surface at ``result["parsed"]["facts"]``."""
         import unittest.mock as _mock
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
-        state["config"].consolidation.sota_enabled = True
-        state["config"].consolidation.extraction_noise_filter = "anthropic"
-        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        state["config"].consolidation.cloud_enabled = True
+        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
+        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
         req = CalibrateEnrichRequest(
             facts=[{"subject": "speaker0", "predicate": "likes", "object": "coffee"}],
             transcript="[user] I like coffee.",
         )
         enriched_facts = [{"subject": "speaker0", "predicate": "likes", "object": "coffee"}]
         with _mock.patch(
-            "paramem.graph.extractor._filter_with_sota",
+            "paramem.graph.extractor.request_enrichment",
             return_value=(enriched_facts, "anon transcript", {}, "raw", {}),
         ) as helper:
             result = calibrate_enrich(state, req)
@@ -1059,8 +1059,8 @@ class TestCalibrateEnrich:
 
         Mirrors ``TestCalibratePlausibility::test_prompt_override_reaches_model``.
         Patches the leaf cloud call (``_filter_anthropic``), NOT
-        ``_filter_with_sota`` itself, so the real ``_load_prompt`` call
-        inside ``_filter_with_sota`` records onto the ``sota_enrich``
+        ``request_enrichment`` itself, so the real ``_load_prompt`` call
+        inside ``request_enrichment`` records onto the ``cloud_enrich``
         phase trace — provenance must come from that real record, not a
         hand-built ``prompts=[...]`` literal.
         """
@@ -1070,10 +1070,10 @@ class TestCalibrateEnrich:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
-        state["config"].consolidation.sota_enabled = True
-        state["config"].consolidation.extraction_noise_filter = "anthropic"
-        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        state["config"].consolidation.cloud_enabled = True
+        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
+        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
 
         prompts_dir = tmp_path / "prompts"
         prompts_dir.mkdir()
@@ -1099,7 +1099,7 @@ class TestCalibrateEnrich:
 
         # Reported provenance is sourced from the real phase-trace record
         # (populated by `_load_prompt`'s own `record_prompt` call inside
-        # `_filter_with_sota`), not a hand-built `prompts=[...]` literal.
+        # `request_enrichment`), not a hand-built `prompts=[...]` literal.
         expected = _load_prompt("my_enrich.txt", prompts_dir=prompts_dir, required=True)
         expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
         shas = {p["sha"] for p in result["prompts"]}
@@ -1284,7 +1284,7 @@ class TestEffectiveParamsSeed:
         assert result["seed"] == 42
 
     def test_seed_none_when_supports_seed_false(self):
-        """SOTA stages report seed=null even when caller sends a seed."""
+        """Cloud stages report seed=null even when caller sends a seed."""
         params = CalibrateParams(seed=99)
         result = _effective_params(params, supports_seed=False)
         assert result["seed"] is None

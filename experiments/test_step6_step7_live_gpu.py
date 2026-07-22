@@ -89,7 +89,7 @@ def main() -> int:
     cfg.consolidation.indexed_key_replay = True
     cfg.consolidation.promotion_threshold = 3
 
-    cfg.consolidation.extraction_noise_filter = ""
+    cfg.consolidation.extraction_enrichment_provider = ""
     cfg.consolidation.extraction_plausibility_judge = "off"
 
     loop = create_consolidation_loop(

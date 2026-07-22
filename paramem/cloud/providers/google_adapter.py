@@ -4,8 +4,7 @@ import logging
 
 from google import genai
 
-from paramem.server.cloud.base import CloudAgent, CloudResponse
-from paramem.server.config import CloudAgentConfig
+from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig, CloudResponse
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,7 @@ class GoogleAgent(CloudAgent):
     def format_tools(self, tools: list[dict]) -> list[dict]:
         """Convert standard tool definitions to Google format.
 
-        Not used for SOTA reasoning path (no tools), but required by ABC.
+        Not used for cloud reasoning path (no tools), but required by ABC.
         """
         return [
             {

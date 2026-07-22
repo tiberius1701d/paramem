@@ -88,8 +88,8 @@ pip install -e ".[voice,dev]"
 
 | Extra | Installs | When to use |
 |-------|----------|-------------|
-| `anthropic` | `anthropic` SDK | Anthropic SOTA provider |
-| `google` | `google-genai` SDK | Google SOTA provider |
+| `anthropic` | `anthropic` SDK | Anthropic cloud provider |
+| `google` | `google-genai` SDK | Google cloud provider |
 | `all-agents` | Both SDKs | All cloud providers |
 | `speaker` | `pyannote-audio>=4.0` | Voice speaker identification |
 | `wyoming` | `wyoming>=1.8.0` | Wyoming STT/TTS protocol |
@@ -336,7 +336,7 @@ options. A short map of the top-level sections:
 
 | Section | Purpose |
 |---------|---------|
-| `cloud_only` | Opt-out of local PM — route every query to the SOTA cloud agent. Security-critical. |
+| `cloud_only` | Opt-out of local PM — route every query to the configured cloud agent. Security-critical. |
 | `headless_boot` | Auto-start the server before any interactive login. Reconciles systemd linger + (WSL) a Windows startup task on every start via `scripts/setup/headless-boot.sh`. |
 | `server` | Host, port, auto-reclaim polling, restart policy. |
 | `vram` | Per-process cap fraction (`process_cap_fraction`); KV cache + activation headroom (`vram_cache_headroom_gib`, code default 1.0 GiB, shipped yaml 1.5 GiB). |
@@ -345,7 +345,7 @@ options. A short map of the top-level sections:
 | `paths` | Data, sessions, debug, prompts directories. |
 | `adapters` | Per-adapter `enabled` / `rank` / `alpha` / `learning_rate` / `target_modules`. |
 | `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (plausibility, anonymization) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). |
-| `agents` | SOTA cloud fallback (`sota` + `sota_providers`), HA conversation agent id. |
+| `agents` | cloud fallback (`agents.cloud` + `agents.cloud_providers`), HA conversation agent id. |
 | `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
 | `sanitization` | PII gate for cloud egress (`off`/`warn`/`block`). The first-person check is encoder-based and multilingual when the intent encoder is loaded; falls back to an English token-set. See `personal_referent` below. |
 | `intent` | Intent classifier — HA fast-path + content-driven residual. `intent.mode: llm` (default) uses the loaded local LLM with a focused classifier prompt; robust to paraphrase and novel phrasings, no exemplar maintenance. `intent.mode: embeddings` uses the multilingual sentence encoder (`intfloat/multilingual-e5-small`) vs per-class exemplar bank under `configs/intents/<class>.<lang>.txt`; cheaper per query but brittle on shapes the operator hasn't anticipated. The encoder is loaded regardless (reused by `sentence_type` and `personal_referent`); `llm` mode auto-falls back to `embeddings` when no local model is registered (cloud-only mode). |
@@ -388,7 +388,7 @@ Voice Satellite → Wyoming STT (Whisper + pyannote) → HA → ParaMem /chat
   ├─ Speaker match (centroid) → attach identity
   ├─ Entity match in knowledge graph? → adapter recall → reason → respond
   ├─ HA entity match? → HA conversation agent (tools, device control)
-  └─ Neither → SOTA cloud agent (reasoning, search)
+  └─ Neither → cloud agent (reasoning, search)
 Response → HA TTS → Sonos (announce)
 ```
 
@@ -890,7 +890,7 @@ ParaMem includes a local voice pipeline for privacy-first operation:
 - **Local STT:** Whisper distil-large-v3 on GPU via Wyoming protocol (port 10300). CPU fallback: distil-small.en.
 - **Speaker identification:** WeSpeaker (`pyannote/wespeaker-voxceleb-resnet34-LM`, 256-dim) voice embeddings via pyannote-audio. Multi-embedding profiles (up to 50 per speaker) with L2-normalized centroid matching for cross-device robustness. Auto-enrichment on confirmed matches. Deferred identity binding keeps anonymous utterances bound to a BPE-stable `speaker{N}` placeholder until the speaker discloses a name, after which the graph is retro-claimed without a rewrite at training time (name resolves at render).
 - **Multilingual TTS:** Piper voices per language with MMS-TTS fallback; language detection on the response text, speaker binding so each speaker's preferred voice persists, routed to media players via HA.
-- **Anti-confabulation voice prompt:** a separate system prompt at the voice turn tells the model not to invent facts about the speaker when the parametric memory has nothing to say, and to fall through to the SOTA path cleanly.
+- **Anti-confabulation voice prompt:** a separate system prompt at the voice turn tells the model not to invent facts about the speaker when the parametric memory has nothing to say, and to fall through to the cloud path cleanly.
 - **Mobile PWA voice path:** The PWA (served at `/app` when `mobile_pwa.enabled: true`) supports push-to-talk voice in addition to text. The browser records audio and POSTs it to `POST /voice` (raw audio blob; `audio/mp4`, `audio/webm`, or `audio/L16`; 25 MB hard cap). The server decodes to 16 kHz int16 mono, transcribes via Whisper, and returns `{transcript, reply, audio, audio_format, follow_up?}` — where `audio` is a base64-encoded WAV of the synthesised reply voiced through the same per-language TTS voices as the HA satellites (e.g. Kokoro `af_heart` for English), or `""` when TTS is unavailable (the PWA falls back to text display). Routing goes through the same `_run_chat_turn` path as `POST /chat`. **Token-type selector:** a per-user token resolves identity from the token (no embedding computed, cheap); a shared token triggers voice-embedding identification and the same enrollment/greeting/name-disclosure path as `POST /chat`, with a fresh per-utterance conversation_id on each push-to-talk press. Deployment: personal device → issue a per-user token; shared device → issue the shared token with voice enrollment. Error statuses: `404` when `mobile_pwa.enabled` is false, `503` when STT is not loaded (cloud-only mode), `413` for an oversized payload, `400` for an undecodable audio body.
 
 ---
@@ -931,7 +931,7 @@ speaker entity from absent → reliable. The principle generalizes:
   `## DROP`, `## Part 1 — RELATIONS` / `## Part 2 — SAME_AS`) with each
   section's POSITIVE + NEGATIVE block co-located. Labels prime
   attention; the imperatives stay one sentence; the examples teach. On
-  `sota_plausibility.txt`, splitting eliminated chunk-1 over-generation
+  `cloud_plausibility.txt`, splitting eliminated chunk-1 over-generation
   (1 input fact → 51 invented facts in the unified version → 0 in the
   split version).
 
@@ -939,14 +939,14 @@ speaker entity from absent → reliable. The principle generalizes:
   the downstream pipeline depends on a schema field, a brace-binding
   requirement, or a token like `[ESCALATE]` that the router parses, put
   it under the headline with its own POSITIVE + NEGATIVE pair. On
-  `sota_enrichment.txt`, hoisting the brace-binding contract for
+  `cloud_enrichment.txt`, hoisting the brace-binding contract for
   newly-minted entities to the top doubled the binding emission
   rate (6 → 16 per session) and recovered 41 personal facts per CV chunk
   that had been silently dropped at the deanon residual sweep.
 
 - **NEGATIVE examples teach harder edges than POSITIVE alone.** Add them
   for the failure modes you observe, not hypothetical ones. On
-  `sota_graph_enrichment.txt`, a single `WRONG: (Alice, ..., "12 months")
+  `cloud_graph_enrichment.txt`, a single `WRONG: (Alice, ..., "12 months")
   — literal value, not a graph node` NEGATIVE eliminated phantom-node
   introduction (2 violations → 0) without changing anything else.
 

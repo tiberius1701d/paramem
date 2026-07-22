@@ -1,5 +1,5 @@
-"""Unit tests for paramem.graph.placeholders — the anonymize <-> deanonymize
-placeholder contract module.
+"""Unit tests for paramem.cloud.placeholders — the anonymize <-> deanonymize
+placeholder primitive kit.
 
 Most of this module's functions (``_apply_bindings``, ``_resolution_map``,
 ``_build_anonymization_mapping``, ...) already have extensive coverage in
@@ -8,23 +8,31 @@ module was carved out of ``paramem.graph.extractor``). This file covers
 the NEW unified primitives introduced by that carve-out: ``mint_placeholder``,
 ``braced``, ``entity_type_to_prefix``, ``prefix_to_entity_type``, and the
 generalized (``placeholder_side``) table normalize/validate pair.
+
+``entity_type_to_prefix``/``prefix_to_entity_type``/``placeholder_entity_type``
+moved to :mod:`paramem.config.taxonomy` (originally
+``paramem.graph.schema_config``, in the ``paramem/cloud/`` package carve of
+2026-07-21; re-homed to ``paramem.config`` when the taxonomy loader itself
+moved out of ``paramem.graph``): they derive from the graph entity-type
+taxonomy (``configs/schema.yaml``).
 """
 
 from __future__ import annotations
 
 import inspect
 
-from paramem.graph.placeholders import (
+from paramem.cloud.placeholders import (
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
     _build_anonymization_mapping,
     _normalize_anonymization_mapping,
     _substitute_whole_words,
     braced,
-    deanonymize_text,
-    entity_type_to_prefix,
     invert_forward_mapping,
     mint_placeholder,
+)
+from paramem.config.taxonomy import (
+    entity_type_to_prefix,
     placeholder_entity_type,
     prefix_to_entity_type,
 )
@@ -62,7 +70,7 @@ class TestBraced:
 
 
 class TestEntityTypeToPrefix:
-    def test_closed_vocabulary_matches_schema_config(self):
+    def test_closed_vocabulary_matches_taxonomy(self):
         assert entity_type_to_prefix("person") == "Person"
         assert entity_type_to_prefix("place") == "City"
         assert entity_type_to_prefix("organization") == "Org"
@@ -83,16 +91,16 @@ class TestEntityTypeToPrefix:
 
 
 class TestPrefixToEntityType:
-    def test_closed_vocabulary_matches_schema_config(self):
+    def test_closed_vocabulary_matches_taxonomy(self):
         assert prefix_to_entity_type("City") == "place"
         assert prefix_to_entity_type("Org") == "organization"
         assert prefix_to_entity_type("Person") == "person"
         assert prefix_to_entity_type("Thing") == "concept"
 
     def test_open_vocabulary_derives_type_from_prefix_itself(self):
-        """The open policy (SOTA's brace-binding protocol: the prefix IS
+        """The open policy (cloud's brace-binding protocol: the prefix IS
         the type name for a novel entity) — matches the pre-refactor
-        behaviour of the entity-rebuild loop in ``_sota_pipeline``, now
+        behaviour of the entity-rebuild loop in ``_cloud_pipeline``, now
         also applied by ``entity_correction.correct_entity_surfaces``."""
         assert prefix_to_entity_type("Project") == "project"
         assert prefix_to_entity_type("Language") == "language"
@@ -144,7 +152,7 @@ class TestNormalizeAndValidateTableBothDirections:
     """The single normalize/validate primitive, generalized by
     ``placeholder_side`` to serve both the CORE anonymizer table
     (``{real_name: placeholder}``, ``placeholder_side="value"``, the
-    default) and the SOTA ``bindings`` table (``{placeholder: real_text}``,
+    default) and the cloud ``bindings`` table (``{placeholder: real_text}``,
     ``placeholder_side="key"`` — the OPPOSITE direction).
     """
 
@@ -344,17 +352,27 @@ class TestSubstituteWholeWordsExactMatchRegression:
         assert out == "Person_1 said the electricity bill was late."
 
     def test_deanon_direction_does_not_substitute_literal_lowercase_text(self):
-        """DEANON direction (:func:`deanonymize_text` / ``_apply_bindings``):
-        literal text a human wrote (``person 1``, ``Person 1``) must NOT
-        be substituted to the real name a DIFFERENT, exact-case, machine
-        -minted token (``Person_1``) stands for — canonical matching would
-        fold the human-written phrase onto the token's identity and, in
-        the full pipeline, consume it before the fail-closed residual-
-        token drop (b14a880) ever saw it.
+        """DEANON direction (:func:`~paramem.cloud.deanonymize.deanonymize_text`
+        / ``_apply_bindings``): literal text a human wrote (``person 1``,
+        ``Person 1``) must NOT be substituted to the real name a
+        DIFFERENT, exact-case, machine-minted token (``Person_1``) stands
+        for — canonical matching would fold the human-written phrase onto
+        the token's identity and, in the full pipeline, consume it before
+        the fail-closed residual-token drop (b14a880) ever saw it.
+
+        Exercised directly against ``_substitute_whole_words`` — the
+        composed ``paramem.cloud.deanonymize.deanonymize_text`` is this
+        exact call plus a declared-token fail-closed check (a standalone
+        ``deanonymize_text(text, resolution)`` primitive used to wrap it,
+        but it was a pure null-guard pass-through already subsumed by
+        ``_substitute_whole_words``'s own guard, so it was retired rather
+        than kept as a second name for the same one-line body).
         """
         reverse = {"Person_1": "Yang Ming"}
-        assert deanonymize_text("person 1 in the queue", reverse) == "person 1 in the queue"
-        assert deanonymize_text("Person 1 of 3 slides", reverse) == "Person 1 of 3 slides"
+        assert _substitute_whole_words("person 1 in the queue", reverse) == (
+            "person 1 in the queue"
+        )
+        assert _substitute_whole_words("Person 1 of 3 slides", reverse) == "Person 1 of 3 slides"
 
 
 class TestPlaceholderShapeRegex:
@@ -546,6 +564,12 @@ class TestNoEntityWalk:
     def test_signature_has_no_entities_parameter(self):
         params = inspect.signature(_build_anonymization_mapping).parameters
         assert "entities" not in params
+        # No ``person_prefix`` parameter either: the speaker-name-seeding
+        # mint resolves its placeholder prefix directly via
+        # ``paramem.config.taxonomy.entity_type_to_prefix`` — a leaf
+        # package ``paramem.cloud`` may import without crossing the
+        # cloud/graph boundary — rather than taking it as a caller-supplied
+        # value.
         assert list(params) == ["llm_mapping", "speaker_name"]
 
     def test_empty_llm_mapping_and_no_speaker_name_yields_empty_tables(self):
@@ -611,12 +635,12 @@ class TestSpeakerNameSeeding:
 
 class TestReverseMapInversionAgreement:
     """The session tier and the graph tier
-    (:func:`~paramem.graph.extractor._graph_enrich_with_sota`) both reach
+    (:func:`~paramem.graph.extractor.request_graph_enrichment`) both reach
     their reverse ``{placeholder: real_name}`` table through the SAME
     :func:`_build_anonymization_mapping` — the graph tier no longer
     inverts a forward map itself at all; it receives
-    ``AnonymizedPayload.reverse`` (built by
-    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud`'s call to
+    ``AnonymizedContract.reverse`` (built by
+    :func:`~paramem.cloud.anonymize.anonymize`'s call to
     :func:`_build_anonymization_mapping`) directly as a caller-supplied
     argument. Before the fix the two sites disagreed on the tie-break for
     a many-to-one forward map (two real names scrubbed onto the SAME
@@ -627,7 +651,7 @@ class TestReverseMapInversionAgreement:
 
     Mutation: reintroduce a graph-tier-local inversion (raw
     ``invert_forward_mapping(mapping)`` or a hand-rolled dict comprehension
-    inside ``_graph_enrich_with_sota``) instead of taking
+    inside ``request_graph_enrichment``) instead of taking
     ``payload.reverse`` as-is -> these tests fail.
     """
 
@@ -641,23 +665,25 @@ class TestReverseMapInversionAgreement:
         assert reverse == invert_forward_mapping(self._MANY_TO_ONE) == {"Person_1": "Alice"}
 
     def test_graph_tier_uses_the_same_shared_helper(self):
-        """The graph tier's SOTA round trip uses EXACTLY the reverse table
+        """The graph tier's cloud round trip uses EXACTLY the reverse table
         :func:`_build_anonymization_mapping` produced — not a
         re-derivation — proven by round-tripping a placeholder through
-        ``_graph_enrich_with_sota`` and confirming it resolves to the
+        ``request_graph_enrichment`` and confirming it resolves to the
         SAME first-wins real name the shared helper picked.
         """
         from unittest.mock import patch
 
-        from paramem.graph.cloud_egress import AnonymizedPayload
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.cloud.anonymize import AnonymizedContract
+        from paramem.graph.extractor import request_graph_enrichment
         from paramem.graph.schema import SessionGraph
 
         forward, reverse = _build_anonymization_mapping(dict(self._MANY_TO_ONE), speaker_name=None)
         assert reverse == {"Person_1": "Alice"}
-        # Realistic shape: SOTA can only propose a relation naming a
-        # placeholder it was actually SHOWN in the rendered triples_json —
-        # ``anon_facts`` must line up 1:1 with ``triples`` (strict zip).
+        # Realistic shape: Cloud can only propose a relation naming a
+        # placeholder it was actually SHOWN — ``request_graph_enrichment``
+        # derives the anonymized triples directly from ``triples`` +
+        # ``payload.forward`` via ``insert_placeholders`` (no separate
+        # ``anon_facts`` field on the contract).
         triples = [
             {
                 "subject": "Alice",
@@ -667,21 +693,11 @@ class TestReverseMapInversionAgreement:
                 "speaker_id": "",
             }
         ]
-        anon_facts = [
-            {
-                "subject": "Person_1",
-                "predicate": "knows",
-                "object": "acme",
-                "relation_type": "factual",
-                "confidence": 1.0,
-            }
-        ]
-        payload = AnonymizedPayload(
+        payload = AnonymizedContract(
             status="ok",
             forward=forward,
             reverse=reverse,
             anon_transcript="",
-            anon_facts=anon_facts,
             declared=frozenset(reverse.keys()),
             norm_stats={"inverted": 0, "dropped": 0},
             rekey_dropped=0,
@@ -693,8 +709,8 @@ class TestReverseMapInversionAgreement:
             '"object": "Person_1", "relation_type": "social", "confidence": 0.9}], '
             '"same_as": []}'
         )
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples=triples,
                 payload=payload,
                 graph=graph,
@@ -717,7 +733,7 @@ class TestReverseMapInversionAgreement:
         reverse map is the caller-supplied ``payload.reverse`` (built by
         :func:`_build_anonymization_mapping`, whose speaker-value guard
         already dropped ``speaker0`` — see :class:`TestSpeakerAnchorReverseSkip`),
-        there is no code path left in ``_graph_enrich_with_sota`` that
+        there is no code path left in ``request_graph_enrichment`` that
         could reintroduce it.
         """
         forward, reverse = _build_anonymization_mapping({"RealName": "speaker0"}, speaker_name=None)

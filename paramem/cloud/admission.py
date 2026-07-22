@@ -1,9 +1,9 @@
 """Cloud-egress admission — the single answer to "may we call a cloud LLM?".
 
 Four sites used to answer that question with four different sets of terms:
-session-tier SOTA enrichment, graph-tier enrichment, graph-tier predicate
+session-tier cloud enrichment, graph-tier enrichment, graph-tier predicate
 normalization, and the ``/calibrate/enrich`` endpoint.  One of them omitted
-the ``sota_enabled`` master switch entirely, so an operator-triggered
+the ``cloud_enabled`` master switch entirely, so an operator-triggered
 endpoint could egress with the switch off.  :func:`evaluate_cloud_egress`
 is now the only place the decision is computed; every caller reads the
 :class:`EgressVerdict` it returns and decides what to DO about a refusal
@@ -12,10 +12,11 @@ itself is not re-derived anywhere.
 
 Leaf module by construction: stdlib only.  It must not import from
 ``paramem.graph``, ``paramem.training`` or ``paramem.server`` — the graph
-layer's ``extraction_pipeline`` imports the extractor, which imports this,
-so any reach back into those packages would close an import cycle.  The
-precedent is :mod:`paramem.utils.identity`, which holds ``canonical()`` for
-the same reason: a primitive every tier needs, owned by none of them.
+layer's ``extraction_pipeline`` imports the extractor, which imports this
+package, so any reach back into those packages would close an import
+cycle.  The precedent is :mod:`paramem.utils.identity`, which holds
+``canonical()`` for the same reason: a primitive every tier needs, owned
+by none of them.
 
 The provider tables below are the registry of what "cloud" means here.
 Adding a provider means adding one entry to :data:`PROVIDER_KEY_ENV` (and,
@@ -104,7 +105,7 @@ def resolve_api_key(provider: str) -> str | None:
 
 def evaluate_cloud_egress(
     *,
-    sota_enabled: bool,
+    cloud_enabled: bool,
     provider: str,
     model: str,
     endpoint: str | None,
@@ -113,7 +114,7 @@ def evaluate_cloud_egress(
 
     Every term must hold for ``permitted=True``:
 
-    1. ``sota_enabled`` — the operator's master switch for all cloud egress.
+    1. ``cloud_enabled`` — the operator's master switch for all cloud egress.
     2. ``provider`` is non-empty and present in :data:`PROVIDER_KEY_ENV`.
     3. ``model`` is non-empty.
     4. :func:`resolve_api_key` returns a non-empty key.
@@ -126,7 +127,7 @@ def evaluate_cloud_egress(
     also missing" loop; one verdict reports everything missing at once.
 
     Args:
-        sota_enabled: The master switch (``consolidation.sota_enabled``).
+        cloud_enabled: The master switch (``consolidation.cloud_enabled``).
         provider: Configured provider name.  ``""`` means "no cloud
             provider configured"; a non-provider token such as ``"auto"``
             or ``"off"`` is reported as unsupported and never reaches a
@@ -141,8 +142,8 @@ def evaluate_cloud_egress(
     """
     gaps: list[str] = []
 
-    if not sota_enabled:
-        gaps.append("sota_enabled is off")
+    if not cloud_enabled:
+        gaps.append("cloud_enabled is off")
 
     known_provider = bool(provider) and provider in PROVIDER_KEY_ENV
     if not provider:

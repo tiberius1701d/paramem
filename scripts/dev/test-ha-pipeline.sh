@@ -1,7 +1,7 @@
 #!/bin/bash
 # Integration test for the HA pipeline and tri-path routing.
-# Tests: greeting flow, HA path, SOTA path, fallback chains, /refresh-ha.
-# Requires: ParaMem server running, HA reachable, SOTA agent configured.
+# Tests: greeting flow, HA path, cloud path, fallback chains, /refresh-ha.
+# Requires: ParaMem server running, HA reachable, cloud agent configured.
 #
 # Usage:
 #   bash scripts/dev/test-ha-pipeline.sh                        # default
@@ -127,7 +127,7 @@ skip() {
 }
 
 # check_routed <label> <text> <route> <expect_pattern> [conversation_id]
-# Forces routing via the "route" parameter (ha, sota)
+# Forces routing via the "route" parameter (ha, cloud)
 check_routed() {
     local label="$1"
     local text="$2"
@@ -238,27 +238,27 @@ check_routed "HA: weather query" "What's the weather like in Berlin right now?" 
     "temperature\|°C\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
 
 # ========================================================================
-# 3. Real-time via SOTA agents (web search per provider)
+# 3. Real-time via cloud agents (web search per provider)
 # ========================================================================
 echo ""
-echo "--- 3a. SOTA: Anthropic (Claude web search) ---"
-check_routed "Anthropic: time query" "What's the current time in Germany?" "sota:anthropic" \
+echo "--- 3a. Cloud: Anthropic (Claude web search) ---"
+check_routed "Anthropic: time query" "What's the current time in Germany?" "cloud:anthropic" \
     "time\|clock\|[0-9].*:[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
-check_routed "Anthropic: weather query" "What's the weather like in Berlin right now?" "sota:anthropic" \
+check_routed "Anthropic: weather query" "What's the weather like in Berlin right now?" "cloud:anthropic" \
     "temperature\|°C\|°F\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
 
 echo ""
-echo "--- 3b. SOTA: OpenAI (web search preview) ---"
-check_routed "OpenAI: time query" "What's the current time in Germany?" "sota:openai" \
+echo "--- 3b. Cloud: OpenAI (web search preview) ---"
+check_routed "OpenAI: time query" "What's the current time in Germany?" "cloud:openai" \
     "time\|clock\|[0-9].*:[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
-check_routed "OpenAI: weather query" "What's the weather like in Berlin right now?" "sota:openai" \
+check_routed "OpenAI: weather query" "What's the weather like in Berlin right now?" "cloud:openai" \
     "temperature\|°C\|°F\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
 
 echo ""
-echo "--- 3c. SOTA: Google Gemini (search grounding) ---"
-check_routed "Gemini: time query" "What's the current time in Germany?" "sota:google" \
+echo "--- 3c. Cloud: Google Gemini (search grounding) ---"
+check_routed "Gemini: time query" "What's the current time in Germany?" "cloud:google" \
     "time\|clock\|[0-9].*:[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
-check_routed "Gemini: weather query" "What's the weather like in Berlin right now?" "sota:google" \
+check_routed "Gemini: weather query" "What's the weather like in Berlin right now?" "cloud:google" \
     "temperature\|°C\|°F\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
 
 # ========================================================================

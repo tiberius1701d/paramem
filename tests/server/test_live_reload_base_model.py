@@ -21,7 +21,7 @@ mode/reason, not real CUDA.
 ``_live_reload_base_model`` calls ``_build_config_derived_state`` after a
 successful model load (to rebuild router, exemplar banks, etc.).  Existing
 tests mock ``_build_config_derived_state`` so they exercise the same
-control-flow contract without triggering real STT/HA/SOTA construction.
+control-flow contract without triggering real STT/HA/cloud construction.
 
 Additional tests cover the config-refresh path:
 - ``refresh_config_from_disk=True`` calls ``load_server_config`` BEFORE

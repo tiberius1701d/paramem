@@ -17,7 +17,7 @@ Everything else in :func:`correct_entity_surfaces` is source-specific
 GATHER (collecting correctable values from the two loci) around that one
 primitive, under one uniform gate. The function does not mutate its
 inputs: it returns the accepted corrections as data (``"applied"``), and
-the caller (:mod:`paramem.graph.extractor`) applies them to
+the caller (:mod:`paramem.graph.stage_enrich`) applies them to
 ``reverse_mapping`` and ``graph.entities`` itself.
 
 ``person`` is structurally excluded from correction: the model's own
@@ -34,12 +34,12 @@ import json
 import logging
 from collections import namedtuple
 
+from paramem.config.taxonomy import placeholder_entity_type
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.placeholders import placeholder_entity_type
 from paramem.graph.prompts import _load_prompt
 from paramem.models.loader import adapt_messages
-from paramem.server.vram_guard import vram_scope
 from paramem.utils.identity import canonical
+from paramem.utils.vram_guard import vram_scope
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ def correct_entity_surfaces(
     """Correct misspelled real-world entity surfaces across two loci.
 
     Gathers correctable values from (a) ``reverse_mapping`` placeholder
-    values (kind-eligible via :func:`~paramem.graph.placeholders.
+    values (kind-eligible via :func:`~paramem.config.taxonomy.
     placeholder_entity_type` — open vocabulary, so a novel prefix's own
     name still passes through as its type) and (b)
     ``entities[*].attributes`` values (only when ``"attributes"`` is a
@@ -227,7 +227,8 @@ def correct_entity_surfaces(
 
     Args:
         reverse_mapping: ``{placeholder: real_surface}`` produced by
-            :func:`paramem.graph.placeholders._build_anonymization_mapping`.
+            :func:`paramem.cloud.placeholders._build_anonymization_mapping`
+            (via :func:`~paramem.cloud.anonymize.anonymize`).
             Read-only — never mutated by this function.
         entities: ``graph.entities`` — read-only, never mutated by this
             function. Only read when ``"attributes"`` is a member of

@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from paramem.utils.config import AdapterConfig, ModelConfig
+from paramem.utils.vram_guard import safe_empty_cache
 
 logger = logging.getLogger(__name__)
 
@@ -457,14 +458,13 @@ def load_base_model(
 def unload_model(model, tokenizer=None) -> None:
     """Free a model from GPU/CPU memory.
 
-    Routes through ``safe_empty_cache`` (lazy-imported to avoid a
-    module-level models→server dependency) so cuBLAS workspaces and
-    allocator-pool slack are released too — otherwise process teardown
-    leaves a ~280 MiB ghost CUDA context that ``_gpu_has_compute_processes``
-    sees on the next boot and forces gpu_conflict mode.
+    Routes through ``safe_empty_cache`` (:mod:`paramem.utils.vram_guard`, a
+    leaf module with no ``paramem`` dependency of its own) so cuBLAS
+    workspaces and allocator-pool slack are released too — otherwise
+    process teardown leaves a ~280 MiB ghost CUDA context that
+    ``_gpu_has_compute_processes`` sees on the next boot and forces
+    gpu_conflict mode.
     """
-    from paramem.server.vram_guard import safe_empty_cache
-
     del model
     if tokenizer is not None:
         del tokenizer

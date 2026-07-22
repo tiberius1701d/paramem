@@ -7,7 +7,7 @@ This module is flow TOPOLOGY, not extraction: it defines the shapes
 (``StageContext``, ``StageState``, ``StageSpec``) and the single walk
 function (:func:`run_flow`) that any linear, gated pipeline of stages
 can be expressed against. It must NOT import any extraction primitive
-(``_run_local_extraction``, ``_sota_pipeline``, etc.) — that would
+(``_run_local_extraction``, ``_cloud_pipeline``, etc.) — that would
 collapse the topology/primitive boundary this module
 exists to keep, and would make the runner untestable without a model.
 The one exception is :func:`~paramem.graph.phase_trace.chain_stopped`,
@@ -15,11 +15,14 @@ which is a control-flow signal (a contextvar read), not an extraction
 primitive.
 
 The first (and, at present, only) consumer is
-``paramem.graph.extractor.SESSION_EXTRACT`` — the
-``local_extract`` -> ``second_order_extract`` -> ``sota_pipeline`` ->
-``deanonymize`` -> ``rebuild`` flow that used to be an imperative
-if-cascade inside ``extract_graph``. See that module for the concrete
-stage specs; this module never references them.
+``paramem.graph.flows.SESSION_EXTRACT`` — the ``local_extract`` ->
+``second_order_extract`` -> ``anonymize`` -> ``enrich`` -> ``deanonymize``
+-> ``rebuild`` flow that used to be an imperative if-cascade inside
+``extract_graph``. Stage bodies are split across
+``paramem.graph.stage_anonymize``, ``paramem.graph.stage_enrich`` and
+``paramem.graph.flows`` (which also owns ``SESSION_EXTRACT`` itself and
+``extract_graph``); see those modules for the concrete stage specs — this
+module never references them.
 """
 
 from __future__ import annotations
@@ -34,7 +37,8 @@ if TYPE_CHECKING:
     # Type-only, and data SHAPES rather than extraction primitives — the
     # boundary this module keeps is "no primitive may be imported here",
     # not "no domain type may be named in an annotation".
-    from paramem.graph.cloud_egress import CloudScope
+    from paramem.cloud.anonymize import AnonymizedContract
+    from paramem.cloud.deanonymize import CloudScope
     from paramem.graph.schema import SessionGraph
 
 
@@ -43,7 +47,7 @@ class StageContext:
     """Every parameter of a flow run that is constant across its stages.
 
     Mirrors ``extract_graph``'s parameter list verbatim (see
-    ``paramem.graph.extractor.extract_graph``) — one field per
+    ``paramem.graph.flows.extract_graph``) — one field per
     parameter, constructed once at the top of that function and passed
     to every stage's ``run`` callable. Adding a flow parameter means
     adding a field here; there is no other place a stage can read
@@ -67,10 +71,10 @@ class StageContext:
     timestamp: str | None
     source_type: str
     validate: bool
-    sota_enabled: bool
-    noise_filter: str
-    noise_filter_model: str
-    noise_filter_endpoint: str | None
+    cloud_enabled: bool
+    enrichment_provider: str
+    enrichment_provider_model: str
+    enrichment_provider_endpoint: str | None
     plausibility_judge: str
     plausibility_stage: str
     plausibility_model: str
@@ -97,12 +101,21 @@ class StageState:
     Attributes:
         graph: The session graph under construction. Threaded and rebound
             by every stage.
+        payload: The local anonymizer's result for this session
+            (:class:`~paramem.cloud.anonymize.AnonymizedContract`),
+            produced by the ``anonymize`` stage and consumed by
+            ``enrich`` (which derives ``reverse``/``anon_transcript``/the
+            anonymized fact array from it). ``None`` before ``anonymize``
+            has run, and ``anonymize``'s own ``terminal_when`` — set back
+            to ``None`` on the fail-closed divert (anonymization parse
+            failure) so the walk stops before ``enrich`` runs on a
+            payload that was never produced.
         facts: The working fact set — dicts, not ``Relation`` objects.
-            Anonymized (placeholder-bearing) as the ``sota_pipeline``
-            composite hands them over; de-anonymized after the
-            ``deanonymize`` stage substitutes real names back in. Empty
-            means "no facts survived", which is how the composite's
-            ``terminal_when`` stops the walk before its tail siblings.
+            Anonymized (placeholder-bearing) as the ``enrich`` stage hands
+            them over; de-anonymized after the ``deanonymize`` stage
+            substitutes real names back in. Empty means "no facts
+            survived", which is how ``enrich``'s ``terminal_when`` stops
+            the walk before its tail siblings.
         scalar_facts: Facts routed off the relation surface because their
             object is a verbatim identifier (URL, email, DOI,
             version-tagged tool name). Partitioned inside the
@@ -112,15 +125,15 @@ class StageState:
         scope: The one anonymize/de-anonymize round-trip scope for the
             cloud response — the resolution map every substitution and
             the entity-type rebuild are keyed on.
-        sota_raw: The cloud enricher's raw response string, recorded to
+        cloud_raw: The cloud enricher's raw response string, recorded to
             diagnostics by ``deanonymize``.
         updated_anon_transcript: The cloud's rewritten anonymized
             transcript, or ``None`` when it returned none (or its delta
             was rejected).
-        original_relation_count: Relation count captured before the SOTA
+        original_relation_count: Relation count captured before the cloud
             pipeline ran — the ``rebuild`` recovery gate's second term.
         empty_cause: Which site emptied ``facts``, from the ``CAUSE_*``
-            vocabulary in ``paramem.graph.relation_build``, or ``None``
+            vocabulary in ``paramem.graph.empty_cause``, or ``None``
             while facts survive. Diagnostic for the ``judgment`` and
             ``breakage`` kinds; load-bearing for the ``routing`` kind,
             which tells ``rebuild``'s recovery gate that the empty
@@ -129,10 +142,11 @@ class StageState:
     """
 
     graph: "SessionGraph"
+    payload: "AnonymizedContract | None" = None
     facts: list[dict] = field(default_factory=list)
     scalar_facts: list[dict] = field(default_factory=list)
     scope: "CloudScope | None" = None
-    sota_raw: str | None = None
+    cloud_raw: str | None = None
     updated_anon_transcript: str | None = None
     original_relation_count: int = 0
     empty_cause: str | None = None
@@ -163,7 +177,7 @@ class StageSpec:
             Receives ``(ctx, state)`` and returns the next ``StageState``.
         enabled_when: Predicate over ``ctx`` gating whether the stage
             runs at all (an operator/config toggle — e.g.
-            ``sota_pipeline``'s cloud-admission gate refusing egress).
+            ``cloud_pipeline``'s cloud-admission gate refusing egress).
             ``None`` means always enabled. A disabled stage
             is skipped with no call to ``run`` and therefore opens no
             phase trace record — mirrors an ``if <config flag>:`` gate

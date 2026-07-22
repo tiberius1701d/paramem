@@ -301,7 +301,7 @@ class QueryRouter:
           a fold) then interim slots filtered to preference keys only (proc-prefix
           OR ``relation_type=="preference"`` in bookkeeping).  Identity facts in
           interim slots are excluded by construction (DEFAULT-DENY).
-        * ``GENERAL``  — empty (route to SOTA with no personal injection).
+        * ``GENERAL``  — empty (route to cloud with no personal injection).
         * ``UNKNOWN``  — resolved via ``IntentConfig.fail_closed_intent``
           (default ``PERSONAL`` — privacy-preserving fallback).
 

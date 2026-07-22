@@ -3,7 +3,17 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from paramem.server.config import CloudAgentConfig
+
+@dataclass
+class CloudAgentConfig:
+    """Configuration for a cloud agent."""
+
+    enabled: bool = False
+    provider: str = "openai"  # openai, anthropic, google, groq
+    model: str = ""
+    api_key: str = field(default="", repr=False)
+    endpoint: str = ""  # optional custom endpoint (for Groq, ollama, etc.)
+    timeout_seconds: float = 90.0  # request timeout per call to this provider's API
 
 
 @dataclass

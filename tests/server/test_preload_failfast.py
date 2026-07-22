@@ -31,7 +31,7 @@ from paramem.server.app import (
     _fail_fast_cuda,
     _record_cuda_fatal_exit,
 )
-from paramem.server.vram_guard import is_fatal_cuda_fault
+from paramem.utils.vram_guard import is_fatal_cuda_fault
 
 # ---------------------------------------------------------------------------
 # Helpers

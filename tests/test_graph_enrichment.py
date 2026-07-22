@@ -1,6 +1,6 @@
-"""Tests for graph-level SOTA enrichment (Task #10).
+"""Tests for graph-level cloud enrichment (Task #10).
 
-All tests are pure-Python — no GPU required. SOTA calls are mocked so
+All tests are pure-Python — no GPU required. Cloud calls are mocked so
 the test suite does not make any network requests.
 """
 
@@ -27,17 +27,17 @@ from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingCon
 
 @pytest.fixture(autouse=True)
 def _stub_local_anonymize(monkeypatch):
-    """Default stub for ``anonymize_with_local_model``.
+    """Default stub for ``anonymize_transcript``.
 
-    ``graph_enrich.run_graph_enrichment`` now runs the local anonymizer
+    ``graph_enrich.enrich_graph`` now runs the local anonymizer
     (the SAME primitive session-tier extraction uses) over each chunk
-    BEFORE the SOTA call, to derive real-name entity types the fold graph
+    BEFORE the cloud call, to derive real-name entity types the fold graph
     itself cannot supply (see that function's docstring). ``_make_loop``'s
     model/tokenizer are ``MagicMock()``s, so a real call always fails to
     parse (there is no JSON in a ``MagicMock``'s generated output), which
-    would fail every chunk closed (skip the SOTA call entirely) before
-    ``_graph_enrich_with_sota`` is ever reached — breaking every test below
-    that mocks ``_graph_enrich_with_sota`` to verify SOTA-response
+    would fail every chunk closed (skip the cloud call entirely) before
+    ``request_graph_enrichment`` is ever reached — breaking every test below
+    that mocks ``request_graph_enrichment`` to verify cloud-response
     consumption.
 
     The default therefore lands on the SAFE side rather than the unsafe
@@ -47,18 +47,18 @@ def _stub_local_anonymize(monkeypatch):
     by default. A genuinely EMPTY mapping (``{}``) now PROCEEDS (the
     anonymizer ran and found nothing in scope, a legitimate verdict, not
     a failure) — see
-    ``TestEmptyMappingProceeds``. ``graph_enrich.run_graph_enrichment``'s
+    ``TestEmptyMappingProceeds``. ``graph_enrich.enrich_graph``'s
     remaining fail-closed guard (leg 2) only fires when the local
     anonymizer DID name something but none of it survived reconciliation
     onto the chunk's actual node keys (a genuine classification/identity-match
     failure) — see ``TestPrivacyFailClosedOnReconciliationFailure``. Tests
     in ``TestGraphTierAnonymizationContract`` call
-    ``_graph_enrich_with_sota`` directly (never through
-    ``graph_enrich.run_graph_enrichment``) and are unaffected by this
+    ``request_graph_enrichment`` directly (never through
+    ``graph_enrich.enrich_graph``) and are unaffected by this
     fixture.
     """
     monkeypatch.setattr(
-        "paramem.graph.cloud_egress.anonymize_with_local_model",
+        "paramem.cloud.anonymize.anonymize_transcript",
         _stub_local_model_types({}),
     )
 
@@ -72,7 +72,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     ``create_adapter`` calls.
 
     Keyword args forwarded to ConsolidationLoop override the defaults
-    set here (e.g. pass ``extraction_noise_filter=""`` to test the
+    set here (e.g. pass ``extraction_enrichment_provider=""`` to test the
     no-provider skip path).
     """
     # __class__ = PeftModel so _ensure_adapters' isinstance check
@@ -86,13 +86,13 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     }
 
     defaults = dict(
-        extraction_noise_filter="anthropic",
-        extraction_noise_filter_model="claude-sonnet-4-6",
+        extraction_enrichment_provider="anthropic",
+        extraction_enrichment_provider_model="claude-sonnet-4-6",
         extraction_scrub={"person name"},
         # Graph-tier enrichment is cloud egress and now routes through the
         # shared cloud-admission verdict, whose first term is the master
         # switch — so it must be ON for any enrichment test to reach a call.
-        sota_enabled=True,
+        cloud_enabled=True,
     )
     defaults.update(kwargs)
 
@@ -100,7 +100,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
     replay_enabled = defaults.pop("replay_enabled", False)
     # Allow callers to supply a pre-built ConsolidationConfig so tests can set
-    # fields like refinement_enrichment/sota_enabled without touching other knobs.
+    # fields like refinement_enrichment/cloud_enabled without touching other knobs.
     consolidation_config = defaults.pop("consolidation_config", ConsolidationConfig())
 
     from paramem.memory.store import MemoryStore as _MS
@@ -143,7 +143,7 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
         model=loop.model,
         tokenizer=loop.tokenizer,
         extraction_config_provider=loop._current_extraction_config,
-        sota_enabled=loop.config.sota_enabled,
+        cloud_enabled=loop.config.cloud_enabled,
         neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
         max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
         gc_disable=loop._disable_gradient_checkpointing,
@@ -259,7 +259,7 @@ class TestEnrichmentAddsEdgesWithSourceTag:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -320,7 +320,7 @@ class TestEnrichmentInheritsSourceWindow:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -378,7 +378,7 @@ class TestLowConfidenceDropped:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -435,7 +435,7 @@ class TestSameAsContractsNodes:
             sessions=["s011"],
         )
 
-        # SOTA returns surface names; production canonicalizes them before lookup:
+        # cloud returns surface names; production canonicalizes them before lookup:
         # "Alice" -> "alice", "Alicia" -> "alicia".
         canned_result = (
             [],  # no new relations
@@ -445,7 +445,7 @@ class TestSameAsContractsNodes:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -491,7 +491,7 @@ class TestSafeToMergeSurface:
 
 
 class TestSameAsSurnameMismatchRejected:
-    """Integration: a bad same_as pair from SOTA must be rejected by the gate."""
+    """Integration: a bad same_as pair from cloud must be rejected by the gate."""
 
     def test_cross_surname_pair_rejected(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
@@ -512,7 +512,7 @@ class TestSameAsSurnameMismatchRejected:
         canned_result = ([], [["Zhang Min", "Wang Min"]], "raw", [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -525,7 +525,7 @@ class TestSameAsSurnameMismatchRejected:
 
 
 def _same_as_per_chunk(*per_chunk: list[list[str]]):
-    """Build a ``_graph_enrich_with_sota`` side_effect yielding one result per chunk.
+    """Build a ``request_graph_enrichment`` side_effect yielding one result per chunk.
 
     Chunk *i* receives ``per_chunk[i]`` as its ``same_as`` pair list; every chunk
     beyond the supplied sequence receives an empty list.  Used by the tests that
@@ -589,17 +589,17 @@ class TestSameAsDedupAcrossChunks:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             side_effect=_same_as_per_chunk(
                 [["Yang Ming", "Zhang Min"]],  # chunk 1 — gate REJECTS
                 [["Yang_Ming", "Zhang_Min"]],  # chunk 2 — gate ACCEPTS
             ),
-        ) as mock_sota:
+        ) as mock_cloud:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
         # Guard against a vacuous pass: the second chunk must actually have run.
-        assert mock_sota.call_count >= 2
+        assert mock_cloud.call_count >= 2
         # Chunk 2's accepted proposal must contract despite chunk 1's rejection.
         assert result["same_as_merges"] == 1
         assert "zhang_min" not in graph.nodes
@@ -644,16 +644,16 @@ class TestSameAsDedupAcrossChunks:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             side_effect=_same_as_per_chunk(
                 [["Yang Ming", "Mr. Yang"]],  # chunk 1 — gate accepts, contracts
                 [["Yang Ming", "Mr. Yang"]],  # chunk 2 — identical, must be inert
             ),
-        ) as mock_sota:
+        ) as mock_cloud:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert mock_sota.call_count >= 2
+        assert mock_cloud.call_count >= 2
         assert result["same_as_merges"] == 1
         assert "mr._yang" not in graph.nodes
         assert "yang_ming" in graph.nodes
@@ -692,8 +692,8 @@ class TestSameAsDedupAcrossChunks:
             last_seen="s031",
         )
 
-        # SOTA returns surface names; production canonicalizes before graph lookup.
-        # Same pair emitted twice in reversed order — simulates SOTA echoing
+        # cloud returns surface names; production canonicalizes before graph lookup.
+        # Same pair emitted twice in reversed order — simulates cloud echoing
         # the duplicate across chunks.
         canned_result = (
             [],
@@ -703,7 +703,7 @@ class TestSameAsDedupAcrossChunks:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -716,7 +716,7 @@ class TestSymmetricPredicateCanonicalized:
     """Symmetric predicates collapse via Relation.symmetric + merger E-2 swap."""
 
     def test_both_directions_collapse_to_one_edge(self, tmp_path, monkeypatch):
-        """When SOTA emits (A,P,B) and (B,P,A) both with symmetric=true and
+        """When cloud emits (A,P,B) and (B,P,A) both with symmetric=true and
         neither endpoint is a speaker, the merger E-2 swap canonicalizes to
         subj < obj and the second insert is a Case-1 duplicate — only one edge lands.
         """
@@ -758,7 +758,7 @@ class TestSymmetricPredicateCanonicalized:
         canned_result = (rels, [], "raw", [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -817,7 +817,7 @@ class TestSymmetricPredicateCanonicalized:
         canned_result = (rels, [], "raw", [])
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -873,7 +873,7 @@ class TestCorefRemapBeforeEdgeInsert:
             last_seen="s050",
         )
 
-        # SOTA response: same_as merges Alex→Alexander (SOTA returns surface names;
+        # cloud response: same_as merges Alex→Alexander (cloud returns surface names;
         # production canonicalizes to "alex"/"alexander" before graph lookup).
         # The relation also uses dropped name "Alex" — the remap routes it to "alexander".
         canned_rels = [
@@ -889,7 +889,7 @@ class TestCorefRemapBeforeEdgeInsert:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(canned_rels, canned_same_as, "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -911,7 +911,7 @@ class TestCorefRemapBeforeEdgeInsert:
 
 
 class TestFloorSkipsSmallGraphs:
-    """Graphs with fewer than 10 nodes must be skipped without a SOTA call."""
+    """Graphs with fewer than 10 nodes must be skipped without a cloud call."""
 
     def test_small_graph_skip(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
@@ -931,7 +931,7 @@ class TestFloorSkipsSmallGraphs:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
             result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
@@ -993,7 +993,7 @@ class TestPartitionRoutesEnrichedEdges:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             _refiner_for(loop).run_enrichment()
@@ -1017,7 +1017,7 @@ class TestPartitionRoutesEnrichedEdges:
 
 
 class TestChunkCapRespected:
-    """Each SOTA call payload must not exceed max_entities_per_pass nodes."""
+    """Each cloud call payload must not exceed max_entities_per_pass nodes."""
 
     def test_each_chunk_within_cap(self, tmp_path, monkeypatch):
         loop = _make_loop(
@@ -1066,10 +1066,10 @@ class TestChunkCapRespected:
             return ([], [], "raw", [])
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", side_effect=_spy_call):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", side_effect=_spy_call):
             _refiner_for(loop).run_enrichment()
 
-        assert call_args_list, "Expected at least one SOTA call"
+        assert call_args_list, "Expected at least one cloud call"
 
         # Gather the unique node names seen in each call's triples
         for triples in call_args_list:
@@ -1106,7 +1106,7 @@ class TestCloudEgressRefusedSkipsGracefully:
     """Every unmet cloud-admission term skips this pass with no crash.
 
     The three terms are checked by the ONE shared component
-    (:func:`paramem.utils.cloud_admission.evaluate_cloud_egress`), so they
+    (:func:`paramem.cloud.admission.evaluate_cloud_egress`), so they
     share one ``skip_reason`` token; the individual unmet terms go to the
     log, which is what these tests assert on.
     """
@@ -1121,7 +1121,7 @@ class TestCloudEgressRefusedSkipsGracefully:
 
         call_spy = MagicMock()
         with _capture_enrich_logs(caplog):
-            with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+            with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
                 result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
@@ -1130,14 +1130,14 @@ class TestCloudEgressRefusedSkipsGracefully:
         call_spy.assert_not_called()
 
     def test_no_provider_skip(self, tmp_path, monkeypatch, caplog):
-        loop = _make_loop(tmp_path, extraction_noise_filter="")
+        loop = _make_loop(tmp_path, extraction_enrichment_provider="")
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
         with _capture_enrich_logs(caplog):
-            with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+            with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
                 result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
@@ -1146,22 +1146,22 @@ class TestCloudEgressRefusedSkipsGracefully:
         call_spy.assert_not_called()
 
     def test_master_switch_off_skip(self, tmp_path, monkeypatch, caplog):
-        """``sota_enabled: false`` alone blocks graph-tier cloud egress —
+        """``cloud_enabled: false`` alone blocks graph-tier cloud egress —
         the master switch is a term of the shared verdict, so this pass can
         no longer egress behind the operator's back."""
-        loop = _make_loop(tmp_path, sota_enabled=False)
+        loop = _make_loop(tmp_path, cloud_enabled=False)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
         with _capture_enrich_logs(caplog):
-            with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+            with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
                 result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "cloud_egress_blocked"
-        assert "sota_enabled is off" in caplog.text
+        assert "cloud_enabled is off" in caplog.text
         call_spy.assert_not_called()
 
 
@@ -1183,7 +1183,7 @@ class TestNoModelSkipsGracefully:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
             result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
@@ -1202,7 +1202,7 @@ class TestVramExhaustedNotSwallowed:
     """
 
     def test_vram_exhausted_propagates(self, tmp_path, monkeypatch):
-        from paramem.server.vram_guard import VramExhausted
+        from paramem.utils.vram_guard import VramExhausted
 
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
@@ -1214,7 +1214,7 @@ class TestVramExhaustedNotSwallowed:
             raise VramExhausted("graph_enrichment_test")
 
         with (
-            patch("paramem.training.graph_enrich._graph_enrich_with_sota", _raise_vram),
+            patch("paramem.training.graph_enrich.request_graph_enrichment", _raise_vram),
             pytest.raises(VramExhausted),
         ):
             _refiner_for(loop).run_enrichment()
@@ -1225,18 +1225,18 @@ class TestEmptyMappingProceeds:
     (``{}``) — even for a chunk with real (non-speaker) node names —
     means the anonymizer ran and classified
     NOTHING in scope against ``scrub``. That is a legitimate verdict, not
-    a classification failure, so egress PROCEEDS: the SOTA call fires
+    a classification failure, so egress PROCEEDS: the cloud call fires
     with an empty ``chunk_mapping`` (nothing to substitute) rather than
     being skipped. Mirrors the session-tier ``mapping == {}`` proceed
-    path in :func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`.
+    path in :func:`~paramem.graph.flows.anonymize_turn`.
 
     Mutation: reintroduce a bare ``not chunk_mapping`` guard (dropping the
-    ``_llm_mapping and`` qualifier) in ``graph_enrich.run_graph_enrichment``
-    -> this test fails (the SOTA call is skipped and
+    ``_llm_mapping and`` qualifier) in ``graph_enrich.enrich_graph``
+    -> this test fails (the cloud call is skipped and
     ``privacy_skipped_chunks`` increments instead of staying 0).
     """
 
-    def test_empty_mapping_proceeds_with_sota_call(self, tmp_path, monkeypatch):
+    def test_empty_mapping_proceeds_with_cloud_call(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
@@ -1246,12 +1246,12 @@ class TestEmptyMappingProceeds:
         # with a genuinely empty-mapping stub — this test exists
         # specifically to exercise that proceed path.
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: ({}, "", "stub-raw"),
         )
         canned_result = ([], [], "raw", [])
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ) as call_spy:
             result = _refiner_for(loop).run_enrichment()
@@ -1304,12 +1304,12 @@ class TestEmptyMappingProceeds:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: ({}, "", "stub-raw"),
         )
         canned_result = ([], [], "raw", [])
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ) as call_spy:
             result = _refiner_for(loop).run_enrichment()
@@ -1331,12 +1331,12 @@ class TestPrivacyFailClosedOnReconciliationFailure:
     the named entity simply isn't one of this chunk's nodes.
 
     Mutation: drop the ``_llm_mapping and`` qualifier from the
-    ``graph_enrich.run_graph_enrichment`` guard -> this test's SOTA call
+    ``graph_enrich.enrich_graph`` guard -> this test's cloud call
     would no longer be distinguished from the empty-mapping proceed case
     and would fire instead of being skipped.
     """
 
-    def test_reconciliation_drops_everything_skips_sota_call(self, tmp_path, monkeypatch):
+    def test_reconciliation_drops_everything_skips_cloud_call(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
@@ -1347,7 +1347,7 @@ class TestPrivacyFailClosedOnReconciliationFailure:
         # drops it, leaving chunk_mapping empty despite a non-empty
         # _llm_mapping.
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: (
                 {"nobody in this chunk": "Person_1"},
                 "stub-anon",
@@ -1355,7 +1355,7 @@ class TestPrivacyFailClosedOnReconciliationFailure:
             ),
         )
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -1378,7 +1378,7 @@ class TestPrivacyFailClosedOnShapeValidationDrop:
     ``payload.rekey_dropped``. Both causes are counted in
     ``privacy_skipped_chunks`` identically.
 
-    Mutation: branch ``graph_enrich.run_graph_enrichment`` on
+    Mutation: branch ``graph_enrich.enrich_graph`` on
     ``payload.rekey_dropped`` instead of ``payload.failure == "guard"`` ->
     this test's chunk is misclassified as a parse failure and
     ``privacy_skipped_chunks`` stays at 0 (undercount).
@@ -1398,7 +1398,7 @@ class TestPrivacyFailClosedOnShapeValidationDrop:
         # ``_normalize_anonymization_mapping``, never reaching the
         # reconciliation loop that increments ``rekey_dropped``.
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: (
                 {"Person0": "person_1"},
                 "stub-anon",
@@ -1406,7 +1406,7 @@ class TestPrivacyFailClosedOnShapeValidationDrop:
             ),
         )
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -1427,7 +1427,7 @@ class TestGuardDomainSeparation:
 
     Mutation: fuse the guard domain onto ``identity_domain``/``chunk_nodes``
     instead of ``graph.relations`` -> this chunk's guard fires (status
-    flips to "failed", ``privacy_skipped_chunks`` increments, the SOTA
+    flips to "failed", ``privacy_skipped_chunks`` increments, the cloud
     call is skipped) even though every SURVIVING edge is speaker-only.
     """
 
@@ -1557,21 +1557,22 @@ class TestGuardDomainSeparation:
         # chunks (e.g. focal=x_node, with real non-speaker filler edges)
         # get a harmless empty mapping so they don't pollute the count
         # this test asserts on.
-        def _stub(session_graph, model, tokenizer, transcript="", **kwargs):
-            names = {r.subject for r in session_graph.relations} | {
-                r.object for r in session_graph.relations
+        def _stub(facts, model, tokenizer, transcript="", **kwargs):
+            # ``facts`` is a plain fact-dict list — never a ``SessionGraph``.
+            names = {str(f.get("subject", "")) for f in facts} | {
+                str(f.get("object", "")) for f in facts
             }
             if names == {"speaker0", "speaker1"}:
                 return {"nobody in this chunk": "Person_1"}, "stub-anon", "stub-raw"
             return {}, "stub-anon", "stub-raw"
 
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             _stub,
         )
         canned_result = ([], [], "raw", [])
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ) as call_spy:
             result = _refiner_for(loop).run_enrichment()
@@ -1606,29 +1607,29 @@ class TestScrubEmptyOptsOutWithoutModelCall:
             return [], [], "raw", []
 
         with (
-            patch("paramem.graph.cloud_egress.anonymize_with_local_model", anonymizer_spy),
-            patch("paramem.training.graph_enrich._graph_enrich_with_sota", side_effect=_capture),
+            patch("paramem.cloud.anonymize.anonymize_transcript", anonymizer_spy),
+            patch("paramem.training.graph_enrich.request_graph_enrichment", side_effect=_capture),
         ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
         anonymizer_spy.assert_not_called()
-        assert captured_mapping, "expected _graph_enrich_with_sota to be called"
+        assert captured_mapping, "expected request_graph_enrichment to be called"
         # Verbatim egress: an empty forward mapping substitutes nothing.
         assert all(m == {} for m in captured_mapping)
 
 
 class TestTotalityRejectedChunks:
-    """Graph-tier enrichment's binding-totality gate — a SOTA response
+    """Graph-tier enrichment's binding-totality gate — a cloud response
     naming an orphan/unresolvable token REJECTS THE WHOLE CHUNK DELTA,
     counted in ``totality_rejected_chunks`` (parallel to the existing
     ``privacy_skipped_chunks`` / ``mapping_rekey_dropped`` counters).
-    Distinct from ``privacy_skipped_chunks``, which fires BEFORE any SOTA
-    call is made; this counter fires AFTER a real SOTA response was
+    Distinct from ``privacy_skipped_chunks``, which fires BEFORE any cloud
+    call is made; this counter fires AFTER a real cloud response was
     rejected by the deanonymize gate.
     """
 
-    def test_orphan_token_in_sota_response_increments_the_counter(self, tmp_path, monkeypatch):
+    def test_orphan_token_in_cloud_response_increments_the_counter(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
@@ -1636,7 +1637,7 @@ class TestTotalityRejectedChunks:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         # Default autouse fixture masks every non-speaker name as
         # "person" (Person_N) — person0 becomes Person_1 (sorted-name
-        # order). The SOTA response below names an orphan token
+        # order). The cloud response below names an orphan token
         # ("Person_99") never declared anywhere in this chunk's mapping —
         # the totality gate must reject the WHOLE delta.
         canned_raw = (
@@ -1644,7 +1645,7 @@ class TestTotalityRejectedChunks:
             '"object": "Person_99", "relation_type": "social", "confidence": 0.9}], '
             '"same_as": []}'
         )
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -1653,29 +1654,29 @@ class TestTotalityRejectedChunks:
         assert result["privacy_skipped_chunks"] == 0
         assert result["new_edges"] == 0
 
-    def test_clean_sota_response_does_not_increment_the_counter(self, tmp_path, monkeypatch):
+    def test_clean_cloud_response_does_not_increment_the_counter(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         canned_raw = '{"relations": [], "same_as": []}'
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
         assert result["totality_rejected_chunks"] == 0
 
     def test_counter_reads_the_returned_verdict_not_a_graph_mutation(self, tmp_path, monkeypatch):
-        """The counter is driven by the VERDICT ``_graph_enrich_with_sota``
+        """The counter is driven by the VERDICT ``request_graph_enrichment``
         returns (its fourth tuple element), not by reading
-        ``sota_pending_orphans`` back off the throwaway per-chunk graph.
+        ``cloud_pending_orphans`` back off the throwaway per-chunk graph.
 
         The stub below returns a rejection verdict while touching no
         graph at all — under the old readback the counter would stay 0.
 
         Mutation: go back to
-        ``if _chunk_session_graph.diagnostics.get("sota_pending_orphans")``
+        ``if _chunk_session_graph.diagnostics.get("cloud_pending_orphans")``
         -> this test fails while the two live-path tests above still
         pass, which is exactly why it exists.
         """
@@ -1685,7 +1686,7 @@ class TestTotalityRejectedChunks:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=([], [], "raw", ["Person_99"]),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -1706,7 +1707,7 @@ class TestTotalityRejectedChunks:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=([], [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -1716,13 +1717,13 @@ class TestTotalityRejectedChunks:
 
 
 class TestSameAsUndeclaredOrphanShapeBackstop:
-    """``deanonymize_response_text`` runs no
+    """``deanonymize_text`` runs no
     undeclared-orphan shape backstop for the ``same_as`` arm — verify the
     documented safety argument holds: an undeclared placeholder-shaped
     token in a ``same_as`` pair (never in this chunk's reverse map, so
     nothing resolves it and no shape check drops it either) still cannot
     reach a node contraction, because it is dropped by
-    ``graph_enrich.run_graph_enrichment``'s own graph-membership guard
+    ``graph_enrich.enrich_graph``'s own graph-membership guard
     first.
     """
 
@@ -1734,11 +1735,11 @@ class TestSameAsUndeclaredOrphanShapeBackstop:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         # "Person_1" is declared (person0's mask, sorted-name order);
         # "Person_99" was never declared for this chunk at all -- it
-        # passes through deanonymize_response_text UNCHANGED (neither
+        # passes through deanonymize_text UNCHANGED (neither
         # resolved nor dropped, since the declared-token check only
         # fires on tokens that WERE declared).
         canned_raw = '{"relations": [], "same_as": [["Person_1", "Person_99"]]}'
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -1747,53 +1748,45 @@ class TestSameAsUndeclaredOrphanShapeBackstop:
 
 
 def _payload_and_graph_for(triples: list[dict], llm_mapping: dict[str, str]):
-    """Build the ``(payload, graph)`` pair ``_graph_enrich_with_sota`` now
+    """Build the ``(payload, graph)`` pair ``request_graph_enrichment`` now
     takes, from a caller-supplied ``llm_mapping`` (real_name -> placeholder)
     and the chunk's ``triples`` — mirroring what
-    ``graph_enrich.run_graph_enrichment`` produces via
-    ``anonymize_for_cloud`` (with ``identity_domain=None``, matching a
+    ``graph_enrich.enrich_graph`` produces via
+    ``anonymize`` (with ``identity_domain=None``, matching a
     direct unit-level call with no reconciliation domain), so these tests
-    exercise the REAL table-building and fact-building primitives rather
-    than a hand-rolled substitute.
-    """
-    from paramem.graph.cloud_egress import AnonymizedPayload
-    from paramem.graph.placeholders import _build_anon_facts, _build_anonymization_mapping
-    from paramem.graph.schema import Relation, SessionGraph
+    exercise the REAL table-building primitive rather than a hand-rolled
+    substitute.
 
-    relations = [
-        Relation(
-            subject=t["subject"],
-            predicate=t["predicate"],
-            object=t["object"],
-            relation_type=t.get("relation_type", "factual"),
-            speaker_id=t.get("speaker_id", ""),
-        )
-        for t in triples
-    ]
+    ``graph`` carries no relations of its own (interface narrowing,
+    2026-07-21): ``request_graph_enrichment`` derives its anonymized
+    triples directly from the ``triples`` argument via
+    ``insert_placeholders``, not from ``graph.relations`` — ``graph`` is
+    only the diagnostics sink.
+    """
+    from paramem.cloud.anonymize import AnonymizedContract
+    from paramem.cloud.placeholders import _build_anonymization_mapping
+    from paramem.graph.schema import SessionGraph
+
     forward, reverse = _build_anonymization_mapping(dict(llm_mapping), speaker_name=None)
-    anon_facts = _build_anon_facts(relations, forward)
-    payload = AnonymizedPayload(
+    payload = AnonymizedContract(
         status="ok",
         forward=forward,
         reverse=reverse,
         anon_transcript="",
-        anon_facts=anon_facts,
         declared=frozenset(reverse.keys()),
         norm_stats={"inverted": 0, "dropped": 0},
         rekey_dropped=0,
         raw="",
     )
-    graph = SessionGraph(
-        session_id="__graph_enrichment_test__", timestamp="", entities=[], relations=relations
-    )
+    graph = SessionGraph(session_id="__graph_enrichment_test__", timestamp="")
     return payload, graph
 
 
-class TestGraphEnrichWithSotaUnit:
-    """Unit tests for the extractor-level _graph_enrich_with_sota function."""
+class TestGraphEnrichWithCloudUnit:
+    """Unit tests for the extractor-level request_graph_enrichment function."""
 
     def test_returns_relations_and_same_as(self):
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         canned_raw = (
             '{"relations": [{"subject": "A", "predicate": "knows", "object": "B", '
@@ -1808,8 +1801,8 @@ class TestGraphEnrichWithSotaUnit:
             }
         ]
         payload, graph = _payload_and_graph_for(triples, {})
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -1826,18 +1819,18 @@ class TestGraphEnrichWithSotaUnit:
         assert same_as[0] == ["Alice", "Alicia"]
 
     def test_system_prompt_overridable_and_recorded_in_provenance(self):
-        """``sota_graph_enrichment_system.txt`` used to bind ONCE at module
-        import time (``_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT``) — unreachable
+        """``cloud_graph_enrichment_system.txt`` used to bind ONCE at module
+        import time (``_CLOUD_GRAPH_ENRICHMENT_SYSTEM_PROMPT``) — unreachable
         by a calibration override and never recorded via ``record_prompt``.
-        It now loads at CALL TIME inside ``_graph_enrich_with_sota`` itself,
+        It now loads at CALL TIME inside ``request_graph_enrichment`` itself,
         so both become possible."""
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
         from paramem.graph.phase_trace import extraction_trace, phase_trace
         from paramem.graph.prompts import prompt_overrides
 
         captured = []
 
-        def fake_sota_call(prompt, *args, **kwargs):
+        def fake_cloud_call(prompt, *args, **kwargs):
             captured.append(kwargs.get("system_prompt"))
             return '{"relations": [], "same_as": []}'
 
@@ -1850,13 +1843,13 @@ class TestGraphEnrichWithSotaUnit:
             }
         ]
         payload, graph = _payload_and_graph_for(triples, {})
-        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+        with patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call):
             with extraction_trace() as trace:
-                with phase_trace("sota_enrich"):
+                with phase_trace("cloud_enrich"):
                     with prompt_overrides(
-                        {"sota_graph_enrichment_system.txt": "SENTINEL-GRAPH-ENRICH-SYSTEM"}
+                        {"cloud_graph_enrichment_system.txt": "SENTINEL-GRAPH-ENRICH-SYSTEM"}
                     ):
-                        _graph_enrich_with_sota(
+                        request_graph_enrichment(
                             triples,
                             payload,
                             graph,
@@ -1867,24 +1860,24 @@ class TestGraphEnrichWithSotaUnit:
                 record = trace.records[-1]
 
         assert captured == ["SENTINEL-GRAPH-ENRICH-SYSTEM"], (
-            "the override must reach _sota_call's system_prompt kwarg"
+            "the override must reach _cloud_call's system_prompt kwarg"
         )
         paths = [p["path"] for p in (record.prompts or [])]
-        assert "<override:sota_graph_enrichment_system.txt>" in paths, (
+        assert "<override:cloud_graph_enrichment_system.txt>" in paths, (
             f"override must be recorded in phase-trace provenance, got paths={paths!r}"
         )
 
     def test_legacy_bare_array(self):
         """Bare JSON array response → treated as relations, empty same_as."""
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         canned_raw = (
             '[{"subject": "A", "predicate": "knows", "object": "B", '
             '"relation_type": "social", "confidence": 0.8}]'
         )
         payload, graph = _payload_and_graph_for([], {})
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 [],
                 payload,
                 graph,
@@ -1898,13 +1891,13 @@ class TestGraphEnrichWithSotaUnit:
         assert len(new_rels) == 1
         assert same_as == []
 
-    def test_none_on_sota_failure(self):
-        """_sota_call returning None → _graph_enrich_with_sota returns None."""
-        from paramem.graph.extractor import _graph_enrich_with_sota
+    def test_none_on_cloud_failure(self):
+        """_cloud_call returning None → request_graph_enrichment returns None."""
+        from paramem.graph.extractor import request_graph_enrichment
 
         payload, graph = _payload_and_graph_for([], {})
-        with patch("paramem.graph.extractor._sota_call", return_value=None):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=None):
+            result = request_graph_enrichment(
                 [],
                 payload,
                 graph,
@@ -1916,12 +1909,12 @@ class TestGraphEnrichWithSotaUnit:
 
     def test_malformed_same_as_skipped(self):
         """Malformed same_as entries are silently skipped."""
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         canned_raw = '{"relations": [], "same_as": ["bad", [1, 2], ["Alice", "Alicia"]]}'
         payload, graph = _payload_and_graph_for([], {})
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 [],
                 payload,
                 graph,
@@ -1939,10 +1932,10 @@ class TestGraphEnrichWithSotaUnit:
         """A rejected chunk delta surfaces TWO ways, and both must hold:
         the verdict is the fourth element of the returned tuple (what the
         caller counts on), AND it still lands under
-        ``graph.diagnostics["sota_pending_orphans"]`` for calibration
+        ``graph.diagnostics["cloud_pending_orphans"]`` for calibration
         inspection — written by the CALLER-side
         ``_record_binding_diagnostics``, not from inside the gate."""
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
             {
@@ -1960,8 +1953,8 @@ class TestGraphEnrichWithSotaUnit:
             '"same_as": []}'
         )
         payload, graph = _payload_and_graph_for(triples, {"Alex": "Person_1"})
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -1975,15 +1968,15 @@ class TestGraphEnrichWithSotaUnit:
         assert verdict == ["Person_99"]
         assert new_rels == []
         assert same_as == []
-        assert graph.diagnostics["sota_pending_orphans"] == ["Person_99"]
-        # No sota_bindings in the response -> the collision scan found
+        assert graph.diagnostics["cloud_pending_orphans"] == ["Person_99"]
+        # No cloud_bindings in the response -> the collision scan found
         # nothing -> no key at all (never a present-but-empty list).
-        assert "sota_binding_collisions" not in graph.diagnostics
+        assert "cloud_binding_collisions" not in graph.diagnostics
 
     def test_accepted_chunk_writes_no_totality_diagnostics(self):
         """The guard conditions are preserved end-to-end: an accepted
         delta leaves both keys ABSENT rather than writing empty lists."""
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
             {
@@ -1995,8 +1988,8 @@ class TestGraphEnrichWithSotaUnit:
         ]
         canned_raw = '{"relations": [], "same_as": []}'
         payload, graph = _payload_and_graph_for(triples, {"Alex": "Person_1"})
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -2007,8 +2000,8 @@ class TestGraphEnrichWithSotaUnit:
 
         assert result is not None
         assert result[3] == []
-        assert "sota_pending_orphans" not in graph.diagnostics
-        assert "sota_binding_collisions" not in graph.diagnostics
+        assert "cloud_pending_orphans" not in graph.diagnostics
+        assert "cloud_binding_collisions" not in graph.diagnostics
 
 
 class TestInterimEnrichmentHook:
@@ -2051,13 +2044,15 @@ class TestInterimEnrichmentHook:
         )
 
     def test_refinement_enrichment_on_calls_run_enrichment(self, tmp_path):
-        """refinement_enrichment='on' + sota_enabled=True → run_enrichment called."""
+        """refinement_enrichment='on' + cloud_enabled=True → run_enrichment called."""
         from paramem.training.key_registry import KeyRegistry
         from paramem.utils.config import ConsolidationConfig
 
         loop = _make_loop(
             tmp_path,
-            consolidation_config=ConsolidationConfig(refinement_enrichment="on", sota_enabled=True),
+            consolidation_config=ConsolidationConfig(
+                refinement_enrichment="on", cloud_enabled=True
+            ),
             replay_enabled=True,
         )
         for tier in ("episodic", "semantic", "procedural"):
@@ -2313,7 +2308,7 @@ class TestRefineConsolidationGraph:
         enrich_mock.assert_not_called()
 
     def test_recurrence_bump_runs_when_enrich_false(self, tmp_path):
-        """Recurrence-bump fires regardless of enrich; enrich=False only skips SOTA."""
+        """Recurrence-bump fires regardless of enrich; enrich=False only skips cloud."""
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_loop(tmp_path, replay_enabled=True)
@@ -2420,7 +2415,7 @@ class TestRefineConsolidationGraph:
         """normalize=True runs the whole-graph normalization pass (light+, both scopes).
 
         The normalization pass is independent of enrich: normalize=True without
-        enrich runs normalization only (the light default), not SOTA enrichment.
+        enrich runs normalization only (the light default), not cloud enrichment.
         """
         loop = _make_loop(tmp_path)
 
@@ -2658,8 +2653,8 @@ class TestHarvestKeylessEdges:
             memory_store=store,
             procedural_adapter_config=AdapterConfig(),
             output_dir=tmp_path,
-            extraction_noise_filter="anthropic",
-            extraction_noise_filter_model="claude-sonnet-4-6",
+            extraction_enrichment_provider="anthropic",
+            extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
@@ -2742,8 +2737,8 @@ class TestHarvestKeylessEdges:
             memory_store=store,
             procedural_adapter_config=None,
             output_dir=tmp_path,
-            extraction_noise_filter="anthropic",
-            extraction_noise_filter_model="claude-sonnet-4-6",
+            extraction_enrichment_provider="anthropic",
+            extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
@@ -2925,7 +2920,7 @@ class TestEnrichmentRemovalLedger:
         )
         graph["alice"]["alicia"][eid][_IK_KEY_ATTR] = "key_same_as_victim"
 
-        # SOTA returns surface names; production canonicalizes before graph lookup.
+        # cloud returns surface names; production canonicalizes before graph lookup.
         canned_result = (
             [],
             [["Alice", "Alicia"]],  # keep=alice, drop=alicia
@@ -2934,7 +2929,7 @@ class TestEnrichmentRemovalLedger:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=canned_result,
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -2991,7 +2986,7 @@ class TestEnrichmentRemovalLedger:
         )
         graph["badkeep"]["baddrop"][eid][_IK_KEY_ATTR] = "key_bad_victim"
 
-        # SOTA returns surface names; production canonicalizes: "BadKeep" → "badkeep".
+        # cloud returns surface names; production canonicalizes: "BadKeep" → "badkeep".
         canned_result = (
             [],
             [["BadKeep", "BadDrop"]],
@@ -3003,7 +2998,7 @@ class TestEnrichmentRemovalLedger:
         # Patch contracted_nodes to always raise so the contraction fails.
         with (
             patch(
-                "paramem.training.graph_enrich._graph_enrich_with_sota",
+                "paramem.training.graph_enrich.request_graph_enrichment",
                 return_value=canned_result,
             ),
             patch("networkx.contracted_nodes", side_effect=ValueError("forced failure")),
@@ -3352,7 +3347,7 @@ class TestEnrichmentThroughMergerComposition:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -3413,7 +3408,7 @@ class TestEnrichmentThroughMergerComposition:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -3511,7 +3506,7 @@ def _seed_speaker_node(loop, speaker_id: str, display: str) -> None:
 
 
 class TestEnrichmentVerbatimSpeakerKeyResolution:
-    """Regression: SOTA echoes back the cased speaker id ('speaker0'), which
+    """Regression: Cloud echoes back the cased speaker id ('speaker0'), which
     must resolve to the existing casefolded speaker node key ('speaker0') via
     canonical fallback.  No duplicate node is created.
 
@@ -3541,7 +3536,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         # Confirm §0 key convention: canonical lowercase key only.
         assert "speaker0" in loop.merger.graph.nodes
 
-        # SOTA emits lowercase speaker id "speaker0" as the subject.
+        # cloud emits lowercase speaker id "speaker0" as the subject.
         rels = [
             {
                 "subject": "speaker0",
@@ -3554,7 +3549,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -3625,7 +3620,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         assert "speaker0" in loop.merger.graph.nodes
         assert "speaker1" in loop.merger.graph.nodes
 
-        # SOTA emits BOTH directions, both symmetric=true, lowercase speaker ids.
+        # cloud emits BOTH directions, both symmetric=true, lowercase speaker ids.
         rels = [
             {
                 "subject": "speaker0",
@@ -3646,7 +3641,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -3729,7 +3724,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
             patch(
-                "paramem.training.graph_enrich._graph_enrich_with_sota",
+                "paramem.training.graph_enrich.request_graph_enrichment",
                 return_value=(rels, same_as, "raw", []),
             ),
             patch(
@@ -3764,7 +3759,7 @@ class TestUniqueSpeakerPredecessor:
     """Direct unit tests for ConsolidationLoop._unique_speaker_predecessor.
 
     Uses a minimal loop with a manually-populated merger.graph (nx.MultiDiGraph).
-    No enrichment, no SOTA calls.
+    No enrichment, no cloud calls.
     """
 
     def test_zero_predecessors_returns_empty(self, tmp_path):
@@ -3840,7 +3835,7 @@ class TestSpeakerPredecessorInheritance:
         """Role-concept attribute edge inherits speaker_id from the unique speaker.
 
         Graph: speaker0 →held_role→ 'Senior PM', 'Senior PM' →achievement→ 'Award X'
-        (both via SOTA canned result).  After enrichment + mint, the minted key for
+        (both via cloud canned result).  After enrichment + mint, the minted key for
         'achievement' must carry speaker_id='speaker0' and be filed under speaker0
         in a rebuilt router index.
         """
@@ -3855,7 +3850,7 @@ class TestSpeakerPredecessorInheritance:
         # Real speaker node via the merger (verbatim key "speaker0").
         _seed_speaker_node(loop, "speaker0", "Alex")
 
-        # SOTA emits: bridge edge + role-concept attribute edge.
+        # cloud emits: bridge edge + role-concept attribute edge.
         # The role concept node ("Senior PM") has no speaker_id of its own.
         rels = [
             {
@@ -3875,7 +3870,7 @@ class TestSpeakerPredecessorInheritance:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -3971,7 +3966,7 @@ class TestSpeakerPredecessorInheritance:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -4036,7 +4031,7 @@ class TestSpeakerPredecessorInheritance:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels_a, [], "raw", []),
         ):
             _refiner_for(loop).run_enrichment()
@@ -4126,7 +4121,7 @@ class TestSpeakerPredecessorInheritance:
 
         _seed_speaker_node(loop, "speaker0", "Alex")
 
-        # SOTA emits an attribute edge whose SUBJECT is a brand-new concept node
+        # cloud emits an attribute edge whose SUBJECT is a brand-new concept node
         # with no speaker predecessor (no bridge edge into it).
         rels = [
             {
@@ -4139,7 +4134,7 @@ class TestSpeakerPredecessorInheritance:
         ]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=(rels, [], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -4235,32 +4230,32 @@ class TestSpeakerPredecessorInheritance:
 
 # ---------------------------------------------------------------------------
 # Graph-tier anonymization contract — the second call site of the
-# anonymize -> SOTA -> de-anonymize contract (paramem.graph.placeholders).
+# anonymize -> cloud -> de-anonymize contract (paramem.graph.placeholders).
 # ---------------------------------------------------------------------------
 
 
 class TestGraphTierAnonymizationContract:
-    """paramem.graph.extractor._graph_enrich_with_sota now runs the SAME
-    anonymize -> SOTA -> de-anonymize contract as session-tier extraction
-    (_sota_pipeline), via the shared primitives in paramem.graph.placeholders.
+    """paramem.graph.extractor.request_graph_enrichment now runs the SAME
+    anonymize -> cloud -> de-anonymize contract as session-tier extraction
+    (_cloud_pipeline), via the shared primitives in paramem.graph.placeholders.
     """
 
     def test_graph_enrichment_sends_no_real_names(self):
         """No name present as a key in the caller-supplied ``mapping``
-        reaches the payload handed to ``_sota_call``; it renders as its
+        reaches the payload handed to ``_cloud_call``; it renders as its
         placeholder token instead.  A bare ``speaker{N}`` id is never a
         ``mapping`` key in production (the local anonymizer prompt
         forbids mapping it — see :func:`_build_anonymization_mapping`'s
         speaker-anchor invariants), so it legitimately reaches the
-        payload UNMASKED — ``_graph_enrich_with_sota`` applies no scope
+        payload UNMASKED — ``request_graph_enrichment`` applies no scope
         gate of its own; it substitutes exactly what ``mapping`` says
         (the model's own mapping is the sole scope authority).
 
         Mutation: restore the pre-fix call (pass ``triples`` straight to
-        ``_sota_call`` with no anonymization step) -> ``"alice"`` appears
+        ``_cloud_call`` with no anonymization step) -> ``"alice"`` appears
         in the captured payload -> this test fails.
         """
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
             {
@@ -4281,8 +4276,8 @@ class TestGraphTierAnonymizationContract:
             captured.append(prompt)
             return '{"relations": [], "same_as": []}'
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=_capture):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -4292,7 +4287,7 @@ class TestGraphTierAnonymizationContract:
             )
 
         assert result is not None
-        assert captured, "Expected the SOTA call to be made"
+        assert captured, "Expected the cloud call to be made"
         rendered = captured[0]
         assert "alice" not in rendered, f"Real name 'alice' leaked into payload: {rendered}"
         assert "Person_1" in rendered, f"Expected 'alice' tokenised as Person_1; got: {rendered}"
@@ -4301,8 +4296,8 @@ class TestGraphTierAnonymizationContract:
         )
 
     def test_graph_enrichment_round_trips_to_real_names(self):
-        """Relations SOTA returns (naming tokens) come back with real node
-        names after ``_graph_enrich_with_sota`` returns; a bare
+        """Relations cloud returns (naming tokens) come back with real node
+        names after ``request_graph_enrichment`` returns; a bare
         ``speaker{N}`` id (never tokenised — not a ``mapping`` key) round
         trips unchanged.
 
@@ -4310,9 +4305,9 @@ class TestGraphTierAnonymizationContract:
         ``same_as_pairs`` straight from the parsed response, un-substituted)
         -> the placeholder reaches the merger -> this test fails.
         """
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
-        # Realistic shape: SOTA can only propose a relation naming a
+        # Realistic shape: Cloud can only propose a relation naming a
         # placeholder it was actually SHOWN, so the chunk's triples must
         # carry "alice" for "Person_1" to be within the observed scope.
         triples = [
@@ -4332,8 +4327,8 @@ class TestGraphTierAnonymizationContract:
             '"symmetric": true}], "same_as": []}'
         )
 
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -4350,7 +4345,7 @@ class TestGraphTierAnonymizationContract:
         assert same_as == []
 
     def test_graph_enrichment_unresolved_token_dropped(self):
-        """A relation naming a token in neither the CORE table nor SOTA
+        """A relation naming a token in neither the CORE table nor cloud
         bindings is DROPPED at the exit gate, not forwarded with a residual
         placeholder.
 
@@ -4358,9 +4353,9 @@ class TestGraphTierAnonymizationContract:
         -> the unresolved token escapes into ``new_relations`` -> this test
         fails.
         """
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
-        # "alice" is shown to SOTA (declared AND observed); "Person_99" is
+        # "alice" is shown to cloud (declared AND observed); "Person_99" is
         # never declared anywhere — the totality gate rejects the WHOLE
         # delta (not a per-fact residual drop) once the gate is unified,
         # but the observable outcome (no surviving relation) is unchanged.
@@ -4379,8 +4374,8 @@ class TestGraphTierAnonymizationContract:
             '"object": "Person_99", "relation_type": "social", '
             '"confidence": 0.9, "symmetric": false}], "same_as": []}'
         )
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -4396,18 +4391,18 @@ class TestGraphTierAnonymizationContract:
         )
 
     def test_graph_enrichment_masks_exactly_what_the_mapping_declares(self):
-        """``_graph_enrich_with_sota`` applies NO scope gate of its own
+        """``request_graph_enrichment`` applies NO scope gate of its own
         — it substitutes exactly the entries the caller's
         ``mapping`` declares, nothing more, nothing less.  The caller's
         ``mapping`` is the model's own ``scrub``-scoped decision in
         production; this test proves the function trusts it verbatim
         rather than re-deriving scope from entity types.
 
-        Mutation: hardcode a scope inside ``_graph_enrich_with_sota``
+        Mutation: hardcode a scope inside ``request_graph_enrichment``
         (ignore what ``mapping`` actually contains) -> either assertion
         below fails.
         """
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
             {
@@ -4427,8 +4422,8 @@ class TestGraphTierAnonymizationContract:
 
         # The model classified only "alice" in scope.
         payload_person, graph_person = _payload_and_graph_for(triples, {"alice": "Person_1"})
-        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
-            _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=_capture):
+            request_graph_enrichment(
                 triples,
                 payload_person,
                 graph_person,
@@ -4443,8 +4438,8 @@ class TestGraphTierAnonymizationContract:
         # The model classified only "acme" in scope (its own decision —
         # not a code-side entity-type re-derivation).
         payload_org, graph_org = _payload_and_graph_for(triples, {"acme": "Org_1"})
-        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
-            _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=_capture):
+            request_graph_enrichment(
                 triples,
                 payload_org,
                 graph_org,
@@ -4458,16 +4453,16 @@ class TestGraphTierAnonymizationContract:
 
     def test_graph_enrichment_placeholder_threaded_verbatim_never_reminted(self):
         """The model's OWN placeholder (whatever token it minted) is
-        threaded straight through to the SOTA payload and the returned
-        relation — ``_graph_enrich_with_sota`` never re-mints its own
+        threaded straight through to the cloud payload and the returned
+        relation — ``request_graph_enrichment`` never re-mints its own
         token for a name already present in ``mapping``, regardless of
         the placeholder's shape (verified with a real anonymizer-style
         surface, not a ``Person_N`` convenience literal).  This is the
         regression this contract exists to prevent: re-minting instead of
-        threading through would desync the forward token from what SOTA
+        threading through would desync the forward token from what cloud
         is shown, or silently drop a mapping entry.
         """
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.extractor import request_graph_enrichment
 
         triples = [
             {
@@ -4490,8 +4485,8 @@ class TestGraphTierAnonymizationContract:
                 '"symmetric": false}], "same_as": []}'
             )
 
-        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", side_effect=_capture):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -4515,8 +4510,8 @@ class TestGraphTierAnonymizationContract:
 
     def test_graph_enrichment_same_as_deanonymized_before_speaker_guard(self):
         """``same_as`` pairs must be real names by the time they LEAVE
-        ``_graph_enrich_with_sota`` — i.e. strictly before
-        ``graph_enrich.run_graph_enrichment``'s speaker-pair guard
+        ``request_graph_enrichment`` — i.e. strictly before
+        ``graph_enrich.enrich_graph``'s speaker-pair guard
         (``is_speaker_id(keep) and is_speaker_id(drop)``, graph_enrich.py)
         ever sees them. ``is_speaker_id`` cannot recognise a
         placeholder token (``Person_N``) as a speaker id, so if
@@ -4535,54 +4530,45 @@ class TestGraphTierAnonymizationContract:
         -> ``is_speaker_id`` on the returned pair is False -> this test
         fails.
         """
-        from paramem.graph.cloud_egress import AnonymizedPayload
-        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.cloud.anonymize import AnonymizedContract
+        from paramem.graph.extractor import request_graph_enrichment
         from paramem.graph.schema import SessionGraph
         from paramem.utils.identity import is_speaker_id
 
         # Hand-built payload (bypassing _build_anonymization_mapping's
         # speaker-key-drop guard on purpose — see docstring: a legal input
         # to this pure function, never how a real caller populates it).
-        # Realistic shape otherwise: SOTA can only propose a same_as pair
+        # Realistic shape otherwise: Cloud can only propose a same_as pair
         # naming placeholders it was actually SHOWN, so the chunk's
-        # triples (and anon_facts) must carry Person_1/Person_2 for them
-        # to be within the observed scope.
+        # ``triples`` (fed to ``request_graph_enrichment`` directly, per
+        # the interface narrowing — no separate ``anon_facts`` field)
+        # must carry Person_1/Person_2 for them to be within the observed
+        # scope.
         triples = [
             {
-                "subject": "speaker0",
+                "subject": "Person_1",
                 "predicate": "knows",
-                "object": "speaker1",
+                "object": "Person_2",
                 "relation_type": "social",
                 "speaker_id": "speaker0",
             }
         ]
         reverse = {"Person_1": "speaker0", "Person_2": "speaker1"}
-        payload = AnonymizedPayload(
+        payload = AnonymizedContract(
             status="ok",
             forward={v: k for k, v in reverse.items()},
             reverse=reverse,
             anon_transcript="",
-            anon_facts=[
-                {
-                    "subject": "Person_1",
-                    "predicate": "knows",
-                    "object": "Person_2",
-                    "relation_type": "social",
-                    "confidence": 1.0,
-                }
-            ],
             declared=frozenset(reverse.keys()),
             norm_stats={"inverted": 0, "dropped": 0},
             rekey_dropped=0,
             raw="",
         )
-        graph = SessionGraph(
-            session_id="__graph_enrichment_test__", timestamp="", entities=[], relations=[]
-        )
+        graph = SessionGraph(session_id="__graph_enrichment_test__", timestamp="")
         canned_raw = '{"relations": [], "same_as": [["Person_1", "Person_2"]]}'
 
-        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
-            result = _graph_enrich_with_sota(
+        with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 graph,
@@ -4597,7 +4583,7 @@ class TestGraphTierAnonymizationContract:
         keep, drop = same_as[0]
         assert is_speaker_id(keep) and is_speaker_id(drop), (
             "same_as pair must be bare speaker ids by the time it leaves "
-            f"_graph_enrich_with_sota — the speaker-pair guard depends on this; got {same_as[0]!r}"
+            f"request_graph_enrichment — the speaker-pair guard depends on this; got {same_as[0]!r}"
         )
         assert {keep, drop} == {"speaker0", "speaker1"}
 
@@ -4606,13 +4592,13 @@ class TestGraphTierAnonymizationContract:
     ):
         """Production-wiring confirmation: driving the same scenario through
         the REAL ``GraphTierRefiner.run_enrichment`` (only
-        ``_sota_call`` mocked; the local anonymizer stays on the module's
+        ``_cloud_call`` mocked; the local anonymizer stays on the module's
         default autouse stub, which masks non-speaker names as ``person``
         — speaker ids are never tokenised regardless, since the local
         anonymizer prompt forbids mapping ``speaker{N}`` in the first
         place) the two distinct speaker nodes are never contracted — the
-        speaker-pair guard fires against the ``same_as`` pair ``_graph_enrich_with_sota``
-        returns, even though the SOTA payload carried the BARE speaker ids
+        speaker-pair guard fires against the ``same_as`` pair ``request_graph_enrichment``
+        returns, even though the cloud payload carried the BARE speaker ids
         verbatim (never opaque tokens: there is nothing to de-anonymize
         here). This is defense-in-depth: the guard fires independently of
         whatever the anonymizer did or didn't mask.
@@ -4644,7 +4630,7 @@ class TestGraphTierAnonymizationContract:
 
         node_count_before = graph.number_of_nodes()
 
-        def _sota_response(prompt, *args, **kwargs):
+        def _cloud_response(prompt, *args, **kwargs):
             # speaker0/speaker1 are never in the local anonymizer's mapping
             # (excluded by construction — see chunk_mapping's is_speaker_id
             # filter), so they reach the payload bare, not as opaque
@@ -4657,7 +4643,7 @@ class TestGraphTierAnonymizationContract:
             return '{"relations": [], "same_as": [["speaker0", "speaker1"]]}'
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with patch("paramem.graph.extractor._sota_call", side_effect=_sota_response):
+        with patch("paramem.graph.extractor._cloud_call", side_effect=_cloud_response):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -4718,7 +4704,7 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
 
 
 def _stub_local_model_types(type_by_name: dict[str, str]):
-    """Build a stand-in for ``anonymize_with_local_model`` typing real names
+    """Build a stand-in for ``anonymize_transcript`` typing real names
     per ``type_by_name`` (default ``"person"`` for anything unlisted),
     minting ``Prefix_N`` tokens in sorted-name order — simulating what the
     LOCAL model's own anonymization pass would classify each real name as.
@@ -4730,12 +4716,15 @@ def _stub_local_model_types(type_by_name: dict[str, str]):
     check (a missing/empty transcript blocks the chunk) see a realistic
     non-empty value.
     """
-    from paramem.graph.placeholders import _substitute_whole_words, entity_type_to_prefix
+    from paramem.cloud.placeholders import _substitute_whole_words
+    from paramem.config.taxonomy import entity_type_to_prefix
 
-    def _stub(session_graph, model, tokenizer, transcript="", **kwargs):
+    def _stub(facts, model, tokenizer, transcript="", **kwargs):
+        # ``facts`` is a plain fact-dict list (interface narrowing,
+        # 2026-07-21) — never a ``SessionGraph`` — so names come off
+        # ``subject``/``object`` keys directly, not ``.relations``.
         names = sorted(
-            {r.subject for r in session_graph.relations}
-            | {r.object for r in session_graph.relations}
+            {str(f.get("subject", "")) for f in facts} | {str(f.get("object", "")) for f in facts}
         )
         mapping: dict[str, str] = {}
         counters: dict[str, int] = {}
@@ -4752,7 +4741,7 @@ def _stub_local_model_types(type_by_name: dict[str, str]):
 class TestGraphTierLocalModelTypeDerivation:
     """The cumulative fold graph carries no reliable entity types of its
     own (production reality — see
-    ``graph_enrich.run_graph_enrichment``'s docstring and ``GraphMerger``'s
+    ``graph_enrich.enrich_graph``'s docstring and ``GraphMerger``'s
     ``entity_type="concept"`` fallback for endpoints without a known
     Entity). These tests drive the REAL
     ``GraphTierRefiner.run_enrichment`` against a graph built with
@@ -4766,7 +4755,7 @@ class TestGraphTierLocalModelTypeDerivation:
 
     def test_graph_enrichment_masks_persons(self, tmp_path, monkeypatch):
         """A real name the LOCAL model classifies as a person must not reach
-        the payload handed to ``_sota_call`` verbatim, even though the fold
+        the payload handed to ``_cloud_call`` verbatim, even though the fold
         graph node itself carries no usable ``entity_type``.
 
         Mutation: revert ``GraphTierRefiner.run_enrichment`` to reading
@@ -4787,13 +4776,13 @@ class TestGraphTierLocalModelTypeDerivation:
         stub = _stub_local_model_types({"acmecorp": "organization"})
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.graph.cloud_egress.anonymize_with_local_model", side_effect=stub),
-            patch("paramem.graph.extractor._sota_call", side_effect=_capture),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=stub),
+            patch("paramem.graph.extractor._cloud_call", side_effect=_capture),
         ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert captured, "Expected the SOTA call to be made"
+        assert captured, "Expected the cloud call to be made"
         payload = captured[0]
         assert "person0" not in payload, f"Real name 'person0' leaked into payload: {payload}"
         assert "Person_" in payload, f"Expected person nodes tokenised as Person_N; got: {payload}"
@@ -4801,7 +4790,7 @@ class TestGraphTierLocalModelTypeDerivation:
     def test_graph_enrichment_leaves_out_of_scope_verbatim(self, tmp_path, monkeypatch):
         """A node the LOCAL model's own mapping OMITS (the model's scope
         decision against ``scrub``, e.g. an organization when only
-        ``person name`` is configured) must appear VERBATIM in the SOTA
+        ``person name`` is configured) must appear VERBATIM in the cloud
         payload — this is what preserves ``same_as`` for non-person
         entities. Post-redesign there is no code-side scope filter
         downstream of the model's mapping — omission from the mapping IS
@@ -4821,10 +4810,11 @@ class TestGraphTierLocalModelTypeDerivation:
             captured.append(prompt)
             return '{"relations": [], "same_as": []}'
 
-        def _stub_omits_acmecorp(session_graph, model, tokenizer, transcript="", **kwargs):
+        def _stub_omits_acmecorp(facts, model, tokenizer, transcript="", **kwargs):
+            # ``facts`` is a plain fact-dict list — never a ``SessionGraph``.
             names = sorted(
-                {r.subject for r in session_graph.relations}
-                | {r.object for r in session_graph.relations}
+                {str(f.get("subject", "")) for f in facts}
+                | {str(f.get("object", "")) for f in facts}
             )
             mapping = {
                 name: f"Person_{i + 1}"
@@ -4835,15 +4825,15 @@ class TestGraphTierLocalModelTypeDerivation:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 side_effect=_stub_omits_acmecorp,
             ),
-            patch("paramem.graph.extractor._sota_call", side_effect=_capture),
+            patch("paramem.graph.extractor._cloud_call", side_effect=_capture),
         ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert captured, "Expected the SOTA call to be made"
+        assert captured, "Expected the cloud call to be made"
         payload = captured[0]
         # Check the DATA (triples_json), not the prompt's static examples —
         # the template itself mentions "Org_1" as a generic illustration.
@@ -4855,7 +4845,7 @@ class TestGraphTierLocalModelTypeDerivation:
         )
 
     def test_graph_enrichment_round_trips(self, tmp_path, monkeypatch):
-        """A new relation SOTA returns (naming the LOCAL model's own tokens)
+        """A new relation cloud returns (naming the LOCAL model's own tokens)
         comes back on the merged graph with REAL node names — the
         production caller never sees a placeholder.
 
@@ -4869,7 +4859,7 @@ class TestGraphTierLocalModelTypeDerivation:
 
         stub = _stub_local_model_types({"acmecorp": "organization"})
 
-        def _sota_response(prompt, *args, **kwargs):
+        def _cloud_response(prompt, *args, **kwargs):
             # Reference the SAME Person_N tokens the local-model stub just
             # minted for person0/person1 (sorted-name order: person0 -> 1st).
             return (
@@ -4880,8 +4870,8 @@ class TestGraphTierLocalModelTypeDerivation:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.graph.cloud_egress.anonymize_with_local_model", side_effect=stub),
-            patch("paramem.graph.extractor._sota_call", side_effect=_sota_response),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=stub),
+            patch("paramem.graph.extractor._cloud_call", side_effect=_cloud_response),
         ):
             result = _refiner_for(loop).run_enrichment()
 
@@ -4901,14 +4891,14 @@ class TestGraphTierLocalModelTypeDerivation:
 class TestGraphTierMappingReconciliation:
     """The local anonymizer's mapping keys are reconciled onto the
     ACTUAL node-key surfaces via ``canonical()`` inside
-    ``graph_enrich.run_graph_enrichment`` itself; the shared
+    ``graph_enrich.enrich_graph`` itself; the shared
     ``_substitute_whole_words`` primitive stays exact-match everywhere (see
     ``tests/test_placeholders.py::TestSubstituteWholeWordsExactMatchRegression``
     for why it must). The fold graph's node keys are already canonicalized
     (``"yang ming"``), while the local model's mapping is keyed by
     whatever real-name surface it independently produced (``"Yang
     Ming"``) — a raw comparison between the two silently misses, so the
-    real name would reach the SOTA payload unmasked even though the model
+    real name would reach the cloud payload unmasked even though the model
     correctly identified it.
     """
 
@@ -4963,8 +4953,8 @@ class TestGraphTierMappingReconciliation:
         raw-string-match the graph's own node text ("yang ming").
 
         Mutation: remove the re-keying step in
-        ``graph_enrich.run_graph_enrichment`` -> the real node text
-        ("yang ming") reaches the SOTA payload verbatim -> this test fails.
+        ``graph_enrich.enrich_graph`` -> the real node text
+        ("yang ming") reaches the cloud payload verbatim -> this test fails.
         """
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
@@ -4977,15 +4967,15 @@ class TestGraphTierMappingReconciliation:
             return '{"relations": [], "same_as": []}'
 
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: ({"Yang Ming": "Person_1"}, "stub-anon-transcript", "stub-raw"),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
+        with patch("paramem.graph.extractor._cloud_call", side_effect=_capture):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert captured, "Expected the SOTA call to be made"
+        assert captured, "Expected the cloud call to be made"
         payload = captured[0]
         assert "yang ming" not in payload.lower(), f"Real name leaked into payload: {payload}"
         assert "Person_1" in payload, f"Expected the node masked as Person_1; got: {payload}"
@@ -5007,7 +4997,7 @@ class TestGraphTierMappingReconciliation:
         _populate_untyped_graph(graph, n_persons=10)
 
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: (
                 {"Someone Else": "Person_1"},
                 "stub-anon-transcript",
@@ -5016,14 +5006,14 @@ class TestGraphTierMappingReconciliation:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
         assert result["mapping_rekey_dropped"] >= 1
         # "Someone Else" names nothing in the chunk -- chunk_mapping ends
         # up empty, tripping the pre-existing empty-mapping fail-closed
-        # guard (leg 2), so no SOTA call fires at all.
+        # guard (leg 2), so no cloud call fires at all.
         call_spy.assert_not_called()
         assert result["privacy_skipped_chunks"] >= 1
 
@@ -5067,12 +5057,12 @@ class TestGraphTierMappingReconciliation:
             )
 
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             lambda *args, **kwargs: ({"Yang Ming": "Person_1"}, "stub-anon-transcript", "stub-raw"),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with patch("paramem.training.graph_enrich._graph_enrich_with_sota", call_spy):
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
@@ -5083,7 +5073,7 @@ class TestGraphTierMappingReconciliation:
 class TestGraphEnrichmentUsesSharedPrimitives:
     """Structural guard mirroring ``tests/test_extraction_pipeline_guard.py``:
     the graph-tier anonymization contract must route entirely through
-    ``paramem.graph.placeholders`` — no second mint/table-build/deanon
+    ``paramem.cloud.placeholders`` — no second mint/table-build/deanon
     implementation may appear in ``paramem/training/consolidation.py``.
     """
 
@@ -5094,7 +5084,6 @@ class TestGraphEnrichmentUsesSharedPrimitives:
             "_normalize_anonymization_mapping",
             "_resolution_map",
             "mint_placeholder",
-            "deanonymize_text",
             "_substitute_whole_words",
             "_declared_placeholder_tokens",
             "_contains_declared_token",
@@ -5103,8 +5092,9 @@ class TestGraphEnrichmentUsesSharedPrimitives:
 
     def test_no_duplicate_primitive_defined_in_consolidation(self):
         """``consolidation.py`` must not define a function sharing a name
-        with a ``placeholders.py`` primitive — that would be a duplicate
-        mint/table/deanon implementation living outside the shared module.
+        with a ``paramem.cloud.placeholders`` primitive — that would be a
+        duplicate mint/table/deanon implementation living outside the
+        shared module.
 
         Mutation: add a function named e.g. ``_apply_bindings`` (or any
         other name in the set below) inside ``paramem/training/
@@ -5125,15 +5115,15 @@ class TestGraphEnrichmentUsesSharedPrimitives:
         collision = defined_names & self._PLACEHOLDER_PRIMITIVE_NAMES
         assert not collision, (
             "paramem/training/consolidation.py defines a function sharing a "
-            f"name with a placeholders.py primitive: {sorted(collision)} — "
+            f"name with a paramem.cloud.placeholders primitive: {sorted(collision)} — "
             "this is a duplicate mint/table/deanon implementation. Route "
-            "through paramem.graph.placeholders instead."
+            "through paramem.cloud.placeholders instead."
         )
 
     def test_consolidation_does_not_reimplement_placeholder_shape_regex(self):
         """``consolidation.py`` must not hardcode its own placeholder-shape
         pattern (PascalCase_N) — that regex lives ONLY in
-        ``paramem/graph/placeholders.py``.
+        ``paramem/cloud/placeholders.py``.
         """
         from pathlib import Path
 
@@ -5142,7 +5132,7 @@ class TestGraphEnrichmentUsesSharedPrimitives:
         text = target.read_text()
         assert "A-Z][A-Za-z]*_" not in text, (
             "consolidation.py appears to hardcode the placeholder-shape "
-            "regex — this pattern must live only in paramem.graph.placeholders."
+            "regex — this pattern must live only in paramem.cloud.placeholders."
         )
 
     # -------------------------------------------------------------------
@@ -5151,27 +5141,43 @@ class TestGraphEnrichmentUsesSharedPrimitives:
     # they do not inspect calls or imports, and do not cover the rest of
     # paramem/.  This is new machinery: an import/call guard over every
     # tracked file under paramem/, asserting the anon/deanon primitives
-    # below are reachable ONLY through paramem/graph/cloud_egress.py (the
-    # one round-trip contract) or paramem/graph/placeholders.py itself
+    # below are reachable ONLY through the ``paramem/cloud/`` round-trip
+    # package — ``anonymize.py`` / ``deanonymize.py`` (the two composed
+    # halves of the one round-trip contract) or ``placeholders.py`` itself
     # (which legitimately calls invert_forward_mapping and
     # _resolution_map internally).
+    #
+    # ``insert_placeholders`` is deliberately NOT in this set (moved out
+    # when ``AnonymizedContract.anon_facts`` was removed as a stored
+    # field): it carries no privacy-guard logic of its own — no
+    # speaker-value guard, no totality gate, no observed scoping, just a
+    # mechanical substitution over the forward map — so, unlike the four
+    # primitives below, straying from the ``cloud/`` package does not
+    # bypass anything SAFETY-critical. Every production reader now
+    # derives the anonymized fact array on demand via
+    # ``insert_placeholders(<facts>, payload.forward)`` instead of
+    # reading a payload-native field: the ``enrich`` stage
+    # (``paramem/graph/stage_enrich.py``), ``request_graph_enrichment``
+    # (``paramem/graph/extractor.py``), and the ``/calibrate/anonymize``
+    # handler (``paramem/server/calibrate.py``, status-gated to ``[]`` on
+    # failure). Guarding it here would forbid the very design those three
+    # call sites implement.
     # -------------------------------------------------------------------
 
-    _CLOUD_EGRESS_ONLY_PRIMITIVES = frozenset(
+    _CLOUD_ROUNDTRIP_ONLY_PRIMITIVES = frozenset(
         {
             "_build_anonymization_mapping",
-            "_build_anon_facts",
             "_check_mapping_totality",
             "_apply_bindings",
-            "deanonymize_text",
             "_resolution_map",
         }
     )
 
-    _CLOUD_EGRESS_ALLOWED_FILES = frozenset(
+    _CLOUD_ROUNDTRIP_ALLOWED_FILES = frozenset(
         {
-            "paramem/graph/cloud_egress.py",
-            "paramem/graph/placeholders.py",
+            "paramem/cloud/anonymize.py",
+            "paramem/cloud/deanonymize.py",
+            "paramem/cloud/placeholders.py",
         }
     )
 
@@ -5182,14 +5188,14 @@ class TestGraphEnrichmentUsesSharedPrimitives:
 
         Two reach patterns are checked:
 
-        1. ``from paramem.graph.placeholders import <name>`` (direct
+        1. ``from paramem.cloud.placeholders import <name>`` (direct
            import — the structural signal that a caller is reaching for
            the primitive itself, regardless of whether it is then
            called).
         2. ``<module_alias>.<name>(...)`` — a module-qualified call (e.g.
            ``placeholders._apply_bindings(...)`` after
-           ``from paramem.graph import placeholders`` or
-           ``import paramem.graph.placeholders as placeholders``).
+           ``from paramem.cloud import placeholders`` or
+           ``import paramem.cloud.placeholders as placeholders``).
         """
         import ast
 
@@ -5204,30 +5210,31 @@ class TestGraphEnrichmentUsesSharedPrimitives:
         lines = text.splitlines()
         out: list[tuple[int, str, str]] = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "paramem.graph.placeholders":
+            if isinstance(node, ast.ImportFrom) and node.module == "paramem.cloud.placeholders":
                 for alias in node.names:
-                    if alias.name in cls._CLOUD_EGRESS_ONLY_PRIMITIVES:
+                    if alias.name in cls._CLOUD_ROUNDTRIP_ONLY_PRIMITIVES:
                         line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
                         out.append((node.lineno, line.strip(), alias.name))
             elif (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr in cls._CLOUD_EGRESS_ONLY_PRIMITIVES
+                and node.func.attr in cls._CLOUD_ROUNDTRIP_ONLY_PRIMITIVES
             ):
                 line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
                 out.append((node.lineno, line.strip(), node.func.attr))
         return out
 
-    def test_placeholders_primitives_reached_only_via_cloud_egress(self):
-        """Every one of the six primitives that make the anon/deanon
+    def test_placeholders_primitives_reached_only_via_cloud_roundtrip(self):
+        """Every one of the four primitives that make the anon/deanon
         contract SAFE (speaker-value guard, totality gate, observed
         scoping) is imported/called, within ``paramem/``, ONLY from
-        ``paramem/graph/cloud_egress.py`` — the one round-trip contract —
-        or from ``paramem/graph/placeholders.py`` itself.
+        ``paramem/cloud/anonymize.py`` / ``paramem/cloud/deanonymize.py``
+        (the one round-trip contract, split into its two composed halves)
+        — or from ``paramem/cloud/placeholders.py`` itself.
 
         Mutation: reintroduce a direct
-        ``from paramem.graph.placeholders import _apply_bindings`` (or
-        any of the other five names) in ``extractor.py`` /
+        ``from paramem.cloud.placeholders import _apply_bindings`` (or
+        any of the other three names) in ``extractor.py`` /
         ``consolidation.py`` / ``inference.py`` / any other
         ``paramem/`` module -> this test fails.
         """
@@ -5242,15 +5249,15 @@ class TestGraphEnrichmentUsesSharedPrimitives:
             rel = py_file.relative_to(repo_root).as_posix()
             if not rel.startswith("paramem/"):
                 continue
-            if rel in self._CLOUD_EGRESS_ALLOWED_FILES:
+            if rel in self._CLOUD_ROUNDTRIP_ALLOWED_FILES:
                 continue
             for lineno, src, name in self._find_guarded_primitive_sites(py_file):
                 offenders.append((rel, lineno, src, name))
 
         assert not offenders, (
-            "anon/deanon primitives reached outside paramem/graph/cloud_egress.py "
-            "(the structural guard that makes the speaker-value guard, totality "
-            "gate, and observed scoping unbypassable):\n"
+            "anon/deanon primitives reached outside paramem/cloud/{anonymize,"
+            "deanonymize}.py (the structural guard that makes the speaker-value "
+            "guard, totality gate, and observed scoping unbypassable):\n"
             + "\n".join(f"  {path}:{line} [{name}] — {src}" for path, line, src, name in offenders)
         )
 
@@ -5261,22 +5268,22 @@ class TestGraphEnrichmentFailureLoudness:
 
     Two swallows used to hide a malformed prompt template: an inner
     ``except KeyError`` around ``enrichment_prompt.format(...)`` in
-    ``_graph_enrich_with_sota``, and a broad ``except Exception`` around the
-    whole chunk body in ``graph_enrich.run_graph_enrichment``.  Together
+    ``request_graph_enrichment``, and a broad ``except Exception`` around the
+    whole chunk body in ``graph_enrich.enrich_graph``.  Together
     they turned a
-    missed brace-doubling in ``sota_graph_enrichment.txt`` into a permanent,
+    missed brace-doubling in ``cloud_graph_enrichment.txt`` into a permanent,
     SILENT outage of graph enrichment.  Both tests below are needed: each
     pins one half, so an inert half-fix is caught.
     """
 
     def test_graph_enrichment_prompt_format_error_propagates(self, tmp_path, monkeypatch):
         """A prompt template with an un-doubled literal brace raises
-        ``KeyError`` out of ``graph_enrich.run_graph_enrichment`` — it does
+        ``KeyError`` out of ``graph_enrich.enrich_graph`` — it does
         not silently disable enrichment.
 
         Mutation: re-add EITHER the inner ``except KeyError`` in
-        ``_graph_enrich_with_sota`` OR the broad ``except Exception`` in
-        ``graph_enrich.run_graph_enrichment`` -> the KeyError is swallowed
+        ``request_graph_enrichment`` OR the broad ``except Exception`` in
+        ``graph_enrich.enrich_graph`` -> the KeyError is swallowed
         and the fold "succeeds" with zero enrichment -> this test fails.
         """
         from paramem.graph.prompts import _load_prompt as _real_load_prompt
@@ -5285,7 +5292,7 @@ class TestGraphEnrichmentFailureLoudness:
         _populate_untyped_graph(loop.merger.graph)
 
         def _bad_prompt(filename, *args, **kwargs):
-            if filename == "sota_graph_enrichment.txt":
+            if filename == "cloud_graph_enrichment.txt":
                 # {oops} is a literal brace the author forgot to double.
                 return "Triples:\n{triples_json}\nSchema: {oops}"
             return _real_load_prompt(filename, *args, **kwargs)
@@ -5293,10 +5300,10 @@ class TestGraphEnrichmentFailureLoudness:
         stub = _stub_local_model_types({})
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.graph.cloud_egress.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=stub),
             patch("paramem.graph.extractor._load_prompt", side_effect=_bad_prompt),
             patch(
-                "paramem.graph.extractor._sota_call",
+                "paramem.graph.extractor._cloud_call",
                 side_effect=AssertionError("the cloud must never be called with a broken prompt"),
             ),
             pytest.raises(KeyError, match="oops"),
@@ -5322,16 +5329,16 @@ class TestGraphEnrichmentFailureLoudness:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
-            patch("paramem.graph.cloud_egress.anonymize_with_local_model", side_effect=_boom),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_boom),
             patch(
-                "paramem.graph.extractor._sota_call",
+                "paramem.graph.extractor._cloud_call",
                 side_effect=AssertionError("the cloud must not be called for a failed chunk"),
             ),
         ):
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert result["chunks"] == 0, "no SOTA call may be made for a chunk that failed locally"
+        assert result["chunks"] == 0, "no cloud call may be made for a chunk that failed locally"
         assert result["new_edges"] == 0
 
     def test_graph_tier_gates_on_mapping_not_facts(self, tmp_path, monkeypatch):
@@ -5351,11 +5358,11 @@ class TestGraphEnrichmentFailureLoudness:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 side_effect=_parse_failure,
             ),
             patch(
-                "paramem.graph.extractor._sota_call",
+                "paramem.graph.extractor._cloud_call",
                 side_effect=AssertionError(
                     "the cloud must not be called for a chunk with no local mapping"
                 ),
@@ -5364,5 +5371,5 @@ class TestGraphEnrichmentFailureLoudness:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        assert result["chunks"] == 0, "no SOTA call may be made when the mapping is None"
+        assert result["chunks"] == 0, "no cloud call may be made when the mapping is None"
         assert result["new_edges"] == 0

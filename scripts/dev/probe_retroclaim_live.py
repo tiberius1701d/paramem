@@ -246,11 +246,11 @@ def run_gpu_phases(out_dir: Path) -> dict:
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
-        extraction_noise_filter="off",
+        extraction_enrichment_provider="off",
         extraction_plausibility_judge="off",
         # Same 5-category default the server config ships
         # (SanitizationConfig.scrub) — no cloud egress happens in this
-        # probe (noise_filter="off"), but ConsolidationLoop's
+        # probe (enrichment_provider="off"), but ConsolidationLoop's
         # ExtractionPipeline requires a scrub value regardless.
         extraction_scrub=set(SanitizationConfig().scrub),
     )

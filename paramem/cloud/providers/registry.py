@@ -2,9 +2,8 @@
 
 import logging
 
-from paramem.server.cloud.base import CloudAgent
-from paramem.server.cloud.openai_compat import COMPATIBLE_PROVIDERS, OpenAICompatAgent
-from paramem.server.config import CloudAgentConfig
+from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig
+from paramem.cloud.providers.openai_compat import COMPATIBLE_PROVIDERS, OpenAICompatAgent
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,7 @@ def get_cloud_agent(config: CloudAgentConfig) -> CloudAgent | None:
 
     if provider == "anthropic":
         try:
-            from paramem.server.cloud.anthropic_adapter import AnthropicAgent
+            from paramem.cloud.providers.anthropic_adapter import AnthropicAgent
         except ImportError:
             logger.error(
                 "Anthropic provider requires the anthropic SDK. "
@@ -50,7 +49,7 @@ def get_cloud_agent(config: CloudAgentConfig) -> CloudAgent | None:
 
     if provider == "google":
         try:
-            from paramem.server.cloud.google_adapter import GoogleAgent
+            from paramem.cloud.providers.google_adapter import GoogleAgent
         except ImportError:
             logger.error(
                 "Google provider requires the google-genai SDK. "

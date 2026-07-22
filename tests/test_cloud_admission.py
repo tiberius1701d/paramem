@@ -1,6 +1,6 @@
 """Unit tests for the shared cloud-egress admission component.
 
-:func:`~paramem.utils.cloud_admission.evaluate_cloud_egress` is the ONLY
+:func:`~paramem.cloud.admission.evaluate_cloud_egress` is the ONLY
 place the "may we reach a cloud LLM, and with what credentials?" decision
 is computed, so its term-by-term behaviour is pinned here: each single
 unmet term, several simultaneously, the OpenAI-compatible endpoint rule,
@@ -10,7 +10,7 @@ must never reach a key lookup.
 
 import pytest
 
-from paramem.utils.cloud_admission import (
+from paramem.cloud.admission import (
     OPENAI_COMPAT_ENDPOINTS,
     OPENAI_COMPAT_PROVIDERS,
     PROVIDER_KEY_ENV,
@@ -54,7 +54,7 @@ class TestPermitted:
     def test_native_sdk_provider(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True,
+            cloud_enabled=True,
             provider="anthropic",
             model="claude-sonnet-4-6",
             endpoint=None,
@@ -72,7 +72,7 @@ class TestPermitted:
     def test_verdict_is_frozen(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="anthropic", model="m", endpoint=None
+            cloud_enabled=True, provider="anthropic", model="m", endpoint=None
         )
         with pytest.raises(AttributeError):
             verdict.permitted = False
@@ -84,30 +84,30 @@ class TestSingleMissingTerm:
     def test_master_switch_off(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
         verdict = evaluate_cloud_egress(
-            sota_enabled=False, provider="anthropic", model="m", endpoint=None
+            cloud_enabled=False, provider="anthropic", model="m", endpoint=None
         )
         assert verdict.permitted is False
-        assert verdict.gaps == ("sota_enabled is off",)
+        assert verdict.gaps == ("cloud_enabled is off",)
         # A refused verdict never hands back a usable credential.
         assert verdict.api_key == ""
 
     def test_no_provider(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-        verdict = evaluate_cloud_egress(sota_enabled=True, provider="", model="m", endpoint=None)
+        verdict = evaluate_cloud_egress(cloud_enabled=True, provider="", model="m", endpoint=None)
         assert verdict.permitted is False
         assert verdict.gaps == ("no cloud provider configured",)
 
     def test_no_model(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="anthropic", model="", endpoint=None
+            cloud_enabled=True, provider="anthropic", model="", endpoint=None
         )
         assert verdict.permitted is False
         assert verdict.gaps == ("no model configured for provider 'anthropic'",)
 
     def test_no_api_key(self):
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="anthropic", model="m", endpoint=None
+            cloud_enabled=True, provider="anthropic", model="m", endpoint=None
         )
         assert verdict.permitted is False
         assert verdict.gaps == ("ANTHROPIC_API_KEY env var is unset",)
@@ -116,7 +116,7 @@ class TestSingleMissingTerm:
     def test_missing_endpoint_for_self_hosted_openai_compat(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_API_KEY", "local-key")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="ollama", model="llama3", endpoint=None
+            cloud_enabled=True, provider="ollama", model="llama3", endpoint=None
         )
         assert verdict.permitted is False
         assert verdict.gaps == ("no endpoint for provider 'ollama'",)
@@ -127,17 +127,17 @@ class TestMultipleGaps:
     collect-all behaviour is that one log line ends the fix-one-rerun loop."""
 
     def test_switch_provider_and_model_all_reported(self):
-        verdict = evaluate_cloud_egress(sota_enabled=False, provider="", model="", endpoint=None)
+        verdict = evaluate_cloud_egress(cloud_enabled=False, provider="", model="", endpoint=None)
         assert verdict.permitted is False
         assert verdict.gaps == (
-            "sota_enabled is off",
+            "cloud_enabled is off",
             "no cloud provider configured",
             "no model configured for provider ''",
         )
 
     def test_key_and_endpoint_both_reported(self):
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="ollama", model="llama3", endpoint=None
+            cloud_enabled=True, provider="ollama", model="llama3", endpoint=None
         )
         assert verdict.permitted is False
         assert verdict.gaps == (
@@ -152,7 +152,7 @@ class TestOpenAICompatEndpoint:
     def test_provider_default_endpoint_is_enough(self, monkeypatch):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="groq", model="llama-3.3-70b", endpoint=None
+            cloud_enabled=True, provider="groq", model="llama-3.3-70b", endpoint=None
         )
         assert verdict.permitted is True
         assert verdict.endpoint == OPENAI_COMPAT_ENDPOINTS["groq"]
@@ -160,7 +160,7 @@ class TestOpenAICompatEndpoint:
     def test_explicit_endpoint_wins_over_default(self, monkeypatch):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True,
+            cloud_enabled=True,
             provider="groq",
             model="llama-3.3-70b",
             endpoint="http://127.0.0.1:9000/v1/chat/completions",
@@ -171,7 +171,7 @@ class TestOpenAICompatEndpoint:
     def test_explicit_endpoint_satisfies_self_hosted_provider(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_API_KEY", "local-key")
         verdict = evaluate_cloud_egress(
-            sota_enabled=True,
+            cloud_enabled=True,
             provider="ollama",
             model="llama3",
             endpoint="http://127.0.0.1:11434/v1/chat/completions",
@@ -189,7 +189,7 @@ class TestUnregisteredProvider:
 
     def test_unknown_provider_refused(self):
         verdict = evaluate_cloud_egress(
-            sota_enabled=True, provider="deepmind", model="m", endpoint=None
+            cloud_enabled=True, provider="deepmind", model="m", endpoint=None
         )
         assert verdict.permitted is False
         assert verdict.gaps == ("unsupported provider 'deepmind'",)
@@ -204,7 +204,7 @@ class TestUnregisteredProvider:
         ``PROVIDER_KEY_ENV.get("auto")``; membership in the registry is what
         prevents it, so assert both the refusal and that no env read happened."""
         reads: list[str] = []
-        import paramem.utils.cloud_admission as mod
+        import paramem.cloud.admission as mod
 
         real_environ_get = mod.os.environ.get
 
@@ -213,7 +213,9 @@ class TestUnregisteredProvider:
             return real_environ_get(name, default)
 
         monkeypatch.setattr(mod.os.environ, "get", _spy)
-        verdict = evaluate_cloud_egress(sota_enabled=True, provider=token, model="m", endpoint=None)
+        verdict = evaluate_cloud_egress(
+            cloud_enabled=True, provider=token, model="m", endpoint=None
+        )
         assert verdict.permitted is False
         assert verdict.gaps == (f"unsupported provider {token!r}",)
         assert reads == []

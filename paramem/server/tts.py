@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from paramem.server.config import DEFAULT_DATA_DIR, TTSConfig, TTSVoiceConfig
-from paramem.server.vram_guard import safe_empty_cache
+from paramem.utils.vram_guard import safe_empty_cache
 
 logger = logging.getLogger(__name__)
 

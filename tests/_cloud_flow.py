@@ -3,11 +3,11 @@
 Why this exists
 ---------------
 
-The ``sota_pipeline`` composite, ``deanonymize`` and ``rebuild`` are three
-sibling stages of ``paramem.graph.extractor.SESSION_EXTRACT``. Tests that
+``anonymize``, ``enrich``, ``deanonymize`` and ``rebuild`` are four
+sibling stages of ``paramem.graph.flows.SESSION_EXTRACT``. Tests that
 want to observe the arc end-to-end (relations out, diagnostics recorded)
-must therefore walk the flow, not call one function — the composite alone
-stops at the hand-over.
+must therefore walk the flow, not call one function — ``anonymize``/
+``enrich`` alone stop at the hand-over.
 
 This module contains no pipeline logic: it is the ARRANGE step those tests
 need — build the run-constant :class:`~paramem.graph.flow.StageContext`,
@@ -22,19 +22,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from paramem.graph.cloud_egress import _DEFAULT_FILTER_MAX_TOKENS
-from paramem.graph.extractor import SESSION_EXTRACT
+from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
+from paramem.graph.flows import SESSION_EXTRACT
 from paramem.graph.schema import SessionGraph
 
-#: The stages downstream of local extraction: the ``sota_pipeline``
-#: composite and its two siblings. Sliced off the production list by
-#: stage name so a reordering or a new stage cannot silently desync this
+#: The stages downstream of local extraction: the ``anonymize``/``enrich``
+#: pair and their two siblings. Sliced off the production list by stage
+#: name so a reordering or a new stage cannot silently desync this
 #: harness from the flow it is supposed to drive.
-_ARC_STAGE_NAMES = ("sota_pipeline", "deanonymize", "rebuild")
+_ARC_STAGE_NAMES = ("anonymize", "enrich", "deanonymize", "rebuild")
 
 
-def sota_arc_specs() -> list[StageSpec]:
+def cloud_arc_specs() -> list[StageSpec]:
     """The ``SESSION_EXTRACT`` specs this harness walks, in flow order."""
     specs = [s for s in SESSION_EXTRACT if s.stage in _ARC_STAGE_NAMES]
     assert [s.stage for s in specs] == list(_ARC_STAGE_NAMES), (
@@ -44,7 +44,7 @@ def sota_arc_specs() -> list[StageSpec]:
     return specs
 
 
-def run_sota_stages(
+def run_cloud_stages(
     graph: SessionGraph,
     transcript: str,
     model,
@@ -60,18 +60,18 @@ def run_sota_stages(
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     model_alias: str | None = None,
-    noise_filter: str = "anthropic",
-    noise_filter_model: str = "claude-sonnet-4-6",
-    noise_filter_endpoint: str | None = None,
+    enrichment_provider: str = "anthropic",
+    enrichment_provider_model: str = "claude-sonnet-4-6",
+    enrichment_provider_endpoint: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     seed: int | None = None,
 ) -> SessionGraph:
     """Walk the cloud arc over ``graph`` and return the resulting graph.
 
-    ``validate``/``sota_enabled`` are pinned on so the composite's
-    ``enabled_when`` admits the arc — every caller of this harness is by
-    definition testing the arc.
+    ``validate``/``cloud_enabled`` are pinned on so the ``anonymize``/
+    ``enrich`` stages' shared ``enabled_when`` admits the arc — every
+    caller of this harness is by definition testing the arc.
 
     Args:
         graph: Seed graph, standing in for local extraction's output.
@@ -103,10 +103,10 @@ def run_sota_stages(
         timestamp=graph.timestamp,
         source_type="transcript",
         validate=True,
-        sota_enabled=True,
-        noise_filter=noise_filter,
-        noise_filter_model=noise_filter_model,
-        noise_filter_endpoint=noise_filter_endpoint,
+        cloud_enabled=True,
+        enrichment_provider=enrichment_provider,
+        enrichment_provider_model=enrichment_provider_model,
+        enrichment_provider_endpoint=enrichment_provider_endpoint,
         plausibility_judge=plausibility_judge,
         plausibility_stage=plausibility_stage,
         plausibility_model=plausibility_model,
@@ -114,4 +114,4 @@ def run_sota_stages(
         scrub=scrub,
         correction_entity_types=correction_entity_types,
     )
-    return run_flow(sota_arc_specs(), ctx, StageState(graph=graph)).graph
+    return run_flow(cloud_arc_specs(), ctx, StageState(graph=graph)).graph

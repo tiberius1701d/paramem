@@ -2,35 +2,36 @@
 
 Pure post-processing: no model, no tokenizer, no cloud, no config. Every
 test here is a total function of its inputs — which is exactly why this
-logic was extracted out of the middle of ``_sota_pipeline``, where
-reaching it required standing up the whole anonymize → enrich → judge
-chain first.
+logic was extracted out of the middle of what used to be
+``extractor._cloud_pipeline``, where reaching it required standing up the
+whole anonymize → enrich → judge chain first.
 
 Covers:
 - schema-validation drop recording (kept vs. dropped, and the record shape)
 - entity typing derived from a placeholder prefix, plus the pruning and
   the inverted-resolution lookup that feeds it
 - the scalar partition / projection round trip
-- the recovery gate's decision AND its cause classification, including
-  the ``routing`` kind that suppresses it
+- the recovery gate's decision, including the ``routing`` kind that
+  suppresses it
+
+The ``CAUSE_*`` vocabulary's own classification tests
+(``cause_kind``/``EMPTY_CAUSE_KIND``) live in ``test_empty_cause.py`` now
+that the vocabulary itself lives in ``paramem.graph.empty_cause``.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from paramem.graph.relation_build import (
-    CAUSE_ANON_JUDGE,
-    CAUSE_CLOUD_EMPTY,
+from paramem.graph.empty_cause import (
     CAUSE_DEANON_JUDGE,
-    CAUSE_DEANON_SUBSTITUTION,
     CAUSE_SCALAR_PARTITION,
     CAUSE_SCHEMA_VALIDATION,
     CAUSE_UNATTRIBUTED,
-    EMPTY_CAUSE_KIND,
+)
+from paramem.graph.relation_build import (
     apply_rebuild,
     build_relations,
-    cause_kind,
     is_scalar_value,
     partition_scalar_facts,
     project_scalar_facts_to_attributes,
@@ -291,34 +292,3 @@ class TestRecoveryGate:
             "cause": CAUSE_UNATTRIBUTED,
             "kind": CAUSE_UNATTRIBUTED,
         }
-
-
-class TestCauseClassification:
-    @pytest.mark.parametrize(
-        "cause,kind",
-        [
-            (CAUSE_CLOUD_EMPTY, "judgment"),
-            (CAUSE_ANON_JUDGE, "judgment"),
-            (CAUSE_DEANON_JUDGE, "judgment"),
-            (CAUSE_DEANON_SUBSTITUTION, "breakage"),
-            (CAUSE_SCHEMA_VALIDATION, "breakage"),
-            (CAUSE_SCALAR_PARTITION, "routing"),
-        ],
-    )
-    def test_each_site_is_classified(self, cause, kind):
-        assert cause_kind(cause) == kind
-
-    def test_every_constant_is_in_the_table(self):
-        assert set(EMPTY_CAUSE_KIND) == {
-            CAUSE_CLOUD_EMPTY,
-            CAUSE_ANON_JUDGE,
-            CAUSE_DEANON_SUBSTITUTION,
-            CAUSE_DEANON_JUDGE,
-            CAUSE_SCHEMA_VALIDATION,
-            CAUSE_SCALAR_PARTITION,
-        }
-        assert set(EMPTY_CAUSE_KIND.values()) == {"judgment", "breakage", "routing"}
-
-    def test_unknown_and_none_are_unattributed(self):
-        assert cause_kind(None) == CAUSE_UNATTRIBUTED
-        assert cause_kind("something_else") == CAUSE_UNATTRIBUTED

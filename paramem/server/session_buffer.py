@@ -1232,7 +1232,7 @@ class SessionBuffer:
         here.  ``speaker_id`` continues to track per-turn for downstream
         provenance.
 
-        Second caller: ``extract_and_anonymize_for_cloud`` (cloud-egress
+        Second caller: ``anonymize_turn`` (cloud-egress
         chat escalation, ``paramem/graph/extractor.py``) calls this with a
         single synthetic ``{"role": "user", "text": <bare chat text>}``
         turn to put the model-facing copy of a bare chat sentence back

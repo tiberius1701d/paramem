@@ -379,7 +379,7 @@ class TestIntentTierSelection:
 
     * PERSONAL → procedural → newest interim first → episodic → semantic
     * COMMAND  → procedural only (preferences for HA injection)
-    * GENERAL  → no steps (route to SOTA without personal injection)
+    * GENERAL  → no steps (route to cloud without personal injection)
     * UNKNOWN  → resolved via IntentConfig.fail_closed_intent (default PERSONAL)
     """
 

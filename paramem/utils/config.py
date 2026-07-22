@@ -141,10 +141,11 @@ class ConsolidationConfig:
     promotion_threshold: int = 3
     decay_window: int = 10
     indexed_key_replay: bool = True
-    # Ship-safe posture: base defaults OFF (no SOTA, no refinement). Operator
+    # Ship-safe posture: base defaults OFF (no cloud, no refinement). Operator
     # YAMLs (fixture/local) opt in explicitly.
-    sota_enabled: bool = False  # master gate for ALL SOTA (transcript pipeline + graph enrichment)
-    # graph-stage GraphTierRefiner.run_enrichment (SOTA-only). off|on
+    # master gate for ALL cloud egress (transcript pipeline + graph enrichment)
+    cloud_enabled: bool = False
+    # graph-stage GraphTierRefiner.run_enrichment (cloud-only). off|on
     refinement_enrichment: str = "off"
     refinement_normalization: str = "on"  # full-fold predicate-synonym collapse. off|on
     # Whether the merger resolves same-predicate/different-object cardinality

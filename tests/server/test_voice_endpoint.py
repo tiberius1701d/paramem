@@ -154,7 +154,7 @@ def _make_state(
         "tokenizer": MagicMock(),
         "router": MagicMock(),
         "memory_store": MagicMock(),
-        "sota_agent": None,
+        "cloud_agent": None,
         "ha_client": None,
         "background_trainer": None,
         "consolidation_loop": None,

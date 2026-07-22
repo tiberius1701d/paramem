@@ -4,15 +4,15 @@ Dispatch is on ``RoutingPlan.intent`` populated by the router:
 
 1. ``PERSONAL`` → local adapter probe + base-model reasoning
    (``_probe_and_reason``); if the local model emits ``[ESCALATE]``,
-   the forwarded query flows through HA → SOTA per
+   the forwarded query flows through HA → cloud per
    :func:`_handle_escalation`.
 2. ``COMMAND`` → HA conversation agent first (verbatim sanitized
-   query), SOTA fallback only when HA is unreachable.
-3. ``GENERAL`` → HA first, SOTA fallback.
+   query), cloud fallback only when HA is unreachable.
+3. ``GENERAL`` → HA first, cloud fallback.
 4. ``UNKNOWN`` (intent could not be established — no classifier
    config, no encoder/exemplars loaded, below-margin confidence) is
    treated as personal at the ``is_personal`` gate below (fail
-   closed): SOTA is never reached.  HA stays reachable as a tool
+   closed): Cloud is never reached.  HA stays reachable as a tool
    fallback.  Tier selection resolves ``UNKNOWN`` separately per
    :class:`IntentConfig.fail_closed_intent` (router-side); this gate
    controls only the cloud-escalation boundary.
@@ -21,21 +21,21 @@ Speaker scoping (``RoutingPlan.steps``) is the privacy boundary — only
 the resolved speaker's keys can populate ``keys_to_probe``.  The
 sanitizer (``sanitize_for_cloud``) runs before every escalation
 candidate; on ``mode=block`` a personal-content finding suppresses both
-HA and SOTA.
+HA and cloud.
 
-Fallback chain at every escalation point: HA → SOTA → local base model
+Fallback chain at every escalation point: HA → cloud → local base model
 (``_base_model_answer``).  ``_escalate_to_ha_agent`` is HA-only;
-callers own the SOTA fallback.
+callers own the cloud fallback.
 """
 
 import json
 import logging
 from dataclasses import dataclass, field
 
+from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
 from paramem.graph.prompts import _load_speaker_directive_section
 from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
-from paramem.server.cloud.base import CloudAgent
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
 from paramem.server.router import Intent, RoutingPlan
@@ -77,7 +77,7 @@ def _build_speaker_prefix(
     """Assemble the speaker + language prefix for a system prompt.
 
     This is the single shared implementation for the "You are speaking with X"
-    + language instruction block used by both local inference and SOTA
+    + language instruction block used by both local inference and cloud
     escalation paths.
 
     Speaker-id-to-name resolution at inference time is handled by the
@@ -116,7 +116,7 @@ def _personalize_prompt(
     """Inject speaker name and language instruction into the system prompt.
 
     Uses :func:`_build_speaker_prefix` to assemble the prefix so that the
-    local-inference and SOTA-escalation paths share exactly one implementation.
+    local-inference and cloud-escalation paths share exactly one implementation.
 
     Speaker-id-to-name resolution is handled at the fact-render boundary via
     the ``speaker_resolver`` in :func:`MemoryStore.probe` — not by a prompt
@@ -207,7 +207,7 @@ def handle_chat(
     tokenizer,
     config: ServerConfig,
     router=None,
-    sota_agent: CloudAgent | None = None,
+    cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker_id: str | None = None,
     language: str | None = None,
@@ -223,14 +223,14 @@ def handle_chat(
 
     * ``PERSONAL`` → local PA probe + reason.  HA is reachable from the
       local model via ``[ESCALATE]`` and from the no-layers branch as a
-      tool fallback.  **SOTA is never reached** — personal-class queries
+      tool fallback.  **cloud is never reached** — personal-class queries
       stay off the cloud (privacy invariant, threaded as ``is_personal``
       through the call tree).
-    * ``COMMAND`` / ``GENERAL`` → HA first (tools, live state), SOTA
+    * ``COMMAND`` / ``GENERAL`` → HA first (tools, live state), cloud
       fallback (reasoning).
     * ``UNKNOWN`` — intent could not be established; ``is_personal``
       treats it the same as ``PERSONAL`` (fail closed), so it never
-      reaches SOTA even when the routing plan carries no probe steps.
+      reaches cloud even when the routing plan carries no probe steps.
 
     The ``is_residual`` diagnostic tracks "did any graph signal fire?"
     for the routing-quality metric independent of the intent decision —
@@ -345,7 +345,7 @@ def handle_chat(
             # caller.  Interrogative form → canned abstention (avoids
             # leaking the existence of indexed facts via an answer).
             # Declarative form → demote to non-personal so the turn flows
-            # to the General/Unknown HA → SOTA path with cloud-side
+            # to the General/Unknown HA → cloud path with cloud-side
             # sanitization, instead of consulting the local store.  Pairs
             # with the sanitizer paraphrase pass (Task #13) to keep
             # CV-derived topics off the personal arm for anonymous callers.
@@ -370,8 +370,8 @@ def handle_chat(
                 # personal store; relay via the standard escalation chain.
                 is_personal = False
 
-            # PERSONAL → local PA probe + reason.  No SOTA anywhere on this
-            # path: is_personal=True suppresses every internal _escalate_to_sota
+            # PERSONAL → local PA probe + reason.  No cloud anywhere on this
+            # path: is_personal=True suppresses every internal _escalate_to_cloud
             # call (no-layers branch, post-reason [ESCALATE], base-model
             # fallthrough).  HA stays reachable as a tool fallback.
             if is_personal and plan is not None and plan.steps:
@@ -379,7 +379,7 @@ def handle_chat(
                 routing_diags["exit_via"] = "personal_probe"
                 # T2c: pre-task GPU cooldown gate — wait until GPU is cool before
                 # the local-PA probe + reason burst.  Placed here (after routing
-                # has committed to the local PA path) so HA/SOTA-routed requests
+                # has committed to the local PA path) so HA/cloud-routed requests
                 # never wait.  Bounded by cooldown_gate_max_wait_inference_s
                 # (default 30 s) — the caller proceeds with a WARNING on timeout.
                 _wait_for_cooldown(
@@ -395,7 +395,7 @@ def handle_chat(
                     model,
                     tokenizer,
                     config,
-                    sota_agent=sota_agent,
+                    cloud_agent=cloud_agent,
                     ha_client=ha_client,
                     speaker=speaker,
                     speaker_id=speaker_id,
@@ -409,8 +409,8 @@ def handle_chat(
                 )
 
             # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
-            # steps path) → HA first, SOTA fallback.  is_personal still gates
-            # SOTA so a defensive PERSONAL request never reaches the cloud.
+            # steps path) → HA first, cloud fallback.  is_personal still gates
+            # cloud so a defensive PERSONAL request never reaches the cloud.
             intent_label = intent.value
             if sanitized_text is not None:
                 routing_diags["paths_attempted"].append(intent_label)
@@ -419,9 +419,9 @@ def handle_chat(
                 if result is not None:
                     routing_diags["exit_via"] = f"{intent_label}_ha"
                     return result
-                sota_result = _escalate_via_cloud_policy(
+                cloud_result = answer_via_cloud(
                     sanitized_text,
-                    sota_agent,
+                    cloud_agent,
                     config,
                     is_personal=is_personal,
                     model=model,
@@ -432,10 +432,10 @@ def handle_chat(
                     language=language,
                     known_entities=known_entities,
                 )
-                if sota_result is not None:
-                    routing_diags["exit_via"] = f"{intent_label}_sota"
-                    logger.info("HA failed, routing to SOTA agent")
-                    return sota_result
+                if cloud_result is not None:
+                    routing_diags["exit_via"] = f"{intent_label}_cloud"
+                    logger.info("HA failed, routing to cloud agent")
+                    return cloud_result
             else:
                 routing_diags["fallthrough_reason"] = "sanitizer_blocked"
                 logger.info("Sanitizer blocked query: %s", sanitization_findings)
@@ -451,7 +451,7 @@ def handle_chat(
             #
             # Scoped to the sanitizer-blocked path here: when the sanitizer
             # allowed the query, escalation has already been attempted above
-            # (HA → SOTA fallback) and either succeeded or failed for non-
+            # (HA → cloud fallback) and either succeeded or failed for non-
             # privacy reasons; only the sanitizer-blocked path falls through
             # without trying anything.  The companion call site inside
             # ``_probe_and_reason`` covers the parallel case where probes
@@ -483,7 +483,7 @@ def handle_chat(
                 model,
                 tokenizer,
                 config,
-                sota_agent=sota_agent,
+                cloud_agent=cloud_agent,
                 ha_client=ha_client,
                 speaker=speaker,
                 speaker_id=speaker_id,
@@ -513,7 +513,7 @@ def _escalate_to_ha_agent(
     """Forward to the HA conversation agent.
 
     Returns None if HA is unavailable or the request fails. Callers own
-    the SOTA fallback — this function is HA-only.
+    the cloud fallback — this function is HA-only.
     """
     if ha_client is None:
         logger.debug("HA escalation skipped — ha_client not configured")
@@ -531,7 +531,7 @@ def _escalate_to_ha_agent(
     return None
 
 
-SOTA_PROMPT = (
+CLOUD_PROMPT = (
     "You are continuing a conversation as a personal assistant. "
     "Derive your persona, tone, and conversational style from the "
     "preceding conversation. Answer clearly and concisely in 1-3 spoken "
@@ -556,7 +556,7 @@ def _sanitize_history(
             (``"block"`` / ``"anonymize"`` / ``"both"``) — a different
             config field entirely; see :func:`~paramem.server.sanitizer.
             sanitize_for_cloud`.  Under an anonymizing ``cloud_mode``
-            (see :func:`_escalate_via_cloud_policy`), the caller passes
+            (see :func:`answer_via_cloud`), the caller passes
             ``mode="block"`` unconditionally regardless of
             ``sanitization.mode`` — a personal-content history turn is
             always dropped, never merely warned-and-passed, when the
@@ -589,9 +589,9 @@ def _sanitize_history(
     return sanitized
 
 
-def _escalate_via_cloud_policy(
+def answer_via_cloud(
     text: str,
-    sota_agent: CloudAgent | None,
+    cloud_agent: CloudAgent | None,
     config: ServerConfig,
     *,
     is_personal: bool,
@@ -603,9 +603,9 @@ def _escalate_via_cloud_policy(
     language: str | None = None,
     known_entities: set[str] | None = None,
 ) -> ChatResult | None:
-    """Apply the configured cloud-egress policy and call SOTA accordingly.
+    """Apply the configured cloud-egress policy and call cloud accordingly.
 
-    Returns the SOTA result on success, or ``None`` when policy or per-query
+    Returns the cloud result on success, or ``None`` when policy or per-query
     safety blocks the call (caller falls through to the next mechanism in the
     escalation chain — typically the base model or abstention).
 
@@ -614,9 +614,9 @@ def _escalate_via_cloud_policy(
     +-------------+----------------------+----------------------+
     | mode        | PERSONAL query       | non-PERSONAL query   |
     +=============+======================+======================+
-    | ``block``   | None (blocked)       | SOTA verbatim        |
-    | ``anonymize`` | anon → SOTA → deanon | anon → SOTA → deanon |
-    | ``both``    | None (blocked)       | anon → SOTA → deanon |
+    | ``block``   | None (blocked)       | cloud verbatim        |
+    | ``anonymize`` | anon → cloud → deanon | anon → cloud → deanon |
+    | ``both``    | None (blocked)       | anon → cloud → deanon |
     +-------------+----------------------+----------------------+
 
     Per-query safety: when an anonymizing path is selected and the local
@@ -629,7 +629,7 @@ def _escalate_via_cloud_policy(
     anonymization; they're ignored in ``block`` mode.  Passing ``None``
     in an anonymizing mode is treated as a per-query block.
     """
-    if sota_agent is None:
+    if cloud_agent is None:
         return None
 
     cloud_mode = config.sanitization.cloud_mode
@@ -652,13 +652,13 @@ def _escalate_via_cloud_policy(
                 "cloud_mode=%s requires model/tokenizer for anonymization; blocking", cloud_mode
             )
             return None
-        from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
-        from paramem.graph.extractor import extract_and_anonymize_for_cloud
-        from paramem.graph.placeholders import _substitute_whole_words
+        from paramem.cloud.deanonymize import CloudScope, deanonymize_text
+        from paramem.cloud.placeholders import _substitute_whole_words
+        from paramem.graph.flows import anonymize_turn
 
         # Anonymize ONLY the current-turn text — the model-facing
         # anonymized transcript comes back on ``payload.anon_transcript``.
-        payload = extract_and_anonymize_for_cloud(
+        payload = anonymize_turn(
             text,
             model,
             tokenizer,
@@ -698,9 +698,9 @@ def _escalate_via_cloud_policy(
             for turn in drop_gated_history
         ]
 
-        result = _escalate_to_sota(
+        result = _escalate_to_cloud(
             payload.anon_transcript,
-            sota_agent,
+            cloud_agent,
             config,
             speaker=speaker,
             sanitized_history=sanitized_history,
@@ -708,12 +708,10 @@ def _escalate_via_cloud_policy(
         )
         # ``sent`` is the current-turn text only at this step — history
         # turns are anonymized via ``payload.forward`` above, not via a
-        # SOTA round trip, so they carry no NEW placeholder tokens to
+        # cloud round trip, so they carry no NEW placeholder tokens to
         # scope; a scoped-observed deanon of the cloud's response.
-        scope = CloudScope.for_response(
-            payload, sota_bindings=None, sent=(payload.anon_transcript,)
-        )
-        deanon_text = deanonymize_response_text(scope, result.text)
+        scope = CloudScope.response(payload, cloud_bindings=None, sent=(payload.anon_transcript,))
+        deanon_text = deanonymize_text(scope, result.text)
         if deanon_text is None:
             # Fail-closed: a declared-but-unobserved placeholder (or
             # otherwise unresolved token) survived in the cloud's
@@ -730,9 +728,9 @@ def _escalate_via_cloud_policy(
     sanitized_history = _sanitize_history(
         history, mode=config.sanitization.mode, known_entities=known_entities, speaker_id=speaker_id
     )
-    return _escalate_to_sota(
+    return _escalate_to_cloud(
         text,
-        sota_agent,
+        cloud_agent,
         config,
         speaker=speaker,
         sanitized_history=sanitized_history,
@@ -740,22 +738,22 @@ def _escalate_via_cloud_policy(
     )
 
 
-def _escalate_to_sota(
+def _escalate_to_cloud(
     text: str,
-    sota_agent: CloudAgent,
+    cloud_agent: CloudAgent,
     config: ServerConfig,
     speaker: str | None = None,
     sanitized_history: list[dict] | None = None,
     language: str | None = None,
 ) -> ChatResult:
-    """Route to SOTA cloud model for reasoning-heavy queries.
+    """Route to cloud model for reasoning-heavy queries.
 
-    Passes conversation history so the SOTA model can derive persona,
+    Passes conversation history so the cloud model can derive persona,
     tone, and style from the conversation context.
 
     Args:
         text: The query text (already sanitized/anonymized by the caller).
-        sota_agent: Cloud agent to delegate to.
+        cloud_agent: Cloud agent to delegate to.
         config: Server config.
         speaker: Display name of the resolved speaker, or ``None``.
         sanitized_history: Conversation history turns, ALREADY sanitized
@@ -764,7 +762,7 @@ def _escalate_to_sota(
             :func:`_sanitize_history`) so the caller — the one place that
             knows the egress policy (``sanitization.mode`` vs
             ``cloud_mode``-driven anonymization) — controls what actually
-            reaches the cloud. See :func:`_escalate_via_cloud_policy` and
+            reaches the cloud. See :func:`answer_via_cloud` and
             ``paramem.server.app._cloud_only_route`` for the two
             production sanitization channels.
         language: BCP-47 language code.
@@ -772,14 +770,14 @@ def _escalate_to_sota(
     sanitized_history = sanitized_history or []
 
     prefix = _build_speaker_prefix(speaker, language, config)
-    prompt = (prefix + " " + SOTA_PROMPT) if prefix else SOTA_PROMPT
+    prompt = (prefix + " " + CLOUD_PROMPT) if prefix else CLOUD_PROMPT
 
     logger.info(
-        "SOTA escalation (%d history turns): %s",
+        "cloud escalation (%d history turns): %s",
         len(sanitized_history),
         text[:100],
     )
-    response = sota_agent.call(
+    response = cloud_agent.call(
         query=text,
         system_prompt=prompt,
         history=sanitized_history,
@@ -796,7 +794,7 @@ def _probe_and_reason(
     model,
     tokenizer,
     config: ServerConfig,
-    sota_agent: CloudAgent | None = None,
+    cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
     speaker_id: str | None = None,
@@ -825,7 +823,7 @@ def _probe_and_reason(
     ``model.disable_adapter()`` so the active adapter during generation does
     not matter — only the post-return state (restored here) does.
 
-    Privacy gate: ``is_personal`` flows through to every internal SOTA
+    Privacy gate: ``is_personal`` flows through to every internal cloud
     fallback site (no-layers branch, base-model fallthrough, post-reason
     [ESCALATE]).  Personal-class queries never reach the cloud.
 
@@ -925,7 +923,7 @@ def _probe_and_reason(
         logger.info(
             "All %d probed key(s) failed, escalating via HA%s (intent=%s)",
             sum(len(s.keys_to_probe) for s in plan.steps),
-            "" if is_personal else " → SOTA",
+            "" if is_personal else " → cloud",
             plan.intent.value,
         )
         sanitized, _ = sanitize_for_cloud(
@@ -935,9 +933,9 @@ def _probe_and_reason(
             result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
             if result is not None:
                 return result
-            sota_result = _escalate_via_cloud_policy(
+            cloud_result = answer_via_cloud(
                 sanitized,
-                sota_agent,
+                cloud_agent,
                 config,
                 is_personal=is_personal,
                 model=model,
@@ -948,8 +946,8 @@ def _probe_and_reason(
                 language=language,
                 known_entities=known_entities,
             )
-            if sota_result is not None:
-                return sota_result
+            if cloud_result is not None:
+                return cloud_result
         # Abstention: ``_probe_and_reason`` is reached only for PERSONAL with
         # non-empty plan.steps (handle_chat dispatch).  Probes failed and HA
         # had no tool answer either; the base model has no context here
@@ -977,7 +975,7 @@ def _probe_and_reason(
             model,
             tokenizer,
             config,
-            sota_agent=sota_agent,
+            cloud_agent=cloud_agent,
             ha_client=ha_client,
             speaker=speaker,
             speaker_id=speaker_id,
@@ -1040,7 +1038,7 @@ def _probe_and_reason(
         config,
         intent=plan.intent,
         probed_keys=successful_keys,
-        sota_agent=sota_agent,
+        cloud_agent=cloud_agent,
         ha_client=ha_client,
         speaker=speaker,
         speaker_id=speaker_id,
@@ -1059,7 +1057,7 @@ def _base_model_answer(
     model,
     tokenizer,
     config: ServerConfig,
-    sota_agent: CloudAgent | None = None,
+    cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
     speaker_id: str | None = None,
@@ -1070,7 +1068,7 @@ def _base_model_answer(
 
     ``is_personal`` propagates the privacy gate to ``_maybe_escalate`` so
     a base-model [ESCALATE] from a personal-class query cannot reach
-    SOTA.
+    Cloud.
     """
     from peft import PeftModel
 
@@ -1089,7 +1087,7 @@ def _base_model_answer(
     return _maybe_escalate(
         response,
         config,
-        sota_agent=sota_agent,
+        cloud_agent=cloud_agent,
         ha_client=ha_client,
         speaker=speaker,
         speaker_id=speaker_id,
@@ -1106,7 +1104,7 @@ def _maybe_escalate(
     config: ServerConfig,
     intent: Intent | None = None,
     probed_keys: list[str] | None = None,
-    sota_agent: CloudAgent | None = None,
+    cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
     speaker_id: str | None = None,
@@ -1117,20 +1115,20 @@ def _maybe_escalate(
     tokenizer=None,
     known_entities: set[str] | None = None,
 ) -> ChatResult:
-    """Check for [ESCALATE] tag and route HA → SOTA.
+    """Check for [ESCALATE] tag and route HA → cloud.
 
     HA agent has tools (search, device control, real-time data) so it
-    gets first shot. SOTA handles queries that need pure reasoning.
+    gets first shot. Cloud handles queries that need pure reasoning.
     When all escalation paths fail, the pre-escalation portion of the
     local response is returned (text before the [ESCALATE] marker).
 
-    Privacy invariant: when ``is_personal`` is True the SOTA fallback is
+    Privacy invariant: when ``is_personal`` is True the cloud fallback is
     suppressed regardless of the agent being available (under
     ``cloud_mode=block`` or ``both``).  Under ``cloud_mode=anonymize``
-    the SOTA call goes through with placeholder substitution.
+    the cloud call goes through with placeholder substitution.
 
     ``model`` and ``tokenizer`` are forwarded to
-    :func:`_escalate_via_cloud_policy` so the anonymizer (when
+    :func:`answer_via_cloud` so the anonymizer (when
     selected) can rewrite outbound text.
     """
     should_escalate, forwarded_query = detect_escalation(response)
@@ -1147,9 +1145,9 @@ def _maybe_escalate(
         result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
         if result is not None:
             return result
-        sota_result = _escalate_via_cloud_policy(
+        cloud_result = answer_via_cloud(
             sanitized,
-            sota_agent,
+            cloud_agent,
             config,
             is_personal=is_personal,
             model=model,
@@ -1160,9 +1158,11 @@ def _maybe_escalate(
             language=language,
             known_entities=known_entities,
         )
-        if sota_result is not None:
-            logger.info("[ESCALATE] → SOTA fallback (intent=%s): %s", intent_label, sanitized[:100])
-            return sota_result
+        if cloud_result is not None:
+            logger.info(
+                "[ESCALATE] → cloud fallback (intent=%s): %s", intent_label, sanitized[:100]
+            )
+            return cloud_result
 
     # All escalation paths exhausted — return pre-escalation text from local model
     local_text = response.split("[ESCALATE]")[0].strip()

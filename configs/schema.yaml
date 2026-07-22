@@ -17,8 +17,8 @@ fallback_relation_type: factual
 
 # Anonymizer vocabulary — single source of truth for placeholder-prefix
 # <-> entity-type resolution on the de-anonymization / repair path
-# (paramem.graph.placeholders.entity_type_to_prefix /
-# prefix_to_entity_type, via schema_config's anonymizer_type_to_prefix /
+# (paramem.config.taxonomy.entity_type_to_prefix /
+# prefix_to_entity_type, via that module's anonymizer_type_to_prefix /
 # anonymizer_prefix_to_type). It is NOT rendered into any prompt —
 # anonymization.txt has exactly three format slots (scrub_categories,
 # facts_json, transcript) and the render call passes only those three;

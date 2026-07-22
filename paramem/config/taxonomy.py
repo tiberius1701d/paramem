@@ -14,6 +14,7 @@ expected; IDE autocomplete on ``entity.entity_type`` will degrade to
 from __future__ import annotations
 
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -180,12 +181,11 @@ def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
     """Return ``{canonical_prefix: entity_type}`` — reverse map for de-anonymization.
 
     Keys are canonicalized via :func:`~paramem.utils.identity.canonical`
-    because the sole lookup site
-    (:func:`~paramem.graph.placeholders.prefix_to_entity_type`, reached via
-    :func:`~paramem.graph.placeholders.placeholder_entity_type` for a full
-    placeholder token) canonicalizes the placeholder's prefix before
-    querying.  Both sides of the map contract use the one identity routine,
-    so a cased or spaced YAML prefix can never silently miss.
+    because the sole lookup site (:func:`prefix_to_entity_type`, reached
+    via :func:`placeholder_entity_type` for a full placeholder token)
+    canonicalizes the placeholder's prefix before querying.  Both sides of
+    the map contract use the one identity routine, so a cased or spaced
+    YAML prefix can never silently miss.
 
     Args:
         path: Optional override path for the schema YAML.
@@ -203,10 +203,10 @@ def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
 def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
     """Return ``{canonical_entity_type: prefix}`` for entries marked ``primary_for_type=True``.
 
-    Used by :func:`~paramem.graph.placeholders.entity_type_to_prefix` — the
-    closed-vocabulary lookup consulted first when minting a placeholder
-    prefix for an entity type. Only types with a primary prefix are
-    eligible; others fall through to the open-vocabulary PascalCase path.
+    Used by :func:`entity_type_to_prefix` — the closed-vocabulary lookup
+    consulted first when minting a placeholder prefix for an entity type.
+    Only types with a primary prefix are eligible; others fall through to
+    the open-vocabulary PascalCase path.
 
     Keys are canonicalized via :func:`~paramem.utils.identity.canonical`
     to match the canonicalization the lookup site applies to its query.
@@ -226,3 +226,93 @@ def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
         for entry in cfg["anonymizer"]["prefixes"]
         if entry.get("primary_for_type", False)
     }
+
+
+# ---------------------------------------------------------------------------
+# prefix <-> entity_type — both directions.
+#
+# These three functions used to live in ``paramem.graph.placeholders``
+# alongside the cloud round-trip's placeholder-shape/substitution
+# primitives. They moved here (2026-07-21, the ``paramem/cloud/`` package
+# carve) because they have no cloud dependency at all — no substitution, no
+# resolution map, no LLM round trip — they are purely a projection of THIS
+# module's own taxonomy config (``anonymizer.prefixes`` above) onto the
+# entity-type vocabulary, so they belong beside the config they read rather
+# than beside the placeholder-substitution mechanism. This is also what
+# keeps ``paramem/cloud/placeholders.py`` free of any ``paramem.graph``
+# import: the primitive kit there needs a placeholder SHAPE, never an
+# entity-type taxonomy.
+# ---------------------------------------------------------------------------
+
+
+def entity_type_to_prefix(entity_type: str) -> str:
+    """Convert an entity-type label to its PascalCase placeholder prefix.
+
+    Closed vocabulary first: :func:`anonymizer_type_to_prefix`
+    (schema.yaml's ``primary_for_type`` entries — ``person`` -> ``Person``,
+    ``place`` -> ``City``, ``organization`` -> ``Org``, ``concept`` ->
+    ``Thing``). Any other label is PascalCase-joined on whitespace /
+    hyphen / underscore — ``"work_of_art"`` -> ``"WorkOfArt"``,
+    ``"language"`` -> ``"Language"``. Empty / whitespace-only input, or a
+    type that PascalCase-joins to nothing, falls back to ``"Entity"``.
+
+    THE only place an entity type becomes a placeholder prefix.
+    """
+    if not entity_type:
+        return "Entity"
+    e = canonical(entity_type)
+    if not e:
+        return "Entity"
+    closed = anonymizer_type_to_prefix().get(e)
+    if closed is not None:
+        return closed
+    parts = re.split(r"[\s_\-]+", e)
+    pascal = "".join(p.capitalize() for p in parts if p)
+    return pascal or "Entity"
+
+
+def prefix_to_entity_type(prefix: str) -> str:
+    """Convert a placeholder prefix back to an entity-type label.
+
+    Closed vocabulary first: :func:`anonymizer_prefix_to_type` (``city`` ->
+    ``place``, ``org`` -> ``organization``, ...). Open vocabulary: any
+    other prefix names its own type — the cloud round trip's
+    brace-binding protocol mints a prefix that IS the type name for a
+    novel entity (``Project_1``, ``Paper_1``, ``Language_1``), so the
+    derived type passes through rather than being treated as unrecognised.
+    Falls back to ``"concept"`` only when ``prefix`` itself is empty.
+
+    THE only place a placeholder prefix resolves to an entity type.
+    """
+    p = canonical(prefix or "")
+    return anonymizer_prefix_to_type().get(p) or p or "concept"
+
+
+def placeholder_entity_type(token: str) -> str:
+    """Convert a placeholder TOKEN (e.g. ``"Person_1"``) to its entity-type
+    label — brace-tolerant.
+
+    THE single site that derives an entity type from a placeholder TOKEN
+    (as opposed to an already-isolated prefix string, which
+    :func:`prefix_to_entity_type` handles). Strips a surrounding ``{...}``
+    shape before splitting the prefix off the token, then delegates to
+    :func:`prefix_to_entity_type`.
+
+    Token shape today is BARE (``Person_1``); a braced form (``{Person_1}``)
+    exists only for the in-text detection net
+    (:data:`~paramem.cloud.placeholders.PLACEHOLDER_TOKEN_RE`) and the
+    cloud round trip's own brace-binding mint protocol. Bypassing the
+    brace strip here would silently mistype a braced token at a future
+    format flip: ``"{Person_1}".split("_")[0]`` is ``"{Person"``, which is
+    not in the closed vocabulary and passes through open-vocabulary as its
+    own (wrong) type ``"{person"`` — corrupting every live consumer of the
+    derived type: Cloud-minted-entity type inference in
+    :func:`~paramem.graph.relation_build.apply_rebuild` and entity-surface
+    correction in :mod:`paramem.graph.entity_correction`. Stripping braces
+    first means this function survives that flip unchanged.
+    """
+    t = (token or "").strip()
+    if len(t) >= 2 and t[0] == "{" and t[-1] == "}":
+        t = t[1:-1]
+    prefix = t.split("_", 1)[0] if "_" in t else t
+    return prefix_to_entity_type(prefix)

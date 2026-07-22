@@ -1,10 +1,10 @@
-"""Post-merge, cloud-SOTA graph enrichment pass.
+"""Post-merge, cloud-cloud graph enrichment pass.
 
 Owns the cross-transcript graph enrichment step that runs after a fold's
 graph has been materialized: chunking the cumulative graph into N-hop
 ego-graphs around high-recurrence entities, anonymizing each chunk
 through the same local-model contract session-tier extraction uses,
-sending it to a configured SOTA provider for second-order relation and
+sending it to a configured cloud provider for second-order relation and
 ``same_as`` coreference discovery, and merging the result back into the
 graph via :meth:`~paramem.graph.merger.GraphMerger.merge_relations`.
 
@@ -20,15 +20,19 @@ from typing import TYPE_CHECKING, Callable
 
 import networkx as nx
 
-from paramem.graph.cloud_egress import anonymize_for_cloud
-from paramem.graph.extractor import _graph_enrich_with_sota
+from paramem.cloud.admission import evaluate_cloud_egress
+from paramem.cloud.anonymize import anonymize
+from paramem.config.taxonomy import (
+    fallback_relation_type,
+    relation_types,
+)
+from paramem.graph.extractor import request_graph_enrichment
 from paramem.graph.merger import GraphMerger, min_nonempty
+from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Relation, SessionGraph
-from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.persistence import _IK_KEY_ATTR
-from paramem.server.vram_guard import VramExhausted
-from paramem.utils.cloud_admission import evaluate_cloud_egress
 from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.vram_guard import VramExhausted
 
 if TYPE_CHECKING:
     from paramem.graph.extraction_pipeline import ExtractionConfig
@@ -36,8 +40,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Frozen set of valid relation types drawn from the single source of truth in
-# schema_config so that the stage-2 clamp stays in sync with the Pydantic
-# Relation schema (_RelationType = Literal[relation_types()]).
+# paramem.config.taxonomy so that the stage-2 clamp stays in sync with the
+# Pydantic Relation schema (_RelationType = Literal[relation_types()]).
 _VALID_RTYPES: frozenset[str] = frozenset(relation_types())
 _FALLBACK_RTYPE: str = fallback_relation_type()
 
@@ -166,7 +170,7 @@ def serialize_subgraph_triples(subgraph) -> list[dict]:
     ``"predicate"`` attribute; ``relation_type`` defaults to ``"factual"`` when
     absent; ``speaker_id`` defaults to ``""`` when absent.
 
-    The ``speaker_id`` field allows the SOTA enrichment prompt to identify speaker
+    The ``speaker_id`` field allows the cloud enrichment prompt to identify speaker
     endpoints and apply the speaker↔speaker exception (emit BOTH directions of a
     symmetric relation when both endpoints are speakers).
 
@@ -191,7 +195,7 @@ def serialize_subgraph_triples(subgraph) -> list[dict]:
     return triples
 
 
-def run_graph_enrichment(
+def enrich_graph(
     merger: "GraphMerger",
     *,
     model,
@@ -202,40 +206,41 @@ def run_graph_enrichment(
     gc_disable: "Callable[[], None] | None" = None,
     gc_enable: "Callable[[], None] | None" = None,
 ) -> dict:
-    """Post-merge graph-level SOTA enrichment pass (Task #10).
+    """Post-merge graph-level cloud enrichment pass (Task #10).
 
     Runs at full consolidation over the cumulative ``merger.graph`` to
     capture cross-transcript second-order relations that per-transcript
     enrichment cannot see.  Folds in coreference resolution via
-    ``same_as`` pairs emitted by the SOTA response.
+    ``same_as`` pairs emitted by the cloud response.
 
     Every cloud call this function makes runs through the SAME
-    anonymize -> SOTA -> de-anonymize contract as session-tier
-    extraction (``paramem.graph.extractor.SESSION_EXTRACT``: the
-    ``sota_pipeline`` composite anonymizes and enriches, its
-    ``deanonymize`` sibling substitutes back), via the shared
-    primitives in :mod:`paramem.graph.placeholders`. The
+    anonymize -> cloud -> de-anonymize contract as session-tier
+    extraction (``paramem.graph.flows.SESSION_EXTRACT``: the
+    ``anonymize``/``enrich`` stages anonymize and enrich, the
+    ``deanonymize`` stage substitutes back), via the shared
+    primitives in :mod:`paramem.cloud.placeholders`. The
     cumulative fold graph carries no entity types of its own (registry
     SPO triples have none; the merger's fallback for an untyped
     relation endpoint is ``entity_type="concept"``), so this function
-    runs :func:`~paramem.graph.extractor.anonymize_with_local_model`
-    (the SAME local-model anonymizer session-tier extraction uses) over
-    each chunk's triples first. That call is where ``ext_cfg.scrub``
-    (sourced from ``sanitization.scrub``) is honoured — it is the SOLE
-    scope authority for THIS tier (no second detector): it decides
-    which real names the chunk's ``chunk_mapping`` even contains, and
-    its placeholders are threaded straight through — never re-derived
-    or re-minted. That mapping is what feeds
-    :func:`~paramem.graph.extractor._graph_enrich_with_sota`, which
+    runs :func:`~paramem.cloud.anonymize.anonymize_transcript`
+    (the SAME local-model anonymizer session-tier extraction uses, via
+    :func:`~paramem.cloud.anonymize.anonymize`) over each chunk's triples
+    first. That call is where ``ext_cfg.scrub`` (sourced from
+    ``sanitization.scrub``) is honoured — it is the SOLE scope authority
+    for THIS tier (no second detector): it decides which real names the
+    chunk's ``chunk_mapping`` even contains, and its placeholders are
+    threaded straight through — never re-derived or re-minted. That
+    mapping is what feeds
+    :func:`~paramem.graph.extractor.request_graph_enrichment`, which
     applies no scope gate of its own — it substitutes every entry it
     is handed (see its docstring for the contract and the accepted
     person-level ``same_as`` loss under the default scope, which only
     ever hands it person names). ``serialize_subgraph_triples`` stays a
     plain, un-anonymized serializer — anonymization happens on its
     output, not inside it. A local-anonymization parse failure fails
-    the chunk closed (skips the SOTA call for that chunk) rather than
-    risk sending it unmasked — mirroring
-    :func:`~paramem.graph.extractor._sota_pipeline`'s own
+    the chunk closed (skips the cloud call for that chunk) rather than
+    risk sending it unmasked — mirroring the session flow's ``anonymize``
+    stage (:func:`~paramem.graph.stage_anonymize._stage_anonymize`)'s own
     fallback-to-local-only behaviour on the same failure mode.
 
     Forward-path privacy: the local anonymizer's mapping keys are
@@ -244,7 +249,7 @@ def run_graph_enrichment(
     a re-cased, separator-varied, or diacritic-varied key (e.g. the
     LLM emits ``"Yang Ming"`` for fold-graph node ``"yang ming"``)
     would silently fail to substitute under a raw string comparison,
-    leaking the real name into the SOTA payload. This function
+    leaking the real name into the cloud payload. This function
     reconciles that mismatch itself, per chunk, before building
     ``chunk_mapping`` (identity reconciliation, not
     classification): every ``_llm_mapping`` key is run through
@@ -254,7 +259,7 @@ def run_graph_enrichment(
     MODEL's own placeholder preserved verbatim, and on no match (or an
     ambiguous multiple-node match) it is dropped and counted in
     ``mapping_rekey_dropped``. The shared ``_substitute_whole_words``
-    primitive (:mod:`paramem.graph.placeholders`) keeps EXACT matching
+    primitive (:mod:`paramem.cloud.placeholders`) keeps EXACT matching
     everywhere else — canonical folding there would let a mapped
     person name silently consume a lowercase common-noun homograph in
     free transcript text, and would defeat the fail-closed
@@ -264,12 +269,12 @@ def run_graph_enrichment(
     the chunk is in scope against ``scrub`` — egress PROCEEDS on
     that verdict, the same way
     ``mapping == {}`` proceeds at the session tier
-    (:func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`).
+    (:func:`~paramem.graph.flows.anonymize_turn`).
     Separately, when ``_llm_mapping`` DID name something but every
     entry is dropped by this reconciliation, while the chunk has
     real (non-speaker) node names, that residual is a
     classification/identity-match failure, not a scope verdict — so
-    that chunk's SOTA call is skipped (fail-closed) and counted in
+    that chunk's cloud call is skipped (fail-closed) and counted in
     the returned ``privacy_skipped_chunks``. This residual (an
     entity the local model named but reconciliation could not match
     to a node) is owner-accepted and not otherwise engineered around
@@ -292,7 +297,7 @@ def run_graph_enrichment(
     Early-return conditions (all return ``skipped=True``):
     - No local model available (``model is None``).
     - Graph has fewer than 10 nodes (floor — too little signal).
-    - ``extraction_noise_filter`` is empty (no SOTA provider configured).
+    - ``extraction_enrichment_provider`` is empty (no cloud provider configured).
     - Provider env-var is absent (API key not set).
 
     Chunking strategy:
@@ -300,7 +305,7 @@ def run_graph_enrichment(
     focal entity an N-hop ego-graph is built (``radius=neighborhood_hops``).
     Chunks are deduplicated by node frozenset so overlapping ego-graphs do
     not re-send the same payload.  The number of chunks is capped at
-    ``ceil(total_nodes / max_entities_per_pass)`` to prevent O(N) SOTA
+    ``ceil(total_nodes / max_entities_per_pass)`` to prevent O(N) cloud
     calls on large graphs.
 
     Args:
@@ -312,8 +317,9 @@ def run_graph_enrichment(
         tokenizer: Tokenizer paired with ``model``.
         extraction_config_provider: Zero-arg callable returning the
             :class:`~paramem.graph.extraction_pipeline.ExtractionConfig` whose
-            ``noise_filter``, ``noise_filter_model``, ``noise_filter_endpoint``,
-            ``scrub``, and ``max_tokens`` fields drive the SOTA provider
+            ``enrichment_provider``, ``enrichment_provider_model``,
+            ``enrichment_provider_endpoint``, ``scrub``, and ``max_tokens`` fields drive
+            the cloud provider
             selection and cloud-egress contract. Deferred, not a resolved
             value: the caller's config typically lives behind a base-model
             holder that is released on the cloud-only path, and every skip
@@ -323,7 +329,7 @@ def run_graph_enrichment(
         max_entities_per_pass: Per-chunk node cap, also used to derive the
             chunk count ceiling.
         gc_disable: Optional zero-arg callable invoked before each
-            ``model.generate()``-touching call (``anonymize_for_cloud``) to
+            ``model.generate()``-touching call (``anonymize``) to
             disable gradient checkpointing (HF silently disables the KV
             cache when checkpointing is active). Defaults to a no-op.
         gc_enable: Optional zero-arg callable invoked after each such call
@@ -331,7 +337,7 @@ def run_graph_enrichment(
 
     Returns:
         Diagnostics dict with keys:
-            - ``chunks`` (int): number of SOTA calls made.
+            - ``chunks`` (int): number of cloud calls made.
             - ``new_edges`` (int): edges added to the graph.
             - ``same_as_merges`` (int): node contractions applied.
             - ``privacy_skipped_chunks`` (int): chunks skipped because
@@ -343,14 +349,13 @@ def run_graph_enrichment(
               entries dropped because they named nothing (or an
               ambiguous multiple) in their chunk once reconciled
               against the chunk's actual node keys via ``canonical()``
-              — see the ``anonymize_for_cloud(identity_domain=...)``
-              call below.
-            - ``totality_rejected_chunks`` (int): chunks whose SOTA
+              — see the ``anonymize(identity_domain=...)`` call below.
+            - ``totality_rejected_chunks`` (int): chunks whose cloud
               response was REJECTED AS A WHOLE by the binding-totality
-              gate (:func:`~paramem.graph.cloud_egress.deanonymize_facts`,
+              gate (:func:`~paramem.cloud.deanonymize.deanonymize_facts`,
               the first totality check this tier has ever had) — an
-              orphan mint or CORE/SOTA conflict, distinct from
-              ``privacy_skipped_chunks`` (which fires before any SOTA
+              orphan mint or CORE/cloud conflict, distinct from
+              ``privacy_skipped_chunks`` (which fires before any cloud
               call is made). A non-zero value with unchanged
               ``privacy_skipped_chunks`` is the signature of ``observed``
               scoping silently rejecting enrichment deltas — see
@@ -388,7 +393,7 @@ def run_graph_enrichment(
         )
         return {**_empty, "skipped": True, "skip_reason": "floor"}
 
-    # Graph-tier SOTA enrichment shares the operator-configured provider
+    # Graph-tier cloud enrichment shares the operator-configured provider
     # with session-tier extraction (anonymize → noise-filter → plausibility
     # chain).  Reading from the extraction config keeps both tiers
     # pointing at the same model + endpoint without an extra knob.
@@ -396,10 +401,10 @@ def run_graph_enrichment(
     # hoisted above the ``no_model`` skip (see the parameter's docstring).
     ext_cfg = extraction_config_provider()
     verdict = evaluate_cloud_egress(
-        sota_enabled=ext_cfg.sota_enabled,
-        provider=ext_cfg.noise_filter,
-        model=ext_cfg.noise_filter_model,
-        endpoint=ext_cfg.noise_filter_endpoint or None,
+        cloud_enabled=ext_cfg.cloud_enabled,
+        provider=ext_cfg.enrichment_provider,
+        model=ext_cfg.enrichment_provider_model,
+        endpoint=ext_cfg.enrichment_provider_endpoint or None,
     )
     if not verdict.permitted:
         logger.warning("graph_enrichment: cloud egress refused — %s", "; ".join(verdict.gaps))
@@ -411,10 +416,16 @@ def run_graph_enrichment(
     endpoint = verdict.endpoint
     # Same cloud-egress scrub categories as session-tier extraction
     # (``sanitization.scrub`` -> ``ExtractionConfig.scrub`` at
-    # bootstrap) — feeds the per-chunk ``anonymize_with_local_model``
-    # call below, which is the prompt-side scope authority at this
-    # tier (see the function docstring).
+    # bootstrap) — feeds the per-chunk ``anonymize_transcript`` call
+    # below, which is the prompt-side scope authority at this tier (see
+    # the function docstring).
     scrub = ext_cfg.scrub
+    # Anonymization prompt templates — loaded ONCE per enrichment pass
+    # (identical for every chunk), not per chunk, so a calibration
+    # override / provenance-recording chokepoint (:func:`_load_prompt`)
+    # is still honoured without re-reading the file per chunk.
+    anon_prompt = _load_prompt("anonymization.txt", required=True)
+    anon_system = _load_prompt("anonymization_system.txt", required=True)
     max_entities = max(1, max_entities_per_pass)
     hops = max(1, neighborhood_hops)
 
@@ -492,12 +503,17 @@ def run_graph_enrichment(
             # verbatim.
             #
             # The local model is the SOLE scope authority instead: run
-            # THE one anonymize chain (:func:`~paramem.graph.cloud_egress.
-            # anonymize_for_cloud`) over this chunk's triples, framed as
-            # a throwaway SessionGraph (transcript="" — there is no
-            # transcript at this tier). ``identity_domain=chunk_nodes``
-            # drives (A)'s identity-reconciliation step (5) — the local
-            # model's mapping is keyed by whatever real-name surface it
+            # THE one anonymize chain (:func:`~paramem.cloud.anonymize.
+            # anonymize`) directly over this chunk's ``triples`` — they
+            # are already a valid ``facts: list[dict]`` (subject/
+            # predicate/object/relation_type/speaker_id), so no
+            # ``Relation``/``SessionGraph`` round trip is needed to reach
+            # this cloud-package call (interface narrowing, 2026-07-21:
+            # ``anonymize`` takes facts directly, never a graph carrier).
+            # ``transcript=""`` — there is no transcript at this tier.
+            # ``identity_domain=chunk_nodes`` drives (A)'s
+            # identity-reconciliation step (5) — the local model's
+            # mapping is keyed by whatever real-name surface it
             # independently produced (e.g. "Yang Ming"); the fold
             # graph's own node keys are already canonicalized (e.g.
             # "yang ming") — a raw comparison between the two silently
@@ -507,59 +523,47 @@ def run_graph_enrichment(
             # ``_substitute_whole_words`` compares against inside
             # ``triples``' subject/object fields below. (A)'s
             # domain-scoped fail-closed guard (step 6) is derived from
-            # ``graph.relations`` — exactly ``_chunk_relations`` below,
-            # the same triples this chunk sends to SOTA — never from
-            # ``identity_domain`` (see that function's docstring for why
-            # the two domains must stay distinct). The anonymization
-            # prompt instructs the model to leave speaker{N} ids
-            # verbatim (never map them), so a speaker anchor never
-            # becomes a ``chunk_mapping`` entry here — it is already
-            # anonymous and reaches the SOTA payload bare by design
-            # (ONE-lowercase-speaker{N} invariant), with no
+            # ``facts`` — exactly ``triples`` here, the same triples this
+            # chunk sends to cloud — never from ``identity_domain`` (see
+            # that function's docstring for why the two domains must stay
+            # distinct). The anonymization prompt instructs the model to
+            # leave speaker{N} ids verbatim (never map them), so a
+            # speaker anchor never becomes a ``chunk_mapping`` entry here
+            # — it is already anonymous and reaches the cloud payload bare
+            # by design (ONE-lowercase-speaker{N} invariant), with no
             # mint/restore round trip needed.
-            _chunk_relations: list[Relation] = []
-            for _t in triples:
-                _rt = _t.get("relation_type", _FALLBACK_RTYPE)
-                if _rt not in _VALID_RTYPES:
-                    _rt = _FALLBACK_RTYPE
-                _chunk_relations.append(
-                    Relation(
-                        subject=_t["subject"],
-                        predicate=_t["predicate"],
-                        object=_t["object"],
-                        relation_type=_rt,  # type: ignore[arg-type]
-                        speaker_id=_t.get("speaker_id", ""),
-                    )
-                )
-            _chunk_session_graph = SessionGraph(
-                session_id="__graph_enrichment__",
-                timestamp="",
-                entities=[],
-                relations=_chunk_relations,
-            )
-            # anonymize_for_cloud calls model.generate() internally
-            # (CLAUDE.md: gradient checkpointing must be disabled around
-            # ANY model.generate() site — HF silently disables the KV
-            # cache when checkpointing is active).  The gradient-
-            # checkpointing pair stays HERE, at the call site — it is a
-            # trainer concern, not a cloud-egress concern.
+            #
+            # ``_chunk_session_graph`` carries no relations of its own —
+            # it exists ONLY as the diagnostics sink
+            # ``request_graph_enrichment`` writes the binding-totality
+            # gate's findings to below; it is NOT how this chunk's facts
+            # reach that call (``triples`` is passed directly).
+            _chunk_session_graph = SessionGraph(session_id="__graph_enrichment__", timestamp="")
+            # anonymize calls model.generate() internally (CLAUDE.md:
+            # gradient checkpointing must be disabled around ANY
+            # model.generate() site — HF silently disables the KV cache
+            # when checkpointing is active).  The gradient-checkpointing
+            # pair stays HERE, at the call site — it is a trainer
+            # concern, not a cloud-egress concern.
             _gc_disable()
             try:
-                payload = anonymize_for_cloud(
-                    _chunk_session_graph,
+                payload = anonymize(
+                    triples,
                     model,
                     tokenizer,
                     transcript="",
                     scrub=scrub,
                     identity_domain=chunk_nodes,
                     max_tokens=ext_cfg.max_tokens,
+                    user_prompt_template=anon_prompt,
+                    system_prompt=anon_system,
                 )
             finally:
                 _gc_enable()
             if payload.status == "failed":
                 # Two distinct fail-closed causes collapse to the SAME
                 # status; ``payload.failure`` names which one fired —
-                # see ``AnonymizedPayload``'s docstring.  NOT
+                # see ``AnonymizedContract``'s docstring.  NOT
                 # ``payload.rekey_dropped``: that count stays ``0`` in
                 # BOTH the parse-failure case AND the guard case where
                 # the model's mapping was dropped entirely by shape
@@ -578,21 +582,22 @@ def run_graph_enrichment(
                     logger.warning(
                         "graph_enrichment: local anonymizer named entities but none "
                         "survived reconciliation for a %d-triple chunk — skipping "
-                        "SOTA call (fail-closed)",
+                        "cloud call (fail-closed)",
                         len(triples),
                     )
                 else:
                     # Mirrors the session tier's fail-closed behaviour:
-                    # _sota_pipeline falls back to LOCAL plausibility on
-                    # anonymization parse failure rather than ever
-                    # sending unmasked content to the cloud. This chunk
+                    # the ``anonymize`` stage falls back to LOCAL
+                    # plausibility on anonymization parse failure rather
+                    # than ever sending unmasked content to the cloud.
+                    # This chunk
                     # has no trustworthy type source at all when the
-                    # local call fails to parse — skip the SOTA call
+                    # local call fails to parse — skip the cloud call
                     # for this chunk entirely rather than sending it
                     # unmasked.
                     logger.warning(
                         "graph_enrichment: local anonymization failed for chunk — "
-                        "skipping SOTA call (fail-closed)"
+                        "skipping cloud call (fail-closed)"
                     )
                 continue
             mapping_rekey_dropped += payload.rekey_dropped
@@ -603,7 +608,7 @@ def run_graph_enrichment(
                     "reconciliation)",
                     payload.rekey_dropped,
                 )
-            result = _graph_enrich_with_sota(
+            result = request_graph_enrichment(
                 triples,
                 payload,
                 _chunk_session_graph,
@@ -614,7 +619,7 @@ def run_graph_enrichment(
             )
             calls_made += 1
             if result is None:
-                logger.warning("graph_enrichment: SOTA call returned None for chunk")
+                logger.warning("graph_enrichment: Cloud call returned None for chunk")
                 continue
             new_rels, same_as_pairs, _raw, totality_verdict = result
             # A rejected totality verdict returns ([], [], raw, verdict) —
@@ -633,9 +638,9 @@ def run_graph_enrichment(
         except RuntimeError as exc:
             # Narrow by design.  The only genuinely-failing runtime leg in
             # this chunk body is the local ``generate()`` inside
-            # ``anonymize_with_local_model`` (the CUDA "device not ready"
+            # ``anonymize_transcript`` (the CUDA "device not ready"
             # class); OOM already arrives as ``VramExhausted`` above.  The
-            # cloud leg cannot raise — ``_sota_call`` and the response
+            # cloud leg cannot raise — ``_cloud_call`` and the response
             # parse both return ``None`` on failure — so a broad
             # ``except Exception`` here could only ever swallow a
             # programming error (e.g. a KeyError from a malformed prompt
@@ -742,7 +747,7 @@ def run_graph_enrichment(
                     exc,
                 )
 
-        # Build Relation objects from SOTA-emitted new_rels for this chunk.
+        # Build Relation objects from cloud-emitted new_rels for this chunk.
         # Endpoint surface rule: speaker endpoints pass their canonical
         # key (the speaker_id), non-speaker endpoints pass the display surface.
         for rel in new_rels:

@@ -1,7 +1,7 @@
-"""Extraction pipeline alignment smoke test — CPU-safe, all SOTA mocked.
+"""Extraction pipeline alignment smoke test — CPU-safe, all cloud mocked.
 
 Feeds a realistic conversational transcript through the full cloud arc
-with mocked SOTA enrichment and mocked SOTA plausibility. Verifies:
+with mocked cloud enrichment and mocked cloud plausibility. Verifies:
 - No entity has entity_type == "person" unless it actually is a person.
 - plausibility_dropped_deanon is recorded when the mock plausibility drops facts.
 - fallback_path is None on the happy path.
@@ -15,7 +15,7 @@ unexpected fallback path fires.
 from unittest.mock import patch
 
 from paramem.graph.schema import Entity, SessionGraph
-from tests._sota_flow import run_sota_stages
+from tests._cloud_flow import run_cloud_stages
 
 
 def _make_graph_from_spec(
@@ -60,7 +60,7 @@ _KNOWN_BAD_PREDICATES = {"listens_to", "has_role", "discussed_topic"}
 
 
 class TestAlignmentSmoke:
-    """CPU-safe smoke test: all SOTA calls mocked, pipeline logic runs for real."""
+    """CPU-safe smoke test: all cloud calls mocked, pipeline logic runs for real."""
 
     def _build_smoke_graph(self) -> tuple[SessionGraph, list[dict], dict]:
         """Build a representative graph + anonymization mock return values."""
@@ -110,21 +110,21 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 side_effect=fake_plaus_filter,
             ),
         ):
             from unittest.mock import MagicMock
 
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
@@ -161,21 +161,21 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor.local_plausibility_filter",
+                "paramem.graph.flows.judge_plausibility",
                 side_effect=fake_plaus_filter,
             ),
         ):
             from unittest.mock import MagicMock
 
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
@@ -199,15 +199,15 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                "paramem.cloud.anonymize.anonymize_transcript",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
-                "paramem.graph.extractor._filter_with_sota",
+                "paramem.graph.stage_enrich.request_enrichment",
                 return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
-            result = run_sota_stages(
+            result = run_cloud_stages(
                 graph,
                 _SMOKE_TRANSCRIPT,
                 None,

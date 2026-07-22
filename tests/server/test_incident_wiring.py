@@ -94,7 +94,7 @@ def _make_state(tmp_path: Path) -> dict:
         "session_buffer": buf,
         "speaker_store": None,
         "router": None,
-        "sota_agent": None,
+        "cloud_agent": None,
         "ha_client": None,
         "consolidation_loop": None,
         "consolidating": False,
@@ -447,7 +447,7 @@ class TestWriteSiteVramExhausted:
     def test_vram_exhausted_callback_records_incident(self, state, tmp_path, monkeypatch):
         """_scheduled_extract_done_callback with VramExhausted → incident recorded."""
         from paramem.server.app import _scheduled_extract_done_callback
-        from paramem.server.vram_guard import VramExhausted
+        from paramem.utils.vram_guard import VramExhausted
 
         sd = _state_dir(state)
 
@@ -472,7 +472,7 @@ class TestWriteSiteVramExhausted:
     def test_vram_exhausted_callback_detail_shape(self, state, tmp_path, monkeypatch):
         """detail dict preserves the historic shape {type, phase, at}."""
         from paramem.server.app import _scheduled_extract_done_callback
-        from paramem.server.vram_guard import VramExhausted
+        from paramem.utils.vram_guard import VramExhausted
 
         sd = _state_dir(state)
 

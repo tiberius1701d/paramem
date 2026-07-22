@@ -33,7 +33,7 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
         model=loop.model,
         tokenizer=loop.tokenizer,
         extraction_config_provider=loop._current_extraction_config,
-        sota_enabled=loop.config.sota_enabled,
+        cloud_enabled=loop.config.cloud_enabled,
         neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
         max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
         gc_disable=loop._disable_gradient_checkpointing,
@@ -208,8 +208,8 @@ class TestExtractionPathParity:
             (
                 True,
                 {
-                    "extraction_noise_filter": "claude",
-                    "extraction_noise_filter_model": "claude-sonnet-4-6",
+                    "extraction_enrichment_provider": "claude",
+                    "extraction_enrichment_provider_model": "claude-sonnet-4-6",
                 },
             ),
             (True, {"extraction_plausibility_stage": "anon"}),
@@ -473,7 +473,7 @@ class TestInterimRefinementGate:
         self,
         monkeypatch,
         tmp_path,
-        sota_enabled: bool = False,
+        cloud_enabled: bool = False,
         refinement_enrichment: str = "off",
         refinement_contradiction: str = "off",
     ):
@@ -521,7 +521,7 @@ class TestInterimRefinementGate:
             model=model,
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(
-                sota_enabled=sota_enabled,
+                cloud_enabled=cloud_enabled,
                 refinement_enrichment=refinement_enrichment,
                 refinement_contradiction=refinement_contradiction,
             ),
@@ -540,7 +540,7 @@ class TestInterimRefinementGate:
         from unittest.mock import patch
 
         loop = self._build_loop(
-            monkeypatch, tmp_path, refinement_enrichment="on", sota_enabled=True
+            monkeypatch, tmp_path, refinement_enrichment="on", cloud_enabled=True
         )
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
@@ -591,7 +591,7 @@ class TestInterimRefinementGate:
         from unittest.mock import patch
 
         loop_a = self._build_loop(
-            monkeypatch, tmp_path / "a", refinement_enrichment="on", sota_enabled=True
+            monkeypatch, tmp_path / "a", refinement_enrichment="on", cloud_enabled=True
         )
         with patch.object(loop_a.extraction, "run", return_value=self._session_graph):
             rels_a, proc_a = loop_a.extract_session("t", "s_gate", speaker_id="spk0")
@@ -836,8 +836,8 @@ class TestInterimRefinementGate:
 class TestRefinementConfigRoundtrip:
     """Loading YAML with refinement knobs propagates through the property chain."""
 
-    def test_yaml_sota_enabled_propagates(self, tmp_path):
-        """YAML sota_enabled: true propagates to schedule and consolidation_config."""
+    def test_yaml_cloud_enabled_propagates(self, tmp_path):
+        """YAML cloud_enabled: true propagates to schedule and consolidation_config."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -845,21 +845,21 @@ model:
   name: "mistralai/Mistral-7B-Instruct-v0.3"
 consolidation:
   refresh_cadence: "12h"
-  sota_enabled: true
+  cloud_enabled: true
 """
-        cfg_path = tmp_path / "server_sota_enabled.yaml"
+        cfg_path = tmp_path / "server_cloud_enabled.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.sota_enabled is True, (
-            "ServerConfig.consolidation.sota_enabled should be True"
+        assert cfg.consolidation.cloud_enabled is True, (
+            "ServerConfig.consolidation.cloud_enabled should be True"
         )
-        assert cfg.consolidation_config.sota_enabled is True, (
-            "consolidation_config.sota_enabled should be True"
+        assert cfg.consolidation_config.cloud_enabled is True, (
+            "consolidation_config.cloud_enabled should be True"
         )
 
-    def test_yaml_sota_defaults_to_false(self, tmp_path):
-        """YAML without sota_enabled defaults to False."""
+    def test_yaml_cloud_defaults_to_false(self, tmp_path):
+        """YAML without cloud_enabled defaults to False."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -868,15 +868,15 @@ model:
 consolidation:
   refresh_cadence: "12h"
 """
-        cfg_path = tmp_path / "server_no_sota.yaml"
+        cfg_path = tmp_path / "server_no_cloud.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.sota_enabled is False, (
-            "ServerConfig.consolidation.sota_enabled should default to False"
+        assert cfg.consolidation.cloud_enabled is False, (
+            "ServerConfig.consolidation.cloud_enabled should default to False"
         )
-        assert cfg.consolidation_config.sota_enabled is False, (
-            "consolidation_config.sota_enabled should default to False"
+        assert cfg.consolidation_config.cloud_enabled is False, (
+            "consolidation_config.cloud_enabled should default to False"
         )
 
     def test_yaml_refinement_enrichment_on_propagates(self, tmp_path):
@@ -6174,14 +6174,14 @@ class TestDriftIntendedRemoval:
         recon_g["Dave"]["London"][eid_ok][_IK_KEY_ATTR] = "key_ok"
 
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
-        # refinement_enrichment="on" + sota_enabled=True required for
+        # refinement_enrichment="on" + cloud_enabled=True required for
         # GraphTierRefiner.run_enrichment to be called; base defaults
         # (off/False) skip enrichment.
         loop.config = loop.config.__class__(
             min_tier_key_floor=0,
             tier_fast_start=False,
             refinement_enrichment="on",
-            sota_enabled=True,
+            cloud_enabled=True,
         )
         loop.merger = GraphMerger(model=None)
 
@@ -10164,7 +10164,7 @@ class TestMaterializeInterimExtraRelations:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            # base defaults: sota_enabled=False, refinement_enrichment="off",
+            # base defaults: cloud_enabled=False, refinement_enrichment="off",
             # refinement_normalization="off" — tests override per scenario
         )
         loop.training_config = TrainingConfig(
@@ -10889,7 +10889,7 @@ class TestInterimRecitalDedup:
         # before the bump loop when enrich=True).  GraphMerger.merge() unconditionally
         # resets self.reinforcements/self.collapsed at entry whenever it is
         # invoked with a non-empty relation set -- this call reproduces that
-        # reset without depending on the SOTA enrichment path.
+        # reset without depending on the cloud enrichment path.
         enrichment_relation = [
             Relation(
                 subject="bob",
@@ -11847,7 +11847,7 @@ class TestInterimKeyedWalk:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            # base defaults: sota_enabled=False, refinement_enrichment="off"
+            # base defaults: cloud_enabled=False, refinement_enrichment="off"
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -12040,7 +12040,7 @@ class TestMergeRegistryRelationsUnification:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            # base defaults: sota_enabled=False, refinement_enrichment="off"
+            # base defaults: cloud_enabled=False, refinement_enrichment="off"
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -12415,7 +12415,7 @@ class TestGraphTierSymbolsNotReexported:
     ``ConsolidationLoop._refine_consolidation_graph`` constructing a per-call
     ``paramem.training.graph_tier.GraphTierRefiner`` and calling
     ``refiner.refine()``, which dispatches into
-    ``paramem.training.graph_enrich.run_graph_enrichment`` for enrichment and
+    ``paramem.training.graph_enrich.enrich_graph`` for enrichment and
     ``GraphTierRefiner.run_normalization`` for normalization — runs unmocked.
 
     The last two names in the parametrize list below are on this list too:
@@ -12429,13 +12429,13 @@ class TestGraphTierSymbolsNotReexported:
     @pytest.mark.parametrize(
         "name",
         [
-            "_graph_enrich_with_sota",
+            "request_graph_enrichment",
             "_safe_to_merge_surface",
             "_strip_honorifics",
             "serialize_subgraph_triples",
             "resolve_to_node_key",
             "normalize_predicates",
-            "_run_graph_enrichment",
+            "_enrich_graph",
             "_run_graph_normalization",
         ],
     )
@@ -12465,36 +12465,39 @@ class TestSameAsSpeakerPairGuard:
 
     @pytest.fixture(autouse=True)
     def _stub_local_anonymize(self, monkeypatch):
-        """Stub ``anonymize_with_local_model`` for every test in this class.
+        """Stub ``anonymize_transcript`` for every test in this class.
 
-        ``graph_enrich.run_graph_enrichment`` now runs the local anonymizer
+        ``graph_enrich.enrich_graph`` now runs the local anonymizer
         (the SAME primitive session-tier extraction uses) over each chunk
-        BEFORE the SOTA call, to derive real-name entity types the fold
+        BEFORE the cloud call, to derive real-name entity types the fold
         graph itself cannot supply (see that function's docstring).
         ``_make_speaker_pair_guard_loop``'s
         model/tokenizer are ``MagicMock()``s, so a real call always fails to
         parse (no JSON in a ``MagicMock``'s generated output), which would
-        fail every chunk closed (skip the SOTA call entirely) before the
-        mocked ``_graph_enrich_with_sota`` below is ever reached — masking
+        fail every chunk closed (skip the cloud call entirely) before the
+        mocked ``request_graph_enrichment`` below is ever reached — masking
         every test in this class behind a vacuous ``same_as_merges == 0``.
 
         The stub lands on the SAFE side rather than the unsafe one: it
         types every non-speaker name found in the chunk's relations as
         ``"person"`` (masked). An EMPTY mapping (``{}``) is deliberately
-        NOT used here — ``graph_enrich.run_graph_enrichment``'s own
+        NOT used here — ``graph_enrich.enrich_graph``'s own
         fail-closed guard (a local mapping that names zero entities for a chunk with real
         content is treated as a classification failure) would otherwise
-        skip the SOTA call entirely for every test in this class before
-        the mocked ``_graph_enrich_with_sota`` is ever reached, the same
+        skip the cloud call entirely for every test in this class before
+        the mocked ``request_graph_enrichment`` is ever reached, the same
         failure mode the docstring above already describes for a
         MagicMock parse failure.
         """
-        from paramem.graph.placeholders import entity_type_to_prefix
+        from paramem.config.taxonomy import entity_type_to_prefix
 
-        def _stub(session_graph, model, tokenizer, transcript="", **kwargs):
+        def _stub(facts, model, tokenizer, transcript="", **kwargs):
+            # ``facts`` is a plain fact-dict list (interface narrowing,
+            # 2026-07-21) — never a ``SessionGraph`` — so names are read
+            # off ``subject``/``object`` keys directly, not ``.relations``.
             names = sorted(
-                {r.subject for r in session_graph.relations}
-                | {r.object for r in session_graph.relations}
+                {str(f.get("subject", "")) for f in facts}
+                | {str(f.get("object", "")) for f in facts}
             )
             mapping: dict[str, str] = {}
             prefix = entity_type_to_prefix("person")
@@ -12503,7 +12506,7 @@ class TestSameAsSpeakerPairGuard:
             return mapping, "stub-anon-transcript", "stub-raw"
 
         monkeypatch.setattr(
-            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            "paramem.cloud.anonymize.anonymize_transcript",
             _stub,
         )
 
@@ -12541,13 +12544,13 @@ class TestSameAsSpeakerPairGuard:
             memory_store=MemoryStore(replay_enabled=True),
             procedural_adapter_config=None,
             output_dir=tmp_path,
-            extraction_noise_filter="anthropic",
-            extraction_noise_filter_model="claude-sonnet-4-6",
+            extraction_enrichment_provider="anthropic",
+            extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
             # Graph-tier enrichment is cloud egress: the shared cloud-admission
             # verdict's first term is the master switch, so it must be ON for
-            # this test to reach a (mocked) SOTA call.
-            sota_enabled=True,
+            # this test to reach a (mocked) cloud call.
+            cloud_enabled=True,
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
         for tier in ("episodic", "semantic", "procedural"):
@@ -12598,10 +12601,10 @@ class TestSameAsSpeakerPairGuard:
         return loop
 
     def test_speaker_id_casing_pair_is_skipped(self, tmp_path, monkeypatch):
-        """SOTA same_as ['speaker0', 'speaker0'] must not contract the speaker node.
+        """Cloud same_as ['speaker0', 'speaker0'] must not contract the speaker node.
 
         Drives the real ``GraphTierRefiner.run_enrichment`` production path
-        with a mocked SOTA response.  Asserts that after processing the
+        with a mocked cloud response.  Asserts that after processing the
         casing-variant pair:
         - result["same_as_merges"] == 0  (no contraction counted)
         - "speaker0" still exists as a distinct node in the graph
@@ -12619,7 +12622,7 @@ class TestSameAsSpeakerPairGuard:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=([], [["speaker0", "speaker0"]], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -12640,10 +12643,10 @@ class TestSameAsSpeakerPairGuard:
         )
 
     def test_distinct_speaker_ids_are_not_merged(self, tmp_path, monkeypatch):
-        """SOTA same_as ['speaker0', 'speaker1'] must NOT merge distinct speakers.
+        """Cloud same_as ['speaker0', 'speaker1'] must NOT merge distinct speakers.
 
         Drives the real ``GraphTierRefiner.run_enrichment`` production
-        path.  speaker0 and speaker1 are distinct enrollments; a SOTA
+        path.  speaker0 and speaker1 are distinct enrollments; a cloud
         same_as proposal must be
         blocked by the generalized speaker-pair guard (both surfaces are speaker ids).
 
@@ -12678,7 +12681,7 @@ class TestSameAsSpeakerPairGuard:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=([], [["speaker0", "speaker1"]], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -12732,7 +12735,7 @@ class TestSameAsSpeakerPairGuard:
         # "Alexander"/"Alex" pass _safe_to_merge_surface (token subset), so the merge
         # is allowed and same_as_merges == 1.
         with patch(
-            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            "paramem.training.graph_enrich.request_graph_enrichment",
             return_value=([], [["Alexander", "Alex"]], "raw", []),
         ):
             result = _refiner_for(loop).run_enrichment()
@@ -14226,17 +14229,17 @@ class TestRunGraphNormalizationApply:
 
 
 # ---------------------------------------------------------------------------
-# SOTA engine wiring in GraphTierRefiner.run_normalization
+# cloud engine wiring in GraphTierRefiner.run_normalization
 # ---------------------------------------------------------------------------
 
 
-class TestRunGraphNormalizationSotaEngine:
-    """``GraphTierRefiner.run_normalization`` SOTA wiring and fail-loud tests.
+class TestRunGraphNormalizationCloudEngine:
+    """``GraphTierRefiner.run_normalization`` cloud wiring and fail-loud tests.
 
     Tests:
-    - SOTA-1: sota_enabled=True + provider + api_key in env → normalize_predicates
-              called with ``sota=`` kwarg, NOT ``model=``.
-    - SOTA-2: sota_enabled=True + provider present but NO api_key in env → local
+    - Cloud-1: cloud_enabled=True + provider + api_key in env → normalize_predicates
+              called with ``cloud=`` kwarg, NOT ``model=``.
+    - Cloud-2: cloud_enabled=True + provider present but NO api_key in env → local
               fallback: normalize_predicates called with ``model=`` kwarg.
     - DBG-1: after retirement, on_normalization receives non-empty raw_outputs list
              and non-empty decisions list.
@@ -14245,7 +14248,7 @@ class TestRunGraphNormalizationSotaEngine:
     """
 
     @staticmethod
-    def _make_loop(tmp_path, *, sota_enabled: bool = False, node_count: int = 15):
+    def _make_loop(tmp_path, *, cloud_enabled: bool = False, node_count: int = 15):
         """Build a minimal ConsolidationLoop for normalization engine tests."""
         import networkx as nx
 
@@ -14262,7 +14265,7 @@ class TestRunGraphNormalizationSotaEngine:
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
             refinement_normalization="on",
-            sota_enabled=sota_enabled,
+            cloud_enabled=cloud_enabled,
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -14295,11 +14298,11 @@ class TestRunGraphNormalizationSotaEngine:
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
 
-        # Extraction pipeline mock — config.noise_filter used for SOTA engine resolution.
+        # Extraction pipeline mock — config.enrichment_provider used for cloud engine resolution.
         ext_mock = MagicMock()
-        ext_mock.config.noise_filter = "anthropic"
-        ext_mock.config.noise_filter_model = "claude-sonnet-4-6"
-        ext_mock.config.noise_filter_endpoint = None
+        ext_mock.config.enrichment_provider = "anthropic"
+        ext_mock.config.enrichment_provider_model = "claude-sonnet-4-6"
+        ext_mock.config.enrichment_provider_endpoint = None
         loop.extraction = ext_mock
 
         merger = GraphMerger(model=None)
@@ -14338,13 +14341,13 @@ class TestRunGraphNormalizationSotaEngine:
 
     _PROMPT_STUB = "dummy {predicates_json}"
 
-    def test_sota_engine_selected_when_enabled_with_api_key(self, tmp_path, monkeypatch):
-        """SOTA-1: sota_enabled=True + provider + env api_key → primitive gets sota=."""
+    def test_cloud_engine_selected_when_enabled_with_api_key(self, tmp_path, monkeypatch):
+        """Cloud-1: cloud_enabled=True + provider + env api_key → primitive gets cloud=."""
 
         from unittest.mock import patch
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-        loop = self._make_loop(tmp_path, sota_enabled=True)
+        loop = self._make_loop(tmp_path, cloud_enabled=True)
         graph = loop.merger.graph
         self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
         self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
@@ -14372,21 +14375,21 @@ class TestRunGraphNormalizationSotaEngine:
         ):
             _refiner_for(loop).run_normalization()
 
-        assert "sota" in captured, (
-            "normalize_predicates must receive sota= kwarg "
-            "when sota_enabled=True and api_key present"
+        assert "cloud" in captured, (
+            "normalize_predicates must receive cloud= kwarg "
+            "when cloud_enabled=True and api_key present"
         )
-        assert "model" not in captured, "model= must NOT be passed when SOTA engine is selected"
-        assert captured["sota"]["provider"] == "anthropic"
-        assert captured["sota"]["api_key"] == "sk-test-key"
+        assert "model" not in captured, "model= must NOT be passed when cloud engine is selected"
+        assert captured["cloud"]["provider"] == "anthropic"
+        assert captured["cloud"]["api_key"] == "sk-test-key"
 
     def test_local_fallback_when_api_key_absent(self, tmp_path, monkeypatch):
-        """SOTA-2: sota_enabled=True but NO api_key → local fallback (model= kwarg)."""
+        """Cloud-2: cloud_enabled=True but NO api_key → local fallback (model= kwarg)."""
         from unittest.mock import patch
 
         # Ensure the env var is absent.
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        loop = self._make_loop(tmp_path, sota_enabled=True)
+        loop = self._make_loop(tmp_path, cloud_enabled=True)
         graph = loop.merger.graph
         self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
         self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
@@ -14416,8 +14419,8 @@ class TestRunGraphNormalizationSotaEngine:
         assert "model" in captured, (
             "normalize_predicates must receive model= kwarg when api_key is absent"
         )
-        assert "sota" not in captured, (
-            "sota= must NOT be passed when api_key is absent (local fallback)"
+        assert "cloud" not in captured, (
+            "cloud= must NOT be passed when api_key is absent (local fallback)"
         )
 
     def test_on_normalization_receives_nonempty_raw_outputs_and_decisions(self, tmp_path):
@@ -14426,7 +14429,7 @@ class TestRunGraphNormalizationSotaEngine:
         import json
         from unittest.mock import patch
 
-        loop = self._make_loop(tmp_path, sota_enabled=False)
+        loop = self._make_loop(tmp_path, cloud_enabled=False)
         graph = loop.merger.graph
         self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
         self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
@@ -14468,7 +14471,7 @@ class TestRunGraphNormalizationSotaEngine:
 
         import pytest
 
-        loop = self._make_loop(tmp_path, sota_enabled=False)
+        loop = self._make_loop(tmp_path, cloud_enabled=False)
         graph = loop.merger.graph
         self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
 
@@ -14662,7 +14665,7 @@ class TestSafePathComponent:
 
 
 # ---------------------------------------------------------------------------
-# Level gating — normalize/enrich booleans for refinement_normalization / sota_enabled
+# Level gating — normalize/enrich booleans for refinement_normalization / cloud_enabled
 # ---------------------------------------------------------------------------
 
 
@@ -14677,7 +14680,11 @@ class TestNormalizationLevelGating:
 
     @staticmethod
     def _make_loop_for_refine(
-        tmp_path, *, refinement_normalization="off", refinement_enrichment="off", sota_enabled=False
+        tmp_path,
+        *,
+        refinement_normalization="off",
+        refinement_enrichment="off",
+        cloud_enabled=False,
     ):
         """Build a minimal loop for _refine_consolidation_graph gating tests."""
         from paramem.graph.merger import GraphMerger
@@ -14693,7 +14700,7 @@ class TestNormalizationLevelGating:
             indexed_key_replay=True,
             refinement_normalization=refinement_normalization,
             refinement_enrichment=refinement_enrichment,
-            sota_enabled=sota_enabled,
+            cloud_enabled=cloud_enabled,
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -14756,7 +14763,7 @@ class TestNormalizationLevelGating:
             loop._refine_consolidation_graph(
                 [],
                 normalize=loop.config.refinement_normalization == "on",
-                enrich=loop.config.refinement_enrichment == "on" and loop.config.sota_enabled,
+                enrich=loop.config.refinement_enrichment == "on" and loop.config.cloud_enabled,
             )
         mock_norm.assert_not_called()
 
@@ -14778,7 +14785,7 @@ class TestNormalizationLevelGating:
             loop._refine_consolidation_graph(
                 [],
                 normalize=loop.config.refinement_normalization == "on",
-                enrich=loop.config.refinement_enrichment == "on" and loop.config.sota_enabled,
+                enrich=loop.config.refinement_enrichment == "on" and loop.config.cloud_enabled,
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_not_called()
@@ -14791,7 +14798,7 @@ class TestNormalizationLevelGating:
             tmp_path,
             refinement_normalization="on",
             refinement_enrichment="on",
-            sota_enabled=True,
+            cloud_enabled=True,
         )
         with (
             patch.object(
@@ -14813,7 +14820,7 @@ class TestNormalizationLevelGating:
             loop._refine_consolidation_graph(
                 [],
                 normalize=loop.config.refinement_normalization == "on",
-                enrich=loop.config.refinement_enrichment == "on" and loop.config.sota_enabled,
+                enrich=loop.config.refinement_enrichment == "on" and loop.config.cloud_enabled,
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_called_once()
@@ -16596,7 +16603,7 @@ class TestCapturePendingRelations:
         """An unrecognised relation_type is replaced with the fallback relation type."""
         import networkx as nx
 
-        from paramem.graph.schema_config import fallback_relation_type
+        from paramem.config.taxonomy import fallback_relation_type
 
         g = nx.MultiDiGraph()
         g.add_edge(
@@ -17914,7 +17921,7 @@ class TestRunFullCycleConsumePending:
         """
         from unittest.mock import patch
 
-        from paramem.server.vram_guard import VramExhausted
+        from paramem.utils.vram_guard import VramExhausted
 
         state = self._make_state(tmp_path)
         loop = state["consolidation_loop"]
@@ -17972,7 +17979,7 @@ class TestRunFullCycleConsumePending:
         state = self._make_state(tmp_path)
         loop = state["consolidation_loop"]
         loop.extract_session.side_effect = ExtractionFailed(
-            "sota_enrich", "upstream 529 overloaded"
+            "cloud_enrich", "upstream 529 overloaded"
         )
 
         sb = state["session_buffer"]

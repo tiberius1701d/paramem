@@ -590,7 +590,7 @@ fmt_device() {
 # Three cloud_only states are distinguished by colour because they have
 # different privacy and operational semantics:
 #   - explicit (RED)      = operator hard-config (cloud_only=true OR --cloud-only).
-#                           Personal data EGRESSES to SOTA on every query;
+#                           Personal data EGRESSES to cloud on every query;
 #                           auto-reclaim disabled; permanent until operator
 #                           changes config.
 #   - training (YELLOW)   = transient. BG-trainer holds the GPU; auto-reclaim
@@ -603,7 +603,7 @@ if [[ "$mode" == "local" ]]; then
 elif [[ "$mode" == "cloud-only" ]]; then
     case "$cloud_only_reason" in
         explicit)
-            mode_display="${RED}CLOUD-ONLY${RESET} (hard config — cloud_only=true; personal data egresses to SOTA on every query)"
+            mode_display="${RED}CLOUD-ONLY${RESET} (hard config — cloud_only=true; personal data egresses to cloud on every query)"
             ;;
         training)
             mode_display="${YELLOW}CLOUD-ONLY${RESET} (transient — deferred for training, auto-reclaim enabled)"

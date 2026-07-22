@@ -4,8 +4,7 @@ import logging
 
 import anthropic
 
-from paramem.server.cloud.base import CloudAgent, CloudResponse
-from paramem.server.config import CloudAgentConfig
+from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig, CloudResponse
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class AnthropicAgent(CloudAgent):
             "model": self.config.model,
             "messages": messages,
             "max_tokens": 1024,
-            # Pin to 0 for the structured-output paths (SOTA enrichment emits
+            # Pin to 0 for the structured-output paths (cloud enrichment emits
             # JSON triples; CLAUDE.md invariant: temperature=0.0 for JSON/QA/
             # distillation).  Anthropic's default is 1.0 when omitted, which
             # was the source of run-to-run variance in graph extraction.
@@ -83,7 +82,7 @@ class AnthropicAgent(CloudAgent):
     def format_tools(self, tools: list[dict]) -> list[dict]:
         """Convert standard tool definitions to Anthropic format.
 
-        Not used for SOTA reasoning path (no tools), but required by ABC.
+        Not used for cloud reasoning path (no tools), but required by ABC.
         """
         return [
             {

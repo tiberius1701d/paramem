@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from paramem.backup.types import FatalConfigError
+from paramem.cloud.providers.base import CloudAgentConfig
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -525,18 +526,6 @@ class PathsConfig:
 
 
 @dataclass
-class CloudAgentConfig:
-    """Configuration for a cloud (SOTA) agent."""
-
-    enabled: bool = False
-    provider: str = "openai"  # openai, anthropic, google, groq
-    model: str = ""
-    api_key: str = field(default="", repr=False)
-    endpoint: str = ""  # optional custom endpoint (for Groq, ollama, etc.)
-    timeout_seconds: float = 90.0  # request timeout per call to this provider's API
-
-
-@dataclass
 class HAToolsConfig:
     """Configuration for HA-proxied tool execution."""
 
@@ -589,14 +578,14 @@ class SanitizationConfig:
       whether ``sanitize_for_cloud`` flags personal-marker queries and
       whether it null-returns them so callers suppress the cloud call.
 
-    * ``cloud_mode`` — egress policy for direct SOTA escalation
+    * ``cloud_mode`` — egress policy for direct cloud escalation
       (block / anonymize / both):
 
-        - ``block``     — PERSONAL queries dropped before SOTA;
+        - ``block``     — PERSONAL queries dropped before cloud;
           non-PERSONAL sent verbatim.  Smallest cloud surface, zero
           anonymizer cost.  Default.
         - ``anonymize`` — cloud-bound text is anonymized via the local
-          LLM (categories set by ``scrub``), sent to SOTA as
+          LLM (categories set by ``scrub``), sent to cloud as
           placeholders, and de-anonymized on return.  PERSONAL queries
           reach cloud as redacted text.
         - ``both``      — strictest privacy posture.  PERSONAL blocked
@@ -1034,11 +1023,11 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # retention parity confirmed in production conditions.
     recall_probe_batch_size: int = 16
     # Output token budget — drives every LLM call in the extraction pipeline
-    # (local extract, anonymize, SOTA enrich, deanon) and every direct
+    # (local extract, anonymize, cloud enrich, deanon) and every direct
     # response across modes.
     extraction_max_tokens: int = 8192
     # Plausibility-stage cap, separately configurable so an operator can
-    # tighten it under VRAM pressure without dragging SOTA enrichment down
+    # tighten it under VRAM pressure without dragging cloud enrichment down
     # too. Default tracks the unified ``extraction_max_tokens`` budget —
     # observed PII-attribute capture (email/phone/linkedin) is more reliable
     # at the larger cap. Tighten (e.g. to 4096) only when the WSL2 host
@@ -1052,9 +1041,11 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # production. Server short-circuits with 503 when a real consolidation
     # cycle is running so calibration calls cannot race against the model.
     calibrate_endpoint_enabled: bool = False
-    extraction_noise_filter: str = ""  # SOTA provider for noise filtering ("" = disabled)
-    extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering
-    extraction_noise_filter_endpoint: str = ""  # custom endpoint for OpenAI-compatible providers
+    extraction_enrichment_provider: str = ""  # cloud provider for enrichment ("" = disabled)
+    # model for the enrichment provider
+    extraction_enrichment_provider_model: str = "claude-sonnet-4-6"
+    # custom endpoint for OpenAI-compatible providers
+    extraction_enrichment_provider_endpoint: str = ""
     training_temp_limit: int = 0  # GPU temp ceiling for background training (0 = disabled)
     training_temp_check_interval: int = 5  # check temp every N training steps
     # Quiet-hours policy: schedules when the thermal throttle is active.
@@ -1074,7 +1065,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # Plausibility filter: final quality gate on extracted facts.
     #   "auto" → local judge at deanon stage (zero cloud cost, privacy-safe)
     #   "off"  → disable plausibility entirely (not recommended)
-    #   a provider name from paramem.utils.cloud_admission.PROVIDER_KEY_ENV
+    #   a provider name from paramem.cloud.admission.PROVIDER_KEY_ENV
     #     (e.g. "anthropic") → cloud judge at anon stage (paid, runs on
     #     anonymized data only, model/endpoint from the two keys below).
     #     IMPORTANT: use stage="anon" with any
@@ -1115,7 +1106,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # entity_similarity_threshold mirrors GraphConfig (paramem/utils/config.py);
     # bridged into GraphMerger construction via ServerConfig.graph_config.
     entity_similarity_threshold: float = 85.0
-    # --- Graph-level SOTA enrichment neighborhood knobs ---
+    # --- Graph-level cloud enrichment neighborhood knobs ---
     graph_enrichment_neighborhood_hops: int = 2
     graph_enrichment_max_entities_per_pass: int = 50
     # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
@@ -1160,7 +1151,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     def __post_init__(self) -> None:
         """Validate privacy-critical and ingestion-critical config combinations.
 
-        Raises ValueError if a cloud SOTA provider is configured as the
+        Raises ValueError if a cloud cloud provider is configured as the
         plausibility judge AND the stage is set to "deanon". That combination
         would send real (de-anonymized) names to a cloud API, violating the
         privacy guarantee. Yaml comments alone are insufficient enforcement.
@@ -1614,7 +1605,7 @@ class ServerConfig:
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
     model_name: str = "mistral"
     debug: bool = True
-    # cloud_only: route every query to the configured SOTA agent instead of the
+    # cloud_only: route every query to the configured cloud agent instead of the
     # local parametric-memory model.  Routing only — extraction and consolidation
     # continue to run.  Combined with the --cloud-only CLI flag via OR: either
     # source being True enables cloud-only mode.  See configs/server.yaml for the
@@ -1630,8 +1621,8 @@ class ServerConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
-    sota_agent: CloudAgentConfig = field(default_factory=CloudAgentConfig)
-    sota_providers: dict[str, CloudAgentConfig] = field(default_factory=dict)
+    cloud_agent: CloudAgentConfig = field(default_factory=CloudAgentConfig)
+    cloud_providers: dict[str, CloudAgentConfig] = field(default_factory=dict)
     ha_agent_id: str = ""  # HA conversation agent for escalation; empty disables HA escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
@@ -1756,7 +1747,7 @@ class ServerConfig:
     def consolidation_config(self) -> ConsolidationConfig:
         """Build ConsolidationConfig for ConsolidationLoop.
 
-        New flat knobs (sota_enabled, refinement_enrichment, refinement_normalization,
+        New flat knobs (cloud_enabled, refinement_enrichment, refinement_normalization,
         refinement_contradiction) are threaded through here so ConsolidationLoop
         reads them from config rather than from direct attribute access.
         """
@@ -1764,7 +1755,7 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
-            sota_enabled=self.consolidation.sota_enabled,
+            cloud_enabled=self.consolidation.cloud_enabled,
             refinement_enrichment=self.consolidation.refinement_enrichment,
             refinement_normalization=self.consolidation.refinement_normalization,
             refinement_contradiction=self.consolidation.refinement_contradiction,
@@ -2021,16 +2012,16 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
     agents_raw = raw.get("agents", {})
     config.ha_agent_id = agents_raw.get("ha_agent_id", "")
 
-    # SOTA agent — high-capability model for reasoning queries
-    sota_raw = agents_raw.get("sota", {})
-    if sota_raw:
-        config.sota_agent = CloudAgentConfig(**sota_raw)
+    # cloud agent — high-capability model for reasoning queries
+    cloud_raw = agents_raw.get("cloud", {})
+    if cloud_raw:
+        config.cloud_agent = CloudAgentConfig(**cloud_raw)
 
-    # Additional SOTA providers for direct routing (sota:anthropic, sota:openai, etc.)
-    sota_providers_raw = agents_raw.get("sota_providers", {})
-    for name, provider_raw in sota_providers_raw.items():
+    # Additional cloud providers for direct routing (cloud:anthropic, cloud:openai, etc.)
+    cloud_providers_raw = agents_raw.get("cloud_providers", {})
+    for name, provider_raw in cloud_providers_raw.items():
         if isinstance(provider_raw, dict):
-            config.sota_providers[name] = CloudAgentConfig(**provider_raw)
+            config.cloud_providers[name] = CloudAgentConfig(**provider_raw)
 
     # Tools
     tools_raw = raw.get("tools", {})

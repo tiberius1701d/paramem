@@ -9,19 +9,17 @@ import logging
 
 import httpx
 
-from paramem.server.cloud.base import CloudAgent, CloudResponse, ToolCall
-from paramem.server.config import CloudAgentConfig
+from paramem.cloud.admission import OPENAI_COMPAT_ENDPOINTS, OPENAI_COMPAT_PROVIDERS
+from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig, CloudResponse, ToolCall
 
 logger = logging.getLogger(__name__)
 
-# Default endpoints per provider
-_DEFAULT_ENDPOINTS = {
-    "openai": "https://api.openai.com/v1/chat/completions",
-    "groq": "https://api.groq.com/openai/v1/chat/completions",
-}
-
-# Providers known to be OpenAI-compatible
-COMPATIBLE_PROVIDERS = {"openai", "groq", "mistral", "ollama"}
+# Providers known to be OpenAI-compatible. Sourced from
+# ``paramem.cloud.admission`` — the ONE provider registry — rather than a
+# second, locally-maintained set: this table used to omit ``mistral``
+# while carrying it in ``COMPATIBLE_PROVIDERS`` below, so a
+# ``provider: mistral`` agent with no explicit endpoint POSTed to ``""``.
+COMPATIBLE_PROVIDERS = OPENAI_COMPAT_PROVIDERS
 
 
 class OpenAICompatAgent(CloudAgent):
@@ -29,7 +27,7 @@ class OpenAICompatAgent(CloudAgent):
 
     def __init__(self, config: CloudAgentConfig):
         super().__init__(config)
-        self._endpoint = config.endpoint or _DEFAULT_ENDPOINTS.get(config.provider, "")
+        self._endpoint = config.endpoint or OPENAI_COMPAT_ENDPOINTS.get(config.provider, "")
         if not self._endpoint:
             logger.warning(
                 "No endpoint for provider '%s'. Set endpoint in config.", config.provider

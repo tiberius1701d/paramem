@@ -201,7 +201,7 @@ def _make_probe_state(*, mode: str = "cloud-only") -> dict:
         "speaker_store": store,
         "router": MagicMock(),
         "ha_client": None,
-        "sota_agent": None,
+        "cloud_agent": None,
         "model": MagicMock(),
         "tokenizer": MagicMock(),
         "memory_store": MagicMock(),

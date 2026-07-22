@@ -18,6 +18,7 @@ from typing import Callable, Literal, Optional
 import torch
 from torch.utils.data import Dataset
 
+from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.merger import GraphMerger
 from paramem.graph.phase_trace import extraction_trace, phase_trace
@@ -26,7 +27,6 @@ from paramem.graph.relation_prep import (
     partition_relations,
 )
 from paramem.graph.schema import Relation, SessionGraph
-from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.entry import (
     assign_keys,
     build_registry,
@@ -35,7 +35,6 @@ from paramem.memory.entry import (
 )
 from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.fold_telemetry import record_fold_telemetry
-from paramem.server.vram_guard import safe_empty_cache
 from paramem.training import graph_tier
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.thermal_throttle import ThermalPolicy
@@ -48,12 +47,13 @@ from paramem.utils.config import (
     WandbConfig,
 )
 from paramem.utils.identity import canonical
+from paramem.utils.vram_guard import safe_empty_cache
 
 logger = logging.getLogger(__name__)
 
 # Frozen set of valid relation types drawn from the single source of truth in
-# schema_config so that the stage-2 clamp stays in sync with the Pydantic
-# Relation schema (_RelationType = Literal[relation_types()]).
+# paramem.config.taxonomy so that the stage-2 clamp stays in sync with the
+# Pydantic Relation schema (_RelationType = Literal[relation_types()]).
 _VALID_RTYPES: frozenset[str] = frozenset(relation_types())
 _FALLBACK_RTYPE: str = fallback_relation_type()
 
@@ -263,7 +263,7 @@ class FoldScope:
             for the interim slot (new-entry tracking); ``False`` for the full fold.
         normalize: When ``True``, run the whole-graph normalization pass via
             :meth:`~ConsolidationLoop._refine_consolidation_graph`.
-        enrich: When ``True``, run SOTA graph enrichment via
+        enrich: When ``True``, run cloud graph enrichment via
             :meth:`~ConsolidationLoop._refine_consolidation_graph`.
         promote: When ``True``, call
             :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
@@ -378,9 +378,9 @@ class ConsolidationLoop:
         run_id: str | None = None,
         prompts_dir: str | Path | None = None,
         model_name: str | None = None,
-        extraction_noise_filter: str = "",
-        extraction_noise_filter_model: str = "claude-sonnet-4-6",
-        extraction_noise_filter_endpoint: str | None = None,
+        extraction_enrichment_provider: str = "",
+        extraction_enrichment_provider_model: str = "claude-sonnet-4-6",
+        extraction_enrichment_provider_endpoint: str | None = None,
         extraction_plausibility_judge: str = "auto",
         extraction_plausibility_stage: str = "deanon",
         extraction_plausibility_model: str = "claude-sonnet-4-6",
@@ -388,7 +388,7 @@ class ConsolidationLoop:
         extraction_scrub: set[str] | frozenset[str],
         extraction_correction_entity_types: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
-        sota_enabled: bool = False,
+        cloud_enabled: bool = False,
         graph_enrichment_neighborhood_hops: int = 2,
         graph_enrichment_max_entities_per_pass: int = 50,
         state_provider=None,
@@ -458,8 +458,8 @@ class ConsolidationLoop:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Extraction pipeline — the single chokepoint for ``extract_graph`` /
-        # ``extract_procedural_graph``.  Owns the 12 SOTA-pipeline tunables
-        # (temperature, max_tokens, anonymizer / noise_filter / plausibility /
+        # ``extract_procedural_graph``.  Owns the 12 cloud-pipeline tunables
+        # (temperature, max_tokens, anonymizer / enrichment_provider / plausibility /
         # scrub categories, etc.) sourced from the ``extraction_*``
         # ConsolidationLoop kwargs.  Every consolidation call site reaches the
         # extractors through ``self.extraction.run`` / ``run_procedural`` —
@@ -484,22 +484,22 @@ class ConsolidationLoop:
                 temperature=extraction_temperature,
                 max_tokens=extraction_max_tokens,
                 plausibility_max_tokens=extraction_plausibility_max_tokens,
-                noise_filter=extraction_noise_filter,
-                noise_filter_model=extraction_noise_filter_model,
-                noise_filter_endpoint=extraction_noise_filter_endpoint,
+                enrichment_provider=extraction_enrichment_provider,
+                enrichment_provider_model=extraction_enrichment_provider_model,
+                enrichment_provider_endpoint=extraction_enrichment_provider_endpoint,
                 plausibility_judge=extraction_plausibility_judge,
                 plausibility_stage=extraction_plausibility_stage,
                 plausibility_model=extraction_plausibility_model,
                 plausibility_endpoint=extraction_plausibility_endpoint,
                 scrub=extraction_scrub,
                 correction_entity_types=extraction_correction_entity_types,
-                sota_enabled=sota_enabled,
+                cloud_enabled=cloud_enabled,
             ),
             prompts_dir=prompts_dir,
             model_name=model_name,
         )
 
-        # Graph-level SOTA enrichment knobs (Task #10).
+        # Graph-level cloud enrichment knobs (Task #10).
         self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
         self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
 
@@ -1099,9 +1099,9 @@ class ConsolidationLoop:
         session_id: str,
         speaker_id: str,
         speaker_name: str | None = None,
-        noise_filter: str | None = None,
-        noise_filter_model: str | None = None,
-        noise_filter_endpoint: str | None = None,
+        enrichment_provider: str | None = None,
+        enrichment_provider_model: str | None = None,
+        enrichment_provider_endpoint: str | None = None,
         plausibility_judge: str | None = None,
         plausibility_stage: str | None = None,
         source_type: str = "transcript",
@@ -1160,9 +1160,9 @@ class ConsolidationLoop:
                 extraction_input,
                 session_id,
                 source_type=source_type,
-                noise_filter=noise_filter,
-                noise_filter_model=noise_filter_model,
-                noise_filter_endpoint=noise_filter_endpoint,
+                enrichment_provider=enrichment_provider,
+                enrichment_provider_model=enrichment_provider_model,
+                enrichment_provider_endpoint=enrichment_provider_endpoint,
                 speaker_name=speaker_name,
                 speaker_id=speaker_id,
                 plausibility_judge=plausibility_judge,
@@ -2097,7 +2097,7 @@ class ConsolidationLoop:
            keying surface (pending-session relations from ``merger.graph`` are
            passed as ``extra_relations`` so they survive the graph reset).
         8c. Refine: call :meth:`_refine_consolidation_graph` with
-           ``enrich=(refinement_enrichment=="on" and sota_enabled)`` so SOTA
+           ``enrich=(refinement_enrichment=="on" and cloud_enabled)`` so cloud
            enrichment is gated.  The recurrence-bump runs at every level.
         9. Build interim key list via graph-walk (episodic + procedural entries).
            The interim slot holds BOTH factual (episodic) and preference
@@ -2273,7 +2273,7 @@ class ConsolidationLoop:
                 defer=True,
                 tag_new=True,
                 normalize=False,  # normalization is full-fold only
-                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
+                enrich=(self.config.refinement_enrichment == "on" and self.config.cloud_enabled),
                 promote=False,
                 tier_floor=False,
                 subtractive_scope="interim",
@@ -2389,7 +2389,7 @@ class ConsolidationLoop:
         """Resolve the live :class:`ExtractionConfig` off the extraction pipeline.
 
         Handed to the graph tier (:class:`~paramem.training.graph_tier.GraphTierRefiner`
-        and :func:`~paramem.training.graph_enrich.run_graph_enrichment`) as a
+        and :func:`~paramem.training.graph_enrich.enrich_graph`) as a
         bound method rather than a resolved value, so the read happens only on
         the paths that actually consume the config — all of which sit past
         those passes' ``no_model``/``floor`` skips.
@@ -4590,7 +4590,9 @@ class ConsolidationLoop:
                     defer=False,
                     tag_new=False,
                     normalize=(self.config.refinement_normalization == "on"),
-                    enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
+                    enrich=(
+                        self.config.refinement_enrichment == "on" and self.config.cloud_enabled
+                    ),
                     promote=False,
                     tier_floor=False,
                     subtractive_scope="fold",
@@ -4620,7 +4622,7 @@ class ConsolidationLoop:
                 defer=False,
                 tag_new=False,
                 normalize=(self.config.refinement_normalization == "on"),
-                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
+                enrich=(self.config.refinement_enrichment == "on" and self.config.cloud_enabled),
                 promote=True,
                 tier_floor=True,
                 subtractive_scope="fold",
@@ -4730,7 +4732,7 @@ class ConsolidationLoop:
         **One pass, two branches per edge:**
 
         Keyless edges (no ``ik_key`` on the edge attribute, i.e. newly-extracted or
-        SOTA-enrichment facts):
+        Cloud-enrichment facts):
             - A key is minted via :meth:`_mint_keyed_entries` using a local running
               counter seeded from ``_indexed_next_index`` / ``_procedural_next_index``
               (the real counters are never touched until the write is committed).
@@ -4875,7 +4877,7 @@ class ConsolidationLoop:
                     _subj_sid = _node_attrs.get("speaker_id", "") or ""
                     if not _subj_sid and _t_data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment":
                         # FALLBACK-ONLY (enrichment edges only): subject node carries no
-                        # speaker_id and this edge is a SOTA-enrichment edge.  Inherit
+                        # speaker_id and this edge is a cloud-enrichment edge.  Inherit
                         # from the subject's UNIQUE non-empty speaker predecessor (1-hop,
                         # direct in-edges).  Exactly one distinct speaker → use it;
                         # zero or ≥2 → keep "".
@@ -5665,7 +5667,7 @@ class ConsolidationLoop:
            ``normalize`` / ``enrich`` flags.  ``refine()`` runs the whole-graph
            local-model normalization pass (predicate alignment + entity merge +
            predicate-synonym normalization) when ``normalize`` is ``True``, then
-           SOTA graph enrichment (additive second-order discovery) when
+           Cloud graph enrichment (additive second-order discovery) when
            ``enrich`` is ``True`` — normalization first, so enrichment sees the
            already-normalized graph. Constructed fresh on every call, never
            cached: ``self.model`` is re-wrapped by adapter operations elsewhere
@@ -5706,10 +5708,10 @@ class ConsolidationLoop:
                 normalization pass.
                 Callers pass ``normalize=scope.normalize``.
                 Default ``False``.
-            enrich: When ``True``, run cloud-SOTA graph enrichment (additive
+            enrich: When ``True``, run cloud-cloud graph enrichment (additive
                 discovery).  Callers pass ``enrich=scope.enrich`` (the
                 scope field is set at construction to
-                ``refinement_enrichment=="on" and sota_enabled``).
+                ``refinement_enrichment=="on" and cloud_enabled``).
                 Default ``False``.
         """
         refiner = graph_tier.GraphTierRefiner(
@@ -5717,7 +5719,7 @@ class ConsolidationLoop:
             model=self.model,
             tokenizer=self.tokenizer,
             extraction_config_provider=self._current_extraction_config,
-            sota_enabled=self.config.sota_enabled,
+            cloud_enabled=self.config.cloud_enabled,
             neighborhood_hops=self.graph_enrichment_neighborhood_hops,
             max_entities_per_pass=self.graph_enrichment_max_entities_per_pass,
             gc_disable=self._disable_gradient_checkpointing,

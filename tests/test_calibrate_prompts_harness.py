@@ -247,7 +247,7 @@ class TestPostStageAuth:
 class TestAnonymizeStageSpeakerName:
     """``--speaker`` must reach the
     ``/calibrate/anonymize`` request payload, not just
-    ``/calibrate/extract`` — production's ``anonymize_for_cloud`` always
+    ``/calibrate/extract`` — production's ``anonymize`` always
     threads the runtime-known speaker name into speaker-name seeding;
     omitting it here silently diverges calibration fidelity from
     production and can leave the speaker's real name un-scrubbed before
@@ -393,7 +393,7 @@ class TestSeedFromEnrichLoading:
 
     def test_anon_facts_pass_through_to_enrich_payload(self, tmp_path: Path):
         """``/calibrate/anonymize``'s ``anon_facts`` — now fully assembled
-        SERVER-side by ``anonymize_for_cloud`` — is fed STRAIGHT THROUGH
+        SERVER-side by ``anonymize`` — is fed STRAIGHT THROUGH
         to ``/calibrate/enrich``; there is no client-side re-derivation
         from ``01_extract_chunk_0.json``'s graph any more (that whole
         primitive-import + table-build + fact-build block was deleted).
@@ -464,7 +464,8 @@ class TestSeedFromEnrichLoading:
     def test_status_failed_aborts_without_a_cloud_call(self, tmp_path: Path):
         """``status == "failed"`` (anonymizer parse failure) must abort
         the chunk's enrich stage — no cloud call — matching production's
-        fail-closed abort-on-``"failed"`` in ``_sota_pipeline``.
+        fail-closed abort-on-``"failed"`` in the ``anonymize`` stage
+        (``paramem.graph.stage_anonymize``).
 
         Mutation: drop the ``status == "failed"`` gate -> the failure is
         silently treated as "proceed" and ``/calibrate/enrich`` (the

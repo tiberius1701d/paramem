@@ -4,7 +4,7 @@ Anchored on runtime ground truth, not lexical patterns:
 
 * The speaker's **known entities** (the router's entity index plus the speaker
   store's enrolled names) are the source of truth for what counts as personal.
-  Detection reuses :func:`~paramem.graph.placeholders._substitute_whole_words`
+  Detection reuses :func:`~paramem.cloud.placeholders._substitute_whole_words`
   — the SAME edge-aware, case-sensitive substitution primitive the
   cloud-egress anonymizer builds its forward map through.  Substitution
   replacing anything means the text contained a personal reference.
@@ -26,7 +26,7 @@ Modes: ``off`` / ``warn`` / ``block``.
 
 import logging
 
-from paramem.graph.placeholders import _substitute_whole_words
+from paramem.cloud.placeholders import _substitute_whole_words
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def _query_paraphrases_entity(
     personal just because some indexed entity contains "system".
 
     Single-content-token entity names (e.g. ``"Alice"``) are already
-    fully covered by :func:`~paramem.graph.placeholders._substitute_whole_words`'s
+    fully covered by :func:`~paramem.cloud.placeholders._substitute_whole_words`'s
     word-boundary primitive in :func:`check_personal_content`, so this function
     returns False for any entity whose content-token count is below
     ``min_overlap``.  Substring (not word-boundary) is the deliberate
@@ -167,7 +167,7 @@ def _query_paraphrases_entity(
 
 def _build_known_entity_mapping(known_entities: set[str] | None) -> dict[str, str]:
     """Build a name → opaque-placeholder mapping for
-    :func:`~paramem.graph.placeholders._substitute_whole_words`.
+    :func:`~paramem.cloud.placeholders._substitute_whole_words`.
 
     Placeholders are unique per known entity so the comparison
     ``anonymized != original`` reliably detects matches.  The actual
@@ -235,7 +235,7 @@ def check_personal_content(
 
     * **Known-entity scrub** — the speaker's known entities (the router's
       entity index plus enrolled speaker names) are substituted via
-      :func:`~paramem.graph.placeholders._substitute_whole_words`.
+      :func:`~paramem.cloud.placeholders._substitute_whole_words`.
       Substitution anywhere → personal.  Exact-case, whole-word: the
       producers hand real-case display surfaces and the raw query text is
       matched against them unmodified.  Already language-agnostic (entity

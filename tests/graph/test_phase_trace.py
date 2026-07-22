@@ -60,7 +60,7 @@ class TestPhaseTraceContract:
     def test_outcome_skipped_with_reason(self):
         graph = _empty_graph()
         with extraction_trace() as trace:
-            with phase_trace("sota_enrich") as t:
+            with phase_trace("cloud_enrich") as t:
                 t.set_outcome("skipped", reason="no API key")
             trace.attach_to(graph)
         phases = get_phases(graph)
@@ -154,7 +154,7 @@ class TestPhaseTraceOrdering:
     def test_phases_appear_in_firing_order(self):
         graph = _empty_graph()
         with extraction_trace() as trace:
-            for name in ("local_extract", "anonymize", "sota_enrich", "deanon"):
+            for name in ("local_extract", "anonymize", "cloud_enrich", "deanon"):
                 with phase_trace(name):
                     pass
             trace.attach_to(graph)
@@ -162,7 +162,7 @@ class TestPhaseTraceOrdering:
         assert [p.name for p in phases] == [
             "local_extract",
             "anonymize",
-            "sota_enrich",
+            "cloud_enrich",
             "deanon",
         ]
 
@@ -226,9 +226,9 @@ class TestRecordPrompt:
     def test_record_prompt_outside_active_scope_is_noop(self):
         """No active phase_trace scope: record_prompt must no-op, never
         raise. Two real production call paths run the prompt loader with
-        no phase scope open — ``anonymize_with_local_model`` reached from
-        ``extract_and_anonymize_for_cloud`` (the live chat egress,
-        extractor.py:1108) and from ``paramem.training.consolidation``
+        no phase scope open — ``anonymize_transcript`` reached from
+        ``anonymize_turn`` (the live chat egress,
+        ``paramem.graph.flows``) and from ``paramem.training.consolidation``
         (consolidation.py:2739) — so this must never become a raise the
         way phase_trace's own missing-scope case is."""
         from paramem.graph.phase_trace import _ACTIVE_SCOPE
@@ -412,7 +412,7 @@ class TestExtractGraphStopPhase:
     def test_stop_phase_local_extract_skips_everything_after(self, monkeypatch):
         from unittest.mock import MagicMock
 
-        from paramem.graph.extractor import extract_graph
+        from paramem.graph.flows import extract_graph
 
         # Mistral output: minimal valid JSON the parser accepts.
         monkeypatch.setattr(
@@ -434,7 +434,7 @@ class TestExtractGraphStopPhase:
                 session_id="test-stop-phase",
                 speaker_id="speaker0",
                 speaker_name="Alex",
-                validate=False,  # don't try the SOTA pipeline
+                validate=False,  # don't try the cloud pipeline
                 scrub={"person name"},
             )
 
@@ -460,7 +460,7 @@ class TestExtractGraphStopPhase:
         the stub."""
         from unittest.mock import MagicMock
 
-        from paramem.graph.extractor import extract_graph
+        from paramem.graph.flows import extract_graph
 
         monkeypatch.setattr(
             "paramem.graph.extractor._generate_extraction",
@@ -500,7 +500,7 @@ class TestExtractGraphStopPhase:
         must BOTH survive in the returned graph."""
         from unittest.mock import MagicMock
 
-        from paramem.graph.extractor import extract_graph
+        from paramem.graph.flows import extract_graph
 
         def _pass1(*a, **kw):
             return (
@@ -609,7 +609,7 @@ class TestStopAt:
 
     def test_soft_failed_outcome_does_not_set_chain_stopped(self):
         """A phase that finishes normally (no exception) but calls
-        ``t.set_outcome("failed", ...)`` — e.g. a SOTA call returning
+        ``t.set_outcome("failed", ...)`` — e.g. a cloud call returning
         ``None`` — must NOT be mistaken for the requested stop point."""
         with stop_at("anon_plausibility"):
             with phase_trace("anon_plausibility") as t:

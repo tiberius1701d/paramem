@@ -339,7 +339,7 @@ def chunk_pdf_file(
     Reads each page with :meth:`pypdf.PageObject.extract_text`, coalesces
     consecutive short pages (below ``min_tokens`` words) into larger sections,
     and then splits any section above ``max_tokens`` words at sentence
-    boundaries (so a chunk never cuts mid-sentence — important for SOTA
+    boundaries (so a chunk never cuts mid-sentence — important for cloud
     enrichment context that depends on resolving "scaling teams from 15
     to 100+ engineers" as one fact, not two halves).
 
@@ -425,7 +425,7 @@ def chunk_pdf_file(
         raise EmptyDocumentError(f"PDF contains no extractable text after filtering: {path}")
 
     # Apply max_tokens cap with sentence-aware splitting: oversize sections
-    # are broken at sentence boundaries so SOTA enrichment never sees a
+    # are broken at sentence boundaries so cloud enrichment never sees a
     # truncated antecedent.
     final_sections: list[str] = []
     for section in sections:

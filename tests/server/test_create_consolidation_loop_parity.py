@@ -43,7 +43,7 @@ SCENARIOS = [
             "model_name": "mistral",
             "consolidation.max_epochs": 20,
             "consolidation.indexed_key_replay": True,
-            "consolidation.extraction_noise_filter": "",
+            "consolidation.extraction_enrichment_provider": "",
             "consolidation.extraction_plausibility_judge": "off",
             "adapters.procedural.enabled": False,
         },
@@ -61,7 +61,7 @@ SCENARIOS = [
             "consolidation.max_epochs": 10,
             "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
-            "consolidation.extraction_noise_filter": "",
+            "consolidation.extraction_enrichment_provider": "",
             "consolidation.extraction_plausibility_judge": "off",
             "adapters.episodic.rank": 8,
             "adapters.episodic.alpha": 16,
@@ -88,10 +88,10 @@ SCENARIOS = [
             "consolidation.max_epochs": 10,
             "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
-            "consolidation.extraction_noise_filter": "anthropic",
-            "consolidation.extraction_noise_filter_model": "claude-sonnet-4-6",
+            "consolidation.extraction_enrichment_provider": "anthropic",
+            "consolidation.extraction_enrichment_provider_model": "claude-sonnet-4-6",
             "consolidation.extraction_plausibility_judge": "off",
-            "consolidation.sota_enabled": True,
+            "consolidation.cloud_enabled": True,
             "consolidation.graph_enrichment_neighborhood_hops": 1,
             "consolidation.graph_enrichment_max_entities_per_pass": 400,
             "adapters.episodic.rank": 8,
@@ -184,7 +184,7 @@ def test_factory_threads_every_config_knob(
 
     # --- Graph and enrichment knobs ---
     assert captured["graph_config"] == cfg.graph_config
-    assert captured["sota_enabled"] == cfg.consolidation.sota_enabled
+    assert captured["cloud_enabled"] == cfg.consolidation.cloud_enabled
     assert (
         captured["graph_enrichment_neighborhood_hops"]
         == cfg.consolidation.graph_enrichment_neighborhood_hops
@@ -194,13 +194,17 @@ def test_factory_threads_every_config_knob(
         == cfg.consolidation.graph_enrichment_max_entities_per_pass
     )
     # --- Extraction knobs ---
-    assert captured["extraction_noise_filter"] == cfg.consolidation.extraction_noise_filter
     assert (
-        captured["extraction_noise_filter_model"] == cfg.consolidation.extraction_noise_filter_model
+        captured["extraction_enrichment_provider"]
+        == cfg.consolidation.extraction_enrichment_provider
     )
     assert (
-        captured["extraction_noise_filter_endpoint"]
-        == cfg.consolidation.extraction_noise_filter_endpoint
+        captured["extraction_enrichment_provider_model"]
+        == cfg.consolidation.extraction_enrichment_provider_model
+    )
+    assert (
+        captured["extraction_enrichment_provider_endpoint"]
+        == cfg.consolidation.extraction_enrichment_provider_endpoint
     )
     assert (
         captured["extraction_plausibility_judge"] == cfg.consolidation.extraction_plausibility_judge

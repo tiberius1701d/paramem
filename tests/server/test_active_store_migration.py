@@ -1452,7 +1452,7 @@ class TestNegativeCouplingGuard:
         module's own vocabulary), which is not the situation here.
         """
         src = self._module_source()
-        for banned in ("graph_tier", "graph_enrich", "run_graph_enrichment"):
+        for banned in ("graph_tier", "graph_enrich", "enrich_graph"):
             assert banned not in src, (
                 f"{banned!r} must not appear in active_store_migration.py — "
                 "migration must not reach into the consolidation fold's tier refiner"

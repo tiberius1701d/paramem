@@ -133,10 +133,10 @@ def _run_one(
     speaker_name: str,
     scrub: set[str],
 ) -> tuple[str, dict, str]:
-    from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
-    from paramem.graph.extractor import extract_and_anonymize_for_cloud
+    from paramem.cloud.deanonymize import CloudScope, deanonymize_text
+    from paramem.graph.flows import anonymize_turn
 
-    payload = extract_and_anonymize_for_cloud(
+    payload = anonymize_turn(
         transcript,
         model,
         tokenizer,
@@ -151,8 +151,8 @@ def _run_one(
         # (status == "ok", forward == {}) is no longer misclassified as a
         # failure — CLAUDE.md forbids truthiness checks on registries.
         return payload.anon_transcript or "", dict(payload.forward), ""
-    scope = CloudScope.for_response(payload, sota_bindings=None, sent=(payload.anon_transcript,))
-    round_trip = deanonymize_response_text(scope, payload.anon_transcript)
+    scope = CloudScope.response(payload, cloud_bindings=None, sent=(payload.anon_transcript,))
+    round_trip = deanonymize_text(scope, payload.anon_transcript)
     return payload.anon_transcript, dict(payload.forward), round_trip or ""
 
 

@@ -35,10 +35,11 @@ extraction primitives), not the training layer.
 Single-topology rule
 --------------------
 
-Direct calls to :func:`paramem.graph.extractor.extract_graph` and
+Direct calls to :func:`paramem.graph.flows.extract_graph` and
 :func:`paramem.graph.extractor.extract_procedural_graph` are allowed
-only inside this module (and inside ``extractor.py`` itself, which
-defines them).  Every orchestrator routes through
+only inside this module (and inside the module that defines each —
+``flows.py`` for ``extract_graph``, ``extractor.py`` for
+``extract_procedural_graph``).  Every orchestrator routes through
 :class:`ExtractionPipeline` so the pipeline cannot diverge by accident.
 
 Enforced by ``tests/test_extraction_pipeline_guard.py`` (AST scan) and
@@ -55,9 +56,9 @@ from paramem.graph.extractor import (
     DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     DEFAULT_SYSTEM_PROMPT_FILENAME,
     DEFAULT_USER_PROMPT_FILENAME,
-    extract_graph,
     extract_procedural_graph,
 )
+from paramem.graph.flows import extract_graph
 from paramem.models.loader import base_model_inference
 
 if TYPE_CHECKING:
@@ -83,10 +84,11 @@ class ExtractionConfig:
     temperature: float = 0.0
     max_tokens: int = 8192
     plausibility_max_tokens: int = 8192
-    noise_filter: str = "anthropic"
-    noise_filter_model: str = "claude-sonnet-4-6"
-    noise_filter_endpoint: str | None = None
-    sota_enabled: bool = False  # master gate for ALL SOTA; mirrors ConsolidationConfig.sota_enabled
+    enrichment_provider: str = "anthropic"
+    enrichment_provider_model: str = "claude-sonnet-4-6"
+    enrichment_provider_endpoint: str | None = None
+    # master gate for ALL cloud egress; mirrors ConsolidationConfig.cloud_enabled
+    cloud_enabled: bool = False
     plausibility_judge: str = "auto"
     plausibility_stage: str = "deanon"
     # Model + endpoint the cloud plausibility judge runs, when
@@ -101,7 +103,7 @@ class ExtractionConfig:
     # (``paramem/server/config.py``). A hidden fallback here would
     # duplicate that policy in the graph layer and silently scrub against
     # a value the operator never configured — see
-    # ``paramem.graph.placeholders._build_anonymization_mapping``'s
+    # ``paramem.cloud.placeholders._build_anonymization_mapping``'s
     # docstring for the same reasoning applied one layer down.
     scrub: set[str] | frozenset[str] = field(kw_only=True)
     correction_entity_types: set[str] | frozenset[str] | None = None
@@ -185,7 +187,7 @@ class ExtractionPipeline:
         # prompts_dir and the default configs/prompts/ directory.  A model
         # overrides only the files it provides; everything else inherits the
         # shared default.  Only local-model extraction prompts are per-model;
-        # sota_* prompts are model-independent by design.
+        # cloud_* prompts are model-independent by design.
         self.model_name = model_name
 
     def kwargs(self, *, source_type: str = "transcript", **overrides) -> dict:
@@ -232,13 +234,17 @@ class ExtractionPipeline:
             plausibility_max_tokens=cfg.plausibility_max_tokens,
             prompts_dir=pick("prompts_dir", self.prompts_dir),
             # model_alias drives per-file prompt resolution in extract_graph /
-            # extract_procedural_graph.  sota_* prompts are model-independent
+            # extract_procedural_graph.  cloud_* prompts are model-independent
             # by design and ignore this value.
             model_alias=self.model_name,
-            noise_filter=pick("noise_filter", cfg.noise_filter),
-            noise_filter_model=pick("noise_filter_model", cfg.noise_filter_model),
-            noise_filter_endpoint=pick("noise_filter_endpoint", cfg.noise_filter_endpoint),
-            sota_enabled=pick("sota_enabled", cfg.sota_enabled),
+            enrichment_provider=pick("enrichment_provider", cfg.enrichment_provider),
+            enrichment_provider_model=pick(
+                "enrichment_provider_model", cfg.enrichment_provider_model
+            ),
+            enrichment_provider_endpoint=pick(
+                "enrichment_provider_endpoint", cfg.enrichment_provider_endpoint
+            ),
+            cloud_enabled=pick("cloud_enabled", cfg.cloud_enabled),
             speaker_name=overrides.get("speaker_name"),
             plausibility_judge=pick("plausibility_judge", cfg.plausibility_judge),
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),

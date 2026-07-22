@@ -141,10 +141,10 @@ class TestSystemPromptFilesPresent:
         "entity_correction_system.txt",
         "merger_coexistence_system.txt",
         "anonymization_system.txt",
-        "sota_plausibility_system.txt",
-        "sota_enrichment_system.txt",
+        "cloud_plausibility_system.txt",
+        "cloud_enrichment_system.txt",
         "predicate_normalization_system.txt",
-        "sota_graph_enrichment_system.txt",
+        "cloud_graph_enrichment_system.txt",
     )
 
     def test_entity_correction_system_txt_exists(self):
@@ -156,17 +156,17 @@ class TestSystemPromptFilesPresent:
     def test_anonymization_system_txt_exists(self):
         assert (_PROMPTS_DIR / "anonymization_system.txt").exists()
 
-    def test_sota_plausibility_system_txt_exists(self):
-        assert (_PROMPTS_DIR / "sota_plausibility_system.txt").exists()
+    def test_cloud_plausibility_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "cloud_plausibility_system.txt").exists()
 
-    def test_sota_enrichment_system_txt_exists(self):
-        assert (_PROMPTS_DIR / "sota_enrichment_system.txt").exists()
+    def test_cloud_enrichment_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "cloud_enrichment_system.txt").exists()
 
     def test_predicate_normalization_system_txt_exists(self):
         assert (_PROMPTS_DIR / "predicate_normalization_system.txt").exists()
 
-    def test_sota_graph_enrichment_system_txt_exists(self):
-        assert (_PROMPTS_DIR / "sota_graph_enrichment_system.txt").exists()
+    def test_cloud_graph_enrichment_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "cloud_graph_enrichment_system.txt").exists()
 
     def test_all_system_prompt_files_no_braces(self):
         for filename in self._SYSTEM_PROMPT_FILES:
@@ -183,7 +183,7 @@ class TestSystemPromptGoldens:
     Each golden string was captured programmatically from the pre-change
     inline literal/constant (single-line literals copied verbatim from
     source; the three former module constants captured via
-    ``repr(extractor._SOTA_*_SYSTEM_PROMPT)`` before the constants were
+    ``repr(extractor._CLOUD_*_SYSTEM_PROMPT)`` before the constants were
     replaced with ``_load_prompt(...)`` calls) — never hand-retyped against
     the new ``.txt`` file, so a shared typo cannot silently pass both sides.
     """
@@ -200,15 +200,15 @@ class TestSystemPromptGoldens:
         content = (_PROMPTS_DIR / "anonymization_system.txt").read_text().strip()
         assert content == "You anonymize data. Output valid JSON only."
 
-    def test_sota_plausibility_system_golden(self):
-        content = (_PROMPTS_DIR / "sota_plausibility_system.txt").read_text().strip()
+    def test_cloud_plausibility_system_golden(self):
+        content = (_PROMPTS_DIR / "cloud_plausibility_system.txt").read_text().strip()
         assert content == (
             "You are a knowledge graph plausibility filter. Drop invalid facts "
             "only. Do NOT add or modify facts. Output valid JSON only."
         )
 
-    def test_sota_enrichment_system_golden(self):
-        content = (_PROMPTS_DIR / "sota_enrichment_system.txt").read_text().strip()
+    def test_cloud_enrichment_system_golden(self):
+        content = (_PROMPTS_DIR / "cloud_enrichment_system.txt").read_text().strip()
         assert content == (
             "You are a knowledge graph enrichment assistant. Resolve coreference "
             "and split compound facts. Do NOT remove facts — a separate "
@@ -219,8 +219,8 @@ class TestSystemPromptGoldens:
         content = (_PROMPTS_DIR / "predicate_normalization_system.txt").read_text().strip()
         assert content == "You identify synonym predicate clusters. Output valid JSON only."
 
-    def test_sota_graph_enrichment_system_golden(self):
-        content = (_PROMPTS_DIR / "sota_graph_enrichment_system.txt").read_text().strip()
+    def test_cloud_graph_enrichment_system_golden(self):
+        content = (_PROMPTS_DIR / "cloud_graph_enrichment_system.txt").read_text().strip()
         assert content == (
             "You are a knowledge graph enrichment assistant operating over a "
             "pre-merged cross-transcript graph. Emit cross-session second-order "

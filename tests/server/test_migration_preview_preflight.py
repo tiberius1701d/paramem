@@ -294,7 +294,7 @@ def _make_full_state(tmp_path: Path, config: MagicMock) -> dict:
         "session_buffer": buf,
         "speaker_store": None,
         "router": None,
-        "sota_agent": None,
+        "cloud_agent": None,
         "ha_client": None,
         "consolidation_loop": None,
         "consolidating": False,
