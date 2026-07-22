@@ -391,8 +391,8 @@ class TestInferenceCooldownGate:
                 side_effect=fake_probe_and_reason,
             ),
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=("sanitized query", []),
+                "paramem.server.inference.check_personal_content",
+                return_value=[],
             ),
         ):
             handle_chat(
@@ -437,8 +437,8 @@ class TestInferenceCooldownGate:
                 return_value=ChatResult(text="ok", escalated=False),
             ),
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=("q", []),
+                "paramem.server.inference.check_personal_content",
+                return_value=[],
             ),
         ):
             handle_chat(
@@ -483,8 +483,8 @@ class TestInferenceCooldownGate:
                 return_value=ChatResult(text="HA says hi", escalated=True),
             ),
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=("what time is it", []),
+                "paramem.server.inference.check_personal_content",
+                return_value=[],
             ),
         ):
             handle_chat(

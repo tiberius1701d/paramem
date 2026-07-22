@@ -166,7 +166,7 @@ The response's `relations` and `same_as` pairs are de-anonymized via `deanonymiz
 
 The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`ConsolidationLoop.consolidate`), keys whose per-key `reinforcement_count` meets the promotion threshold are promoted episodic→semantic; `store.move(key, "semantic")` moves the registry entry and SimHash — so promotion happens before tier assignment.
 
-**Transcript-stage boundary (§4.S architectural symmetry).** The consolidation fold has two modes sharing an identical grooming pipeline — they diverge ONLY in their persistence tail:
+**Transcript-stage boundary (architectural symmetry).** The consolidation fold has two modes sharing an identical grooming pipeline — they diverge ONLY in their persistence tail:
 - **`train` mode**: source = reconstruct-from-adapter-weights; sink = retrain PEFT adapters.
 - **`simulate` mode**: source = `load_memory_from_disk(graph.json)`; sink = `save_memory_to_disk(graph.json)`.
 Both modes run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `GraphTierRefiner.run_normalization` (predicate-synonym collapse via `normalize_predicates`; runs when `refinement_normalization` is on, which is the default) + `GraphTierRefiner.run_enrichment` before the divergence point. Grooming logic is shared: the interim tick (`run_consolidation_cycle`) and the full fold (`ConsolidationLoop.consolidate`, the single public fold entry) both route through the private spine `_run_fold`. There is no dual-method parity requirement — a grooming change goes in `_run_fold` once and both modes inherit it. The fold has no notion of who asked for it: whether there is anything to consolidate at all is decided in the server's dispatch layer before the fold is entered, and the key-count floor holds for every trigger. `POST /reconsolidate` is the on-demand re-grooming pass — it runs the full fold even when nothing is new (its input is the knowledge already stored).
@@ -296,6 +296,85 @@ speaker's own queries as `PERSONAL` (the old "speaker-in-graph →
 PERSONAL" short-circuit caused imperatives from enrolled speakers
 to misroute into the PA path). The router scopes keys by speaker
 but lets the classifier decide intent.
+
+### AD-21: One Cloud Master Switch, One Personal Verdict, One Egress Funnel
+
+**One switch.** `cloud.enabled` (`CloudConfig`) is the single on-off for all
+cloud egress: the conversation agent, the per-session extraction enrichment
+chain, the graph-tier enrichment pass, and `/calibrate/enrich`. It replaced
+two structurally disjoint switches that answered the same question with no
+cross-reference between them (`consolidation.cloud_enabled` and
+`agents.cloud.enabled`) — a deployment could have the conversation agent live
+while the pipeline believed cloud was off, or the reverse. `agents.cloud` and
+`agents.cloud_providers` carry provider, model and credentials only; they have
+no on-off of their own. The switch is necessary but never sufficient: whether
+a specific call may be placed is decided by
+`paramem.cloud.admission.evaluate_cloud_egress`, which also requires a
+supported provider, a model, a resolvable API key and (for OpenAI-compatible
+providers) an endpoint. With no provider and no API key there is no cloud
+mode; only the local model answers. Ship default is `false` — enabling it
+sends knowledge-graph content to a third party under best-effort
+anonymization only.
+
+**Self-hosted is not cloud.** `admission.py`'s provider tables are the
+registry of what "cloud" means. A host that speaks the OpenAI-compatible wire
+format but runs on the operator's own hardware has no entry there and never
+reaches an admission check.
+
+**One personal verdict.** Two detectors used to answer "is this turn
+personal?" independently, each with its own knob threaded through the same
+call sites: the intent classifier (`PERSONAL`/`UNKNOWN`) and the sanitizer's
+`check_personal_content` (graph-anchored known-entity scrub + self-reference
+gate). Both signals are kept — they cover different failure modes: a query
+naming a stored entity with no first-person marker, versus a first-person
+query naming nothing the graph knows. They are unioned into one `is_personal`
+verdict computed once in `handle_chat` and threaded from there. The sanitizer
+has no policy knob of its own (the deleted `sanitization.mode`
+off/warn/block): detection always runs, and what to DO about a personal
+verdict is the caller's decision. Personal-content history turns are always
+dropped from a cloud payload, never warned-and-passed.
+
+**The verdict gates cloud, not HA.** HA is local and stays reachable as a
+tool fallback on every path.
+
+**The forwarded query is a distinct artifact.** The text after `[ESCALATE]`
+is authored by the local model after it has recalled facts from parametric
+memory, so it can carry personal content the user never typed. It gets its
+own verdict from the same `check_personal_content` predicate, computed in
+`_maybe_escalate`; a personal forwarded query suppresses the HA hop as well
+as the cloud hop, because `ha_agent_id` is operator-pointed and may be
+cloud-backed.
+
+**One egress funnel.** `answer_via_cloud` is the sole cloud-egress path in
+local mode; `cloud_mode` (`block`/`anonymize`/`both`) applies there and
+nowhere else. `/chat`'s forced routing (`route=cloud:<provider>`) selects the
+provider; it does not buy a policy bypass. `_cloud_only_route` is the
+cloud-only counterpart and calls the shared `_escalate_to_cloud` primitive
+directly: in cloud-only mode there is no local model, so `_state["model"]`
+and the memory store are absent and `history` is client-supplied — no
+ParaMem-held knowledge can reach the cloud by any path. Cloud-only mode is
+therefore honestly a plain cloud agent, and it runs no intent classification,
+personal-referent gate, anonymization or `cloud_mode` enforcement.
+
+**Degraded serving is an explicit operator decision.**
+`cloud.allow_degraded_serving` (default `false`) gates the cloud leg when the
+server is cloud-only for an *involuntary* reason — GPU held by another
+process, insufficient VRAM, a failed adapter reload or apply, a persistent
+CUDA fault. Deliberate cloud-only (`cloud_only: true`, `POST /gpu/release`)
+and transient internal states (training, live reload) proceed regardless.
+When the gate closes, the cloud leg closes and the HA leg stays open: HA
+carries no ParaMem-held knowledge and runs on the user's own network, so
+breaking it during a GPU conflict buys no privacy. Anything HA cannot serve
+returns the canned limited-mode response. When the gate is open, the first
+turn of each conversation on that path is prefixed with a notice that a cloud
+model is answering — app-layer prefix, the same mechanism as the greeting,
+never written to the session buffer and so never able to reach a training
+transcript.
+
+**The HA agent must be local.** `ha_agent_id` names the leg that stays open
+when the cloud leg is closed, and ParaMem sends it cleartext. Pointing it at
+a cloud-backed HA conversation agent re-opens cloud egress one hop away,
+outside every switch above.
 
 ### AD-18: Multi-Engine Multilingual TTS
 

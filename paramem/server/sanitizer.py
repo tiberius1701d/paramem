@@ -13,23 +13,23 @@ Anchored on runtime ground truth, not lexical patterns:
   has facts to anchor on).  The token set is explicit; there is no
   pattern matching.
 
-Findings emitted (purely for diagnostics / mode=warn logging — production
-routing reads :class:`paramem.server.router.Intent` instead):
+:func:`check_personal_content` is the predicate: non-empty findings mean
+the text is personal.  There is no policy knob here — what a caller DOES
+about a personal verdict (drop the turn, suppress the cloud call,
+abstain) is the caller's decision.  ``handle_chat`` unions this verdict
+with the intent classifier's into the single ``is_personal`` gate; the
+two arms cover different failure modes (a query naming a stored entity
+with no first-person marker vs. a first-person query naming nothing).
+
+Findings emitted:
 
 * ``personal_entity`` — query mentions an entity in the speaker's graph or
   an enrolled name.
 * ``first_person_personal`` — query contains a first-person pronoun and an
   identified ``speaker_id``.
-
-Modes: ``off`` / ``warn`` / ``block``.
 """
 
-import logging
-
 from paramem.cloud.placeholders import _substitute_whole_words
-
-logger = logging.getLogger(__name__)
-
 
 # Token-set lookup, not a pattern.  Explicit list of first-person openings
 # the chat handler resolves to the identified speaker.  Includes
@@ -248,8 +248,31 @@ def check_personal_content(
       because a self-referential query with no resolved speaker has no
       target to be personal about.
 
-    Back-compat: if neither ``speaker_id`` nor ``known_entities`` is supplied
-    the function returns ``[]`` because there is nothing to anchor against.
+    Args:
+        text: The text to classify — a chat turn, verbatim and unmodified.
+        speaker_id: Identifier of the resolved speaker, or ``None`` when the
+            speaker has not been resolved.  Gates the self-reference arm:
+            without an identified speaker there is no one for "I" / "my" to
+            refer to.
+        known_entities: Set of **real-case** entity / speaker names that count
+            as personal references.  Assembled by ``handle_chat`` from
+            ``memory_store.iter_entries()`` subject/object fields plus the
+            resolved speaker display name plus the household display names;
+            in cloud-only / forced-routing paths (``app.py``) only the
+            household display names are available.  Names are passed through
+            ``.strip()`` only — the known-entity scrub matches them exact-case
+            and whole-word, so a folded name would not match the user's query
+            surface.
+        personal_referent_config: Optional
+            :class:`paramem.server.config.PersonalReferentConfig`.  When
+            supplied (production), the encoder-based classifier drives the
+            self-reference gate; otherwise the English token-set fallback
+            (:func:`_contains_first_person`) does.
+
+    Returns:
+        The findings list.  Empty when nothing anchored — including the case
+        where neither ``speaker_id`` nor ``known_entities`` was supplied,
+        because then there is nothing to anchor against.
     """
     findings: list[str] = []
 
@@ -299,63 +322,3 @@ def check_personal_content(
         findings.append("first_person_personal")
 
     return findings
-
-
-def sanitize_for_cloud(
-    text: str,
-    mode: str = "warn",
-    *,
-    speaker_id: str | None = None,
-    known_entities: set[str] | None = None,
-    personal_referent_config=None,
-) -> tuple[str | None, list[str]]:
-    """Check query before sending to cloud.  Returns ``(query, findings)``.
-
-    Args:
-        text: query to check.
-        mode: ``off`` (skip), ``warn`` (log + pass through),
-            ``block`` (return ``None`` instead of the text when personal
-            content is found).
-        speaker_id: identifier of the resolved speaker, or ``None`` if the
-            speaker has not been resolved.  Used to gate first-person
-            interpretation — without an identified speaker there is no one
-            for "I" / "my" to refer to.
-        known_entities: set of **real-case** entity / speaker names that count
-            as personal references.  Assembled by ``handle_chat`` from
-            ``memory_store.iter_entries()`` subject/object fields plus the
-            resolved speaker display name (M3 — plumbed directly from the
-            ``speaker`` argument, not from ``SpeakerStore.speaker_names()``)
-            plus the household display names.  Names are passed through
-            ``.strip()`` only: the known-entity scrub matches them
-            exact-case and whole-word, so a folded name would not match the
-            user's query surface.
-        personal_referent_config: optional
-            :class:`paramem.server.config.PersonalReferentConfig`.  When
-            supplied (production), the encoder-based classifier is used
-            for the self-reference gate; otherwise the English token-set
-            fallback (:func:`_contains_first_person`) is used.
-
-    Returns:
-        ``(sanitized_query, findings)``.  When ``mode="block"`` and personal
-        content is found, ``sanitized_query`` is ``None`` and the caller
-        should fall back to the local model.
-    """
-    if mode == "off":
-        return text, []
-
-    findings = check_personal_content(
-        text,
-        speaker_id=speaker_id,
-        known_entities=known_entities,
-        personal_referent_config=personal_referent_config,
-    )
-    if not findings:
-        return text, []
-
-    if mode == "warn":
-        logger.warning("Personal content detected (mode=warn): %s — %s", findings, text[:100])
-        return text, findings
-
-    # mode == "block"
-    logger.info("Blocked cloud escalation due to personal content: %s — %s", findings, text[:100])
-    return None, findings

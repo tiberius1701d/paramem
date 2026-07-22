@@ -8,7 +8,7 @@ mode from 2026-04-21 (user asked "Where do I live?" on an untrained
 adapter, Mistral confabulated "New York City").
 
 Distinct from ``test_abstention.py``: those tests patch
-``sanitize_for_cloud`` and use a ``MagicMock`` config to isolate the
+``check_personal_content`` and use a ``MagicMock`` config to isolate the
 short-circuit logic. This test exercises the real sanitizer and real
 YAML loader end-to-end.
 """
@@ -21,7 +21,7 @@ import pytest
 from paramem.server.config import load_server_config
 from paramem.server.inference import handle_chat
 from paramem.server.router import RoutingPlan
-from paramem.server.sanitizer import sanitize_for_cloud
+from paramem.server.sanitizer import check_personal_content
 
 
 @pytest.fixture
@@ -93,9 +93,8 @@ class TestSanitizerPrecondition:
         # there is no resolution target for "I" / "my" without a
         # speaker_id.  Production callers always have one when the
         # speaker is enrolled (which is when self-referential matters).
-        sanitized, findings = sanitize_for_cloud(query, mode="block", speaker_id="speaker0")
-        assert sanitized is None, f"sanitizer should block {query!r}"
-        assert findings, "sanitizer must explain why the query was blocked"
+        findings = check_personal_content(query, speaker_id="speaker0")
+        assert findings, f"sanitizer should flag {query!r} as personal"
 
     @pytest.mark.parametrize(
         "query",
@@ -105,8 +104,8 @@ class TestSanitizerPrecondition:
         ],
     )
     def test_real_sanitizer_allows_non_personal(self, query):
-        sanitized, findings = sanitize_for_cloud(query, mode="block", speaker_id="speaker0")
-        assert sanitized is not None, f"sanitizer should not block {query!r}"
+        findings = check_personal_content(query, speaker_id="speaker0")
+        assert findings == [], f"sanitizer should not flag {query!r}"
 
 
 @pytest.mark.skipif(

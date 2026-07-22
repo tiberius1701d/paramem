@@ -2,6 +2,9 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from paramem.cloud.admission import PROVIDER_KEY_ENV
 from paramem.cloud.providers.base import CloudAgent, CloudAgentConfig, CloudResponse, ToolCall
 from paramem.cloud.providers.openai_compat import OpenAICompatAgent
 from paramem.cloud.providers.registry import get_cloud_agent
@@ -44,7 +47,6 @@ class TestCloudResponse:
 class TestOpenAICompatAdapter:
     def _make_config(self, **kwargs):
         defaults = {
-            "enabled": True,
             "provider": "openai",
             "model": "gpt-4o",
             "api_key": "sk-test",
@@ -194,33 +196,74 @@ class TestOpenAICompatAdapter:
 
 
 class TestRegistry:
-    def test_disabled_returns_none(self):
-        config = CloudAgentConfig(enabled=False)
-        assert get_cloud_agent(config) is None
+    """``get_cloud_agent`` admits solely via ``evaluate_cloud_egress``.
 
-    def test_openai_with_key(self):
-        config = CloudAgentConfig(
-            enabled=True, provider="openai", model="gpt-4o", api_key="sk-test"
-        )
-        agent = get_cloud_agent(config)
+    The registry has no predicate of its own: the master switch
+    (``cloud.enabled``, passed as ``cloud_enabled=``), the provider, the
+    model and the provider's API-key ENV VAR are all checked in one place.
+    ``CloudAgentConfig.api_key`` is a YAML surface only — the built agent
+    carries the env-resolved key, so the credential that authenticates a
+    call is the one admission checked.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_provider_keys(self, monkeypatch):
+        """No developer's real key may make a "missing key" case pass."""
+        for env_name in PROVIDER_KEY_ENV.values():
+            monkeypatch.delenv(env_name, raising=False)
+
+    def test_master_switch_off_returns_none(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+        config = CloudAgentConfig(provider="openai", model="gpt-4o")
+        assert get_cloud_agent(config, cloud_enabled=False) is None
+
+    def test_openai_with_key(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+        config = CloudAgentConfig(provider="openai", model="gpt-4o")
+        agent = get_cloud_agent(config, cloud_enabled=True)
         assert isinstance(agent, OpenAICompatAgent)
+        assert agent.config.api_key == "sk-env"
 
-    def test_groq_with_key(self):
-        config = CloudAgentConfig(
-            enabled=True, provider="groq", model="llama-4-scout", api_key="gsk-test"
-        )
-        agent = get_cloud_agent(config)
+    def test_groq_with_key(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-env")
+        config = CloudAgentConfig(provider="groq", model="llama-4-scout")
+        agent = get_cloud_agent(config, cloud_enabled=True)
         assert isinstance(agent, OpenAICompatAgent)
 
     def test_missing_key_returns_none(self):
-        config = CloudAgentConfig(enabled=True, provider="openai", model="gpt-4o", api_key="")
-        assert get_cloud_agent(config) is None
+        config = CloudAgentConfig(provider="openai", model="gpt-4o")
+        assert get_cloud_agent(config, cloud_enabled=True) is None
+
+    def test_no_model_returns_none(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+        config = CloudAgentConfig(provider="openai", model="")
+        assert get_cloud_agent(config, cloud_enabled=True) is None
+
+    def test_endpoint_without_key_returns_none(self, monkeypatch):
+        """The bug the old ``is_available`` shipped: a configured endpoint
+        satisfied it with no key at all, so the agent was built and POSTed
+        ``Authorization: Bearer `` (empty). Admission requires the key."""
+        config = CloudAgentConfig(
+            provider="groq",
+            model="llama-3.3-70b",
+            endpoint="https://api.groq.com/openai/v1/chat/completions",
+        )
+        assert get_cloud_agent(config, cloud_enabled=True) is None
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        assert isinstance(get_cloud_agent(config, cloud_enabled=True), OpenAICompatAgent)
+
+    def test_yaml_api_key_alone_is_not_admission(self, monkeypatch):
+        """A literal key in YAML with the env var unset does NOT admit — the
+        env var named in PROVIDER_KEY_ENV is the one key source."""
+        config = CloudAgentConfig(provider="openai", model="gpt-4o", api_key="sk-yaml-only")
+        assert get_cloud_agent(config, cloud_enabled=True) is None
 
     def test_unknown_provider_returns_none(self):
-        config = CloudAgentConfig(enabled=True, provider="unknown_ai", model="test", api_key="key")
-        assert get_cloud_agent(config) is None
+        config = CloudAgentConfig(provider="unknown_ai", model="test", api_key="key")
+        assert get_cloud_agent(config, cloud_enabled=True) is None
 
-    def test_anthropic_agent_created(self):
+    def test_anthropic_agent_created(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env")
         mock_anthropic = MagicMock()
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             # Force reimport so the adapter picks up the mock
@@ -229,15 +272,14 @@ class TestRegistry:
             mod_name = "paramem.cloud.providers.anthropic_adapter"
             sys.modules.pop(mod_name, None)
 
-            config = CloudAgentConfig(
-                enabled=True, provider="anthropic", model="claude-sonnet", api_key="key"
-            )
-            agent = get_cloud_agent(config)
+            config = CloudAgentConfig(provider="anthropic", model="claude-sonnet")
+            agent = get_cloud_agent(config, cloud_enabled=True)
             assert agent is not None
 
             from paramem.cloud.providers.anthropic_adapter import AnthropicAgent
 
             assert isinstance(agent, AnthropicAgent)
+            assert agent.config.api_key == "sk-env"
 
 
 class TestPrivacyRouting:
@@ -251,7 +293,6 @@ class TestPrivacyRouting:
         """Create a mock cloud agent that tracks whether call() was invoked."""
         agent = MagicMock(spec=CloudAgent)
         agent.call.return_value = CloudResponse(text="cloud answer")
-        agent.is_available.return_value = True
         return agent
 
     def _make_mock_router(self, known_entities=None):
@@ -430,7 +471,6 @@ class TestPrivacyRouting:
 
         config = MagicMock()
         config.voice.load_prompt.return_value = "You are a helper."
-        config.sanitization.mode = "off"
 
         # Mock HA client that returns None (simulates HA unavailable)
         ha_client = MagicMock()
@@ -480,7 +520,6 @@ class TestPrivacyRouting:
 
         config = MagicMock()
         config.voice.load_prompt.return_value = "You are a helper."
-        config.sanitization.mode = "off"
 
         # Mock HA client that returns None (simulates HA unavailable) so the
         # cloud fallback is the next stop — same shape as the GENERAL case
@@ -584,7 +623,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.sanitization.mode = "off"
         config.voice.load_prompt.return_value = "You are a helper."
 
         ha_client = MagicMock()
@@ -622,7 +660,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.sanitization.mode = "off"
         config.voice.load_prompt.return_value = "You are a helper."
 
         ha_client = MagicMock()
@@ -669,7 +706,6 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
-        config.sanitization.mode = "off"
         config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
@@ -733,7 +769,6 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
-        config.sanitization.mode = "off"
         config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
@@ -783,6 +818,76 @@ class TestPrivacyRouting:
         assert "I'm not sure" in result.text
 
 
+class TestForwardedQueryVerdict:
+    """The model-authored forwarded query carries its own personal verdict.
+
+    ``detect_escalation`` returns everything after ``[ESCALATE]``.  On the
+    personal path the local model has already recalled facts from
+    parametric memory, so that string can name entities the user never
+    typed.  ``_maybe_escalate`` therefore re-runs
+    ``check_personal_content`` on the forwarded query and gates BOTH
+    external hops with the result — the HA hop included, because
+    ``ha_agent_id`` is operator-configurable and routinely points at a
+    cloud-backed agent.
+    """
+
+    RESPONSE = "I'm not sure where to look. [ESCALATE] Find ceramics shops in Munich for Maria."
+    CONTROL_RESPONSE = "I'm not sure. [ESCALATE] What is the capital of France?"
+
+    def _config(self):
+        config = MagicMock()
+        config.sanitization.cloud_mode = "block"
+        # No encoder in unit tests — check_personal_content falls back to the
+        # English token-set arm; the known-entity arm is unaffected.
+        config.personal_referent = None
+        return config
+
+    def _run(self, response, *, is_personal=False):
+        from paramem.server.inference import _maybe_escalate
+
+        cloud_agent = MagicMock(spec=CloudAgent)
+        cloud_agent.call.return_value = CloudResponse(text="cloud answer")
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = "HA answer"
+
+        result = _maybe_escalate(
+            response,
+            self._config(),
+            cloud_agent=cloud_agent,
+            ha_client=ha_client,
+            speaker_id="spk-test",
+            is_personal=is_personal,
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            known_entities={"Maria"},
+        )
+        return result, ha_client, cloud_agent
+
+    def test_personal_forwarded_query_suppresses_ha_hop(self):
+        _result, ha_client, _cloud_agent = self._run(self.RESPONSE)
+        ha_client.conversation_process.assert_not_called()
+
+    def test_personal_forwarded_query_blocks_cloud_hop(self):
+        """Turn verdict is False — only the forwarded-query verdict blocks."""
+        _result, _ha_client, cloud_agent = self._run(self.RESPONSE, is_personal=False)
+        cloud_agent.call.assert_not_called()
+
+    def test_both_hops_suppressed_returns_pre_escalation_text(self):
+        result, _ha_client, _cloud_agent = self._run(self.RESPONSE)
+        assert result.text == "I'm not sure where to look."
+        assert result.escalated is False
+
+    def test_non_personal_forwarded_query_still_reaches_ha(self):
+        result, ha_client, cloud_agent = self._run(self.CONTROL_RESPONSE)
+        ha_client.conversation_process.assert_called_once()
+        assert ha_client.conversation_process.call_args.args[0] == (
+            "What is the capital of France?"
+        )
+        cloud_agent.call.assert_not_called()  # HA answered, no fallback needed
+        assert result.text == "HA answer"
+        assert result.escalated is True
+
+
 class TestCloudModePolicy:
     """Architecture #3: ``sanitization.cloud_mode`` selects the egress policy.
 
@@ -795,12 +900,10 @@ class TestCloudModePolicy:
     def _make_cloud_agent(self):
         agent = MagicMock(spec=CloudAgent)
         agent.call.return_value = CloudResponse(text="<placeholder> answer")
-        agent.is_available.return_value = True
         return agent
 
-    def _config(self, cloud_mode: str, *, mode: str = "off"):
+    def _config(self, cloud_mode: str):
         config = MagicMock()
-        config.sanitization.mode = mode
         config.sanitization.cloud_mode = cloud_mode
         config.voice.load_prompt.return_value = "You are a helper."
         return config
@@ -1012,14 +1115,13 @@ class TestCloudModePolicy:
 
     # ---- dual-scope closure (history alongside the anonymized transcript) ----
 
-    def test_history_names_are_anonymized_under_anonymize_mode_even_at_sanitization_mode_warn(
-        self,
-    ):
-        """With ``cloud_mode="anonymize"`` and ``sanitization.mode="warn"``,
-        no history turn reaches ``cloud_agent.call`` carrying a name present
-        in ``payload.forward`` — the history channel is no longer governed
-        by ``sanitization.mode`` (which would let it through verbatim at
-        ``mode="warn"``) once the current turn is being placeholdered.
+    def test_history_names_are_anonymized_under_anonymize_mode(self):
+        """Under ``cloud_mode="anonymize"``, no history turn reaches
+        ``cloud_agent.call`` carrying a name present in ``payload.forward``.
+
+        The history channel has no policy knob of its own: it is always
+        drop-gated, and under an anonymizing ``cloud_mode`` the survivors are
+        additionally substituted through the forward map.
         """
         cloud_agent = self._make_cloud_agent()
         cloud_agent.call.return_value = CloudResponse(text="<answer>")
@@ -1030,9 +1132,9 @@ class TestCloudModePolicy:
             reverse={"Person_1": "Alex"},
         )
         # No first-person markers and "Alex" is not a known_entity in this
-        # test's setup, so the mode="block" drop-gate lets the turn
-        # through unchanged — proving any absence of "Alex" downstream is
-        # the forward-map substitution, not the drop gate.
+        # test's setup, so the drop-gate lets the turn through unchanged —
+        # proving any absence of "Alex" downstream is the forward-map
+        # substitution, not the drop gate.
         history = [{"role": "user", "text": "Did Alex call?"}]
         with (
             patch(
@@ -1046,7 +1148,7 @@ class TestCloudModePolicy:
         ):
             self._run(
                 router=self._personal_router(),
-                config=self._config("anonymize", mode="warn"),
+                config=self._config("anonymize"),
                 cloud_agent=cloud_agent,
                 history=history,
             )
@@ -1065,9 +1167,9 @@ class TestCloudModePolicy:
 
 class TestCloudOnlyRouteSpeakerId:
     """``_cloud_only_route``'s ``speaker_id`` parameter
-    must reach ``_sanitize_history`` — consistent with the other three
+    must reach ``_sanitize_history`` — consistent with the other
     ``_sanitize_history`` call sites (both branches of
-    ``inference.answer_via_cloud`` and the forced-routing debug
+    ``inference.answer_via_cloud`` and the forced-routing
     path in ``app.py``).
     """
 
@@ -1076,15 +1178,9 @@ class TestCloudOnlyRouteSpeakerId:
         from paramem.server.inference import ChatResult
 
         config = MagicMock()
-        config.sanitization.mode = "off"
         cloud_agent = MagicMock()
-        cloud_agent.is_available.return_value = True
 
         with (
-            patch(
-                "paramem.server.sanitizer.sanitize_for_cloud",
-                return_value=("What's the population of Berlin?", set()),
-            ),
             patch("paramem.server.app._sanitize_history", return_value=[]) as mock_sanitize,
             patch(
                 "paramem.server.app._escalate_to_cloud",
@@ -1096,6 +1192,7 @@ class TestCloudOnlyRouteSpeakerId:
                 speaker="Alex",
                 history=[{"role": "user", "text": "hi"}],
                 config=config,
+                cloud_permitted=True,
                 ha_client=None,
                 cloud_agent=cloud_agent,
                 speaker_id="spk-test",
@@ -1103,3 +1200,84 @@ class TestCloudOnlyRouteSpeakerId:
 
         mock_sanitize.assert_called_once()
         assert mock_sanitize.call_args.kwargs["speaker_id"] == "spk-test"
+
+    def test_current_turn_reaches_cloud_verbatim(self):
+        """Cloud-only has no local model, so there is nothing to anonymize.
+
+        The old ``sanitize_for_cloud`` call here was a second policy gate on
+        a path that holds no ParaMem knowledge; it is deleted.  The turn
+        itself must arrive at ``_escalate_to_cloud`` unmodified.
+        """
+        from paramem.server.app import _cloud_only_route
+        from paramem.server.inference import ChatResult
+
+        config = MagicMock()
+
+        with (
+            patch("paramem.server.app._sanitize_history", return_value=[]),
+            patch(
+                "paramem.server.app._escalate_to_cloud",
+                return_value=ChatResult(text="answer"),
+            ) as mock_escalate,
+        ):
+            _cloud_only_route(
+                text="Where does Alex live?",
+                speaker="Alex",
+                history=None,
+                config=config,
+                cloud_permitted=True,
+                ha_client=None,
+                cloud_agent=MagicMock(),
+                known_entities={"Alex"},
+            )
+
+        assert mock_escalate.call_args.args[0] == "Where does Alex live?"
+
+
+class TestDegradedServingGate:
+    """``cloud.allow_degraded_serving`` closes the CLOUD leg only.
+
+    The HA leg carries no ParaMem-held knowledge and runs on the user's own
+    network, so it stays open in every degraded state.
+    """
+
+    def _run(self, *, cloud_permitted, ha_answers):
+        from paramem.server.app import _cloud_only_route
+        from paramem.server.inference import ChatResult
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = "HA answer" if ha_answers else None
+
+        with (
+            patch("paramem.server.app._sanitize_history", return_value=[]),
+            patch(
+                "paramem.server.app._escalate_to_cloud",
+                return_value=ChatResult(text="cloud answer"),
+            ) as mock_escalate,
+        ):
+            result = _cloud_only_route(
+                text="What's the population of Berlin?",
+                speaker="Alex",
+                history=None,
+                config=MagicMock(),
+                cloud_permitted=cloud_permitted,
+                ha_client=ha_client,
+                cloud_agent=MagicMock(),
+            )
+        return result, mock_escalate, ha_client
+
+    def test_gated_closes_cloud_leg(self):
+        result, mock_escalate, _ = self._run(cloud_permitted=False, ha_answers=False)
+        mock_escalate.assert_not_called()
+        assert "limited mode" in result.text
+
+    def test_gated_keeps_ha_leg(self):
+        result, mock_escalate, ha_client = self._run(cloud_permitted=False, ha_answers=True)
+        ha_client.conversation_process.assert_called_once()
+        mock_escalate.assert_not_called()
+        assert result.text == "HA answer"
+
+    def test_permitted_opens_cloud_leg(self):
+        result, mock_escalate, _ = self._run(cloud_permitted=True, ha_answers=False)
+        mock_escalate.assert_called_once()
+        assert result.text == "cloud answer"

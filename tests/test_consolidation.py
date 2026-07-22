@@ -33,7 +33,7 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
         model=loop.model,
         tokenizer=loop.tokenizer,
         extraction_config_provider=loop._current_extraction_config,
-        cloud_enabled=loop.config.cloud_enabled,
+        cloud_enabled=loop.cloud_enabled,
         neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
         max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
         gc_disable=loop._disable_gradient_checkpointing,
@@ -521,7 +521,6 @@ class TestInterimRefinementGate:
             model=model,
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(
-                cloud_enabled=cloud_enabled,
                 refinement_enrichment=refinement_enrichment,
                 refinement_contradiction=refinement_contradiction,
             ),
@@ -532,6 +531,7 @@ class TestInterimRefinementGate:
             procedural_adapter_config=None,
             output_dir=tmp_path,
             extraction_scrub={"person name"},
+            cloud_enabled=cloud_enabled,
         )
         return loop
 
@@ -837,29 +837,25 @@ class TestRefinementConfigRoundtrip:
     """Loading YAML with refinement knobs propagates through the property chain."""
 
     def test_yaml_cloud_enabled_propagates(self, tmp_path):
-        """YAML cloud_enabled: true propagates to schedule and consolidation_config."""
+        """Top-level ``cloud.enabled: true`` reaches ServerConfig.cloud."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
 model:
   name: "mistralai/Mistral-7B-Instruct-v0.3"
+cloud:
+  enabled: true
 consolidation:
   refresh_cadence: "12h"
-  cloud_enabled: true
 """
         cfg_path = tmp_path / "server_cloud_enabled.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.cloud_enabled is True, (
-            "ServerConfig.consolidation.cloud_enabled should be True"
-        )
-        assert cfg.consolidation_config.cloud_enabled is True, (
-            "consolidation_config.cloud_enabled should be True"
-        )
+        assert cfg.cloud.enabled is True, "ServerConfig.cloud.enabled should be True"
 
     def test_yaml_cloud_defaults_to_false(self, tmp_path):
-        """YAML without cloud_enabled defaults to False."""
+        """YAML without a ``cloud`` section defaults the master switch to False."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -872,12 +868,28 @@ consolidation:
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.cloud_enabled is False, (
-            "ServerConfig.consolidation.cloud_enabled should default to False"
-        )
-        assert cfg.consolidation_config.cloud_enabled is False, (
-            "consolidation_config.cloud_enabled should default to False"
-        )
+        assert cfg.cloud.enabled is False, "ServerConfig.cloud.enabled should default to False"
+
+    def test_consolidation_config_carries_no_cloud_switch(self):
+        """The cloud switch is NOT a ConsolidationConfig field.
+
+        A second copy there is exactly what let the extraction pipeline and
+        the conversation agent disagree about whether cloud egress was on.
+        """
+        from paramem.utils.config import ConsolidationConfig
+
+        assert not hasattr(ConsolidationConfig(), "cloud_enabled")
+
+    def test_retired_consolidation_cloud_enabled_fails_loudly(self, tmp_path):
+        """A stale ``consolidation.cloud_enabled`` raises by name at load."""
+        import pytest as _pytest
+
+        from paramem.server.config import load_server_config
+
+        cfg_path = tmp_path / "server_stale_key.yaml"
+        cfg_path.write_text('model:\n  name: "m"\nconsolidation:\n  cloud_enabled: true\n')
+        with _pytest.raises(TypeError, match="cloud_enabled"):
+            load_server_config(str(cfg_path))
 
     def test_yaml_refinement_enrichment_on_propagates(self, tmp_path):
         """YAML refinement_enrichment: "on" propagates to schedule and consolidation_config."""
@@ -6181,8 +6193,8 @@ class TestDriftIntendedRemoval:
             min_tier_key_floor=0,
             tier_fast_start=False,
             refinement_enrichment="on",
-            cloud_enabled=True,
         )
+        loop.cloud_enabled = True
         loop.merger = GraphMerger(model=None)
 
         # key_ok — survives (recon edge present, full SPO).
@@ -10164,7 +10176,7 @@ class TestMaterializeInterimExtraRelations:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            # base defaults: cloud_enabled=False, refinement_enrichment="off",
+            # base defaults: cloud master switch off, refinement_enrichment="off",
             # refinement_normalization="off" — tests override per scenario
         )
         loop.training_config = TrainingConfig(
@@ -11847,7 +11859,7 @@ class TestInterimKeyedWalk:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            # base defaults: cloud_enabled=False, refinement_enrichment="off"
+            # base defaults: cloud master switch off, refinement_enrichment="off"
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -12040,7 +12052,7 @@ class TestMergeRegistryRelationsUnification:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            # base defaults: cloud_enabled=False, refinement_enrichment="off"
+            # base defaults: cloud master switch off, refinement_enrichment="off"
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -14265,8 +14277,8 @@ class TestRunGraphNormalizationCloudEngine:
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
             refinement_normalization="on",
-            cloud_enabled=cloud_enabled,
         )
+        loop.cloud_enabled = cloud_enabled
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -14700,8 +14712,8 @@ class TestNormalizationLevelGating:
             indexed_key_replay=True,
             refinement_normalization=refinement_normalization,
             refinement_enrichment=refinement_enrichment,
-            cloud_enabled=cloud_enabled,
         )
+        loop.cloud_enabled = cloud_enabled
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -14763,7 +14775,7 @@ class TestNormalizationLevelGating:
             loop._refine_consolidation_graph(
                 [],
                 normalize=loop.config.refinement_normalization == "on",
-                enrich=loop.config.refinement_enrichment == "on" and loop.config.cloud_enabled,
+                enrich=loop.config.refinement_enrichment == "on" and loop.cloud_enabled,
             )
         mock_norm.assert_not_called()
 
@@ -14785,7 +14797,7 @@ class TestNormalizationLevelGating:
             loop._refine_consolidation_graph(
                 [],
                 normalize=loop.config.refinement_normalization == "on",
-                enrich=loop.config.refinement_enrichment == "on" and loop.config.cloud_enabled,
+                enrich=loop.config.refinement_enrichment == "on" and loop.cloud_enabled,
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_not_called()
@@ -14820,7 +14832,7 @@ class TestNormalizationLevelGating:
             loop._refine_consolidation_graph(
                 [],
                 normalize=loop.config.refinement_normalization == "on",
-                enrich=loop.config.refinement_enrichment == "on" and loop.config.cloud_enabled,
+                enrich=loop.config.refinement_enrichment == "on" and loop.cloud_enabled,
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_called_once()

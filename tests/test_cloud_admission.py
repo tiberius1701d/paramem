@@ -87,7 +87,7 @@ class TestSingleMissingTerm:
             cloud_enabled=False, provider="anthropic", model="m", endpoint=None
         )
         assert verdict.permitted is False
-        assert verdict.gaps == ("cloud_enabled is off",)
+        assert verdict.gaps == ("cloud.enabled is off",)
         # A refused verdict never hands back a usable credential.
         assert verdict.api_key == ""
 
@@ -113,13 +113,18 @@ class TestSingleMissingTerm:
         assert verdict.gaps == ("ANTHROPIC_API_KEY env var is unset",)
         assert verdict.api_key == ""
 
-    def test_missing_endpoint_for_self_hosted_openai_compat(self, monkeypatch):
-        monkeypatch.setenv("OLLAMA_API_KEY", "local-key")
+    def test_self_hosted_provider_is_not_cloud(self):
+        """Self-hosted is not cloud: it has no entry in the provider tables.
+
+        ``ollama`` used to sit in both tables while the module's own comments
+        said it was self-hosted.  Admission is only ever asked about CLOUD
+        egress, so a self-hosted host is simply not a provider here.
+        """
         verdict = evaluate_cloud_egress(
             cloud_enabled=True, provider="ollama", model="llama3", endpoint=None
         )
         assert verdict.permitted is False
-        assert verdict.gaps == ("no endpoint for provider 'ollama'",)
+        assert verdict.gaps == ("unsupported provider 'ollama'",)
 
 
 class TestMultipleGaps:
@@ -130,19 +135,19 @@ class TestMultipleGaps:
         verdict = evaluate_cloud_egress(cloud_enabled=False, provider="", model="", endpoint=None)
         assert verdict.permitted is False
         assert verdict.gaps == (
-            "cloud_enabled is off",
+            "cloud.enabled is off",
             "no cloud provider configured",
             "no model configured for provider ''",
         )
 
-    def test_key_and_endpoint_both_reported(self):
+    def test_switch_and_key_both_reported(self):
         verdict = evaluate_cloud_egress(
-            cloud_enabled=True, provider="ollama", model="llama3", endpoint=None
+            cloud_enabled=False, provider="groq", model="llama-3.3-70b", endpoint=None
         )
         assert verdict.permitted is False
         assert verdict.gaps == (
-            "OLLAMA_API_KEY env var is unset",
-            "no endpoint for provider 'ollama'",
+            "cloud.enabled is off",
+            "GROQ_API_KEY env var is unset",
         )
 
 
@@ -168,20 +173,14 @@ class TestOpenAICompatEndpoint:
         assert verdict.permitted is True
         assert verdict.endpoint == "http://127.0.0.1:9000/v1/chat/completions"
 
-    def test_explicit_endpoint_satisfies_self_hosted_provider(self, monkeypatch):
-        monkeypatch.setenv("OLLAMA_API_KEY", "local-key")
-        verdict = evaluate_cloud_egress(
-            cloud_enabled=True,
-            provider="ollama",
-            model="llama3",
-            endpoint="http://127.0.0.1:11434/v1/chat/completions",
-        )
-        assert verdict.permitted is True
-        assert verdict.endpoint == "http://127.0.0.1:11434/v1/chat/completions"
+    def test_every_openai_compat_provider_carries_a_default(self):
+        """No provider in the compat set lacks a default endpoint.
 
-    def test_ollama_is_openai_compat_without_a_default(self):
-        assert "ollama" in OPENAI_COMPAT_PROVIDERS
-        assert "ollama" not in OPENAI_COMPAT_ENDPOINTS
+        Since ``ollama`` (self-hosted, no canonical URL) left the tables, the
+        two sets are identical — a provider needing an operator-supplied
+        endpoint would be a self-hosted one, which is not cloud.
+        """
+        assert OPENAI_COMPAT_PROVIDERS == set(OPENAI_COMPAT_ENDPOINTS)
 
 
 class TestUnregisteredProvider:

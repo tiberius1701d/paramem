@@ -141,10 +141,13 @@ class ConsolidationConfig:
     promotion_threshold: int = 3
     decay_window: int = 10
     indexed_key_replay: bool = True
-    # Ship-safe posture: base defaults OFF (no cloud, no refinement). Operator
-    # YAMLs (fixture/local) opt in explicitly.
-    # master gate for ALL cloud egress (transcript pipeline + graph enrichment)
-    cloud_enabled: bool = False
+    # Ship-safe posture: base defaults OFF (no refinement). Operator YAMLs
+    # (fixture/local) opt in explicitly.
+    # The cloud master switch is NOT here: it is `cloud.enabled`
+    # (paramem.server.config.CloudConfig), the single switch for all cloud
+    # egress, and reaches ConsolidationLoop as an explicit constructor
+    # argument.  A second copy on this dataclass is what let the pipeline and
+    # the conversation agent disagree about whether cloud was on.
     # graph-stage GraphTierRefiner.run_enrichment (cloud-only). off|on
     refinement_enrichment: str = "off"
     refinement_normalization: str = "on"  # full-fold predicate-synonym collapse. off|on

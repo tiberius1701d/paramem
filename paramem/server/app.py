@@ -73,10 +73,12 @@ from paramem.server.inference import (
     ChatResult,
     _escalate_to_cloud,
     _sanitize_history,
+    answer_via_cloud,
     handle_chat,
 )
 from paramem.server.router import QueryRouter
 from paramem.server.run_status import read_last_runs, record_last_run
+from paramem.server.sanitizer import check_personal_content
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
 from paramem.server.tools.ha_client import HAClient
 from paramem.server.trial_state import (
@@ -157,6 +159,9 @@ _state = {
     # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
     "cloud_only_reason": None,
     "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
+    # conversation_ids already told they are being served over the degraded
+    # cloud path (see _DEGRADED_SERVING_NOTICE) — the notice fires once each.
+    "degraded_notice_conversations": set(),
     "defer_model": False,  # set by --defer-model CLI flag before app start
     "ha_graph": None,  # HAEntityGraph built from HA states/services at startup
     "event_loop": None,  # asyncio event loop reference for cross-thread scheduling
@@ -2777,14 +2782,13 @@ async def chat(request: ChatRequest, http_request: Request):
                 if len(parts) == 2
                 else _state.get("cloud_agent")
             )
-            if agent is not None:
-                # Direct provider testing — no anonymization/policy
-                # branching, matching the pre-lift behaviour: history is
-                # sanitized (never anonymized) via the operator-configured
-                # ``sanitization.mode`` gate.
+            if agent is not None and _state["mode"] == "cloud-only":
+                # Cloud-only: no local model, so no ParaMem-held knowledge and
+                # no anonymizer — the same plain-cloud-agent posture as
+                # _cloud_only_route.  History is still drop-gated.
                 sanitized_history = _sanitize_history(
                     request.history,
-                    mode=_state["config"].sanitization.mode,
+                    known_entities=_household_known_entities(),
                     speaker_id=_speaker_id,
                 )
                 result = await loop.run_in_executor(
@@ -2795,6 +2799,37 @@ async def chat(request: ChatRequest, http_request: Request):
                         _state["config"],
                         speaker=speaker,
                         sanitized_history=sanitized_history,
+                    ),
+                )
+            elif agent is not None:
+                # Local mode: forced routing selects the PROVIDER, it does not
+                # buy a policy bypass.  The turn goes through the one egress
+                # funnel, so cloud_mode and the personal verdict apply exactly
+                # as they do on the routed path.  Only the household names are
+                # available as entity ground truth here — forced routing skips
+                # the router and the memory store by construction.
+                _forced_known_entities = _household_known_entities()
+                _forced_is_personal = bool(
+                    check_personal_content(
+                        request.text,
+                        speaker_id=_speaker_id,
+                        known_entities=_forced_known_entities,
+                        personal_referent_config=_state["config"].personal_referent,
+                    )
+                )
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: answer_via_cloud(
+                        request.text,
+                        agent,
+                        _state["config"],
+                        is_personal=_forced_is_personal,
+                        model=_state.get("model"),
+                        tokenizer=_state.get("tokenizer"),
+                        speaker=speaker,
+                        speaker_id=_speaker_id,
+                        history=request.history,
+                        known_entities=_forced_known_entities,
                     ),
                 )
         if result and result.text:
@@ -3101,6 +3136,46 @@ async def _resolve_and_enroll_speaker(
     )
 
 
+#: ``_state["cloud_only_reason"]`` values that mean the local model the
+#: operator CHOSE to run is unavailable against their wishes.  These are the
+#: only states ``cloud.allow_degraded_serving`` gates.  Deliberate cloud-only
+#: ("explicit", "released") and transient internal states ("training",
+#: "live_reload") are not degraded serving and always proceed.
+_INVOLUNTARY_CLOUD_ONLY_REASONS: frozenset[str] = frozenset(
+    {
+        "gpu_conflict",
+        "insufficient_vram",
+        "reload_failed",
+        "apply_failed",
+        "cuda_fault_persistent",
+    }
+)
+
+#: Prepended once per conversation when a turn is served over the degraded
+#: cloud path.  App-layer prefix (same mechanism as the greeting) — never
+#: written to the session buffer, so it can never reach a training transcript.
+_DEGRADED_SERVING_NOTICE = "My local memory is offline right now, so a cloud model is answering. "
+
+
+def _household_known_entities() -> set[str] | None:
+    """Household display names for the sanitizer's known-entity scrub.
+
+    The only entity ground truth available on paths with no local model /
+    memory store (cloud-only routing, forced provider routing).  Real case is
+    preserved: the scrub is exact-case, whole-word (person "Bill" vs invoice
+    "bill").
+
+    Returns:
+        The stripped, non-empty display names, or ``None`` when no speaker
+        store is registered or no non-anonymous profile is enrolled.
+    """
+    store = _state.get("speaker_store")
+    if store is None:
+        return None
+    names = {n.strip() for n in store.household_display_names() if n and n.strip()}
+    return names or None
+
+
 async def _run_chat_turn(
     *,
     text: str,
@@ -3165,24 +3240,23 @@ async def _run_chat_turn(
 
     # Cloud-only mode — route via HA graph + cloud, no local model.
     if _state["mode"] == "cloud-only":
-        _cloud_speaker_store = _state.get("speaker_store")
-        _cloud_known_entities: set[str] | None = None
-        if _cloud_speaker_store is not None:
-            _names = _cloud_speaker_store.household_display_names()
-            if _names:
-                # Real case preserved: the sanitizer's known-entity scrub is
-                # exact-case, whole-word (person "Bill" vs invoice "bill").
-                _cloud_known_entities = {n.strip() for n in _names if n}
+        # Degraded serving: the local model is gone for a reason the operator
+        # did not choose.  The CLOUD leg is closed unless they opted in; the
+        # HA leg stays open either way — HA carries no ParaMem-held knowledge
+        # and runs on the user's own network, so breaking it during a GPU
+        # conflict buys no privacy.
+        degraded = _state.get("cloud_only_reason") in _INVOLUNTARY_CLOUD_ONLY_REASONS
+        cloud_permitted = not degraded or _state["config"].cloud.allow_degraded_serving
         result = _cloud_only_route(
             text=text,
             speaker=display_speaker,
             history=history,
             config=_state["config"],
-            router=_state.get("router"),
+            cloud_permitted=cloud_permitted,
             ha_client=_state.get("ha_client"),
             cloud_agent=_state.get("cloud_agent"),
             language=language,
-            known_entities=_cloud_known_entities,
+            known_entities=_household_known_entities(),
             speaker_id=speaker_id,
         )
         buffer.append(
@@ -3201,7 +3275,15 @@ async def _run_chat_turn(
             speaker_id=speaker_id,
             speaker=speaker,
         )
-        spoken_text = f"{greeting_prefix}{cloud_text}" if greeting_prefix else cloud_text
+        # Degradation notice — once per conversation, first degraded turn only.
+        # Prefix order: greeting, then notice, then the answer.
+        notice = ""
+        if degraded and cloud_permitted:
+            announced: set[str] = _state["degraded_notice_conversations"]
+            if conversation_id not in announced:
+                announced.add(conversation_id)
+                notice = _DEGRADED_SERVING_NOTICE
+        spoken_text = f"{greeting_prefix or ''}{notice}{cloud_text}"
         return result, spoken_text
 
     # Local mode — normal inference with entity routing.
@@ -5270,7 +5352,9 @@ def _build_config_derived_state(
         logger.info("Voice pipeline profile: %r", _state["voice_profile"])
 
         # ── 4. Cloud agent + providers ─────────────────────────────────────────
-        _state["cloud_agent"] = get_cloud_agent(config.cloud_agent)
+        _state["cloud_agent"] = get_cloud_agent(
+            config.cloud_agent, cloud_enabled=config.cloud.enabled
+        )
         if _state["cloud_agent"]:
             logger.info(
                 "cloud agent: %s (%s)",
@@ -5282,7 +5366,7 @@ def _build_config_derived_state(
 
         _state["cloud_providers"] = {}
         for name, provider_config in config.cloud_providers.items():
-            agent = get_cloud_agent(provider_config)
+            agent = get_cloud_agent(provider_config, cloud_enabled=config.cloud.enabled)
             if agent:
                 _state["cloud_providers"][name] = agent
                 logger.info("cloud provider registered: %s (%s)", name, provider_config.model)
@@ -6958,24 +7042,19 @@ async def debug_probe(request: DebugProbeRequest):
 
     # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
     if _state["mode"] == "cloud-only":
-        _cloud_speaker_store2 = _state.get("speaker_store")
-        _cloud_known_entities2: set[str] | None = None
-        if _cloud_speaker_store2 is not None:
-            _names2 = _cloud_speaker_store2.household_display_names()
-            if _names2:
-                # Real case preserved: the sanitizer's known-entity scrub is
-                # exact-case, whole-word (person "Bill" vs invoice "bill").
-                _cloud_known_entities2 = {n.strip() for n in _names2 if n}
         cloud_result = _cloud_only_route(
             text=request.text,
             speaker=speaker_name,
             history=request.history,
             config=config,
-            router=_state.get("router"),
+            cloud_permitted=(
+                _state.get("cloud_only_reason") not in _INVOLUNTARY_CLOUD_ONLY_REASONS
+                or config.cloud.allow_degraded_serving
+            ),
             ha_client=_state.get("ha_client"),
             cloud_agent=_state.get("cloud_agent"),
             language=detected_language,
-            known_entities=_cloud_known_entities2,
+            known_entities=_household_known_entities(),
             speaker_id=request.speaker_id,
         )
         return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
@@ -11781,7 +11860,8 @@ def _cloud_only_route(
     speaker: str | None,
     history: list[dict] | None,
     config,
-    router=None,
+    *,
+    cloud_permitted: bool,
     ha_client=None,
     cloud_agent=None,
     language: str | None = None,
@@ -11790,27 +11870,38 @@ def _cloud_only_route(
 ) -> ChatResult:
     """Route queries when the local model is unavailable (cloud-only mode).
 
-    HA first (has tools for weather, time, devices), cloud as fallback
-    for reasoning. Mutual fallback: if one fails, try the other.
+    HA first (has tools for weather, time, devices), cloud as fallback for
+    reasoning.  Nothing else runs here: with no local model there is no
+    ParaMem-held knowledge to protect on this path — ``_state["model"]`` and
+    ``["memory_store"]`` are absent and ``history`` is client-supplied — so
+    this is honestly a plain cloud agent.  No intent classification, no
+    personal-referent gate, no ``cloud_mode`` policy.
 
-    ``known_entities`` is the set of household display names in their stored
-    (real) case — the sanitizer's known-entity scrub matches exact-case.
-    Passed to ``sanitize_for_cloud`` and ``_escalate_to_cloud`` so that a
-    household name typed directly by the user (e.g. "Where does Alex live?")
-    is recognised as personal content and redacted under ``cloud_mode=anonymize``.
+    Args:
+        text: The user's turn, verbatim.
+        speaker: Display name of the resolved speaker, or ``None``.
+        history: Prior conversation turns, or ``None``.  Drop-gated by
+            ``_sanitize_history`` before it egresses.
+        config: The live :class:`~paramem.server.config.ServerConfig`.
+        cloud_permitted: Whether the CLOUD leg may be used.  Computed by the
+            caller (``_run_chat_turn``) from ``_state["cloud_only_reason"]``
+            and ``config.cloud.allow_degraded_serving``: ``False`` closes the
+            cloud leg while the server is cloud-only for an involuntary
+            reason and the operator has not opted into degraded serving.  The
+            HA leg is unaffected.
+        ha_client: HA client, or ``None`` when HA is not configured.
+        cloud_agent: Cloud agent, or ``None`` when cloud is not configured.
+        language: Resolved BCP-47 code for this turn, or ``None``.
+        known_entities: Household display names in their stored (real) case —
+            the scrub matches exact-case.  From ``_household_known_entities``.
+        speaker_id: Resolved canonical speaker ID, or ``None`` for anonymous
+            turns; threaded to ``_sanitize_history`` so the first-person
+            detector fires on the history channel.
 
-    ``speaker_id`` is the resolved canonical speaker ID (or ``None`` for
-    anonymous turns), threaded through to ``_sanitize_history`` so the
-    first-person detector fires on this channel — consistent with the other
-    three ``_sanitize_history`` call sites (``app.py``'s forced-routing
-    debug path and both branches of ``inference.py``'s
-    ``answer_via_cloud``).
+    Returns:
+        The answering leg's :class:`~paramem.server.inference.ChatResult`, or
+        the canned limited-mode result when neither leg served the turn.
     """
-    from paramem.server.sanitizer import sanitize_for_cloud
-
-    # Cloud-only: no local model for PA probing.
-    # HA first (has tools for weather, time, devices), cloud as fallback.
-
     # Try HA conversation agent — it has tools and real-time data
     # Language passed via HA's native conversation API parameter
     if ha_client is not None:
@@ -11828,29 +11919,29 @@ def _cloud_only_route(
         logger.info("Cloud-only route: HA agent failed, trying cloud")
 
     # HA failed or unavailable → try cloud for reasoning
-    if cloud_agent is not None:
-        sanitized, _ = sanitize_for_cloud(
-            text, mode=config.sanitization.mode, known_entities=known_entities
+    if cloud_agent is not None and cloud_permitted:
+        logger.info("Cloud-only route: escalating to cloud")
+        sanitized_history = _sanitize_history(
+            history,
+            known_entities=known_entities,
+            speaker_id=speaker_id,
         )
-        if sanitized is not None:
-            logger.info("Cloud-only route: escalating to cloud")
-            sanitized_history = _sanitize_history(
-                history,
-                mode=config.sanitization.mode,
-                known_entities=known_entities,
-                speaker_id=speaker_id,
-            )
-            result = _escalate_to_cloud(
-                sanitized,
-                cloud_agent,
-                config,
-                speaker=speaker,
-                sanitized_history=sanitized_history,
-                language=language,
-            )
-            if result.text:
-                logger.info("Cloud-only route: Cloud responded")
-                return result
+        result = _escalate_to_cloud(
+            text,
+            cloud_agent,
+            config,
+            speaker=speaker,
+            sanitized_history=sanitized_history,
+            language=language,
+        )
+        if result.text:
+            logger.info("Cloud-only route: Cloud responded")
+            return result
+    elif cloud_agent is not None:
+        logger.warning(
+            "Cloud-only route: cloud leg closed (degraded serving; "
+            "set cloud.allow_degraded_serving: true to open it)"
+        )
 
     logger.warning("Cloud-only route: all services failed")
     return ChatResult(

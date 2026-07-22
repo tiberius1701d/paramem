@@ -1,14 +1,19 @@
 """Cloud-egress admission — the single answer to "may we call a cloud LLM?".
 
-Four sites used to answer that question with four different sets of terms:
+Five sites used to answer that question with different sets of terms:
 session-tier cloud enrichment, graph-tier enrichment, graph-tier predicate
-normalization, and the ``/calibrate/enrich`` endpoint.  One of them omitted
-the ``cloud_enabled`` master switch entirely, so an operator-triggered
-endpoint could egress with the switch off.  :func:`evaluate_cloud_egress`
-is now the only place the decision is computed; every caller reads the
+normalization, the ``/calibrate/enrich`` endpoint, and the conversation
+agent's own ``is_available`` predicate.  One omitted the master switch
+entirely, so an operator-triggered endpoint could egress with the switch
+off; another accepted "endpoint configured, no key" and sent an empty
+``Authorization: Bearer``.  :func:`evaluate_cloud_egress` is now the only
+place the decision is computed; every caller reads the
 :class:`EgressVerdict` it returns and decides what to DO about a refusal
-(skip silently, fall back to the local model, or raise) — the decision
-itself is not re-derived anywhere.
+(skip silently, fall back to the local model, raise, or decline to build
+the agent) — the decision itself is not re-derived anywhere.
+
+The switch it takes is the ONE master switch, ``cloud.enabled``
+(:class:`paramem.server.config.CloudConfig`).
 
 Leaf module by construction: stdlib only.  It must not import from
 ``paramem.graph``, ``paramem.training`` or ``paramem.server`` — the graph
@@ -27,9 +32,8 @@ nothing else in the codebase enumerates providers.
 import os
 from dataclasses import dataclass
 
-# Default chat-completions URL per OpenAI-compatible provider.  A provider
-# in this table needs no configured endpoint; one outside it (``ollama``,
-# which is self-hosted and has no canonical URL) does.
+# Default chat-completions URL per OpenAI-compatible provider.  Every
+# provider in this table needs no configured endpoint.
 OPENAI_COMPAT_ENDPOINTS = {
     "openai": "https://api.openai.com/v1/chat/completions",
     "groq": "https://api.groq.com/openai/v1/chat/completions",
@@ -37,9 +41,11 @@ OPENAI_COMPAT_ENDPOINTS = {
 }
 
 # Providers reached over the OpenAI-compatible chat-completions wire format,
-# as opposed to a native SDK.  ``ollama`` speaks the same format but is
-# self-hosted, so it carries no default endpoint.
-OPENAI_COMPAT_PROVIDERS = set(OPENAI_COMPAT_ENDPOINTS) | {"ollama"}
+# as opposed to a native SDK.  A self-hosted host speaking the same wire
+# format is NOT cloud and has no entry here — this module's tables are the
+# registry of what "cloud" means, and admission is only ever asked about
+# cloud egress.
+OPENAI_COMPAT_PROVIDERS = set(OPENAI_COMPAT_ENDPOINTS)
 
 # Env var holding the API key for each supported provider.  Membership in
 # this table is also what makes a string a PROVIDER at all: ``"auto"`` and
@@ -51,7 +57,6 @@ PROVIDER_KEY_ENV = {
     "google": "GOOGLE_API_KEY",
     "groq": "GROQ_API_KEY",
     "mistral": "MISTRAL_API_KEY",
-    "ollama": "OLLAMA_API_KEY",
 }
 
 
@@ -114,7 +119,8 @@ def evaluate_cloud_egress(
 
     Every term must hold for ``permitted=True``:
 
-    1. ``cloud_enabled`` — the operator's master switch for all cloud egress.
+    1. ``cloud_enabled`` — the operator's master switch for all cloud egress
+       (``cloud.enabled`` in ``server.yaml``).
     2. ``provider`` is non-empty and present in :data:`PROVIDER_KEY_ENV`.
     3. ``model`` is non-empty.
     4. :func:`resolve_api_key` returns a non-empty key.
@@ -127,7 +133,10 @@ def evaluate_cloud_egress(
     also missing" loop; one verdict reports everything missing at once.
 
     Args:
-        cloud_enabled: The master switch (``consolidation.cloud_enabled``).
+        cloud_enabled: The master switch, ``ServerConfig.cloud.enabled``
+            (YAML ``cloud.enabled``) — the ONE on-off for cloud egress,
+            shared by the conversation agent, the extraction chain, the
+            graph-tier enrichment pass and ``/calibrate/enrich``.
         provider: Configured provider name.  ``""`` means "no cloud
             provider configured"; a non-provider token such as ``"auto"``
             or ``"off"`` is reported as unsupported and never reaches a
@@ -143,7 +152,7 @@ def evaluate_cloud_egress(
     gaps: list[str] = []
 
     if not cloud_enabled:
-        gaps.append("cloud_enabled is off")
+        gaps.append("cloud.enabled is off")
 
     known_provider = bool(provider) and provider in PROVIDER_KEY_ENV
     if not provider:

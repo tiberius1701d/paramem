@@ -126,12 +126,8 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
     {
         # --- Test-mode posture: fixture intentionally exercises code paths
         # that the example ships disabled for ship-safety. ----------------
-        "agents.cloud.enabled",  # cloud agent ON in tests, OFF in shipped default
-        "agents.cloud_providers.anthropic.enabled",
-        "agents.cloud_providers.google.enabled",
-        "agents.cloud_providers.openai.enabled",
+        "cloud.enabled",  # the ONE cloud master switch: ON in tests, OFF in shipped default
         "consolidation.extraction_enrichment_provider",  # cloud noise filter ON in tests
-        "consolidation.cloud_enabled",  # cloud master gate ON in tests, OFF in shipped default
         "consolidation.refinement_enrichment",  # enrichment ON in tests, OFF in shipped default
         "consolidation.refinement_contradiction",  # "on" in tests, "off" in shipped default
         # ON in tests + live deployment; example ships OFF (default-OFF rollout posture).

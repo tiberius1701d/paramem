@@ -1122,7 +1122,7 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
     turn-marking + prompt-file checks (zero inference cost on failure),
     then asks the shared cloud-admission component
     (:func:`~paramem.cloud.admission.evaluate_cloud_egress`) whether
-    egress is allowed at all — the ``cloud_enabled`` master switch being
+    egress is allowed at all — the ``cloud.enabled`` master switch being
     off, a missing provider/model, an unset key or a missing endpoint each
     surface as HTTP 400 naming every unmet term, before any cloud call is
     made.  This endpoint is operator-triggered, so it fails LOUDLY where
@@ -1162,7 +1162,7 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
         _ensure_prompt_exists(req.prompts_dir, filename)
         cfg = state["config"]
         verdict = evaluate_cloud_egress(
-            cloud_enabled=cfg.consolidation.cloud_enabled,
+            cloud_enabled=cfg.cloud.enabled,
             provider=cfg.consolidation.extraction_enrichment_provider,
             model=cfg.consolidation.extraction_enrichment_provider_model,
             endpoint=cfg.consolidation.extraction_enrichment_provider_endpoint or None,
@@ -1173,7 +1173,7 @@ def calibrate_enrich(state: dict, req: CalibrateEnrichRequest) -> dict[str, Any]
                 detail=(
                     "Cloud egress refused for cloud enrichment: "
                     + "; ".join(verdict.gaps)
-                    + ". Fix consolidation.cloud_enabled / "
+                    + ". Fix cloud.enabled / "
                     "consolidation.extraction_enrichment_provider* in server.yaml, or set "
                     "the provider's key env var."
                 ),

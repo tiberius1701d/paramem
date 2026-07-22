@@ -172,8 +172,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -203,8 +203,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -237,8 +237,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -274,8 +274,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
@@ -308,8 +308,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
@@ -342,8 +342,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=("What's the weather?", []),
+                "paramem.server.inference.check_personal_content",
+                return_value=[],
             ),
             patch(
                 "paramem.server.inference._escalate_to_ha_agent",
@@ -380,8 +380,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=("What's the weather?", []),
+                "paramem.server.inference.check_personal_content",
+                return_value=[],
             ),
             patch(
                 "paramem.server.inference._escalate_to_ha_agent",
@@ -432,8 +432,8 @@ class TestAbstentionShortCircuit:
         # and previously dropped through to _base_model_answer.
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",
@@ -474,8 +474,8 @@ class TestAbstentionShortCircuit:
             # This represents a personal-flavored query that doesn't trip
             # the self-referential blocker — HA can be attempted.
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=("What's my next meeting?", []),
+                "paramem.server.inference.check_personal_content",
+                return_value=[],
             ),
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",
@@ -518,8 +518,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["first_person_personal"]),
+                "paramem.server.inference.check_personal_content",
+                return_value=["first_person_personal"],
             ),
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",

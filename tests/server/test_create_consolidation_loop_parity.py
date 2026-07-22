@@ -91,7 +91,7 @@ SCENARIOS = [
             "consolidation.extraction_enrichment_provider": "anthropic",
             "consolidation.extraction_enrichment_provider_model": "claude-sonnet-4-6",
             "consolidation.extraction_plausibility_judge": "off",
-            "consolidation.cloud_enabled": True,
+            "cloud.enabled": True,
             "consolidation.graph_enrichment_neighborhood_hops": 1,
             "consolidation.graph_enrichment_max_entities_per_pass": 400,
             "adapters.episodic.rank": 8,
@@ -184,7 +184,7 @@ def test_factory_threads_every_config_knob(
 
     # --- Graph and enrichment knobs ---
     assert captured["graph_config"] == cfg.graph_config
-    assert captured["cloud_enabled"] == cfg.consolidation.cloud_enabled
+    assert captured["cloud_enabled"] == cfg.cloud.enabled
     assert (
         captured["graph_enrichment_neighborhood_hops"]
         == cfg.consolidation.graph_enrichment_neighborhood_hops

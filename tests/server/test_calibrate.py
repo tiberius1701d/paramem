@@ -47,13 +47,17 @@ from paramem.server.calibrate import (
     calibrate_plausibility,
     calibrate_procedural,
 )
-from paramem.server.config import SanitizationConfig
+from paramem.server.config import CloudConfig, SanitizationConfig
 
 
 def _state_disabled() -> dict:
     """Server state where calibrate is OFF (production default)."""
     consolidation_cfg = SimpleNamespace(calibrate_endpoint_enabled=False)
-    config = SimpleNamespace(consolidation=consolidation_cfg, sanitization=SanitizationConfig())
+    config = SimpleNamespace(
+        consolidation=consolidation_cfg,
+        sanitization=SanitizationConfig(),
+        cloud=CloudConfig(),
+    )
     return {
         "config": config,
         "consolidating": False,
@@ -68,7 +72,13 @@ def _state_enabled() -> dict:
     # (SanitizationConfig._DEFAULT_SCRUB) — calibrate_anonymize sources
     # ``scrub`` from here, the same policy knob every production call
     # site reads (see calibrate_anonymize's docstring).
-    config = SimpleNamespace(consolidation=consolidation_cfg, sanitization=SanitizationConfig())
+    # ``cloud`` is the ONE cloud master switch (CloudConfig, ship default OFF);
+    # the enrich tests flip ``config.cloud.enabled`` per case.
+    config = SimpleNamespace(
+        consolidation=consolidation_cfg,
+        sanitization=SanitizationConfig(),
+        cloud=CloudConfig(),
+    )
     return {
         "config": config,
         "consolidating": False,
@@ -946,7 +956,7 @@ class TestCalibrateEnrich:
         import unittest.mock as _mock
 
         state = _state_enabled()
-        state["config"].consolidation.cloud_enabled = True
+        state["config"].cloud.enabled = True
         state["config"].consolidation.extraction_enrichment_provider = "anthropic"
         state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
@@ -966,7 +976,7 @@ class TestCalibrateEnrich:
         import unittest.mock as _mock
 
         state = _state_enabled()
-        state["config"].consolidation.cloud_enabled = True
+        state["config"].cloud.enabled = True
         state["config"].consolidation.extraction_enrichment_provider = ""
         state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
@@ -981,21 +991,22 @@ class TestCalibrateEnrich:
         assert not helper.called
 
     def test_master_switch_off_400(self, monkeypatch: pytest.MonkeyPatch):
-        """``cloud_enabled: false`` -> 400, no cloud call.
+        """``cloud.enabled: false`` -> 400, no cloud call.
 
         This endpoint used to egress with the master switch OFF: it checked
-        the provider and the key but never ``cloud_enabled``. It now asks the
-        same cloud-admission component every other egress site asks, and —
-        being operator-triggered — fails loudly rather than skipping.
+        the provider and the key but never the switch. It now asks the same
+        cloud-admission component every other egress site asks — reading the
+        ONE master switch, ``config.cloud.enabled`` — and, being
+        operator-triggered, fails loudly rather than skipping.
 
-        Mutation: drop the ``cloud_enabled`` term from the verdict -> this
-        test sees a successful call instead of a 400.
+        Mutation: drop the master-switch term from the verdict -> this test
+        sees a successful call instead of a 400.
         """
         import unittest.mock as _mock
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
-        state["config"].consolidation.cloud_enabled = False
+        state["config"].cloud.enabled = False
         state["config"].consolidation.extraction_enrichment_provider = "anthropic"
         state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
@@ -1006,7 +1017,7 @@ class TestCalibrateEnrich:
         ):
             calibrate_enrich(state, req)
         assert exc.value.status_code == 400
-        assert "cloud_enabled is off" in exc.value.detail.lower()
+        assert "cloud.enabled is off" in exc.value.detail.lower()
         assert not helper.called
 
     def test_missing_api_key_400(self, monkeypatch: pytest.MonkeyPatch):
@@ -1015,7 +1026,7 @@ class TestCalibrateEnrich:
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         state = _state_enabled()
-        state["config"].consolidation.cloud_enabled = True
+        state["config"].cloud.enabled = True
         state["config"].consolidation.extraction_enrichment_provider = "anthropic"
         state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
@@ -1036,7 +1047,7 @@ class TestCalibrateEnrich:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
-        state["config"].consolidation.cloud_enabled = True
+        state["config"].cloud.enabled = True
         state["config"].consolidation.extraction_enrichment_provider = "anthropic"
         state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
@@ -1070,7 +1081,7 @@ class TestCalibrateEnrich:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         state = _state_enabled()
-        state["config"].consolidation.cloud_enabled = True
+        state["config"].cloud.enabled = True
         state["config"].consolidation.extraction_enrichment_provider = "anthropic"
         state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
         state["config"].consolidation.extraction_enrichment_provider_endpoint = ""

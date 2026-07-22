@@ -162,7 +162,9 @@ def create_consolidation_loop(
         prompts_dir=config.prompts_dir,
         model_name=config.model_name,
         graph_config=config.graph_config,
-        cloud_enabled=config.consolidation.cloud_enabled,
+        # The ONE cloud master switch (ServerConfig.cloud.enabled) — same
+        # switch the conversation agent and /calibrate/enrich read.
+        cloud_enabled=config.cloud.enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
         # Same `scrub` knob as inference-time cloud egress: the cloud

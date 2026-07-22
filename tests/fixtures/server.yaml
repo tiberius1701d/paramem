@@ -246,8 +246,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  cloud_enabled: true            # dev-test posture: exercise cloud code paths (cloud calls fall through when API key unset). In a real deployment this egresses knowledge-graph content (subjects/objects) to the configured cloud provider; anonymization is best-effort, scoped by sanitization.scrub, and a misclassified value can leak real PII.
-  refinement_enrichment: "on"   # graph-stage cloud enrichment — on in tests; requires cloud_enabled:true. This is the flag that actually triggers the graph-content cloud call — same real-name-leak residual on misclassification.
+  refinement_enrichment: "on"   # graph-stage cloud enrichment — on in tests; requires the top-level `cloud.enabled: true` master switch. This is the flag that actually triggers the graph-content cloud call — same real-name-leak residual on misclassification.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (per-group cluster model call); local-7B precision ~0.89 accepted
   refinement_contradiction: "on"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
@@ -292,7 +291,7 @@ consolidation:
   #
   # `auto` => use the same local model that performed extraction.
   # `off`  => disable plausibility entirely (not recommended).
-  # The judge names a cloud PROVIDER (anthropic|openai|google|groq|mistral|ollama),
+  # The judge names a cloud PROVIDER (anthropic|openai|google|groq|mistral),
   # not a model — the model and endpoint are the two keys below.
   extraction_plausibility_judge: auto
   extraction_plausibility_stage: deanon         # "anon" | "deanon"
@@ -372,21 +371,37 @@ consolidation:
   training_seed: 42
   training_lr_decay_steps: null
 
+# --- Cloud ---
+# THE master switch for ALL cloud egress (conversation agent, extraction
+# enrichment chain, graph-tier enrichment, /calibrate/enrich). Dev-test
+# posture: ON so those code paths are exercised. Cloud calls are still
+# refused by evaluate_cloud_egress when the provider's API key env var is
+# unset, so CI makes no real cloud calls. In a real deployment this egresses
+# knowledge-graph content (subjects/objects) to the configured cloud provider;
+# anonymization is best-effort, scoped by sanitization.scrub, and a
+# misclassified value can leak real PII.
+cloud:
+  enabled: true
+  # Degraded serving: keep the CLOUD leg open while the server is cloud-only
+  # for an INVOLUNTARY reason (GPU held by another process, insufficient VRAM,
+  # a failed adapter reload/apply, a persistent CUDA fault) — i.e. the local
+  # model you chose to run is unavailable. false (ship default) closes the
+  # cloud leg in that state: HA still answers, and anything HA cannot serve
+  # returns the canned limited-mode reply rather than routing the household's
+  # questions to a third party you did not choose for them. Deliberate
+  # cloud-only (`cloud_only: true`, POST /gpu/release) and transient internal
+  # states (training, live reload) are NOT gated by this and always proceed.
+  allow_degraded_serving: false
+
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.
 # Cloud is the fallback for general reasoning when HA cannot answer.
 #
-# All cloud agents ship disabled. To enable, set the relevant API key env var
-# (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY) and flip enabled: true.
-# The ${VAR} placeholders below document the surface; they are resolved at
-# load time.
+# These blocks carry provider/model/credentials ONLY — the on-off is
+# `cloud.enabled` above. The ${VAR} placeholders document the surface; they
+# are resolved at load time, and the same env var is what admission checks.
 agents:
-  # Dev-test posture: Cloud agents enabled so escalation routing code paths are
-  # exercised. Cloud calls fall through gracefully when API keys are unset
-  # (the loader logs and skips). Tests that need real cloud responses are
-  # marked `integration` and require keys.
   cloud:
-    enabled: true
     provider: anthropic
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
@@ -394,19 +409,16 @@ agents:
     timeout_seconds: 90.0
   cloud_providers:
     anthropic:
-      enabled: true
       provider: anthropic
       model: claude-sonnet-4-6
       api_key: ${ANTHROPIC_API_KEY}
       timeout_seconds: 90.0
     openai:
-      enabled: true
       provider: openai
       model: gpt-4o-search-preview
       api_key: ${OPENAI_API_KEY}
       timeout_seconds: 90.0
     google:
-      enabled: true
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
@@ -469,10 +481,9 @@ tools:
 # cleartext, gated by intent classification. Hardening the HA hop is a planned
 # follow-up package.
 #
-# Cloud reachability is independent: with `agents.cloud.enabled: false` (or no
-# api_key), no queries reach cloud regardless of `cloud_mode`.
+# Cloud reachability is independent: with `cloud.enabled: false` (or no API key
+# env var), no queries reach cloud regardless of `cloud_mode`.
 sanitization:
-  mode: block            # off | warn | block — PII detection layer
   cloud_mode: anonymize  # block | anonymize | both — direct-cloud egress policy
   scrub:                 # reduced person-only set (NOT the shipped default) — exercises both
                          # the mask path (name terms) and the not-in-scope verbatim pass-through

@@ -116,19 +116,19 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.entity_similarity_threshold": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_neighborhood_hops": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_max_entities_per_pass": Tier.PIPELINE_ALTERING,
-    "consolidation.cloud_enabled": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_enrichment": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_normalization": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_contradiction": Tier.PIPELINE_ALTERING,
-    # --- agents.cloud ---
-    "agents.cloud.enabled": Tier.PIPELINE_ALTERING,
+    # --- cloud (the one master switch for all cloud egress) ---
+    "cloud.enabled": Tier.PIPELINE_ALTERING,
+    "cloud.allow_degraded_serving": Tier.PIPELINE_ALTERING,
+    # --- agents.cloud (provider/credentials only; no on-off of its own) ---
     "agents.cloud.provider": Tier.PIPELINE_ALTERING,
     "agents.cloud.model": Tier.PIPELINE_ALTERING,
     "agents.cloud.api_key": Tier.PIPELINE_ALTERING,
     "agents.cloud.endpoint": Tier.PIPELINE_ALTERING,
     "agents.cloud.timeout_seconds": Tier.OPERATIONAL,
     # --- agents.cloud_providers (wildcard for any provider name) ---
-    "agents.cloud_providers.*.enabled": Tier.PIPELINE_ALTERING,
     "agents.cloud_providers.*.provider": Tier.PIPELINE_ALTERING,
     "agents.cloud_providers.*.model": Tier.PIPELINE_ALTERING,
     "agents.cloud_providers.*.api_key": Tier.PIPELINE_ALTERING,
@@ -144,7 +144,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "tools.ha.allowlist": Tier.OPERATIONAL,
     "tools.tool_timeout_seconds": Tier.OPERATIONAL,
     # --- sanitization ---
-    "sanitization.mode": Tier.OPERATIONAL,
     "sanitization.cloud_mode": Tier.OPERATIONAL,
     # --- abstention ---
     "abstention.enabled": Tier.PIPELINE_ALTERING,

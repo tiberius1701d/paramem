@@ -545,6 +545,33 @@ class ToolsConfig:
     tool_timeout_seconds: float = 3.0
 
 
+@dataclass
+class CloudConfig:
+    """Operator switches for cloud egress (rationale: ``architecture.md``, AD-21).
+
+    Attributes:
+        enabled: The master switch for ALL cloud egress.  Necessary but
+            never sufficient — :func:`paramem.cloud.admission.evaluate_cloud_egress`
+            also requires a supported provider, a model, a resolvable API
+            key and (for OpenAI-compatible providers) an endpoint.  Ship
+            default ``False``.
+        allow_degraded_serving: Whether the cloud leg stays open while the
+            server is cloud-only for an INVOLUNTARY reason (GPU conflict,
+            insufficient VRAM, a failed adapter reload/apply) — i.e. the
+            local model the operator chose to run is unavailable.  Ship
+            default ``False``: the household's queries fall back to HA
+            only, and anything HA cannot serve returns the canned
+            "limited mode" response.  Set ``True`` to accept cloud
+            answers during an outage.  Does NOT gate deliberate cloud-only
+            operation (``cloud_only: true``, ``POST /gpu/release``) or
+            transient internal states (training, live reload) — those
+            proceed regardless.
+    """
+
+    enabled: bool = False
+    allow_degraded_serving: bool = False
+
+
 #: Ship default for ``SanitizationConfig.scrub`` — a load-bearing set of
 #: PII-vocabulary hints (name / phone / address / online-identity sub-terms).
 #: This is the SINGLE declaration of the default and feeds ONLY the
@@ -572,11 +599,7 @@ _DEFAULT_SCRUB = [
 class SanitizationConfig:
     """PII sanitization + cloud egress policy.
 
-    Three layered knobs:
-
-    * ``mode`` — sanitizer detection layer (off / warn / block).  Controls
-      whether ``sanitize_for_cloud`` flags personal-marker queries and
-      whether it null-returns them so callers suppress the cloud call.
+    Two knobs:
 
     * ``cloud_mode`` — egress policy for direct cloud escalation
       (block / anonymize / both):
@@ -624,16 +647,10 @@ class SanitizationConfig:
     HA hop is a planned follow-up.
     """
 
-    mode: str = "block"  # off, warn, block
     cloud_mode: str = "block"  # block, anonymize, both
     scrub: list[str] = field(default_factory=lambda: list(_DEFAULT_SCRUB))
 
     def __post_init__(self):
-        valid_mode = {"off", "warn", "block"}
-        if self.mode not in valid_mode:
-            raise ValueError(
-                f"Invalid sanitization mode '{self.mode}'. Must be one of: {valid_mode}"
-            )
         valid_cloud_mode = {"block", "anonymize", "both"}
         if self.cloud_mode not in valid_cloud_mode:
             raise ValueError(
@@ -1621,6 +1638,9 @@ class ServerConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
+    # Cloud egress switches (see CloudConfig); `agents.cloud` /
+    # `agents.cloud_providers` below carry provider/model/credentials only.
+    cloud: CloudConfig = field(default_factory=CloudConfig)
     cloud_agent: CloudAgentConfig = field(default_factory=CloudAgentConfig)
     cloud_providers: dict[str, CloudAgentConfig] = field(default_factory=dict)
     ha_agent_id: str = ""  # HA conversation agent for escalation; empty disables HA escalation
@@ -1747,15 +1767,17 @@ class ServerConfig:
     def consolidation_config(self) -> ConsolidationConfig:
         """Build ConsolidationConfig for ConsolidationLoop.
 
-        New flat knobs (cloud_enabled, refinement_enrichment, refinement_normalization,
+        The refinement knobs (refinement_enrichment, refinement_normalization,
         refinement_contradiction) are threaded through here so ConsolidationLoop
         reads them from config rather than from direct attribute access.
+
+        ``cloud.enabled`` is not among them — it reaches ConsolidationLoop as
+        the explicit ``cloud_enabled`` constructor argument.
         """
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
-            cloud_enabled=self.consolidation.cloud_enabled,
             refinement_enrichment=self.consolidation.refinement_enrichment,
             refinement_normalization=self.consolidation.refinement_normalization,
             refinement_contradiction=self.consolidation.refinement_contradiction,
@@ -2008,6 +2030,9 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
             config.process = ProcessConfig(restart=RestartConfig(**restart_raw))
         else:
             config.process = ProcessConfig()
+
+    # Cloud master switch — the ONE gate for all cloud egress (see CloudConfig).
+    config.cloud = CloudConfig(**raw.get("cloud", {}))
 
     agents_raw = raw.get("agents", {})
     config.ha_agent_id = agents_raw.get("ha_agent_id", "")

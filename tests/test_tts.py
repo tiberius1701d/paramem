@@ -1204,13 +1204,11 @@ class TestHouseholdNamesInKnownEntities:
 
         captured: dict = {}
 
-        def _fake_sanitize(
-            text, *, mode=None, speaker_id=None, known_entities=None, personal_referent_config=None
-        ):
+        def _fake_check(text, *, speaker_id=None, known_entities=None, **_kwargs):
             captured["known_entities"] = known_entities
-            return text, {}
+            return []
 
-        with patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize):
+        with patch("paramem.server.inference.check_personal_content", side_effect=_fake_check):
             from paramem.server.inference import handle_chat
 
             try:
@@ -1223,7 +1221,6 @@ class TestHouseholdNamesInKnownEntities:
                     tokenizer=MagicMock(),
                     config=MagicMock(
                         abstention=MagicMock(enabled=False),
-                        sanitization=MagicMock(mode="block"),
                         personal_referent=MagicMock(),
                     ),
                     router=None,
@@ -1240,7 +1237,7 @@ class TestHouseholdNamesInKnownEntities:
 
 
 class TestSanitizeHistoryKnownEntities:
-    """_sanitize_history passes known_entities to sanitize_for_cloud."""
+    """_sanitize_history passes known_entities to check_personal_content."""
 
     def test_known_entities_forwarded(self) -> None:
         from unittest.mock import patch
@@ -1249,14 +1246,13 @@ class TestSanitizeHistoryKnownEntities:
 
         captured: dict = {}
 
-        def _fake_sanitize(text, *, mode=None, known_entities=None, **_kwargs):
+        def _fake_check(text, *, known_entities=None, **_kwargs):
             captured["known_entities"] = known_entities
-            return text, {}
+            return []
 
-        with patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize):
+        with patch("paramem.server.inference.check_personal_content", side_effect=_fake_check):
             _sanitize_history(
                 [{"role": "user", "text": "hello"}],
-                mode="block",
                 known_entities={"alice"},
             )
         assert captured.get("known_entities") == {"alice"}
@@ -1268,10 +1264,10 @@ class TestSanitizeHistoryKnownEntities:
 
         captured: dict = {}
 
-        def _fake_sanitize(text, *, mode=None, known_entities=None, **_kwargs):
+        def _fake_check(text, *, known_entities=None, **_kwargs):
             captured["known_entities"] = known_entities
-            return text, {}
+            return []
 
-        with patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize):
-            _sanitize_history([{"role": "user", "text": "hello"}], mode="block")
+        with patch("paramem.server.inference.check_personal_content", side_effect=_fake_check):
+            _sanitize_history([{"role": "user", "text": "hello"}])
         assert captured.get("known_entities") is None

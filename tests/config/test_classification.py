@@ -81,7 +81,7 @@ class TestOperationalSamples:
             "stt.model",
             "tts.voices.en.engine",
             "headless_boot",
-            "sanitization.mode",
+            "sanitization.cloud_mode",
             "voice.prompt_file",
         ]
         for path in operational_paths:
@@ -107,11 +107,15 @@ class TestWildcardMatchesAnyAdapterName:
 
 class TestWildcardMatchesAnyProviderName:
     def test_wildcard_matches_any_provider_name(self):
-        """Wildcard entry agents.cloud_providers.*.enabled matches any provider."""
+        """Wildcard entry agents.cloud_providers.*.model matches any provider.
+
+        ``.enabled`` is deliberately absent: cloud providers carry no on-off
+        of their own since the master switch collapsed onto ``cloud.enabled``.
+        """
         provider_paths = [
-            "agents.cloud_providers.anthropic.enabled",
-            "agents.cloud_providers.openai.enabled",
-            "agents.cloud_providers.some_new_vendor.enabled",
+            "agents.cloud_providers.anthropic.model",
+            "agents.cloud_providers.openai.model",
+            "agents.cloud_providers.some_new_vendor.model",
         ]
         for path in provider_paths:
             assert classify(path) == Tier.PIPELINE_ALTERING, (

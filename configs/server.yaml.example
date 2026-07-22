@@ -209,8 +209,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  cloud_enabled: false           # master gate for ALL cloud (transcript pipeline + graph enrichment). false = ship default (off). NOT a benign toggle: enabling egresses knowledge-graph content (subjects/objects) to the configured cloud provider. Anonymization is best-effort, scoped by sanitization.scrub, and depends on the LOCAL model's classification of each value against that scope — a misclassified value can leak real PII to the cloud with no downstream detection or repair. Keep false unless this risk is accepted.
-  refinement_enrichment: "off"  # graph-stage cloud enrichment pass. off|on. Requires cloud_enabled:true to fire. Same cloud-egress risk as cloud_enabled above — this is the flag that actually triggers the graph-content cloud call.
+  refinement_enrichment: "off"  # graph-stage cloud enrichment pass. off|on. Requires the top-level `cloud.enabled: true` master switch to fire. Same cloud-egress risk described there — this is the flag that actually triggers the graph-content cloud call.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
@@ -288,7 +287,7 @@ consolidation:
   #
   # `auto` => use the same local model that performed extraction.
   # `off`  => disable plausibility entirely (not recommended).
-  # The judge names a cloud PROVIDER (anthropic|openai|google|groq|mistral|ollama),
+  # The judge names a cloud PROVIDER (anthropic|openai|google|groq|mistral),
   # not a model — the model and endpoint are the two keys below.
   extraction_plausibility_judge: auto
   extraction_plausibility_stage: deanon         # "anon" | "deanon"
@@ -403,17 +402,54 @@ consolidation:
   training_seed: 42
   training_lr_decay_steps: null
 
+# --- Cloud ---
+# THE master switch for ALL cloud egress: the conversation agent below, the
+# per-session extraction enrichment chain, the graph-tier enrichment pass and
+# the /calibrate/enrich endpoint. There is no second on-off anywhere.
+#
+# false = ship default. NOT a benign toggle: enabling egresses knowledge-graph
+# content (subjects/objects) to the configured cloud provider. Anonymization is
+# best-effort, scoped by sanitization.scrub, and depends on the LOCAL model's
+# classification of each value against that scope — a misclassified value can
+# leak real PII to the cloud with no downstream detection or repair. Keep false
+# unless this risk is accepted.
+#
+# Necessary but not sufficient: a call is placed only if a supported provider,
+# a model, a resolvable API key env var and (for OpenAI-compatible providers)
+# an endpoint are ALL present. With no provider and no API key there is no
+# cloud mode — only the local model answers.
+cloud:
+  enabled: false
+  # Degraded serving: keep the CLOUD leg open while the server is cloud-only
+  # for an INVOLUNTARY reason (GPU held by another process, insufficient VRAM,
+  # a failed adapter reload/apply, a persistent CUDA fault) — i.e. the local
+  # model you chose to run is unavailable. false (ship default) closes the
+  # cloud leg in that state: HA still answers, and anything HA cannot serve
+  # returns the canned limited-mode reply rather than routing the household's
+  # questions to a third party you did not choose for them. Deliberate
+  # cloud-only (`cloud_only: true`, POST /gpu/release) and transient internal
+  # states (training, live reload) are NOT gated by this and always proceed.
+  allow_degraded_serving: false
+
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.
 # Cloud is the fallback for general reasoning when HA cannot answer.
 #
-# All cloud agents ship disabled. To enable, set the relevant API key env var
-# (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY) and flip enabled: true.
+# `ha_agent_id` MUST name a LOCAL Home Assistant conversation agent (the
+# built-in `conversation.home_assistant`, or a self-hosted LLM agent running
+# on your own hardware). ParaMem sends the HA hop CLEARTEXT and treats it as
+# on-premise: it is the leg that stays open when the cloud leg is closed by
+# `cloud.enabled: false` or by `cloud.allow_degraded_serving: false`. Pointing
+# it at a cloud-backed HA agent (`conversation.groq`, `conversation.openai`,
+# …) silently re-opens cloud egress one hop away, outside every switch below.
+#
+# These blocks carry provider/model/credentials ONLY — the on-off is `cloud.enabled`
+# above. To enable, set the relevant API key env var (ANTHROPIC_API_KEY /
+# OPENAI_API_KEY / GOOGLE_API_KEY) and flip `cloud.enabled: true`.
 # The ${VAR} placeholders below document the surface; they are resolved at
-# load time.
+# load time, and the same env var is what admission checks.
 agents:
   cloud:
-    enabled: false
     provider: anthropic
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
@@ -424,24 +460,21 @@ agents:
                                 # cloud agents and cloud enrichment both honour this value.
   cloud_providers:
     anthropic:
-      enabled: false
       provider: anthropic
       model: claude-sonnet-4-6
       api_key: ${ANTHROPIC_API_KEY}
       timeout_seconds: 90.0
     openai:
-      enabled: false
       provider: openai
       model: gpt-4o-search-preview
       api_key: ${OPENAI_API_KEY}
       timeout_seconds: 90.0
     google:
-      enabled: false
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
       timeout_seconds: 90.0
-  ha_agent_id: ""  # set to e.g. "conversation.groq" once HA token configured
+  ha_agent_id: ""  # e.g. "conversation.home_assistant" — MUST be a LOCAL agent (see above)
 
 # --- Tools ---
 tools:
@@ -461,13 +494,12 @@ tools:
 # ============================================================================
 # SANITIZATION & CLOUD EGRESS POLICY
 # ============================================================================
-# Two layered knobs control what happens to cloud-bound text:
-#
-#   `mode`        — sanitizer detection layer
-#                     off    : no PII detection, queries flow through unchanged
-#                     warn   : log findings, queries flow through unchanged
-#                     block  : null-return personal-marker queries, suppressing
-#                              the cloud call at the first checkpoint
+# Personal-content detection itself has no knob: `check_personal_content`
+# (graph-anchored known-entity scrub + self-reference gate) always runs, and
+# its verdict is unioned with the intent classifier's into the ONE
+# `is_personal` verdict `/chat` computes per turn. A personal-content history
+# turn is always dropped from a cloud payload. Two knobs remain, and both
+# govern what happens to text that is ABOUT to leave:
 #
 #   `cloud_mode`  — egress policy for direct cloud escalation
 #                     block      : PERSONAL queries dropped before cloud;
@@ -525,10 +557,9 @@ tools:
 # HA receives cleartext, gated by intent classification. Hardening the HA hop
 # is a planned follow-up package.
 #
-# Cloud reachability is independent: with `agents.cloud.enabled: false` (or no
-# api_key), no queries reach cloud regardless of `cloud_mode`.
+# Cloud reachability is independent: with `cloud.enabled: false` (or no API key
+# env var), no queries reach cloud regardless of `cloud_mode`.
 sanitization:
-  mode: block            # off | warn | block — PII detection layer
   cloud_mode: block      # block | anonymize | both — direct-cloud egress policy (ship-safe default)
   scrub:                 # PII-vocabulary hints anonymized when cloud_mode=anonymize|both ([] = off)
     - person name

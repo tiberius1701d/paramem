@@ -42,13 +42,19 @@ def test_example_parses_without_env_vars(example_config):
     assert example_config is not None
 
 
-def test_cloud_agent_disabled_by_default(example_config):
-    assert example_config.cloud_agent.enabled is False
+def test_cloud_master_switch_disabled_by_default(example_config):
+    """The ONE cloud switch ships off — the conversation agent, the extraction
+    chain, graph-tier enrichment and /calibrate/enrich are all gated by it."""
+    assert example_config.cloud.enabled is False
 
 
-def test_all_cloud_providers_disabled_by_default(example_config):
+def test_cloud_agents_carry_no_switch_of_their_own(example_config):
+    """``agents.cloud`` / ``agents.cloud_providers`` are provider+credential
+    blocks only; a second ``enabled`` there is what let the agent and the
+    pipeline disagree about whether cloud was on."""
+    assert not hasattr(example_config.cloud_agent, "enabled")
     for name, provider in example_config.cloud_providers.items():
-        assert provider.enabled is False, f"cloud_providers[{name!r}] must default disabled"
+        assert not hasattr(provider, "enabled"), f"cloud_providers[{name!r}] must carry no switch"
 
 
 def test_ha_agent_id_empty_by_default(example_config):
@@ -69,10 +75,6 @@ def test_tts_disabled_by_default(example_config):
 
 def test_extraction_enrichment_provider_empty_by_default(example_config):
     assert example_config.consolidation.extraction_enrichment_provider == ""
-
-
-def test_cloud_disabled_by_default(example_config):
-    assert example_config.consolidation.cloud_enabled is False
 
 
 def test_refinement_enrichment_off_by_default(example_config):

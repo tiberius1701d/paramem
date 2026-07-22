@@ -18,10 +18,22 @@ Dispatch is on ``RoutingPlan.intent`` populated by the router:
    controls only the cloud-escalation boundary.
 
 Speaker scoping (``RoutingPlan.steps``) is the privacy boundary — only
-the resolved speaker's keys can populate ``keys_to_probe``.  The
-sanitizer (``sanitize_for_cloud``) runs before every escalation
-candidate; on ``mode=block`` a personal-content finding suppresses both
-HA and cloud.
+the resolved speaker's keys can populate ``keys_to_probe``.
+
+There is ONE personal verdict, computed once in :func:`handle_chat`: the
+union of the intent classifier's ``PERSONAL``/``UNKNOWN`` result and
+:func:`~paramem.server.sanitizer.check_personal_content`'s findings.  It
+travels the call tree as ``is_personal`` and gates the CLOUD leg only —
+HA is local and stays reachable as a tool fallback on every path.
+The one exception is the model-authored forwarded query behind
+``[ESCALATE]``: it is a different artifact from the turn, so
+:func:`_maybe_escalate` computes a second verdict on it with the same
+predicate and suppresses BOTH hops (``ha_agent_id`` is operator-pointed
+and may be cloud-backed) when that verdict is personal.
+:func:`answer_via_cloud` is the sole cloud-egress funnel in local mode.
+:func:`_escalate_to_cloud` is a shared primitive, not a funnel — the only
+other caller is ``paramem.server.app._cloud_only_route``, which runs with
+no local model and therefore no ParaMem-held knowledge to protect.
 
 Fallback chain at every escalation point: HA → cloud → local base model
 (``_base_model_answer``).  ``_escalate_to_ha_agent`` is HA-only;
@@ -39,7 +51,7 @@ from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
 from paramem.server.router import Intent, RoutingPlan
-from paramem.server.sanitizer import sanitize_for_cloud
+from paramem.server.sanitizer import check_personal_content
 from paramem.server.tools.ha_client import HAClient
 from paramem.training.thermal_throttle import wait_for_cooldown as _wait_for_cooldown
 from paramem.utils.identity import canonical, is_speaker_id
@@ -232,6 +244,14 @@ def handle_chat(
       treats it the same as ``PERSONAL`` (fail closed), so it never
       reaches cloud even when the routing plan carries no probe steps.
 
+    ``is_personal`` is computed ONCE here, as the union of that intent
+    verdict and :func:`~paramem.server.sanitizer.check_personal_content`'s
+    findings over ``text``.  A ``COMMAND``/``GENERAL`` turn that names a
+    stored entity is therefore personal too, even though the classifier
+    said otherwise.  The verdict gates the CLOUD leg only; HA stays
+    reachable on every path, and a personal turn that neither HA nor the
+    cloud answered falls to abstention before the base model.
+
     The ``is_residual`` diagnostic tracks "did any graph signal fire?"
     for the routing-quality metric independent of the intent decision —
     ``True`` when neither PA steps nor HA domains were produced.
@@ -264,13 +284,12 @@ def handle_chat(
                 routing_diags["intent"] = plan.intent.value
 
             intent = plan.intent if plan is not None else Intent.UNKNOWN
-            # Fail closed: an intent that could not be established (no
-            # IntentConfig, classifier unavailable, below-margin confidence)
-            # is treated as personal here so it is never escalated to an
-            # external cloud provider.
-            is_personal = intent in (Intent.PERSONAL, Intent.UNKNOWN)
+            # First arm of the personal verdict.  Fail closed: an intent that
+            # could not be established (no IntentConfig, classifier
+            # unavailable, below-margin confidence) counts as personal.
+            intent_is_personal = intent in (Intent.PERSONAL, Intent.UNKNOWN)
 
-            # Pre-compute sanitization once for all cloud escalation paths.
+            # Second arm's ground truth, assembled once per /chat call.
             # Personal-content detection is anchored on the graph's
             # subject/object names (read directly from the MemoryStore — the
             # same source the router uses for speaker scoping) plus the
@@ -330,13 +349,20 @@ def handle_chat(
                 name = speaker_store.resolve_speaker_name(canonical(tok)) if speaker_store else None
                 return name if name else THIRD_PARTY_DESCRIPTOR
 
-            sanitized_text, sanitization_findings = sanitize_for_cloud(
+            # THE personal verdict, computed once.  Two arms, unioned: the
+            # intent classifier (covers a first-person query naming nothing
+            # the graph knows) and the graph-anchored content check (covers a
+            # query naming a stored entity with no first-person marker).
+            # Everything downstream reads ``is_personal``; neither arm is
+            # re-derived anywhere else.
+            personal_findings = check_personal_content(
                 text,
-                mode=config.sanitization.mode,
                 speaker_id=speaker_id,
                 known_entities=known_entities,
                 personal_referent_config=config.personal_referent,
             )
+            is_personal = intent_is_personal or bool(personal_findings)
+            routing_diags["personal_findings"] = personal_findings
 
             # Anonymous deny-by-default: an unauthenticated caller has no claim
             # on the speaker's private parametric memory.  When the router
@@ -412,33 +438,31 @@ def handle_chat(
             # steps path) → HA first, cloud fallback.  is_personal still gates
             # cloud so a defensive PERSONAL request never reaches the cloud.
             intent_label = intent.value
-            if sanitized_text is not None:
-                routing_diags["paths_attempted"].append(intent_label)
-                logger.info("Intent dispatch: %s → HA first", intent_label)
-                result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
-                if result is not None:
-                    routing_diags["exit_via"] = f"{intent_label}_ha"
-                    return result
-                cloud_result = answer_via_cloud(
-                    sanitized_text,
-                    cloud_agent,
-                    config,
-                    is_personal=is_personal,
-                    model=model,
-                    tokenizer=tokenizer,
-                    speaker=speaker,
-                    speaker_id=speaker_id,
-                    history=history,
-                    language=language,
-                    known_entities=known_entities,
-                )
-                if cloud_result is not None:
-                    routing_diags["exit_via"] = f"{intent_label}_cloud"
-                    logger.info("HA failed, routing to cloud agent")
-                    return cloud_result
-            else:
-                routing_diags["fallthrough_reason"] = "sanitizer_blocked"
-                logger.info("Sanitizer blocked query: %s", sanitization_findings)
+            routing_diags["paths_attempted"].append(intent_label)
+            logger.info("Intent dispatch: %s → HA first", intent_label)
+            result = _escalate_to_ha_agent(text, ha_client, config, language=language)
+            if result is not None:
+                routing_diags["exit_via"] = f"{intent_label}_ha"
+                return result
+            cloud_result = answer_via_cloud(
+                text,
+                cloud_agent,
+                config,
+                is_personal=is_personal,
+                model=model,
+                tokenizer=tokenizer,
+                speaker=speaker,
+                speaker_id=speaker_id,
+                history=history,
+                language=language,
+                known_entities=known_entities,
+            )
+            if cloud_result is not None:
+                routing_diags["exit_via"] = f"{intent_label}_cloud"
+                logger.info("HA failed, routing to cloud agent")
+                return cloud_result
+            if is_personal:
+                routing_diags["fallthrough_reason"] = "personal_cloud_blocked"
 
             # Abstention: personal interrogative with no local match → canned response.
             # The bare base model would otherwise confabulate personal data here
@@ -447,32 +471,27 @@ def handle_chat(
             # confabulation risk — the user is the source of the facts in the same
             # turn — so they fall through to the base model for conversational
             # acknowledgement.  The interrogative gate (inside the helper)
-            # distinguishes the two.
+            # distinguishes the two, and ``is_personal`` gates the whole thing.
             #
-            # Scoped to the sanitizer-blocked path here: when the sanitizer
-            # allowed the query, escalation has already been attempted above
-            # (HA → cloud fallback) and either succeeded or failed for non-
-            # privacy reasons; only the sanitizer-blocked path falls through
-            # without trying anything.  The companion call site inside
-            # ``_probe_and_reason`` covers the parallel case where probes
-            # ran but recalled nothing.
-            if sanitized_text is None:
-                abstention = _abstain_if_applicable(
-                    text,
-                    config,
-                    is_personal=is_personal,
-                    speaker_id=speaker_id,
-                    router=router,
+            # Reached only after HA and cloud both produced nothing.  The
+            # companion call site inside ``_probe_and_reason`` covers the
+            # parallel case where probes ran but recalled nothing.
+            abstention = _abstain_if_applicable(
+                text,
+                config,
+                is_personal=is_personal,
+                speaker_id=speaker_id,
+                router=router,
+            )
+            if abstention is not None:
+                result, label = abstention
+                routing_diags["paths_attempted"].append("abstention")
+                routing_diags["exit_via"] = label
+                logger.info(
+                    "Abstention: self-referential query + no local match (%s)",
+                    label,
                 )
-                if abstention is not None:
-                    result, label = abstention
-                    routing_diags["paths_attempted"].append("abstention")
-                    routing_diags["exit_via"] = label
-                    logger.info(
-                        "Abstention: self-referential query + no local match (%s)",
-                        label,
-                    )
-                    return result
+                return result
 
             # All cloud services failed — local base model as last resort
             routing_diags["paths_attempted"].append("base")
@@ -489,6 +508,7 @@ def handle_chat(
                 speaker_id=speaker_id,
                 language=language,
                 is_personal=is_personal,
+                known_entities=known_entities,
             )
     finally:
         if getattr(config, "debug", False):
@@ -541,37 +561,34 @@ CLOUD_PROMPT = (
 
 def _sanitize_history(
     history: list[dict] | None,
-    mode: str,
     known_entities: set[str] | None = None,
     *,
     speaker_id: str | None = None,
 ) -> list[dict]:
-    """Sanitize conversation history for cloud, dropping blocked turns.
+    """Drop-gate conversation history for cloud: personal turns are removed.
+
+    Unconditional — there is no pass-through or warn-only setting.  A
+    history turn that :func:`~paramem.server.sanitizer.check_personal_content`
+    flags never egresses, whether or not the current turn is being
+    placeholdered for privacy.
 
     Args:
-        history: Conversation turns to sanitize.
-        mode: ``SanitizationConfig.mode``'s closed vocabulary — ``"off"``
-            (skip), ``"warn"`` (log + pass through), ``"block"`` (drop
-            personal-content turns).  NOT ``cloud_mode``'s vocabulary
-            (``"block"`` / ``"anonymize"`` / ``"both"``) — a different
-            config field entirely; see :func:`~paramem.server.sanitizer.
-            sanitize_for_cloud`.  Under an anonymizing ``cloud_mode``
-            (see :func:`answer_via_cloud`), the caller passes
-            ``mode="block"`` unconditionally regardless of
-            ``sanitization.mode`` — a personal-content history turn is
-            always dropped, never merely warned-and-passed, when the
-            current turn is being placeholdered for privacy.
+        history: Conversation turns to gate.  Only the last
+            :data:`MAX_HISTORY_TURNS` are considered; empty-text turns are
+            dropped.
         known_entities: Optional set of **real-case** entity/speaker names to
             treat as personal referents.  When provided, household display
-            names are recognised as personal content and stripped/replaced
-            so they never egress to the cloud.  ``None`` → same behaviour
-            as before (back-compat).
+            names are recognised as personal content and the turn naming one
+            is dropped.
         speaker_id: Resolved speaker store ID, threaded to
-            :func:`~paramem.server.sanitizer.sanitize_for_cloud`'s
+            :func:`~paramem.server.sanitizer.check_personal_content`'s
             first-person detector (:func:`~paramem.server.sanitizer.
             _is_about_speaker`) — without it, "I" / "my" in a history
             turn never resolves to a concrete speaker and the detector
             is dead on this channel.
+
+    Returns:
+        The surviving turns as ``{"role", "text"}`` dicts, in order.
     """
     if not history:
         return []
@@ -581,11 +598,13 @@ def _sanitize_history(
         text = turn.get("text", "")
         if not text:
             continue
-        clean, _ = sanitize_for_cloud(
-            text, mode=mode, speaker_id=speaker_id, known_entities=known_entities
+        findings = check_personal_content(
+            text, speaker_id=speaker_id, known_entities=known_entities
         )
-        if clean is not None:
-            sanitized.append({"role": role, "text": clean})
+        if findings:
+            logger.info("Dropped personal-content history turn from cloud payload: %s", findings)
+            continue
+        sanitized.append({"role": role, "text": text})
     return sanitized
 
 
@@ -679,19 +698,15 @@ def answer_via_cloud(
         # NOT bundled into a single anonymized transcript with the current
         # turn (that would show the cloud the history twice and forces
         # multi-turn text reproduction on the local 7B model, which it
-        # doesn't do reliably).  Instead: (i) drop-gate each turn with
-        # ``mode="block"`` UNCONDITIONALLY (never merely warn-and-pass
-        # while the current turn is being placeholdered for privacy),
+        # doesn't do reliably).  Instead: (i) drop-gate each turn,
         # speaker_id threaded so the first-person detector actually fires
         # on this channel, then (ii) substitute through ``payload.forward``
         # — no second LLM call.  Accepted residual: ``payload.forward``
         # only covers entities the anonymizer named in the CURRENT turn,
         # so a personal entity appearing ONLY in history is dropped by the
-        # block gate but not placeholdered — strictly better than the old
-        # verbatim-at-mode="warn" behaviour, strictly no worse than
-        # mode="block".  See benchmarking.md.
+        # gate but not placeholdered.  See benchmarking.md.
         drop_gated_history = _sanitize_history(
-            history, mode="block", known_entities=known_entities, speaker_id=speaker_id
+            history, known_entities=known_entities, speaker_id=speaker_id
         )
         sanitized_history = [
             {**turn, "text": _substitute_whole_words(turn["text"], payload.forward)}
@@ -721,12 +736,11 @@ def answer_via_cloud(
         result.text = deanon_text
         return result
 
-    # cloud_mode=block + non-PERSONAL: send verbatim (today's behaviour).
-    # No table exists to apply to history here — the two channels no
-    # longer conflict because neither channel is placeholdered; today's
-    # ``sanitization.mode`` gate governs history unchanged.
+    # cloud_mode=block + non-PERSONAL: current turn goes verbatim (the
+    # personal verdict already cleared it).  History is still drop-gated —
+    # an old turn can be personal even when this one is not.
     sanitized_history = _sanitize_history(
-        history, mode=config.sanitization.mode, known_entities=known_entities, speaker_id=speaker_id
+        history, known_entities=known_entities, speaker_id=speaker_id
     )
     return _escalate_to_cloud(
         text,
@@ -756,15 +770,13 @@ def _escalate_to_cloud(
         cloud_agent: Cloud agent to delegate to.
         config: Server config.
         speaker: Display name of the resolved speaker, or ``None``.
-        sanitized_history: Conversation history turns, ALREADY sanitized
-            by the caller — this function does not sanitize.  Lifted out
-            of this function (was previously computed here via
-            :func:`_sanitize_history`) so the caller — the one place that
-            knows the egress policy (``sanitization.mode`` vs
-            ``cloud_mode``-driven anonymization) — controls what actually
-            reaches the cloud. See :func:`answer_via_cloud` and
-            ``paramem.server.app._cloud_only_route`` for the two
-            production sanitization channels.
+        sanitized_history: Conversation history turns, ALREADY drop-gated
+            (and, under an anonymizing ``cloud_mode``, placeholdered) by the
+            caller — this function does not sanitize.  The caller is the one
+            place that knows the egress policy.  This is a shared primitive,
+            not an egress funnel: :func:`answer_via_cloud` is the funnel in
+            local mode, ``paramem.server.app._cloud_only_route`` its
+            cloud-only counterpart, and nothing else calls this.
         language: BCP-47 language code.
     """
     sanitized_history = sanitized_history or []
@@ -926,28 +938,24 @@ def _probe_and_reason(
             "" if is_personal else " → cloud",
             plan.intent.value,
         )
-        sanitized, _ = sanitize_for_cloud(
-            text, mode=config.sanitization.mode, known_entities=known_entities
+        result = _escalate_to_ha_agent(text, ha_client, config, language=language)
+        if result is not None:
+            return result
+        cloud_result = answer_via_cloud(
+            text,
+            cloud_agent,
+            config,
+            is_personal=is_personal,
+            model=model,
+            tokenizer=tokenizer,
+            speaker=speaker,
+            speaker_id=speaker_id,
+            history=history,
+            language=language,
+            known_entities=known_entities,
         )
-        if sanitized is not None:
-            result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
-            if result is not None:
-                return result
-            cloud_result = answer_via_cloud(
-                sanitized,
-                cloud_agent,
-                config,
-                is_personal=is_personal,
-                model=model,
-                tokenizer=tokenizer,
-                speaker=speaker,
-                speaker_id=speaker_id,
-                history=history,
-                language=language,
-                known_entities=known_entities,
-            )
-            if cloud_result is not None:
-                return cloud_result
+        if cloud_result is not None:
+            return cloud_result
         # Abstention: ``_probe_and_reason`` is reached only for PERSONAL with
         # non-empty plan.steps (handle_chat dispatch).  Probes failed and HA
         # had no tool answer either; the base model has no context here
@@ -981,6 +989,7 @@ def _probe_and_reason(
             speaker_id=speaker_id,
             language=language,
             is_personal=is_personal,
+            known_entities=known_entities,
         )
 
     total_facts = sum(len(f) for f in layers.values())
@@ -1063,12 +1072,15 @@ def _base_model_answer(
     speaker_id: str | None = None,
     language: str | None = None,
     is_personal: bool = False,
+    known_entities: set[str] | None = None,
 ) -> ChatResult:
     """Answer from base model without context — escalation candidate.
 
     ``is_personal`` propagates the privacy gate to ``_maybe_escalate`` so
     a base-model [ESCALATE] from a personal-class query cannot reach
-    Cloud.
+    Cloud.  ``known_entities`` is forwarded for the same reason: it is one
+    of the two arms ``_maybe_escalate`` uses to give the model-authored
+    forwarded query its own personal verdict.
     """
     from peft import PeftModel
 
@@ -1096,6 +1108,7 @@ def _base_model_answer(
         is_personal=is_personal,
         model=model,
         tokenizer=tokenizer,
+        known_entities=known_entities,
     )
 
 
@@ -1117,15 +1130,26 @@ def _maybe_escalate(
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route HA → cloud.
 
+    This is the escalation-from-a-failed-local-answer path only.  Device
+    control does not pass through here: an imperative with an HA entity
+    match routes to HA directly in ``handle_chat`` and never reaches this
+    function.
+
     HA agent has tools (search, device control, real-time data) so it
     gets first shot. Cloud handles queries that need pure reasoning.
-    When all escalation paths fail, the pre-escalation portion of the
-    local response is returned (text before the [ESCALATE] marker).
+    When both hops are suppressed or fail, the pre-escalation portion of
+    the local response is returned (text before the [ESCALATE] marker).
 
-    Privacy invariant: when ``is_personal`` is True the cloud fallback is
-    suppressed regardless of the agent being available (under
-    ``cloud_mode=block`` or ``both``).  Under ``cloud_mode=anonymize``
-    the cloud call goes through with placeholder substitution.
+    Privacy invariant: the forwarded query is a **model-authored** artifact,
+    not the user's turn — on the personal path the model has already
+    recalled facts from parametric memory and may have written them into
+    the text after the tag.  It therefore carries its OWN verdict, computed
+    here with the same :func:`~paramem.server.sanitizer.check_personal_content`
+    predicate that produced the turn verdict.  A personal forwarded query
+    suppresses the HA hop outright (``ha_agent_id`` is operator-configurable
+    and is routinely pointed at a cloud-backed agent), and is unioned into
+    the ``is_personal`` passed to :func:`answer_via_cloud` so the existing
+    ``cloud_mode`` policy applies to the stronger of the two verdicts.
 
     ``model`` and ``tokenizer`` are forwarded to
     :func:`answer_via_cloud` so the anonymizer (when
@@ -1136,33 +1160,43 @@ def _maybe_escalate(
     if not should_escalate:
         return ChatResult(text=response, probed_keys=probed_keys or [])
 
-    intent_label = intent.value if intent is not None else "unknown"
-    sanitized, _ = sanitize_for_cloud(
-        forwarded_query, mode=config.sanitization.mode, known_entities=known_entities
+    forwarded_is_personal = bool(
+        check_personal_content(
+            forwarded_query,
+            speaker_id=speaker_id,
+            known_entities=known_entities,
+            personal_referent_config=config.personal_referent,
+        )
     )
-    if sanitized is not None:
-        logger.info("[ESCALATE] → HA (intent=%s): %s", intent_label, sanitized[:100])
-        result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
+
+    intent_label = intent.value if intent is not None else "unknown"
+    if forwarded_is_personal:
+        logger.info(
+            "[ESCALATE] → HA suppressed (intent=%s): forwarded query is personal", intent_label
+        )
+    else:
+        logger.info("[ESCALATE] → HA (intent=%s): %s", intent_label, forwarded_query[:100])
+        result = _escalate_to_ha_agent(forwarded_query, ha_client, config, language=language)
         if result is not None:
             return result
-        cloud_result = answer_via_cloud(
-            sanitized,
-            cloud_agent,
-            config,
-            is_personal=is_personal,
-            model=model,
-            tokenizer=tokenizer,
-            speaker=speaker,
-            speaker_id=speaker_id,
-            history=history,
-            language=language,
-            known_entities=known_entities,
+    cloud_result = answer_via_cloud(
+        forwarded_query,
+        cloud_agent,
+        config,
+        is_personal=is_personal or forwarded_is_personal,
+        model=model,
+        tokenizer=tokenizer,
+        speaker=speaker,
+        speaker_id=speaker_id,
+        history=history,
+        language=language,
+        known_entities=known_entities,
+    )
+    if cloud_result is not None:
+        logger.info(
+            "[ESCALATE] → cloud fallback (intent=%s): %s", intent_label, forwarded_query[:100]
         )
-        if cloud_result is not None:
-            logger.info(
-                "[ESCALATE] → cloud fallback (intent=%s): %s", intent_label, sanitized[:100]
-            )
-            return cloud_result
+        return cloud_result
 
     # All escalation paths exhausted — return pre-escalation text from local model
     local_text = response.split("[ESCALATE]")[0].strip()

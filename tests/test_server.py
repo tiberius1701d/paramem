@@ -74,7 +74,6 @@ class TestConfig:
         config_file.write_text(
             "agents:\n"
             "  cloud:\n"
-            "    enabled: true\n"
             "    provider: anthropic\n"
             "    model: claude-sonnet\n"
             "    api_key: ${TEST_API_KEY}\n"
@@ -86,9 +85,7 @@ class TestConfig:
     def test_env_var_missing_uses_empty(self, tmp_path, monkeypatch):
         monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
         config_file = tmp_path / "server.yaml"
-        config_file.write_text(
-            "agents:\n  cloud:\n    enabled: true\n    api_key: ${NONEXISTENT_VAR}\n"
-        )
+        config_file.write_text("agents:\n  cloud:\n    api_key: ${NONEXISTENT_VAR}\n")
         config = load_server_config(config_file)
         assert config.cloud_agent.api_key == ""
 
@@ -541,8 +538,8 @@ class TestProbeAndReasonDispatch:
             lambda path: {},
         )
         monkeypatch.setattr(
-            "paramem.server.inference.sanitize_for_cloud",
-            lambda text, mode=None: (text, []),
+            "paramem.server.inference.check_personal_content",
+            lambda text, **kwargs: [],
         )
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer",
@@ -637,8 +634,8 @@ class TestProbeAndReasonDispatch:
             lambda path: {},
         )
         monkeypatch.setattr(
-            "paramem.server.inference.sanitize_for_cloud",
-            lambda text, mode=None: (text, []),
+            "paramem.server.inference.check_personal_content",
+            lambda text, **kwargs: [],
         )
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer",

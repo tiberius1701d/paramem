@@ -1,7 +1,7 @@
 """OpenAI-compatible cloud agent adapter.
 
-Works with: OpenAI, Groq, Mistral API, local ollama, and any provider
-that implements the OpenAI chat completions API format.
+Works with: OpenAI, Groq, Mistral API, and any cloud provider that
+implements the OpenAI chat completions API format.
 """
 
 import json

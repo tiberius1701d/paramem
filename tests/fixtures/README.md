@@ -12,7 +12,7 @@ deterministic test runs:
 | Pinned | Why |
 |---|---|
 | `model: mistral` | Mistral 7B is the validated production model. All contract-test thresholds are calibrated against it. |
-| Most optional services off (`speaker.enabled: false`, `stt.enabled: false`, `tts.enabled: false`, etc.); `agents.cloud.enabled: true` so escalation routing paths are exercised (calls fall through gracefully when API keys are unset) | Tests run without API keys, model downloads, daemons. |
+| Most optional services off (`speaker.enabled: false`, `stt.enabled: false`, `tts.enabled: false`, etc.); `cloud.enabled: true` (the one cloud master switch) so escalation routing paths are exercised — `evaluate_cloud_egress` still refuses each call while the provider API-key env vars are unset | Tests run without API keys, model downloads, daemons. |
 | Ports shifted by 10000/9000 (`server.port: 18420`, `stt.port: 19300`, `tts.port: 19301`) | A test fixture can coexist with a live server during development. |
 
 ### Loading from a test

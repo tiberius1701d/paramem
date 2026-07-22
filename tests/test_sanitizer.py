@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from paramem.server.sanitizer import check_personal_content, sanitize_for_cloud
+from paramem.server.sanitizer import check_personal_content
 
 # ---------------------------------------------------------------------------
 # Graph-anchored personal-entity detection
@@ -198,8 +198,8 @@ class TestKnownEntityScrubIsCaseSensitive:
     Before this was fixed, both sides were lowercased, so any household with
     a member named Bill / Mark / Will / Rose / Grace silently lost cloud
     escalation on ordinary queries containing the common noun:
-    ``sanitize_for_cloud(mode="block")`` returned ``None`` →
-    ``fallthrough_reason="sanitizer_blocked"`` → abstention.
+    ``check_personal_content`` returned a ``personal_entity`` finding →
+    the turn was classified personal → cloud blocked → abstention.
     """
 
     def test_common_noun_homograph_of_a_household_name_is_not_personal(self):
@@ -372,67 +372,46 @@ class TestFirstPersonResolution:
 
 
 # ---------------------------------------------------------------------------
-# sanitize_for_cloud — mode behaviour and contract preservation
+# check_personal_content is the predicate — there is no policy knob
 # ---------------------------------------------------------------------------
 
 
-class TestSanitizeForCloud:
-    def test_mode_off_passes_everything(self):
-        query, findings = sanitize_for_cloud(
-            "Where do I live?",
-            mode="off",
-            speaker_id="speaker0",
-        )
-        assert query == "Where do I live?"
-        assert findings == []
+class TestPersonalPredicateIsUnconditional:
+    """``sanitization.mode`` (off/warn/block) is deleted.
 
-    def test_mode_warn_passes_with_findings(self):
-        query, findings = sanitize_for_cloud(
-            "Where do I live?",
-            mode="warn",
-            speaker_id="speaker0",
-        )
-        assert query == "Where do I live?"
+    Detection always runs and always reports; the caller owns what to do
+    about a personal verdict.  These cases used to be the ``mode`` matrix.
+    """
+
+    def test_first_person_is_personal(self):
+        findings = check_personal_content("Where do I live?", speaker_id="speaker0")
         assert "first_person_personal" in findings
 
-    def test_mode_block_returns_none_on_first_person(self):
-        query, findings = sanitize_for_cloud(
-            "Where do I live?",
-            mode="block",
-            speaker_id="speaker0",
-        )
-        assert query is None
-        assert "first_person_personal" in findings
-
-    def test_mode_block_returns_none_on_known_entity(self):
-        query, findings = sanitize_for_cloud(
-            "Did Pat call?",
-            mode="block",
-            known_entities={"Pat"},
-        )
-        assert query is None
+    def test_known_entity_is_personal(self):
+        findings = check_personal_content("Did Pat call?", known_entities={"Pat"})
         assert "personal_entity" in findings
 
-    def test_mode_block_passes_clean_query(self):
-        query, findings = sanitize_for_cloud(
+    def test_clean_query_is_not_personal(self):
+        findings = check_personal_content(
             "What's the weather today?",
-            mode="block",
             speaker_id="speaker0",
             known_entities={"pat"},
         )
-        assert query == "What's the weather today?"
         assert findings == []
 
-    def test_clean_query_passes_all_modes(self):
-        for mode in ("off", "warn", "block"):
-            query, findings = sanitize_for_cloud(
-                "Turn on the kitchen light",
-                mode=mode,
-                speaker_id="speaker0",
-                known_entities={"pat"},
-            )
-            assert query == "Turn on the kitchen light"
-            assert findings == []
+    def test_imperative_without_personal_reference_is_not_personal(self):
+        findings = check_personal_content(
+            "Turn on the kitchen light",
+            speaker_id="speaker0",
+            known_entities={"pat"},
+        )
+        assert findings == []
+
+    def test_no_mode_parameter_survives(self):
+        """Regression guard: the deleted knob must not come back as a kwarg."""
+        import inspect
+
+        assert "mode" not in inspect.signature(check_personal_content).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -441,12 +420,11 @@ class TestSanitizeForCloud:
 
 
 class TestSanitizationConfigCloudMode:
-    """The cloud_mode field is the egress-policy knob added in Architecture #3.
+    """``cloud_mode`` is the surviving egress-policy knob.
 
     These tests pin the dataclass surface (defaults, validator) and the
-    load_server_config wiring; the actual behavior change (anonymize-and-send,
-    block-PERSONAL, etc.) is tested in tests of inference.py once the
-    cloud_anonymizer module is wired.
+    load_server_config wiring; the behaviour it selects (anonymize-and-send,
+    block-PERSONAL) is tested against ``answer_via_cloud``.
     """
 
     def test_default_is_block(self):
@@ -475,35 +453,35 @@ class TestSanitizationConfigCloudMode:
         with pytest.raises(ValueError, match="cloud_mode"):
             SanitizationConfig(cloud_mode="not_a_real_mode")
 
-    def test_mode_validator_still_fires(self):
-        # Regression guard: adding the cloud_mode validator must not break
-        # the existing mode validator.
+    def test_deleted_mode_field_is_rejected_by_name(self):
+        """``sanitization.mode`` is gone — a pinned value must fail loudly.
+
+        Removed keys raise by name at config load; that is the desired
+        failure mode, not a silent ignore.
+        """
         import pytest
 
         from paramem.server.config import SanitizationConfig
 
-        with pytest.raises(ValueError, match="sanitization mode"):
-            SanitizationConfig(mode="bogus")
+        with pytest.raises(TypeError, match="mode"):
+            SanitizationConfig(mode="block")
 
     def test_loaded_from_yaml(self, tmp_path):
         """load_server_config wires sanitization.cloud_mode through SanitizationConfig(**raw)."""
         from paramem.server.config import load_server_config
 
         yaml_file = tmp_path / "server.yaml"
-        yaml_file.write_text(
-            "sanitization:\n  mode: block\n  cloud_mode: anonymize\n", encoding="utf-8"
-        )
+        yaml_file.write_text("sanitization:\n  cloud_mode: anonymize\n", encoding="utf-8")
         config = load_server_config(yaml_file)
         assert config.sanitization.cloud_mode == "anonymize"
 
     def test_yaml_omits_cloud_mode_falls_back_to_default(self, tmp_path):
-        """Existing server.yaml files that don't carry cloud_mode get the safe default."""
+        """A server.yaml that doesn't carry cloud_mode gets the safe default."""
         from paramem.server.config import load_server_config
 
         yaml_file = tmp_path / "server.yaml"
-        yaml_file.write_text("sanitization:\n  mode: warn\n", encoding="utf-8")
+        yaml_file.write_text("sanitization:\n  scrub: [person name]\n", encoding="utf-8")
         config = load_server_config(yaml_file)
-        assert config.sanitization.mode == "warn"
         assert config.sanitization.cloud_mode == "block"  # dataclass default
 
     @pytest.mark.skipif(
@@ -562,8 +540,9 @@ class TestM3SpeakerDisplayNameCoverage:
         """handle_chat plumbs the speaker display name into known_entities.
 
         This unit test verifies the inference.py M3 fix without invoking the
-        GPU model.  We patch the downstream sanitize_for_cloud call to capture
-        the known_entities argument and confirm it contains the speaker name.
+        GPU model.  We patch the downstream check_personal_content call to
+        capture the known_entities argument and confirm it holds the speaker
+        name.
         """
         from unittest.mock import MagicMock, patch
 
@@ -571,12 +550,11 @@ class TestM3SpeakerDisplayNameCoverage:
 
         captured: dict = {}
 
-        def _fake_sanitize(text, mode="warn", *, speaker_id=None, known_entities=None, **kw):
+        def _fake_check(text, *, speaker_id=None, known_entities=None, **kw):
             captured["known_entities"] = known_entities
-            return text, []
+            return []
 
         mock_config = MagicMock()
-        mock_config.sanitization.mode = "warn"
         mock_config.personal_referent = None
         mock_config.debug = False
         mock_config.voice.load_prompt.return_value = "base"
@@ -598,7 +576,7 @@ class TestM3SpeakerDisplayNameCoverage:
         mock_tokenizer = MagicMock()
 
         with (
-            patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize),
+            patch("paramem.server.inference.check_personal_content", side_effect=_fake_check),
             patch(
                 "paramem.server.inference._base_model_answer",
                 return_value=MagicMock(text="ok", escalated=False, probed_keys=[]),
@@ -633,12 +611,11 @@ class TestM3SpeakerDisplayNameCoverage:
 
         captured: dict = {}
 
-        def _fake_sanitize(text, mode="warn", *, speaker_id=None, known_entities=None, **kw):
+        def _fake_check(text, *, speaker_id=None, known_entities=None, **kw):
             captured["known_entities"] = known_entities
-            return text, []
+            return []
 
         mock_config = MagicMock()
-        mock_config.sanitization.mode = "warn"
         mock_config.personal_referent = None
         mock_config.debug = False
         mock_config.voice.load_prompt.return_value = "base"
@@ -659,7 +636,7 @@ class TestM3SpeakerDisplayNameCoverage:
         mock_tokenizer = MagicMock()
 
         with (
-            patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize),
+            patch("paramem.server.inference.check_personal_content", side_effect=_fake_check),
             patch(
                 "paramem.server.inference._base_model_answer",
                 return_value=MagicMock(text="ok", escalated=False, probed_keys=[]),

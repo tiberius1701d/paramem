@@ -357,6 +357,11 @@ class ConsolidationLoop:
     # tests/test_adapter_verification.py) still resolve this attribute.
     _telemetry_dir: "Path | None" = None
 
+    # Same reason: ``cloud_enabled`` must resolve on instances built via
+    # ``object.__new__``.  Default OFF — a harness that skips ``__init__``
+    # gets no cloud egress unless it says so.
+    cloud_enabled: bool = False
+
     def __init__(
         self,
         model,
@@ -415,6 +420,10 @@ class ConsolidationLoop:
             Path(telemetry_dir) if telemetry_dir is not None else None
         )
         self._keep_prior_slots = keep_prior_slots
+        # ``ServerConfig.cloud.enabled``, passed in at the bootstrap call site
+        # (paramem/server/consolidation.py).  Necessary but not sufficient —
+        # every call is admitted by ``evaluate_cloud_egress``.
+        self.cloud_enabled = cloud_enabled
         # BASE-MODEL HOLDER (ConsolidationLoop): released via
         # _state["consolidation_loop"]=None in _release_base_model_in_process.
         self.model = model
@@ -2273,7 +2282,7 @@ class ConsolidationLoop:
                 defer=True,
                 tag_new=True,
                 normalize=False,  # normalization is full-fold only
-                enrich=(self.config.refinement_enrichment == "on" and self.config.cloud_enabled),
+                enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                 promote=False,
                 tier_floor=False,
                 subtractive_scope="interim",
@@ -4590,9 +4599,7 @@ class ConsolidationLoop:
                     defer=False,
                     tag_new=False,
                     normalize=(self.config.refinement_normalization == "on"),
-                    enrich=(
-                        self.config.refinement_enrichment == "on" and self.config.cloud_enabled
-                    ),
+                    enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                     promote=False,
                     tier_floor=False,
                     subtractive_scope="fold",
@@ -4622,7 +4629,7 @@ class ConsolidationLoop:
                 defer=False,
                 tag_new=False,
                 normalize=(self.config.refinement_normalization == "on"),
-                enrich=(self.config.refinement_enrichment == "on" and self.config.cloud_enabled),
+                enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                 promote=True,
                 tier_floor=True,
                 subtractive_scope="fold",
@@ -5719,7 +5726,7 @@ class ConsolidationLoop:
             model=self.model,
             tokenizer=self.tokenizer,
             extraction_config_provider=self._current_extraction_config,
-            cloud_enabled=self.config.cloud_enabled,
+            cloud_enabled=self.cloud_enabled,
             neighborhood_hops=self.graph_enrichment_neighborhood_hops,
             max_entities_per_pass=self.graph_enrichment_max_entities_per_pass,
             gc_disable=self._disable_gradient_checkpointing,

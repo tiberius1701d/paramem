@@ -6,13 +6,24 @@ from dataclasses import dataclass, field
 
 @dataclass
 class CloudAgentConfig:
-    """Configuration for a cloud agent."""
+    """Which cloud provider to call, and with what credentials.
 
-    enabled: bool = False
+    Carries no on-off switch of its own.  Whether this agent may be
+    instantiated at all is decided once, by
+    :func:`paramem.cloud.admission.evaluate_cloud_egress`, from the
+    ``cloud.enabled`` master switch plus this config's provider/model/
+    endpoint — see :func:`paramem.cloud.providers.registry.get_cloud_agent`.
+
+    ``api_key`` is a YAML surface (``${ENV}``-interpolated at load time) and
+    is NOT the admission key source: ``get_cloud_agent`` overwrites it with
+    the env-resolved key from the verdict, so the key that authenticates a
+    request and the key that admitted it are always the same string.
+    """
+
     provider: str = "openai"  # openai, anthropic, google, groq
     model: str = ""
     api_key: str = field(default="", repr=False)
-    endpoint: str = ""  # optional custom endpoint (for Groq, ollama, etc.)
+    endpoint: str = ""  # optional custom endpoint override for this provider
     timeout_seconds: float = 90.0  # request timeout per call to this provider's API
 
 
@@ -75,11 +86,3 @@ class CloudAgent(ABC):
     @abstractmethod
     def format_tools(self, tools: list[dict]) -> list[dict]:
         """Convert standard tool definitions to provider-specific format."""
-
-    def is_available(self) -> bool:
-        """Check if the provider is configured and reachable.
-
-        Requires either an API key or a custom endpoint (for keyless
-        providers like ollama).
-        """
-        return bool(self.config.enabled and (self.config.api_key or self.config.endpoint))

@@ -118,7 +118,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     _real_graph.add_edge("subject2", "object2", predicate="knows", relation_type="factual")
     loop.merger.graph = _real_graph
     # Graph-enrichment knobs. Default neighborhood hops for these unit tests.
-    # Enrichment is off by default (refinement_enrichment="off", cloud_enabled=False in
+    # Enrichment is off by default (refinement_enrichment="off", cloud master switch off in
     # ConsolidationConfig base defaults) so GraphTierRefiner.run_enrichment is never reached.
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50

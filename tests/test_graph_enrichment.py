@@ -100,7 +100,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
     replay_enabled = defaults.pop("replay_enabled", False)
     # Allow callers to supply a pre-built ConsolidationConfig so tests can set
-    # fields like refinement_enrichment/cloud_enabled without touching other knobs.
+    # fields like refinement_enrichment without touching other knobs.
     consolidation_config = defaults.pop("consolidation_config", ConsolidationConfig())
 
     from paramem.memory.store import MemoryStore as _MS
@@ -143,7 +143,7 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
         model=loop.model,
         tokenizer=loop.tokenizer,
         extraction_config_provider=loop._current_extraction_config,
-        cloud_enabled=loop.config.cloud_enabled,
+        cloud_enabled=loop.cloud_enabled,
         neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
         max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
         gc_disable=loop._disable_gradient_checkpointing,
@@ -1146,7 +1146,7 @@ class TestCloudEgressRefusedSkipsGracefully:
         call_spy.assert_not_called()
 
     def test_master_switch_off_skip(self, tmp_path, monkeypatch, caplog):
-        """``cloud_enabled: false`` alone blocks graph-tier cloud egress —
+        """``cloud.enabled: false`` alone blocks graph-tier cloud egress —
         the master switch is a term of the shared verdict, so this pass can
         no longer egress behind the operator's back."""
         loop = _make_loop(tmp_path, cloud_enabled=False)
@@ -1161,7 +1161,7 @@ class TestCloudEgressRefusedSkipsGracefully:
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "cloud_egress_blocked"
-        assert "cloud_enabled is off" in caplog.text
+        assert "cloud.enabled is off" in caplog.text
         call_spy.assert_not_called()
 
 
@@ -2044,15 +2044,14 @@ class TestInterimEnrichmentHook:
         )
 
     def test_refinement_enrichment_on_calls_run_enrichment(self, tmp_path):
-        """refinement_enrichment='on' + cloud_enabled=True → run_enrichment called."""
+        """refinement_enrichment='on' + cloud master switch on → run_enrichment called."""
         from paramem.training.key_registry import KeyRegistry
         from paramem.utils.config import ConsolidationConfig
 
         loop = _make_loop(
             tmp_path,
-            consolidation_config=ConsolidationConfig(
-                refinement_enrichment="on", cloud_enabled=True
-            ),
+            consolidation_config=ConsolidationConfig(refinement_enrichment="on"),
+            cloud_enabled=True,
             replay_enabled=True,
         )
         for tier in ("episodic", "semantic", "procedural"):
