@@ -20,6 +20,8 @@ Bound by ``speaker_id``: a self-referential query with no resolved
 speaker has no target to be personal about.
 """
 
+from paramem.utils.identity import prose_fold
+
 # Token-set lookup, not a pattern.  Explicit list of first-person openings
 # the chat handler resolves to the identified speaker.  Includes
 # contractions because chat input is unmodified text.
@@ -53,7 +55,7 @@ _PUNCT = ".,!?;:'\"()[]{}"
 def _contains_first_person(text: str) -> bool:
     """Token-level scan for first-person pronouns.  No regex."""
     for raw in text.split():
-        token = raw.strip(_PUNCT).lower()
+        token = prose_fold(raw.strip(_PUNCT))
         if token in _FIRST_PERSON_TOKENS:
             return True
     return False

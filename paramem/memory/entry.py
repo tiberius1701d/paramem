@@ -25,6 +25,7 @@ import logging
 from collections.abc import Callable
 
 from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
+from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,17 @@ def compute_simhash(
 ) -> int:
     """Compute a SimHash fingerprint from key + subject + predicate + object.
 
+    The fingerprint is over the fact's **identity**, not its raw surface: each
+    of ``key``, ``subject``, ``predicate``, ``obj`` is folded through
+    :func:`paramem.utils.identity.canonical` before tokenization, so the result
+    is invariant to case, diacritics, and whitespace-vs-underscore variation
+    (``"New York"`` and ``"new_york"`` fold to the same identity and therefore
+    produce the same fingerprint). This is the single chokepoint for both
+    registration (:func:`entry_simhash`) and recall (:func:`verify_confidence`)
+    — folding here means both sides converge on the same identity form
+    regardless of which surface (raw extraction vs. canonicalized edge) a
+    caller happens to pass in.
+
     Uses unigram+bigram feature tokenization and a bit-vote algorithm. The key is
     included so that identical triple content under different keys produces
     different fingerprints — catches hallucinations where the model echoes the
@@ -301,7 +313,7 @@ def compute_simhash(
     Returns:
         A ``num_bits``-bit integer fingerprint.
     """
-    text = f"{key} {subject} {predicate} {obj}"
+    text = " ".join(canonical(x) for x in (key, subject, predicate, obj))
     features = _tokenize_features(text)
 
     if not features:

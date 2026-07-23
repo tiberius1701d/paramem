@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.consolidation import ConsolidationLoop, _relation_to_entry_dict
 from paramem.utils.config import TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -72,6 +72,94 @@ def _make_qa_kp(**overrides) -> dict:
     }
     base.update(overrides)
     return base
+
+
+# ---------------------------------------------------------------------------
+# Tests: _relation_to_entry_dict (Fix A — interim-tier predicate canonicalization)
+# ---------------------------------------------------------------------------
+
+
+def _mock_relation(subject: str, predicate: str, obj: str, relation_type: str = "factual"):
+    rel = MagicMock()
+    rel.subject = subject
+    rel.predicate = predicate
+    rel.object = obj
+    rel.relation_type = relation_type
+    return rel
+
+
+class TestRelationToEntryDict:
+    """``_relation_to_entry_dict`` is the single helper both
+    ``_entries_from_graph`` call sites (episodic and procedural) route
+    through — it canonicalizes ``predicate`` so interim-tier entries match
+    the identity form the merger stamps onto the cumulative edge."""
+
+    def test_canonicalizes_predicate(self):
+        rel = _mock_relation("Alice", "lives in", "Berlin")
+        result = _relation_to_entry_dict(rel)
+        assert result["predicate"] == "lives_in"
+
+    def test_leaves_subject_and_object_untouched(self):
+        """Subject/object are display surfaces — not canonicalized."""
+        rel = _mock_relation("Alice Smith", "lives in", "New York")
+        result = _relation_to_entry_dict(rel)
+        assert result["subject"] == "Alice Smith"
+        assert result["object"] == "New York"
+
+    def test_does_not_mutate_the_source_relation(self):
+        """r.predicate itself must stay raw — load-bearing provenance for
+        merger.removal_ledger's pre_surfaces.incoming (merger.py:815)."""
+        rel = _mock_relation("Alice", "lives in", "Berlin")
+        _relation_to_entry_dict(rel)
+        assert rel.predicate == "lives in"
+
+    def test_idempotent_on_already_canonical_predicate(self):
+        rel = _mock_relation("Bob", "works_at", "ACME")
+        result = _relation_to_entry_dict(rel)
+        assert result["predicate"] == "works_at"
+
+    def test_preserves_relation_type(self):
+        rel = _mock_relation("Alice", "lives in", "Berlin", relation_type="location")
+        result = _relation_to_entry_dict(rel)
+        assert result["relation_type"] == "location"
+
+    def test_interim_entry_predicate_matches_full_cycle_edge_predicate(self):
+        """The exact desync Fix A closes: an interim-tier entry built from a
+        raw ``session_graph.relations`` predicate must carry the SAME
+        surface as the full-cycle edge entry, which merger.py:710 stamps via
+        ``canonical()`` onto the edge attribute (read back verbatim by
+        ``_build_all_edge_entries_into``'s ``pred = _t_data.get("predicate", "")``).
+        """
+        from paramem.utils.identity import canonical
+
+        raw_predicate = "lives in"
+        rel = _mock_relation("Alice", raw_predicate, "Berlin")
+        interim_entry = _relation_to_entry_dict(rel)
+
+        full_cycle_edge_predicate = canonical(raw_predicate)
+
+        assert interim_entry["predicate"] == full_cycle_edge_predicate
+
+    def test_interim_and_full_cycle_fingerprints_match(self):
+        """Same triple via the interim path vs. the full-cycle edge path must
+        produce the SAME SimHash fingerprint — the recall-confidence desync
+        (measured: 'lives_in' vs 'lives in' -> 0.688) Fix A closes."""
+        from paramem.memory.entry import entry_simhash
+        from paramem.utils.identity import canonical
+
+        raw_predicate = "lives in"
+        rel = _mock_relation("Alice", raw_predicate, "Berlin")
+        interim_entry = _relation_to_entry_dict(rel)
+        interim_entry["key"] = "graph1"
+
+        full_cycle_entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": canonical(raw_predicate),
+            "object": "Berlin",
+        }
+
+        assert entry_simhash(interim_entry) == entry_simhash(full_cycle_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -262,3 +350,15 @@ class TestEntriesFromGraph:
         graph = self._make_session_graph()
         loop._entries_from_graph(graph, procedural_enabled=False)
         loop.model.generate.assert_not_called()
+
+    def test_raw_space_predicate_is_canonicalized(self):
+        """Fix A end-to-end through the real call site: a raw-surface
+        predicate (e.g. from extraction, before the merger ever sees it)
+        must come out of _entries_from_graph already canonicalized."""
+        loop = _make_loop()
+        graph = self._make_session_graph()
+        graph.relations[0].predicate = "lives in"
+        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
+        predicates = [r["predicate"] for r in episodic if r["subject"] == "Alice"]
+        assert "lives_in" in predicates
+        assert "lives in" not in predicates

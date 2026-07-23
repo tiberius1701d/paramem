@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from rapidfuzz import fuzz
 
+from paramem.utils.identity import prose_fold
+
 logger = logging.getLogger(__name__)
 
 # Minimum fuzzy match score for HA entity matching
@@ -150,12 +152,12 @@ class HAEntityGraph:
                 area=area,
             )
 
-            friendly_lower = friendly.lower()
+            friendly_lower = prose_fold(friendly)
             self._entity_names.add(friendly_lower)
             self._entity_lookup[friendly_lower] = node
 
             if area:
-                area_lower = area.lower()
+                area_lower = prose_fold(area)
                 self._area_names.add(area_lower)
                 self._entity_names.add(area_lower)
 
@@ -191,7 +193,7 @@ class HAEntityGraph:
         Returns HAMatchResult if any HA entity/area/verb matched, None otherwise.
         Uses the same substring + fuzzy pattern as the PA router.
         """
-        text_lower = text.lower()
+        text_lower = prose_fold(text)
 
         # Match entities and areas (substring, then fuzzy fallback)
         matched_entities = []
@@ -204,7 +206,7 @@ class HAEntityGraph:
                     matched_areas.append(name)
                     # Collect domains of entities in this area
                     for fn, node in self._entity_lookup.items():
-                        if node.area and node.area.lower() == name:
+                        if node.area and prose_fold(node.area) == name:
                             entity_domains.add(node.domain)
                 elif name in self._entity_lookup:
                     matched_entities.append(name)

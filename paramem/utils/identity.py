@@ -1,11 +1,26 @@
-"""String-identity canonicalization for entity names, objects, and predicates.
+"""String-normalization primitives — two separate families, one module.
 
-The project-wide identity primitives.  :class:`paramem.graph.merger.GraphMerger`
-applies :func:`canonical` at the node-identity boundary to produce deterministic
-node keys; the server, training, memory, evaluation and cli packages route every
-identity/dedup comparison through the same two functions.  Name *matching*
-(fuzzy/surface tiers) is a separate concern and lives in the merger, not here.
-Stateless, deterministic, no I/O.  Thread-safe by construction.
+This module owns BOTH normalization families used project-wide:
+
+* :func:`canonical` — the **identity** fold, for comparing/hashing whole
+  strings as keys (node keys, dedup, fuzzy match, the SimHash fingerprint).
+* :func:`prose_fold` — the **prose-matching** fold, for case-insensitive
+  substring/token matching against free text (entity-name matching in HA
+  routing, interrogative-prefix detection, first-person pronoun detection).
+  It is deliberately weaker than :func:`canonical`: it must NOT fold
+  whitespace to ``_`` (that would break matching a multi-word name embedded
+  in space-separated prose), and it must NOT go beyond simple
+  case-lowering (one consumer is the sanitizer's first-person PII gate,
+  where casefold/diacritic-folding would change privacy-relevant matching
+  behavior — out of scope for that fold).
+
+:class:`paramem.graph.merger.GraphMerger` applies :func:`canonical` at the
+node-identity boundary to produce deterministic node keys; the server,
+training, memory, evaluation and cli packages route every identity/dedup
+comparison through the same two ``canonical``-family functions.  Name
+*matching* (fuzzy/surface tiers) is a separate concern and lives in the
+merger, not here.  Stateless, deterministic, no I/O.  Thread-safe by
+construction.
 
 One surface form, project-wide: lower-case, blank runs collapsed to a single
 ``_``, ``-`` and ``_`` preserved verbatim.  This is the identity form — the
@@ -102,6 +117,32 @@ def canonical(s: str) -> str:
     s = "".join(ch for ch in unicodedata.normalize("NFD", s) if not unicodedata.combining(ch))
     s = unicodedata.normalize("NFC", s)
     return "_".join(s.split())
+
+
+def prose_fold(text: str) -> str:
+    """Case-insensitive fold for matching a needle against free prose.
+
+    This is the **prose-matching** counterpart to :func:`canonical` — the
+    two families are not interchangeable.  ``canonical`` folds whitespace to
+    ``_``, which breaks substring/token matching against space-separated
+    prose (a folded multi-word entity name would never be found embedded in
+    a sentence).  ``prose_fold`` deliberately does neither: it does NOT fold
+    whitespace, and it does NOT go beyond ``str.lower()`` (no casefold, no
+    diacritic-folding).  One consumer is the sanitizer's first-person PII
+    gate (:mod:`paramem.server.sanitizer`), where changing case/diacritic
+    matching behavior would alter privacy-relevant matching — out of scope
+    for this fold.
+
+    Args:
+        text: Free-text string (or a token/needle extracted from one) to
+            fold for case-insensitive comparison.
+
+    Returns:
+        ``text.lower()`` — behavior-preserving; identical to what every
+        prose-matching call site already did before routing through this
+        function.
+    """
+    return text.lower()
 
 
 # ---------------------------------------------------------------------------

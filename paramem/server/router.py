@@ -33,6 +33,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from paramem.utils.identity import prose_fold
+
 if TYPE_CHECKING:
     from paramem.server.config import IntentConfig
     from paramem.server.ha_graph import HAEntityGraph, HAMatchResult
@@ -178,7 +180,7 @@ def _is_interrogative(text: str, config=None) -> bool:
 
     if stripped[-1] in _INTERROGATIVE_PUNCT:
         return True
-    first_word = stripped.split()[0].lower()
+    first_word = prose_fold(stripped.split()[0])
     if first_word.endswith("'s"):
         first_word = first_word[:-2]
     return first_word in _INTERROGATIVE_PREFIXES

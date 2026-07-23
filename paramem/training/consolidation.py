@@ -115,6 +115,38 @@ def _fingerprint_entries(entries: "list[dict]") -> str:
     return fp.hexdigest()
 
 
+def _relation_to_entry_dict(r: "Relation") -> dict:
+    """Project a single ``Relation`` into the ``{subject, predicate, object,
+    relation_type}`` shape used to seed interim-tier entry dicts.
+
+    ``predicate`` is canonicalized via :func:`~paramem.utils.identity.canonical`
+    so interim-tier entries match the identity form the merger stamps onto the
+    cumulative edge (``merger.py:710``) — without this, an interim entry built
+    straight from ``session_graph.relations``/``proc_graph.relations`` carries
+    the raw extraction surface (e.g. ``"lives in"``) while the full-cycle edge
+    entry (:meth:`ConsolidationLoop._build_all_edge_entries_into`) carries the
+    canonical form (``"lives_in"``), desyncing the SimHash fingerprint below
+    :data:`~paramem.memory.entry.DEFAULT_CONFIDENCE_THRESHOLD`.  ``subject`` and
+    ``object`` are left as-is — display surfaces, not identity keys.  ``r``
+    itself (in particular ``r.predicate``) is never mutated: the raw surface
+    remains load-bearing provenance for the merger's ``removal_ledger``
+    (``merger.py:815``).
+
+    Args:
+        r: A single extracted or reconstructed ``Relation``.
+
+    Returns:
+        Dict with ``subject``, ``predicate`` (canonical), ``object``, and
+        ``relation_type``.
+    """
+    return {
+        "subject": r.subject,
+        "predicate": canonical(r.predicate),
+        "object": r.object,
+        "relation_type": r.relation_type,
+    }
+
+
 def _persisted_from_entry_and_rec(entry: "dict", tier: str, rec: "dict | None") -> "dict":
     """Build one ``fold_resume.json`` train_assignment entry for the interim fold.
 
@@ -1021,8 +1053,11 @@ class ConsolidationLoop:
         """Build entry relation dicts from a session graph — no model call.
 
         Projects relations and entity attributes into a unified relation-dict
-        set, then partitions it into episodic/procedural.  The attribute
-        surface (``Entity.attributes``) is projected via
+        set, then partitions it into episodic/procedural.  Each relation is
+        projected via :func:`_relation_to_entry_dict`, which canonicalizes
+        the predicate so interim-tier entries match the identity form the
+        merger stamps onto the cumulative edge.  The attribute surface
+        (``Entity.attributes``) is projected via
         ``relation_prep._flatten_entity_attributes`` so scalar-PII keying
         (email/phone/linkedin) is not silently dropped.
 
@@ -1038,15 +1073,7 @@ class ConsolidationLoop:
         """
         from paramem.graph import relation_prep
 
-        relation_dicts = [
-            {
-                "subject": r.subject,
-                "predicate": r.predicate,
-                "object": r.object,
-                "relation_type": r.relation_type,
-            }
-            for r in session_graph.relations
-        ]
+        relation_dicts = [_relation_to_entry_dict(r) for r in session_graph.relations]
         exclude = {(r["subject"], r["predicate"]) for r in relation_dicts}
         projected = relation_prep._flatten_entity_attributes(
             session_graph.entities, exclude_pairs=exclude
@@ -1228,15 +1255,7 @@ class ConsolidationLoop:
                     speaker_id=speaker_id,
                     timestamp=event_time,
                 )
-                procedural_rels.extend(
-                    {
-                        "subject": r.subject,
-                        "predicate": r.predicate,
-                        "object": r.object,
-                        "relation_type": r.relation_type,
-                    }
-                    for r in proc_graph.relations
-                )
+                procedural_rels.extend(_relation_to_entry_dict(r) for r in proc_graph.relations)
                 # Merge proc_graph into the cumulative graph so its relations
                 # reach the unified keying surface (_build_all_edge_entries_into)
                 # at the next run_consolidation_cycle call.  Same

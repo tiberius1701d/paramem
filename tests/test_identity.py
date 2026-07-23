@@ -21,6 +21,7 @@ lowercase-uniform refactor — speaker equality is plain ``==``.
 from paramem.utils.identity import (
     canonical,
     is_speaker_id,
+    prose_fold,
 )
 
 
@@ -169,6 +170,45 @@ class TestNegatives:
 # ---------------------------------------------------------------------------
 # Speaker-identity primitive tests (§0 invariant)
 # ---------------------------------------------------------------------------
+
+
+class TestProseFold:
+    """``prose_fold`` is the case-insensitive fold for matching a needle
+    against free prose — it must be exactly ``str.lower()``, deliberately
+    weaker than ``canonical`` (no whitespace→``_`` fold, no diacritic fold
+    beyond what ``.lower()`` does)."""
+
+    def test_equals_lower(self):
+        for s in (
+            "Hello World",
+            "ALREADY UPPER",
+            "MiXeD CaSe",
+            "",
+            "  spaced out  ",
+            "Straße",
+            "José",
+        ):
+            assert prose_fold(s) == s.lower()
+
+    def test_does_not_fold_whitespace_to_underscore(self):
+        """Unlike canonical(), prose_fold must preserve spaces — folding them
+        to ``_`` would break substring matching against free prose."""
+        assert prose_fold("Living Room") == "living room"
+        assert prose_fold("Living Room") != canonical("Living Room")
+
+    def test_does_not_diacritic_fold(self):
+        """Unlike canonical(), prose_fold must NOT strip diacritics — only
+        str.lower() is applied."""
+        assert prose_fold("José") == "josé"
+        assert prose_fold("José") != canonical("José")
+
+    def test_substring_match_against_prose_survives(self):
+        """The exact failure mode canonical() would introduce: a multi-word
+        entity name must still be found as a substring of a sentence after
+        folding both sides."""
+        query = "please turn on the Living Room light"
+        entity = "Living Room"
+        assert prose_fold(entity) in prose_fold(query)
 
 
 class TestIsSpeakerId:

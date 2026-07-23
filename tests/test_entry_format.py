@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.memory.entry import (
-    DEFAULT_CONFIDENCE_THRESHOLD,
     RECALL_TEMPLATE,
     SIMHASH_BITS,
     _build_response,
@@ -246,6 +245,29 @@ class TestComputeSimhash:
         result = compute_simhash("graph1", "", "", "")
         assert isinstance(result, int)
 
+    def test_predicate_space_vs_underscore_invariant(self):
+        """Fix B: the fingerprint is over identity, not raw surface — a
+        space-separated predicate and its underscore-joined canonical form
+        must hash identically."""
+        h1 = compute_simhash("graph1", "Alice", "lives in", "Berlin")
+        h2 = compute_simhash("graph1", "Alice", "lives_in", "Berlin")
+        assert h1 == h2
+
+    def test_subject_object_case_and_whitespace_invariant(self):
+        """Fix B: subject/object case and whitespace-vs-underscore variation
+        must no longer desync the fingerprint — 'New York' and 'new_york'
+        are the same identity and now score 1.0."""
+        h1 = compute_simhash("graph1", "Alice", "lives_in", "New York")
+        h2 = compute_simhash("graph1", "alice", "lives_in", "new_york")
+        assert h1 == h2
+        assert simhash_confidence(h1, h2) == 1.0
+
+    def test_diacritic_invariant(self):
+        """Fix B: diacritic folding applies to every field, not just predicate."""
+        h1 = compute_simhash("graph1", "José", "lives_in", "Saint-Étienne")
+        h2 = compute_simhash("graph1", "jose", "lives_in", "saint-etienne")
+        assert h1 == h2
+
 
 # --- entry_simhash ---
 
@@ -278,11 +300,14 @@ class TestEntrySimhash:
         registry = {entry["key"]: entry_simhash(entry)}
         assert verify_confidence(entry, registry) == 1.0
 
-    def test_diverges_from_hashing_a_different_surface_of_the_same_fact(self):
-        """Hashing a DIFFERENT representation of the same fact (e.g. the
-        canonical()-folded graph node key instead of the entry's own display
-        subject/object) must desync from what verify_confidence reconstructs
-        from the entry — this is the exact bug entry_simhash closes."""
+    def test_converges_with_hashing_a_different_surface_of_the_same_fact(self):
+        """Fix B changes this contract: compute_simhash now folds every
+        argument through canonical() itself, so hashing a DIFFERENT surface
+        of the same fact (e.g. the canonical()-folded subject/object instead
+        of the entry's own raw display subject/object) converges on the SAME
+        fingerprint rather than desyncing from it. This is the surface
+        invariance Fix B establishes — the fingerprint is the fact's
+        identity, not a hash of whatever surface happened to be passed in."""
         from paramem.utils.identity import canonical
 
         entry = {
@@ -291,20 +316,19 @@ class TestEntrySimhash:
             "predicate": "lives in",
             "object": "Saint-Étienne",
         }
-        wrong_fp = compute_simhash(
+        pre_canonicalized_fp = compute_simhash(
             entry["key"],
             canonical(entry["subject"]),
             entry["predicate"],
             canonical(entry["object"]),
         )
-        registry = {entry["key"]: wrong_fp}
+        registry = {entry["key"]: pre_canonicalized_fp}
         confidence = verify_confidence(entry, registry)
-        assert confidence < DEFAULT_CONFIDENCE_THRESHOLD, (
-            f"Expected the canonical-node-key fingerprint to desync below "
-            f"threshold; got confidence={confidence}"
+        assert confidence == 1.0, (
+            f"Expected the pre-canonicalized-surface fingerprint to verify at "
+            f"full confidence against the raw-surface entry; got confidence={confidence}"
         )
-        # entry_simhash (the fix) does not reproduce the divergent fingerprint.
-        assert entry_simhash(entry) != wrong_fp
+        assert entry_simhash(entry) == pre_canonicalized_fp
 
 
 # --- verify_confidence ---
