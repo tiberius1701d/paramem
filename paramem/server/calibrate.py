@@ -77,7 +77,7 @@ from paramem.graph.prompts import prompt_overrides
 from paramem.graph.schema import SessionGraph
 from paramem.server.gpu_lock import gpu_lock_sync
 from paramem.server.session_buffer import SessionBuffer
-from paramem.utils.artifacts import calibration_run, on_calibration_result
+from paramem.utils.artifacts import calibration_run, on_calibration_result, on_session_extracted
 
 logger = logging.getLogger(__name__)
 
@@ -870,6 +870,18 @@ def calibrate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> d
                 req.transcript,
                 req.session_id,
                 **kwargs,
+            )
+        # Symmetric to ConsolidationLoop.extract_session: the caller that turned
+        # a transcript into a session graph persists it as the per-session
+        # snapshot.  The calibration_run scope _run_calibration opened routes it
+        # into this run's own directory (the production debug tree, too, when
+        # debug is on).  Mid-chain endpoints (injects="graph") inject a graph and
+        # run a sub-step — not a session extraction — so they write no snapshot.
+        if decl.injects == "transcript":
+            on_session_extracted(
+                graph,
+                req.session_id,
+                "procedural_graph" if decl.entry == "run_procedural" else "graph",
             )
         parsed = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else {}
 

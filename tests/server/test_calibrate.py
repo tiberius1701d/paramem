@@ -521,6 +521,57 @@ class TestChainDispatch:
         assert hook.call_args.args[0] == result
 
 
+class TestChainSessionSnapshot:
+    """A transcript-extracting run persists the per-session graph snapshot into
+    its own run dir — the same ``sessions/<id>/graph_snapshot.json`` artifact
+    ``ConsolidationLoop.extract_session`` writes in production, so a calibration
+    tree can be diffed file-for-file against a production cycle. Mid-chain
+    endpoints inject a graph and run a sub-step, not a session extraction, and
+    write no session snapshot."""
+
+    def _paths_state(self, tmp_path, phase: str) -> dict:
+        state = _state_enabled()
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        pipeline = state["consolidation_loop"].extraction
+        pipeline.run.side_effect = _chain_side_effect(phase)
+        pipeline.run_procedural.side_effect = _chain_side_effect(phase)
+        return state
+
+    def test_extract_writes_the_session_snapshot(self, tmp_path):
+        state = self._paths_state(tmp_path, "local_extract")
+        calibrate_chain(
+            state,
+            "extract",
+            CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
+        )
+        snaps = list((tmp_path / "artifacts").glob("extract_*/sessions/calib/graph_snapshot.json"))
+        assert len(snaps) == 1
+
+    def test_procedural_writes_the_procedural_snapshot(self, tmp_path):
+        state = self._paths_state(tmp_path, "procedural_extract")
+        calibrate_chain(
+            state,
+            "procedural",
+            CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
+        )
+        snaps = list(
+            (tmp_path / "artifacts").glob(
+                "procedural_*/sessions/calib/procedural_graph_snapshot.json"
+            )
+        )
+        assert len(snaps) == 1
+
+    def test_graph_injecting_use_case_writes_no_session_snapshot(self, tmp_path):
+        state = self._paths_state(tmp_path, "anonymize")
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            graph={"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        calibrate_chain(state, "anonymize", req)
+        assert not list((tmp_path / "artifacts").glob("**/*graph_snapshot.json"))
+
+
 class TestDeclaredStepUnreached:
     """A calibration promises ONE step's output. When the configured chain
     cannot reach that step, the operator must get a refusal naming the gap
