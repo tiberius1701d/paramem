@@ -71,14 +71,12 @@ from paramem.server.incidents import (
 )
 from paramem.server.inference import (
     ChatResult,
-    _escalate_to_cloud,
-    _sanitize_history,
     answer_via_cloud,
     handle_chat,
 )
 from paramem.server.router import QueryRouter
 from paramem.server.run_status import read_last_runs, record_last_run
-from paramem.server.sanitizer import check_personal_content
+from paramem.server.sanitizer import is_self_referential
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
 from paramem.server.tools.ha_client import HAClient
 from paramem.server.trial_state import (
@@ -2785,37 +2783,36 @@ async def chat(request: ChatRequest, http_request: Request):
             if agent is not None and _state["mode"] == "cloud-only":
                 # Cloud-only: no local model, so no ParaMem-held knowledge and
                 # no anonymizer — the same plain-cloud-agent posture as
-                # _cloud_only_route.  History is still drop-gated.
-                sanitized_history = _sanitize_history(
-                    request.history,
-                    known_entities=_household_known_entities(),
-                    speaker_id=_speaker_id,
+                # _cloud_only_route.  Routed through the one egress funnel
+                # (model/tokenizer=None selects its cannot-anonymize branch);
+                # history is still drop-gated there.
+                _forced_cloud_permitted = (
+                    _state.get("cloud_only_reason") not in _INVOLUNTARY_CLOUD_ONLY_REASONS
+                    or _state["config"].cloud.allow_degraded_serving
                 )
                 result = await loop.run_in_executor(
                     None,
-                    lambda: _escalate_to_cloud(
+                    lambda: answer_via_cloud(
                         request.text,
                         agent,
                         _state["config"],
+                        model=None,
+                        tokenizer=None,
                         speaker=speaker,
-                        sanitized_history=sanitized_history,
+                        speaker_id=_speaker_id,
+                        history=request.history,
+                        cloud_permitted=_forced_cloud_permitted,
                     ),
                 )
             elif agent is not None:
                 # Local mode: forced routing selects the PROVIDER, it does not
                 # buy a policy bypass.  The turn goes through the one egress
                 # funnel, so cloud_mode and the personal verdict apply exactly
-                # as they do on the routed path.  Only the household names are
-                # available as entity ground truth here — forced routing skips
-                # the router and the memory store by construction.
-                _forced_known_entities = _household_known_entities()
-                _forced_is_personal = bool(
-                    check_personal_content(
-                        request.text,
-                        speaker_id=_speaker_id,
-                        known_entities=_forced_known_entities,
-                        personal_referent_config=_state["config"].personal_referent,
-                    )
+                # as they do on the routed path.
+                _forced_is_personal = is_self_referential(
+                    request.text,
+                    speaker_id=_speaker_id,
+                    personal_referent_config=_state["config"].personal_referent,
                 )
                 result = await loop.run_in_executor(
                     None,
@@ -2829,7 +2826,6 @@ async def chat(request: ChatRequest, http_request: Request):
                         speaker=speaker,
                         speaker_id=_speaker_id,
                         history=request.history,
-                        known_entities=_forced_known_entities,
                     ),
                 )
         if result and result.text:
@@ -3157,25 +3153,6 @@ _INVOLUNTARY_CLOUD_ONLY_REASONS: frozenset[str] = frozenset(
 _DEGRADED_SERVING_NOTICE = "My local memory is offline right now, so a cloud model is answering. "
 
 
-def _household_known_entities() -> set[str] | None:
-    """Household display names for the sanitizer's known-entity scrub.
-
-    The only entity ground truth available on paths with no local model /
-    memory store (cloud-only routing, forced provider routing).  Real case is
-    preserved: the scrub is exact-case, whole-word (person "Bill" vs invoice
-    "bill").
-
-    Returns:
-        The stripped, non-empty display names, or ``None`` when no speaker
-        store is registered or no non-anonymous profile is enrolled.
-    """
-    store = _state.get("speaker_store")
-    if store is None:
-        return None
-    names = {n.strip() for n in store.household_display_names() if n and n.strip()}
-    return names or None
-
-
 async def _run_chat_turn(
     *,
     text: str,
@@ -3256,7 +3233,6 @@ async def _run_chat_turn(
             ha_client=_state.get("ha_client"),
             cloud_agent=_state.get("cloud_agent"),
             language=language,
-            known_entities=_household_known_entities(),
             speaker_id=speaker_id,
         )
         buffer.append(
@@ -5118,6 +5094,44 @@ def _preload_memory_store(config, *, model, tokenizer):
     return memory_store
 
 
+def _record_intent_classifier_incident_if_needed(config, encoder_handle, exemplar_bank) -> None:
+    """Fail loud when the embeddings intent classifier failed to load.
+
+    ``mode="embeddings"`` has no LLM fallback (unlike ``mode="llm"``, which
+    slides to the encoder residual when no classifier model is registered),
+    so a missing encoder or exemplar bank means every query classifies as
+    ``Intent.UNKNOWN`` from here on: no personal-memory access, and cloud
+    escalation stays available.  That capability loss is silent unless an
+    operator is watching logs, so it is recorded as a durable incident
+    (``type="intent_classifier_unavailable"``) surfaced via ``GET /status``
+    and the attention block.
+
+    No-op when ``config.intent.enabled`` is false, ``config.intent.mode``
+    is not ``"embeddings"``, or both ``encoder_handle`` and
+    ``exemplar_bank`` loaded successfully.
+    """
+    if not (config.intent.enabled and config.intent.mode == "embeddings"):
+        return
+    if encoder_handle is not None and exemplar_bank is not None:
+        return
+    missing = []
+    if encoder_handle is None:
+        missing.append("encoder")
+    if exemplar_bank is None:
+        missing.append("exemplars")
+    record_incident(
+        config.paths.data / "state",
+        type="intent_classifier_unavailable",
+        key=config.intent.mode,
+        severity="warning",
+        summary=(
+            "Intent classifier unavailable (mode=embeddings); queries now "
+            "route as UNKNOWN — no personal-memory access, escalation allowed"
+        ),
+        detail={"mode": config.intent.mode, "missing": missing},
+    )
+
+
 def _build_config_derived_state(
     config,
     *,
@@ -5465,8 +5479,12 @@ def _build_config_derived_state(
             )
 
             encoder_handle = load_encoder(config.intent)
-            if encoder_handle is not None:
+            exemplar_bank = (
                 load_exemplars(config.intent, encoder_handle)
+                if encoder_handle is not None
+                else None
+            )
+            _record_intent_classifier_incident_if_needed(config, encoder_handle, exemplar_bank)
 
         # Register the local LLM for intent.mode=llm classification.
         # BASE-MODEL HOLDER (function-local _classifier_model /
@@ -7054,7 +7072,6 @@ async def debug_probe(request: DebugProbeRequest):
             ha_client=_state.get("ha_client"),
             cloud_agent=_state.get("cloud_agent"),
             language=detected_language,
-            known_entities=_household_known_entities(),
             speaker_id=request.speaker_id,
         )
         return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
@@ -11865,23 +11882,26 @@ def _cloud_only_route(
     ha_client=None,
     cloud_agent=None,
     language: str | None = None,
-    known_entities: "set[str] | None" = None,
     speaker_id: str | None = None,
 ) -> ChatResult:
     """Route queries when the local model is unavailable (cloud-only mode).
 
     HA first (has tools for weather, time, devices), cloud as fallback for
-    reasoning.  Nothing else runs here: with no local model there is no
-    ParaMem-held knowledge to protect on this path — ``_state["model"]`` and
-    ``["memory_store"]`` are absent and ``history`` is client-supplied — so
-    this is honestly a plain cloud agent.  No intent classification, no
+    reasoning.  The cloud leg goes through :func:`~paramem.server.inference.
+    answer_via_cloud` — the sole cloud-egress funnel — with
+    ``model``/``tokenizer`` left ``None`` so it selects the cannot-anonymize
+    branch: with no local model there is no ParaMem-held knowledge to
+    protect on this path (``_state["model"]`` and ``["memory_store"]`` are
+    absent and ``history`` is client-supplied), so the current turn egresses
+    verbatim and history is still drop-gated.  No intent classification, no
     personal-referent gate, no ``cloud_mode`` policy.
 
     Args:
         text: The user's turn, verbatim.
         speaker: Display name of the resolved speaker, or ``None``.
         history: Prior conversation turns, or ``None``.  Drop-gated by
-            ``_sanitize_history`` before it egresses.
+            :func:`~paramem.server.inference._sanitize_history` (inside
+            ``answer_via_cloud``) before it egresses.
         config: The live :class:`~paramem.server.config.ServerConfig`.
         cloud_permitted: Whether the CLOUD leg may be used.  Computed by the
             caller (``_run_chat_turn``) from ``_state["cloud_only_reason"]``
@@ -11892,11 +11912,9 @@ def _cloud_only_route(
         ha_client: HA client, or ``None`` when HA is not configured.
         cloud_agent: Cloud agent, or ``None`` when cloud is not configured.
         language: Resolved BCP-47 code for this turn, or ``None``.
-        known_entities: Household display names in their stored (real) case —
-            the scrub matches exact-case.  From ``_household_known_entities``.
         speaker_id: Resolved canonical speaker ID, or ``None`` for anonymous
-            turns; threaded to ``_sanitize_history`` so the first-person
-            detector fires on the history channel.
+            turns; threaded through to the first-person detector on the
+            history channel.
 
     Returns:
         The answering leg's :class:`~paramem.server.inference.ChatResult`, or
@@ -11919,29 +11937,28 @@ def _cloud_only_route(
         logger.info("Cloud-only route: HA agent failed, trying cloud")
 
     # HA failed or unavailable → try cloud for reasoning
-    if cloud_agent is not None and cloud_permitted:
-        logger.info("Cloud-only route: escalating to cloud")
-        sanitized_history = _sanitize_history(
-            history,
-            known_entities=known_entities,
-            speaker_id=speaker_id,
-        )
-        result = _escalate_to_cloud(
-            text,
-            cloud_agent,
-            config,
-            speaker=speaker,
-            sanitized_history=sanitized_history,
-            language=language,
-        )
-        if result.text:
-            logger.info("Cloud-only route: Cloud responded")
-            return result
-    elif cloud_agent is not None:
+    if cloud_agent is not None and not cloud_permitted:
         logger.warning(
             "Cloud-only route: cloud leg closed (degraded serving; "
             "set cloud.allow_degraded_serving: true to open it)"
         )
+    elif cloud_agent is not None:
+        logger.info("Cloud-only route: escalating to cloud")
+        result = answer_via_cloud(
+            text,
+            cloud_agent,
+            config,
+            model=None,
+            tokenizer=None,
+            speaker=speaker,
+            speaker_id=speaker_id,
+            history=history,
+            language=language,
+            cloud_permitted=cloud_permitted,
+        )
+        if result is not None and result.text:
+            logger.info("Cloud-only route: Cloud responded")
+            return result
 
     logger.warning("Cloud-only route: all services failed")
     return ChatResult(

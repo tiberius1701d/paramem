@@ -1,4 +1,4 @@
-"""Intent classifier — HA fast-path + content-driven residual + fail-closed.
+"""Intent classifier — HA fast-path + content-driven residual + UNKNOWN.
 
 Routing decisions follow a tiered model:
 
@@ -20,10 +20,12 @@ Routing decisions follow a tiered model:
      path when no classifier model is registered (cloud-only mode,
      model load failed).
 
-3. **Fail-closed.**  When the residual classifier is unavailable or
-   below the confidence margin, the classifier returns the configured
-   ``fail_closed_intent`` — defaulting to ``personal`` so the
-   cloud-escalation gate stays privacy-preserving under uncertainty.
+3. **Unresolved verdict.**  When the residual classifier is unavailable
+   or below the confidence margin, the classifier returns
+   ``Intent.UNKNOWN``.  An unresolved verdict is never remapped to a
+   positive intent: it grants no personal-memory access and does not
+   block cloud escalation — the query routes through the normal
+   HA → cloud → base-model chain, same as :attr:`Intent.GENERAL`.
 
 PA graph match is **not** a state signal here.  Speaker enrollment must
 not classify the speaker's queries as PERSONAL — that signal is the
@@ -125,9 +127,8 @@ def load_encoder(config: IntentConfig) -> _EncoderHandle | None:
 
     Returns the loaded handle on success, or ``None`` on any failure
     (missing dep, model download error, OOM, invalid config).  Failure
-    is non-fatal: callers fall back to ``Intent.UNKNOWN`` from the
-    residual path, and :func:`classify_intent` honours the
-    fail-closed default.
+    is non-fatal: callers fall back to ``Intent.UNKNOWN`` from
+    :func:`classify_intent`.
 
     Idempotent — calling with the same config returns the cached
     handle without reloading.  A different ``encoder_model`` /
@@ -221,8 +222,8 @@ def load_exemplars(config: IntentConfig, encoder: _EncoderHandle | None) -> _Exe
     typos surface in the log.
 
     Returns ``None`` if the encoder isn't loaded, the exemplars dir is
-    missing, or no exemplars were collected.  Callers fall back to the
-    fail-closed default in that case.
+    missing, or no exemplars were collected.  Callers fall back to
+    ``Intent.UNKNOWN`` from :func:`classify_intent` in that case.
 
     The encoder applies ``config.encoder_query_prefix`` (e.g. the literal
     ``"query: "`` for the E5 family) to every exemplar before embedding,
@@ -301,23 +302,6 @@ def get_exemplars() -> _ExemplarBank | None:
     return _exemplars_singleton
 
 
-def _fail_closed_intent(config: IntentConfig) -> Intent:
-    """Resolve ``config.fail_closed_intent`` to an :class:`Intent` value.
-
-    Honours arbitrary operator-supplied strings by falling back to
-    ``Intent.PERSONAL`` (the privacy-preserving default) when the
-    string is not a recognised intent value.
-    """
-    try:
-        return Intent(config.fail_closed_intent)
-    except ValueError:
-        logger.warning(
-            "Invalid fail_closed_intent=%r; defaulting to PERSONAL",
-            config.fail_closed_intent,
-        )
-        return Intent.PERSONAL
-
-
 def _classify_via_encoder(
     text: str,
     encoder: _EncoderHandle,
@@ -330,7 +314,9 @@ def _classify_via_encoder(
     against every exemplar embedding, takes the per-class top score,
     and returns the top class only when the margin between top-1 and
     top-2 classes meets ``config.confidence_margin``.  Below the
-    margin the classifier returns the configured fail-closed intent.
+    margin (or on any embedding failure) the classifier returns
+    ``Intent.UNKNOWN`` — callers must not positively grant personal
+    access on an unresolved verdict.
 
     Embeddings are L2-normalised at load time, so cosine reduces to a
     plain dot product.  Per-class top score is the max similarity
@@ -343,7 +329,7 @@ def _classify_via_encoder(
         ]
     except Exception:
         logger.exception("Query embedding failed; falling back")
-        return _fail_closed_intent(config)
+        return Intent.UNKNOWN
 
     # Cosine since both are L2-normalised: simple dot product.
     sims = bank.embeddings @ query_emb
@@ -355,7 +341,7 @@ def _classify_via_encoder(
             by_class[intent] = score
 
     if not by_class:
-        return _fail_closed_intent(config)
+        return Intent.UNKNOWN
 
     sorted_classes = sorted(by_class.items(), key=lambda kv: -kv[1])
     top_intent, top_score = sorted_classes[0]
@@ -363,12 +349,12 @@ def _classify_via_encoder(
 
     if margin < config.confidence_margin:
         logger.debug(
-            "Intent classifier margin below threshold (top=%s score=%.3f margin=%.3f); fail-closed",
+            "Intent classifier margin below threshold (top=%s score=%.3f margin=%.3f); unknown",
             top_intent.value,
             top_score,
             margin,
         )
-        return _fail_closed_intent(config)
+        return Intent.UNKNOWN
 
     return top_intent
 
@@ -445,8 +431,7 @@ def _classify_via_llm(
     label plus possible whitespace.
 
     Failure modes (prompt missing, generation error, unparseable
-    output) all return the configured fail-closed intent; the function
-    never raises.
+    output) all return ``Intent.UNKNOWN``; the function never raises.
     """
     voice = _build_voice_config(config)
     classifier_prompt = voice.load_intent_classifier_prompt()
@@ -455,7 +440,7 @@ def _classify_via_llm(
             "LLM intent classification requested but classifier prompt section "
             "is missing from voice.prompt_file; falling back"
         )
-        return _fail_closed_intent(config)
+        return Intent.UNKNOWN
 
     try:
         tokenizer = handle.tokenizer
@@ -501,15 +486,15 @@ def _classify_via_llm(
         response = tokenizer.decode(generated, skip_special_tokens=True)
     except Exception:
         logger.exception("LLM intent classification failed; falling back")
-        return _fail_closed_intent(config)
+        return Intent.UNKNOWN
 
     label = _parse_intent_label(response)
     if label is None:
         logger.warning(
-            "LLM intent classifier produced no recognised label (response=%r); fail-closed",
+            "LLM intent classifier produced no recognised label (response=%r); unknown",
             response[:200],
         )
-        return _fail_closed_intent(config)
+        return Intent.UNKNOWN
     logger.debug("LLM intent classifier verdict=%s (raw=%r)", label.value, response[:80])
     return label
 
@@ -530,12 +515,15 @@ def classify_intent(
 
     Cosine similarity against per-class exemplar embeddings, with a
     confidence-margin gate (top-1 vs top-2 class scores).  Below the
-    margin the classifier returns the fail-closed default.
+    margin the classifier returns ``Intent.UNKNOWN``.
 
     Tier 3 — degraded mode:
 
-    Encoder or exemplars unavailable → fall back to the fail-closed
-    default when a ``config`` is given; ``Intent.UNKNOWN`` without one.
+    Encoder or exemplars unavailable, or no ``config`` supplied →
+    ``Intent.UNKNOWN``.  An unresolved verdict is never remapped to a
+    positive intent — callers must treat ``Intent.UNKNOWN`` as "not
+    positively PERSONAL": no personal-memory access, and escalation
+    stays available.
 
     PA graph match is intentionally **not** a state signal.  Speaker
     enrollment scopes keys at the router layer; intent comes from query
@@ -564,14 +552,10 @@ def classify_intent(
 
     encoder = get_encoder()
     bank = get_exemplars()
-    if encoder is None or bank is None:
-        if config is None:
-            return Intent.UNKNOWN
-        return _fail_closed_intent(config)
-
-    if config is None:
-        # Without config we have no margin threshold or fail-closed
-        # default; degrade to UNKNOWN so callers treat conservatively.
+    if encoder is None or bank is None or config is None:
+        # No margin threshold to apply (config is None) or nothing to
+        # compare against (encoder/bank unavailable) — degrade to
+        # UNKNOWN so callers treat the query conservatively.
         return Intent.UNKNOWN
 
     return _classify_via_encoder(text, encoder, bank, config)

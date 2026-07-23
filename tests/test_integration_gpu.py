@@ -1251,3 +1251,79 @@ class TestSimulateModePromptIteration:
         assert not lora_files, (
             f"Simulate mode wrote LoRA weight files (should never happen): {lora_files}"
         )
+
+
+# --- 12. Intent classifier mode=llm dispatch on a real model ---
+# Regression coverage for the UNKNOWN-not-remapped-to-personal change:
+# _classify_via_llm's failure branches (missing classifier-prompt section,
+# unparseable label) now return Intent.UNKNOWN instead of a configured
+# fail-closed intent. The unit tests (tests/test_intent.py) exercise this
+# with mocked tokenizer/model; this test exercises the same code paths
+# against the real chat-template + generate() pipeline so a tokenization or
+# KV-cache regression (gradient checkpointing left enabled, wrong slice
+# math, etc.) surfaces here rather than only in production.
+
+
+class TestIntentClassifierLLMModeGPU:
+    def test_real_generate_returns_valid_intent(self, model_and_tokenizer):
+        """classify_intent(mode="llm") against the real model returns a
+        valid Intent without raising — exercises apply_chat_template →
+        tokenizer() → generate() → decode() end to end."""
+        from paramem.server import intent as intent_module
+        from paramem.server.config import IntentConfig
+        from paramem.server.intent import classify_intent, set_classifier_model
+        from paramem.server.router import Intent
+
+        model, tokenizer = model_and_tokenizer
+        set_classifier_model(model, tokenizer)
+        try:
+            config = IntentConfig(mode="llm")
+            result = classify_intent(
+                "Turn on the kitchen lights.",
+                has_ha_match=False,
+                config=config,
+            )
+            assert result in (
+                Intent.PERSONAL,
+                Intent.COMMAND,
+                Intent.GENERAL,
+                Intent.UNKNOWN,
+            )
+        finally:
+            set_classifier_model(None, None)
+            intent_module._classifier_model_singleton = None
+
+    def test_missing_classifier_section_returns_unknown_no_generate(
+        self, model_and_tokenizer, tmp_path, monkeypatch
+    ):
+        """Real model/tokenizer handle, but the classifier-prompt section is
+        missing from voice.prompt_file: must return Intent.UNKNOWN and must
+        NOT call generate() (bails before touching the GPU)."""
+        from paramem.server import intent as intent_module
+        from paramem.server.config import IntentConfig, VoiceConfig
+        from paramem.server.intent import classify_intent, set_classifier_model
+        from paramem.server.router import Intent
+
+        model, tokenizer = model_and_tokenizer
+        set_classifier_model(model, tokenizer)
+
+        prompt_path = tmp_path / "no_classifier_section.txt"
+        prompt_path.write_text("PA path instructions only.\n[ESCALATE] etc.\n")
+        monkeypatch.setattr(
+            intent_module,
+            "_build_voice_config",
+            lambda _config: VoiceConfig(prompt_file=str(prompt_path)),
+        )
+        # Spy on generate — this branch must bail out before calling it, so
+        # the spy is never invoked and never touches the GPU.
+        generate_spy = MagicMock()
+        monkeypatch.setattr(model, "generate", generate_spy)
+
+        try:
+            config = IntentConfig(mode="llm")
+            result = classify_intent("anything", has_ha_match=False, config=config)
+            assert result == Intent.UNKNOWN
+            generate_spy.assert_not_called()
+        finally:
+            set_classifier_model(None, None)
+            intent_module._classifier_model_singleton = None

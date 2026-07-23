@@ -156,9 +156,6 @@ class TestAbstentionShortCircuit:
             ],
         )
         router._speaker_key_index = {speaker_id: {"graph0001"}}
-        # _all_entities is read by handle_chat for the sanitizer's known-entities
-        # set; an empty list is a valid stub that doesn't perturb sanitization.
-        router._all_entities = []
         return router
 
     def test_fires_when_sanitizer_blocks_and_no_match(self):
@@ -172,8 +169,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -203,8 +200,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -237,8 +234,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -274,8 +271,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
@@ -308,8 +305,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
@@ -342,8 +339,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=[],
+                "paramem.server.inference.is_self_referential",
+                return_value=False,
             ),
             patch(
                 "paramem.server.inference._escalate_to_ha_agent",
@@ -380,8 +377,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=[],
+                "paramem.server.inference.is_self_referential",
+                return_value=False,
             ),
             patch(
                 "paramem.server.inference._escalate_to_ha_agent",
@@ -432,8 +429,8 @@ class TestAbstentionShortCircuit:
         # and previously dropped through to _base_model_answer.
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",
@@ -474,8 +471,8 @@ class TestAbstentionShortCircuit:
             # This represents a personal-flavored query that doesn't trip
             # the self-referential blocker — HA can be attempted.
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=[],
+                "paramem.server.inference.is_self_referential",
+                return_value=False,
             ),
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",
@@ -518,8 +515,8 @@ class TestAbstentionShortCircuit:
 
         with (
             patch(
-                "paramem.server.inference.check_personal_content",
-                return_value=["first_person_personal"],
+                "paramem.server.inference.is_self_referential",
+                return_value=True,
             ),
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",

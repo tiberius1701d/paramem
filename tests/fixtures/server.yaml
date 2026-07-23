@@ -456,7 +456,7 @@ tools:
 #
 #   `cloud_mode`  — egress policy for direct cloud escalation
 #                     block      : PERSONAL queries dropped before cloud;
-#                                  non-PERSONAL sent verbatim. Phase 2 default,
+#                                  non-PERSONAL sent verbatim. Default,
 #                                  zero anonymizer cost, smallest cloud surface.
 #                     anonymize  : cloud-bound text is anonymized via the
 #                                  local LLM (categories chosen by `scrub`),
@@ -541,8 +541,7 @@ intent:
   encoder_dtype: float16                          # float16 | float32
   encoder_query_prefix: "query: "                 # E5 family requires this; empty for other models
   exemplars_dir: configs/intents
-  confidence_margin: 0.05                         # min top1-top2 margin; below → fail_closed_intent
-  fail_closed_intent: personal                    # privacy-preserving default on uncertainty
+  confidence_margin: 0.05                         # min top1-top2 margin; below → Intent.UNKNOWN
   llm_max_new_tokens: 8                           # cap on classifier generate() output — one label
   llm_temperature: 0.0                            # deterministic; required for structured output
 

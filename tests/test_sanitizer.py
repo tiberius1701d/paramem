@@ -1,257 +1,18 @@
-"""Unit tests for the graph-anchored sanitizer.
+"""Unit tests for the self-reference sanitizer gate.
 
-The sanitizer detects personal content using ground truth that already
-exists in the running system:
-
-* ``known_entities`` — caller-supplied set of **real-case** entity / speaker
-  names.  Assembled by ``handle_chat`` from ``memory_store.iter_entries()``
-  subject/object fields plus the resolved speaker display name (M3 — plumbed
-  directly from the ``speaker`` argument so the real name is covered even when
-  it is no longer a registry subject under id-as-subject extraction).
-  Reuses the placeholder module's ``_substitute_whole_words`` primitive to
-  decide whether the query references any of them.  That primitive is
-  case-sensitive by design, and the known-entity scrub matches the raw query
-  text against the real-case names: case is the only signal separating a
-  person named "Bill" from an electricity "bill".
-* ``speaker_id`` + first-person pronouns from a fixed token set — covers
-  cold-start before the graph has facts.
-
-There are no static keyword lists, no regex patterns.  A query like
-"What time does my dentist's office open?" is not personal unless the
-speaker actually has a "dentist" entity.  A query like "Did Pat call?"
-is personal once Pat is enrolled or graphed.
+``is_self_referential`` decides whether a piece of text refers to / asks
+about the identified speaker.  Detection is two-tier: an encoder-based
+classifier when ``personal_referent_config`` is supplied, falling back to
+an explicit first-person token set.  There is no static keyword list for
+personal *content* — that arm was removed; self-reference is the only
+signal this module contributes to the ``is_personal`` verdict.
 """
 
 from pathlib import Path
 
 import pytest
 
-from paramem.server.sanitizer import check_personal_content
-
-# ---------------------------------------------------------------------------
-# Graph-anchored personal-entity detection
-# ---------------------------------------------------------------------------
-
-
-class TestPersonalEntityDetection:
-    """``personal_entity`` fires when the query mentions a known entity."""
-
-    def test_named_entity_in_known_set_flags_personal(self):
-        findings = check_personal_content(
-            "Did Pat call?",
-            known_entities={"Pat"},
-        )
-        assert "personal_entity" in findings
-
-    def test_named_entity_not_in_known_set_is_clean(self):
-        # Without graph state, a generic name is not personal.
-        findings = check_personal_content(
-            "Did Pat call?",
-            known_entities=set(),
-        )
-        assert findings == []
-
-    def test_relationship_noun_alone_is_not_personal(self):
-        # The old regex blocked anything mentioning "wife" / "dentist" /
-        # "house" / "favourite". Graph-anchored: only blocked if the
-        # speaker actually has such an entity in their graph.
-        findings = check_personal_content(
-            "What time does my dentist's office open?",
-            known_entities={"dr_smith"},  # the dentist isn't a known entity
-            speaker_id="speaker0",
-        )
-        assert "personal_entity" not in findings
-        # First-person + speaker_id — first_person_personal fires
-        # (correct: the query is about the speaker).
-        assert "first_person_personal" in findings
-
-    def test_word_boundary_prevents_substring_false_positives(self):
-        # "Pat" must not match inside "Patron" — _substitute_whole_words
-        # uses word-boundary matching.  Both sides share the same case here
-        # so word boundary, not case, is the only reason there is no match.
-        findings = check_personal_content(
-            "Where is the nearest Patron saint?",
-            known_entities={"Pat"},
-        )
-        assert findings == []
-
-    def test_no_known_entities_supplied_returns_clean(self):
-        # Back-compat: callers that don't yet pass known_entities and
-        # also don't pass speaker_id get an empty findings list.  The
-        # primary protection is then entity-based routing upstream.
-        findings = check_personal_content("Did Pat call?")
-        assert findings == []
-
-
-# ---------------------------------------------------------------------------
-# Paraphrase pass: catches plural / re-ordered / partial references to
-# multi-word entities that the strict word-boundary scrub misses.
-# ---------------------------------------------------------------------------
-
-
-class TestPersonalEntityParaphraseDetection:
-    """``personal_entity`` also fires when ≥2 content tokens of a multi-word
-    entity name appear as substrings in the query — closes the gap that
-    let 2026-05 paraphrased ADAS-platform queries reach the cloud."""
-
-    def test_paraphrase_two_token_overlap_flags_personal(self):
-        # Surface-form scrub bug: personal_entity check
-        # misses because the indexed name reorders + adds modifier
-        # ("multi-OEM") that the user query omits.
-        findings = check_personal_content(
-            "Tell me about the ADAS compute platforms project",
-            known_entities={"critical multi-OEM ADAS platform turnaround"},
-        )
-        assert "personal_entity" in findings
-
-    def test_pluralisation_single_token_does_not_fire(self):
-        # Only ONE entity content token in the query ("platform") — the
-        # 2-token floor must hold to avoid generic-word false positives.
-        findings = check_personal_content(
-            "What is a platform-as-a-service?",
-            known_entities={"platform engineering team"},
-        )
-        assert findings == []
-
-    def test_two_token_overlap_via_different_words_flags(self):
-        # Reordered, no modifier overlap — but two content tokens match.
-        findings = check_personal_content(
-            "When is the team building event?",
-            known_entities={"annual team building Q3"},  # Q3 < 3 chars → dropped
-        )
-        assert "personal_entity" in findings
-
-    def test_single_token_entity_relies_on_surface_form(self):
-        # "alice" alone — only one content token, so paraphrase pass is
-        # skipped.  Surface-form word-boundary still catches direct
-        # mentions of "Alice".
-        findings_direct = check_personal_content(
-            "Did Alice call?",
-            known_entities={"Alice"},
-        )
-        assert "personal_entity" in findings_direct
-        # And substring false positive still rejected: "Patron" ≠ "Pat"
-        # (handled by surface-form word-boundary, same case on both sides).
-        findings_fp = check_personal_content(
-            "I want a Patron saint.",
-            known_entities={"Pat"},
-        )
-        assert "personal_entity" not in findings_fp
-
-    def test_generic_stopwords_do_not_count_as_content_tokens(self):
-        # Entity name "the system and the platform" — after stopword +
-        # length filter, content tokens are {system, platform}.  Query
-        # "the and for" hits no content tokens → no fire.
-        findings = check_personal_content(
-            "the and for with",
-            known_entities={"the system and the platform"},
-        )
-        assert findings == []
-
-    def test_paraphrase_does_not_double_fire(self):
-        # Surface-form already caught the entity by exact match — the
-        # paraphrase pass must not add a second copy of the finding.
-        findings = check_personal_content(
-            "tell me about ADAS platform",
-            known_entities={"ADAS platform"},
-        )
-        assert findings.count("personal_entity") == 1
-
-    def test_empty_known_entities_paraphrase_pass_noop(self):
-        findings = check_personal_content(
-            "Tell me about the ADAS compute platforms project",
-            known_entities=set(),
-        )
-        assert findings == []
-
-    def test_paraphrase_arm_unaffected_by_real_case_entities(self):
-        """The paraphrase arm still fires when ``known_entities`` carry real case.
-
-        Arm 2 lowercases entity names internally via
-        ``_entity_content_tokens`` and matches against the lowercased query,
-        so making the producers hand real-case names (the fix for the
-        Bill/bill known-entity bug) leaves this arm's behaviour unchanged.
-        Mirrors ``test_paraphrase_two_token_overlap_flags_personal`` with the
-        production-shaped, case-preserved entity name.
-        """
-        findings = check_personal_content(
-            "Tell me about the ADAS compute platforms project",
-            known_entities={"Critical Multi-OEM ADAS Platform Turnaround"},
-        )
-        assert "personal_entity" in findings
-
-
-# ---------------------------------------------------------------------------
-# Case sensitivity of the known-entity scrub (person "Bill" vs invoice "bill")
-# ---------------------------------------------------------------------------
-
-
-class TestKnownEntityScrubIsCaseSensitive:
-    """The known-entity scrub matches exact-case, whole-word, on raw text.
-
-    No mechanical rule separates ``Bill`` the person from ``bill`` the
-    invoice except case, so detection matches substitution:
-    ``_substitute_whole_words`` is case-sensitive by design and the
-    producers (``handle_chat``, ``_cloud_only_route``'s callers) hand the
-    sanitizer the stored display surface with its original case.
-
-    Before this was fixed, both sides were lowercased, so any household with
-    a member named Bill / Mark / Will / Rose / Grace silently lost cloud
-    escalation on ordinary queries containing the common noun:
-    ``check_personal_content`` returned a ``personal_entity`` finding →
-    the turn was classified personal → cloud blocked → abstention.
-    """
-
-    def test_common_noun_homograph_of_a_household_name_is_not_personal(self):
-        """Regression: "electricity bill" must not match the person "Bill"."""
-        findings = check_personal_content(
-            "I need to pay the electricity bill",
-            known_entities={"Bill"},
-        )
-        assert "personal_entity" not in findings
-
-    def test_household_name_in_its_own_case_is_still_detected(self):
-        """The fix must not cost detection: "Bill" the person still fires."""
-        findings = check_personal_content(
-            "Is Bill coming to dinner?",
-            known_entities={"Bill"},
-        )
-        assert "personal_entity" in findings
-
-    def test_lowercased_user_typing_of_a_single_token_name_is_an_accepted_miss(self):
-        """PINNED ACCEPTED CONSEQUENCE — not a bug, do not "fix" this.
-
-        A user who types a name in the wrong case ("meyer" when the stored
-        display surface is "Meyer") is not flagged by the known-entity
-        scrub.  That is inherent to the case-sensitivity decision: the only
-        way to recover this match is case-insensitive matching, which is
-        exactly what reintroduces the ``Bill``/``bill`` false positive that
-        blocks cloud escalation for ordinary queries.
-
-        Do not add a case-insensitive fallback, a second matching pass, or a
-        fuzzy tier to make this assertion flip.
-        """
-        findings = check_personal_content(
-            "is meyer coming",
-            known_entities={"Meyer"},
-        )
-        assert "personal_entity" not in findings
-
-    def test_lowercased_multi_token_name_is_still_caught_by_the_paraphrase_arm(self):
-        """The accepted miss is bounded to single-content-token names.
-
-        A multi-token name ("Bill Meyer") has >= ``min_overlap`` content
-        tokens, so the paraphrase arm — which is case-insensitive by design
-        and deliberately unchanged — still flags a lowercased typing of it.
-        Pinned so the boundary of the accepted miss is explicit rather than
-        assumed.
-        """
-        findings = check_personal_content(
-            "is bill meyer coming",
-            known_entities={"Bill Meyer"},
-        )
-        assert "personal_entity" in findings
-
+from paramem.server.sanitizer import is_self_referential
 
 # ---------------------------------------------------------------------------
 # First-person + speaker_id resolution
@@ -264,34 +25,21 @@ class TestFirstPersonResolution:
     The interrogative-vs-declarative split that used to live here was
     removed once ``Intent`` + ``_is_interrogative`` in inference.py
     took over as the routing signals; the sanitizer now emits a single
-    ``first_person_personal`` finding for both shapes.
+    boolean verdict for both shapes.
     """
 
-    def test_question_with_speaker_flags_first_person_personal(self):
-        findings = check_personal_content(
-            "Where do I live?",
-            speaker_id="speaker0",
-        )
-        assert "first_person_personal" in findings
+    def test_question_with_speaker_is_self_referential(self):
+        assert is_self_referential("Where do I live?", speaker_id="speaker0") is True
 
-    def test_statement_with_speaker_flags_first_person_personal(self):
-        findings = check_personal_content(
-            "I live in Kelkham.",
-            speaker_id="speaker0",
-        )
-        assert "first_person_personal" in findings
+    def test_statement_with_speaker_is_self_referential(self):
+        assert is_self_referential("I live in Kelkham.", speaker_id="speaker0") is True
 
-    def test_first_person_without_speaker_is_clean(self):
-        # No identified speaker → no resolution target for "I" → clean.
-        findings = check_personal_content("Where do I live?")
-        assert findings == []
+    def test_first_person_without_speaker_is_false(self):
+        # No identified speaker → no resolution target for "I" → False.
+        assert is_self_referential("Where do I live?") is False
 
-    def test_no_first_person_no_finding(self):
-        findings = check_personal_content(
-            "What's the capital of France?",
-            speaker_id="speaker0",
-        )
-        assert findings == []
+    def test_no_first_person_is_false(self):
+        assert is_self_referential("What's the capital of France?", speaker_id="speaker0") is False
 
     def test_encoder_path_overrides_token_set_for_german(self):
         """Encoder-based classification fires when ``personal_referent_config``
@@ -312,15 +60,15 @@ class TestFirstPersonResolution:
             "paramem.server.personal_referent.classify_personal_referent",
             return_value=PersonalReferent.ABOUT_SPEAKER,
         ):
-            findings = check_personal_content(
+            result = is_self_referential(
                 "Wo wohne ich?",
                 speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
-        assert "first_person_personal" in findings
+        assert result is True
 
-    def test_encoder_returning_not_about_speaker_clears_finding(self):
-        """Encoder verdict NOT_ABOUT_SPEAKER suppresses the finding even
+    def test_encoder_returning_not_about_speaker_clears_verdict(self):
+        """Encoder verdict NOT_ABOUT_SPEAKER suppresses the verdict even
         when the English token-set heuristic would fire.  (The encoder
         recognises that the surface "I" doesn't refer to the speaker.)
         """
@@ -334,12 +82,12 @@ class TestFirstPersonResolution:
             "paramem.server.personal_referent.classify_personal_referent",
             return_value=PersonalReferent.NOT_ABOUT_SPEAKER,
         ):
-            findings = check_personal_content(
+            result = is_self_referential(
                 "I read that the Eiffel Tower was built in 1889.",
                 speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
-        assert "first_person_personal" not in findings
+        assert result is False
 
     def test_encoder_uncertain_falls_back_to_token_set(self):
         """Encoder returning ``None`` (margin not met / not loaded) falls
@@ -355,63 +103,53 @@ class TestFirstPersonResolution:
             "paramem.server.personal_referent.classify_personal_referent",
             return_value=None,
         ):
-            findings = check_personal_content(
+            result = is_self_referential(
                 "Where do I live?",
                 speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
-        assert "first_person_personal" in findings
+        assert result is True
 
     def test_first_person_anywhere_in_text_matches(self):
         # "my" appears mid-sentence, not first word.
-        findings = check_personal_content(
-            "Tell me what's on my schedule today.",
-            speaker_id="speaker0",
+        assert (
+            is_self_referential("Tell me what's on my schedule today.", speaker_id="speaker0")
+            is True
         )
-        assert "first_person_personal" in findings
 
 
 # ---------------------------------------------------------------------------
-# check_personal_content is the predicate — there is no policy knob
+# is_self_referential is the predicate — there is no policy knob
 # ---------------------------------------------------------------------------
 
 
-class TestPersonalPredicateIsUnconditional:
+class TestSelfReferentialPredicateIsUnconditional:
     """``sanitization.mode`` (off/warn/block) is deleted.
 
     Detection always runs and always reports; the caller owns what to do
-    about a personal verdict.  These cases used to be the ``mode`` matrix.
+    about a personal verdict.
     """
 
     def test_first_person_is_personal(self):
-        findings = check_personal_content("Where do I live?", speaker_id="speaker0")
-        assert "first_person_personal" in findings
-
-    def test_known_entity_is_personal(self):
-        findings = check_personal_content("Did Pat call?", known_entities={"Pat"})
-        assert "personal_entity" in findings
+        assert is_self_referential("Where do I live?", speaker_id="speaker0") is True
 
     def test_clean_query_is_not_personal(self):
-        findings = check_personal_content(
-            "What's the weather today?",
-            speaker_id="speaker0",
-            known_entities={"pat"},
-        )
-        assert findings == []
+        assert is_self_referential("What's the weather today?", speaker_id="speaker0") is False
 
-    def test_imperative_without_personal_reference_is_not_personal(self):
-        findings = check_personal_content(
-            "Turn on the kitchen light",
-            speaker_id="speaker0",
-            known_entities={"pat"},
-        )
-        assert findings == []
+    def test_imperative_without_first_person_is_not_personal(self):
+        assert is_self_referential("Turn on the kitchen light", speaker_id="speaker0") is False
 
     def test_no_mode_parameter_survives(self):
         """Regression guard: the deleted knob must not come back as a kwarg."""
         import inspect
 
-        assert "mode" not in inspect.signature(check_personal_content).parameters
+        assert "mode" not in inspect.signature(is_self_referential).parameters
+
+    def test_no_known_entities_parameter_survives(self):
+        """Regression guard: the deleted known-entity arm must not come back."""
+        import inspect
+
+        assert "known_entities" not in inspect.signature(is_self_referential).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -494,168 +232,3 @@ class TestSanitizationConfigCloudMode:
 
         config = load_server_config("configs/server.yaml")
         assert config.sanitization.cloud_mode in {"block", "anonymize", "both"}
-
-
-# ---------------------------------------------------------------------------
-# M3 — speaker display-name coverage in known_entities (handle_chat plumbing)
-# ---------------------------------------------------------------------------
-
-
-class TestM3SpeakerDisplayNameCoverage:
-    """M3 coverage: the speaker's display name must be flagged as a personal
-    referent even when it is not a registry subject.
-
-    Under the id-as-subject refactor (step 8+) the registry holds ``speaker0``
-    as the subject rather than ``"Alex"``.  inference.py::handle_chat now
-    explicitly adds the resolved ``speaker`` display name to ``known_entities``
-    so the sanitizer still catches queries that mention the real name.
-
-    These tests verify the sanitizer side of the contract: passing the display
-    name in ``known_entities`` flags it as personal.  The inference.py plumbing
-    (which adds ``speaker`` to ``known_entities``) is covered by the integration
-    test below.
-    """
-
-    def test_display_name_in_known_entities_flags_personal(self):
-        """Querying the speaker by their display name is caught as personal."""
-        findings = check_personal_content(
-            "What does Alex do for work?",
-            known_entities={"Alex"},
-        )
-        assert "personal_entity" in findings
-
-    def test_display_name_absent_from_known_entities_is_clean(self):
-        """Without the display name in known_entities, a name query is not personal.
-
-        This is the regression case for M3: if the display name falls out of
-        known_entities the sanitizer would let personal queries through.
-        """
-        findings = check_personal_content(
-            "What does Alex do for work?",
-            known_entities=set(),
-        )
-        assert "personal_entity" not in findings
-
-    def test_handle_chat_adds_speaker_to_known_entities(self):
-        """handle_chat plumbs the speaker display name into known_entities.
-
-        This unit test verifies the inference.py M3 fix without invoking the
-        GPU model.  We patch the downstream check_personal_content call to
-        capture the known_entities argument and confirm it holds the speaker
-        name.
-        """
-        from unittest.mock import MagicMock, patch
-
-        from paramem.server.inference import handle_chat
-
-        captured: dict = {}
-
-        def _fake_check(text, *, speaker_id=None, known_entities=None, **kw):
-            captured["known_entities"] = known_entities
-            return []
-
-        mock_config = MagicMock()
-        mock_config.personal_referent = None
-        mock_config.debug = False
-        mock_config.voice.load_prompt.return_value = "base"
-        mock_config.sentence_type = None
-        mock_config.abstention = MagicMock()
-        mock_config.abstention.enabled = False
-
-        mock_router = MagicMock()
-        mock_plan = MagicMock()
-        mock_plan.intent.value = "GENERAL"
-        from paramem.server.router import Intent
-
-        mock_plan.intent = Intent.GENERAL
-        mock_plan.steps = []
-        mock_router.route.return_value = mock_plan
-
-        mock_model = MagicMock()
-        mock_model.gradient_checkpointing_disable = MagicMock()
-        mock_tokenizer = MagicMock()
-
-        with (
-            patch("paramem.server.inference.check_personal_content", side_effect=_fake_check),
-            patch(
-                "paramem.server.inference._base_model_answer",
-                return_value=MagicMock(text="ok", escalated=False, probed_keys=[]),
-            ),
-        ):
-            handle_chat(
-                text="What does Alex do for work?",
-                conversation_id="conv1",
-                speaker="Alex",
-                speaker_id="speaker0",
-                history=None,
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                config=mock_config,
-                router=mock_router,
-            )
-
-        assert "known_entities" in captured
-        assert captured["known_entities"] is not None
-        # Real case preserved — the sanitizer scrub matches exact-case.
-        assert "Alex" in captured["known_entities"]
-
-    def test_handle_chat_anonymous_speaker_not_added_to_known_entities(self):
-        """Anonymous display-name suppression: None speaker must not pollute known_entities.
-
-        When resolve_speaker_name returns None (anonymous profile), handle_chat
-        receives speaker=None and must not add anything to known_entities.
-        """
-        from unittest.mock import MagicMock, patch
-
-        from paramem.server.inference import handle_chat
-
-        captured: dict = {}
-
-        def _fake_check(text, *, speaker_id=None, known_entities=None, **kw):
-            captured["known_entities"] = known_entities
-            return []
-
-        mock_config = MagicMock()
-        mock_config.personal_referent = None
-        mock_config.debug = False
-        mock_config.voice.load_prompt.return_value = "base"
-        mock_config.sentence_type = None
-        mock_config.abstention = MagicMock()
-        mock_config.abstention.enabled = False
-
-        mock_router = MagicMock()
-        mock_plan = MagicMock()
-        from paramem.server.router import Intent
-
-        mock_plan.intent = Intent.GENERAL
-        mock_plan.steps = []
-        mock_router.route.return_value = mock_plan
-
-        mock_model = MagicMock()
-        mock_model.gradient_checkpointing_disable = MagicMock()
-        mock_tokenizer = MagicMock()
-
-        with (
-            patch("paramem.server.inference.check_personal_content", side_effect=_fake_check),
-            patch(
-                "paramem.server.inference._base_model_answer",
-                return_value=MagicMock(text="ok", escalated=False, probed_keys=[]),
-            ),
-        ):
-            handle_chat(
-                text="Hello there.",
-                conversation_id="conv2",
-                speaker=None,  # anonymous / not resolved
-                speaker_id="speaker0",
-                history=None,
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                config=mock_config,
-                router=mock_router,
-            )
-
-        # known_entities may be None (no memory_store) or an empty set —
-        # but must NOT contain a non-None speaker name since speaker is None.
-        ke = captured.get("known_entities")
-        if ke is not None:
-            assert not any(v for v in ke if v)  # no truthy entity from anonymous

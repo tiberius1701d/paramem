@@ -538,8 +538,8 @@ class TestProbeAndReasonDispatch:
             lambda path: {},
         )
         monkeypatch.setattr(
-            "paramem.server.inference.check_personal_content",
-            lambda text, **kwargs: [],
+            "paramem.server.inference.is_self_referential",
+            lambda text, **kwargs: False,
         )
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer",
@@ -634,8 +634,8 @@ class TestProbeAndReasonDispatch:
             lambda path: {},
         )
         monkeypatch.setattr(
-            "paramem.server.inference.check_personal_content",
-            lambda text, **kwargs: [],
+            "paramem.server.inference.is_self_referential",
+            lambda text, **kwargs: False,
         )
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer",

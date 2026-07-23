@@ -286,9 +286,13 @@ maintenance.
 **Cloud-only and degraded fallback.** When the local model is not
 registered (cloud-only mode, model load failure), the dispatch
 auto-falls back to the encoder path so routing keeps working with
-the encoder + exemplar bank. Below-margin or fully unavailable cases
-return `IntentConfig.fail_closed_intent` (default `personal`) so
-uncertain queries stay on-device.
+the encoder + exemplar bank. When intent cannot be positively
+established — below margin, or encoder/exemplars fail to load — the
+query is classified `UNKNOWN`: no personal-memory access, and not
+blocked from escalation, so it routes through the normal HA → cloud →
+base-model chain. A classifier unavailable in a mode that requires it
+raises an operator-visible incident, so the degraded state is loud,
+not silent.
 
 **State signal asymmetry.** PA graph match is intentionally NOT a
 state signal here. Speaker enrollment must not classify the
@@ -321,18 +325,17 @@ registry of what "cloud" means. A host that speaks the OpenAI-compatible wire
 format but runs on the operator's own hardware has no entry there and never
 reaches an admission check.
 
-**One personal verdict.** Two detectors used to answer "is this turn
-personal?" independently, each with its own knob threaded through the same
-call sites: the intent classifier (`PERSONAL`/`UNKNOWN`) and the sanitizer's
-`check_personal_content` (graph-anchored known-entity scrub + self-reference
-gate). Both signals are kept — they cover different failure modes: a query
-naming a stored entity with no first-person marker, versus a first-person
-query naming nothing the graph knows. They are unioned into one `is_personal`
-verdict computed once in `handle_chat` and threaded from there. The sanitizer
-has no policy knob of its own (the deleted `sanitization.mode`
-off/warn/block): detection always runs, and what to DO about a personal
-verdict is the caller's decision. Personal-content history turns are always
-dropped from a cloud payload, never warned-and-passed.
+**One personal verdict.** The intent classifier is the routing authority for
+whether a turn is personal. A single self-reference check (encoder-based,
+first-person fallback) supplements it for first-person queries that name
+nothing the classifier keyed on. The two are unioned into one `is_personal`
+verdict, computed once in `handle_chat` and threaded from there. An earlier
+graph-anchored scrub — matching a query against the speaker's stored entity
+surfaces — was removed: it re-derived a signal the classifier already owns and
+could only add false positives. The sanitizer has no policy knob of its own:
+what to DO about a personal verdict is the caller's decision. Self-referential
+history turns are always dropped from a cloud payload, never
+warned-and-passed.
 
 **The verdict gates cloud, not HA.** HA is local and stays reachable as a
 tool fallback on every path.
@@ -340,21 +343,23 @@ tool fallback on every path.
 **The forwarded query is a distinct artifact.** The text after `[ESCALATE]`
 is authored by the local model after it has recalled facts from parametric
 memory, so it can carry personal content the user never typed. It gets its
-own verdict from the same `check_personal_content` predicate, computed in
-`_maybe_escalate`; a personal forwarded query suppresses the HA hop as well
-as the cloud hop, because `ha_agent_id` is operator-pointed and may be
+own verdict from the same `is_self_referential` predicate, computed in
+`_maybe_escalate`; a self-referential forwarded query suppresses the HA hop as
+well as the cloud hop, because `ha_agent_id` is operator-pointed and may be
 cloud-backed.
 
-**One egress funnel.** `answer_via_cloud` is the sole cloud-egress path in
-local mode; `cloud_mode` (`block`/`anonymize`/`both`) applies there and
-nowhere else. `/chat`'s forced routing (`route=cloud:<provider>`) selects the
-provider; it does not buy a policy bypass. `_cloud_only_route` is the
-cloud-only counterpart and calls the shared `_escalate_to_cloud` primitive
-directly: in cloud-only mode there is no local model, so `_state["model"]`
-and the memory store are absent and `history` is client-supplied — no
-ParaMem-held knowledge can reach the cloud by any path. Cloud-only mode is
-therefore honestly a plain cloud agent, and it runs no intent classification,
-personal-referent gate, anonymization or `cloud_mode` enforcement.
+**One egress funnel.** `answer_via_cloud` is the sole cloud-egress entry
+point, in both local and cloud-only mode; `cloud_mode`
+(`block`/`anonymize`/`both`) applies through it. Forced routing
+(`route=cloud:<provider>`) selects the provider, not a policy bypass. The
+funnel branches on one question — can the local model anonymize? In local mode
+it can, and the `cloud_mode` policy runs. In cloud-only mode there is no local
+model: the memory store is absent, no ParaMem-held knowledge can reach the
+cloud by any path, and the current turn egresses verbatim only if the operator
+has permitted the cloud leg. Cloud-only is therefore honestly a plain cloud
+agent — no intent classification, no personal-referent gate, no anonymization
+— gated by the master switch and the degraded-serving decision, not by
+`cloud_mode`.
 
 **Degraded serving is an explicit operator decision.**
 `cloud.allow_degraded_serving` (default `false`) gates the cloud leg when the

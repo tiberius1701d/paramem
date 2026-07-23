@@ -304,11 +304,10 @@ class TestPrivacyRouting:
         intent is encoder-driven.  This mock continues to use entity matching
         as a convenient way to simulate "encoder says PERSONAL" for the
         privacy-invariant tests below, without standing up the encoder.  The
-        no-match branch uses ``Intent.GENERAL`` (a genuinely non-personal
-        classification) rather than ``Intent.UNKNOWN`` — since the fail-
-        closed gate in ``handle_chat`` now treats UNKNOWN as personal (see
-        ``test_unknown_intent_never_reaches_cloud``), UNKNOWN is no longer a
-        valid stand-in for "non-personal" here.
+        no-match branch uses ``Intent.GENERAL`` for clarity; ``Intent.UNKNOWN``
+        would behave identically (see :func:`_make_unknown_router` and
+        ``test_unknown_intent_may_reach_cloud`` — both non-personal intents
+        route the same way).
         """
         from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
@@ -340,8 +339,8 @@ class TestPrivacyRouting:
         Simulates the "intent could not be established" case (no
         ``IntentConfig``, classifier unavailable, below-margin confidence):
         ``RoutingPlan.intent`` carries the raw ``UNKNOWN`` value and
-        ``plan.steps`` is empty, exercising the defensive fallthrough
-        branch in ``handle_chat`` rather than the direct personal-probe
+        ``plan.steps`` is empty, exercising the HA-first/cloud-fallback
+        escalation branch in ``handle_chat`` rather than the personal-probe
         branch.
         """
         from paramem.server.router import Intent, RoutingPlan
@@ -498,16 +497,15 @@ class TestPrivacyRouting:
         assert result.escalated is True
         assert result.text == "cloud answer"
 
-    def test_unknown_intent_never_reaches_cloud(self):
-        """Regression: Intent.UNKNOWN must fail closed to personal.
+    def test_unknown_intent_may_reach_cloud(self):
+        """Regression: Intent.UNKNOWN is not positively PERSONAL.
 
         Without an ``IntentConfig`` (or below the confidence margin),
         ``classify_intent`` returns ``Intent.UNKNOWN``.  The privacy gate in
-        ``handle_chat`` must treat that identically to ``PERSONAL`` — an
-        unclassifiable query is never escalated to the external cloud
-        provider, even though the routing plan carries no probe steps and
-        falls through the same HA-first/cloud-fallback branch a GENERAL
-        query would use.
+        ``handle_chat`` only grants personal-memory access and blocks cloud
+        escalation on a positive ``PERSONAL`` verdict — ``UNKNOWN`` routes
+        identically to ``GENERAL``: HA first, cloud fallback when HA is
+        unreachable.
         """
         from paramem.server.inference import handle_chat
 
@@ -527,41 +525,27 @@ class TestPrivacyRouting:
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None
 
-        # HA fails and cloud is blocked (is_personal), so handle_chat falls
-        # through to the local base-model answer as the last resort — mock
-        # its generation the same way test_no_cloud_falls_back_to_local
-        # does so the assertions below exercise the routing/privacy gate,
-        # not real (unmocked) model.generate() output.
-        with (
-            patch(
-                "paramem.server.inference.generate_answer",
-                return_value="I'm not sure about that.",
-            ),
-            patch(
-                "paramem.server.inference.detect_escalation",
-                return_value=(False, ""),
-            ),
-        ):
-            result = handle_chat(
-                text="What is the weather today?",
-                conversation_id="test",
-                speaker=None,
-                speaker_id="spk-test",
-                history=None,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-                router=router,
-                ha_client=ha_client,
-                cloud_agent=cloud_agent,
-                memory_store=_MS(replay_enabled=False),
-            )
+        result = handle_chat(
+            text="What is the weather today?",
+            conversation_id="test",
+            speaker=None,
+            speaker_id="spk-test",
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            router=router,
+            ha_client=ha_client,
+            cloud_agent=cloud_agent,
+            memory_store=_MS(replay_enabled=False),
+        )
 
-        # HA (local) is still reachable as a tool fallback for UNKNOWN...
+        # HA attempted first...
         ha_client.conversation_process.assert_called_once()
-        # ...but cloud (external cloud) must NOT have been called.
-        cloud_agent.call.assert_not_called()
-        assert result.escalated is False
+        # ...and cloud reached as fallback since HA was unreachable.
+        cloud_agent.call.assert_called_once()
+        assert result.escalated is True
+        assert result.text == "cloud answer"
 
     def test_no_cloud_falls_back_to_local(self):
         """Without cloud agent, non-personal query uses local model."""
@@ -823,22 +807,22 @@ class TestForwardedQueryVerdict:
 
     ``detect_escalation`` returns everything after ``[ESCALATE]``.  On the
     personal path the local model has already recalled facts from
-    parametric memory, so that string can name entities the user never
-    typed.  ``_maybe_escalate`` therefore re-runs
-    ``check_personal_content`` on the forwarded query and gates BOTH
+    parametric memory, so that string can be self-referential even when
+    the user's own turn was not.  ``_maybe_escalate`` therefore re-runs
+    ``is_self_referential`` on the forwarded query and gates BOTH
     external hops with the result — the HA hop included, because
     ``ha_agent_id`` is operator-configurable and routinely points at a
     cloud-backed agent.
     """
 
-    RESPONSE = "I'm not sure where to look. [ESCALATE] Find ceramics shops in Munich for Maria."
+    RESPONSE = "I'm not sure where to look. [ESCALATE] Can you check my calendar for today?"
     CONTROL_RESPONSE = "I'm not sure. [ESCALATE] What is the capital of France?"
 
     def _config(self):
         config = MagicMock()
         config.sanitization.cloud_mode = "block"
-        # No encoder in unit tests — check_personal_content falls back to the
-        # English token-set arm; the known-entity arm is unaffected.
+        # No encoder in unit tests — is_self_referential falls back to the
+        # English token-set arm.
         config.personal_referent = None
         return config
 
@@ -859,7 +843,6 @@ class TestForwardedQueryVerdict:
             is_personal=is_personal,
             model=MagicMock(),
             tokenizer=MagicMock(),
-            known_entities={"Maria"},
         )
         return result, ha_client, cloud_agent
 
@@ -1165,28 +1148,119 @@ class TestCloudModePolicy:
         )
 
 
-class TestCloudOnlyRouteSpeakerId:
-    """``_cloud_only_route``'s ``speaker_id`` parameter
-    must reach ``_sanitize_history`` — consistent with the other
-    ``_sanitize_history`` call sites (both branches of
-    ``inference.answer_via_cloud`` and the forced-routing
-    path in ``app.py``).
+class TestCannotAnonymizeEgress:
+    """``answer_via_cloud`` with ``model``/``tokenizer`` absent.
+
+    This is the cloud-only axis: no local model means no anonymizer and no
+    ParaMem-held knowledge to protect, so ``cloud_mode``/``is_personal`` do
+    not apply.  The current turn egresses verbatim, gated only by
+    ``cloud_permitted``.
     """
 
-    def test_speaker_id_reaches_history_sanitizer(self):
+    def test_verbatim_when_permitted(self):
+        from paramem.server.inference import answer_via_cloud
+
+        cloud_agent = MagicMock(spec=CloudAgent)
+        cloud_agent.call.return_value = CloudResponse(text="Berlin has 3.7M people.")
+        config = MagicMock()
+
+        result = answer_via_cloud(
+            "What's the population of Berlin?",
+            cloud_agent,
+            config,
+            is_personal=True,  # irrelevant on this axis — no store to be personal about
+            model=None,
+            tokenizer=None,
+            cloud_permitted=True,
+        )
+
+        assert result is not None
+        assert result.text == "Berlin has 3.7M people."
+        sent = cloud_agent.call.call_args.kwargs["query"]
+        assert sent == "What's the population of Berlin?"
+
+    def test_blocked_when_not_permitted(self):
+        from paramem.server.inference import answer_via_cloud
+
+        cloud_agent = MagicMock(spec=CloudAgent)
+        config = MagicMock()
+
+        result = answer_via_cloud(
+            "What's the population of Berlin?",
+            cloud_agent,
+            config,
+            model=None,
+            tokenizer=None,
+            cloud_permitted=False,
+        )
+
+        assert result is None
+        cloud_agent.call.assert_not_called()
+
+    def test_missing_tokenizer_alone_also_cannot_anonymize(self):
+        """Either half absent selects the cannot-anonymize branch, not just model."""
+        from paramem.server.inference import answer_via_cloud
+
+        cloud_agent = MagicMock(spec=CloudAgent)
+        cloud_agent.call.return_value = CloudResponse(text="ok")
+        config = MagicMock()
+
+        result = answer_via_cloud(
+            "hello",
+            cloud_agent,
+            config,
+            model=MagicMock(),
+            tokenizer=None,
+            cloud_permitted=True,
+        )
+
+        assert result is not None
+        assert result.text == "ok"
+
+    def test_history_still_drop_gated_when_verbatim(self):
+        """Verbatim egress applies to the CURRENT turn only — history is
+        still passed through ``_sanitize_history`` (self-referential turns
+        removed), same as every other ``answer_via_cloud`` branch."""
+        from paramem.server.inference import answer_via_cloud
+
+        cloud_agent = MagicMock(spec=CloudAgent)
+        cloud_agent.call.return_value = CloudResponse(text="ok")
+        config = MagicMock()
+
+        answer_via_cloud(
+            "What's the population of Berlin?",
+            cloud_agent,
+            config,
+            model=None,
+            tokenizer=None,
+            cloud_permitted=True,
+            speaker_id="spk-test",
+            history=[{"role": "user", "text": "My social security number is 123-45-6789"}],
+        )
+
+        sent_history = cloud_agent.call.call_args.kwargs["history"]
+        assert not any("123-45-6789" in turn["text"] for turn in sent_history)
+
+
+class TestCloudOnlyRouteSpeakerId:
+    """``_cloud_only_route``'s ``speaker_id``/``text`` parameters
+    must reach ``answer_via_cloud`` — the sole cloud-egress funnel, called
+    here with ``model``/``tokenizer`` left ``None`` so it selects the
+    cannot-anonymize branch (verbatim iff ``cloud_permitted``; history
+    still drop-gated inside the funnel via ``_sanitize_history``).
+    """
+
+    def test_speaker_id_reaches_the_funnel(self):
         from paramem.server.app import _cloud_only_route
         from paramem.server.inference import ChatResult
 
         config = MagicMock()
         cloud_agent = MagicMock()
 
-        with (
-            patch("paramem.server.app._sanitize_history", return_value=[]) as mock_sanitize,
-            patch(
-                "paramem.server.app._escalate_to_cloud",
-                return_value=ChatResult(text="Berlin has 3.7M people."),
-            ),
-        ):
+        with patch(
+            "paramem.server.app.answer_via_cloud",
+            return_value=ChatResult(text="Berlin has 3.7M people."),
+        ) as mock_funnel:
             _cloud_only_route(
                 text="What's the population of Berlin?",
                 speaker="Alex",
@@ -1198,28 +1272,27 @@ class TestCloudOnlyRouteSpeakerId:
                 speaker_id="spk-test",
             )
 
-        mock_sanitize.assert_called_once()
-        assert mock_sanitize.call_args.kwargs["speaker_id"] == "spk-test"
+        mock_funnel.assert_called_once()
+        assert mock_funnel.call_args.kwargs["speaker_id"] == "spk-test"
+        assert mock_funnel.call_args.kwargs["model"] is None
+        assert mock_funnel.call_args.kwargs["tokenizer"] is None
 
-    def test_current_turn_reaches_cloud_verbatim(self):
+    def test_current_turn_reaches_the_funnel_verbatim(self):
         """Cloud-only has no local model, so there is nothing to anonymize.
 
         The old ``sanitize_for_cloud`` call here was a second policy gate on
         a path that holds no ParaMem knowledge; it is deleted.  The turn
-        itself must arrive at ``_escalate_to_cloud`` unmodified.
+        itself must arrive at ``answer_via_cloud`` unmodified.
         """
         from paramem.server.app import _cloud_only_route
         from paramem.server.inference import ChatResult
 
         config = MagicMock()
 
-        with (
-            patch("paramem.server.app._sanitize_history", return_value=[]),
-            patch(
-                "paramem.server.app._escalate_to_cloud",
-                return_value=ChatResult(text="answer"),
-            ) as mock_escalate,
-        ):
+        with patch(
+            "paramem.server.app.answer_via_cloud",
+            return_value=ChatResult(text="answer"),
+        ) as mock_funnel:
             _cloud_only_route(
                 text="Where does Alex live?",
                 speaker="Alex",
@@ -1228,10 +1301,9 @@ class TestCloudOnlyRouteSpeakerId:
                 cloud_permitted=True,
                 ha_client=None,
                 cloud_agent=MagicMock(),
-                known_entities={"Alex"},
             )
 
-        assert mock_escalate.call_args.args[0] == "Where does Alex live?"
+        assert mock_funnel.call_args.args[0] == "Where does Alex live?"
 
 
 class TestDegradedServingGate:
@@ -1248,13 +1320,10 @@ class TestDegradedServingGate:
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = "HA answer" if ha_answers else None
 
-        with (
-            patch("paramem.server.app._sanitize_history", return_value=[]),
-            patch(
-                "paramem.server.app._escalate_to_cloud",
-                return_value=ChatResult(text="cloud answer"),
-            ) as mock_escalate,
-        ):
+        with patch(
+            "paramem.server.app.answer_via_cloud",
+            return_value=ChatResult(text="cloud answer"),
+        ) as mock_funnel:
             result = _cloud_only_route(
                 text="What's the population of Berlin?",
                 speaker="Alex",
@@ -1264,20 +1333,21 @@ class TestDegradedServingGate:
                 ha_client=ha_client,
                 cloud_agent=MagicMock(),
             )
-        return result, mock_escalate, ha_client
+        return result, mock_funnel, ha_client
 
     def test_gated_closes_cloud_leg(self):
-        result, mock_escalate, _ = self._run(cloud_permitted=False, ha_answers=False)
-        mock_escalate.assert_not_called()
+        result, mock_funnel, _ = self._run(cloud_permitted=False, ha_answers=False)
+        mock_funnel.assert_not_called()
         assert "limited mode" in result.text
 
     def test_gated_keeps_ha_leg(self):
-        result, mock_escalate, ha_client = self._run(cloud_permitted=False, ha_answers=True)
+        result, mock_funnel, ha_client = self._run(cloud_permitted=False, ha_answers=True)
         ha_client.conversation_process.assert_called_once()
-        mock_escalate.assert_not_called()
+        mock_funnel.assert_not_called()
         assert result.text == "HA answer"
 
     def test_permitted_opens_cloud_leg(self):
-        result, mock_escalate, _ = self._run(cloud_permitted=True, ha_answers=False)
-        mock_escalate.assert_called_once()
+        result, mock_funnel, _ = self._run(cloud_permitted=True, ha_answers=False)
+        mock_funnel.assert_called_once()
+        assert mock_funnel.call_args.kwargs["cloud_permitted"] is True
         assert result.text == "cloud answer"

@@ -6,7 +6,7 @@ caller falls back to a deterministic heuristic.  Reuses the same
 multilingual sentence encoder loaded by the intent classifier — no
 new model.
 
-Used by :func:`paramem.server.sanitizer.check_personal_content` to
+Used by :func:`paramem.server.sanitizer.is_self_referential` to
 decide whether a query is asking about / referring to the speaker
 themselves (``ABOUT_SPEAKER``) or about the world, third parties, or
 device state (``NOT_ABOUT_SPEAKER``).  Replaces the

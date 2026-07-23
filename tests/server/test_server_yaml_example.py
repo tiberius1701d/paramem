@@ -292,7 +292,7 @@ def test_abstention_messages_load(example_config):
 
 def test_intent_exemplars_dir_populated(example_config):
     """Intent exemplars directory must exist and contain at least one exemplar file
-    per shipped intent class. Empty/missing dir = silent fall-through to fail_closed_intent.
+    per shipped intent class. Empty/missing dir = silent fall-through to Intent.UNKNOWN.
     """
     from pathlib import Path
 

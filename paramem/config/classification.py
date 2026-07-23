@@ -159,7 +159,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "intent.encoder_query_prefix": Tier.PIPELINE_ALTERING,
     "intent.exemplars_dir": Tier.PIPELINE_ALTERING,
     "intent.confidence_margin": Tier.PIPELINE_ALTERING,
-    "intent.fail_closed_intent": Tier.PIPELINE_ALTERING,
     # --- voice ---
     "voice.prompt_file": Tier.OPERATIONAL,
     "voice.greeting_interval_hours": Tier.OPERATIONAL,

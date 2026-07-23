@@ -8,11 +8,12 @@ leg is open, not what the funnel does once entered.
 Covered:
 
 * ``POST /chat`` with ``route="cloud"`` — forced routing selects the
-  PROVIDER; it does not buy a policy bypass.  In local mode the turn goes
-  through ``answer_via_cloud``; in cloud-only mode (no local model, so no
-  anonymizer and no ParaMem-held knowledge) it uses the shared
-  ``_escalate_to_cloud`` primitive directly.  This endpoint path had no test
-  coverage at all before.
+  PROVIDER; it does not buy a policy bypass.  Both local mode and
+  cloud-only mode route through ``answer_via_cloud`` — the sole
+  cloud-egress funnel; cloud-only passes ``model``/``tokenizer=None`` so
+  the funnel selects its cannot-anonymize (verbatim) branch instead of the
+  ``cloud_mode`` policy.  This endpoint path had no test coverage at all
+  before.
 * ``cloud.allow_degraded_serving`` — the cloud leg is gated only when the
   server is cloud-only for an INVOLUNTARY reason.
 * The degradation notice fires exactly once per conversation.
@@ -77,11 +78,9 @@ def _post_chat(client, **body):
 
 class TestForcedCloudRouting:
     def test_local_mode_goes_through_the_funnel(self, tmp_path, monkeypatch):
-        """``route="cloud"`` in local mode reaches ``answer_via_cloud``.
-
-        Regression guard for the deleted policy bypass: the branch used to
-        hand ``request.text`` straight to ``_escalate_to_cloud`` with no
-        ``cloud_mode`` and no personal verdict applied.
+        """``route="cloud"`` in local mode reaches ``answer_via_cloud`` with
+        a live model/tokenizer — selecting the ``cloud_mode`` policy branch,
+        not the cannot-anonymize branch.
         """
         monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="local"))
 
@@ -92,7 +91,6 @@ class TestForcedCloudRouting:
                 "answer_via_cloud",
                 return_value=ChatResult(text="cloud answer", escalated=True),
             ) as mock_funnel,
-            patch.object(app_module, "_escalate_to_cloud") as mock_primitive,
         ):
             resp = _post_chat(
                 TestClient(app_module.app),
@@ -102,9 +100,10 @@ class TestForcedCloudRouting:
 
         assert resp.status_code == 200
         assert resp.json()["text"] == "cloud answer"
-        mock_primitive.assert_not_called()
         mock_funnel.assert_called_once()
         assert mock_funnel.call_args.args[0] == "What's the population of Berlin?"
+        assert mock_funnel.call_args.kwargs["model"] is not None
+        assert mock_funnel.call_args.kwargs["tokenizer"] is not None
 
     def test_local_mode_forwards_the_personal_verdict(self, tmp_path, monkeypatch):
         """A personal turn on the forced route carries ``is_personal=True``.
@@ -148,11 +147,11 @@ class TestForcedCloudRouting:
 
         assert mock_funnel.call_args.kwargs["is_personal"] is False
 
-    def test_cloud_only_mode_uses_the_shared_primitive(self, tmp_path, monkeypatch):
-        """No local model → no anonymizer, so the funnel would block every turn.
-
-        Cloud-only is honestly a plain cloud agent (no memory store, no local
-        model, client-supplied history), so it calls the shared primitive.
+    def test_cloud_only_mode_goes_through_the_same_funnel(self, tmp_path, monkeypatch):
+        """Cloud-only also reaches ``answer_via_cloud`` — with no local model
+        (``model``/``tokenizer=None``) so the funnel selects its
+        cannot-anonymize (verbatim) branch instead of the ``cloud_mode``
+        policy.  There is no separate bypass primitive on this path anymore.
         """
         monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="cloud-only"))
 
@@ -160,10 +159,9 @@ class TestForcedCloudRouting:
             patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
             patch.object(
                 app_module,
-                "_escalate_to_cloud",
+                "answer_via_cloud",
                 return_value=ChatResult(text="cloud answer", escalated=True),
-            ) as mock_primitive,
-            patch.object(app_module, "answer_via_cloud") as mock_funnel,
+            ) as mock_funnel,
         ):
             resp = _post_chat(
                 TestClient(app_module.app),
@@ -172,8 +170,10 @@ class TestForcedCloudRouting:
             )
 
         assert resp.json()["text"] == "cloud answer"
-        mock_funnel.assert_not_called()
-        mock_primitive.assert_called_once()
+        mock_funnel.assert_called_once()
+        assert mock_funnel.call_args.kwargs["model"] is None
+        assert mock_funnel.call_args.kwargs["tokenizer"] is None
+        assert mock_funnel.call_args.kwargs["cloud_permitted"] is True
 
     def test_unavailable_provider_reports_the_route(self, tmp_path, monkeypatch):
         state = _make_state(tmp_path, mode="local")

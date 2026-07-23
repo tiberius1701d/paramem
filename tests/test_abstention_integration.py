@@ -8,7 +8,7 @@ mode from 2026-04-21 (user asked "Where do I live?" on an untrained
 adapter, Mistral confabulated "New York City").
 
 Distinct from ``test_abstention.py``: those tests patch
-``check_personal_content`` and use a ``MagicMock`` config to isolate the
+``is_self_referential`` and use a ``MagicMock`` config to isolate the
 short-circuit logic. This test exercises the real sanitizer and real
 YAML loader end-to-end.
 """
@@ -21,7 +21,7 @@ import pytest
 from paramem.server.config import load_server_config
 from paramem.server.inference import handle_chat
 from paramem.server.router import RoutingPlan
-from paramem.server.sanitizer import check_personal_content
+from paramem.server.sanitizer import is_self_referential
 
 
 @pytest.fixture
@@ -93,8 +93,9 @@ class TestSanitizerPrecondition:
         # there is no resolution target for "I" / "my" without a
         # speaker_id.  Production callers always have one when the
         # speaker is enrolled (which is when self-referential matters).
-        findings = check_personal_content(query, speaker_id="speaker0")
-        assert findings, f"sanitizer should flag {query!r} as personal"
+        assert is_self_referential(query, speaker_id="speaker0"), (
+            f"sanitizer should flag {query!r} as personal"
+        )
 
     @pytest.mark.parametrize(
         "query",
@@ -104,8 +105,9 @@ class TestSanitizerPrecondition:
         ],
     )
     def test_real_sanitizer_allows_non_personal(self, query):
-        findings = check_personal_content(query, speaker_id="speaker0")
-        assert findings == [], f"sanitizer should not flag {query!r}"
+        assert not is_self_referential(query, speaker_id="speaker0"), (
+            f"sanitizer should not flag {query!r}"
+        )
 
 
 @pytest.mark.skipif(

@@ -10,8 +10,11 @@ The router answers two questions per query:
   :meth:`QueryRouter._steps_for_intent`.
 
 Intent is decided by :func:`paramem.server.intent.classify_intent` — HA
-lexical fast-path + encoder-cosine residual + fail-closed default.
-Speaker enrollment is intentionally NOT a routing signal: a query from
+lexical fast-path + encoder-cosine residual + ``Intent.UNKNOWN`` when
+unresolved.  ``Intent.UNKNOWN`` is never remapped to a positive intent;
+it routes identically to ``Intent.GENERAL`` (no personal-memory access,
+escalation available).  Speaker enrollment is intentionally NOT a
+routing signal: a query from
 an enrolled speaker is classified by content, not by who said it.  This
 removes the "speaker-in-graph → PERSONAL" short-circuit that previously
 caused imperatives from enrolled speakers to misroute (HR3 bug).
@@ -45,8 +48,8 @@ class Intent(str, Enum):
       to the HA conversation agent.
     * ``GENERAL``  — general-knowledge query; full escalation chain available.
     * ``UNKNOWN``  — classifier unavailable or below confidence margin;
-      treated per :class:`IntentConfig.fail_closed_intent`
-      (privacy-preserving default).
+      not positively PERSONAL, so it grants no personal-memory access and
+      does not block escalation — routed identically to ``GENERAL``.
     """
 
     PERSONAL = "personal"
@@ -302,8 +305,9 @@ class QueryRouter:
           OR ``relation_type=="preference"`` in bookkeeping).  Identity facts in
           interim slots are excluded by construction (DEFAULT-DENY).
         * ``GENERAL``  — empty (route to cloud with no personal injection).
-        * ``UNKNOWN``  — resolved via ``IntentConfig.fail_closed_intent``
-          (default ``PERSONAL`` — privacy-preserving fallback).
+        * ``UNKNOWN``  — empty, identically to ``GENERAL``.  An unresolved
+          intent is never remapped to a positive intent, so it grants no
+          personal-memory access.
 
         Returns an empty list when ``allowed_keys`` is empty (anonymous
         speaker or enrolled speaker with no keys).
@@ -311,13 +315,9 @@ class QueryRouter:
         if not allowed_keys:
             return []
 
-        effective = intent
-        if intent is Intent.UNKNOWN:
-            effective = self._resolve_unknown_intent()
-
-        if effective is Intent.PERSONAL:
+        if intent is Intent.PERSONAL:
             tiers = self._personal_tier_order()
-        elif effective is Intent.COMMAND:
+        elif intent is Intent.COMMAND:
             # COMMAND: probe procedural MAIN unfiltered, then interim slots with
             # the preference-only filter so factual/temporal/social interim keys
             # never reach HA payloads.
@@ -342,20 +342,6 @@ class QueryRouter:
             if scoped:
                 steps.append(RoutingStep(adapter_name=tier, keys_to_probe=scoped))
         return steps
-
-    def _resolve_unknown_intent(self) -> Intent:
-        """Resolve ``Intent.UNKNOWN`` via ``IntentConfig.fail_closed_intent``.
-
-        Defaults to ``Intent.PERSONAL`` so unrecognised queries from an
-        enrolled speaker keep their context on-device.
-        """
-        config = self._intent_config
-        if config is None:
-            return Intent.PERSONAL
-        try:
-            return Intent(config.fail_closed_intent)
-        except ValueError:
-            return Intent.PERSONAL
 
     def _personal_tier_order(self) -> list[str]:
         """PERSONAL probe order: procedural → newest interim first → episodic → semantic.

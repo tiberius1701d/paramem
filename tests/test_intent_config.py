@@ -61,7 +61,6 @@ class TestIntentConfig:
         assert cfg.encoder_query_prefix == "query: "
         assert cfg.exemplars_dir == "configs/intents"
         assert cfg.confidence_margin == 0.05
-        assert cfg.fail_closed_intent == "personal"
 
     def test_server_config_includes_intent(self):
         config = ServerConfig()
@@ -83,10 +82,9 @@ class TestIntentConfig:
 
     def test_yaml_override_thresholds(self, tmp_path):
         config_file = tmp_path / "server.yaml"
-        config_file.write_text("intent:\n  confidence_margin: 0.1\n  fail_closed_intent: general\n")
+        config_file.write_text("intent:\n  confidence_margin: 0.1\n")
         config = load_server_config(config_file)
         assert config.intent.confidence_margin == 0.1
-        assert config.intent.fail_closed_intent == "general"
 
     def test_yaml_partial_override_keeps_defaults(self, tmp_path):
         config_file = tmp_path / "server.yaml"

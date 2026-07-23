@@ -380,7 +380,8 @@ class TestIntentTierSelection:
     * PERSONAL → procedural → newest interim first → episodic → semantic
     * COMMAND  → procedural only (preferences for HA injection)
     * GENERAL  → no steps (route to cloud without personal injection)
-    * UNKNOWN  → resolved via IntentConfig.fail_closed_intent (default PERSONAL)
+    * UNKNOWN  → no steps, identically to GENERAL — an unresolved intent
+      is never remapped to a positive intent
     """
 
     def _three_tier_router(self):
@@ -429,27 +430,25 @@ class TestIntentTierSelection:
         assert plan.intent is Intent.GENERAL
         assert plan.strategy == "direct"
 
-    def test_unknown_without_config_defaults_to_personal(self, monkeypatch):
+    def test_unknown_produces_empty_steps_like_general(self, monkeypatch):
+        """UNKNOWN grants no personal-memory access — same as GENERAL.
+
+        An unresolved intent is never remapped to a positive intent: the
+        query still routes through escalation, but the local probe never
+        runs, regardless of whether an ``intent_config`` is supplied.
+        """
         _stub_intent(monkeypatch, Intent.UNKNOWN)
         router = self._three_tier_router()
         plan = router.route("ambiguous", speaker_id="alice")
-        # No intent_config → PERSONAL fallback.
-        assert [s.adapter_name for s in plan.steps] == ["procedural", "episodic", "semantic"]
-
-    def test_unknown_resolves_via_intent_config_fail_closed(self, monkeypatch):
-        from paramem.server.config import IntentConfig
-
-        _stub_intent(monkeypatch, Intent.UNKNOWN)
-        router = _make_router_from_entries(
-            [
-                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural"),
-            ],
-            intent_config=IntentConfig(fail_closed_intent="general"),
-        )
-        plan = router.route("ambiguous", speaker_id="alice")
-        # general → no steps
         assert plan.steps == []
+        assert plan.intent is Intent.UNKNOWN
+        assert plan.strategy == "direct"
+
+    def test_steps_for_intent_unknown_returns_empty_list(self, monkeypatch):
+        """Direct unit check on ``_steps_for_intent`` — UNKNOWN → []."""
+        router = self._three_tier_router()
+        allowed_keys = {"ep1", "se1", "pr1"}
+        assert router._steps_for_intent(Intent.UNKNOWN, allowed_keys) == []
 
     def test_tier_missing_from_store_is_skipped(self, monkeypatch):
         """Speaker has only procedural keys → PERSONAL plan skips the

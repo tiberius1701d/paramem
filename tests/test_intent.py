@@ -20,7 +20,6 @@ from paramem.server.intent import (
     _classify_via_encoder,
     _EncoderHandle,
     _ExemplarBank,
-    _fail_closed_intent,
     _parse_intent_label,
     _read_exemplar_file,
     _resolve_device,
@@ -81,39 +80,18 @@ class TestResidualFallback:
         )
         assert result == Intent.UNKNOWN
 
-    def test_residual_with_config_returns_fail_closed_default(self):
-        config = IntentConfig()  # fail_closed_intent defaults to "personal"
+    def test_residual_with_config_but_no_encoder_returns_unknown(self):
+        # A config is supplied but no encoder/exemplars are loaded (the
+        # degraded-classifier case).  An unresolved verdict is never
+        # remapped to a positive intent — it stays UNKNOWN, granting no
+        # personal-memory access and not blocking escalation.
+        config = IntentConfig()
         result = classify_intent(
             "What is the capital of France?",
             has_ha_match=False,
             config=config,
         )
-        assert result == Intent.PERSONAL
-
-    def test_residual_honours_custom_fail_closed_intent(self):
-        config = IntentConfig(fail_closed_intent="general")
-        result = classify_intent(
-            "Tell me about quantum computing.",
-            has_ha_match=False,
-            config=config,
-        )
-        assert result == Intent.GENERAL
-
-
-class TestFailClosedIntent:
-    def test_personal_default(self):
-        cfg = IntentConfig()
-        assert _fail_closed_intent(cfg) == Intent.PERSONAL
-
-    def test_invalid_value_falls_back_to_personal(self):
-        cfg = IntentConfig(fail_closed_intent="not_a_valid_intent")
-        # Invalid values must not crash; safest fallback is PERSONAL
-        # (privacy-preserving).
-        assert _fail_closed_intent(cfg) == Intent.PERSONAL
-
-    def test_unknown_is_a_valid_choice(self):
-        cfg = IntentConfig(fail_closed_intent="unknown")
-        assert _fail_closed_intent(cfg) == Intent.UNKNOWN
+        assert result == Intent.UNKNOWN
 
 
 class TestResolveDevice:
@@ -335,36 +313,26 @@ class TestClassifyViaEncoder:
 
         assert result == Intent.PERSONAL
 
-    def test_below_margin_returns_fail_closed(self):
+    def test_below_margin_returns_unknown(self):
         bank = _bank_with_three_classes()
         encoder = _stub_encoder()
         # Top two classes within 0.01 of each other — below default margin 0.05.
         encoder.model.encode.return_value = np.array([[0.50, 0.49, 0.10]], dtype=np.float32)
-        config = IntentConfig()  # fail_closed defaults to "personal"
+        config = IntentConfig()
 
         result = _classify_via_encoder("ambiguous query", encoder, bank, config)
 
-        assert result == Intent.PERSONAL  # via fail-closed, not via top score
+        assert result == Intent.UNKNOWN  # unresolved, not remapped to a positive intent
 
-    def test_below_margin_honours_custom_fail_closed(self):
-        bank = _bank_with_three_classes()
-        encoder = _stub_encoder()
-        encoder.model.encode.return_value = np.array([[0.50, 0.49, 0.10]], dtype=np.float32)
-        config = IntentConfig(fail_closed_intent="general")
-
-        result = _classify_via_encoder("ambiguous query", encoder, bank, config)
-
-        assert result == Intent.GENERAL
-
-    def test_query_embedding_failure_falls_back(self):
+    def test_query_embedding_failure_returns_unknown(self):
         bank = _bank_with_three_classes()
         encoder = _stub_encoder()
         encoder.model.encode.side_effect = RuntimeError("simulated failure")
-        config = IntentConfig(fail_closed_intent="general")
+        config = IntentConfig()
 
         result = _classify_via_encoder("any query", encoder, bank, config)
 
-        assert result == Intent.GENERAL
+        assert result == Intent.UNKNOWN
 
     def test_query_prefix_applied(self):
         bank = _bank_with_three_classes()
@@ -437,10 +405,10 @@ class TestClassifyIntentIntegration:
         assert result == Intent.COMMAND
         intent_module._encoder_singleton.model.encode.assert_not_called()
 
-    def test_missing_bank_falls_back_to_fail_closed(self):
+    def test_missing_bank_returns_unknown(self):
         intent_module._encoder_singleton = _stub_encoder()
         # _exemplars_singleton stays None
-        config = IntentConfig(fail_closed_intent="general")
+        config = IntentConfig()
 
         result = classify_intent(
             "what is the capital of France?",
@@ -448,7 +416,7 @@ class TestClassifyIntentIntegration:
             config=config,
         )
 
-        assert result == Intent.GENERAL
+        assert result == Intent.UNKNOWN
 
     def test_personal_query_from_enrolled_speaker_not_short_circuited(self):
         """Speaker enrollment must NOT classify queries as PERSONAL.
@@ -572,9 +540,9 @@ class TestClassifyViaLLM:
 
     * dispatch on ``config.mode == "llm"`` when the singleton is set;
     * fallback to encoder path when singleton is None;
-    * fail-closed when the classifier section is missing from the
-      voice prompt file;
-    * fail-closed when generate() raises or returns garbage.
+    * ``Intent.UNKNOWN`` when the classifier section is missing from
+      the voice prompt file;
+    * ``Intent.UNKNOWN`` when generate() raises or returns garbage.
     """
 
     def test_llm_dispatch_when_singleton_set(self, monkeypatch):
@@ -593,15 +561,15 @@ class TestClassifyViaLLM:
         """``mode=llm`` with no classifier model registered → encoder path.
 
         The encoder is also absent here so the call lands on
-        fail_closed_intent (PERSONAL by default).  The key contract is
-        that the dispatch did NOT raise and did NOT block — it slid
-        gracefully to the encoder path.
+        ``Intent.UNKNOWN``.  The key contract is that the dispatch did
+        NOT raise and did NOT block — it slid gracefully to the encoder
+        path, which then degrades to UNKNOWN for lack of an encoder.
         """
         from paramem.server.config import IntentConfig as _Cfg
 
         config = _Cfg(mode="llm")
         result = classify_intent("anything", has_ha_match=False, config=config)
-        assert result == Intent.PERSONAL  # fail-closed default
+        assert result == Intent.UNKNOWN
 
     def test_ha_match_still_short_circuits_in_llm_mode(self):
         """HA fast-path runs before the LLM dispatch."""
@@ -615,31 +583,31 @@ class TestClassifyViaLLM:
         assert result == Intent.COMMAND
         handle.model.generate.assert_not_called()
 
-    def test_generate_failure_returns_fail_closed(self):
+    def test_generate_failure_returns_unknown(self):
         from paramem.server.config import IntentConfig as _Cfg
 
         handle = _stub_classifier_model("COMMAND")
         handle.model.generate.side_effect = RuntimeError("simulated OOM")
         set_classifier_model(handle.model, handle.tokenizer)
-        config = _Cfg(mode="llm", fail_closed_intent="general")
+        config = _Cfg(mode="llm")
 
         result = classify_intent("anything", has_ha_match=False, config=config)
-        assert result == Intent.GENERAL
+        assert result == Intent.UNKNOWN
 
-    def test_unrecognised_label_returns_fail_closed(self):
+    def test_unrecognised_label_returns_unknown(self):
         from paramem.server.config import IntentConfig as _Cfg
 
         handle = _stub_classifier_model("hmm, I'm not sure")
         set_classifier_model(handle.model, handle.tokenizer)
-        config = _Cfg(mode="llm", fail_closed_intent="general")
+        config = _Cfg(mode="llm")
 
         result = classify_intent("anything", has_ha_match=False, config=config)
-        assert result == Intent.GENERAL
+        assert result == Intent.UNKNOWN
 
-    def test_missing_classifier_section_returns_fail_closed(self, tmp_path, monkeypatch):
+    def test_missing_classifier_section_returns_unknown(self, tmp_path, monkeypatch):
         """When ``voice.prompt_file`` lacks the
         ``##---INTENT-CLASSIFIER-SECTION---`` marker, the LLM path
-        cannot find a system prompt and fail-closes."""
+        cannot find a system prompt and returns ``Intent.UNKNOWN``."""
         from paramem.server.config import IntentConfig as _Cfg
         from paramem.server.config import VoiceConfig as _VoiceConfig
 
@@ -656,10 +624,10 @@ class TestClassifyViaLLM:
 
         handle = _stub_classifier_model("COMMAND")
         set_classifier_model(handle.model, handle.tokenizer)
-        config = _Cfg(mode="llm", fail_closed_intent="general")
+        config = _Cfg(mode="llm")
 
         result = classify_intent("anything", has_ha_match=False, config=config)
-        assert result == Intent.GENERAL
+        assert result == Intent.UNKNOWN
         # generate() should not have been invoked — we bailed before then.
         handle.model.generate.assert_not_called()
 

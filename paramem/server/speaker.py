@@ -613,31 +613,6 @@ class SpeakerStore:
     def profile_count(self) -> int:
         return len(self._profiles)
 
-    def household_display_names(self) -> list[str]:
-        """Display names of non-anonymous household profiles.
-
-        Returns the ``name`` field for every profile whose ``enroll_method``
-        is NOT ``"anonymous_voice"``.  Anonymous profiles carry the canonical
-        ``speaker{N}`` id as their name — an internal token, not a salutation —
-        and are deliberately excluded so the sanitizer does not treat opaque
-        ids as personal referents.
-
-        Used by the inference layer to extend ``known_entities`` so that
-        enrolled household members' names are always recognised as personal
-        content by the cloud sanitizer, even after the id-as-subject refactor
-        moved display names out of the registry subjects.
-
-        Returns:
-            List of non-empty display name strings (may be empty when all
-            profiles are anonymous or the store has no profiles).
-        """
-        with self._lock:
-            return [
-                p["name"]
-                for p in self._profiles.values()
-                if p.get("enroll_method") != "anonymous_voice" and p.get("name")
-            ]
-
     @property
     def speaker_names(self) -> list[str]:
         """Unique display names across all profiles."""

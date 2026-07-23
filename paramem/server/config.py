@@ -733,7 +733,9 @@ class IntentConfig:
 
     The dispatcher tries the deterministic HA fast-path first; on miss,
     it falls to the residual classifier configured by :attr:`mode`.
-    Below-margin / unavailable cases use :attr:`fail_closed_intent`.
+    Below-margin / unavailable cases return ``Intent.UNKNOWN`` — never
+    remapped to a positive intent, so an unresolved verdict grants no
+    personal-memory access and does not block cloud escalation.
 
     Two residual backends:
 
@@ -775,10 +777,9 @@ class IntentConfig:
       / personal-referent classifiers.
     * Confidence is the margin between the top-1 and top-2 cosine
       similarity scores against the exemplar set; below threshold
-      classification falls back to ``fail_closed_intent``.
-    * ``fail_closed_intent="personal"`` keeps privacy-preserving
-      defaults under uncertainty — a misclassified personal query
-      never escalates.
+      classification returns ``Intent.UNKNOWN`` — routed identically
+      to ``Intent.GENERAL`` (no personal-memory access, escalation
+      available).
 
     All fields can be overridden in ``configs/server.yaml`` so
     operators can swap mode, encoders, exemplar sets, or thresholds
@@ -801,7 +802,6 @@ class IntentConfig:
     encoder_query_prefix: str = "query: "  # E5 family requires this; empty for others
     exemplars_dir: str = "configs/intents"
     confidence_margin: float = 0.05
-    fail_closed_intent: str = "personal"  # personal | command | general | unknown
     # LLM-mode generation knobs.  Kept tight: one label, deterministic.
     llm_max_new_tokens: int = 8
     llm_temperature: float = 0.0

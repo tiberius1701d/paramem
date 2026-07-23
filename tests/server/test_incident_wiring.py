@@ -744,3 +744,69 @@ class TestResolveIncidentIdempotencyFix:
 
         second = resolve_incident(state_dir, "vram_exhausted", "phase1")
         assert second is False  # no transition — already resolved
+
+
+# ---------------------------------------------------------------------------
+# Intent classifier fail-loud: load-time incident when the embeddings
+# residual (encoder/exemplars) fails to load — see
+# ``app_module._record_intent_classifier_incident_if_needed``.
+# ---------------------------------------------------------------------------
+
+
+class TestIntentClassifierUnavailableIncident:
+    def _cfg(self, tmp_path: Path, *, enabled: bool = True, mode: str = "embeddings") -> MagicMock:
+        cfg = MagicMock()
+        cfg.intent.enabled = enabled
+        cfg.intent.mode = mode
+        cfg.paths.data = tmp_path
+        return cfg
+
+    def test_recorded_when_encoder_missing(self, tmp_path):
+        """encoder=None, mode=embeddings, enabled=True → incident recorded."""
+        cfg = self._cfg(tmp_path)
+
+        app_module._record_intent_classifier_incident_if_needed(cfg, None, None)
+
+        incidents = read_incidents(tmp_path / "state")
+        assert len(incidents) == 1
+        inc = incidents[0]
+        assert inc.type == "intent_classifier_unavailable"
+        assert inc.id == "intent_classifier_unavailable:embeddings"
+        assert inc.severity == "warning"
+        assert inc.detail["mode"] == "embeddings"
+        assert set(inc.detail["missing"]) == {"encoder", "exemplars"}
+
+    def test_recorded_when_exemplars_missing_but_encoder_loaded(self, tmp_path):
+        """encoder loaded, exemplars=None → incident recorded, missing=[\"exemplars\"]."""
+        cfg = self._cfg(tmp_path)
+        fake_encoder = MagicMock()
+
+        app_module._record_intent_classifier_incident_if_needed(cfg, fake_encoder, None)
+
+        incidents = read_incidents(tmp_path / "state")
+        assert len(incidents) == 1
+        assert incidents[0].detail["missing"] == ["exemplars"]
+
+    def test_not_recorded_when_both_loaded(self, tmp_path):
+        """Both encoder and exemplar bank present → no incident."""
+        cfg = self._cfg(tmp_path)
+
+        app_module._record_intent_classifier_incident_if_needed(cfg, MagicMock(), MagicMock())
+
+        assert not (tmp_path / "state" / "incidents.json").exists()
+
+    def test_not_recorded_when_mode_is_llm(self, tmp_path):
+        """mode=llm has its own encoder-residual fallback — no incident on this path."""
+        cfg = self._cfg(tmp_path, mode="llm")
+
+        app_module._record_intent_classifier_incident_if_needed(cfg, None, None)
+
+        assert not (tmp_path / "state" / "incidents.json").exists()
+
+    def test_not_recorded_when_intent_disabled(self, tmp_path):
+        """intent.enabled=False → classifier is intentionally off, not degraded."""
+        cfg = self._cfg(tmp_path, enabled=False)
+
+        app_module._record_intent_classifier_incident_if_needed(cfg, None, None)
+
+        assert not (tmp_path / "state" / "incidents.json").exists()
