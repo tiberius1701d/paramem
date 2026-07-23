@@ -27,11 +27,14 @@ import pytest
 from paramem.graph.phase_trace import (
     PHASE_NAMES,
     PhaseRecord,
+    chain_seed,
+    chain_start,
     chain_stopped,
     extraction_trace,
     get_phases,
     phase_trace,
     record_prompt,
+    start_at,
     stop_at,
 )
 from paramem.graph.schema import SessionGraph
@@ -561,6 +564,54 @@ class TestGetPhases:
         ]
         phases = get_phases(graph)
         assert [p.name for p in phases] == ["local_extract", "anonymize"]
+
+
+class TestStartAt:
+    """Unit tests for :func:`start_at`/:func:`chain_start`/:func:`chain_seed`
+    — the chain-entry counterpart to :func:`stop_at`, independent of
+    ``extract_graph``. Opened by the caller, never threaded as a
+    parameter: the artifact rides the contextvar for the same reason the
+    stop request does."""
+
+    def test_default_has_no_active_request(self):
+        assert chain_start() is None
+        assert chain_seed() is None
+
+    def test_none_phase_is_a_no_op(self):
+        with start_at(None):
+            assert chain_start() is None
+            assert chain_seed() is None
+
+    def test_invalid_phase_name_raises(self):
+        with pytest.raises(ValueError, match="not a valid phase name"):
+            with start_at("anonymise"):  # British spelling — should fail
+                pass
+
+    def test_phase_and_artifact_are_both_readable(self):
+        marker = object()
+        with start_at("anonymize", marker):
+            assert chain_start() == "anonymize"
+            assert chain_seed() is marker
+
+    def test_artifact_defaults_to_none_when_the_phase_needs_no_seed(self):
+        with start_at("local_extract"):
+            assert chain_start() == "local_extract"
+            assert chain_seed() is None
+
+    def test_nested_start_at_replaces_outer_value_and_restores_on_exit(self):
+        outer, inner = object(), object()
+        with start_at("local_extract", outer):
+            with start_at("anonymize", inner):
+                assert chain_start() == "anonymize"
+                assert chain_seed() is inner
+            assert chain_start() == "local_extract"
+            assert chain_seed() is outer
+
+    def test_reset_on_exit_leaves_no_active_request(self):
+        with start_at("anonymize", object()):
+            assert chain_start() == "anonymize"
+        assert chain_start() is None
+        assert chain_seed() is None
 
 
 class TestStopAt:

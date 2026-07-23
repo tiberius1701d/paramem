@@ -11,7 +11,6 @@ import random
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import cached_property
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -39,6 +38,18 @@ from paramem.training import graph_tier
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks
+from paramem.utils.artifacts import (
+    debug_run,
+    on_cycle_end,
+    on_extraction_end,
+    on_fold_assignments,
+    on_fold_graph,
+    on_main_adapters_saved,
+    on_recall_probe,
+    on_removal_ledger,
+    on_session_extracted,
+    on_tier_delta,
+)
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -1103,7 +1114,7 @@ class ConsolidationLoop:
         Returns ``None`` when debug snapshots are disabled (no
         ``snapshot_dir`` was wired into the loop).
         """
-        if self._debug_base is None or not self.save_cycle_snapshots:
+        if not self.save_cycle_snapshots or self._debug_base is None:
             return None
         parts: list[str] = ["episodic"]
         if interim_stamp:
@@ -1112,22 +1123,17 @@ class ConsolidationLoop:
         parts.append(f"run_{self.run_id}")
         return self._debug_base.joinpath(*parts)
 
-    def _current_interim_stamp_or_none(self) -> str | None:
-        """Convenience accessor for the active interim stamp, if any."""
-        return getattr(self, "_current_interim_stamp", None)
+    def _artifact_scope(self, *, interim_stamp: str | None = None):
+        """Open the debug artifact root for the work in this block.
 
-    @cached_property
-    def _debug_writer(self):
-        """Single owner for every plaintext write under ``paths.debug``.
-
-        Self-gates on ``save_cycle_snapshots`` and ``_debug_base`` so callers
-        never check.  Constructed lazily so test fixtures that bypass
-        ``__init__`` (``object.__new__(ConsolidationLoop)``) still have a
-        functioning writer without explicit wiring.
+        Every artifact hook fired inside — at any depth, including from the
+        extraction pipeline and the graph-tier refiner — lands under
+        :meth:`snapshot_dir_for`.  ``None`` from that method (debug off) is
+        passed through: :func:`~paramem.utils.artifacts.debug_run` treats it
+        as "this producer is inactive", which is how the gate is expressed
+        without any caller testing the flag.
         """
-        from paramem.training.debug_snapshot import DebugSnapshotWriter
-
-        return DebugSnapshotWriter(self)
+        return debug_run(self.snapshot_dir_for(interim_stamp=interim_stamp))
 
     def extract_session(
         self,
@@ -1283,10 +1289,11 @@ class ConsolidationLoop:
             # each session graph before dumping so diagnostics["phases"] holds
             # everything that fired this session.
             trace.attach_to(session_graph)
-            self._debug_writer.on_session_extracted(session_graph, session_id, "graph")
-            if proc_graph is not None:
-                trace.attach_to(proc_graph)
-                self._debug_writer.on_session_extracted(proc_graph, session_id, "procedural_graph")
+            with self._artifact_scope():
+                on_session_extracted(session_graph, session_id, "graph")
+                if proc_graph is not None:
+                    trace.attach_to(proc_graph)
+                    on_session_extracted(proc_graph, session_id, "procedural_graph")
 
         self.last_session_graph = session_graph
 
@@ -1533,7 +1540,7 @@ class ConsolidationLoop:
         - ``paths.debug/.../training/tiers/<tier>/adapter_weights/`` —
           per-cycle plaintext shadow for inspection (only when
           ``save_cycle_snapshots`` is on; written by
-          :meth:`DebugSnapshotWriter.on_main_adapters_saved`).
+          :func:`~paramem.utils.artifacts.on_main_adapters_saved`).
 
         Atomic save ordering — registry written last as the commit signal:
           1. ``save_bytes`` → in-memory registry bytes (no disk write).
@@ -1699,15 +1706,17 @@ class ConsolidationLoop:
             )
 
         # Per-cycle adapter-weight shadows (debug/analysis only — no
-        # manifest).  Layout owned by DebugSnapshotWriter:
+        # manifest).  Layout owned by paramem.utils.artifacts:
         #   paths.debug/.../training/tiers/<tier>/adapter_weights/
-        # Writer self-gates on save_cycle_snapshots; callers do not check.
+        # The artifact scope opened below resolves to no root when
+        # save_cycle_snapshots is off, so the hook no-ops without a flag check.
         tier_shadow = ["episodic"]
         if "semantic" in self.model.peft_config:
             tier_shadow.append("semantic")
         if "procedural" in self.model.peft_config:
             tier_shadow.append("procedural")
-        self._debug_writer.on_main_adapters_saved(tier_shadow)
+        with self._artifact_scope():
+            on_main_adapters_saved(self.model, tier_shadow)
 
         # Flush the indexed_key_registry per tier (the unified file now carries
         # active∪stale simhashes in its "simhash" key), then the registry commit signal.
@@ -2266,7 +2275,8 @@ class ConsolidationLoop:
                     "venue": mode,
                     "error": None,
                 }
-                self._debug_writer.on_cycle_end(cap_pending_summary, interim_stamp=stamp)
+                with self._artifact_scope(interim_stamp=stamp):
+                    on_cycle_end(cap_pending_summary)
                 return cap_pending_summary
             elif c >= N:
                 # overflow mint: ring is full but slack allows a later-stamped
@@ -2291,28 +2301,32 @@ class ConsolidationLoop:
         # execute inside _run_fold; this wrapper only owns pre-resolution + early-exits.
         # Map the caller's mode Literal to the FoldScope source axis without a mode== fork.
         _interim_source = {"train": "weights", "simulate": "disk"}[mode]
-        result = self._run_fold(
-            FoldScope(
-                name="interim",
-                source=_interim_source,
-                persist="interim_slot",
-                tier=adapter_name,
-                extra_relations_source="pending",
-                defer=True,
-                tag_new=True,
-                normalize=False,  # normalization is full-fold only
-                enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
-                promote=False,
-                tier_floor=False,
-                subtractive_scope="interim",
-            ),
-            adapter_name=adapter_name,
-            stamp=stamp,
-            run_label=run_label,
-            triples_extracted=triples_extracted,
-            episodic_rels=episodic_rels,
-            procedural_rels=procedural_rels,
-        )
+        # Every artifact the fold and its nested passes emit lands in this
+        # cycle's debug root; a calibration run, when one is open, adds its own
+        # root independently.
+        with self._artifact_scope():
+            result = self._run_fold(
+                FoldScope(
+                    name="interim",
+                    source=_interim_source,
+                    persist="interim_slot",
+                    tier=adapter_name,
+                    extra_relations_source="pending",
+                    defer=True,
+                    tag_new=True,
+                    normalize=False,  # normalization is full-fold only
+                    enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
+                    promote=False,
+                    tier_floor=False,
+                    subtractive_scope="interim",
+                ),
+                adapter_name=adapter_name,
+                stamp=stamp,
+                run_label=run_label,
+                triples_extracted=triples_extracted,
+                episodic_rels=episodic_rels,
+                procedural_rels=procedural_rels,
+            )
         # Only tag a real mint: an aborted overflow fold must not trigger
         # the interim_cap_reached incident on the app.py consumer side.
         if is_overflow and result.get("mode") == "trained":
@@ -2950,8 +2964,8 @@ class ConsolidationLoop:
                     active_after={"episodic": _after_count},
                     minted_by_tier={"episodic": _minted_count},
                 )
-                self._debug_writer.on_tier_delta(_sim_tier_delta)
-                self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
+                on_tier_delta(_sim_tier_delta)
+                on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
                 for _idir in inp.interim_dirs:
                     try:
@@ -3065,11 +3079,10 @@ class ConsolidationLoop:
             # _run_fold always controls the merger.graph lifecycle for the interim path.
             try:
                 # --- End-of-extraction debug dump (interim only) ---
-                self._debug_writer.on_extraction_end(
-                    episodic_rels or [],
-                    procedural_rels or [],
-                    interim_stamp=stamp,
-                )
+                # Interim-stamped root, like this path's cycle summary: these
+                # are the interim cycle's own inputs, not the fold's.
+                with self._artifact_scope(interim_stamp=stamp):
+                    on_extraction_end(episodic_rels or [], procedural_rels or [])
 
                 # --- Mint PEFT slot (weights source only) ---
                 if scope.source == "weights":
@@ -3518,7 +3531,8 @@ class ConsolidationLoop:
                     "rollback_tier": None,
                     "tier_delta": {},
                 }
-                self._debug_writer.on_cycle_end(cycle_summary, interim_stamp=stamp)
+                with self._artifact_scope(interim_stamp=stamp):
+                    on_cycle_end(cycle_summary)
                 return cycle_summary
             finally:
                 self.merger.reset_graph()
@@ -3672,7 +3686,7 @@ class ConsolidationLoop:
                         sorted(recall_miss_keys),
                     )
 
-                self._debug_writer.on_fold_graph(self.merger, label="keyed")
+                on_fold_graph(self.merger.graph, label="keyed")
 
                 # --- Per-tier floor gate (scope-gated) ---
                 _floor = self.config.min_tier_key_floor
@@ -3741,7 +3755,7 @@ class ConsolidationLoop:
                     train_assignment["episodic"] = list(_ep_union.values())
                     train_assignment[_fst] = []
 
-                self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
+                on_fold_assignments(serve_assignment, train_assignment)
 
                 _train_active_before: dict[str, int] = {
                     t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
@@ -3984,7 +3998,7 @@ class ConsolidationLoop:
                     drift_intended_removal_count,
                 )
 
-                self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
+                on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
             # --- Build per-tier TrainingJob objects ---
             from paramem.server.background_trainer import TrainingJob
@@ -4406,7 +4420,7 @@ class ConsolidationLoop:
                         recall_state.last_per_key if recall_state is not None else None
                     )
                     if recall_state is not None and recall_state.last_per_key is not None:
-                        self._debug_writer.on_recall_probe(
+                        on_recall_probe(
                             recall_state.last_per_key,
                             phase="train_fill",
                             adapter_name=tier,
@@ -4501,7 +4515,7 @@ class ConsolidationLoop:
                 active_after={t: len(serve_assignment.get(t, [])) for t in _train_tiers},
                 minted_by_tier=minted_by_tier,
             )
-            self._debug_writer.on_tier_delta(_train_tier_delta)
+            on_tier_delta(_train_tier_delta)
 
             logger.info(
                 "_run_fold[main_tiers]: complete — rebuilt %s, drift=%d"
@@ -4608,22 +4622,26 @@ class ConsolidationLoop:
             )
 
         if mode == "simulate":
-            return self._run_fold(
-                FoldScope(
-                    name="full",
-                    source="disk",
-                    persist="graph_json",
-                    tier=None,
-                    extra_relations_source="disk",
-                    defer=False,
-                    tag_new=False,
-                    normalize=(self.config.refinement_normalization == "on"),
-                    enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
-                    promote=False,
-                    tier_floor=False,
-                    subtractive_scope="fold",
-                ),
-            )
+            # Every artifact the fold and its nested passes emit lands in this
+            # cycle's debug root; a calibration run, when one is open, adds its
+            # own root independently.
+            with self._artifact_scope():
+                return self._run_fold(
+                    FoldScope(
+                        name="full",
+                        source="disk",
+                        persist="graph_json",
+                        tier=None,
+                        extra_relations_source="disk",
+                        defer=False,
+                        tag_new=False,
+                        normalize=(self.config.refinement_normalization == "on"),
+                        enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
+                        promote=False,
+                        tier_floor=False,
+                        subtractive_scope="fold",
+                    ),
+                )
 
         from paramem.server.gpu_lock import _gpu_thread_lock
 
@@ -4638,26 +4656,30 @@ class ConsolidationLoop:
                 "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
             )
 
-        return self._run_fold(
-            FoldScope(
-                name="full",
-                source="weights",
-                persist="main_tiers",
-                tier=None,
-                extra_relations_source="pending" if consume_pending else "none",
-                defer=False,
-                tag_new=False,
-                normalize=(self.config.refinement_normalization == "on"),
-                enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
-                promote=True,
-                tier_floor=True,
-                subtractive_scope="fold",
-                consume_pending=consume_pending,
-            ),
-            trainer=trainer,
-            router=router,
-            recall_sanity_threshold=recall_sanity_threshold,
-        )
+        # Every artifact the fold and its nested passes emit lands in this
+        # cycle's debug root; a calibration run, when one is open, adds its own
+        # root independently.
+        with self._artifact_scope():
+            return self._run_fold(
+                FoldScope(
+                    name="full",
+                    source="weights",
+                    persist="main_tiers",
+                    tier=None,
+                    extra_relations_source="pending" if consume_pending else "none",
+                    defer=False,
+                    tag_new=False,
+                    normalize=(self.config.refinement_normalization == "on"),
+                    enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
+                    promote=True,
+                    tier_floor=True,
+                    subtractive_scope="fold",
+                    consume_pending=consume_pending,
+                ),
+                trainer=trainer,
+                router=router,
+                recall_sanity_threshold=recall_sanity_threshold,
+            )
 
     def _promote_mature_keys_inline(self) -> list[str]:
         """Promote episodic keys whose reinforcement_count has reached the promotion threshold.
@@ -5462,7 +5484,7 @@ class ConsolidationLoop:
             )
             # Emit debug snapshot of the empty (pre-merge) graph so the artifact
             # chain matches the weights path (reconstructed → merged → enriched).
-            self._debug_writer.on_fold_graph(self.merger, label="reconstructed")
+            on_fold_graph(self.merger.graph, label="reconstructed")
             # Merge the disk-loaded relations through the extra_relations channel.
             # resolve_contradictions mirrors the train path: driven by
             # config.refinement_contradiction.  With timestamp="" (default), legacy
@@ -5489,7 +5511,7 @@ class ConsolidationLoop:
             finally:
                 if _disk_needs_guard:
                     self._enable_gradient_checkpointing()
-            self._debug_writer.on_fold_graph(self.merger, label="merged")
+            on_fold_graph(self.merger.graph, label="merged")
             return set(), []
 
         # --- Reconstruct all active keys from adapter weights ---
@@ -5586,7 +5608,7 @@ class ConsolidationLoop:
         # in merger.collapsed.  The drift-partition step below soft-stales that key.
         # Debug: snapshot the reconstructed graph (before re-merge mutates the
         # keying surface).  Self-gated; no-op when save_cycle_snapshots=False.
-        self._debug_writer.on_fold_graph(recon_result.graph, label="reconstructed")
+        on_fold_graph(recon_result.graph, label="reconstructed")
 
         recon_relations: list[Relation] = self._build_registry_true_relations(keys=keys)
 
@@ -5671,9 +5693,36 @@ class ConsolidationLoop:
         # Debug: snapshot the merged graph (after re-merge, before enrichment).
         # Emits even when recon_relations is empty so the fold always produces a
         # merged snapshot.  Self-gated; no-op when save_cycle_snapshots=False.
-        self._debug_writer.on_fold_graph(self.merger, label="merged")
+        on_fold_graph(self.merger.graph, label="merged")
 
         return recall_miss_keys, recon_relations
+
+    def build_tier_refiner(self, merger) -> "graph_tier.GraphTierRefiner":
+        """Construct a graph-tier refiner over *merger* with this loop's config.
+
+        THE construction site. The consolidation cycle passes its own
+        ``self.merger``; a calibration run passes a throwaway merger holding
+        the relations the operator injected, so the pass it exercises is the
+        production pass — same engine selection, same survivor rule — rather
+        than a second implementation of it.
+
+        Args:
+            merger: The single mutation target for both refinement passes.
+
+        Returns:
+            A refiner bound to *merger* and this loop's model handle.
+        """
+        return graph_tier.GraphTierRefiner(
+            merger,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            extraction_config_provider=self._current_extraction_config,
+            cloud_enabled=self.cloud_enabled,
+            neighborhood_hops=self.graph_enrichment_neighborhood_hops,
+            max_entities_per_pass=self.graph_enrichment_max_entities_per_pass,
+            gc_disable=self._disable_gradient_checkpointing,
+            gc_enable=self._enable_gradient_checkpointing,
+        )
 
     def _refine_consolidation_graph(
         self,
@@ -5699,9 +5748,9 @@ class ConsolidationLoop:
            cached: ``self.model`` is re-wrapped by adapter operations elsewhere
            in the fold, so a cached refiner would risk pinning a stale handle.
         2. Emit a debug snapshot ("enriched") after the refine step (or
-           immediately when both stages are skipped). Stays on the loop rather
-           than the refiner — this is what lets the refiner's normalization
-           sink stay a one-method protocol instead of the whole debug writer.
+           immediately when both stages are skipped). Emitted from the loop
+           rather than the refiner, which calls :func:`on_normalization`
+           directly for its own pass.
         3. Two INDEPENDENTLY-guarded recurrence-bump blocks, reading the
            reinforcement maps off the returned
            :class:`~paramem.training.graph_tier.RefineResult` (never unioned
@@ -5740,24 +5789,13 @@ class ConsolidationLoop:
                 ``refinement_enrichment=="on" and cloud_enabled``).
                 Default ``False``.
         """
-        refiner = graph_tier.GraphTierRefiner(
-            self.merger,
-            model=self.model,
-            tokenizer=self.tokenizer,
-            extraction_config_provider=self._current_extraction_config,
-            cloud_enabled=self.cloud_enabled,
-            neighborhood_hops=self.graph_enrichment_neighborhood_hops,
-            max_entities_per_pass=self.graph_enrichment_max_entities_per_pass,
-            gc_disable=self._disable_gradient_checkpointing,
-            gc_enable=self._enable_gradient_checkpointing,
-            normalization_sink=self._debug_writer,
-        )
+        refiner = self.build_tier_refiner(self.merger)
         result = refiner.refine(normalize=normalize, enrich=enrich)
 
         # Debug: snapshot the refined graph (after normalization + enrichment, or
         # immediately when both are skipped at level off).
         # Self-gated; no-op when save_cycle_snapshots=False.
-        self._debug_writer.on_fold_graph(self.merger, label="enriched")
+        on_fold_graph(self.merger.graph, label="enriched")
 
         if recon_relations:
             # --- Reinforcement bump: Case-1 duplicate-SPO collapses ---
@@ -5849,7 +5887,7 @@ class ConsolidationLoop:
                 interim training path.
             debug_phase: When not ``None``, the per-key verdict (including
                 ``raw_output``) is persisted to the debug snapshot via
-                :meth:`~paramem.training.debug_snapshot.DebugSnapshotWriter.on_recall_probe`
+                :func:`~paramem.utils.artifacts.on_recall_probe`
                 under ``<debug_base>/recall_probes/<debug_phase>_<adapter_name>.json``.
                 Only written on the success path (where ``recall_result`` is
                 available); probe exceptions still return ``0.0`` without writing.
@@ -5880,11 +5918,12 @@ class ConsolidationLoop:
                 batch_size=self.training_config.recall_probe_batch_size,
             )
             if debug_phase is not None:
-                self._debug_writer.on_recall_probe(
-                    recall_result["per_key"],
-                    phase=debug_phase,
-                    adapter_name=adapter_name,
-                )
+                with self._artifact_scope():
+                    on_recall_probe(
+                        recall_result["per_key"],
+                        phase=debug_phase,
+                        adapter_name=adapter_name,
+                    )
             return float(recall_result["rate"])
         except Exception:
             logger.exception(

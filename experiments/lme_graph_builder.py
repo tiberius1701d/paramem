@@ -47,6 +47,10 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+import networkx as nx  # noqa: E402
+
+from experiments.utils.production import write_artifact  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lme_graph_builder")
 
@@ -523,8 +527,8 @@ def _persist(
 ) -> int:
     """Write graph_snapshot.json and build_state.json.
 
-    Uses the merger's save_graph (NetworkX node-link JSON, unencrypted)
-    so Stage 2 (quadruple_adapter.py) can load it directly via
+    Writes the snapshot via ``write_artifact`` (NetworkX node-link JSON,
+    plaintext) so quadruple_adapter.py can load it directly via
     load_unique_triples().
 
     Args:
@@ -539,7 +543,7 @@ def _persist(
     Returns:
         Number of unique (subject, predicate, object) triples in the snapshot.
     """
-    loop.merger.save_graph(snapshot_path, encrypted=False)
+    write_artifact(snapshot_path, nx.node_link_data(loop.merger.graph))
     # Count unique triples consistently with how Stage 2 will count them.
     try:
         n_unique = len(load_unique_triples_fn(snapshot_path))

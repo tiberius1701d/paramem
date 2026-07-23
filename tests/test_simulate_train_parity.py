@@ -802,7 +802,7 @@ def _write_graph(path, quads: list[dict]) -> None:
                 "speaker_id": quad.get("speaker_id", ""),
             },
         )
-    save_memory_to_disk(graph, path, encrypted=False)
+    save_memory_to_disk(graph, path)
 
 
 class TestProbeKeysFromGraph:
@@ -964,8 +964,8 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
       - ``merger`` — a model-free ``GraphMerger`` so the merge topology
         can run without a GPU or loaded model (``merger.model=None`` means the
         model-gated Case-2 branch is skipped; production-correct for simulate mode).
-      - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
-      - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
+      - ``save_cycle_snapshots`` — False so ``snapshot_dir_for`` returns None.
+      - ``_debug_base`` — None, so no artifact root is ever opened.
       - ``config`` — minimal ``ConsolidationConfig`` with base defaults
         (cloud master switch off, refinement_enrichment="off", refinement_normalization="off")
         so enrichment and normalization are suppressed without explicit flags.
@@ -1023,7 +1023,7 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
         )
     from paramem.memory.persistence import save_memory_to_disk as _save
 
-    _save(graph, interim_dir / "graph.json", encrypted=False)
+    _save(graph, interim_dir / "graph.json")
     return interim_dir
 
 
@@ -1966,7 +1966,6 @@ class TestGraphTierSkipsAfterRelease:
             max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
             gc_disable=loop._disable_gradient_checkpointing,
             gc_enable=loop._enable_gradient_checkpointing,
-            normalization_sink=loop._debug_writer,
         )
 
     def test_normalization_skips_on_released_loop(self, tmp_path):
@@ -2128,7 +2127,7 @@ class TestCommitTierSlotCleanup:
 
 
 # ---------------------------------------------------------------------------
-# DebugSnapshotWriter integration through run_consolidation_cycle
+# Artifact-hook integration through run_consolidation_cycle
 # ---------------------------------------------------------------------------
 
 
@@ -2168,13 +2167,11 @@ class TestDebugSnapshotIntegration:
         cycle_dir = loop.snapshot_dir_for(interim_stamp=_STAMP)
         assert cycle_dir is not None
         # graph_enriched_snapshot.json is written by _refine_consolidation_graph
-        # via on_fold_graph (no interim_stamp) → lands under fold/ not cycle_dir.
+        # via on_fold_graph, which always lands under fold/ — not cycle_dir.
         # graph_merged_snapshot.json is no longer emitted on the interim path.
         fold_base = loop.snapshot_dir_for()
         assert fold_base is not None
-        loop.merger.save_graph.assert_any_call(
-            fold_base / "fold" / "graph_enriched_snapshot.json", encrypted=False
-        )
+        assert (fold_base / "fold" / "graph_enriched_snapshot.json").exists()
         assert (cycle_dir / "episodic_rels_snapshot.json").exists()
         assert (cycle_dir / "procedural_rels_snapshot.json").exists()
         assert (cycle_dir / "cycle_summary_snapshot.json").exists()
@@ -2235,7 +2232,7 @@ class TestDebugSnapshotIntegration:
 
 
 class TestDebugSnapshotOnTierDelta:
-    """``DebugSnapshotWriter.on_tier_delta`` persists the per-tier delta record.
+    """``on_tier_delta`` persists the per-tier delta record.
 
     Every fold emits a
     ``tier_delta.json`` under ``<debug_base>/fold/`` so operators can see
@@ -2247,17 +2244,14 @@ class TestDebugSnapshotOnTierDelta:
         import json as _json
 
         from paramem.training.consolidation import ConsolidationLoop
-        from paramem.training.debug_snapshot import DebugSnapshotWriter
+        from paramem.utils.artifacts import on_tier_delta
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.output_dir = tmp_path
         loop.save_cycle_snapshots = True
         loop._debug_base = tmp_path / "debug"
-        loop._current_interim_stamp = None
         loop.run_id = "test_run_01"
         loop.cycle_count = 1
-
-        writer = DebugSnapshotWriter(loop)
 
         tier_delta = {
             "episodic": {
@@ -2267,7 +2261,8 @@ class TestDebugSnapshotOnTierDelta:
                 "minted": 0,
             }
         }
-        writer.on_tier_delta(tier_delta)
+        with loop._artifact_scope():
+            on_tier_delta(tier_delta)
 
         # Locate the written file under fold/.
         fold_dir = loop.snapshot_dir_for()
@@ -2288,24 +2283,24 @@ class TestDebugSnapshotOnTierDelta:
     def test_on_tier_delta_noop_when_snapshots_disabled(self, tmp_path) -> None:
         """on_tier_delta is a no-op (no file written) when save_cycle_snapshots=False."""
         from paramem.training.consolidation import ConsolidationLoop
-        from paramem.training.debug_snapshot import DebugSnapshotWriter
+        from paramem.utils.artifacts import on_tier_delta
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.output_dir = tmp_path
         loop.save_cycle_snapshots = False
         loop._debug_base = None
 
-        writer = DebugSnapshotWriter(loop)
-        writer.on_tier_delta(
-            {
-                "episodic": {
-                    "active_before": 5,
-                    "active_after": 5,
-                    "staled_by_reason": {},
-                    "minted": 0,
+        with loop._artifact_scope():
+            on_tier_delta(
+                {
+                    "episodic": {
+                        "active_before": 5,
+                        "active_after": 5,
+                        "staled_by_reason": {},
+                        "minted": 0,
+                    }
                 }
-            }
-        )
+            )
 
         # No file should have been written anywhere.
         written_files = list(tmp_path.rglob("tier_delta.json"))
@@ -2606,7 +2601,7 @@ class TestCollectDiskFoldRelations:
         canonical_g = nx.MultiDiGraph()
         canonical_g.add_edge("A", "B", **{_IK_KEY_ATTR: "k1", "predicate": "p1", "speaker_id": ""})
         canonical_g.add_edge("C", "D", **{_IK_KEY_ATTR: "k2", "predicate": "p2", "speaker_id": ""})
-        save_memory_to_disk(canonical_g, canonical_path, encrypted=False)
+        save_memory_to_disk(canonical_g, canonical_path)
 
         # Write one simulate-mode interim slot with 1 edge.
         _write_interim_graph(
@@ -2695,7 +2690,7 @@ class TestCollectDiskFoldRelations:
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
         canonical_g = nx.MultiDiGraph()
         canonical_g.add_edge("A", "B", **{_IK_KEY_ATTR: "k1", "predicate": "p1", "speaker_id": ""})
-        save_memory_to_disk(canonical_g, canonical_path, encrypted=False)
+        save_memory_to_disk(canonical_g, canonical_path)
 
         _write_interim_graph(
             tmp_path,

@@ -266,7 +266,7 @@ consolidation:
                                     # downgrade.
   extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, cloud enrich, deanon; 8192 sized for ~1500-word document chunks
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
-  calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,anonymize,plausibility} for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.
+  calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,procedural,anonymize,enrich,plausibility,normalize,name} runs the real production chain for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.
   extraction_enrichment_provider: ""  # cloud provider for enrichment ("" = disabled, ship default)
   extraction_enrichment_provider_model: claude-sonnet-4-6  # model for the enrichment provider
   extraction_enrichment_provider_endpoint: ""  # custom endpoint for OpenAI-compatible providers ("" = use the provider's default endpoint)

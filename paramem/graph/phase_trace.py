@@ -43,6 +43,24 @@ Usage
 scope it raises :class:`RuntimeError` immediately rather than silently
 dropping records.
 
+Chain-entry signal
+------------------
+
+:func:`start_at` — opened by the CALLER, the same way :func:`stop_at` is
+— names the phase the chain should ENTER at, and carries the artifact
+that seeds it.  :func:`paramem.graph.flow.run_flow` drops every stage
+ordered ahead of the stage whose body opens that phase, and
+``paramem.graph.flows.extract_graph`` seeds its initial state from
+:func:`chain_seed` instead of an empty graph.  Together with
+:func:`stop_at` this is the ``run(start, artifact, stop)`` mechanism
+every calibration endpoint is expressed against: the endpoint declares
+which phase it enters at, what artifact it injects, and which phase's
+output it wants back.  The artifact rides the contextvar rather than a
+parameter for the same reason the stop request does — a parameter that
+is ``None`` on every production call is not a parameter.  Production
+opens no :func:`start_at` scope, so the chain always enters at its first
+stage.
+
 Chain-stop signal
 ------------------
 
@@ -394,6 +412,81 @@ _STOP_AT: ContextVar[str | None] = ContextVar("paramem_stop_at", default=None)
 # with a non-``"failed"`` outcome, then ``True`` for the rest of the
 # :func:`stop_at` scope's lifetime.  Read via :func:`chain_stopped`.
 _STOPPED: ContextVar[bool] = ContextVar("paramem_stopped", default=False)
+
+# ContextVar holding the phase name the chain should ENTER at paired with the
+# artifact that seeds it, or ``None`` for "enter at the first stage" (the
+# production default).  Set by :func:`start_at`; read by
+# :func:`paramem.graph.flow.run_flow` (which phase) and
+# ``paramem.graph.flows.extract_graph`` (which artifact).  Same
+# caller-opened discipline as ``_STOP_AT``.
+_START_AT: ContextVar[tuple[str, Any] | None] = ContextVar("paramem_start_at", default=None)
+
+
+@contextmanager
+def start_at(phase: str | None, artifact: Any = None) -> Iterator[None]:
+    """Request the extraction chain enter at ``phase``, seeded with ``artifact``.
+
+    The counterpart to :func:`stop_at`: where that one names the last
+    phase to run, this one names the first, and carries the artifact the
+    entered phase consumes.  A calibration endpoint declares both,
+    which is the whole of ``run(start, artifact, stop)`` — the endpoint
+    tells the chain what it is doing; nothing is inferred from the
+    artifact's type.
+
+    Args:
+        phase: A name from :data:`PHASE_NAMES` whose stage the walk
+            should start at, or ``None`` to start at the flow's first
+            stage (the production default — production opens no
+            :func:`start_at` scope at all).
+        artifact: The value seeding the entered phase's input — a
+            ``SessionGraph`` for ``anonymize``.  ``None`` when the
+            entered phase reads its input from the run's own parameters
+            (``local_extract`` consumes the transcript
+            ``extract_graph`` already receives), which is why this
+            defaults rather than being required.
+
+    Raises:
+        ValueError: When ``phase`` is not ``None`` and not in
+            :data:`PHASE_NAMES`.  Validated here, before any work
+            happens, rather than silently never matching.
+
+    Nesting: like :func:`stop_at`, an inner call fully replaces the outer
+    value for its duration (no merge) and the outer value is restored on
+    exit via ``ContextVar.reset``.
+    """
+    if phase is not None and phase not in PHASE_NAMES:
+        raise ValueError(
+            f"start_phase {phase!r} is not a valid phase name. Valid: {list(PHASE_NAMES)}"
+        )
+    token = _START_AT.set(None if phase is None else (phase, artifact))
+    try:
+        yield
+    finally:
+        _START_AT.reset(token)
+
+
+def chain_start() -> str | None:
+    """The phase the active :func:`start_at` request enters at.
+
+    ``None`` when no :func:`start_at` scope is open (production), which
+    means "enter at the flow's first stage".  Read by
+    :func:`paramem.graph.flow.run_flow` — never a phase-name string
+    comparison against the request itself.
+    """
+    request = _START_AT.get()
+    return None if request is None else request[0]
+
+
+def chain_seed() -> Any:
+    """The artifact the active :func:`start_at` request injects.
+
+    ``None`` when no scope is open, or when the entered phase needs no
+    seed beyond the run's own parameters.  Read by
+    ``paramem.graph.flows.extract_graph`` when it builds the initial
+    state.
+    """
+    request = _START_AT.get()
+    return None if request is None else request[1]
 
 
 @contextmanager

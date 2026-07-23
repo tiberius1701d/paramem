@@ -851,13 +851,27 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/debug/probe` | admin + `config.debug=true` | Operator-only ephemeral probe of the chat handler with explicit `speaker_id` injection.  Bypasses `_resolve_speaker`; **no buffer mutation, no jsonl rewrite, no consolidation impact** — pure single-call probe in RAM only.  Body: `{text, speaker_id, conversation_id?, history?}`. |
 | POST | `/debug/recall` | admin + `config.debug=true` | Operator-only direct adapter recall probe.  Bypasses the router and reasoning step: activates `adapter` (or disables all when `adapter="none"`), runs `text` through the model, returns raw output + a `parse_recalled_entry` attempt + the active adapter + latency.  Use to measure direct natural-language recall from adapter weights as distinct from the cache-driven enumerate-then-reason path on `/chat`.  Body: `{text, adapter, system_prompt?, max_new_tokens?, temperature?}`. |
 | GET | `/debug/dump` | admin + `config.debug=true` | Operator-only zero-GPU read of the in-memory `MemoryStore`.  Walks `iter_entries()` and returns every `(tier, key, entry)` as a flat list.  ~5 ms for typical operator-scale stores vs ~min for the equivalent per-key `/debug/recall` sweep.  Use for content inventory, cross-model A/B setup, or scoring against a probe-suite output. |
-| POST | `/calibrate/extract` | admin + `calibrate_endpoint_enabled` | Live extraction prompt probe — run the extraction pipeline on a sample transcript; no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
-| POST | `/calibrate/procedural` | admin + `calibrate_endpoint_enabled` | Live procedural-extraction prompt probe; no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
-| POST | `/calibrate/anonymize` | admin + `calibrate_endpoint_enabled` | Live anonymization prompt probe — no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
-| POST | `/calibrate/normalize` | admin + `calibrate_endpoint_enabled` | Live predicate-synonym normalization probe (retest harness for `refinement_normalization`); no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
-| POST | `/calibrate/plausibility` | admin + `calibrate_endpoint_enabled` | Live plausibility-filter prompt probe — no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
-| POST | `/calibrate/enrich` | admin + `calibrate_endpoint_enabled` + cloud egress | Live probe of the per-session `cloud_enrich` stage — runs the same `request_enrichment` the consolidation cycle calls; no weights written. The only `/calibrate/*` route that places a cloud call, so it is additionally admitted by `evaluate_cloud_egress`: `cloud.enabled` off, a missing provider/model, an unset key or a missing endpoint each return HTTP 400 naming every unmet term, before any cloud call is made. Does **not** reach the separate graph-level enrichment, which has no calibrate endpoint. |
-| POST | `/calibrate/name` | admin + `calibrate_endpoint_enabled` | Live name-extraction prompt probe; no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
+| POST | `/calibrate/extract` | admin + `calibrate_endpoint_enabled` | Run the extraction chain from a transcript. `stop_phase` selects which step's output comes back (default: run to the end); every other calibration route fixes its own. |
+| POST | `/calibrate/procedural` | admin + `calibrate_endpoint_enabled` | Run the procedural extractor on a transcript. |
+| POST | `/calibrate/anonymize` | admin + `calibrate_endpoint_enabled` | Enter the chain at `anonymize` with a supplied `graph` and return the anonymizer's output. |
+| POST | `/calibrate/normalize` | admin + `calibrate_endpoint_enabled` | Run the graph tier's predicate-normalization pass over supplied `relations` or a `snapshot_path`. Uses the production engine selection (cloud when egress is permitted, local otherwise) and the production survivor rule. |
+| POST | `/calibrate/plausibility` | admin + `calibrate_endpoint_enabled` + cloud egress | Enter the chain at `anonymize` with a supplied `graph` and return the de-anonymized plausibility judge's output. Reaching that judge runs the cloud enrichment it sits downstream of, so this route places a cloud call. |
+| POST | `/calibrate/enrich` | admin + `calibrate_endpoint_enabled` + cloud egress | Enter the chain at `anonymize` with a supplied `graph` and return the `cloud_enrich` step's output. Places a cloud call. Does **not** reach the separate graph-level enrichment, which has no calibration route. |
+| POST | `/calibrate/name` | admin + `calibrate_endpoint_enabled` | Run the enrollment name extractor over supplied `turns`. |
+
+Every route above runs the **real production chain** — none re-invokes a
+step's primitive on its own, so what a probe reports is what the
+consolidation cycle would do on that input with that prompt. Each route
+declares where the chain is entered, which artifact it accepts, and which
+step's output it returns; routes entering past `local_extract` require the
+`graph` that step would have produced (typically a prior
+`/calibrate/extract` response, posted back verbatim). When the configured
+chain cannot reach the step a route reports on — cloud egress refused, an
+injected graph with no relations, a pass short-circuiting on its own floor
+— the call returns HTTP 400 naming the steps that did run and the cloud
+verdict, rather than a response whose provenance is silently empty. All
+routes are gated by `consolidation.calibrate_endpoint_enabled=true`
+(default off); none writes weights or production data.
 
 **Chat request:**
 
@@ -979,15 +993,25 @@ against the running server with operator-supplied variants, captures the
 per-phase trace (`paramem/graph/phase_trace.py`), and renders a
 baseline-vs-candidate diff per phase. Workflow:
 
-1. Drop a `calib_<original>.txt` variant next to the production prompt
-   under `configs/prompts/`.
+1. Drop a `calib_<original>.txt` variant into the calibration prompt
+   directory, `paths.calibration/prompts/` (default
+   `data/ha/calibration/prompts/`). Variants live there, never beside the
+   production prompts under `configs/prompts/` — a run names the variant
+   and the server resolves it strictly from that directory, so a typo is
+   refused rather than silently falling back to the shipped prompt.
 2. Run `python scripts/dev/calibrate_prompts.py --input <fixture>
    --baseline auto --stop-phase <phase>` (use `--stop-phase` to skip
    downstream phases when iterating on early stages — saves compute at
    ~50–70 s per skipped phase).
 3. Read the per-phase diff in stdout (raw output deltas, parsed-summary
-   changes per phase) and the dump JSON under
-   `data/ha/debug/calibration/<ts>/`.
+   changes per phase). Every run's full result — the response, plus anything
+   the production code emitted while the run executed — is written by the
+   server under `paths.calibration/artifacts/<run>/`, and each response
+   names its own `artifact_dir`. The client keeps no copy: it writes a
+   `runs.json` index of which run covered which chunk, plus the
+   baseline/variance comparisons it computes across runs. `--seed-from`
+   reads a recorded run back through that index, so a run's output can be
+   posted back as the next run's seed.
 4. Promote the variant to production only when the per-phase diff confirms
    the targeted improvement without regressions on other phases.
 

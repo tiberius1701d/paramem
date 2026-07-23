@@ -12,6 +12,14 @@ import pytest
 from paramem.memory.store import MemoryStore as _MS  # noqa: F401
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.graph_tier import GraphTierRefiner
+from paramem.utils.artifacts import (
+    debug_run,
+    on_calibration_result,
+    on_fold_assignments,
+    on_fold_graph,
+    on_normalization,
+    on_removal_ledger,
+)
 
 
 def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
@@ -38,7 +46,6 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
         max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
         gc_disable=loop._disable_gradient_checkpointing,
         gc_enable=loop._enable_gradient_checkpointing,
-        normalization_sink=loop._debug_writer,
     )
 
 
@@ -1563,15 +1570,19 @@ class TestSaveAdaptersManifest:
         assert manifest.schema_version == 4
 
 
-class TestAtomicJsonWriteEncryptedFlag:
-    """_atomic_json_write(..., encrypted=False) bypasses the envelope.
+class TestAtomicJsonWriteHonoursSecurityPosture:
+    """_atomic_json_write always routes through the infrastructure envelope.
 
-    Debug-directory writers (simulate mode, per-cycle graph snapshots) rely
-    on this so debug output is uniformly inspectable with ``cat`` regardless
-    of the server's Security posture.
+    There is no per-call plaintext override: the operator's posture
+    (``security.require_encryption`` + key material) is the only thing that
+    decides, so no caller can write infrastructure JSON in the clear behind
+    the operator's back. Inspection output is not written here — that is an
+    artifact and goes through ``paramem.utils.artifacts.write_artifact``.
+
+    Mutation: reintroduce an ``encrypted=False`` branch -> this fails.
     """
 
-    def test_encrypted_false_writes_plaintext_under_security_on(self, tmp_path, monkeypatch):
+    def test_writes_age_envelope_under_security_on(self, tmp_path, monkeypatch):
         from paramem.backup.key_store import (
             DAILY_PASSPHRASE_ENV_VAR,
             _clear_daily_identity_cache,
@@ -1589,17 +1600,18 @@ class TestAtomicJsonWriteEncryptedFlag:
         monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
         _clear_daily_identity_cache()
 
-        out = tmp_path / "debug.json"
-        _atomic_json_write({"debug": True, "n": 42}, out, encrypted=False)
+        out = tmp_path / "state.json"
+        _atomic_json_write({"debug": True, "n": 42}, out)
 
-        head = out.read_bytes()[:22]
-        assert not head.startswith(b"age-encryption.org/v1"), (
-            "encrypted=False must bypass the age envelope"
+        assert out.read_bytes().startswith(b"age-encryption.org/v1"), (
+            "infrastructure JSON must be age-wrapped when a daily identity is loaded"
         )
-        # File is directly readable as JSON (no dump needed).
+
         import json as _json
 
-        assert _json.loads(out.read_text()) == {"debug": True, "n": 42}
+        from paramem.backup.encryption import read_maybe_encrypted
+
+        assert _json.loads(read_maybe_encrypted(out)) == {"debug": True, "n": 42}
 
 
 class TestCreateConsolidationLoopFingerprintCacheWiring:
@@ -2259,7 +2271,7 @@ class TestInterimSlotPayloadFilter:
             predicate="lives in",
             speaker_id="speaker1",
         )
-        save_memory_to_disk(g, graph_slot / "graph.json", encrypted=False)
+        save_memory_to_disk(g, graph_slot / "graph.json")
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         result = loop._collect_disk_fold_relations(tmp_path)
@@ -6375,187 +6387,117 @@ class TestDriftIntendedRemoval:
 
 
 class TestFoldGraphDebug:
-    """Tests for DebugSnapshotWriter.on_fold_graph, on_removal_ledger,
-    on_fold_assignments.
+    """Tests for on_fold_graph, on_removal_ledger, on_fold_assignments.
+
+    These write real bytes now: ``on_fold_graph`` renders the graph with
+    ``nx.node_link_data`` and hands it to ``write_artifact`` like every other
+    artifact, instead of delegating to a persistence function through a
+    duck-typed branch.
     """
 
-    def _make_writer(self, tmp_path, *, debug_on: bool = True):
-        """Build a minimal loop + DebugSnapshotWriter with optional debug gate."""
-        from unittest.mock import MagicMock
+    @staticmethod
+    def _base(tmp_path):
+        return tmp_path / "cycle_1" / "run_test"
 
-        from paramem.training.debug_snapshot import DebugSnapshotWriter
-
-        base_dir = tmp_path / "cycle_1" / "run_test"
-        loop = MagicMock()
-        loop.save_cycle_snapshots = debug_on
-        loop._debug_base = tmp_path if debug_on else None
-        loop._current_interim_stamp_or_none = MagicMock(return_value=None)
-        loop.snapshot_dir_for = MagicMock(return_value=base_dir)
-        return loop, DebugSnapshotWriter(loop)
-
-    def test_on_fold_graph_merger_writes_fold_subdir(self, tmp_path):
-        """on_fold_graph(merger, label='merged') writes fold/graph_merged_snapshot.json
-        via merger.save_graph when input is a GraphMerger (has save_graph).
-        """
-        from unittest.mock import MagicMock
-
-        loop, writer = self._make_writer(tmp_path)
-        base_dir = loop.snapshot_dir_for()
-
-        merger_mock = MagicMock()
-        # Simulate GraphMerger: has save_graph.
-        merger_mock.save_graph = MagicMock()
-
-        writer.on_fold_graph(merger_mock, label="merged")
-
-        merger_mock.save_graph.assert_called_once_with(
-            base_dir / "fold" / "graph_merged_snapshot.json",
-            encrypted=False,
-        )
-
-    def test_on_fold_graph_bare_graph_writes_fold_subdir(self, tmp_path):
-        """on_fold_graph(nx_graph, label='reconstructed') writes
-        fold/graph_reconstructed_snapshot.json via save_memory_to_disk.
+    def test_on_fold_graph_writes_fold_subdir(self, tmp_path):
+        """on_fold_graph(graph, label='merged') writes
+        fold/graph_merged_snapshot.json, node-link encoded, plaintext.
         """
         import json
-        from unittest.mock import patch
 
         import networkx as nx
 
-        loop, writer = self._make_writer(tmp_path)
-        base_dir = loop.snapshot_dir_for()
+        base_dir = self._base(tmp_path)
+        g = nx.MultiDiGraph()
+        g.add_node("Alice")
+        g.add_edge("Alice", "Acme", predicate="works_at")
+
+        with debug_run(base_dir):
+            on_fold_graph(g, label="merged")
+
+        out = base_dir / "fold" / "graph_merged_snapshot.json"
+        assert out.exists(), f"snapshot must exist; base={base_dir}"
+        assert json.loads(out.read_text()) == json.loads(json.dumps(nx.node_link_data(g)))
+
+    def test_on_fold_graph_round_trips_the_graph(self, tmp_path):
+        """The snapshot reloads into an equivalent graph — the rendering is
+        ``nx.node_link_data``, not a hand-rolled second serializer.
+        """
+        import json
+
+        import networkx as nx
+
+        base_dir = self._base(tmp_path)
+        g = nx.MultiDiGraph()
+        g.add_edge("Alice", "Acme", predicate="works_at", ik_key="ep1")
+
+        with debug_run(base_dir):
+            on_fold_graph(g, label="reconstructed")
+
+        raw = json.loads((base_dir / "fold" / "graph_reconstructed_snapshot.json").read_text())
+        restored = nx.node_link_graph(raw, multigraph=True, directed=True)
+        assert set(restored.nodes) == set(g.nodes)
+        assert [d["predicate"] for *_, d in restored.edges(data=True)] == ["works_at"]
+
+    def test_on_fold_graph_no_op_when_no_root_is_open(self, tmp_path):
+        """No artifact root open → no write, no directory."""
+        import networkx as nx
 
         g = nx.MultiDiGraph()
         g.add_node("Alice")
-        calls = []
 
-        def _fake_save(graph, path, *, encrypted):
-            calls.append((path, encrypted))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(nx.node_link_data(graph)))
+        with debug_run(None):
+            on_fold_graph(g, label="enriched")
 
-        with patch("paramem.memory.persistence.save_memory_to_disk", side_effect=_fake_save):
-            writer.on_fold_graph(g, label="reconstructed")
+        assert list(tmp_path.iterdir()) == []
 
-        assert len(calls) == 1
-        assert calls[0][0] == base_dir / "fold" / "graph_reconstructed_snapshot.json"
-        assert calls[0][1] is False
-
-    def test_on_fold_graph_interim_no_fold_subdir(self, tmp_path):
-        """on_fold_graph with interim_stamp writes at base root, not under fold/."""
-        from unittest.mock import MagicMock
-
-        loop, writer = self._make_writer(tmp_path)
-        loop._current_interim_stamp_or_none = MagicMock(return_value="20260610_1200")
-        base_dir = loop.snapshot_dir_for()
-
-        merger_mock = MagicMock()
-        merger_mock.save_graph = MagicMock()
-
-        writer.on_fold_graph(merger_mock, label="merged", interim_stamp="20260610_1200")
-
-        merger_mock.save_graph.assert_called_once_with(
-            base_dir / "graph_merged_snapshot.json",
-            encrypted=False,
-        )
-
-    def test_on_fold_graph_no_op_when_debug_off(self, tmp_path):
-        """on_fold_graph is a no-op when save_cycle_snapshots=False."""
-        from unittest.mock import MagicMock
-
-        loop, writer = self._make_writer(tmp_path, debug_on=False)
-        merger_mock = MagicMock()
-        merger_mock.save_graph = MagicMock()
-
-        writer.on_fold_graph(merger_mock, label="enriched")
-
-        merger_mock.save_graph.assert_not_called()
-
-    def test_naming_parity_merged_interim_vs_fold(self, tmp_path):
-        """Interim and fold 'merged' snapshots share the same basename.
-
-        Guards against a future re-split that accidentally changes one path.
+    def test_every_label_shares_one_directory_and_naming_rule(self, tmp_path):
+        """All four purpose labels land under fold/ as
+        ``graph_<label>_snapshot.json`` — guards against a future re-split
+        that changes one path and not the others.
         """
-        from unittest.mock import MagicMock
+        import networkx as nx
 
-        loop, writer = self._make_writer(tmp_path)
+        base_dir = self._base(tmp_path)
+        g = nx.MultiDiGraph()
+        g.add_node("Alice")
 
-        merger_mock = MagicMock()
-        merger_mock.save_graph = MagicMock()
+        labels = ["reconstructed", "merged", "enriched", "keyed"]
+        with debug_run(base_dir):
+            for label in labels:
+                on_fold_graph(g, label=label)
 
-        # Fold path (no interim_stamp).
-        writer.on_fold_graph(merger_mock, label="merged")
-        fold_call = merger_mock.save_graph.call_args_list[-1]
-        fold_path = fold_call.args[0]
-
-        merger_mock.save_graph.reset_mock()
-
-        # Interim path.
-        writer.on_fold_graph(merger_mock, label="merged", interim_stamp="20260610_0900")
-        interim_call = merger_mock.save_graph.call_args_list[-1]
-        interim_path = interim_call.args[0]
-
-        # Same basename, different directories.
-        assert fold_path.name == interim_path.name == "graph_merged_snapshot.json", (
-            f"Basename mismatch: fold={fold_path.name!r} interim={interim_path.name!r}"
-        )
-        assert fold_path.parent.name == "fold", (
-            f"Fold path must be under 'fold/'; got {fold_path.parent.name!r}"
-        )
-        assert interim_path.parent.name != "fold", (
-            f"Interim path must NOT be under 'fold/'; got {interim_path.parent.name!r}"
-        )
-
-    def test_naming_parity_enriched(self, tmp_path):
-        """Interim and fold 'enriched' snapshots share the same basename."""
-        from unittest.mock import MagicMock
-
-        loop, writer = self._make_writer(tmp_path)
-        merger_mock = MagicMock()
-        merger_mock.save_graph = MagicMock()
-
-        writer.on_fold_graph(merger_mock, label="enriched")
-        fold_name = merger_mock.save_graph.call_args_list[-1].args[0].name
-        merger_mock.save_graph.reset_mock()
-
-        writer.on_fold_graph(merger_mock, label="enriched", interim_stamp="20260610_0900")
-        interim_name = merger_mock.save_graph.call_args_list[-1].args[0].name
-
-        assert fold_name == interim_name == "graph_enriched_snapshot.json"
+        for label in labels:
+            out = base_dir / "fold" / f"graph_{label}_snapshot.json"
+            assert out.exists(), f"{label} snapshot missing at {out}"
 
     def test_on_removal_ledger_writes_under_fold_subdir(self, tmp_path):
         """on_removal_ledger writes fold/removal_ledger.json with the full ledger."""
         import json
 
-        loop, writer = self._make_writer(tmp_path)
-        base_dir = loop.snapshot_dir_for()
-
+        base_dir = self._base(tmp_path)
         ledger = {
             "key_dup": {"reason": "dedup", "surviving_twin": "key_ok"},
             "key_enriched": {"reason": "enrichment_same_as", "merged_into": "Alice"},
         }
-        writer.on_removal_ledger(ledger)
+        with debug_run(base_dir):
+            on_removal_ledger(ledger)
 
         out = base_dir / "fold" / "removal_ledger.json"
         assert out.exists(), f"removal_ledger.json must exist; base={base_dir}"
-        saved = json.loads(out.read_text())
-        assert saved == ledger
+        assert json.loads(out.read_text()) == ledger
 
-    def test_on_removal_ledger_no_op_when_debug_off(self, tmp_path):
-        """on_removal_ledger is a no-op when save_cycle_snapshots=False."""
-        loop, writer = self._make_writer(tmp_path, debug_on=False)
-        # Should not raise and should write nothing.
-        writer.on_removal_ledger({"k": {"reason": "dedup"}})
-        # Confirm no fold/ subdir was created.
+    def test_on_removal_ledger_no_op_when_no_root_is_open(self, tmp_path):
+        """on_removal_ledger is a no-op with no artifact root."""
+        with debug_run(None):
+            on_removal_ledger({"k": {"reason": "dedup"}})
         assert not (tmp_path / "fold").exists()
 
     def test_on_fold_assignments_writes_key_lists(self, tmp_path):
         """on_fold_assignments writes fold/fold_assignments.json with per-tier key lists."""
         import json
 
-        loop, writer = self._make_writer(tmp_path)
-        base_dir = loop.snapshot_dir_for()
-
+        base_dir = self._base(tmp_path)
         serve = {
             "episodic": [{"key": "ep1", "subject": "A", "predicate": "p", "object": "B"}],
             "semantic": [{"key": "sem1", "subject": "X", "predicate": "q", "object": "Y"}],
@@ -6569,7 +6511,8 @@ class TestFoldGraphDebug:
             "semantic": [],
             "procedural": [],
         }
-        writer.on_fold_assignments(serve, train)
+        with debug_run(base_dir):
+            on_fold_assignments(serve, train)
 
         out = base_dir / "fold" / "fold_assignments.json"
         assert out.exists(), f"fold_assignments.json must exist; base={base_dir}"
@@ -6586,13 +6529,13 @@ class TestFoldGraphDebug:
             "procedural": [],
         }
 
-    def test_on_fold_assignments_no_op_when_debug_off(self, tmp_path):
-        """on_fold_assignments is a no-op when save_cycle_snapshots=False."""
-        loop, writer = self._make_writer(tmp_path, debug_on=False)
-        writer.on_fold_assignments(
-            {"episodic": [], "semantic": [], "procedural": []},
-            {"episodic": [], "semantic": [], "procedural": []},
-        )
+    def test_on_fold_assignments_no_op_when_no_root_is_open(self, tmp_path):
+        """on_fold_assignments is a no-op with no artifact root."""
+        with debug_run(None):
+            on_fold_assignments(
+                {"episodic": [], "semantic": [], "procedural": []},
+                {"episodic": [], "semantic": [], "procedural": []},
+            )
         assert not (tmp_path / "fold").exists()
 
 
@@ -14462,7 +14405,10 @@ class TestRunGraphNormalizationCloudEngine:
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_raw),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
-            patch.object(loop._debug_writer, "on_normalization", side_effect=_spy_on_normalization),
+            patch(
+                "paramem.training.graph_tier.on_normalization",
+                side_effect=_spy_on_normalization,
+            ),
         ):
             _refiner_for(loop).run_normalization()
 
@@ -14506,7 +14452,7 @@ class TestRunGraphNormalizationCloudEngine:
 
 class TestNormalizationDebugSnapshot:
     """on_normalization routes raw outputs + decisions + applied counts through
-    DebugSnapshotWriter and writes normalization_snapshot.json under fold/.
+    the shared artifact primitive and writes normalization_snapshot.json under fold/.
 
     Tests:
     - DS-1: save_cycle_snapshots=True → normalization_snapshot.json written with
@@ -14518,7 +14464,6 @@ class TestNormalizationDebugSnapshot:
     def _make_debug_loop(tmp_path, *, save_cycle_snapshots: bool):
         """Build a ConsolidationLoop with debug snapshot writing enabled/disabled."""
         from paramem.training.consolidation import ConsolidationLoop
-        from paramem.training.debug_snapshot import DebugSnapshotWriter
         from paramem.utils.config import ConsolidationConfig
 
         loop = object.__new__(ConsolidationLoop)
@@ -14538,7 +14483,6 @@ class TestNormalizationDebugSnapshot:
             loop._debug_base = None
             loop.snapshot_dir = None
 
-        loop._debug_writer = DebugSnapshotWriter(loop)
         return loop
 
     def test_normalization_snapshot_written_when_debug_enabled(self, tmp_path):
@@ -14551,7 +14495,8 @@ class TestNormalizationDebugSnapshot:
         decisions = [{"relations": [{"subject": "A", "predicate": "b", "object": "C"}]}]
         applied = {"groups_collapsed": 1, "edges_retired": 1}
 
-        loop._debug_writer.on_normalization(raw_outputs, decisions, applied)
+        with loop._artifact_scope():
+            on_normalization(raw_outputs, decisions, applied)
 
         matches = list(tmp_path.rglob("normalization_snapshot.json"))
         assert matches, "normalization_snapshot.json must be written when debug is enabled"
@@ -14568,109 +14513,122 @@ class TestNormalizationDebugSnapshot:
         decisions = [{"relations": []}]
         applied = {"groups_collapsed": 0, "edges_retired": 0}
 
-        loop._debug_writer.on_normalization(raw_outputs, decisions, applied)
+        with loop._artifact_scope():
+            on_normalization(raw_outputs, decisions, applied)
 
         matches = list(tmp_path.rglob("normalization_snapshot.json"))
         assert not matches, "normalization_snapshot.json must NOT be written when debug is disabled"
 
 
 # ---------------------------------------------------------------------------
-# Debug snapshot — on_calibrate_extract writes calibrate_extract_<sid>_<ts>.json
+# Debug snapshot — the two artifact roots and their independent gates
 # ---------------------------------------------------------------------------
 
 
-class TestCalibrateExtractDebugSnapshot:
-    """on_calibrate_extract routes the full ``/calibrate/extract`` result
-    payload through DebugSnapshotWriter, gated identically to on_normalization.
+class TestCalibrationAndDebugRoots:
+    """``_active_bases`` resolves TWO roots, gated independently.
 
-    Tests:
-    - CE-1: save_cycle_snapshots=True -> calibrate_extract_<sid>_<ts>.json written
-            with the payload verbatim.
-    - CE-2: save_cycle_snapshots=False -> no file written (self-gated no-op).
+    The debug root comes from ``ConsolidationLoop._artifact_scope`` (``None``
+    when ``debug`` is off); the calibration root from ``calibration_run``.
+
+    A calibration run must capture its artifacts whether or not the
+    production ``debug`` switch is on — the two answer different
+    questions. With both active the same artifact lands in both, so the
+    debug tree stays a complete record and the run's directory stays
+    self-contained.
     """
 
     @staticmethod
-    def _make_debug_loop(tmp_path, *, save_cycle_snapshots: bool):
-        """Build a ConsolidationLoop with debug snapshot writing enabled/disabled."""
-        from paramem.training.consolidation import ConsolidationLoop
-        from paramem.training.debug_snapshot import DebugSnapshotWriter
-        from paramem.utils.config import ConsolidationConfig
+    def _loop(tmp_path, *, save_cycle_snapshots: bool):
+        return TestNormalizationDebugSnapshot._make_debug_loop(
+            tmp_path, save_cycle_snapshots=save_cycle_snapshots
+        )
 
-        loop = object.__new__(ConsolidationLoop)
-        loop.config = ConsolidationConfig(indexed_key_replay=True)
-        loop.save_cycle_snapshots = save_cycle_snapshots
-        loop._current_interim_stamp = None  # type: ignore[assignment]
-        loop.cycle_count = 0
-        loop.run_id = "test_run"
+    def test_calibration_root_receives_artifact_with_debug_off(self, tmp_path):
+        """Mutation: gate the calibration root on ``save_cycle_snapshots``
+        -> nothing is captured and every probe silently depends on a
+        production setting it has nothing to do with."""
+        from paramem.utils.artifacts import calibration_run
 
-        if save_cycle_snapshots:
-            debug_base = tmp_path / "debug"
-            debug_base.mkdir()
-            loop._debug_base = debug_base
-            loop.snapshot_dir = tmp_path / "snapshot"
-            loop.snapshot_dir.mkdir()
-        else:
-            loop._debug_base = None
-            loop.snapshot_dir = None
+        loop = self._loop(tmp_path, save_cycle_snapshots=False)
+        run_dir = tmp_path / "calibration" / "extract_1"
+        with loop._artifact_scope(), calibration_run(run_dir):
+            on_calibration_result({"stage": "extract", "parsed": {}})
 
-        loop._debug_writer = DebugSnapshotWriter(loop)
-        return loop
+        import json as _json
 
-    def test_calibrate_extract_snapshot_written_when_debug_enabled(self, tmp_path):
-        """CE-1: save_cycle_snapshots=True -> file written with the payload verbatim."""
-        import json
+        written = list(run_dir.glob("calibration_extract_*.json"))
+        assert len(written) == 1
+        assert _json.loads(written[0].read_text())["stage"] == "extract"
 
-        loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=True)
+    def test_both_roots_receive_the_artifact_when_both_are_active(self, tmp_path):
+        from paramem.utils.artifacts import calibration_run
 
-        payload = {
-            "stage": "extract",
-            "raw_output": "raw model output",
-            "parsed": {"diagnostics": {"entity_correction_verdicts": [{"applied": False}]}},
-            "phases": [{"name": "local_extract"}],
-        }
+        loop = self._loop(tmp_path, save_cycle_snapshots=True)
+        run_dir = tmp_path / "calibration" / "extract_1"
+        with loop._artifact_scope(), calibration_run(run_dir):
+            on_calibration_result({"stage": "extract", "parsed": {}})
 
-        loop._debug_writer.on_calibrate_extract(payload, session_id="calib")
+        assert len(list(run_dir.glob("calibration_extract_*.json"))) == 1
+        assert len(list((tmp_path / "debug").rglob("calibration_extract_*.json"))) == 1
 
-        matches = list(tmp_path.rglob("calibrate_extract_calib_*.json"))
-        assert matches, "calibrate_extract_<sid>_<ts>.json must be written when debug is enabled"
-        assert json.loads(matches[0].read_text()) == payload
+    def test_no_calibration_run_leaves_only_the_debug_root(self, tmp_path):
+        loop = self._loop(tmp_path, save_cycle_snapshots=True)
+        with loop._artifact_scope():
+            on_calibration_result({"stage": "extract", "parsed": {}})
 
-    def test_calibrate_extract_snapshot_not_written_when_debug_disabled(self, tmp_path):
-        """CE-2: save_cycle_snapshots=False -> no file written (self-gated no-op)."""
-        loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=False)
+        assert len(list((tmp_path / "debug").rglob("calibration_extract_*.json"))) == 1
+        assert not (tmp_path / "calibration").exists()
 
-        loop._debug_writer.on_calibrate_extract({"stage": "extract"}, session_id="calib")
+    def test_neither_root_active_is_a_no_op(self, tmp_path):
+        loop = self._loop(tmp_path, save_cycle_snapshots=False)
+        with loop._artifact_scope():
+            on_calibration_result({"stage": "extract", "parsed": {}})
 
-        matches = list(tmp_path.rglob("calibrate_extract_*.json"))
-        assert not matches, "calibrate_extract snapshot must NOT be written when debug is disabled"
+        assert not list(tmp_path.rglob("calibration_*.json"))
+
+    def test_production_hook_artifacts_follow_the_calibration_run(self, tmp_path):
+        """Not just the calibration response: an artifact a PRODUCTION hook
+        emits while a calibration run executes lands in the run's directory
+        too. ``/calibrate/normalize`` runs the graph tier's normalization
+        pass, which writes its raw outputs through this same primitive.
+        """
+        from paramem.utils.artifacts import calibration_run
+
+        loop = self._loop(tmp_path, save_cycle_snapshots=False)
+        run_dir = tmp_path / "calibration" / "normalize_1"
+        with loop._artifact_scope(), calibration_run(run_dir):
+            on_normalization(["raw"], [{"cluster": ["a", "b"]}], {"retired": 1})
+
+        assert (run_dir / "fold" / "normalization_snapshot.json").exists()
 
 
 # ---------------------------------------------------------------------------
-# _safe_path_component — sanitizes session_id used as a path component
+# Debug snapshot — path-component sanitisation
 # ---------------------------------------------------------------------------
 
 
 class TestSafePathComponent:
     """``_safe_path_component`` maps non alnum/-/_ characters to ``_``.
 
-    Guards the ``on_calibrate_extract`` filename and ``on_session_extracted``
-    directory-component write sites against a request-controlled
-    ``session_id`` containing path separators or ``..``.
+    Guards the ``on_session_extracted`` directory-component write site
+    against a request-controlled ``session_id`` containing path separators
+    or ``..``.
     """
 
     def test_traversal_attempt_sanitized(self):
-        from paramem.training.debug_snapshot import _safe_path_component
+        from paramem.utils.artifacts import _safe_path_component
 
         assert "/" not in _safe_path_component("../etc")
         assert ".." not in _safe_path_component("../etc")
 
     def test_path_separator_sanitized(self):
-        from paramem.training.debug_snapshot import _safe_path_component
+        from paramem.utils.artifacts import _safe_path_component
 
         assert _safe_path_component("a/b") == "a_b"
 
     def test_normal_uuid_passes_through_unchanged(self):
-        from paramem.training.debug_snapshot import _safe_path_component
+        from paramem.utils.artifacts import _safe_path_component
 
         uuid = "f3c2c91e-c000"
         assert _safe_path_component(uuid) == uuid
@@ -15610,7 +15568,6 @@ class TestThreeWayGate:
         loop.cycle_count = 0
         loop._current_interim_stamp = None
         loop.run_id = "test_s5"
-        loop._debug_writer = MagicMock()
         return loop
 
     def test_slack_zero_at_cap_is_cap_pending(self, tmp_path):
@@ -16044,7 +16001,6 @@ class TestFoldResumeHelpers:
         loop._indexed_ep_interim = {}
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
-        loop._debug_writer = MagicMock()
         return loop
 
     def test_marker_roundtrip_plaintext(self, tmp_path):

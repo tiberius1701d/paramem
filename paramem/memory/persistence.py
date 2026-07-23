@@ -69,7 +69,7 @@ _IK_KEY_ATTR = "ik_key"
 _EDGE_SOURCE_ATTR = "edge_source"
 
 
-def save_memory_to_disk(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool = True) -> None:
+def save_memory_to_disk(graph: nx.MultiDiGraph, path: Path) -> None:
     """Atomic encrypted write of *graph* to *path*.
 
     Serialises via ``nx.node_link_data`` → JSON → bytes, then delegates to
@@ -87,22 +87,17 @@ def save_memory_to_disk(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool =
         graph: The ``MultiDiGraph`` to persist.
         path: Destination path (e.g. ``adapter_dir/episodic/graph.json``).
             Parent directory is created if absent.
-        encrypted: When ``True`` (default) routes through
-            :func:`paramem.backup.encryption.write_infra_bytes` — age-encrypted
-            when a daily identity is loaded, plaintext otherwise.  When
-            ``False`` always writes plaintext; reserved for debug-directory
-            writers so output is inspectable with ``cat``/``grep``.
+
+    Inspection copies of a graph are not written here — they are artifacts,
+    and go through :func:`paramem.utils.artifacts.on_fold_graph`.
     """
-    from paramem.backup.encryption import write_infra_bytes, write_plaintext_atomic
+    from paramem.backup.encryption import write_infra_bytes
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = nx.node_link_data(graph)
     payload = json.dumps(data, indent=2).encode("utf-8")
-    if encrypted:
-        write_infra_bytes(path, payload)
-    else:
-        write_plaintext_atomic(path, payload)
+    write_infra_bytes(path, payload)
     logger.debug("Memory graph saved to %s (%d edges)", path, graph.number_of_edges())
 
 

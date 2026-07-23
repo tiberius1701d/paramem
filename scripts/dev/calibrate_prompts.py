@@ -33,7 +33,7 @@ Usage::
     # Re-iterate on the enrichment prompt only, seeded from a prior dump:
     python scripts/dev/calibrate_prompts.py \\
         --input ingest/resume.pdf --chunk 0 --stages enrich \\
-        --seed-from data/ha/debug/calibration/<prior-ts>/
+        --seed-from data/ha/calibration/artifacts/<prior-ts>/
 
 Out of scope: merger, keyed-entry assembly, adapter training, recall/chat.  The
 tool stops at "what did the LLM emit for this stage given this prompt
@@ -63,6 +63,7 @@ from paramem.graph.document_chunker import (  # noqa: E402
     chunk_text_file,
 )
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
+from paramem.utils.artifacts import write_artifact  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Input loading
@@ -125,18 +126,58 @@ def _load_chunks(path: Path, source_type_override: str | None) -> tuple[list[dic
 # ---------------------------------------------------------------------------
 
 
-def _calibration_variant_exists(
-    prompts_dir: Path,
-    base_filenames: list[str],
-    prefix: str,
-) -> bool:
-    """True iff at least one prefixed prompt file exists for this stage.
+_STAGE_PROMPTS: dict[str, tuple[str, ...]] = {
+    "extract": ("extract_user", "extract_system"),
+    "anonymize": ("anonymize",),
+    "enrich": ("enrich",),
+    "plausibility": ("plausibility",),
+    "normalize": ("normalize_filter",),
+    "name": ("name_user", "name_system"),
+}
 
-    Used by ``--baseline auto`` to decide whether to do the side-by-side
-    comparison (only worth running baseline when there's something to
-    compare against).
+
+_INDEX_FILENAME = "runs.json"
+
+
+def _load_run(index_dir: Path, chunk_idx: int) -> dict | None:
+    """Read a previously recorded extract run back from the SERVER's record.
+
+    The client keeps an index of which run covered which chunk
+    (``runs.json``); the run itself is the artifact the server wrote under
+    ``paths.calibration/artifacts/<run>/``. Nothing is re-recorded on this
+    side, so there is exactly one copy of any run's bytes.
+
+    Returns ``None`` when the index has no entry for *chunk_idx* or the
+    recorded artifact is gone.
     """
-    return any((prompts_dir / f"{prefix}{base}").exists() for base in base_filenames)
+    index_path = index_dir / _INDEX_FILENAME
+    if not index_path.exists():
+        return None
+    artifact_dir = json.loads(index_path.read_text()).get("extract", {}).get(str(chunk_idx))
+    if artifact_dir is None:
+        return None
+    results = sorted(Path(artifact_dir).glob("calibration_extract_*.json"))
+    if not results:
+        return None
+    return json.loads(results[-1].read_text())
+
+
+def _variants(prompts_dir: Path, prefix: str, stage: str) -> dict[str, str]:
+    """Build the ``prompt_variants`` mapping for *stage*.
+
+    ``{production basename: variant basename}`` for every prompt this
+    stage loads that the operator has a prefixed variant of. The server
+    resolves the variant names against its own calibration prompt
+    directory — the names travel, not the paths — so *prompts_dir* is the
+    local view of that same directory.
+    """
+    mapping: dict[str, str] = {}
+    for key in _STAGE_PROMPTS[stage]:
+        basename = _STAGE_FILENAME[key]
+        variant = f"{prefix}{basename}"
+        if (prompts_dir / variant).exists():
+            mapping[basename] = variant
+    return mapping
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +535,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--prompts-dir",
-        default=str(_REPO_ROOT / "configs" / "prompts"),
-        help="default: project's configs/prompts/",
+        default=str(_REPO_ROOT / "data" / "ha" / "calibration" / "prompts"),
+        help=(
+            "Local view of the server's calibration prompt directory "
+            "(paths.calibration/prompts). Variant NAMES travel to the server, "
+            "which resolves them there; this path is only read to discover "
+            "which variants exist. default: data/ha/calibration/prompts/"
+        ),
     )
     parser.add_argument("--prompt-prefix", default="calib_")
     parser.add_argument(
@@ -525,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dump-dir",
         default=None,
-        help="default: data/ha/debug/calibration/<utc-timestamp>/",
+        help="default: data/ha/calibration/artifacts/<utc-timestamp>/",
     )
     parser.add_argument(
         "--seed-from",
@@ -567,10 +613,12 @@ def main(argv: list[str] | None = None) -> int:
         "max_tokens": args.max_tokens,
     }
 
-    # Default dump dir under data/ha/debug/calibration/<ts>/.
+    # Default dump dir under the calibration workspace (paths.calibration),
+    # never under paths.debug: probing artifacts are not debug output and
+    # must not depend on, or pollute, the production debug switch.
     if args.dump_dir is None:
         ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        dump_dir = _REPO_ROOT / "data" / "ha" / "debug" / "calibration" / ts
+        dump_dir = _REPO_ROOT / "data" / "ha" / "calibration" / "artifacts" / ts
     else:
         dump_dir = Path(args.dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)
@@ -593,23 +641,13 @@ def main(argv: list[str] | None = None) -> int:
         source_type = "document"
 
     # Decide whether baseline runs alongside candidate.
-    base_filenames_per_stage = {
-        "extract": [_STAGE_FILENAME["extract_user"], _STAGE_FILENAME["extract_system"]],
-        "anonymize": [_STAGE_FILENAME["anonymize"]],
-        "enrich": [_STAGE_FILENAME["enrich"]],
-        "plausibility": [_STAGE_FILENAME["plausibility"]],
-        "normalize": [_STAGE_FILENAME["normalize_filter"]],
-        "name": [_STAGE_FILENAME["name_user"], _STAGE_FILENAME["name_system"]],
-    }
-
     def _run_baseline_for(stage: str) -> bool:
         if args.baseline == "none":
             return False
         if args.baseline == "production":
             return True
-        return _calibration_variant_exists(
-            prompts_dir, base_filenames_per_stage[stage], args.prompt_prefix
-        )
+        # "auto": only worth a side-by-side when a variant exists to compare.
+        return bool(_variants(prompts_dir, args.prompt_prefix, stage))
 
     # Guard: normalize cannot be combined with chunk stages.
     _CHUNK_STAGES = {"extract", "anonymize", "enrich", "plausibility"}
@@ -646,52 +684,36 @@ def main(argv: list[str] | None = None) -> int:
         "dump_dir": str(dump_dir),
         "started_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     }
-    (dump_dir / "00_invocation.json").write_text(json.dumps(invocation, indent=2, default=str))
+    write_artifact(dump_dir / "00_invocation.json", invocation)
+
+    # Which server-side run covered which chunk. The runs themselves live
+    # where the server put them (each response names its own
+    # ``artifact_dir``); this side records only the mapping, so a run's
+    # bytes exist in exactly one place.
+    run_index: dict[str, dict[str, str]] = {}
+
+    def _record_run(stage: str, key: str, response: dict) -> None:
+        run_index.setdefault(stage, {})[key] = response.get("artifact_dir", "")
 
     # ----- run stages per chunk per seed ---------------------------------
+    # Every chunk stage runs the SAME production chain server-side; what
+    # differs is where it is entered and which step's output comes back.
+    # So the client hands over exactly ONE artifact — the graph the local
+    # extractor produced — and the chain re-derives everything downstream
+    # of it by running. The old anonymize->enrich->plausibility relay
+    # (anon facts, anonymized transcript, enriched facts, and a
+    # client-side fail-closed check on the anonymizer's status) is gone:
+    # each of those was a client-side copy of a decision the chain makes.
+    _SEEDED_STAGES = ("anonymize", "enrich", "plausibility")
     for chunk in chunks:
         chunk_idx = chunk["chunk_index"]
         prior_extract: dict | None = None
-        prior_anonymize: dict | None = None
-        prior_enrich: dict | None = None
 
         if args.seed_from:
-            seed_from = Path(args.seed_from)
-            for fname, slot in [
-                (f"01_extract_chunk_{chunk_idx}.json", "extract"),
-                (f"02_anonymize_chunk_{chunk_idx}.json", "anonymize"),
-                (f"03_enrich_chunk_{chunk_idx}.json", "enrich"),
-            ]:
-                f = seed_from / fname
-                if not f.exists():
-                    continue
-                blob = json.loads(f.read_text())
-                if slot == "extract":
-                    # 01_extract_chunk_N.json is written as a WRAPPER
-                    # ({"stage", "chunk_index", "candidate_runs": [...]}) —
-                    # unlike 02_/03_, which write the raw stage response
-                    # directly. `prior_extract` must carry the same
-                    # {"parsed", ...} shape a live "extract" stage leaves in
-                    # it (`prior_extract = extract_runs[0]` below), or
-                    # downstream `.get("parsed")` reads see nothing and the
-                    # "enrich" stage builds its payload from an EMPTY graph.
-                    runs = blob.get("candidate_runs") or []
-                    prior_extract = runs[0] if runs else None
-                elif slot == "anonymize":
-                    prior_anonymize = blob
-                elif slot == "enrich":
-                    prior_enrich = blob
+            prior_extract = _load_run(Path(args.seed_from), chunk_idx)
 
         if "extract" in stages:
             extract_runs: list[dict] = []
-            # Single prompt-pair for every source type — same baseline file
-            # regardless of whether the input is a transcript or a document.
-            user_basename = _STAGE_FILENAME["extract_user"]
-            system_basename = _STAGE_FILENAME["extract_system"]
-            user_calib = f"{args.prompt_prefix}{user_basename}"
-            system_calib = f"{args.prompt_prefix}{system_basename}"
-            user_override = user_calib if (prompts_dir / user_calib).exists() else None
-            system_override = system_calib if (prompts_dir / system_calib).exists() else None
             for seed in seeds:
                 params = dict(params_base)
                 params["seed"] = seed
@@ -704,15 +726,12 @@ def main(argv: list[str] | None = None) -> int:
                         "speaker_name": args.speaker,
                         "source_type": source_type,
                         "session_id": f"calib-chunk-{chunk_idx}",
-                        "prompts_dir": (args.prompts_dir if args.prompts_dir else None),
-                        "extraction_prompt_filename": user_override,
-                        "extraction_system_prompt_filename": system_override,
+                        "prompt_variants": _variants(prompts_dir, args.prompt_prefix, "extract"),
                         "stop_phase": args.stop_phase,
                         "params": {k: v for k, v in params.items() if v is not None},
                     },
                 )
-                run_record = {"seed": seed, **candidate}
-                extract_runs.append(run_record)
+                extract_runs.append({"seed": seed, **candidate})
             baseline_blob = None
             if _run_baseline_for("extract"):
                 baseline_blob = _post_stage(
@@ -724,20 +743,24 @@ def main(argv: list[str] | None = None) -> int:
                         "speaker_name": args.speaker,
                         "source_type": source_type,
                         "session_id": f"calib-chunk-{chunk_idx}-baseline",
-                        "prompts_dir": args.prompts_dir,
-                        "extraction_prompt_filename": None,
-                        "extraction_system_prompt_filename": None,
+                        "prompt_variants": {},
                         "stop_phase": args.stop_phase,
                         "params": {k: v for k, v in params_base.items() if v is not None},
                     },
                 )
+            _record_run("extract", str(chunk_idx), extract_runs[0])
+            # The runs are the server's record; what this file adds is the
+            # comparison across them, which nothing else computes.
             out_blob: dict[str, Any] = {
                 "stage": "extract",
                 "chunk_index": chunk_idx,
-                "candidate_runs": extract_runs,
+                "runs": [
+                    {"seed": r["seed"], "artifact_dir": r.get("artifact_dir", "")}
+                    for r in extract_runs
+                ],
             }
             if baseline_blob is not None:
-                out_blob["baseline"] = baseline_blob
+                out_blob["baseline_artifact_dir"] = baseline_blob.get("artifact_dir", "")
                 out_blob["diff"] = _diff_blocks(baseline_blob, extract_runs[0])
                 # Per-phase diff over the phase trace — localises which
                 # phase a prompt change actually moved.  Renders to
@@ -748,107 +771,45 @@ def main(argv: list[str] | None = None) -> int:
                 _print_phase_diff(phase_diff)
             if len(seeds) > 1:
                 out_blob["variance"] = _variance_report("extract", extract_runs)
-            (dump_dir / f"01_extract_chunk_{chunk_idx}.json").write_text(
-                json.dumps(out_blob, indent=2, default=str)
-            )
+            if "diff" in out_blob or "variance" in out_blob:
+                write_artifact(dump_dir / f"01_extract_chunk_{chunk_idx}.json", out_blob)
             prior_extract = extract_runs[0]
 
-        if "anonymize" in stages and prior_extract is not None:
-            anon_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['anonymize']}"
-            anon_override = anon_calib if (prompts_dir / anon_calib).exists() else None
-            anon = _post_stage(
-                args.server,
-                "anonymize",
-                {
-                    "graph": prior_extract.get("parsed", {}),
-                    "transcript": chunk["text"],
-                    "session_id": f"calib-chunk-{chunk_idx}",
-                    # Same runtime-known speaker name every production
-                    # caller of anonymize threads through — a
-                    # calibration run that never speaker-seeds diverges
-                    # from production fidelity (see
-                    # CalibrateAnonymizeRequest.speaker_name docstring).
-                    "speaker_name": args.speaker,
-                    "prompts_dir": args.prompts_dir,
-                    "anonymization_prompt_filename": anon_override,
-                    "params": {k: v for k, v in params_base.items() if v is not None},
-                },
-            )
-            (dump_dir / f"02_anonymize_chunk_{chunk_idx}.json").write_text(
-                json.dumps(anon, indent=2, default=str)
-            )
-            prior_anonymize = anon
-
-        if "enrich" in stages and prior_extract is not None and prior_anonymize is not None:
-            # /calibrate/anonymize now returns the FULLY-ASSEMBLED
-            # artifacts from THE one anonymize chain
-            # (paramem.cloud.anonymize.anonymize) —
-            # status / mapping / anonymized_transcript / forward /
-            # reverse / anon_facts / norm_stats.  Fed straight through to
-            # /calibrate/enrich; no client-side re-derivation.
-            anon_parsed = prior_anonymize.get("parsed") or {}
-            # status == "failed" OR a missing/empty `anonymized_transcript`
-            # is fail-closed — matches production's abort-on-failure
-            # (the `anonymize` stage's `status == "failed"` branch falls
-            # back without ever calling the cloud).  `status == "opted_out"`
-            # still proceeds to enrich (verbatim facts/transcript), same
-            # as production.  Never a truthiness check on a mapping per
-            # CLAUDE.md.
-            status = anon_parsed.get("status")
-            anon_facts = anon_parsed.get("anon_facts")
-            anon_transcript = anon_parsed.get("anonymized_transcript")
-            if status == "failed" or not anon_transcript:
+        for ordinal, stage in enumerate(_SEEDED_STAGES, start=2):
+            if stage not in stages:
+                continue
+            if prior_extract is None:
                 print(
-                    f"Chunk {chunk_idx}: anonymize stage status={status!r} or "
-                    f"anonymized_transcript missing/empty (fail-closed) "
-                    f"— skipping enrich stage, no cloud call made."
+                    f"Chunk {chunk_idx}: no extract result to seed {stage!r} — "
+                    f"run --stages extract first, or point --seed-from at a dump "
+                    f"that contains 01_extract_chunk_{chunk_idx}.json."
                 )
                 continue
-
-            enrich_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['enrich']}"
-            enrich_override = enrich_calib if (prompts_dir / enrich_calib).exists() else None
-            enriched = _post_stage(
+            params_stage = dict(params_base)
+            if stage == "plausibility" and args.plausibility_max_tokens is not None:
+                params_stage["max_tokens"] = args.plausibility_max_tokens
+            result = _post_stage(
                 args.server,
-                "enrich",
+                stage,
                 {
-                    "facts": anon_facts,
-                    "transcript": anon_transcript,
-                    "prompts_dir": args.prompts_dir,
-                    "enrichment_prompt_filename": enrich_override,
-                    "params": {k: v for k, v in params_base.items() if v is not None},
-                },
-            )
-            (dump_dir / f"03_enrich_chunk_{chunk_idx}.json").write_text(
-                json.dumps(enriched, indent=2, default=str)
-            )
-            prior_enrich = enriched
-
-        if "plausibility" in stages and prior_enrich is not None:
-            facts = (prior_enrich.get("parsed") or {}).get("facts") or []
-            params_plaus = dict(params_base)
-            if args.plausibility_max_tokens is not None:
-                params_plaus["max_tokens"] = args.plausibility_max_tokens
-            plaus_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['plausibility']}"
-            plaus_override = plaus_calib if (prompts_dir / plaus_calib).exists() else None
-            plaus = _post_stage(
-                args.server,
-                "plausibility",
-                {
-                    "facts": facts,
                     "transcript": chunk["text"],
-                    "prompts_dir": args.prompts_dir,
-                    "plausibility_prompt_filename": plaus_override,
-                    "params": {k: v for k, v in params_plaus.items() if v is not None},
+                    "graph": prior_extract.get("parsed", {}),
+                    "speaker_id": args.speaker_id,
+                    # Same runtime-known speaker name every production
+                    # caller threads through — a calibration run that never
+                    # speaker-seeds diverges from production fidelity.
+                    "speaker_name": args.speaker,
+                    "source_type": source_type,
+                    "session_id": f"calib-chunk-{chunk_idx}",
+                    "prompt_variants": _variants(prompts_dir, args.prompt_prefix, stage),
+                    "params": {k: v for k, v in params_stage.items() if v is not None},
                 },
             )
-            (dump_dir / f"04_plausibility_chunk_{chunk_idx}.json").write_text(
-                json.dumps(plaus, indent=2, default=str)
-            )
+            _record_run(stage, str(chunk_idx), result)
+            print(f"  {stage} chunk {chunk_idx}: {result.get('artifact_dir', '<not recorded>')}")
 
     # ----- normalize stage (graph-level, runs outside the chunk loop) -------
     if "normalize" in stages:
-        filter_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['normalize_filter']}"
-        filter_override = filter_calib if (prompts_dir / filter_calib).exists() else None
         normalize_runs: list[dict] = []
         for seed in seeds:
             params = dict(params_base)
@@ -858,30 +819,28 @@ def main(argv: list[str] | None = None) -> int:
                 "normalize",
                 {
                     "snapshot_path": args.snapshot,
-                    "normalization_prompt_filename": filter_override,
-                    "prompts_dir": args.prompts_dir,
+                    "prompt_variants": _variants(prompts_dir, args.prompt_prefix, "normalize"),
                     "params": {k: v for k, v in params.items() if v is not None},
                 },
             )
             normalize_runs.append({"seed": seed, **norm})
-        out_blob: dict[str, Any] = {
-            "stage": "normalize",
-            "snapshot_path": args.snapshot,
-            "candidate_runs": normalize_runs,
-        }
+        for run in normalize_runs:
+            _record_run("normalize", str(run["seed"]), run)
         if len(seeds) > 1:
-            out_blob["variance"] = _variance_report("normalize", normalize_runs)
-        (dump_dir / "05_normalize.json").write_text(json.dumps(out_blob, indent=2, default=str))
+            write_artifact(
+                dump_dir / "05_normalize.json",
+                {
+                    "stage": "normalize",
+                    "snapshot_path": args.snapshot,
+                    "variance": _variance_report("normalize", normalize_runs),
+                },
+            )
 
     # ----- name stage (standalone — requires --turns-jsonl) ----------------
     if "name" in stages:
         turns_path = Path(args.turns_jsonl)
         with turns_path.open(encoding="utf-8") as _f:
             turns_data = [json.loads(line) for line in _f if line.strip()]
-        name_user_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['name_user']}"
-        name_sys_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['name_system']}"
-        name_user_override = name_user_calib if (prompts_dir / name_user_calib).exists() else None
-        name_sys_override = name_sys_calib if (prompts_dir / name_sys_calib).exists() else None
         name_runs: list[dict] = []
         for seed in seeds:
             params = dict(params_base)
@@ -891,26 +850,26 @@ def main(argv: list[str] | None = None) -> int:
                 "name",
                 {
                     "turns": turns_data,
-                    "prompts_dir": args.prompts_dir,
-                    "name_prompt_filename": name_user_override or _STAGE_FILENAME["name_user"],
-                    "name_system_prompt_filename": (
-                        name_sys_override or _STAGE_FILENAME["name_system"]
-                    ),
+                    "prompt_variants": _variants(prompts_dir, args.prompt_prefix, "name"),
                     "user_turns_only": True,
                     "params": {k: v for k, v in params.items() if v is not None},
                 },
             )
             name_runs.append({"seed": seed, **name_result})
-        out_blob_name: dict[str, Any] = {
-            "stage": "name",
-            "turns_jsonl": str(turns_path),
-            "candidate_runs": name_runs,
-        }
+        for run in name_runs:
+            _record_run("name", str(run["seed"]), run)
         if len(seeds) > 1:
-            out_blob_name["variance"] = _variance_report("name", name_runs)
-        (dump_dir / "06_name.json").write_text(json.dumps(out_blob_name, indent=2, default=str))
+            write_artifact(
+                dump_dir / "06_name.json",
+                {
+                    "stage": "name",
+                    "turns_jsonl": str(turns_path),
+                    "variance": _variance_report("name", name_runs),
+                },
+            )
 
-    print(f"Calibration complete.  Dump: {dump_dir}")
+    write_artifact(dump_dir / _INDEX_FILENAME, run_index)
+    print(f"Calibration complete.  Index: {dump_dir / _INDEX_FILENAME}")
     return 0
 
 

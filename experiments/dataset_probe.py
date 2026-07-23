@@ -685,7 +685,7 @@ def parse_args() -> argparse.Namespace:
         "--debug",
         action="store_true",
         help=(
-            "Set cfg.debug=True so DebugSnapshotWriter.on_session_extracted "
+            "Set cfg.debug=True so on_session_extracted "
             "persists per-session SessionGraphs (with full graph.diagnostics) "
             "under <run_dir>/debug/cycle_<N>/sessions/<id>/. Required to "
             "capture diagnostics that aren't surfaced via _build_session_diagnostics."

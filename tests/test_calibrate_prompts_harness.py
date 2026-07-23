@@ -31,22 +31,30 @@ if str(_SCRIPTS_DEV) not in sys.path:
 import calibrate_prompts  # noqa: E402 (scripts/dev is not a package)
 
 _CANNED_NORMALIZE_RESPONSE = {
+    "stage": "normalize",
     "filtered": [],
     "filter_prompt_used": "normalize_filter.txt",
     "raw_output": "[]",
+    # Every calibration response names the directory the SERVER wrote the
+    # run's artifacts to; the client records that pointer rather than
+    # keeping its own copy of the run.
+    "artifact_dir": "/tmp/paramem-calibration/normalize_1",
 }
 
 
 class TestNormalizeStageNoNameError:
     """--stages normalize must not raise NameError when chunks is empty."""
 
-    def test_normalize_writes_output_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_normalize_records_the_run_in_the_index(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """Invoke main(['--stages','normalize',...]) with _post_stage mocked.
 
         Asserts:
         - No NameError (params_base is bound before the chunk loop)
-        - 05_normalize.json is written to the dump directory
-        - The output file contains the expected 'stage' key
+        - the run is recorded in ``runs.json`` by the directory the SERVER
+          wrote it to — a single-seed run has nothing to compare, so the
+          client writes no file of its own and keeps no copy of the response
         """
         # Minimal snapshot file — content is opaque to the harness (passed as a
         # path string to the server endpoint, not parsed locally).
@@ -97,12 +105,10 @@ class TestNormalizeStageNoNameError:
 
         assert rc == 0, f"Expected rc=0, got {rc}"
 
-        out_file = dump_dir / "05_normalize.json"
-        assert out_file.exists(), "05_normalize.json was not written"
-
-        blob = json.loads(out_file.read_text())
-        assert blob["stage"] == "normalize", f"Unexpected stage in output: {blob.get('stage')!r}"
-        assert blob["snapshot_path"] == str(snapshot)
+        index = json.loads((dump_dir / "runs.json").read_text())
+        assert index["normalize"] == {"None": _CANNED_NORMALIZE_RESPONSE["artifact_dir"]}
+        # Single seed: nothing to compare, so no client-side file at all.
+        assert not (dump_dir / "05_normalize.json").exists()
 
     def test_params_base_bound_before_chunk_loop(self):
         """Unit-level guard: params_base must be referenced in the module source
@@ -308,10 +314,14 @@ class TestAnonymizeStageSpeakerName:
 
 
 class TestSeedFromEnrichLoading:
-    """``--seed-from --stages enrich`` reads prior-stage dumps off disk
-    instead of re-running ``extract``/``anonymize``.  All three regression
-    cases share one real input file + real prompts dir; only the seed
-    dump contents differ.
+    """``--seed-from --stages enrich`` reads the prior EXTRACT dump off
+    disk instead of re-running extraction.
+
+    The graph is the only artifact the client hands over: every stage
+    past ``local_extract`` is entered server-side with that graph as its
+    seed, and the chain re-derives the anonymized facts, the anonymized
+    transcript and the fail-closed decisions by running. The client no
+    longer relays any of them.
     """
 
     _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
@@ -323,46 +333,43 @@ class TestSeedFromEnrichLoading:
         return input_path
 
     @staticmethod
-    def _extract_wrapper_blob() -> dict:
-        """01_extract_chunk_0.json shape: a WRAPPER around candidate_runs."""
+    def _recorded_run() -> dict:
+        """The SERVER's record of an extract run — a calibration response."""
         return {
             "stage": "extract",
-            "chunk_index": 0,
-            "candidate_runs": [
-                {
-                    "seed": None,
-                    "parsed": {
-                        "session_id": "calib-chunk-0",
-                        "timestamp": "2026-07-14T00:00:00Z",
-                        "entities": [
-                            {"name": "Alex", "entity_type": "person", "speaker_id": "speaker0"},
-                            {"name": "Acme Corp", "entity_type": "organization"},
-                        ],
-                        "relations": [
-                            {
-                                "subject": "speaker0",
-                                "predicate": "works_at",
-                                "object": "Acme Corp",
-                                "relation_type": "factual",
-                                "confidence": 0.9,
-                                "speaker_id": "speaker0",
-                            }
-                        ],
-                    },
-                }
-            ],
+            "seed": None,
+            "parsed": {
+                "session_id": "calib-chunk-0",
+                "timestamp": "2026-07-14T00:00:00Z",
+                "entities": [
+                    {"name": "Alex", "entity_type": "person", "speaker_id": "speaker0"},
+                    {"name": "Acme Corp", "entity_type": "organization"},
+                ],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "works_at",
+                        "object": "Acme Corp",
+                        "relation_type": "factual",
+                        "confidence": 0.9,
+                        "speaker_id": "speaker0",
+                    }
+                ],
+            },
         }
 
-    def _run(
-        self, tmp_path: Path, *, anonymize_blob: dict, write_extract: bool = True
-    ) -> tuple[int, MagicMock]:
+    def _run(self, tmp_path: Path, *, write_extract: bool = True) -> tuple[int, MagicMock]:
         seed_from = tmp_path / "seed_from"
         seed_from.mkdir()
         if write_extract:
-            (seed_from / "01_extract_chunk_0.json").write_text(
-                json.dumps(self._extract_wrapper_blob())
+            # The client's index points at the directory the SERVER wrote the
+            # run to; the run itself lives there, in one copy.
+            artifact_dir = tmp_path / "artifacts" / "extract_1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "calibration_extract_1.json").write_text(
+                json.dumps(self._recorded_run())
             )
-        (seed_from / "02_anonymize_chunk_0.json").write_text(json.dumps(anonymize_blob))
+            (seed_from / "runs.json").write_text(json.dumps({"extract": {"0": str(artifact_dir)}}))
 
         dump_dir = tmp_path / "dump"
         dump_dir.mkdir()
@@ -391,111 +398,45 @@ class TestSeedFromEnrichLoading:
             rc = calibrate_prompts.main(argv)
         return rc, fake_post_stage
 
-    def test_anon_facts_pass_through_to_enrich_payload(self, tmp_path: Path):
-        """``/calibrate/anonymize``'s ``anon_facts`` — now fully assembled
-        SERVER-side by ``anonymize`` — is fed STRAIGHT THROUGH
-        to ``/calibrate/enrich``; there is no client-side re-derivation
-        from ``01_extract_chunk_0.json``'s graph any more (that whole
-        primitive-import + table-build + fact-build block was deleted).
+    def test_seeded_stage_posts_the_extract_graph(self, tmp_path: Path):
+        """The seeded stage hands over the graph from the extract dump and
+        nothing else derived from it — no anon facts, no anonymized
+        transcript, no client-side status check. The chain produces those
+        by running.
 
-        Mutation: reintroduce client-side fact building from
-        ``prior_extract``'s graph -> this test fails (the facts payload
-        would differ from — or ignore — ``anon_facts``).
+        Mutation: reintroduce a client-side relay (posting ``facts`` built
+        from the anonymize dump) -> this fails, because the payload would
+        carry a fact list instead of the seed graph.
         """
-        rc, fake_post_stage = self._run(
-            tmp_path,
-            anonymize_blob={
-                "parsed": {
-                    "status": "ok",
-                    "anonymized_transcript": "[user] Person_1 works as an engineer.",
-                    "forward": {"Alex": "Person_1"},
-                    "reverse": {"Person_1": "Alex"},
-                    "anon_facts": [
-                        {
-                            "subject": "speaker0",
-                            "predicate": "works_at",
-                            "object": "Acme Corp",
-                            "relation_type": "factual",
-                            "confidence": 0.9,
-                        }
-                    ],
-                    "norm_stats": {"inverted": 0, "dropped": 0},
-                }
-            },
-        )
+        rc, fake_post_stage = self._run(tmp_path)
         assert rc == 0
         fake_post_stage.assert_called_once()
         args, _kwargs = fake_post_stage.call_args
         assert args[1] == "enrich"
         payload = args[2]
-        assert payload["facts"] == [
-            {
-                "subject": "speaker0",
-                "predicate": "works_at",
-                "object": "Acme Corp",
-                "relation_type": "factual",
-                "confidence": 0.9,
-            }
-        ]
-        assert payload["transcript"] == "[user] Person_1 works as an engineer."
+        assert payload["graph"] == self._recorded_run()["parsed"]
+        assert payload["transcript"] == "[user] Alex works as an engineer at Acme Corp in Berlin."
+        assert "facts" not in payload
+
+    def test_seeded_stage_sends_only_variant_names(self, tmp_path: Path):
+        """Prompt variants travel as ``{production: variant}`` names; the
+        server resolves them against its own calibration prompt directory,
+        so no filesystem path is posted."""
+        rc, fake_post_stage = self._run(tmp_path)
+        assert rc == 0
+        payload = fake_post_stage.call_args[0][2]
+        assert "prompts_dir" not in payload
+        assert isinstance(payload["prompt_variants"], dict)
+        assert all("/" not in name for name in payload["prompt_variants"].values())
 
     def test_missing_extract_dump_does_not_crash(self, tmp_path: Path):
-        """A seed dir with ``02_anonymize_chunk_0.json`` but no
-        ``01_extract_chunk_0.json`` must not crash — ``prior_extract``
-        stays ``None`` and the enrich stage is skipped for that chunk.
+        """A seed dir with no ``runs.json`` must not crash —
+        ``prior_extract`` stays ``None``, the seeded stage is skipped for
+        that chunk, and the operator is told what to run.
 
-        Mutation: drop the ``prior_extract is not None`` guard on the
-        enrich stage -> ``AttributeError: 'NoneType' object has no
-        attribute 'get'`` -> this test fails.
+        Mutation: drop the ``prior_extract is None`` guard -> the payload
+        build raises ``AttributeError`` -> this test fails.
         """
-        rc, fake_post_stage = self._run(
-            tmp_path,
-            anonymize_blob={
-                "parsed": {
-                    "forward": {"Alex": "speaker0"},
-                    "anonymized_transcript": "[user] Person_1 works as an engineer.",
-                }
-            },
-            write_extract=False,
-        )
-        assert rc == 0
-        fake_post_stage.assert_not_called()
-
-    def test_status_failed_aborts_without_a_cloud_call(self, tmp_path: Path):
-        """``status == "failed"`` (anonymizer parse failure) must abort
-        the chunk's enrich stage — no cloud call — matching production's
-        fail-closed abort-on-``"failed"`` in the ``anonymize`` stage
-        (``paramem.graph.stage_anonymize``).
-
-        Mutation: drop the ``status == "failed"`` gate -> the failure is
-        silently treated as "proceed" and ``/calibrate/enrich`` (the
-        cloud call) is posted to anyway -> this test fails.
-        """
-        rc, fake_post_stage = self._run(
-            tmp_path,
-            anonymize_blob={
-                "parsed": {"status": "failed", "anon_facts": [], "anonymized_transcript": ""}
-            },
-        )
-        assert rc == 0
-        fake_post_stage.assert_not_called()
-
-    def test_missing_anonymized_transcript_aborts_without_a_cloud_call(self, tmp_path: Path):
-        """A ``status="ok"`` response with a missing/empty
-        ``anonymized_transcript`` is ALSO fail-closed — the model never
-        authored a safe transcript to send to the cloud, so the chunk's
-        enrich stage must abort with no cloud call, exactly like the
-        ``status == "failed"`` case.
-
-        Mutation: gate only on ``status == "failed"`` (drop the
-        ``anonymized_transcript`` check) -> ``/calibrate/enrich`` is
-        posted to anyway -> this test fails.
-        """
-        rc, fake_post_stage = self._run(
-            tmp_path,
-            anonymize_blob={
-                "parsed": {"status": "ok", "anon_facts": []}
-            },  # no anonymized_transcript
-        )
+        rc, fake_post_stage = self._run(tmp_path, write_extract=False)
         assert rc == 0
         fake_post_stage.assert_not_called()

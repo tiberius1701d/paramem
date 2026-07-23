@@ -1066,41 +1066,19 @@ class GraphMerger:
         return triples
 
     def save_bytes(self) -> bytes:
-        """Return the serialized graph as bytes; mirror of save_graph(path) for in-memory consumers.
+        """Return the serialized graph as bytes for in-memory consumers.
 
-        Produces the same JSON that save_graph would write to disk, but returns
-        the bytes without performing any I/O.  Used by /migration/confirm step 2
-        to capture a point-in-time snapshot of the graph for the pre-migration
-        backup without requiring a temporary file.
+        Produces the same node-link JSON that
+        :func:`~paramem.memory.persistence.save_memory_to_disk` writes, but
+        returns the bytes without performing any I/O.  Used by
+        /migration/confirm to capture a point-in-time snapshot of the graph for
+        the pre-migration backup without requiring a temporary file.
 
         Returns:
             UTF-8-encoded JSON bytes (node-link format, indent=2).
         """
         data = nx.node_link_data(self.graph)
         return json.dumps(data, indent=2).encode("utf-8")
-
-    def save_graph(self, path: str | Path, *, encrypted: bool = True) -> None:
-        """Save cumulative graph to JSON — atomic write, fsynced parent for
-        power-loss safety.
-
-        ``encrypted=True`` (default) routes through the infrastructure
-        envelope — age under Security ON, plaintext under Security OFF.
-        ``encrypted=False`` bypasses the envelope and always writes
-        plaintext; used by debug-directory writers so ``debug/*`` output
-        is uniformly inspectable with ``cat``/``grep`` regardless of the
-        server's Security posture.
-        """
-        from paramem.backup.encryption import write_infra_bytes, write_plaintext_atomic
-
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = nx.node_link_data(self.graph)
-        payload = json.dumps(data, indent=2).encode("utf-8")
-        if encrypted:
-            write_infra_bytes(path, payload)
-        else:
-            write_plaintext_atomic(path, payload)
-        logger.info("Graph saved to %s", path)
 
     def load_graph(self, path: str | Path) -> nx.MultiDiGraph:
         """Load cumulative graph from JSON — transparently decrypts

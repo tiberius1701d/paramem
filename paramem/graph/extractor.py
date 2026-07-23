@@ -2592,138 +2592,150 @@ def normalize_predicates(
             "discards": [],
         }
 
-    normalization_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
-    normalization_system_prompt = _load_prompt(
-        system_filename, prompts_dir=prompts_dir, required=True
-    )
+    # This primitive owns its phase, the way the local extraction primitive
+    # owns ``local_extract``: prompt provenance and every group's raw model
+    # output are captured identically wherever it runs — the graph tier's
+    # production pass and a calibration run alike.  The enclosing
+    # ``extraction_trace`` scope belongs to the pass that calls this.
+    with phase_trace("normalize") as t:
+        normalization_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
+        normalization_system_prompt = _load_prompt(
+            system_filename, prompts_dir=prompts_dir, required=True
+        )
 
-    # --- Build canonical grouping -------------------------------------------
-    groups: dict[tuple[str, str], list[dict]] = {}
-    for rel in relations:
-        s = str(rel.get("subject", ""))
-        o = str(rel.get("object", ""))
-        key = (canonical(s), canonical(o))
-        groups.setdefault(key, []).append(rel)
+        # --- Build canonical grouping -------------------------------------------
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for rel in relations:
+            s = str(rel.get("subject", ""))
+            o = str(rel.get("object", ""))
+            key = (canonical(s), canonical(o))
+            groups.setdefault(key, []).append(rel)
 
-    # Candidate groups: ≥2 distinct canonical predicates on the same (s, o).
-    # Single-predicate groups pass through untouched (no model call).
-    candidate_keys: list[tuple[str, str]] = [
-        key
-        for key, rels in groups.items()
-        if len({canonical(str(r.get("predicate", ""))) for r in rels}) >= 2
-    ]
+        # Candidate groups: ≥2 distinct canonical predicates on the same (s, o).
+        # Single-predicate groups pass through untouched (no model call).
+        candidate_keys: list[tuple[str, str]] = [
+            key
+            for key, rels in groups.items()
+            if len({canonical(str(r.get("predicate", ""))) for r in rels}) >= 2
+        ]
 
-    diagnostics: dict = {
-        "groups_examined": len(groups),
-        "candidate_groups": len(candidate_keys),
-        "groups_with_clusters": 0,
-        "model_calls": 0,
-        "raw_outputs": [],
-        "discards": [],
-    }
+        diagnostics: dict = {
+            "groups_examined": len(groups),
+            "candidate_groups": len(candidate_keys),
+            "groups_with_clusters": 0,
+            "model_calls": 0,
+            "raw_outputs": [],
+            "discards": [],
+        }
 
-    if not candidate_keys:
-        return clusters_by_so, diagnostics
+        if not candidate_keys:
+            t.set_outcome(
+                "no_input",
+                reason="no (subject, object) group carries two or more predicates",
+            )
+            return clusters_by_so, diagnostics
 
-    local_mode = cloud is None
-    # Predicate-normalization is structured extraction: the local path must run on the
-    # base weights (adapter disabled) with the KV cache live (checkpointing off,
-    # restored to entry state on exit).  The cloud path uses the cloud model and
-    # leaves the local model untouched.
-    cm = base_model_inference(model) if local_mode else contextlib.nullcontext()
-    with cm:
-        for key in candidate_keys:
-            rels_for_group = groups[key]
-            # Build canonical → first-seen surface predicate map.
-            pred_surface: dict[str, str] = {}
-            for rel in rels_for_group:
-                can_pred = canonical(str(rel.get("predicate", "")))
-                if can_pred not in pred_surface:
-                    pred_surface[can_pred] = str(rel.get("predicate", ""))
-            preds_to_send = list(pred_surface.values())
+        local_mode = cloud is None
+        # Predicate-normalization is structured extraction: the local path must run on the
+        # base weights (adapter disabled) with the KV cache live (checkpointing off,
+        # restored to entry state on exit).  The cloud path uses the cloud model and
+        # leaves the local model untouched.
+        cm = base_model_inference(model) if local_mode else contextlib.nullcontext()
+        with cm:
+            for key in candidate_keys:
+                rels_for_group = groups[key]
+                # Build canonical → first-seen surface predicate map.
+                pred_surface: dict[str, str] = {}
+                for rel in rels_for_group:
+                    can_pred = canonical(str(rel.get("predicate", "")))
+                    if can_pred not in pred_surface:
+                        pred_surface[can_pred] = str(rel.get("predicate", ""))
+                preds_to_send = list(pred_surface.values())
 
-            rendered = normalization_prompt.format(predicates_json=json.dumps(preds_to_send))
+                rendered = normalization_prompt.format(predicates_json=json.dumps(preds_to_send))
 
-            if local_mode:
-                messages = [
-                    {"role": "system", "content": normalization_system_prompt},
-                    {"role": "user", "content": rendered},
-                ]
-                formatted = tokenizer.apply_chat_template(
-                    adapt_messages(messages, tokenizer),
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                with vram_scope("dedup"):
-                    raw = generate_answer(
-                        model,
-                        tokenizer,
-                        formatted,
-                        max_new_tokens=max_tokens,
-                        temperature=temperature,
-                        seed=seed,
+                if local_mode:
+                    messages = [
+                        {"role": "system", "content": normalization_system_prompt},
+                        {"role": "user", "content": rendered},
+                    ]
+                    formatted = tokenizer.apply_chat_template(
+                        adapt_messages(messages, tokenizer),
+                        tokenize=False,
+                        add_generation_prompt=True,
                     )
-            else:
-                raw = _cloud_call(
-                    rendered,
-                    api_key=cloud["api_key"],
-                    provider=cloud["provider"],
-                    filter_model=cloud["filter_model"],
-                    endpoint=cloud["endpoint"],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system_prompt=normalization_system_prompt,
-                )
-                if raw is None:
-                    diagnostics["raw_outputs"].append("")
-                    continue
-
-            diagnostics["model_calls"] += 1
-            diagnostics["raw_outputs"].append(raw)
-            logger.debug("dedup group %r raw: %s", key, raw[:300] if raw else "")
-
-            # Parse {"clusters": [["predA", "predB"], ...]} schema.
-            raw_clusters: list = []
-            try:
-                json_str = _extract_json_block(raw)
-                data = json.loads(json_str)
-                if isinstance(data, dict):
-                    raw_clusters = data.get("clusters", [])
-                if not isinstance(raw_clusters, list):
-                    raw_clusters = []
-            except (json.JSONDecodeError, ValueError) as exc:
-                logger.warning("dedup parse failed for group %r: %s", key, exc)
-
-            # Ground cluster members against input predicates for this group.
-            input_can_preds = set(pred_surface.keys())
-            grounded_clusters: list[list[str]] = []
-            for cluster in raw_clusters:
-                if not isinstance(cluster, list):
-                    continue
-                grounded = [
-                    can_p
-                    for p in cluster
-                    for can_p in (canonical(str(p)),)
-                    if can_p in input_can_preds
-                ]
-                # Always record hallucinated predicates (those not in input) in
-                # discards — regardless of whether the cluster passes the ≥2
-                # grounded check.
-                for p in cluster:
-                    can_p = canonical(str(p))
-                    if can_p not in input_can_preds and p:
-                        diagnostics["discards"].append(
-                            {
-                                "reason": "hallucinated_predicate",
-                                "predicate": str(p),
-                                "group": list(key),
-                            }
+                    with vram_scope("dedup"):
+                        raw = generate_answer(
+                            model,
+                            tokenizer,
+                            formatted,
+                            max_new_tokens=max_tokens,
+                            temperature=temperature,
+                            seed=seed,
                         )
-                if len(grounded) >= 2:
-                    grounded_clusters.append(grounded)
+                else:
+                    raw = _cloud_call(
+                        rendered,
+                        api_key=cloud["api_key"],
+                        provider=cloud["provider"],
+                        filter_model=cloud["filter_model"],
+                        endpoint=cloud["endpoint"],
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        system_prompt=normalization_system_prompt,
+                    )
+                    if raw is None:
+                        diagnostics["raw_outputs"].append("")
+                        continue
 
-            if grounded_clusters:
-                clusters_by_so[key] = grounded_clusters
-                diagnostics["groups_with_clusters"] += 1
+                diagnostics["model_calls"] += 1
+                diagnostics["raw_outputs"].append(raw)
+                logger.debug("dedup group %r raw: %s", key, raw[:300] if raw else "")
 
+                # Parse {"clusters": [["predA", "predB"], ...]} schema.
+                raw_clusters: list = []
+                try:
+                    json_str = _extract_json_block(raw)
+                    data = json.loads(json_str)
+                    if isinstance(data, dict):
+                        raw_clusters = data.get("clusters", [])
+                    if not isinstance(raw_clusters, list):
+                        raw_clusters = []
+                except (json.JSONDecodeError, ValueError) as exc:
+                    logger.warning("dedup parse failed for group %r: %s", key, exc)
+
+                # Ground cluster members against input predicates for this group.
+                input_can_preds = set(pred_surface.keys())
+                grounded_clusters: list[list[str]] = []
+                for cluster in raw_clusters:
+                    if not isinstance(cluster, list):
+                        continue
+                    grounded = [
+                        can_p
+                        for p in cluster
+                        for can_p in (canonical(str(p)),)
+                        if can_p in input_can_preds
+                    ]
+                    # Always record hallucinated predicates (those not in input) in
+                    # discards — regardless of whether the cluster passes the ≥2
+                    # grounded check.
+                    for p in cluster:
+                        can_p = canonical(str(p))
+                        if can_p not in input_can_preds and p:
+                            diagnostics["discards"].append(
+                                {
+                                    "reason": "hallucinated_predicate",
+                                    "predicate": str(p),
+                                    "group": list(key),
+                                }
+                            )
+                    if len(grounded) >= 2:
+                        grounded_clusters.append(grounded)
+
+                if grounded_clusters:
+                    clusters_by_so[key] = grounded_clusters
+                    diagnostics["groups_with_clusters"] += 1
+
+        t.set_raw("\n---\n".join(diagnostics["raw_outputs"]))
+        t.set_parsed({k: v for k, v in diagnostics.items() if k != "raw_outputs"})
     return clusters_by_so, diagnostics

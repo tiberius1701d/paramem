@@ -63,6 +63,7 @@ def extract_name_via_llm(
             all searched directories.
     """
     from paramem.evaluation.recall import generate_answer
+    from paramem.graph.phase_trace import phase_trace
     from paramem.graph.prompts import _load_prompt
 
     # Build transcript — filter to user turns only when requested.
@@ -77,52 +78,59 @@ def extract_name_via_llm(
 
     prompts_dir_path: Path | None = Path(prompts_dir) if prompts_dir is not None else None
 
-    # required=True: a missing prompt file surfaces immediately rather than
-    # silently yielding an empty prompt in production.
-    system_msg = _load_prompt(
-        system_filename,
-        prompts_dir=prompts_dir_path,
-        required=True,
-    )
-    user_template = _load_prompt(
-        prompt_filename,
-        prompts_dir=prompts_dir_path,
-        required=True,
-    )
+    # This primitive owns its phase, the way the local extraction primitive
+    # owns ``local_extract`` — so the prompt provenance and raw output are
+    # captured identically wherever it runs, production enrollment and
+    # calibration alike, and neither caller has to synthesise a phase
+    # record around it.
+    with phase_trace("name_extract") as t:
+        # required=True: a missing prompt file surfaces immediately rather
+        # than silently yielding an empty prompt in production.
+        system_msg = _load_prompt(
+            system_filename,
+            prompts_dir=prompts_dir_path,
+            required=True,
+        )
+        user_template = _load_prompt(
+            prompt_filename,
+            prompts_dir=prompts_dir_path,
+            required=True,
+        )
 
-    user_msg = user_template.format(transcript=transcript_text)
+        user_msg = user_template.format(transcript=transcript_text)
 
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    # Resolve inference params.
-    p = params or {}
-    temperature = p.get("temperature", 0.0)
-    if temperature is None:
-        temperature = 0.0
-    max_new_tokens = p.get("max_tokens", 64)
-    if max_new_tokens is None:
-        max_new_tokens = 64
-    seed = p.get("seed", None)
+        # Resolve inference params.
+        p = params or {}
+        temperature = p.get("temperature", 0.0)
+        if temperature is None:
+            temperature = 0.0
+        max_new_tokens = p.get("max_tokens", 64)
+        if max_new_tokens is None:
+            max_new_tokens = 64
+        seed = p.get("seed", None)
 
-    result = generate_answer(
-        model,
-        tokenizer,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=float(temperature),
-        seed=seed,
-    )
-    raw_output = result.strip().strip('"').strip("'").strip(".")
+        result = generate_answer(
+            model,
+            tokenizer,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=float(temperature),
+            seed=seed,
+        )
+        raw_output = result.strip().strip('"').strip("'").strip(".")
 
-    if not raw_output or raw_output.upper() == "NONE" or len(raw_output) > 30:
-        return None, raw_output
+        words = raw_output.split()
+        rejected = (
+            not raw_output or raw_output.upper() == "NONE" or len(raw_output) > 30 or len(words) > 3
+        )
+        name = None if rejected else raw_output
+        t.set_raw(raw_output)
+        t.set_parsed({"name": name, "turns_considered": len(lines)})
 
-    words = raw_output.split()
-    if len(words) > 3 or len(words) == 0:
-        return None, raw_output
-
-    return raw_output, raw_output
+    return name, raw_output

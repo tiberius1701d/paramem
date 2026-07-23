@@ -17,37 +17,45 @@ left to the existing integration suite + manual calibration runs.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
-from pydantic import ValidationError
 
 from paramem.graph.extraction_pipeline import ExtractionPipeline
+from paramem.graph.phase_trace import (
+    _STOP_AT,
+    PHASE_NAMES,
+    chain_seed,
+    chain_start,
+    phase_trace,
+)
+from paramem.graph.prompts import _load_prompt
+from paramem.graph.schema import SessionGraph
 from paramem.server.calibrate import (
-    CalibrateAnonymizeRequest,
-    CalibrateEnrichRequest,
-    CalibrateExtractRequest,
+    _CHAIN,
+    CalibrateChainRequest,
     CalibrateNameRequest,
     CalibrateNormalizeRequest,
     CalibrateParams,
-    CalibratePlausibilityRequest,
-    CalibrateProceduralRequest,
     _effective_params,
     _preflight,
     _production_turn_markers,
     _require_turn_marked_transcript,
     _run_calibration,
-    calibrate_anonymize,
-    calibrate_enrich,
-    calibrate_extract,
+    calibrate_chain,
     calibrate_name,
     calibrate_normalize,
-    calibrate_plausibility,
-    calibrate_procedural,
 )
-from paramem.server.config import CloudConfig, SanitizationConfig
+from paramem.server.config import CloudConfig, PathsConfig, SanitizationConfig
+
+
+def _empty_graph() -> SessionGraph:
+    """The shape every mocked pipeline entry returns."""
+    return SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
 
 
 def _state_disabled() -> dict:
@@ -57,6 +65,7 @@ def _state_disabled() -> dict:
         consolidation=consolidation_cfg,
         sanitization=SanitizationConfig(),
         cloud=CloudConfig(),
+        paths=PathsConfig(),
     )
     return {
         "config": config,
@@ -69,15 +78,16 @@ def _state_disabled() -> dict:
 def _state_enabled() -> dict:
     consolidation_cfg = SimpleNamespace(calibrate_endpoint_enabled=True)
     # SanitizationConfig() carries the production default ``scrub`` list
-    # (SanitizationConfig._DEFAULT_SCRUB) — calibrate_anonymize sources
-    # ``scrub`` from here, the same policy knob every production call
-    # site reads (see calibrate_anonymize's docstring).
+    # (SanitizationConfig._DEFAULT_SCRUB) — the chain's anonymize step
+    # sources ``scrub`` from the server config, the same policy knob every
+    # production call site reads; it is never a request field.
     # ``cloud`` is the ONE cloud master switch (CloudConfig, ship default OFF);
     # the enrich tests flip ``config.cloud.enabled`` per case.
     config = SimpleNamespace(
         consolidation=consolidation_cfg,
         sanitization=SanitizationConfig(),
         cloud=CloudConfig(),
+        paths=PathsConfig(),
     )
     return {
         "config": config,
@@ -87,6 +97,50 @@ def _state_enabled() -> dict:
         "consolidation_loop": MagicMock(),
         "model_id": "test-model",
     }
+
+
+def _chain_side_effect(phase: str, extra=None):
+    """A pipeline stand-in that behaves like a real chain run.
+
+    A real run opens the phase it is stopped at; the calibration substrate
+    refuses (400) when the declared step left no record. A double that
+    skips the phase would therefore be testing the refusal, not the wiring
+    it is aimed at.
+    """
+
+    def _run(*_args, **_kwargs):
+        with phase_trace(phase):
+            pass
+        if extra is not None:
+            extra(*_args, **_kwargs)
+        return _empty_graph()
+
+    return _run
+
+
+def _stub_refiner() -> MagicMock:
+    """A GraphTierRefiner stand-in returning the pass's diagnostics shape.
+
+    The real pass needs a loaded model; what these tests pin is that the
+    endpoint routes through the loop's construction site and reports what
+    the pass returned, not how the pass itself clusters.
+    """
+    refiner = MagicMock()
+
+    def _run_normalization():
+        with phase_trace("normalize"):
+            pass
+        return {
+            "groups_examined": 1,
+            "groups_collapsed": 0,
+            "edges_retired": 0,
+            "chunks": 1,
+            "skipped": False,
+            "skip_reason": None,
+        }
+
+    refiner.run_normalization.side_effect = _run_normalization
+    return refiner
 
 
 def _peft_model_mock() -> MagicMock:
@@ -143,9 +197,8 @@ class TestRequireTurnMarkedTranscript:
     """Unit coverage for the shared turn-marking gate.
 
     Every ``/calibrate/*`` endpoint that accepts a ``transcript`` field
-    routes through this check (see ``TestCalibrateExtract`` /
-    ``TestCalibrateProcedural`` / ``TestCalibrateAnonymize`` /
-    ``TestCalibratePlausibility`` below for the per-endpoint 400s).
+    routes through this check (see ``TestChainGuards`` below for the
+    per-use-case 400s).
     """
 
     def test_markers_derived_from_format_turns(self):
@@ -188,942 +241,397 @@ class TestRequireTurnMarkedTranscript:
         assert exc.value.status_code == 400
 
 
-class TestCalibrateExtract:
-    def test_disabled_404(self):
-        req = CalibrateExtractRequest(
-            transcript="[user] x",
-            speaker_id="speaker0",
-            source_type="document",
-        )
+class TestChainDeclarations:
+    """The declaration table is the contract every chain endpoint runs on.
+
+    A typo'd phase name or a non-existent pipeline entry would otherwise
+    surface only at request time, on the operator's machine, after the
+    model is loaded.
+    """
+
+    def test_every_declared_phase_is_a_real_phase_name(self):
+        for use_case, decl in _CHAIN.items():
+            assert decl.start in PHASE_NAMES, use_case
+            assert decl.stop is None or decl.stop in PHASE_NAMES, use_case
+
+    def test_every_declared_entry_is_a_real_pipeline_method(self):
+        for use_case, decl in _CHAIN.items():
+            assert callable(getattr(ExtractionPipeline, decl.entry, None)), use_case
+
+    def test_injects_vocabulary_is_closed(self):
+        for use_case, decl in _CHAIN.items():
+            assert decl.injects in {"transcript", "graph"}, use_case
+
+    def test_graph_injecting_use_cases_enter_past_local_extract(self):
+        """A use case that injects a graph must enter the chain AFTER the
+        step that would have produced it — otherwise the seed is discarded
+        by the local extractor's own rebind."""
+        for use_case, decl in _CHAIN.items():
+            if decl.injects == "graph":
+                assert decl.start != "local_extract", use_case
+
+    def test_only_the_open_stop_use_case_leaves_stop_unset(self):
+        """Exactly one use case exists to inspect an operator-chosen point
+        of a transcript-fed run; every other endpoint fixes its own stop."""
+        open_stop = [u for u, d in _CHAIN.items() if d.stop is None]
+        assert open_stop == ["extract"]
+
+
+@pytest.mark.parametrize("use_case", sorted(_CHAIN))
+class TestChainGuards:
+    """Every unusable input is refused before any inference runs — the
+    same guard for every use case, since they share one handler."""
+
+    def _req(self, use_case: str, **overrides) -> CalibrateChainRequest:
+        fields: dict = {
+            "transcript": "[user] Should I follow up with Alex tomorrow?",
+            "speaker_id": "speaker0",
+        }
+        if _CHAIN[use_case].injects == "graph":
+            fields["graph"] = {"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"}
+        fields.update(overrides)
+        return CalibrateChainRequest(**fields)
+
+    def test_disabled_404(self, use_case):
         with pytest.raises(HTTPException) as exc:
-            calibrate_extract(_state_disabled(), req)
+            calibrate_chain(_state_disabled(), use_case, self._req(use_case))
         assert exc.value.status_code == 404
 
-    def test_consolidating_503(self):
+    def test_consolidating_503(self, use_case):
         state = _state_enabled()
         state["consolidating"] = True
-        req = CalibrateExtractRequest(
-            transcript="[user] x",
-            speaker_id="speaker0",
-            source_type="document",
-        )
         with pytest.raises(HTTPException) as exc:
-            calibrate_extract(state, req)
+            calibrate_chain(state, use_case, self._req(use_case))
         assert exc.value.status_code == 503
 
-    def test_debug_writer_invoked_with_response_and_session_id(self):
-        """calibrate_extract routes its assembled response through the debug hook.
-
-        Regression guard for the call site at calibrate.py's
-        ``loop._debug_writer.on_calibrate_extract(response, session_id=...)``
-        line: DebugSnapshotWriter.on_calibrate_extract's own file-write
-        behaviour is covered by
-        tests/test_consolidation.py::TestCalibrateExtractDebugSnapshot, but
-        nothing previously asserted that calibrate_extract actually calls it.
-        """
-        from paramem.graph.schema import SessionGraph
-
+    def test_unmarked_transcript_400(self, use_case):
         state = _state_enabled()
-        graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
-        state["consolidation_loop"].extraction.run.return_value = graph
-        req = CalibrateExtractRequest(
-            transcript="[user] hello there",
-            speaker_id="speaker0",
-            source_type="transcript",
-        )
-
-        result = calibrate_extract(state, req)
-
-        writer = state["consolidation_loop"]._debug_writer
-        assert writer.on_calibrate_extract.call_count == 1
-        call = writer.on_calibrate_extract.call_args
-        assert call.args[0] == result
-        assert call.kwargs["session_id"] == req.session_id
-
-    def test_unmarked_transcript_raises_400(self):
-        """A bare, unmarked transcript is rejected before the pipeline runs.
-
-        Mutation: remove the ``_require_turn_marked_transcript`` call from
-        ``calibrate_extract`` -> this test fails (no 400 raised, or the
-        pipeline mock gets invoked on unmarked input).
-        """
-        state = _state_enabled()
-        req = CalibrateExtractRequest(
-            transcript="Should I follow up with Alex tomorrow?",
-            speaker_id="speaker0",
-            source_type="transcript",
-        )
+        req = self._req(use_case, transcript="Should I follow up with Alex tomorrow?")
         with pytest.raises(HTTPException) as exc:
-            calibrate_extract(state, req)
+            calibrate_chain(state, use_case, req)
         assert exc.value.status_code == 400
         assert "turn-marked" in exc.value.detail.lower()
         assert not state["consolidation_loop"].extraction.run.called
 
-    def test_marked_transcript_reaches_pipeline(self):
-        """A turn-marked transcript clears the gate and reaches the pipeline.
-
-        Mutation: make the gate reject marked transcripts too (e.g. require
-        an exact-match on a different marker set) -> this test fails
-        because ``loop.extraction.run`` is never reached.
-        """
-        from paramem.graph.schema import SessionGraph
-
+    def test_empty_speaker_id_400(self, use_case):
         state = _state_enabled()
-        graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
-        state["consolidation_loop"].extraction.run.return_value = graph
-        req = CalibrateExtractRequest(
-            transcript="[user] Should I follow up with Alex tomorrow?",
-            speaker_id="speaker0",
-            source_type="transcript",
-        )
-        result = calibrate_extract(state, req)
-        assert state["consolidation_loop"].extraction.run.called
-        assert result["stage"] == "extract"
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, use_case, self._req(use_case, speaker_id=""))
+        assert exc.value.status_code == 400
+        assert "speaker_id" in exc.value.detail
 
-    def test_prompt_override_reaches_model(self, tmp_path):
-        """A prompts_dir + filename override actually drives the model call,
-        with a REAL ``ExtractionPipeline`` (not a mocked ``.run``).
-
-        Regression guard for the ``_run_calibration(entry="pipeline")``
-        conversion: provenance must come from the ``local_extract`` phase
-        record the pipeline itself opens (via ``_load_prompt``'s
-        ``record_prompt`` call) — never a hand-built ``prompts=[...]``
-        literal. Mirrors
-        ``TestCalibratePlausibility::test_prompt_override_reaches_model``.
-        ``stop_phase="local_extract"`` keeps the run cheap (no cloud/second-
-        order passes).
-        """
-        import unittest.mock as _mock
-
-        from paramem.graph.extraction_pipeline import ExtractionConfig
-        from paramem.graph.prompts import _load_prompt
-
+    def test_missing_prompt_variant_400(self, use_case, tmp_path):
+        """A named variant that does not exist in the calibration prompt
+        directory is refused — calibration never silently falls back to the
+        shipped prompt of the same name."""
         state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        sentinel = "SENTINEL-EXTRACT-OVERRIDE"
-        (prompts_dir / "my_extract.txt").write_text(
-            f"{sentinel}\n{{speaker_context}}\ntranscript: {{transcript}}"
-        )
-        (prompts_dir / "my_extract_system.txt").write_text("SENTINEL-EXTRACT-SYSTEM")
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        req = self._req(use_case, prompt_variants={"extraction.txt": "typo_variant.txt"})
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, use_case, req)
+        assert exc.value.status_code == 400
+        assert "variant not found" in exc.value.detail.lower()
+        assert not state["consolidation_loop"].extraction.run.called
 
-        pipeline = ExtractionPipeline(
-            state["model"], state["tokenizer"], config=ExtractionConfig(scrub=set())
-        )
-        loop = MagicMock()
-        loop.extraction = pipeline
-        loop.model = state["model"]
-        state["consolidation_loop"] = loop
 
-        captured: list[list[dict]] = []
+class TestChainSeedGuards:
+    """Guards specific to the use cases that inject a graph."""
 
-        def _capture_template(messages, **kw):
-            captured.append(messages)
-            return "formatted-prompt"
+    _GRAPH_USE_CASES = sorted(u for u, d in _CHAIN.items() if d.injects == "graph")
 
-        state["tokenizer"].apply_chat_template.side_effect = _capture_template
+    @pytest.mark.parametrize("use_case", _GRAPH_USE_CASES)
+    def test_missing_graph_400(self, use_case):
+        state = _state_enabled()
+        req = CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, use_case, req)
+        assert exc.value.status_code == 400
+        assert _CHAIN[use_case].start in exc.value.detail
+        assert not state["consolidation_loop"].extraction.run.called
 
-        req = CalibrateExtractRequest(
-            transcript="[user] hello there",
+    @pytest.mark.parametrize("use_case", _GRAPH_USE_CASES)
+    def test_invalid_graph_400(self, use_case):
+        state = _state_enabled()
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
             speaker_id="speaker0",
-            source_type="transcript",
-            prompts_dir=str(prompts_dir),
-            extraction_prompt_filename="my_extract.txt",
-            extraction_system_prompt_filename="my_extract_system.txt",
-            stop_phase="local_extract",
+            graph={"not_a": "session graph"},
         )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, use_case, req)
+        assert exc.value.status_code == 400
+        assert "SessionGraph" in exc.value.detail
 
-        with (
-            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
-            _mock.patch(
-                "paramem.graph.extractor.generate_answer",
-                return_value='{"entities": [], "relations": []}',
-            ),
-        ):
-            result = calibrate_extract(state, req)
-
-        assert result["stage"] == "extract"
-        assert captured, "apply_chat_template was never called"
-        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
-        assert sentinel in user_content, (
-            f"Model received default prompt instead of override: {user_content!r}"
-        )
-
-        # Reported provenance comes from the real phase-trace record
-        # (populated by _load_prompt's own record_prompt call inside
-        # _generate_extraction), not a hand-built _read_prompt literal.
-        expected = _load_prompt("my_extract.txt", prompts_dir=prompts_dir, required=True)
-        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        shas = {p["sha"] for p in result["prompts"]}
-        templates = {p["template"] for p in result["prompts"]}
-        assert expected_sha in shas
-        assert expected in templates
-
-
-class TestCalibrateProceduralRequest:
-    """Schema-level tests for CalibrateProceduralRequest (no GPU)."""
-
-    def test_defaults(self):
-        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="speaker0")
-        assert req.source_type == "transcript"
-        assert req.session_id == "calib"
-        assert req.speaker_name is None
-        assert req.prompts_dir is None
-        assert req.procedural_prompt_filename is None
-        assert req.procedural_system_prompt_filename is None
-
-    def test_source_type_pattern_rejects_bad_value(self):
-        with pytest.raises(ValidationError):
-            CalibrateProceduralRequest(
-                transcript="[user] x", speaker_id="speaker0", source_type="voice"
+    def test_transcript_use_cases_need_no_graph(self):
+        for use_case, decl in _CHAIN.items():
+            if decl.injects != "transcript":
+                continue
+            state = _state_enabled()
+            state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect(
+                decl.stop or decl.start
             )
+            state["consolidation_loop"].extraction.run_procedural.side_effect = _chain_side_effect(
+                decl.stop or decl.start
+            )
+            result = calibrate_chain(
+                state,
+                use_case,
+                CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
+            )
+            assert result["stage"] == use_case
 
 
-class TestCalibrateProcedural:
-    def test_disabled_404(self):
-        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="speaker0")
-        with pytest.raises(HTTPException) as exc:
-            calibrate_procedural(_state_disabled(), req)
-        assert exc.value.status_code == 404
+class TestChainDispatch:
+    """What the handler hands the chain: the declared entry, the declared
+    start (with the validated seed), and the declared stop."""
 
-    def test_consolidating_503(self):
+    def _capturing_state(self, captured: dict) -> dict:
+        """State whose pipeline records the chain-entry request it sees."""
         state = _state_enabled()
-        state["consolidating"] = True
-        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="speaker0")
-        with pytest.raises(HTTPException) as exc:
-            calibrate_procedural(state, req)
-        assert exc.value.status_code == 503
 
-    def test_empty_speaker_id_400(self):
-        state = _state_enabled()
-        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="")
-        with pytest.raises(HTTPException) as exc:
-            calibrate_procedural(state, req)
-        assert exc.value.status_code == 400
-        assert "speaker_id" in exc.value.detail.lower()
+        def _record(*_args, **_kwargs):
+            captured["start"] = chain_start()
+            captured["seed"] = chain_seed()
+            # No public reader for the requested stop: production reads only
+            # whether it FIRED (chain_stopped), which a mocked run never
+            # does. The request itself is what this asserts.
+            captured["stop"] = _STOP_AT.get()
+            captured["kwargs"] = _kwargs
+            with phase_trace(captured["stop"] or captured["start"]):
+                pass
+            return _empty_graph()
 
-    def test_unmarked_transcript_raises_400(self):
-        """Mutation: remove the gate call from ``calibrate_procedural`` ->
-        this test fails (no 400, or the pipeline mock gets invoked)."""
-        state = _state_enabled()
-        req = CalibrateProceduralRequest(
-            transcript="My sister lives in Frankfurt.", speaker_id="speaker0"
-        )
-        with pytest.raises(HTTPException) as exc:
-            calibrate_procedural(state, req)
-        assert exc.value.status_code == 400
-        assert "turn-marked" in exc.value.detail.lower()
-        assert not state["consolidation_loop"].extraction.run_procedural.called
+        state["consolidation_loop"].extraction.run.side_effect = _record
+        state["consolidation_loop"].extraction.run_procedural.side_effect = _record
+        return state
 
-    def test_marked_transcript_reaches_pipeline(self):
-        """Mutation: make the gate reject marked transcripts too -> this
-        test fails because ``loop.extraction.run_procedural`` is never
-        reached."""
-        from paramem.graph.schema import SessionGraph
+    @pytest.mark.parametrize("use_case", sorted(_CHAIN))
+    def test_declared_entry_is_the_one_called(self, use_case):
+        state = self._capturing_state({})
+        fields: dict = {"transcript": "[user] hi there", "speaker_id": "speaker0"}
+        if _CHAIN[use_case].injects == "graph":
+            fields["graph"] = {"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"}
+        calibrate_chain(state, use_case, CalibrateChainRequest(**fields))
+        entry = getattr(state["consolidation_loop"].extraction, _CHAIN[use_case].entry)
+        assert entry.called
 
-        state = _state_enabled()
-        graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
-        state["consolidation_loop"].extraction.run_procedural.return_value = graph
-        req = CalibrateProceduralRequest(
-            transcript="[user] My sister lives in Frankfurt.", speaker_id="speaker0"
-        )
-        result = calibrate_procedural(state, req)
-        assert state["consolidation_loop"].extraction.run_procedural.called
-        assert result["stage"] == "procedural"
+    @pytest.mark.parametrize("use_case", sorted(_CHAIN))
+    def test_declared_start_and_stop_are_opened(self, use_case):
+        captured: dict = {}
+        state = self._capturing_state(captured)
+        decl = _CHAIN[use_case]
+        fields: dict = {"transcript": "[user] hi there", "speaker_id": "speaker0"}
+        if decl.injects == "graph":
+            fields["graph"] = {"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"}
+        calibrate_chain(state, use_case, CalibrateChainRequest(**fields))
+        assert captured["start"] == decl.start
+        assert captured["stop"] == decl.stop
 
-    def test_prompt_override_reaches_model(self, tmp_path):
-        """A prompts_dir + filename override actually drives the model call,
-        with a REAL ``ExtractionPipeline`` (not a mocked ``.run_procedural``).
-
-        Regression guard for the ``_run_calibration(entry="pipeline")``
-        conversion: procedural extraction now runs through the shared
-        ``_run_local_extraction`` primitive inside ``extract_procedural_graph``,
-        which self-traces the ``procedural_extract`` phase — proven here by
-        asserting ``result["phases"]`` carries that record.  Provenance
-        comes from the real phase-trace record (``_load_prompt``'s own
-        ``record_prompt`` call), never a hand-built ``prompts=[...]``
-        literal.
-        """
-        import unittest.mock as _mock
-
-        from paramem.graph.extraction_pipeline import ExtractionConfig
-        from paramem.graph.prompts import _load_prompt
-
-        state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        sentinel = "SENTINEL-PROCEDURAL-OVERRIDE"
-        (prompts_dir / "my_procedural.txt").write_text(
-            f"{sentinel}\n{{speaker_context}}\ntranscript: {{transcript}}"
-        )
-        (prompts_dir / "my_procedural_system.txt").write_text("SENTINEL-PROCEDURAL-SYSTEM")
-
-        pipeline = ExtractionPipeline(
-            state["model"], state["tokenizer"], config=ExtractionConfig(scrub=set())
-        )
-        loop = MagicMock()
-        loop.extraction = pipeline
-        loop.model = state["model"]
-        state["consolidation_loop"] = loop
-
-        captured: list[list[dict]] = []
-
-        def _capture_template(messages, **kw):
-            captured.append(messages)
-            return "formatted-prompt"
-
-        state["tokenizer"].apply_chat_template.side_effect = _capture_template
-
-        req = CalibrateProceduralRequest(
-            transcript="[user] hello there",
+    def test_graph_seed_reaches_the_chain_validated(self):
+        """The seed the chain receives is the parsed SessionGraph, not the
+        raw request dict — the chain seeds StageState.graph with it."""
+        captured: dict = {}
+        state = self._capturing_state(captured)
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
             speaker_id="speaker0",
-            source_type="transcript",
-            prompts_dir=str(prompts_dir),
-            procedural_prompt_filename="my_procedural.txt",
-            procedural_system_prompt_filename="my_procedural_system.txt",
+            graph={"session_id": "seeded", "timestamp": "2026-01-01T00:00:00Z"},
         )
+        calibrate_chain(state, "anonymize", req)
+        assert isinstance(captured["seed"], SessionGraph)
+        assert captured["seed"].session_id == "seeded"
 
-        with (
-            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
-            _mock.patch(
-                "paramem.graph.extractor.generate_answer",
-                return_value='{"entities": [], "relations": []}',
-            ),
-        ):
-            result = calibrate_procedural(state, req)
-
-        assert result["stage"] == "procedural"
-        assert captured, "apply_chat_template was never called"
-        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
-        assert sentinel in user_content, (
-            f"Model received default prompt instead of override: {user_content!r}"
+    def test_transcript_use_case_seeds_nothing(self):
+        captured: dict = {}
+        state = self._capturing_state(captured)
+        calibrate_chain(
+            state,
+            "extract",
+            CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
         )
+        assert captured["seed"] is None
 
-        expected = _load_prompt("my_procedural.txt", prompts_dir=prompts_dir, required=True)
-        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        shas = {p["sha"] for p in result["prompts"]}
-        templates = {p["template"] for p in result["prompts"]}
-        assert result["prompts"], "procedural stage must surface prompt provenance"
-        assert expected_sha in shas
-        assert expected in templates
+    def test_operator_stop_honoured_only_where_the_declaration_leaves_it_open(self):
+        captured: dict = {}
+        state = self._capturing_state(captured)
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            stop_phase="second_order_extract",
+        )
+        calibrate_chain(state, "extract", req)
+        assert captured["stop"] == "second_order_extract"
 
-        # Proves self-tracing: extract_procedural_graph opens its own
-        # extraction_trace() and records a "procedural_extract" phase that
-        # nest-no-ops onto _run_calibration's outer trace.
-        phase_names = {p.get("name") for p in result["phases"]}
-        assert "procedural_extract" in phase_names
+    def test_operator_stop_ignored_where_the_endpoint_fixes_one(self):
+        captured: dict = {}
+        state = self._capturing_state(captured)
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            graph={"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"},
+            stop_phase="second_order_extract",
+        )
+        calibrate_chain(state, "plausibility", req)
+        assert captured["stop"] == "deanon_plausibility"
 
+    def test_run_opens_a_calibration_scope_under_the_calibration_root(self, tmp_path):
+        """The run's artifacts are directed at a per-run directory under
+        paths.calibration — so a production hook firing DURING the run (the
+        graph tier's normalization pass writes through the same writer)
+        lands there too, independently of the production debug switch."""
+        from paramem.utils.artifacts import _CALIBRATION_ROOT
 
-class TestCalibrateAnonymize:
-    def test_invalid_graph_400(self, tmp_path):
         state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "anonymization.txt").write_text("x")
-        req = CalibrateAnonymizeRequest(
-            graph={"not": "a valid sessiongraph"},
-            transcript="[user] x",
-            prompts_dir=str(prompts_dir),
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        seen: dict = {}
+
+        def _capture(*_args, **_kwargs):
+            seen["root"] = _CALIBRATION_ROOT.get()
+
+        state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect(
+            "local_extract", _capture
         )
-        with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize(state, req)
-        assert exc.value.status_code == 400
-
-    def test_disabled_404(self):
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] x",
+        calibrate_chain(
+            state,
+            "extract",
+            CalibrateChainRequest(transcript="[user] hello there", speaker_id="speaker0"),
         )
-        with pytest.raises(HTTPException) as exc:
-            calibrate_anonymize(_state_disabled(), req)
-        assert exc.value.status_code == 404
 
-    def test_prompt_override_reaches_model(self, tmp_path):
-        """A prompts_dir + filename override actually drives the model call.
+        assert seen["root"] is not None
+        assert seen["root"].parent == tmp_path / "artifacts"
+        assert seen["root"].name.startswith("extract_")
+        # Scope closed on the way out — it never leaks past the run.
+        assert _CALIBRATION_ROOT.get() is None
 
-        Regression guard: anonymize_transcript previously ignored
-        prompts_dir and always loaded configs/prompts/anonymization.txt, so
-        the override was cosmetic (displayed but not executed).  This asserts
-        the SENTINEL override template is what apply_chat_template receives.
+    def test_result_is_emitted_through_the_one_writer(self):
+        """The response goes to the shared artifact hook — the single surface
+        for pipeline artifacts — not to a second writer owned by this module.
+
+        Mutation: reintroduce a private write in calibrate.py -> the hook is
+        never called and this fails.
         """
-        import unittest.mock as _mock
-
         state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        sentinel = "SENTINEL-ANON-OVERRIDE"
-        (prompts_dir / "my_anon.txt").write_text(
-            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
-        )
+        state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect("local_extract")
+        req = CalibrateChainRequest(transcript="[user] hello there", speaker_id="speaker0")
 
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] hello there",
-            prompts_dir=str(prompts_dir),
-            anonymization_prompt_filename="my_anon.txt",
-        )
+        with patch("paramem.server.calibrate.on_calibration_result") as hook:
+            result = calibrate_chain(state, "extract", req)
 
-        captured: list[list[dict]] = []
+        assert hook.call_count == 1
+        assert hook.call_args.args[0] == result
 
-        def _capture_template(messages, **kw):
-            captured.append(messages)
-            return "formatted-prompt"
 
-        state["tokenizer"].apply_chat_template.side_effect = _capture_template
+class TestDeclaredStepUnreached:
+    """A calibration promises ONE step's output. When the configured chain
+    cannot reach that step, the operator must get a refusal naming the gap
+    — never a 200 whose provenance is silently empty.
 
-        valid_json = '{"mapping": {}, "anonymized_transcript": "[user] hello there"}'
-        with (
-            _mock.patch("paramem.cloud.anonymize.adapt_messages", side_effect=lambda m, t: m),
-            _mock.patch("paramem.cloud.anonymize.generate_answer", return_value=valid_json),
-        ):
-            result = calibrate_anonymize(state, req)
-
-        assert result["stage"] == "anonymize"
-        assert captured, "apply_chat_template was never called"
-        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
-        assert sentinel in user_content, (
-            f"Model received default prompt instead of override: {user_content!r}"
-        )
-
-    def test_runs_on_base_weights(self):
-        """calibrate_anonymize disables the active adapter around the model call.
-
-        Mirrors production, where anonymization runs inside extract_graph's
-        disable_adapter scope.  The direct calibrate call must do the same via
-        base_model_inference so it does not read the training-active adapter.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        state["model"] = _peft_model_mock()
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] hello",
-        )
-
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            return_value=({}, "[user] hello", "raw"),
-        ) as helper:
-            result = calibrate_anonymize(state, req)
-
-        assert result["stage"] == "anonymize"
-        assert helper.called
-        assert state["model"].disable_adapter.called, (
-            "calibrate_anonymize must run the helper under base_model_inference"
-        )
-
-    def test_calibrate_anonymize_returns_mapping_and_transcript(self):
-        """The ``parsed`` payload carries the model's two artifacts —
-        ``forward`` AND ``anonymized_transcript`` — plus a ``status``
-        (current 3-tuple ``anonymize_transcript`` contract; facts
-        are still never part of the anonymizer's response).
-
-        Mutation: drop ``anonymized_transcript`` or ``status`` from
-        ``parsed`` -> this test fails.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] hello",
-        )
-
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            return_value=({"Alex": "Person_1"}, "[user] Person_1 said hi", "raw"),
-        ):
-            result = calibrate_anonymize(state, req)
-
-        assert result["parsed"] == {
-            "status": "ok",
-            "anonymized_transcript": "[user] Person_1 said hi",
-            "forward": {"Alex": "Person_1"},
-            "reverse": {"Person_1": "Alex"},
-            "anon_facts": [],
-            "norm_stats": {"inverted": 0, "dropped": 0},
-        }
-
-    def test_fail_closed_when_mapping_is_none(self):
-        """Fail-closed: a parse failure (``mapping is None``) is
-        reported as ``status: "failed"`` with an empty ``forward`` table
-        and an empty ``anonymized_transcript`` — never a fallback to the
-        real-name transcript.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] My friend Alex moved to Berlin.",
-        )
-
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            return_value=(None, "", "raw"),
-        ):
-            result = calibrate_anonymize(state, req)
-
-        assert result["parsed"] == {
-            "status": "failed",
-            "anonymized_transcript": "",
-            "forward": {},
-            "reverse": {},
-            "anon_facts": [],
-            "norm_stats": {"inverted": 0, "dropped": 0},
-        }
-
-    def test_empty_scrub_opts_out_without_model_call(self):
-        """An operator-configured empty ``scrub`` (operator opt-out) short-circuits
-        before any model call — the passed-in transcript egresses verbatim.
-
-        Mutation: call ``anonymize_transcript`` unconditionally ->
-        this test fails (``helper.called`` is True).
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        state["config"].sanitization.scrub = []
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] My friend Alex moved to Berlin.",
-        )
-
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-        ) as helper:
-            result = calibrate_anonymize(state, req)
-
-        assert not helper.called
-        assert result["parsed"] == {
-            "status": "opted_out",
-            "anonymized_transcript": "[user] My friend Alex moved to Berlin.",
-            "forward": {},
-            "reverse": {},
-            "anon_facts": [],
-            "norm_stats": {"inverted": 0, "dropped": 0},
-        }
-
-    def test_scrub_sourced_from_config(self):
-        """``scrub`` reaches ``anonymize_transcript`` from
-        ``state["config"].sanitization.scrub`` — the same policy knob
-        every production call site reads — not a request field.
-
-        Mutation: hardcode a different scrub set or drop the ``scrub=``
-        kwarg -> this test fails.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        state["config"].sanitization.scrub = ["person name", "phone number"]
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] hello",
-        )
-
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            return_value=({}, "[user] hello", "raw"),
-        ) as helper:
-            calibrate_anonymize(state, req)
-
-        assert helper.call_args.kwargs["scrub"] == {"person name", "phone number"}
-
-    def test_speaker_name_reaches_speaker_seeding(self):
-        """``req.speaker_name`` reaches
-        ``anonymize``'s speaker-name seeding — the same
-        runtime-known speaker name every production caller threads
-        through.  A transcript the model itself never named (empty
-        mapping) still gets the speaker minted into ``forward``/``reverse``
-        via seeding — proving ``speaker_name`` actually reached the
-        builder, not merely accepted and dropped.
-
-        Mutation: drop the ``speaker_name=req.speaker_name`` kwarg from
-        the ``anonymize`` call -> ``forward`` comes back empty
-        -> this test fails.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] hello",
-            speaker_name="Alex",
-        )
-
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            return_value=({}, "[user] hello", "raw"),
-        ):
-            result = calibrate_anonymize(state, req)
-
-        assert result["parsed"]["forward"] == {"Alex": "Person_1"}
-        assert result["parsed"]["reverse"] == {"Person_1": "Alex"}
-
-    def test_unmarked_transcript_raises_400(self):
-        """Mutation: remove the gate call from ``calibrate_anonymize`` ->
-        this test fails (no 400, or ``anonymize_transcript`` runs)."""
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="My friend Alex moved to Berlin.",
-        )
-        with (
-            _mock.patch("paramem.cloud.anonymize.anonymize_transcript") as helper,
-            pytest.raises(HTTPException) as exc,
-        ):
-            calibrate_anonymize(state, req)
-        assert exc.value.status_code == 400
-        assert "turn-marked" in exc.value.detail.lower()
-        assert not helper.called
-
-    def test_marked_transcript_reaches_model(self):
-        """Mutation: make the gate reject marked transcripts too -> this
-        test fails because ``anonymize_transcript`` is never called."""
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibrateAnonymizeRequest(
-            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="[user] My friend Alex moved to Berlin.",
-        )
-        with _mock.patch(
-            "paramem.cloud.anonymize.anonymize_transcript",
-            return_value=({}, "[user] My friend Person_1 moved to City_1.", "raw"),
-        ) as helper:
-            result = calibrate_anonymize(state, req)
-        assert helper.called
-        assert result["stage"] == "anonymize"
-
-
-class TestCalibratePlausibility:
-    def test_disabled_404(self):
-        req = CalibratePlausibilityRequest(facts=[], transcript="[user] x")
-        with pytest.raises(HTTPException) as exc:
-            calibrate_plausibility(_state_disabled(), req)
-        assert exc.value.status_code == 404
-
-    def test_prompt_override_reaches_model(self, tmp_path):
-        """A prompts_dir + filename override actually drives the model call.
-
-        Regression guard: judge_plausibility previously ignored
-        prompts_dir and always loaded configs/prompts/cloud_plausibility.txt,
-        so the override was cosmetic.  This asserts the SENTINEL override
-        template is what apply_chat_template receives.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        sentinel = "SENTINEL-PLAUS-OVERRIDE"
-        (prompts_dir / "my_plaus.txt").write_text(
-            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
-        )
-
-        req = CalibratePlausibilityRequest(
-            facts=[],
-            transcript="[user] hello there",
-            prompts_dir=str(prompts_dir),
-            plausibility_prompt_filename="my_plaus.txt",
-        )
-
-        captured: list[list[dict]] = []
-
-        def _capture_template(messages, **kw):
-            captured.append(messages)
-            return "formatted-prompt"
-
-        state["tokenizer"].apply_chat_template.side_effect = _capture_template
-
-        with (
-            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
-            _mock.patch("paramem.graph.extractor.generate_answer", return_value="{}"),
-        ):
-            result = calibrate_plausibility(state, req)
-
-        assert result["stage"] == "plausibility"
-        assert captured, "apply_chat_template was never called"
-        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
-        assert sentinel in user_content, (
-            f"Model received default prompt instead of override: {user_content!r}"
-        )
-
-        # Reported provenance is sourced from the real
-        # phase-trace record (populated by `_load_prompt`'s own
-        # `record_prompt` call inside `judge_plausibility`), not a
-        # hand-built `_read_prompt` literal — its sha must match a live
-        # `_load_prompt` computation of the same file.
-        from paramem.graph.prompts import _load_prompt
-
-        expected = _load_prompt("my_plaus.txt", prompts_dir=prompts_dir, required=True)
-        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        # ``judge_plausibility`` now also loads its SYSTEM prompt
-        # (``cloud_plausibility_system.txt``) at call time — no longer a
-        # module-import-time constant unreachable by provenance — so this
-        # phase records TWO prompts: the (overridden) user template, then
-        # the system prompt.  ``req`` carries no system-prompt override
-        # here, so the second entry resolves the shipped default.
-        expected_system = _load_prompt("cloud_plausibility_system.txt", required=True)
-        expected_system_sha = hashlib.sha256(expected_system.encode("utf-8")).hexdigest()[:12]
-        assert len(result["prompts"]) == 2
-        assert result["prompts"][0]["sha"] == expected_sha
-        assert result["prompts"][0]["template"] == expected
-        assert result["prompts"][1]["sha"] == expected_system_sha
-        assert result["prompts"][1]["template"] == expected_system
-
-    def test_runs_on_base_weights(self):
-        """calibrate_plausibility disables the active adapter around the model call.
-
-        Mirrors production, where the plausibility filter runs inside
-        extract_graph's disable_adapter scope.
-        """
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        state["model"] = _peft_model_mock()
-        req = CalibratePlausibilityRequest(facts=[], transcript="[user] hello")
-
-        with _mock.patch(
-            "paramem.graph.extractor.judge_plausibility",
-            return_value=([], "raw"),
-        ) as helper:
-            result = calibrate_plausibility(state, req)
-
-        assert result["stage"] == "plausibility"
-        assert helper.called
-        assert state["model"].disable_adapter.called, (
-            "calibrate_plausibility must run the helper under base_model_inference"
-        )
-
-    def test_unmarked_transcript_raises_400(self):
-        """Mutation: remove the gate call from ``calibrate_plausibility`` ->
-        this test fails (no 400, or ``judge_plausibility`` runs)."""
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibratePlausibilityRequest(facts=[], transcript="Should I call the vet?")
-        with (
-            _mock.patch("paramem.graph.extractor.judge_plausibility") as helper,
-            pytest.raises(HTTPException) as exc,
-        ):
-            calibrate_plausibility(state, req)
-        assert exc.value.status_code == 400
-        assert "turn-marked" in exc.value.detail.lower()
-        assert not helper.called
-
-    def test_marked_transcript_reaches_model(self):
-        """Mutation: make the gate reject marked transcripts too -> this
-        test fails because ``judge_plausibility`` is never called."""
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        req = CalibratePlausibilityRequest(facts=[], transcript="[user] Should I call the vet?")
-        with _mock.patch(
-            "paramem.graph.extractor.judge_plausibility",
-            return_value=([], "raw"),
-        ) as helper:
-            result = calibrate_plausibility(state, req)
-        assert helper.called
-        assert result["stage"] == "plausibility"
-
-
-class TestCalibrateEnrich:
-    """Tests for CalibrateEnrichRequest validation and calibrate_enrich.
-
-    Mirrors ``TestCalibratePlausibility`` — ``calibrate_enrich`` is the
-    same ``_run_calibration(entry="standalone")`` shape, wrapping
-    ``request_enrichment`` (the production ``cloud_enrich`` stage) instead
-    of ``judge_plausibility``.  The cloud provider config
-    (``extraction_enrichment_provider`` / ``_model`` / ``_endpoint``) is not on
-    the shared ``_state_enabled()`` fixture's ``consolidation``
-    ``SimpleNamespace`` by default, so each test sets the attributes it
-    needs directly (``SimpleNamespace`` accepts arbitrary attributes).
+    Mutation: drop the check in ``_run_calibration`` -> these fail, and a
+    cloud-disabled server answers /calibrate/enrich with an empty envelope
+    exactly as the pre-unification standalone endpoints never did (they
+    raised 400 from their own guard).
     """
 
-    def test_disabled_404(self):
-        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
+    def _state_with_chain(self, *, phases_that_run: list[str]) -> dict:
+        state = _state_enabled()
+
+        def _run(*_args, **_kwargs):
+            for name in phases_that_run:
+                with phase_trace(name):
+                    pass
+            return _empty_graph()
+
+        state["consolidation_loop"].extraction.run.side_effect = _run
+        return state
+
+    def _graph_req(self) -> CalibrateChainRequest:
+        return CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            graph={"session_id": "calib", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+
+    @pytest.mark.parametrize("use_case", ["enrich", "plausibility"])
+    def test_cloud_gated_step_never_reached_is_a_400(self, use_case):
+        """With cloud egress refused the anonymize/enrich stages are skipped,
+        so the declared stop never records. The endpoint says so."""
+        state = self._state_with_chain(phases_that_run=["local_extract"])
         with pytest.raises(HTTPException) as exc:
-            calibrate_enrich(_state_disabled(), req)
-        assert exc.value.status_code == 404
-
-    def test_unmarked_transcript_raises_400(self):
-        """Mutation: remove the gate call from ``calibrate_enrich`` ->
-        this test fails (no 400, or ``request_enrichment`` runs)."""
-        import unittest.mock as _mock
-
-        state = _state_enabled()
-        state["config"].cloud.enabled = True
-        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
-        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
-        req = CalibrateEnrichRequest(facts=[], transcript="Should I call the vet?")
-        with (
-            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
-            pytest.raises(HTTPException) as exc,
-        ):
-            calibrate_enrich(state, req)
+            calibrate_chain(state, use_case, self._graph_req())
         assert exc.value.status_code == 400
-        assert "turn-marked" in exc.value.detail.lower()
-        assert not helper.called
+        assert _CHAIN[use_case].stop in exc.value.detail
 
-    def test_provider_not_configured_400(self):
-        """Empty ``extraction_enrichment_provider`` (production default) -> 400,
-        no cloud call."""
-        import unittest.mock as _mock
+    def test_detail_names_the_steps_that_did_run(self):
+        state = self._state_with_chain(phases_that_run=["local_extract", "anonymize"])
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, "enrich", self._graph_req())
+        assert "local_extract" in exc.value.detail
+        assert "anonymize" in exc.value.detail
 
-        state = _state_enabled()
-        state["config"].cloud.enabled = True
-        state["config"].consolidation.extraction_enrichment_provider = ""
-        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
-        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
-        with (
-            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
-            pytest.raises(HTTPException) as exc,
-        ):
-            calibrate_enrich(state, req)
-        assert exc.value.status_code == 400
-        assert "no cloud provider configured" in exc.value.detail.lower()
-        assert not helper.called
+    def test_detail_reports_the_cloud_verdict_from_the_pipeline_config(self):
+        """The verdict is read from the ExtractionConfig the chain itself
+        runs on, through the shared admission component — not re-derived."""
+        from paramem.graph.extraction_pipeline import ExtractionConfig
 
-    def test_master_switch_off_400(self, monkeypatch: pytest.MonkeyPatch):
-        """``cloud.enabled: false`` -> 400, no cloud call.
-
-        This endpoint used to egress with the master switch OFF: it checked
-        the provider and the key but never the switch. It now asks the same
-        cloud-admission component every other egress site asks — reading the
-        ONE master switch, ``config.cloud.enabled`` — and, being
-        operator-triggered, fails loudly rather than skipping.
-
-        Mutation: drop the master-switch term from the verdict -> this test
-        sees a successful call instead of a 400.
-        """
-        import unittest.mock as _mock
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        state = _state_enabled()
-        state["config"].cloud.enabled = False
-        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
-        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
-        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
-        with (
-            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
-            pytest.raises(HTTPException) as exc,
-        ):
-            calibrate_enrich(state, req)
-        assert exc.value.status_code == 400
-        assert "cloud.enabled is off" in exc.value.detail.lower()
-        assert not helper.called
-
-    def test_missing_api_key_400(self, monkeypatch: pytest.MonkeyPatch):
-        """Provider configured but its key env var is unset -> 400, no cloud call."""
-        import unittest.mock as _mock
-
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        state = _state_enabled()
-        state["config"].cloud.enabled = True
-        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
-        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
-        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
-        with (
-            _mock.patch("paramem.graph.extractor.request_enrichment") as helper,
-            pytest.raises(HTTPException) as exc,
-        ):
-            calibrate_enrich(state, req)
-        assert exc.value.status_code == 400
-        assert "anthropic_api_key env var is unset" in exc.value.detail.lower()
-        assert not helper.called
-
-    def test_success(self, monkeypatch: pytest.MonkeyPatch):
-        """Provider configured + key present -> ``request_enrichment`` runs;
-        ``calibrate_enrich`` applies the parsed delta itself (via the SAME
-        ``_apply_enrichment_delta`` the ``enrich`` stage calls), so its
-        surviving facts surface at ``result["parsed"]["facts"]``."""
-        import unittest.mock as _mock
-
-        from paramem.graph.extractor import EnrichmentDelta
-
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        state = _state_enabled()
-        state["config"].cloud.enabled = True
-        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
-        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
-        req = CalibrateEnrichRequest(
-            facts=[{"subject": "speaker0", "predicate": "likes", "object": "coffee"}],
-            transcript="[user] I like coffee.",
+        state = self._state_with_chain(phases_that_run=["local_extract"])
+        state["consolidation_loop"].extraction.config = ExtractionConfig(
+            cloud_enabled=False, enrichment_provider="anthropic", scrub=frozenset()
         )
-        # An empty delta (KEEP-by-default) — the input facts survive
-        # ``_apply_enrichment_delta`` unchanged, mirroring the old mock's
-        # "enrichment left this fact as-is" shape.
-        empty_delta = EnrichmentDelta(add=[], modify=[], drop=set(), bindings={})
-        with _mock.patch(
-            "paramem.graph.extractor.request_enrichment",
-            return_value=(empty_delta, "raw", {}),
-        ) as helper:
-            result = calibrate_enrich(state, req)
-        assert helper.called
-        assert result["stage"] == "enrich"
-        assert result["parsed"]["facts"] == req.facts
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, "enrich", self._graph_req())
+        assert "Cloud egress is refused" in exc.value.detail
+        assert "cloud.enabled is off" in exc.value.detail
 
-    def test_prompt_override_reaches_model(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
-        """A prompts_dir + filename override actually drives the cloud call.
+    def test_reached_step_returns_normally(self):
+        state = self._state_with_chain(phases_that_run=["local_extract", "anonymize"])
+        result = calibrate_chain(state, "anonymize", self._graph_req())
+        assert result["stage"] == "anonymize"
 
-        Mirrors ``TestCalibratePlausibility::test_prompt_override_reaches_model``.
-        Patches the leaf cloud call (``_filter_anthropic``), NOT
-        ``request_enrichment`` itself, so the real ``_load_prompt`` call
-        inside ``request_enrichment`` records onto the ``cloud_enrich``
-        phase trace — provenance must come from that real record, not a
-        hand-built ``prompts=[...]`` literal.
-        """
-        import unittest.mock as _mock
 
-        from paramem.graph.prompts import _load_prompt
+class TestChainProductionParity:
+    """The properties that make a calibration run 1:1 with production."""
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    def test_plausibility_inspects_the_de_anonymized_judge(self):
+        """Regression guard. The standalone endpoint judged whatever fact
+        list the client posted, and the client posted ANONYMIZED facts —
+        while production feeds this judge DE-ANONYMIZED ones. Running the
+        real chain and stopping at ``deanon_plausibility`` is what closes
+        that gap; a declaration pointing anywhere else reopens it."""
+        assert _CHAIN["plausibility"].stop == "deanon_plausibility"
+
+    def test_no_use_case_reaches_a_step_primitive(self):
+        """The handler must route through ExtractionPipeline only. A
+        dispatch calling anonymize()/judge_plausibility()/
+        request_enrichment() directly is the standalone shape this
+        unification removed."""
+        source = inspect.getsource(calibrate_chain)
+        for primitive in ("anonymize(", "judge_plausibility(", "request_enrichment("):
+            assert primitive not in source
+
+    def test_prompt_variant_content_reaches_the_loader(self, tmp_path):
+        """An operator variant is injected through prompt_overrides, so the
+        chain's own ``_load_prompt`` call returns the variant's CONTENT —
+        the same mechanism for every step, no per-endpoint filename knob."""
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts" / "my_extraction.txt").write_text("VARIANT BODY {transcript}")
+
         state = _state_enabled()
-        state["config"].cloud.enabled = True
-        state["config"].consolidation.extraction_enrichment_provider = "anthropic"
-        state["config"].consolidation.extraction_enrichment_provider_model = "claude-sonnet-4-6"
-        state["config"].consolidation.extraction_enrichment_provider_endpoint = ""
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        seen: dict = {}
 
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        sentinel = "SENTINEL-ENRICH-OVERRIDE"
-        (prompts_dir / "my_enrich.txt").write_text(
-            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
+        def _capture(*_args, **_kwargs):
+            seen["loaded"] = _load_prompt("extraction.txt", required=True)
+
+        state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect(
+            "local_extract", _capture
         )
-
-        req = CalibrateEnrichRequest(
-            facts=[],
-            transcript="[user] hello there",
-            prompts_dir=str(prompts_dir),
-            enrichment_prompt_filename="my_enrich.txt",
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            prompt_variants={"extraction.txt": "my_extraction.txt"},
         )
-
-        with _mock.patch(
-            "paramem.graph.extractor._filter_anthropic",
-            return_value='{"add": [], "modify": [], "drop": [], "bindings": {}}',
-        ):
-            result = calibrate_enrich(state, req)
-
-        assert result["stage"] == "enrich"
-
-        # Reported provenance is sourced from the real phase-trace record
-        # (populated by `_load_prompt`'s own `record_prompt` call inside
-        # `request_enrichment`), not a hand-built `prompts=[...]` literal.
-        expected = _load_prompt("my_enrich.txt", prompts_dir=prompts_dir, required=True)
-        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        shas = {p["sha"] for p in result["prompts"]}
-        templates = {p["template"] for p in result["prompts"]}
-        assert expected_sha in shas
-        assert expected in templates
+        calibrate_chain(state, "extract", req)
+        assert seen["loaded"] == "VARIANT BODY {transcript}"
 
 
 class TestCalibrateNormalize:
@@ -1168,8 +676,8 @@ class TestCalibrateNormalize:
         assert "exactly one" in exc.value.detail.lower()
 
     def test_snapshot_node_link_flattening(self, tmp_path):
-        """Snapshot node-link edges are correctly flattened to relation dicts."""
-        import json
+        """Snapshot node-link edges are flattened into the relation set the
+        production pass is seeded with — edges with no predicate are skipped."""
 
         snap = {
             "nodes": [{"id": "Alex"}, {"id": "Acme"}],
@@ -1182,105 +690,69 @@ class TestCalibrateNormalize:
         snap_path = tmp_path / "graph_merged_snapshot.json"
         snap_path.write_text(json.dumps(snap), encoding="utf-8")
 
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "predicate_normalization.txt").write_text("filter {predicates_json}")
-
         state = _state_enabled()
-        # One candidate group (Alex/Acme with works_for + employed_by) → one model call.
-        import json as _json
-        import unittest.mock as _mock
+        refiner = _stub_refiner()
+        state["consolidation_loop"].build_tier_refiner.return_value = refiner
 
-        filter_raw = _json.dumps({"clusters": [["works_for", "employed_by"]]})
-        state["model"].gradient_checkpointing_disable = MagicMock()
+        result = calibrate_normalize(
+            state,
+            CalibrateNormalizeRequest(snapshot_path=str(snap_path)),
+        )
 
-        with _mock.patch(
-            "paramem.graph.extractor.generate_answer",
-            side_effect=[filter_raw],
-        ):
-            result = calibrate_normalize(
-                state,
-                CalibrateNormalizeRequest(
-                    snapshot_path=str(snap_path),
-                    prompts_dir=str(prompts_dir),
-                ),
-            )
-
-        parsed = result["parsed"]
-        # Two grounded links (third has no predicate and is skipped).
-        assert parsed["input_count"] == 2
         assert result["stage"] == "normalize"
-        # raw_output is a string (single-stage shape).
+        assert result["parsed"]["input_count"] == 2
         assert isinstance(result["raw_output"], str)
 
-        # Reported provenance is sourced from the real
-        # phase-trace record (populated by `_load_prompt`'s own
-        # `record_prompt` call inside `normalize_predicates`), not a
-        # hand-built `_read_prompt` literal — its sha must match a live
-        # `_load_prompt` computation of the same file.
-        from paramem.graph.prompts import _load_prompt
+    def test_runs_the_production_tier_pass(self):
+        """The endpoint reaches the production pass through the loop's own
+        construction site, seeded with a throwaway merger holding the
+        injected relations — never a second normalization implementation.
 
-        expected = _load_prompt(
-            "predicate_normalization.txt", prompts_dir=prompts_dir, required=True
-        )
-        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        filter_entry = next(p for p in result["prompts"] if not p["path"].endswith("_system.txt"))
-        assert filter_entry["sha"] == expected_sha
-        assert filter_entry["template"] == expected
-
-    def test_n_output_tokens_positive_for_nonempty_filter_output(self, tmp_path):
-        """normalize n_output_tokens counts raw output tokens (not -1).
-
-        Two relations on the SAME (subject, object) pair with DIFFERENT
-        predicates are required: normalize_predicates only calls
-        generate_answer when it finds at least one candidate group (≥2 distinct
-        predicates on the same s/o pair).  A single relation produces no
-        candidate group → early return with empty raw_outputs → n_output_tokens=-1.
+        Mutation: have the handler call ``normalize_predicates`` directly
+        again -> ``build_tier_refiner`` is never called and this fails.
         """
-        import json
-        import unittest.mock as _mock
-
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "predicate_normalization.txt").write_text("filter {predicates_json}")
-
         state = _state_enabled()
-        # Tokenizer mock: _count_tokens calls tokenizer(text)["input_ids"]; the
-        # dedup function also calls tokenizer.apply_chat_template — keep both.
-        tok = MagicMock()
-        tok.side_effect = lambda text, **kw: {"input_ids": text.split()}
-        tok.apply_chat_template.return_value = "formatted-prompt"
-        state["tokenizer"] = tok
+        refiner = _stub_refiner()
+        state["consolidation_loop"].build_tier_refiner.return_value = refiner
 
-        # model.gradient_checkpointing_disable() is called inside dedup primitive.
-        state["model"].gradient_checkpointing_disable = MagicMock()
-
-        filter_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
-
-        with _mock.patch(
-            "paramem.graph.extractor.generate_answer",
-            side_effect=[filter_raw],
-        ):
-            result = calibrate_normalize(
-                state,
-                CalibrateNormalizeRequest(
-                    # Two relations on identical (A, B) pair with distinct predicates
-                    # → forms one candidate group → generate_answer is called →
-                    # raw_outputs is non-empty → n_output_tokens > 0.
-                    relations=[
-                        {"subject": "A", "predicate": "works_for", "object": "B"},
-                        {"subject": "A", "predicate": "employed_by", "object": "B"},
-                    ],
-                    prompts_dir=str(prompts_dir),
-                ),
-            )
-
-        # n_output_tokens must reflect the model output, not be -1.
-        assert result["n_output_tokens"] != -1, (
-            "n_output_tokens must be a positive token count from raw model output, not -1. "
-            "Verify the relations list forms a candidate group so generate_answer is called."
+        result = calibrate_normalize(
+            state,
+            CalibrateNormalizeRequest(
+                relations=[
+                    {"subject": "Alex", "predicate": "works_for", "object": "Acme"},
+                    {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
+                ]
+            ),
         )
-        assert result["n_output_tokens"] > 0
+
+        builder = state["consolidation_loop"].build_tier_refiner
+        assert builder.call_count == 1
+        seeded = builder.call_args.args[0]
+        # The merger handed to the production builder carries the injected
+        # relations, and it is NOT the loop's live merger.
+        assert seeded is not state["consolidation_loop"].merger
+        assert {t[1] for t in seeded.get_all_triples()} == {"works_for", "employed_by"}
+        assert refiner.run_normalization.call_count == 1
+        # The pass's own diagnostics are reported verbatim.
+        assert result["parsed"]["groups_examined"] == 1
+        assert result["parsed"]["input_count"] == 2
+
+    def test_no_reimplementation_of_the_survivor_rule(self):
+        """The handler must not re-derive which predicate survives — that
+        rule lives in the tier pass (highest reinforcement_count) and a
+        second copy is exactly the drift this unification removed."""
+        import ast
+
+        tree = ast.parse(inspect.getsource(calibrate_normalize).lstrip())
+        # Prose describing the production rule is fine; executing it is not,
+        # so strip docstrings and comments by reading identifiers only.
+        names = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Name, ast.Attribute))
+        }
+        assert "normalize_predicates" not in names
+        assert "reinforcement_count" not in names
 
 
 class TestEffectiveParamsSeed:
@@ -1315,16 +787,12 @@ class TestEffectiveParamsSeed:
 
 class TestRunCalibrationResponseEnvelope:
     """Verify _run_calibration's inlined response assembly emits the
-    expected uniform envelope.
+        expected uniform envelope.
 
-    ``_build_calibrate_response`` (the former single-caller indirection)
-    has been folded directly into :func:`_run_calibration`; these tests
-    exercise the envelope through a trivial ``guard``/``dispatch`` pair
-    that returns a fixed ``(raw_output, parsed)`` so the assembly logic
-    is pinned independent of any one handler's real behavior.  This
-    proves the fold is behavior-preserving: the 11-key tail (plus
-    ``phases``) matches what the six handlers previously assembled via
-    the now-deleted ``_build_calibrate_response``.
+    These tests exercise the envelope through a trivial ``guard``/
+        ``dispatch`` pair so the assembly logic is pinned independent of any
+        one handler's real behavior. The stand-in ``dispatch`` opens its own
+        phase, exactly as the production paths the real handlers call do.
     """
 
     _REQUIRED_KEYS = {
@@ -1339,6 +807,7 @@ class TestRunCalibrationResponseEnvelope:
         "params_effective",
         "vram_before",
         "vram_after",
+        "artifact_dir",
     }
 
     def _run(
@@ -1359,12 +828,14 @@ class TestRunCalibrationResponseEnvelope:
             return None
 
         def dispatch() -> tuple:
-            return raw_output, parsed
+            # A production path opens its own phase onto the trace
+            # _run_calibration holds open; the substrate never synthesises
+            # one. This stand-in does the same.
+            with phase_trace("anonymize"):
+                return raw_output, parsed
 
         return _run_calibration(
             stage=stage,
-            entry="standalone",
-            phase="anonymize",
             guard=guard,
             dispatch=dispatch,
             input_prompt_phase="anonymize",
@@ -1466,36 +937,36 @@ class TestCalibrateName:
             calibrate_name(state, req)
         assert exc.value.status_code == 503
 
-    def test_missing_prompt_file_raises_400(self, tmp_path):
-        """calibrate_name raises 400 when the prompt file is absent."""
+    def test_missing_prompt_variant_raises_400(self, tmp_path):
+        """A named variant absent from the calibration prompt directory is
+        refused before any model call — never a silent fall-back to the
+        shipped prompt of the same name."""
         state = _state_enabled()
-        # Use a prompts dir that has no name_extraction files.
-        prompts_dir = tmp_path / "empty_prompts"
-        prompts_dir.mkdir()
+        state["config"].paths = PathsConfig(calibration=tmp_path)
         req = CalibrateNameRequest(
             turns=[{"role": "user", "text": "Hi, I'm Riley."}],
-            prompts_dir=str(prompts_dir),
+            prompt_variants={"name_extraction.txt": "absent_variant.txt"},
         )
         with pytest.raises(HTTPException) as exc:
             calibrate_name(state, req)
         assert exc.value.status_code == 400
-        assert "prompt file not found" in exc.value.detail.lower()
+        assert "variant not found" in exc.value.detail.lower()
 
     def test_returns_uniform_shape(self, tmp_path):
         """calibrate_name returns the uniform calibration response shape."""
         import unittest.mock as _mock
 
         state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "name_extraction_system.txt").write_text("system prompt")
-        (prompts_dir / "name_extraction.txt").write_text(
+        variants = tmp_path / "prompts"
+        variants.mkdir()
+        (variants / "my_name_extraction.txt").write_text(
             "Extract name from:\n{transcript}\nAnswer:"
         )
+        state["config"].paths = PathsConfig(calibration=tmp_path)
 
         req = CalibrateNameRequest(
             turns=[{"role": "user", "text": "Hi, I'm Alex."}],
-            prompts_dir=str(prompts_dir),
+            prompt_variants={"name_extraction.txt": "my_name_extraction.txt"},
         )
 
         # generate_answer is a lazy local import inside extract_name_via_llm;
@@ -1520,50 +991,44 @@ class TestCalibrateName:
         # Two prompt entries (system + user).
         assert len(result["prompts"]) == 2
 
-        # Reported provenance is sourced from the real
-        # phase-trace record (populated by `_load_prompt`'s own
-        # `record_prompt` call inside `extract_name_via_llm`), not a
-        # hand-built `_read_prompt` literal — its sha must match a live
-        # `_load_prompt` computation of each file.
+        # Reported provenance is sourced from the real phase-trace record
+        # (populated by `_load_prompt`'s own `record_prompt` call inside
+        # `extract_name_via_llm`), never a hand-built literal: the user
+        # prompt was overridden by a variant and the system prompt was not,
+        # so the two entries must report exactly that split, each with the
+        # sha of the content actually used.
         from paramem.graph.prompts import _load_prompt
 
-        expected_sys = _load_prompt(
-            "name_extraction_system.txt", prompts_dir=prompts_dir, required=True
+        by_path = {p["path"]: p for p in result["prompts"]}
+        variant = (variants / "my_name_extraction.txt").read_text()
+        shipped_sys = _load_prompt("name_extraction_system.txt", required=True)
+        assert (
+            by_path["<override:name_extraction.txt>"]["sha"]
+            == (hashlib.sha256(variant.encode("utf-8")).hexdigest()[:12])
         )
-        expected_user = _load_prompt("name_extraction.txt", prompts_dir=prompts_dir, required=True)
-        expected_sys_sha = hashlib.sha256(expected_sys.encode("utf-8")).hexdigest()[:12]
-        expected_user_sha = hashlib.sha256(expected_user.encode("utf-8")).hexdigest()[:12]
         sys_entry = next(p for p in result["prompts"] if p["path"].endswith("_system.txt"))
-        user_entry = next(p for p in result["prompts"] if not p["path"].endswith("_system.txt"))
-        assert sys_entry["sha"] == expected_sys_sha
-        assert user_entry["sha"] == expected_user_sha
+        assert sys_entry["sha"] == hashlib.sha256(shipped_sys.encode("utf-8")).hexdigest()[:12]
         assert result["parsed"]["name"] == "Alex"
 
     def test_filename_override_used_at_execution(self, tmp_path):
-        """Filename override is what the model actually sees, not a display-only value.
-
-        Regression guard for BLOCKING-2: before the fix, _read_prompt used the
-        override for the provenance block while extract_name_via_llm hardcoded
-        the default filenames — so a calibration A/B run would report file X's
-        sha/content but execute file Y.
-        """
+        """The variant is what the model actually sees, not a display-only
+        value: what the provenance block reports and what reaches the model
+        are the same resolution, because both come from the one loader."""
         import unittest.mock as _mock
 
         state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-
-        # Write BOTH default and override files with distinct content.
-        (prompts_dir / "name_extraction_system.txt").write_text("default system")
-        (prompts_dir / "name_extraction.txt").write_text("default user {transcript}")
-        (prompts_dir / "my_custom_system.txt").write_text("custom system")
-        (prompts_dir / "my_custom_user.txt").write_text("custom user {transcript}")
+        variants = tmp_path / "prompts"
+        variants.mkdir()
+        (variants / "my_custom_system.txt").write_text("custom system")
+        (variants / "my_custom_user.txt").write_text("custom user {transcript}")
+        state["config"].paths = PathsConfig(calibration=tmp_path)
 
         req = CalibrateNameRequest(
             turns=[{"role": "user", "text": "I'm Alex."}],
-            prompts_dir=str(prompts_dir),
-            name_prompt_filename="my_custom_user.txt",
-            name_system_prompt_filename="my_custom_system.txt",
+            prompt_variants={
+                "name_extraction.txt": "my_custom_user.txt",
+                "name_extraction_system.txt": "my_custom_system.txt",
+            },
         )
 
         captured_messages: list[list[dict]] = []
@@ -1580,14 +1045,12 @@ class TestCalibrateName:
         ):
             result = calibrate_name(state, req)
 
-        # The provenance block must report the override file.
+        # The provenance block must report the variants as overrides —
+        # _load_prompt records "<override:NAME>" for a prompt_overrides hit,
+        # so what is reported is what the model was actually given.
         paths_reported = {p["path"] for p in result["prompts"]}
-        assert any("my_custom_system.txt" in p for p in paths_reported), (
-            "provenance block must reference my_custom_system.txt"
-        )
-        assert any("my_custom_user.txt" in p for p in paths_reported), (
-            "provenance block must reference my_custom_user.txt"
-        )
+        assert "<override:name_extraction_system.txt>" in paths_reported
+        assert "<override:name_extraction.txt>" in paths_reported
 
         # The model must have received the OVERRIDE content, not the default.
         assert captured_messages, "apply_chat_template was never called"

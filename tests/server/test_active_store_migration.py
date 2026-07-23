@@ -58,7 +58,8 @@ def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) ->
     """Write a graph.json in the simulate-store layout (plaintext for tests).
 
     Uses :func:`paramem.memory.persistence.save_memory_to_disk` with
-    ``encrypted=False`` so the file is human-readable in the test filesystem.
+    No daily identity is loaded in tests, so the file is plaintext and
+    human-readable in the test filesystem.
     """
     tier_dir = simulate_dir / tier
     tier_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +75,7 @@ def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) ->
                 "speaker_id": entry.get("speaker_id", "speaker0"),
             },
         )
-    save_memory_to_disk(graph, graph_path, encrypted=False)
+    save_memory_to_disk(graph, graph_path)
     return graph_path
 
 
@@ -1647,5 +1648,5 @@ def _write_simulate_graph_at(slot_root: Path, entries: list[dict]) -> Path:
                 "speaker_id": entry.get("speaker_id", "speaker0"),
             },
         )
-    save_memory_to_disk(graph, graph_path, encrypted=False)
+    save_memory_to_disk(graph, graph_path)
     return graph_path

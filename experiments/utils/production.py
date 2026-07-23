@@ -82,6 +82,9 @@ from paramem.training.recall_eval import evaluate_indexed_recall, probe_entries
 from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
 from paramem.training.trainer import TrainingHooks, train_adapter
 
+# --- artifacts ------------------------------------------------------------
+from paramem.utils.artifacts import write_artifact
+
 # --- config ---------------------------------------------------------------
 from paramem.utils.config import AdapterConfig, ModelConfig, TrainingConfig
 
@@ -110,6 +113,8 @@ __all__ = [
     "format_entry_training",
     "load_registry",
     "save_registry",
+    # artifacts
+    "write_artifact",
     # models
     "adapt_messages",
     "create_adapter",

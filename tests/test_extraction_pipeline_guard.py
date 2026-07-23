@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.memory.store import MemoryStore as _MS
+from paramem.utils.artifacts import on_session_extracted
 from tests._guard_utils import tracked_python_files
 
 # Files allowed to call the extractors directly:
@@ -951,7 +952,7 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
 
     Patches ExtractionPipeline.extract_graph / extract_procedural_graph to
     return a fixed SessionGraph so the orchestrator's
-    ``DebugSnapshotWriter.on_session_extracted`` runs against deterministic
+    ``on_session_extracted`` runs against deterministic
     input.
     """
     from peft import PeftModel
@@ -1001,7 +1002,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
     Verifies the architectural seam: extraction returns a SessionGraph;
     the orchestrator calls
-    ``self._debug_writer.on_session_extracted(graph, session_id, kind)``
+    ``on_session_extracted(graph, session_id, kind)`` inside its artifact scope
     immediately afterward.  ``kind`` reflects which extractor produced the
     graph — never an adapter name (allocation is downstream).
 
@@ -1040,7 +1041,8 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
     # --- Episodic chokepoint ---
     graph = loop.extraction.run("transcript text", "sess-A", speaker_id="speaker0")
-    loop._debug_writer.on_session_extracted(graph, "sess-A", "graph")
+    with loop._artifact_scope():
+        on_session_extracted(graph, "sess-A", "graph")
 
     main_path = snapshot_root / "sessions" / "sess-A" / "graph_snapshot.json"
     assert main_path.exists(), f"episodic dump missing at {main_path}"
@@ -1051,7 +1053,8 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
     # --- Procedural chokepoint ---
     proc_graph = loop.extraction.run_procedural("transcript text", "sess-A", speaker_id="speaker0")
-    loop._debug_writer.on_session_extracted(proc_graph, "sess-A", "procedural_graph")
+    with loop._artifact_scope():
+        on_session_extracted(proc_graph, "sess-A", "procedural_graph")
 
     proc_path = snapshot_root / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
     assert proc_path.exists(), f"procedural dump missing at {proc_path}"
@@ -1065,30 +1068,31 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
 
 def test_on_session_extracted_short_circuits_when_debug_off(tmp_path):
-    """``DebugSnapshotWriter.on_session_extracted`` must short-circuit when
-    either ``save_cycle_snapshots`` is False or the debug base
-    (``_debug_base``) is None.  Production runs without debug mode must not
-    pay any disk cost from this debug-only diagnostic.
+    """``on_session_extracted`` must short-circuit when either
+    ``save_cycle_snapshots`` is False or the debug base (``_debug_base``) is
+    None — both make ``snapshot_dir_for`` return None, which is what the loop
+    hands to ``debug_run``.  Production runs without debug mode must not pay
+    any disk cost from this debug-only diagnostic.
     """
     from paramem.training.consolidation import ConsolidationLoop
-    from paramem.training.debug_snapshot import DebugSnapshotWriter
 
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.cycle_count = 0
     loop.run_id = "20260515T000000Z_aaaaaa"
-    writer = DebugSnapshotWriter(loop)
     fake_graph = MagicMock(model_dump_json=lambda **kw: "{}")
 
     # save_cycle_snapshots=False → no write.
     loop.save_cycle_snapshots = False
     loop._debug_base = tmp_path
-    writer.on_session_extracted(fake_graph, "s001", "graph")
+    with loop._artifact_scope():
+        on_session_extracted(fake_graph, "s001", "graph")
     assert not (tmp_path / "episodic").exists(), "dump fired despite save_cycle_snapshots=False"
 
     # _debug_base=None → no write (no AttributeError on ``None / "<tier>"``).
     loop.save_cycle_snapshots = True
     loop._debug_base = None
-    writer.on_session_extracted(fake_graph, "s002", "graph")
+    with loop._artifact_scope():
+        on_session_extracted(fake_graph, "s002", "graph")
 
 
 # ---------------------------------------------------------------------------
@@ -1359,13 +1363,14 @@ def test_base_model_inference_skips_disable_adapter_for_plain_model():
     m.disable_adapter.assert_not_called()
 
 
-def test_extract_name_via_llm_enters_base_model_inference():
+def test_name_enrollment_enters_base_model_inference():
     """Name enrollment in ``paramem/server/app.py`` must run on the base weights.
 
-    ``_extract_name_via_llm`` runs structured name extraction; production
-    invokes it with the training-active adapter live, so it must open
-    ``base_model_inference(model)`` before the ``extract_name_via_llm``
-    generate call.  Source-level guard: the graph/ and calibrate copies of the
+    ``_run_enrollment_for_speaker`` runs structured name extraction;
+    production invokes it with the training-active adapter live, so the
+    executor payload it hands to ``extract_name_via_llm`` must open
+    ``base_model_inference(model)`` around that generate call.
+    Source-level guard: the graph/ and calibrate copies of the
     base-inference guard are covered by their own module tests, but this
     enrollment site lives in app.py and otherwise has no offline regression net.
     """
@@ -1377,10 +1382,13 @@ def test_extract_name_via_llm_enters_base_model_inference():
 
     target = None
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_extract_name_via_llm":
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_run_enrollment_for_speaker"
+        ):
             target = node
             break
-    assert target is not None, "_extract_name_via_llm not found in paramem/server/app.py"
+    assert target is not None, "_run_enrollment_for_speaker not found in paramem/server/app.py"
 
     def _enters_base_model_inference(fn: ast.FunctionDef) -> bool:
         for node in ast.walk(fn):
@@ -1396,7 +1404,7 @@ def test_extract_name_via_llm_enters_base_model_inference():
         return False
 
     assert _enters_base_model_inference(target), (
-        "_extract_name_via_llm must wrap its extract_name_via_llm call in "
+        "_run_enrollment_for_speaker must wrap its extract_name_via_llm call in "
         "`with base_model_inference(model):` — name enrollment is structured "
         "extraction and must run on the base weights, not the training-active "
         "adapter."

@@ -599,7 +599,7 @@ class TestEncryptionRoundTrip:
         _setup_daily(tmp_path, monkeypatch)
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path, encrypted=True)
+        save_memory_to_disk(g, path)
         g2 = load_memory_from_disk(path)
         assert g2.number_of_edges() == 1
         entries = list(iter_entries(g2))
@@ -612,7 +612,7 @@ class TestEncryptionRoundTrip:
         _setup_daily(tmp_path, monkeypatch)
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path, encrypted=True)
+        save_memory_to_disk(g, path)
         raw = path.read_bytes()
         assert raw.startswith(AGE_MAGIC), f"expected age envelope, got {raw[:40]!r}"
         # The plaintext marker ("directed" is in every nx.node_link_data output)
@@ -620,7 +620,12 @@ class TestEncryptionRoundTrip:
         assert b"directed" not in raw
 
     def test_plaintext_write_is_readable_json(self, tmp_path, monkeypatch):
-        """encrypted=False writes inspectable plaintext JSON."""
+        """No daily identity loaded (Security OFF) → inspectable plaintext JSON.
+
+        The posture is the only thing that decides this now: there is no
+        per-call override, so a caller cannot write plaintext behind the
+        operator's back.
+        """
         monkeypatch.setattr(
             "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
             tmp_path / "absent.age",
@@ -628,7 +633,7 @@ class TestEncryptionRoundTrip:
         monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_memory_to_disk(g, path, encrypted=False)
+        save_memory_to_disk(g, path)
         raw = path.read_bytes()
         # Plaintext must be valid JSON and contain the "directed" key.
         parsed = json.loads(raw.decode("utf-8"))

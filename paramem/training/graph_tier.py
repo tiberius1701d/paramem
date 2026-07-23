@@ -18,37 +18,20 @@ handle, and the small set of scalars/callables listed on
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Protocol
+from typing import TYPE_CHECKING, Callable
 
 from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.graph.extractor import normalize_predicates
 from paramem.graph.merger import GraphMerger, min_nonempty
+from paramem.graph.phase_trace import extraction_trace
 from paramem.training import graph_enrich
+from paramem.utils.artifacts import on_normalization
 from paramem.utils.identity import canonical
 
 if TYPE_CHECKING:
     from paramem.graph.extraction_pipeline import ExtractionConfig
 
 logger = logging.getLogger(__name__)
-
-
-class NormalizationSink(Protocol):
-    """Structural protocol for the one debug-write the normalization pass needs.
-
-    :class:`~paramem.training.debug_snapshot.DebugSnapshotWriter` satisfies
-    this protocol structurally — it is never imported here. Handing the
-    refiner the full writer would give it a back-reference into
-    :class:`~paramem.training.consolidation.ConsolidationLoop` (the writer
-    stores ``self._loop``), which defeats the module boundary described in
-    the module docstring. The refiner only ever needs this one method.
-    """
-
-    def on_normalization(
-        self,
-        raw_outputs: list[str],
-        decisions: list[dict],
-        applied: dict[str, int],
-    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -98,7 +81,6 @@ class GraphTierRefiner:
         max_entities_per_pass: int,
         gc_disable: "Callable[[], None] | None" = None,
         gc_enable: "Callable[[], None] | None" = None,
-        normalization_sink: "NormalizationSink | None" = None,
     ) -> None:
         """Construct a refiner bound to one merger and one model handle.
 
@@ -144,10 +126,6 @@ class GraphTierRefiner:
                 does not use it (its own model calls disable/enable GC
                 internally, inside :func:`~paramem.graph.extractor.normalize_predicates`).
             gc_enable: Counterpart to ``gc_disable``.
-            normalization_sink: Optional :class:`NormalizationSink` that
-                receives the raw model outputs, parsed decisions, and applied
-                counts from :meth:`run_normalization`. ``None`` means no
-                debug write.
         """
         # BASE-MODEL HOLDER (GraphTierRefiner): per-call lifetime, dropped when
         # the caller returns; no persistent reference exists.
@@ -160,7 +138,6 @@ class GraphTierRefiner:
         self._max_entities_per_pass = max_entities_per_pass
         self._gc_disable = gc_disable
         self._gc_enable = gc_enable
-        self._normalization_sink = normalization_sink
 
     def release(self) -> None:
         """Null all references this refiner holds. Idempotent.
@@ -345,7 +322,16 @@ class GraphTierRefiner:
 
         # Delegate model calls to normalize_predicates.
         # GC disable/enable is handled inside normalize_predicates.
-        clusters_by_so, _normalization_diag = normalize_predicates(_flat_relations, **engine_kwargs)
+        #
+        # This pass owns the trace scope; the primitive opens the
+        # ``normalize`` phase inside it. Re-entry is a documented no-op
+        # (paramem.graph.phase_trace.extraction_trace), so when a
+        # calibration caller already has a scope open the phase record
+        # lands on THAT trace and is reported back to the operator.
+        with extraction_trace():
+            clusters_by_so, _normalization_diag = normalize_predicates(
+                _flat_relations, **engine_kwargs
+            )
 
         total_edges_retired = 0
         total_groups_collapsed = 0
@@ -457,10 +443,7 @@ class GraphTierRefiner:
         _decisions = [
             {"subject": s, "object": o, "clusters": cl} for (s, o), cl in clusters_by_so.items()
         ]
-        if self._normalization_sink is not None:
-            self._normalization_sink.on_normalization(
-                _normalization_diag.get("raw_outputs", []), _decisions, _applied
-            )
+        on_normalization(_normalization_diag.get("raw_outputs", []), _decisions, _applied)
 
         return {
             **_applied,

@@ -45,8 +45,11 @@ from paramem.backup.backup import write_bundle
 from paramem.backup.types import ArtifactKind
 from paramem.cloud.providers import get_cloud_agent
 from paramem.graph.extractor import ExtractionFailed
+from paramem.graph.name_extraction import extract_name_via_llm
+from paramem.graph.phase_trace import extraction_trace
 from paramem.models.loader import (
     active_adapter_name,
+    base_model_inference,
     load_base_model,
     switch_adapter,
     unload_model,
@@ -7383,29 +7386,33 @@ async def debug_dump():
 # --------------------------------------------------------------------------
 
 
+# Every endpoint below runs the SAME production extraction chain through
+# the SAME handler; the route name selects which calibration use case's
+# declaration (start step, injected artifact, stop step) applies — see
+# paramem.server.calibrate._CHAIN.
 @app.post("/calibrate/extract", dependencies=[Depends(require_admin)])
-async def calibrate_extract_route(req: calibrate_module.CalibrateExtractRequest):
-    return calibrate_module.calibrate_extract(_state, req)
+async def calibrate_extract_route(req: calibrate_module.CalibrateChainRequest):
+    return calibrate_module.calibrate_chain(_state, "extract", req)
 
 
 @app.post("/calibrate/procedural", dependencies=[Depends(require_admin)])
-async def calibrate_procedural_route(req: calibrate_module.CalibrateProceduralRequest):
-    return calibrate_module.calibrate_procedural(_state, req)
+async def calibrate_procedural_route(req: calibrate_module.CalibrateChainRequest):
+    return calibrate_module.calibrate_chain(_state, "procedural", req)
 
 
 @app.post("/calibrate/anonymize", dependencies=[Depends(require_admin)])
-async def calibrate_anonymize_route(req: calibrate_module.CalibrateAnonymizeRequest):
-    return calibrate_module.calibrate_anonymize(_state, req)
+async def calibrate_anonymize_route(req: calibrate_module.CalibrateChainRequest):
+    return calibrate_module.calibrate_chain(_state, "anonymize", req)
 
 
 @app.post("/calibrate/plausibility", dependencies=[Depends(require_admin)])
-async def calibrate_plausibility_route(req: calibrate_module.CalibratePlausibilityRequest):
-    return calibrate_module.calibrate_plausibility(_state, req)
+async def calibrate_plausibility_route(req: calibrate_module.CalibrateChainRequest):
+    return calibrate_module.calibrate_chain(_state, "plausibility", req)
 
 
 @app.post("/calibrate/enrich", dependencies=[Depends(require_admin)])
-async def calibrate_enrich_route(req: calibrate_module.CalibrateEnrichRequest):
-    return calibrate_module.calibrate_enrich(_state, req)
+async def calibrate_enrich_route(req: calibrate_module.CalibrateChainRequest):
+    return calibrate_module.calibrate_chain(_state, "enrich", req)
 
 
 @app.post("/calibrate/normalize", dependencies=[Depends(require_admin)])
@@ -14954,31 +14961,6 @@ def _run_active_store_migration_sync() -> None:
 # no regex pre-filter; the user's own utterance is always the trigger.
 
 
-def _extract_name_via_llm(
-    turns: list[dict],
-    model,
-    tokenizer,
-) -> str | None:
-    """Extract a speaker's self-introduced name using the external-prompt module.
-
-    Thin shim so the existing ``_run_enrollment_for_speaker`` call site does
-    not need to change.  Delegates entirely to
-    :func:`paramem.graph.name_extraction.extract_name_via_llm`, which loads
-    prompts from ``configs/prompts/name_extraction{,_system}.txt`` and filters
-    the transcript to user turns only (assistant salutation leak fix).
-    """
-    from paramem.graph.name_extraction import extract_name_via_llm
-    from paramem.models.loader import base_model_inference
-
-    # Name enrollment is structured extraction — it must run on the base
-    # weights, never the training-active adapter.  base_model_inference also
-    # keeps the KV cache live for the generate call and restores the model's
-    # entry state on exit.
-    with base_model_inference(model):
-        name, _raw = extract_name_via_llm(turns, model, tokenizer)
-    return name
-
-
 async def _run_enrollment_for_speaker(
     speaker_id: str,
     conv_id: str,
@@ -15023,12 +15005,23 @@ async def _run_enrollment_for_speaker(
 
     from paramem.server.gpu_lock import gpu_lock
 
+    def _extract(turns: list[dict]) -> str | None:
+        """The executor payload: this pass's trace scope + the extractor.
+
+        Opened HERE rather than around the ``run_in_executor`` call because
+        the executor runs on a worker thread, which does not inherit the
+        caller's contextvars — a scope opened outside would not be visible
+        to the phase the extractor opens inside. Name enrollment is
+        structured extraction, so it runs on the base weights, never the
+        training-active adapter.
+        """
+        with extraction_trace(), base_model_inference(model):
+            name, _raw = extract_name_via_llm(turns, model, tokenizer)
+        return name
+
     async with gpu_lock():
         loop = asyncio.get_running_loop()
-        extracted = await loop.run_in_executor(
-            None,
-            lambda t=all_turns: _extract_name_via_llm(t, model, tokenizer),
-        )
+        extracted = await loop.run_in_executor(None, _extract, all_turns)
 
     if not extracted:
         return None

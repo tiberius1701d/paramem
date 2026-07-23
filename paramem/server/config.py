@@ -462,6 +462,23 @@ class PathsConfig:
     # switch. Deliberately absent from ``infra_paths()`` (encryption.py) so
     # it stays plaintext and greppable during an incident.
     telemetry: Path = Path("data/ha/telemetry")
+    # Calibration workspace: ``prompts/`` holds the operator's prompt
+    # variants (resolved by name from a calibration request, never mixed
+    # into the shipped ``prompts`` dir), ``artifacts/`` receives every
+    # artifact a calibration run produces. Deliberately outside ``debug``:
+    # calibration output must not depend on, or pollute, the production
+    # debug switch. Throwaway by nature — gitignored.
+    calibration: Path = Path("data/ha/calibration")
+
+    @property
+    def calibration_prompts(self) -> Path:
+        """Directory the operator's prompt variants are resolved from."""
+        return self.calibration / "prompts"
+
+    @property
+    def calibration_artifacts(self) -> Path:
+        """Directory every calibration-run artifact is written to."""
+        return self.calibration / "artifacts"
 
     @property
     def adapters(self) -> Path:
@@ -1932,9 +1949,10 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
             debug=Path(paths_raw.get("debug", config.paths.debug)),
             prompts=Path(paths_raw.get("prompts", config.paths.prompts)),
             telemetry=Path(paths_raw.get("telemetry", config.paths.telemetry)),
+            calibration=Path(paths_raw.get("calibration", config.paths.calibration)),
         )
     # Make relative paths absolute (anchored to project root)
-    for path_field in ("data", "sessions", "debug", "prompts", "telemetry"):
+    for path_field in ("data", "sessions", "debug", "prompts", "telemetry", "calibration"):
         p = getattr(config.paths, path_field)
         if not p.is_absolute():
             setattr(config.paths, path_field, config_dir / p)

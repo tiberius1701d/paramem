@@ -68,7 +68,7 @@ from paramem.graph.extractor import (
     judge_plausibility,
 )
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
-from paramem.graph.phase_trace import chain_stopped, extraction_trace, phase_trace
+from paramem.graph.phase_trace import chain_seed, chain_stopped, extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.relation_build import (
     apply_rebuild,
@@ -715,11 +715,19 @@ def extract_graph(
     # once, seed the initial StageState, walk the flow, and keep the
     # extraction_trace lifecycle (open/attach) exactly as before.
     with extraction_trace() as trace:
+        # A calibration caller entering the chain past ``local_extract``
+        # supplies the graph that stage would have produced (see
+        # paramem.graph.phase_trace.start_at); with no such request open —
+        # every production call — the seed is the empty graph the local
+        # extractor rebinds wholesale.
+        seed = chain_seed()
         state = StageState(
             graph=SessionGraph(
                 session_id=session_id,
                 timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
             )
+            if seed is None
+            else seed
         )
         try:
             ctx = StageContext(

@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.graph.extractor import normalize_predicates
-from paramem.graph.phase_trace import extraction_trace, phase_trace
+from paramem.graph.phase_trace import extraction_trace
 from paramem.graph.prompts import _load_prompt
 
 
@@ -336,9 +336,11 @@ class TestCloudBranch:
 
 
 class TestPromptProvenance:
-    """normalize_predicates loads both prompts through the single
-    production loader ``_load_prompt`` — proven by the phase-trace
-    provenance record it emits when a phase scope is open."""
+    """normalize_predicates opens the ``normalize`` phase ITSELF and loads
+    both prompts through the single production loader ``_load_prompt`` —
+    proven by the provenance record on the phase it emitted. No caller
+    synthesises that phase: production (the graph tier pass) and
+    calibration open only the enclosing trace scope."""
 
     def test_filter_prompt_load_recorded_on_normalize_phase(self):
         relations = [
@@ -353,13 +355,12 @@ class TestPromptProvenance:
         tokenizer.apply_chat_template = MagicMock(return_value="<formatted>")
 
         with extraction_trace() as trace:
-            with phase_trace("normalize"):
-                with patch("paramem.graph.extractor.generate_answer", return_value=raw):
-                    normalize_predicates(
-                        relations,
-                        model=model,
-                        tokenizer=tokenizer,
-                    )
+            with patch("paramem.graph.extractor.generate_answer", return_value=raw):
+                normalize_predicates(
+                    relations,
+                    model=model,
+                    tokenizer=tokenizer,
+                )
 
         records = [r for r in trace.records if r.name == "normalize"]
         assert len(records) == 1

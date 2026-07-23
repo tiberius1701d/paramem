@@ -131,7 +131,6 @@ REVIEW_REPORT.md
 configs/prompts/calib_*.txt
 
 # Calibration tool dump dirs.
-data/ha/debug/calibration/
 
 # Experiment-local fixtures (binary weights, plaintext reference data).
 # Stable baselines captured from production cycles for reproducibility;

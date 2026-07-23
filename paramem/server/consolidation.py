@@ -237,27 +237,22 @@ def session_retention_dir(loop, config) -> Path | None:
 
     Returns ``None`` when neither retention nor debug mode is enabled —
     the SessionBuffer will unlink the JSONL after consume.  Otherwise
-    returns ``loop.snapshot_dir_for(interim_stamp=...)/sessions/``
-    (2026-05-14 hierarchy:
-    ``paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/sessions/``).
-    Falls back to ``config.debug_dir/cycle_<N>/sessions/`` when the loop
-    cannot produce a snapshot path.
+    returns ``loop.snapshot_dir_for()/sessions/``, the same root every
+    artifact hook writes under
+    (``paths.debug/episodic/cycle_<N>/run_<run_id>/sessions/``), so retained
+    transcripts sit beside the snapshots taken from them.
+
+    Falls back to ``config.debug_dir/cycle_<N>/sessions/`` when ``debug`` is
+    off and only ``retain_sessions`` asked for this: ``snapshot_dir_for``
+    returns ``None`` there, but the transcripts were still requested.
     """
     if not (config.consolidation.retain_sessions or config.debug):
         return None
-    # The loop DOES carry a ``_current_interim_stamp`` attribute (ConsolidationLoop
-    # assigns it around the fold), but no production path ever assigns a stamp to
-    # it — every assignment is ``None``, and the interim stamp travels as an
-    # explicit parameter instead.  Reading it here would therefore add nothing;
-    # pass None so snapshot_dir_for uses the cycle-scoped path
-    # (paths.debug/episodic/cycle_<N>/run_<run_id>/).
-    snap = None
-    snap_fn = getattr(loop, "snapshot_dir_for", None)
-    if callable(snap_fn):
-        snap = snap_fn(interim_stamp=None)
+    # No interim stamp: no production path assigns one to the loop, and the
+    # per-cycle root is what the artifact hooks use.
+    snap = loop.snapshot_dir_for()
     if snap is None:
-        cycle = getattr(loop, "cycle_count", 0)
-        return config.debug_dir / f"cycle_{cycle}" / "sessions"
+        return config.debug_dir / f"cycle_{loop.cycle_count}" / "sessions"
     return snap / "sessions"
 
 
@@ -279,24 +274,17 @@ _dedup_procedural = ConsolidationLoop.dedup_procedural
 # --- Persistence ---
 
 
-def _atomic_json_write(data: dict | list, path: Path, *, encrypted: bool = True) -> None:
-    """Write JSON atomically.
+def _atomic_json_write(data: dict | list, path: Path) -> None:
+    """Write infrastructure JSON atomically through ``write_infra_bytes``.
 
-    ``encrypted=True`` (default) routes through ``write_infra_bytes`` so
-    every infrastructure JSON artifact respects the Security-ON/OFF
-    contract through a single chokepoint.  ``encrypted=False`` bypasses
-    the envelope and always writes plaintext; used by debug-directory
-    writers so ``debug/*`` output is uniformly inspectable with ``cat``
-    regardless of the server's Security posture.
+    One chokepoint, so every infrastructure JSON file respects the operator's
+    ``security.require_encryption`` posture — age-encrypted when a daily
+    identity is loaded, plaintext otherwise.  Inspection output is not written
+    here: that is an artifact, and goes through
+    :func:`paramem.utils.artifacts.write_artifact`.
     """
-    from paramem.backup.encryption import write_plaintext_atomic
-
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2).encode("utf-8")
-    if encrypted:
-        write_infra_bytes(path, payload)
-    else:
-        write_plaintext_atomic(path, payload)
+    write_infra_bytes(path, json.dumps(data, indent=2).encode("utf-8"))
 
 
 def _load_key_metadata(path: Path) -> dict | None:

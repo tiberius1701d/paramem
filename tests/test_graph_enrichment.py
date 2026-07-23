@@ -148,7 +148,6 @@ def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
         max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
         gc_disable=loop._disable_gradient_checkpointing,
         gc_enable=loop._enable_gradient_checkpointing,
-        normalization_sink=loop._debug_writer,
     )
 
 

@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from paramem.graph.phase_trace import chain_stopped
+from paramem.graph.phase_trace import chain_start, chain_stopped
 
 if TYPE_CHECKING:
     # Type-only, and data SHAPES rather than extraction primitives — the
@@ -221,6 +221,14 @@ class StageSpec:
 def run_flow(flow: list[StageSpec], ctx: StageContext, state: StageState) -> StageState:
     """Walk ``flow`` in order, mutating ``state`` through each stage.
 
+    When a calibration caller's :func:`~paramem.graph.phase_trace.start_at`
+    request is open, every stage ordered ahead of the one whose
+    ``trace_names`` declares that phase is dropped before the walk begins
+    — the caller has supplied that stage's input directly, so the stages
+    that would have produced it have nothing to do. A start phase no
+    stage in this flow opens is a caller error and raises, rather than
+    silently running the whole flow from the top.
+
     For each :class:`StageSpec` in ``flow``:
 
     1. If ``enabled_when`` is set and false, skip the stage entirely —
@@ -249,6 +257,15 @@ def run_flow(flow: list[StageSpec], ctx: StageContext, state: StageState) -> Sta
         The state after the last stage that ran, or after an early stop
         (chain-stopped or terminal).
     """
+    start = chain_start()
+    if start is not None:
+        entered = [i for i, spec in enumerate(flow) if start in spec.trace_names]
+        if not entered:
+            raise ValueError(
+                f"start phase {start!r} is not opened by any stage in this flow. "
+                f"Stages open: {sorted({n for s in flow for n in s.trace_names})}"
+            )
+        flow = flow[entered[0] :]
     for spec in flow:
         if spec.enabled_when is not None and not spec.enabled_when(ctx):
             continue

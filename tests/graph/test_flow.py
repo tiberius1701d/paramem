@@ -22,7 +22,7 @@ import dataclasses
 import pytest
 
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
-from paramem.graph.phase_trace import extraction_trace, phase_trace, stop_at
+from paramem.graph.phase_trace import extraction_trace, phase_trace, start_at, stop_at
 
 # requires/produces are required (no default) StageSpec fields, but the
 # gating tests below don't exercise the I/O contract itself (run_flow never
@@ -209,6 +209,76 @@ class TestRunFlowGating:
             with stop_at("local_extract"):
                 state = run_flow(flow, _make_ctx(), StageState(graph=_Counter()))
         assert state.graph.ran == ["first"]
+
+    def test_start_at_drops_stages_ahead_of_the_entered_one(self):
+        """A calibration start_at request enters the walk at the stage
+        whose trace_names declares that phase; every stage ordered ahead
+        of it is dropped, its input having been supplied by the caller."""
+        flow = [
+            StageSpec(
+                stage="first",
+                trace_names=("local_extract",),
+                run=_run_stage("first"),
+                requires=_INERT_REQUIRES,
+                produces=_INERT_PRODUCES,
+            ),
+            StageSpec(
+                stage="second",
+                trace_names=("anonymize",),
+                run=_run_stage("second"),
+                requires=_INERT_REQUIRES,
+                produces=_INERT_PRODUCES,
+            ),
+            StageSpec(
+                stage="third",
+                trace_names=(),
+                run=_run_stage("third"),
+                requires=_INERT_REQUIRES,
+                produces=_INERT_PRODUCES,
+            ),
+        ]
+        with start_at("anonymize"):
+            state = run_flow(flow, _make_ctx(), StageState(graph=_Counter()))
+        assert state.graph.ran == ["second", "third"]
+
+    def test_no_start_at_scope_enters_at_the_first_stage(self):
+        """With no active start_at request (production default, or an
+        explicit start_at(None)), the walk enters at the first stage."""
+        flow = [
+            StageSpec(
+                stage="first",
+                trace_names=("local_extract",),
+                run=_run_stage("first"),
+                requires=_INERT_REQUIRES,
+                produces=_INERT_PRODUCES,
+            ),
+            StageSpec(
+                stage="second",
+                trace_names=("anonymize",),
+                run=_run_stage("second"),
+                requires=_INERT_REQUIRES,
+                produces=_INERT_PRODUCES,
+            ),
+        ]
+        with start_at(None):
+            state = run_flow(flow, _make_ctx(), StageState(graph=_Counter()))
+        assert state.graph.ran == ["first", "second"]
+
+    def test_start_phase_no_stage_opens_raises(self):
+        """A start phase no stage in this flow opens is a caller error —
+        it raises rather than silently walking from the top."""
+        flow = [
+            StageSpec(
+                stage="first",
+                trace_names=("local_extract",),
+                run=_run_stage("first"),
+                requires=_INERT_REQUIRES,
+                produces=_INERT_PRODUCES,
+            ),
+        ]
+        with start_at("deanon"):
+            with pytest.raises(ValueError, match="not opened by any stage"):
+                run_flow(flow, _make_ctx(), StageState(graph=_Counter()))
 
     def test_stage_exception_propagates_unswallowed(self):
         """A stage raising propagates to run_flow's caller — no blanket
