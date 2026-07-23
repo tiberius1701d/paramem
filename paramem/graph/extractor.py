@@ -98,6 +98,14 @@ _DEFAULT_FILTER_MAX_TOKENS = 8192
 # Deterministic by default; threaded to every provider call so Anthropic
 # and OpenAI-compatible filters match exactly.
 _DEFAULT_FILTER_TEMPERATURE = 0.0
+# Cloud enrichment returns the delta envelope ``{"add", "modify", "drop",
+# "bindings"}`` on virtually every call; a bare-list / malformed shape is a
+# rare per-sample deviation (2 in the whole recorded history vs. dozens of
+# clean deltas).  Re-issue the call on a parse miss rather than accept a
+# guessed-at shape — a fresh sample almost always parses.  Exhausting the
+# budget hands ``None`` back to the caller, which fails OPEN (keeps the
+# pre-enrichment facts), never fatal.
+_ENRICHMENT_MAX_ATTEMPTS = 3
 # Per-call timeout for cloud enrichment / plausibility / anonymization.
 _DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
 
@@ -1539,18 +1547,24 @@ def request_enrichment(
     ``info`` is a dict with diagnostic flags the caller persists into
     ``graph.diagnostics``:
 
-    * ``parse_path``: ``"delta"`` (envelope parsed), ``"failed"`` (parse
-      failure), or ``"no_response"`` (provider returned nothing). Both
-      failure paths return ``delta=None``, and the caller (the ``enrich``
-      stage, :func:`~paramem.graph.stage_enrich._stage_enrich`) raises
-      :class:`ExtractionFailed` on either — it does NOT fail open.
-      Failing open used to silently bake a degraded, un-enriched
-      snapshot into the cumulative graph, where the next cycle's
-      re-extraction deduped it and the missing relations were lost
-      permanently; see the call site for the full reasoning. This is the
-      ONE remaining whole-response failure mode — per-triple
-      resolvability inside an otherwise-parseable delta is no longer one.
-    * ``response_chars``: length of the raw response in characters.
+    * ``parse_path``: ``"delta"`` (envelope parsed), ``"failed"`` (the
+      provider answered but never in the delta-envelope shape on any
+      attempt — a rare per-input hiccup), or ``"no_response"`` (the
+      provider was unreachable on every attempt — an outage; ``_cloud_call``
+      collapses every API/network/SDK error to ``None``).  The call retries
+      up to ``_ENRICHMENT_MAX_ATTEMPTS`` times — the model returns the
+      envelope on nearly every call, so a fresh sample almost always
+      parses.  ``delta=None`` only after all attempts miss, and the caller
+      (the ``enrich`` stage,
+      :func:`~paramem.graph.stage_enrich._stage_enrich`) branches on
+      ``parse_path``: ``"failed"`` fails OPEN (keeps the pre-enrichment
+      facts, records a ``cloud_enrichment_degraded`` diagnostic — one
+      session un-enriched, the run continues), while ``"no_response"``
+      raises :class:`ExtractionFailed` so the batch aborts and its sessions
+      stay pending for a clean retry once the provider recovers.
+    * ``attempts``: how many cloud calls were issued (``1`` on the common
+      first-try success, up to ``_ENRICHMENT_MAX_ATTEMPTS``).
+    * ``response_chars``: length of the last raw response in characters.
 
     The action counts (``add_count`` / ``modify_count`` / ``drop_count`` /
     ``bindings_count``) that used to live in this dict moved to
@@ -1574,31 +1588,79 @@ def request_enrichment(
     system_prompt = _load_prompt("cloud_enrichment_system.txt", required=True)
     facts_json, transcript_text = _cloud_facing_payload(anon_facts, anon_transcript)
     prompt = enrichment_prompt.format(facts_json=facts_json, transcript=transcript_text)
-    raw = _cloud_call(
-        prompt,
-        api_key,
-        provider,
-        filter_model,
-        endpoint,
-        max_tokens,
-        temperature,
-        system_prompt=system_prompt,
-        timeout_seconds=timeout_seconds,
-    )
-    if raw is None:
-        return None, None, {"parse_path": "no_response"}
-    delta = _parse_enrichment_delta(raw, len(anon_facts))
-    info: dict = {"response_chars": len(raw)}
-    if delta is None:
-        info["parse_path"] = "failed"
-        logger.warning(
-            "cloud enrichment delta parse failed (response_chars=%d) — "
-            "caller will fail the extraction (ExtractionFailed)",
-            info["response_chars"],
+    last_raw: str | None = None
+    responded = False
+    for attempt in range(1, _ENRICHMENT_MAX_ATTEMPTS + 1):
+        raw = _cloud_call(
+            prompt,
+            api_key,
+            provider,
+            filter_model,
+            endpoint,
+            max_tokens,
+            temperature,
+            system_prompt=system_prompt,
+            timeout_seconds=timeout_seconds,
         )
-    else:
-        info["parse_path"] = "delta"
-    return delta, raw, info
+        if raw is None:
+            # No usable response — an API/network/SDK error, which
+            # ``_filter_anthropic`` / ``_filter_openai_compat`` collapse to
+            # ``None`` (see their ``except Exception`` boundary handlers).
+            logger.warning(
+                "cloud enrichment: no response on attempt %d/%d — retrying",
+                attempt,
+                _ENRICHMENT_MAX_ATTEMPTS,
+            )
+            continue
+        responded = True
+        last_raw = raw
+        delta = _parse_enrichment_delta(raw, len(anon_facts))
+        if delta is not None:
+            return (
+                delta,
+                raw,
+                {
+                    "response_chars": len(raw),
+                    "parse_path": "delta",
+                    "attempts": attempt,
+                },
+            )
+        # Parseable JSON but not the delta envelope (the rare bare-list /
+        # malformed shape).  Log the actual payload so the deviation is
+        # diagnosable — the type alone hides which shape the model returned —
+        # then retry: the envelope is what it emits on nearly every call.
+        logger.warning(
+            "cloud enrichment delta parse failed on attempt %d/%d "
+            "(response_chars=%d) — retrying; raw[:500]=%r",
+            attempt,
+            _ENRICHMENT_MAX_ATTEMPTS,
+            len(raw),
+            raw[:500],
+        )
+    # Every attempt missed.  ``responded`` is the OUTAGE-vs-HICCUP
+    # discriminator: the provider answered at least once (``"failed"`` — a
+    # per-input shape hiccup, caller fails OPEN) or it was unreachable on
+    # every attempt (``"no_response"`` — an outage, caller leaves the batch
+    # pending for a clean retry next cycle).
+    if responded:
+        return (
+            None,
+            last_raw,
+            {
+                "response_chars": len(last_raw or ""),
+                "parse_path": "failed",
+                "attempts": _ENRICHMENT_MAX_ATTEMPTS,
+            },
+        )
+    return (
+        None,
+        None,
+        {
+            "response_chars": 0,
+            "parse_path": "no_response",
+            "attempts": _ENRICHMENT_MAX_ATTEMPTS,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

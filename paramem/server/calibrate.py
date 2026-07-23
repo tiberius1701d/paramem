@@ -890,7 +890,7 @@ def calibrate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> d
         from paramem.graph.phase_trace import get_phases
 
         record = next(
-            (r.to_dict() for r in get_phases(graph) if r.name == focus),
+            (r for r in get_phases(graph) if r.name == focus),
             None,
         )
         return (record.raw_output if record else "") or "", parsed

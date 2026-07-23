@@ -84,6 +84,15 @@ class ExtractionConfig:
     temperature: float = 0.0
     max_tokens: int = 8192
     plausibility_max_tokens: int = 8192
+    # RNG seed forwarded to every ``generate_answer`` (``torch.manual_seed``),
+    # a sampling knob like ``temperature``/``max_tokens``.  ``None`` (the
+    # default, and the value production runs with today) means no seeding —
+    # today's non-deterministic status quo.  It exists so a calibration probe
+    # can pin a seed to sweep sampling variance, AND so production and
+    # calibration source the seed through one identical path: reproducibility
+    # is the whole point of calibration, so a seed set for a production run is
+    # the same seed a calibration run reads by default.
+    seed: int | None = None
     enrichment_provider: str = "anthropic"
     enrichment_provider_model: str = "claude-sonnet-4-6"
     enrichment_provider_endpoint: str | None = None
@@ -229,9 +238,14 @@ class ExtractionPipeline:
         user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
 
         return dict(
-            temperature=cfg.temperature,
-            max_tokens=cfg.max_tokens,
-            plausibility_max_tokens=cfg.plausibility_max_tokens,
+            # Sampling knobs, all sourced the same way: a calibration override
+            # if given, else the config default.  Uniform with ``seed`` below —
+            # before this the two ``*_tokens``/``temperature`` overrides the
+            # calibrate dispatch sets were silently dropped (read straight off
+            # ``cfg``), so a probe could never vary them.
+            temperature=pick("temperature", cfg.temperature),
+            max_tokens=pick("max_tokens", cfg.max_tokens),
+            plausibility_max_tokens=pick("plausibility_max_tokens", cfg.plausibility_max_tokens),
             prompts_dir=pick("prompts_dir", self.prompts_dir),
             # model_alias drives per-file prompt resolution in extract_graph /
             # extract_procedural_graph.  cloud_* prompts are model-independent
@@ -255,7 +269,10 @@ class ExtractionPipeline:
             speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
-            seed=overrides.get("seed"),
+            # Sourced like every other sampling knob: a calibration override
+            # if given, else the config default (``None`` today = status quo,
+            # no seeding).  Production and calibration thread it identically.
+            seed=pick("seed", cfg.seed),
             timestamp=overrides.get("timestamp"),
             source_type=source_type,
         )
@@ -363,7 +380,9 @@ class ExtractionPipeline:
             speaker_id=speaker_id,
             system_prompt_filename=resolved_system_prompt_filename,
             user_prompt_filename=resolved_user_prompt_filename,
-            seed=seed,
+            # Same sourcing as :meth:`run`: explicit override else the config
+            # default (``None`` today = status quo, no seeding).
+            seed=seed if seed is not None else cfg.seed,
             timestamp=timestamp,
             source_type=source_type,
         )

@@ -520,6 +520,40 @@ class TestChainDispatch:
         assert hook.call_count == 1
         assert hook.call_args.args[0] == result
 
+    def test_dispatch_surfaces_focus_step_raw_output(self):
+        """The inspected step's ``raw_output`` is surfaced at the response top
+        level, read off the ``PhaseRecord`` object (not a dict).
+
+        Regression: the dispatch built ``record`` from ``r.to_dict()`` then read
+        ``record.raw_output`` — an ``AttributeError`` on a dict, masked because
+        the enrichment fail-closed raise short-circuited the walk before this
+        line ever ran on a completed extract.  The other dispatch mocks return a
+        graph with no attached phases (``get_phases`` empty → ``record is None``
+        → ``""``), so only a graph carrying a real focus-step record exercises
+        it.
+        """
+        state = _state_enabled()
+
+        def _record(*_a, **_k):
+            # (1) open the phase on the OUTER trace so the substrate's
+            # declared-step-reached check passes; (2) attach a phase record with
+            # a raw_output to the returned graph for the dispatch's focus lookup.
+            with phase_trace("local_extract") as t:
+                t.set_raw("RAW_FROM_LOCAL_EXTRACT")
+            g = _empty_graph()
+            g.diagnostics["phases"] = [
+                {"name": "local_extract", "raw_output": "RAW_FROM_LOCAL_EXTRACT"}
+            ]
+            return g
+
+        state["consolidation_loop"].extraction.run.side_effect = _record
+        result = calibrate_chain(
+            state,
+            "extract",
+            CalibrateChainRequest(transcript="[user] hi there", speaker_id="speaker0"),
+        )
+        assert result["raw_output"] == "RAW_FROM_LOCAL_EXTRACT"
+
 
 class TestChainSessionSnapshot:
     """A transcript-extracting run persists the per-session graph snapshot into

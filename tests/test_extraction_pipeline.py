@@ -1653,18 +1653,16 @@ class TestCloudEnrichmentProvider:
         # Fallback path recorded in diagnostics.
         assert result.diagnostics.get("fallback_path") == "anon_failed"
 
-    def test_pipeline_enrichment_failure_raises_extraction_failed(self):
-        """Enrichment failure must FAIL the cycle, not silently fall back.
+    def test_pipeline_enrichment_failure_fails_open(self):
+        """Enrichment failure degrades the session, it does not fail the cycle.
 
-        Previously this test asserted the silent-fallback behavior, which
-        was a load-bearing bug: a cloud 5xx baked a degraded (un-enriched)
-        snapshot into the cumulative graph; the next cycle deduped the
-        same triples so the missing second-order relations were lost
-        permanently.  The pipeline now raises ``ExtractionFailed`` so
-        the per-session loop in ``app.py`` leaves the session pending
-        for retry.
+        ``request_enrichment`` retries the cloud call; when every attempt
+        misses a parseable delta it returns ``delta=None`` and the enrich
+        stage fails OPEN — keeps the pre-enrichment facts, records
+        ``cloud_enrichment_degraded``, and continues.  See
+        :class:`TestCloudEnrichmentFailureFailsOpen` for the full rationale
+        (d0913f6 had silently made this fatal).
         """
-        from paramem.graph.extractor import ExtractionFailed
         from tests._cloud_flow import run_cloud_stages
 
         graph = _make_graph(
@@ -1684,21 +1682,21 @@ class TestCloudEnrichmentProvider:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                # ``delta=None`` -- parse failure/no-response shape.
-                return_value=(None, None, {}),
+                # ``delta=None`` -- every retry missed a parseable delta.
+                return_value=(None, None, {"parse_path": "failed", "attempts": 3}),
             ),
         ):
-            with pytest.raises(ExtractionFailed) as excinfo:
-                run_cloud_stages(
-                    graph,
-                    "transcript",
-                    None,
-                    None,
-                    speaker_id="speaker0",
-                    correction_entity_types=set(),
-                    scrub={"person name"},
-                )
-        assert excinfo.value.phase == "cloud_enrich"
+            result = run_cloud_stages(
+                graph,
+                "transcript",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+        assert any(r.predicate == "lives_in" for r in result.relations)
+        assert result.diagnostics.get("cloud_enrichment_degraded") is not None
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
         """Enrichment output flows through de-anonymization to real names."""
@@ -3771,20 +3769,190 @@ class TestAnonFailureFallback:
         assert result.diagnostics.get("fallback_path") == "anon_failed"
 
 
-class TestCloudEnrichmentFailureRaises:
-    """When cloud enrichment fails, raise ExtractionFailed instead of
-    silently falling back to pre-enrichment facts.
-
-    Closes the regression that on 2026-05-13 baked a degraded snapshot
-    into the cumulative graph after an Anthropic 529 — by the time the
-    next cycle re-extracted, the in-memory merger had already absorbed
-    the un-enriched triples, so the missing second-order relations were
-    permanently lost.  The extraction-failure-fails-cycle policy requires
-    the whole cycle to abort so sessions stay pending for a clean retry.
+class TestExtractionSeedSourcing:
+    """Seed is sourced like its sibling sampling knobs (temperature/max_tokens):
+    the config default (``None`` today = status quo, no seeding — the value
+    production runs with), overridable by a calibration probe.  Production and
+    calibration thread it through one identical path (``kwargs()``), so a seed
+    set for a production run is the same seed a calibration run reads — the
+    reproducibility calibration exists to provide.
     """
 
-    def test_cloud_enrich_failure_raises_extraction_failed(self):
-        """request_enrichment returning (None, ...) → ExtractionFailed."""
+    def _pipe(self, cfg_seed):
+        from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
+
+        return ExtractionPipeline(
+            MagicMock(),
+            MagicMock(),
+            config=ExtractionConfig(seed=cfg_seed, scrub=set()),
+        )
+
+    def test_seed_defaults_to_config_none_is_status_quo(self):
+        # Production shape: no override, config default None → no seeding.
+        assert self._pipe(None).kwargs(speaker_id="speaker0")["seed"] is None
+
+    def test_seed_falls_back_to_the_config_value(self):
+        # A config seed reaches the pipeline with no override (reproducible
+        # production run); calibration reading the same config reproduces it.
+        assert self._pipe(42).kwargs(speaker_id="speaker0")["seed"] == 42
+
+    def test_calibration_override_wins_over_config(self):
+        # A calibration probe pins its own seed to sweep sampling variance.
+        assert self._pipe(42).kwargs(speaker_id="speaker0", seed=7)["seed"] == 7
+
+    def test_sibling_sampling_knobs_default_to_config(self):
+        kw = self._pipe(None).kwargs(speaker_id="speaker0")
+        assert kw["temperature"] == 0.0  # ExtractionConfig defaults
+        assert kw["max_tokens"] == 8192
+
+    def test_sibling_sampling_knob_overrides_are_honored(self):
+        # temperature/max_tokens overrides were dead (read straight off cfg);
+        # now they flow like seed. temperature=0.0 is a value, not "unset".
+        kw = self._pipe(None).kwargs(speaker_id="speaker0", temperature=0.7, max_tokens=256)
+        assert kw["temperature"] == 0.7
+        assert kw["max_tokens"] == 256
+
+
+class TestExtractGraphSeedIsolation:
+    """The injected chain-seed graph seeds ``StageState.graph`` but must NOT
+    become ``ctx.seed`` — the int sampling seed forwarded to every
+    ``generate_answer``.
+
+    Regression: ``extract_graph`` rebound its ``seed`` parameter to
+    ``chain_seed()``, so (a) the parameter was globally dead — production's
+    ``ctx.seed`` was always ``None`` — and (b) a calibration caller injecting a
+    graph fed a ``SessionGraph`` into ``int(seed)`` at the first
+    ``generate_answer`` (anonymize), 500-ing ``/calibrate/{enrich,plausibility}``.
+    """
+
+    def test_injected_graph_does_not_clobber_sampling_seed(self):
+        from paramem.graph.flows import extract_graph
+        from paramem.graph.phase_trace import start_at
+
+        captured: dict = {}
+
+        def _fake_run_flow(_spec, ctx, state):
+            captured["ctx_seed"] = ctx.seed
+            captured["state_graph"] = state.graph
+            return state
+
+        injected = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
+        with patch("paramem.graph.flows.run_flow", side_effect=_fake_run_flow):
+            with start_at("anonymize", injected):
+                extract_graph(
+                    MagicMock(),
+                    MagicMock(),
+                    "[user] hi there",
+                    "calib",
+                    "speaker0",
+                    seed=1234,
+                    scrub=set(),
+                )
+
+        # The int sampling seed survives graph injection ...
+        assert captured["ctx_seed"] == 1234
+        # ... and the injected graph is what seeds the initial StageState.
+        assert captured["state_graph"] is injected
+
+    def test_no_injection_starts_from_a_fresh_graph_and_forwards_seed(self):
+        """Production shape: no injection → StageState starts empty, and the
+        sampling seed still reaches ctx.seed (was dead before)."""
+        from paramem.graph.flows import extract_graph
+        from paramem.graph.phase_trace import start_at
+
+        captured: dict = {}
+
+        def _fake_run_flow(_spec, ctx, state):
+            captured["ctx_seed"] = ctx.seed
+            captured["state_graph"] = state.graph
+            return state
+
+        with patch("paramem.graph.flows.run_flow", side_effect=_fake_run_flow):
+            # start_at(None) opens no injection — chain_seed() is None.
+            with start_at(None):
+                extract_graph(
+                    MagicMock(),
+                    MagicMock(),
+                    "[user] hi there",
+                    "calib",
+                    "speaker0",
+                    seed=7,
+                    scrub=set(),
+                )
+
+        assert captured["ctx_seed"] == 7
+        assert captured["state_graph"].session_id == "calib"
+
+
+class TestCloudEnrichmentFailureModes:
+    """``request_enrichment`` returns ``delta=None`` after exhausting its
+    retries, and the enrich stage branches on ``parse_path`` — the two failure
+    modes get opposite treatment because opposite recoveries work:
+
+    * ``"failed"`` (HICCUP) — the provider answered but never in the delta
+      envelope shape.  Fail OPEN: keep the pre-enrichment facts, record
+      ``cloud_enrichment_degraded``, continue.  Waiting would not help (same
+      input → same mis-shape), so degrade this one session.  Consistent with
+      the graph-tier enrichment path and both plausibility judges.
+    * ``"no_response"`` (OUTAGE) — the provider was unreachable on every
+      attempt.  Raise ``ExtractionFailed`` so the batch aborts and its sessions
+      stay pending for a clean retry once cloud recovers.
+
+    (d0913f6 silently flipped BOTH to a fatal raise when it carved the tail
+    into declarative stages; only the outage case belongs there.)
+    """
+
+    def test_cloud_enrich_hiccup_fails_open(self):
+        """request_enrichment returning (None, ...) → pre-enrichment facts
+        kept, degradation recorded, no raise."""
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                # First element None ⇒ every retry missed a parseable delta.
+                # The stage must fail OPEN: keep the pre-enrichment facts,
+                # record the degradation, and NOT raise.
+                return_value=(None, None, {"parse_path": "failed", "attempts": 3}),
+            ),
+        ):
+            result = run_cloud_stages(
+                graph,
+                "transcript",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        # The pre-enrichment fact survives — the run was NOT failed.
+        assert any(r.predicate == "lives_in" for r in result.relations)
+        # The degradation is recorded so the server layer can surface it on
+        # pstatus, and it names how many attempts were spent.
+        degraded = result.diagnostics.get("cloud_enrichment_degraded")
+        assert degraded is not None
+        assert degraded["attempts"] == 3
+        assert degraded["kept_facts"] == 1
+
+    def test_cloud_enrich_outage_raises_extraction_failed(self):
+        """request_enrichment returning (None, ..., parse_path="no_response")
+        → ExtractionFailed, so the batch aborts and its sessions stay
+        pending for a clean retry once the provider recovers."""
         from paramem.graph.extractor import ExtractionFailed
         from tests._cloud_flow import run_cloud_stages
 
@@ -3805,14 +3973,11 @@ class TestCloudEnrichmentFailureRaises:
             ),
             patch(
                 "paramem.graph.stage_enrich.request_enrichment",
-                # First element None ⇒ cloud call failed or unparseable.
-                # Pre-fix this silently fell back to anon_facts.  Post-fix
-                # this MUST raise so the per-session loop in app.py marks
-                # the chunk failed and leaves the session pending.
-                return_value=(None, None, {"parse_path": "no_response"}),
+                # No response on any attempt ⇒ outage, not a shape hiccup.
+                return_value=(None, None, {"parse_path": "no_response", "attempts": 3}),
             ),
         ):
-            try:
+            with pytest.raises(ExtractionFailed) as excinfo:
                 run_cloud_stages(
                     graph,
                     "transcript",
@@ -3822,13 +3987,7 @@ class TestCloudEnrichmentFailureRaises:
                     correction_entity_types=set(),
                     scrub={"person name"},
                 )
-            except ExtractionFailed as exc:
-                assert exc.phase == "cloud_enrich"
-                assert exc.reason
-            else:
-                raise AssertionError(
-                    "the enrich stage must raise ExtractionFailed on cloud failure"
-                )
+        assert excinfo.value.phase == "cloud_enrich"
 
     def test_extraction_failed_exposes_phase_and_reason(self):
         """Exception class contract used by the app.py per-chunk handler."""

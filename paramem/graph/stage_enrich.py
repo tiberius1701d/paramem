@@ -218,77 +218,116 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
             graph.diagnostics["cloud_call_info"] = _cloud_info
             t.add("cloud_call_info", _cloud_info)
         if delta is None:
-            # FAIL the cycle.  Previously fell back to anon_facts, which
-            # silently baked a degraded (un-enriched) snapshot into the
-            # cumulative graph — the same triples re-extracted in the
-            # next cycle would dedup, so the missing second-order
-            # relations were lost permanently.  Extraction failure must
-            # fail the whole cycle: raise and propagate
-            # past :meth:`ConsolidationLoop.extract_session` (which has
-            # not yet merged this session's graph), and let the
-            # per-session loop in app.py treat this session like a
-            # ``VramExhausted`` chunk — leave it pending and retry on
-            # the next cycle.  This is the ONE remaining whole-response
-            # failure mode (the envelope itself is unparseable/absent) —
-            # per-triple resolvability inside an otherwise-parseable
-            # delta is handled below and never raises.
+            # ``request_enrichment`` has already retried the call
+            # ``_ENRICHMENT_MAX_ATTEMPTS`` times.  ``parse_path`` splits the two
+            # failure modes it distinguishes (see its docstring):
+            parse_path = (_cloud_info or {}).get("parse_path", "failed")
+            attempts = (_cloud_info or {}).get("attempts", 0)
+            if parse_path == "no_response":
+                # OUTAGE — the provider was unreachable on every attempt
+                # (``_cloud_call`` collapses API/network/SDK errors to
+                # ``None``).  Abort so the batch's sessions stay PENDING and
+                # re-run next cycle once cloud recovers: the session graph is
+                # not merged here, so re-extraction enriches cleanly with no
+                # dedup loss.  This is the abort machinery's real purpose —
+                # a shape hiccup (below) is NOT routed here.
+                t.set_outcome("failed", reason="cloud provider unreachable (no response)")
+                raise ExtractionFailed(
+                    "cloud_enrich",
+                    "cloud enrichment provider unreachable after retries",
+                )
+            # HICCUP — the provider answered but never in the delta-envelope
+            # shape.  Fail OPEN: a rare per-input deviation is a performance
+            # degradation (this session goes un-enriched), NOT a reason to fail
+            # the whole run.  Same policy as the graph-tier enrichment path
+            # (``graph_enrich``) and both plausibility judges: keep the
+            # pre-enrichment facts, warn loudly, and record the degradation in
+            # diagnostics so the server layer can surface it on ``pstatus``.
+            # (d0913f6 silently flipped BOTH cases to a fatal raise when it
+            # carved the stage out; only the outage case belongs there.)
+            # ``enriched_anon`` is the local facts unchanged;
+            # ``updated_anon_transcript`` stays the anonymizer's transcript —
+            # no cloud rewrite happened.
+            logger.warning(
+                "cloud enrichment unparseable after %d attempt(s) — keeping "
+                "%d pre-enrichment fact(s), no enrichment applied this session "
+                "(degraded, not fatal)",
+                attempts,
+                len(anon_facts),
+            )
+            enriched_anon = anon_facts
+            updated_anon_transcript = anon_transcript
+            # No cloud delta ⇒ no cloud-minted bindings.  Build the same
+            # round-trip scope the ``deanonymize`` sibling consumes, but with
+            # ``cloud_bindings=None`` (the no-op form the conversation path
+            # uses) so de-anonymization resolves only the anonymizer's own
+            # placeholders — there are no new ones to bind.
+            scope = CloudScope.response(
+                payload, cloud_bindings=None, sent=(_facts_text, _transcript_text)
+            )
+            graph.diagnostics["cloud_enrichment_degraded"] = {
+                "parse_path": (_cloud_info or {}).get("parse_path", "failed"),
+                "attempts": attempts,
+                "response_chars": (_cloud_info or {}).get("response_chars", 0),
+                "kept_facts": len(anon_facts),
+            }
             t.set_parsed(
                 {
                     "input_count": len(anon_facts),
-                    "output_count": 0,
+                    "output_count": len(anon_facts),
                     "new_bindings_count": 0,
                     "new_bindings": {},
-                    "updated_anon_transcript_len": 0,
+                    "updated_anon_transcript_len": len(updated_anon_transcript or ""),
+                    "degraded": True,
                 }
             )
-            t.set_outcome("failed", reason="cloud call failed or unparseable")
-            raise ExtractionFailed(
-                "cloud_enrich",
-                "cloud enrichment call failed or response unparseable",
+            t.set_outcome("degraded", reason="cloud response unparseable after retries")
+        else:
+            # The ONE anonymize/deanonymize round-trip scope for this
+            # response.  ``CloudScope.response`` computes ``observed`` from
+            # the DECLARED vocabulary and the rendered payload (never a shape
+            # scrape — see its docstring) and prunes any binding whose own
+            # value carries an unresolvable placeholder.
+            scope = CloudScope.response(
+                payload, cloud_bindings=delta.bindings, sent=(_facts_text, _transcript_text)
             )
-        # The ONE anonymize/deanonymize round-trip scope for this
-        # response.  ``CloudScope.response`` computes ``observed`` from
-        # the DECLARED vocabulary and the rendered payload (never a shape
-        # scrape — see its docstring) and prunes any binding whose own
-        # value carries an unresolvable placeholder.
-        scope = CloudScope.response(
-            payload, cloud_bindings=delta.bindings, sent=(_facts_text, _transcript_text)
-        )
-        # Apply the delta — per-triple accept/drop/revert against
-        # ``scope.resolution``, never a whole-delta rejection (retired
-        # 2026-07-22): an unresolvable ``add`` is dropped, an
-        # unresolvable ``modify`` is reverted to its original fact, and
-        # ``drop`` is honored unconditionally. See
-        # ``_apply_enrichment_delta``'s own docstring for the full
-        # per-action contract and the ``report`` keys below.
-        enriched_anon, updated_anon_transcript, report = _apply_enrichment_delta(
-            anon_facts, delta, scope, anon_transcript
-        )
-        graph.diagnostics["cloud_enrichment_report"] = report
-        if report["rejected_adds"] or report["reverted_modifies"]:
-            logger.warning(
-                "cloud enrichment: %d add(s) dropped, %d modify(ies) reverted "
-                "(unresolvable token(s): %s)%s.",
-                report["rejected_adds"],
-                report["reverted_modifies"],
-                report["rejected_tokens"][:5],
-                " — co-occurred with a non-empty drop set" if report["drop_with_rejection"] else "",
+            # Apply the delta — per-triple accept/drop/revert against
+            # ``scope.resolution``, never a whole-delta rejection (retired
+            # 2026-07-22): an unresolvable ``add`` is dropped, an
+            # unresolvable ``modify`` is reverted to its original fact, and
+            # ``drop`` is honored unconditionally. See
+            # ``_apply_enrichment_delta``'s own docstring for the full
+            # per-action contract and the ``report`` keys below.
+            enriched_anon, updated_anon_transcript, report = _apply_enrichment_delta(
+                anon_facts, delta, scope, anon_transcript
             )
-        t.set_parsed(
-            {
-                "input_count": len(anon_facts),
-                "output_count": len(enriched_anon),
-                "new_bindings_count": len(delta.bindings or {}),
-                "new_bindings": dict(delta.bindings) if delta.bindings else {},
-                "updated_anon_transcript_len": len(updated_anon_transcript or ""),
-                "observed_count": len(scope.observed),
-                "mapped_count": len(scope.resolution),
-                **report,
-            }
-        )
-        if not enriched_anon:
-            logger.info("cloud enrichment removed all relations")
-            empty_cause = CAUSE_CLOUD_EMPTY
+            graph.diagnostics["cloud_enrichment_report"] = report
+            if report["rejected_adds"] or report["reverted_modifies"]:
+                logger.warning(
+                    "cloud enrichment: %d add(s) dropped, %d modify(ies) reverted "
+                    "(unresolvable token(s): %s)%s.",
+                    report["rejected_adds"],
+                    report["reverted_modifies"],
+                    report["rejected_tokens"][:5],
+                    " — co-occurred with a non-empty drop set"
+                    if report["drop_with_rejection"]
+                    else "",
+                )
+            t.set_parsed(
+                {
+                    "input_count": len(anon_facts),
+                    "output_count": len(enriched_anon),
+                    "new_bindings_count": len(delta.bindings or {}),
+                    "new_bindings": dict(delta.bindings) if delta.bindings else {},
+                    "updated_anon_transcript_len": len(updated_anon_transcript or ""),
+                    "observed_count": len(scope.observed),
+                    "mapped_count": len(scope.resolution),
+                    **report,
+                }
+            )
+            if not enriched_anon:
+                logger.info("cloud enrichment removed all relations")
+                empty_cause = CAUSE_CLOUD_EMPTY
     if chain_stopped():
         # Calibration short-circuit: Cloud enrichment block recorded,
         # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.

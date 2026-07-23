@@ -716,18 +716,22 @@ def extract_graph(
     # extraction_trace lifecycle (open/attach) exactly as before.
     with extraction_trace() as trace:
         # A calibration caller entering the chain past ``local_extract``
-        # supplies the graph that stage would have produced (see
-        # paramem.graph.phase_trace.start_at); with no such request open —
-        # every production call — the seed is the empty graph the local
-        # extractor rebinds wholesale.
-        seed = chain_seed()
+        # supplies, via :func:`~paramem.graph.phase_trace.start_at`, the graph
+        # that stage would have produced; it seeds the initial ``StageState``.
+        # With no such request open — every production call — ``chain_seed()``
+        # is ``None`` and the chain starts from a fresh empty graph.  This is
+        # the injected GRAPH; keep it DISTINCT from the sampling ``seed`` (an
+        # int forwarded verbatim to every ``generate_answer`` via ``ctx.seed``).
+        # They shared one name until 2026-07-23, which fed a ``SessionGraph``
+        # into ``int(seed)`` the moment a caller injected a graph.
+        injected_graph = chain_seed()
         state = StageState(
             graph=SessionGraph(
                 session_id=session_id,
                 timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
             )
-            if seed is None
-            else seed
+            if injected_graph is None
+            else injected_graph
         )
         try:
             ctx = StageContext(

@@ -443,6 +443,7 @@ class ConsolidationLoop:
         thermal_policy: ThermalPolicy | None = None,
         keep_prior_slots: int = 3,
         telemetry_dir: str | Path | None = None,
+        incidents_state_dir: str | Path | None = None,
     ):
         # Optional callable that returns the server ``_state`` dict.  When
         # provided, ``run_cycle`` calls ``self.guard_trial_state(state_provider())``
@@ -461,6 +462,16 @@ class ConsolidationLoop:
         # Always-on when set; NOT gated on ``debug``.
         self._telemetry_dir: Path | None = (
             Path(telemetry_dir) if telemetry_dir is not None else None
+        )
+        # Operator-visible incident store (``data/state``) for non-fatal
+        # degradations — e.g. a cloud-enrichment hiccup that fell back to
+        # pre-enrichment facts.  Threaded from the server bootstrap exactly like
+        # ``telemetry_dir``; ``None`` for experiments/tests, which record no
+        # incidents.  Recorded through the same ``record_incident`` primitive
+        # the outage path uses — one incident surface, called directly the way
+        # ``_save_adapters`` calls ``save_adapter``.
+        self._incidents_state_dir: Path | None = (
+            Path(incidents_state_dir) if incidents_state_dir is not None else None
         )
         self._keep_prior_slots = keep_prior_slots
         # ``ServerConfig.cloud.enabled``, passed in at the bootstrap call site
@@ -1296,6 +1307,35 @@ class ConsolidationLoop:
                     on_session_extracted(proc_graph, session_id, "procedural_graph")
 
         self.last_session_graph = session_graph
+
+        # Surface a non-fatal cloud-enrichment degradation (the hiccup fail-open
+        # in ``stage_enrich``) as an operator-visible incident — the SAME
+        # ``record_incident`` surface the outage path uses, called directly here
+        # the way this method already calls ``on_session_extracted`` and
+        # ``_save_adapters`` calls ``save_adapter``.  ``session_graph`` is this
+        # method's own local, not a side-channel read.  Severity ``"warning"``
+        # (the run succeeded); keyed by phase so repeated hiccups bump one
+        # incident rather than flooding the store.
+        degraded = session_graph.diagnostics.get("cloud_enrichment_degraded")
+        if degraded is not None and self._incidents_state_dir is not None:
+            from paramem.server.incidents import record_incident
+
+            record_incident(
+                self._incidents_state_dir,
+                type="enrichment_degraded",
+                key="cloud_enrich",
+                severity="warning",
+                summary=(
+                    "Consolidation: cloud enrichment degraded — kept "
+                    "pre-enrichment facts (unparseable response)"
+                ),
+                detail={
+                    "type": "enrichment_degraded",
+                    "session_id": session_id,
+                    **degraded,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
 
         # Release reclaimable device memory back to the WSL2 dxg layer at every
         # session boundary.  PyTorch's caching allocator retains freed blocks
