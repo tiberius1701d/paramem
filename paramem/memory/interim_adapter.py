@@ -4,7 +4,8 @@ This module owns two operations that must stay co-located so the full
 consolidation fold can call unload without importing app.py:
 
   create_interim_adapter  — live creation of the current episodic_interim_* adapter
-  unload_interim_adapters — post-consolidation removal of all interim adapters
+  unload_interim_adapters — post-consolidation reap of all interim slots
+                            (PEFT adapters where they exist, on-disk dirs always)
 
 It also provides a timestamp helper:
 
@@ -278,32 +279,41 @@ def create_interim_adapter(
     return model
 
 
-def unload_interim_adapters(model: PeftModel, adapter_dir: Path) -> list[str]:
-    """Delete every loaded episodic_interim_* adapter from PEFT and its on-disk dir.
+def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
+    """Reap every interim slot: the PEFT adapters (when any) and the on-disk dirs.
 
-    This is phase 3 of the consolidation finalize sequence.  Call it ONLY after:
-      1. Registry rewrite (adapter_id values updated to main tier names).
-      2. On-disk delete of interim adapter dirs (done here for completeness).
-    And BEFORE:
-      3. Router.reload() — which must not see any episodic_interim_* dirs.
+    This is phase 3 of the consolidation finalize sequence.  It must run AFTER
+    the registry rewrite that rebooks interim keys onto the main tiers, so no
+    live registry still points at a slot this call removes.
 
-    Phase ordering relative to registry rewrite and Router.reload() is the
-    caller's responsibility: registry rewrite must complete before this call,
-    and Router.reload() must not be called until after this call returns.
+    **Both fold venues call this.**  The weights venue has PEFT interim adapters
+    mounted and an on-disk slot dir per adapter; the disk venue has only the
+    on-disk slot dirs (``self.model`` there is a bare base model, not a
+    :class:`~peft.PeftModel`, and holds no ``peft_config``).  The PEFT half is
+    therefore skipped when *model* is not a ``PeftModel`` — the on-disk reap is
+    unconditional and is the same reap in both venues.  Do not write a second
+    reaper for the disk venue.
 
     The three main adapters (episodic, semantic, procedural) remain loaded
     throughout — the sole-adapter trap does not apply.
 
     Args:
-        model: Live PeftModel.  Must contain at least one main adapter so
-            delete_adapter never removes the last adapter from the model.
+        model: Live model.  A :class:`~peft.PeftModel` has its interim adapters
+            deleted and must contain at least one main adapter so
+            ``delete_adapter`` never removes the last adapter.  Anything else
+            (bare base model, ``None``) skips the PEFT half.
         adapter_dir: Parent directory (config.adapter_dir) whose
             episodic_interim_* subdirectories are removed.
 
     Returns:
-        Sorted list of adapter names that were unloaded (may be empty).
+        Sorted list of adapter names that were unloaded from PEFT (empty in the
+        disk venue, where there are none).
     """
-    interim_names = sorted(n for n in model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
+    interim_names = (
+        sorted(n for n in model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
+        if isinstance(model, PeftModel)
+        else []
+    )
     for name in interim_names:
         model.delete_adapter(name)
         logger.info("Deleted interim adapter from PEFT: %s", name)

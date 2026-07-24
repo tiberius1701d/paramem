@@ -45,7 +45,12 @@ from paramem.memory.persistence import (
     save_memory_to_disk,
 )
 from paramem.memory.probe import probe_keys_grouped_by_adapter
-from paramem.memory.source import DiskMemorySource, MemorySource, WeightMemorySource
+from paramem.memory.source import (
+    DiskMemorySource,
+    MemorySource,
+    WeightMemorySource,
+    build_memory_source,
+)
 from paramem.memory.store import MemoryStore
 
 __all__ = [
@@ -59,6 +64,7 @@ __all__ = [
     "WeightMemorySource",
     "adapter_slot_root_for_name",
     "assign_keys",
+    "build_memory_source",
     "build_registry",
     "commit_tier_slot",
     "compute_simhash",

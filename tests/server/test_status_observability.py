@@ -81,7 +81,6 @@ class TestSecondsUntilNextFullConsolidation:
     - N == 0: every tick is full → next tick.
     - No interim dirs: None.
     - Manual-only cadence: None.
-    - Count-primary condition holds: next tick.
     - Deadline in future: ceiled to next tick boundary.
     - Deadline in past: next tick.
     """
@@ -126,24 +125,30 @@ class TestSecondsUntilNextFullConsolidation:
         result = _seconds_until_next_full_consolidation(cfg)
         assert result is None
 
-    def test_count_primary_condition_holds_returns_next_tick(self, tmp_path):
-        """Count-primary: n > 1 and (n-1) % N == 0 → due on next tick."""
+    def test_slot_count_does_not_shorten_the_prediction(self, tmp_path):
+        """A full ring does NOT bring the prediction forward — the deadline decides.
+
+        Four slots at N=3 would have satisfied the retired count gate.  The ETA
+        must still be the OLDEST slot's deadline (midnight + 36h, ceiled to a
+        tick), not "the next tick", or ``/status`` would contradict
+        ``_is_full_cycle_due``.
+        """
         adapter_dir = tmp_path / "adapters"
         cfg = _make_config(
             refresh_cadence="every 12h",
             max_interim_count=3,
-            consolidation_period_seconds=3 * 12 * 3600,
+            consolidation_period_seconds=3 * 12 * 3600,  # 36h
             adapter_dir=adapter_dir,
         )
-        # Create 4 dirs: n=4, N=3 → (4-1) % 3 == 0 → count-primary holds.
         for i in range(4):
             stamp = f"20260701T{i:02d}00"
             _make_interim_dir(adapter_dir, stamp)
 
-        now = datetime(2026, 7, 1, 1, 0, 0)  # 01:00 → next 12h tick at 12:00 = 11h
+        now = datetime(2026, 7, 1, 1, 0, 0)  # 01:00
         result = _seconds_until_next_full_consolidation(cfg, now=now)
-        assert result is not None
-        assert result == 11 * 3600
+        # Oldest slot 2026-07-01 00:00 + 36h = 2026-07-02 12:00, which is a tick
+        # boundary → 35h from 01:00.
+        assert result == 35 * 3600
 
     def test_deadline_in_future_ceiled_to_tick(self, tmp_path):
         """Deadline in future must be ceiled to the next tick boundary."""

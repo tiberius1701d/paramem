@@ -245,7 +245,9 @@ class KeyRegistry:
 
         PRIVATE — intentionally not a public accessor.  Used by
         :meth:`MemoryStore.tier_simhashes(include_stale=True)`,
-        :meth:`MemoryStore.snapshot`, and the integrity check.
+        :meth:`MemoryStore.snapshot`, the integrity check, and
+        :meth:`load_simhashes` (the on-disk leaf, which projects a
+        freshly-parsed payload through this same accessor).
 
         The returned map is what is serialised to ``indexed_key_registry.json``
         under the ``"simhash"`` key, so the on-disk file always holds the full
@@ -433,17 +435,104 @@ class KeyRegistry:
 
     @classmethod
     def load(cls, path: str | Path) -> "KeyRegistry":
-        """Load a tier's registry from ``path`` (empty registry if absent)."""
+        """Load a tier's registry from ``path`` (empty registry if absent).
+
+        Tolerant by design: any section the file does not carry is loaded as
+        empty.  In particular a pre-unification file without ``"simhash"``
+        loads its active keys with an empty fingerprint map rather than
+        failing — the boot walk
+        (:meth:`paramem.memory.store.MemoryStore.read_registries_from_disk`)
+        must not die on one.  Callers that specifically ask for fingerprints
+        use :meth:`load_simhashes`, which refuses a file that cannot answer.
+        """
+        path = Path(path)
+        data = cls._read_payload(path)
+        if data is None:
+            logger.info("No registry at %s, starting fresh", path)
+            return cls()
+
+        registry = cls._from_payload(data)
+        logger.info(
+            "Key registry loaded from %s: %d active keys, %d stale, %d fingerprints, health=%s",
+            path,
+            len(registry._active_keys),
+            len(registry._stale),
+            len(registry._simhash) + sum(1 for r in registry._stale.values() if "simhash" in r),
+            "set" if registry._health is not None else "unset",
+        )
+        return registry
+
+    @classmethod
+    def load_simhashes(cls, path: str | Path) -> dict[str, int]:
+        """Read the ``{key: fingerprint}`` map out of ONE registry file.
+
+        The single leaf for "read the SimHash fingerprints out of an
+        ``indexed_key_registry.json``".  Both the per-file callers (the trial
+        consolidation gates, which are handed a path and must be told when it
+        is the wrong one) and the adapter-tree walk
+        (:meth:`paramem.memory.store.MemoryStore.read_simhash_registry_from_disk`)
+        go through here, so the encryption read, the on-disk shape and the
+        wrong-file guard exist exactly once.
+
+        Returns the active∪stale fingerprint superset — the same map
+        :meth:`save_bytes` serialises under ``"simhash"`` — with non-integer
+        values dropped.  Sharing :meth:`_from_payload` with :meth:`load` means
+        the active/stale partition routing cannot drift between the two.
+
+        A file that cannot answer the question is a caller error, not an empty
+        map: it must carry a dict-valued ``"simhash"`` section or this raises.
+        ``key_metadata.json`` (``{"cycle_count", "promoted_keys", "keys"}`` —
+        per-key bookkeeping, never a fingerprint) has no such section, so
+        pointing this method at it fails immediately instead of silently
+        un-gating every key it was supposed to verify.  An EMPTY ``"simhash"``
+        map is accepted — that is what a registered-but-untrained tier
+        serialises, and it truthfully answers "no fingerprints".
+
+        Args:
+            path: Path to one tier's ``indexed_key_registry.json``.
+
+        Returns:
+            ``{key: fingerprint}``.  Empty when *path* does not exist (fresh
+            install / tier not yet trained) or its ``"simhash"`` map is empty.
+
+        Raises:
+            ValueError: When the parsed JSON is not a registry payload — not a
+                dict, or carrying no dict-valued ``"simhash"`` section.
+        """
+        path = Path(path)
+        data = cls._read_payload(path)
+        if data is None:
+            return {}
+        if not isinstance(data, dict) or not isinstance(data.get("simhash"), dict):
+            raise ValueError(
+                f"{path} is not a KeyRegistry-shaped registry file (missing a "
+                "dict-valued 'simhash' section) — refusing to coerce a foreign "
+                "registry schema into a simhash map"
+            )
+        return cls._from_payload(data)._known_simhashes()
+
+    @classmethod
+    def _read_payload(cls, path: Path) -> dict | None:
+        """Decrypt and parse one registry file; ``None`` when it does not exist.
+
+        The only read of ``indexed_key_registry.json`` — every consumer
+        (:meth:`load`, :meth:`load_simhashes`) goes through here so the
+        encryption-aware read exists once.
+        """
         from paramem.backup.encryption import read_maybe_encrypted
 
-        path = Path(path)
-        registry = cls()
         if not path.exists():
-            logger.info("No registry at %s, starting fresh", path)
-            return registry
+            return None
+        return json.loads(read_maybe_encrypted(path).decode("utf-8"))
 
-        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
+    @classmethod
+    def _from_payload(cls, data: dict) -> "KeyRegistry":
+        """Build a registry from a parsed ``indexed_key_registry.json`` payload.
 
+        The only place that knows the on-disk field layout written by
+        :meth:`save_bytes`.  Absent sections load as empty (see :meth:`load`).
+        """
+        registry = cls()
         registry._active_keys = data.get("active_keys", [])
         for key, scores in data.get("fidelity_history", {}).items():
             registry._fidelity_history[key] = scores
@@ -470,12 +559,4 @@ class KeyRegistry:
                     else:
                         registry._simhash[k] = fp
 
-        logger.info(
-            "Key registry loaded from %s: %d active keys, %d stale, %d fingerprints, health=%s",
-            path,
-            len(registry._active_keys),
-            len(registry._stale),
-            len(registry._simhash) + sum(1 for r in registry._stale.values() if "simhash" in r),
-            "set" if registry._health is not None else "unset",
-        )
         return registry

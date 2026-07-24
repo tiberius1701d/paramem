@@ -9,8 +9,9 @@ medium for the current consolidation mode.  Two implementations exist:
   ``graph.json`` files and decodes the entry directly.
 
 Both implementations return the same canonical entry shape so callers
-(boot hydration, on-miss inference probe, in-training verification,
-active-store migration) are mode-agnostic.
+(boot hydration, on-miss inference probe, fold hydration, active-store
+migration) are mode-agnostic.  :func:`build_memory_source` is the ONE
+construction site — callers name the mode, never the class.
 
 The source is **not** the cache — :class:`paramem.memory.store.MemoryStore`
 is.  A source is invoked at boot to populate the cache and on cache miss to
@@ -30,7 +31,7 @@ still holds.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Literal, Protocol, runtime_checkable
 
 from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD
 
@@ -95,9 +96,10 @@ class WeightMemorySource:
                 — no default is provided so callers cannot silently fall back
                 to single-key generation.
         """
-        # BASE-MODEL HOLDER (WeightMemorySource): boot-preload only. The
-        # lifespan must drop its _source local after the probe —
-        # _release_base_model_in_process cannot reach a lifespan-frame local.
+        # BASE-MODEL HOLDER (WeightMemorySource): every construction goes
+        # through build_memory_source, and every caller of that keeps the result
+        # as a frame-local it drops before returning —
+        # _release_base_model_in_process cannot reach a caller-frame local.
         self.model = model
         self.tokenizer = tokenizer
         self.registry = registry
@@ -215,3 +217,67 @@ class DiskMemorySource:
                     ),
                 }
         return results
+
+
+def build_memory_source(
+    *,
+    mode: "Literal['train', 'simulate']",
+    adapter_dir: "Path | str",
+    batch_size: int,
+    model=None,
+    tokenizer=None,
+) -> "MemorySource | None":
+    """Construct the :class:`MemorySource` for *mode* — the ONE construction site.
+
+    Every path that needs a source goes through here: boot / post-fold store
+    hydration (``app._build_store_contents``), the per-query on-miss probe
+    (``inference._probe_and_reason``), and the per-fold store hydration
+    (``ConsolidationLoop._hydrate_store_for_fold``).  The mode → class mapping
+    exists exactly once, which is why this is the only function in
+    ``paramem/memory/`` on the mode-fork allowlist.
+
+    **BASE-MODEL HOLDER** — a returned :class:`WeightMemorySource` captures
+    *model*.  The caller owns the lifetime: keep it as a frame-local and drop it
+    before returning, never on ``self`` (see the invariant header on
+    ``app._release_base_model_in_process``).
+
+    Args:
+        mode: Consolidation persistence mode.  ``"simulate"`` → graph.json on
+            disk; ``"train"`` → adapter weights.  Production sources:
+            ``config.consolidation.mode`` (server sites) and
+            ``ConsolidationLoop._venue_from_scope(scope)`` (fold site).
+        adapter_dir: Adapter root.  ``config.adapter_dir`` on the server sites,
+            ``ConsolidationLoop.output_dir`` in the fold — the same directory
+            the per-tier ``graph.json`` and ``indexed_key_registry.json`` files
+            are written into.
+        batch_size: Keys per ``model.generate`` call for the weight probe.
+            Production source: ``config.consolidation.recall_probe_batch_size``
+            (server sites) / ``TrainingConfig.recall_probe_batch_size`` (fold),
+            which ``ServerConfig`` derives from the same field.  Required even
+            in simulate mode so the signature does not fork.
+        model: Loaded ``PeftModel``.  Train mode only; ``None`` means no local
+            model (cloud-only boot, or a failed load).
+        tokenizer: Tokenizer matching *model*.  Train mode only.
+
+    Returns:
+        A :class:`DiskMemorySource` in simulate mode; a
+        :class:`WeightMemorySource` in train mode; ``None`` in train mode when
+        no model is loaded — the caller then has no source of truth and must
+        decide whether to skip or degrade.
+    """
+    if mode == "simulate":
+        return DiskMemorySource(adapter_dir)
+    if model is None:
+        return None
+
+    # SimHash registry is DERIVED from adapter_dir, never passed in: it gates
+    # recalled entries before they enter the cache (the store-boundary gate in
+    # MemoryStore.probe remains the hermetic authority).
+    from paramem.memory.store import MemoryStore
+
+    return WeightMemorySource(
+        model,
+        tokenizer,
+        registry=MemoryStore.read_simhash_registry_from_disk(adapter_dir),
+        batch_size=batch_size,
+    )

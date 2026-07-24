@@ -469,12 +469,14 @@ class ConsolidateResponse(BaseModel):
         Terminal status of the dispatch: ``started*`` (the run was submitted),
         ``noop_*`` (nothing to do), or ``deferred_*`` (blocked, retry later).
     action:
-        What the request actually resolved to — ``"full"`` (main memory
-        rebuilt from stored knowledge), ``"interim"`` (recent conversations
-        absorbed), or ``"auto"`` when the dispatch was refused before the
-        schedule could resolve it.  ``POST /consolidate`` and
-        ``POST /scheduled-tick`` let the schedule decide, so this is how their
-        caller learns which of the two ran.
+        What the request actually resolved to — ``"full"`` (the interim slots
+        collapsed into main memory), ``"interim"`` (recent conversations
+        absorbed into a new interim slot), ``"reconcile"`` (main memory rebuilt
+        from its own stored knowledge, interim slots left alone), or ``"auto"``
+        when the dispatch was refused before the schedule could resolve it.
+        ``POST /scheduled-tick`` is the one door that lets the schedule decide,
+        so this is how its caller learns which of the two ran; the operator
+        doors echo the action they asked for.
     """
 
     status: str
@@ -4689,12 +4691,7 @@ def _build_store_contents(
         ``stats``: ``{"boot_degraded": dict | None, "store_load_degraded": bool,
                       "meta_loaded": int, "meta_orphaned": int}``
     """
-    from paramem.memory.source import (
-        DiskMemorySource as _DiskMemorySource,
-    )
-    from paramem.memory.source import (
-        WeightMemorySource as _WeightMemorySource,
-    )
+    from paramem.memory.source import build_memory_source as _build_memory_source
     from paramem.memory.store import MemoryStore as _MemoryStore
 
     stats: dict = {
@@ -4749,42 +4746,25 @@ def _build_store_contents(
             # No active keys — nothing to preload; store is correctly empty.
             stats["boot_degraded"] = None
         else:
-            # Mode-aware source: simulate persists graph.json (DiskMemorySource);
-            # train persists only adapter weights (WeightMemorySource).
-            # Select from config.consolidation.mode — NOT from _state["mode"]
-            # (that conflates consolidation persistence mode with runtime mode).
-            _mode = config.consolidation.mode
+            # Mode-aware source, built by the one factory.  Select from
+            # config.consolidation.mode — NOT from _state["mode"] (that
+            # conflates consolidation persistence mode with runtime mode).
             # BASE-MODEL HOLDER (_source frame-local — set to None before return)
-            _source = None
-            if _mode == "simulate":
-                _source = _DiskMemorySource(config.adapter_dir)
-            elif model is not None:
-                # Pass the on-disk SimHash registry to the WeightMemorySource so
-                # it gates BEFORE caching (belt-and-suspenders early-out).
-                # The store-boundary gate in MemoryStore.probe is the hermetic
-                # authority; this prevents below-threshold entries from entering
-                # the cache in the first place, matching the per-query path
-                # (inference.py:782 passes registry= to WeightMemorySource).
-                from paramem.server.inference import (
-                    _load_simhash_registry as _boot_load_simhash_registry,
-                )
-
-                _boot_registry = _boot_load_simhash_registry(config.adapter_dir)
-                _source = _WeightMemorySource(
-                    model,
-                    tokenizer,
-                    registry=_boot_registry,
-                    batch_size=config.consolidation.recall_probe_batch_size,
-                )
-            else:
+            _source = _build_memory_source(
+                mode=config.consolidation.mode,
+                adapter_dir=config.adapter_dir,
+                batch_size=config.consolidation.recall_probe_batch_size,
+                model=model,
+                tokenizer=tokenizer,
+            )
+            if _source is None:
                 logger.info(
                     "preload_cache: skipping entry preload — no model loaded "
                     "(cloud-only mode or model load failed); store will stay "
                     "empty for entries and inference will pay source latency "
                     "on each query"
                 )
-
-            if _source is not None:
+            else:
                 _total = sum(len(v) for v in _preload_keys_by_tier.values())
                 logger.info(
                     "preload_cache: probing %d active key(s) across %d tier(s) via %s",
@@ -7464,11 +7444,13 @@ async def require_no_trial() -> None:
 async def scheduled_tick():
     """Systemd user-timer entrypoint (paramem-consolidate.timer).
 
-    Dispatches exactly as ``POST /consolidate`` does — :func:`_is_full_cycle_due`
-    resolves the tick to an interim cycle (the cooperative extract +
-    background-train path) or to a full fold — except that this route also
-    applies the catch-up gate, so a heartbeat wakeup that is not yet due does
-    not fire a cycle.  Skipped when there is nothing new to consume.
+    The ONLY scheduled door, and therefore the only one that carries the
+    schedule's three decisions: the suspend/power-off catch-up gate (a
+    heartbeat wakeup that is not yet due fires no cycle),
+    :func:`_is_full_cycle_due` resolving the tick to a full fold or an interim
+    cycle (the cooperative extract + background-train path), and the content
+    gate that skips a tick with nothing new to consume.  ``action`` in the
+    response reports which of the two the schedule resolved to.
 
     Non-blocking; HTTP 200 in every case, read ``status``.  If the GPU is
     unavailable (cloud-only, or bg training already active) the status is
@@ -7479,10 +7461,7 @@ async def scheduled_tick():
     Returns 409 ``trial_active`` when a migration TRIAL is in progress
     ("refuses new cycles" while TRIAL is active).
     """
-    # Gate ON: the systemd timer may fire a heartbeat wakeup well before a
-    # non-calendar-exact cadence is actually due — see systemd_timer module
-    # docstring. The catch-up gate decides whether THIS wakeup dispatches.
-    status, action = _dispatch_consolidation(ConsolidationAction.AUTO, apply_schedule_gate=True)
+    status, action = _dispatch_consolidation(ConsolidationAction.AUTO)
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -7492,47 +7471,34 @@ async def scheduled_tick():
     dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
 async def consolidate():
-    """Run the scheduled consolidation now, without waiting for the timer.
+    """Collapse the recent conversations into main memory now.
 
-    Manual ``/consolidate`` and the systemd-driven ``/scheduled-tick`` share
-    the same dispatcher: :func:`_is_full_cycle_due` decides between a full
-    cycle (collapse the interim slots into main) and an interim cycle (extract
-    pending sessions into a new ``episodic_interim_<stamp>`` slot), from the
-    count and age of the payload-bearing interim slots on disk.  ``window_stamp``
-    is manifest provenance only — no gate reads it, so there is no
-    "clear the stamp to force a full cycle" escape hatch.  To rebuild main
-    memory on demand, use ``POST /reconsolidate``.
+    The full fold, run on demand: every interim slot on disk is folded into the
+    main tiers, which are re-groomed and re-learned, and the absorbed slots are
+    then reaped.  This is the operation the schedule performs when it decides a
+    full cycle is due — the same fold, keyed and reported identically.
 
-    Skipped when there is nothing new to consume (``noop_*``) — in both train
-    and simulate mode, on both the interim and the full path.
+    It is a deliberate request, so the schedule does not re-decide it: neither
+    the catch-up gate (which exists to stop the systemd heartbeat over-firing a
+    non-calendar-exact cadence) nor the "nothing new to consume" content gate
+    applies, and the run does not move the cadence window.  To absorb only the
+    recent conversations without touching main memory, use
+    ``POST /consolidate/interim``; to rebuild main memory from its own stored
+    knowledge without absorbing the interim slots, use ``POST /reconsolidate``.
 
-    Unlike ``/scheduled-tick``, this endpoint calls the dispatcher with
-    ``apply_schedule_gate=False`` — the suspend/power-off catch-up gate
-    (see systemd_timer module docstring) exists to stop the systemd
-    heartbeat from over-firing a non-calendar-exact cadence; it must never
-    block an operator's deliberate manual trigger, which is the escape
-    hatch the gate itself cannot substitute for. A manual run still resets
-    the cadence window (the last-attempt stamp is written on dispatch
-    regardless of the gate), so it does not cause an extra tick immediately
-    after.
-
-    Takes no request body.  ``action`` in the response reports which of the two
-    the schedule resolved to.
+    Takes no request body.
 
     Non-blocking: the run is submitted to an executor and this returns at once.
     Poll ``GET /status`` (``consolidating``).  Every outcome below is HTTP 200 —
     read ``status``:
 
-    - ``started`` / ``started_full`` — submitted.
-    - ``noop_*`` — nothing new to consume; no GPU work was done.
+    - ``started_full`` — submitted.
     - ``deferred_*`` — busy (a run is already going, someone is chatting, the
       GPU is held, or the server is cloud-only).  Retry later.
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    # Gate OFF: a manual trigger is the operator's deliberate escape hatch —
-    # it must never be refused for "not due yet" (see docstring above).
-    status, action = _dispatch_consolidation(ConsolidationAction.AUTO, apply_schedule_gate=False)
+    status, action = _dispatch_consolidation(ConsolidationAction.FULL)
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -7547,16 +7513,18 @@ async def consolidate_interim():
     Extracts every attributable conversation that is still pending and learns it
     into memory.  Use it when something was just said that the assistant should
     know immediately.  Main memory is untouched — that is what
-    ``POST /reconsolidate`` is for.
+    ``POST /consolidate`` and ``POST /reconsolidate`` are for.
+
+    A deliberate request runs: the schedule does not re-decide it, and it is not
+    refused for "nothing is waiting".  With an empty batch the extraction phase
+    finds no relations, mints no interim slot and trains nothing — so an
+    unnecessary call costs an extraction pass, not a ring slot.
 
     Takes no request body.
 
     Returns (HTTP 200 in every case below; read ``status``):
 
     - ``started`` — the run was submitted; poll ``GET /status`` (``consolidating``).
-    - ``noop_no_pending`` / ``noop_no_named`` — nothing is waiting to be
-      absorbed, or nothing waiting can be attributed to a known speaker.  There
-      is no point running: the request is refused rather than learning nothing.
     - ``noop_no_interim_tier`` — the deployment is configured with
       ``consolidation.max_interim_count: 0``, so recent conversations are never
       staged separately; they are absorbed by the scheduled consolidation
@@ -7566,7 +7534,7 @@ async def consolidate_interim():
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    status, action = _dispatch_consolidation(ConsolidationAction.INTERIM, apply_schedule_gate=False)
+    status, action = _dispatch_consolidation(ConsolidationAction.INTERIM)
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -7576,17 +7544,20 @@ async def consolidate_interim():
     dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
 async def reconsolidate():
-    """Rebuild main memory from stored knowledge — even when nothing is new.
+    """Rebuild main memory from its own stored knowledge — even when nothing is new.
 
     This is the operation to run after changing the model, the extraction
-    prompts, or the extraction config: it re-grooms the whole knowledge base and
-    re-learns the main memory from it, absorbing anything recent that has not
-    been absorbed yet.
+    prompts, or the extraction config: main memory is reconstructed from the
+    keys it already holds, re-groomed, and re-learned from the result.
 
-    Unlike ``POST /consolidate``, it is never skipped for "nothing new to learn"
-    — its input is the knowledge already stored, so there is always something to
-    rebuild from.  It is otherwise the same operation the schedule performs, and
-    is indistinguishable from it afterwards.
+    It is the one door with a narrower key source than the full fold: the
+    interim slots are NOT folded in, NOT reaped and NOT marked consumed, and
+    the pending conversations stay pending.  Nothing is lost by running it — the
+    recent material is still there for ``POST /consolidate`` or the schedule to
+    absorb afterwards.
+
+    Its input is the knowledge already stored, so "nothing new" is never a
+    reason to skip it.  The run does not move the cadence window.
 
     Takes no request body.
 
@@ -7599,7 +7570,7 @@ async def reconsolidate():
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    status, action = _dispatch_consolidation(ConsolidationAction.FULL, apply_schedule_gate=False)
+    status, action = _dispatch_consolidation(ConsolidationAction.RECONCILE)
     return ConsolidateResponse(status=status, action=action.value)
 
 
@@ -11978,35 +11949,35 @@ def _cloud_only_route(
 
 
 def _is_full_cycle_due(config) -> bool:
-    """Count/phase primary gate + oldest-interim-age deadline backstop.
+    """Oldest-interim-age deadline gate — the mechanism that fires the full fold.
 
     Replaces the window-stamp identity gate with a content-driven signal that
     is robust to skipped ticks, restarts, and the ≥24h stamp-collapse bug:
 
-    **Primary (count/phase):** the full fold is due when the on-disk interim
-    count ``n`` equals ``N + 1`` (first slot of the next cycle), where
-    ``N = max_interim_count``.  Reads ``iter_interim_dirs`` on-disk so the
-    count is restart-safe and derived from durable state.  The boundary
-    ``(n - 1) % N == 0`` detects the (N+1)-th slot; ``n > 1`` ensures there is
-    at least one completed interim cycle before triggering.
+    **The deadline:** the fold is due when the **oldest un-folded interim
+    tier's age** ≥ the full consolidation period (``N × refresh_cadence``
+    seconds, ``N = max_interim_count``).  Anchored to the oldest interim, not
+    to wall-clock since the last fold, so a skipped tick or a restart does not
+    shift it.
+
+    There is no second, count-based signal.  A slot-count gate ("due on the
+    (N+1)-th slot") is unreachable by construction: ``consolidation_period_
+    seconds`` is *derived* as ``refresh_cadence × N`` (``server/config.py``),
+    so the deadline always lands inside the very window in which the (N+1)-th
+    slot would be minted — that tick resolves FULL and drains the ring, so an
+    (N+1)-th slot never comes into existence for a count gate to observe.
 
     **What is counted:** only interim slots that carry the configured venue's
     payload (``iter_interim_dirs(..., mode=config.consolidation.mode)`` — a
     ``graph.json`` in simulate, adapter weights in train).  A slot directory
     whose payload write never landed holds nothing to fold, so it must not
-    drive the gate on its own.  The count/deadline arithmetic below is
-    unchanged; only its input set is venue-filtered.  ``_oldest_interim_stamp``,
+    drive the gate on its own.  ``_oldest_interim_stamp``,
     ``_full_cycle_deadline_dt`` and ``_seconds_until_next_full_consolidation``
-    filter the same way — the gate, its deadline backstop, its incident dedup
-    key and ``/status``'s ETA must all describe one set.
+    filter the same way — the gate, its deadline, its incident dedup key and
+    ``/status``'s ETA must all describe one set.
 
-    **Backstop (deadline):** even if count never reaches N+1 (sparse / broken
-    chain), the fold is also due when the **oldest un-folded interim tier's
-    age** ≥ the full consolidation period (``N × refresh_cadence`` seconds).
-    Anchored to the oldest interim, not to wall-clock since last fold.
-
-    Both signals are gated on ``n ≥ 1`` (un-folded interims must exist).
-    An empty store returns ``False`` and stays on the interim path.
+    Gated on ``n ≥ 1`` (un-folded interims must exist).  An empty store
+    returns ``False`` and stays on the interim path.
 
     **N == 0 special case (full-fold-only consume-pending mode)**: when
     ``max_interim_count == 0`` there are no interim adapter slots — the
@@ -12047,16 +12018,10 @@ def _is_full_cycle_due(config) -> bool:
     if N < 0:
         return False
 
-    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
-    n = len(dirs)
-    if n == 0:
+    if not any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
         return False
 
-    # Primary: due on the (N+1)-th interim slot — first slot of the new cycle.
-    if _count_primary_due(n, N):
-        return True
-
-    # Deadline backstop: oldest un-folded interim may not age past the full period.
+    # Deadline: the oldest un-folded interim may not age past the full period.
     deadline_dt = _full_cycle_deadline_dt(config)
     if deadline_dt is None:
         return False
@@ -12095,18 +12060,6 @@ def _oldest_interim_stamp(config) -> "str | None":
         return None
     oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
     return interim_stamp_from_name(oldest_name)
-
-
-def _count_primary_due(n: int, N: int) -> bool:
-    """Return True when the count-primary full-fold condition holds.
-
-    The full fold is due on the (N+1)-th interim slot — the first slot of the
-    next cycle.  Condition: at least two interims exist AND ``(n - 1) % N == 0``.
-
-    Single source of truth for both :func:`_is_full_cycle_due` (gate) and
-    :func:`_seconds_until_next_full_consolidation` (predictor).
-    """
-    return n > 1 and (n - 1) % N == 0
 
 
 def _full_cycle_deadline_dt(config) -> "datetime | None":
@@ -12156,8 +12109,6 @@ def _seconds_until_next_full_consolidation(
       fold).  The scan is venue-filtered (``mode=config.consolidation.mode``)
       exactly as the gate's is — an unfiltered predictor would contradict the
       gate in ``/status``.
-    - Count-primary condition already holds (``n > 1 and (n-1) % N == 0``):
-      returns seconds to the next tick.
     - Otherwise: ``deadline = oldest_interim_dt + full_period_seconds``; the
       result is the deadline ceiled to the next tick boundary, since folds only
       happen on ticks.
@@ -12195,16 +12146,9 @@ def _seconds_until_next_full_consolidation(
     if N == 0:
         return _next_tick_seconds()
 
-    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
-    n = len(dirs)
-    if n == 0:
+    if not any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
         return None  # no interims yet — nothing to fold
 
-    # Count-primary condition already holds → due on the next tick.
-    if _count_primary_due(n, N):
-        return _next_tick_seconds()
-
-    # Deadline backstop.
     deadline_dt = _full_cycle_deadline_dt(config)
     if deadline_dt is None:
         return None  # cadence off or no interims → no deadline
@@ -12296,18 +12240,30 @@ def _full_consolidation_overdue_key(config) -> "str | None":
 class ConsolidationAction(str, Enum):
     """What a consolidation dispatch is asked to do — the internal vocabulary.
 
-    ``AUTO`` is the only action the schedule resolves: it becomes ``FULL`` or
-    ``INTERIM`` in :func:`_dispatch_consolidation` according to
-    :func:`_is_full_cycle_due`.  ``FULL`` and ``INTERIM`` are the operator's
-    explicit requests and never consult the schedule gate.
+    ``AUTO`` is the scheduled tick's action, and the only one the schedule
+    resolves: it becomes ``FULL`` or ``INTERIM`` in
+    :func:`_dispatch_consolidation` according to :func:`_is_full_cycle_due`.
+    It is also the only action that consults the catch-up gate and the content
+    gate — an operator's deliberate request is never re-decided or refused for
+    "nothing new".
+
+    The other three are the operator's doors, one intent each:
+
+    - ``FULL`` — collapse the interim slots into the main tiers now.
+    - ``INTERIM`` — absorb the pending conversations into a new interim slot.
+    - ``RECONCILE`` — rebuild the main tiers from their OWN keys.  Same fold,
+      narrower key source: the interim slots are neither folded in nor reaped,
+      and pending sessions are left where they are.
 
     The arbitrator resolves this action and keeps it: the training layer below
-    receives only the fold's mode and its fold inputs.
+    receives the fold's mode, its key source and its fold inputs — never who
+    asked.
     """
 
     AUTO = "auto"
     FULL = "full"
     INTERIM = "interim"
+    RECONCILE = "reconcile"
 
 
 def _consolidation_dispatch_guards() -> "str | None":
@@ -12344,9 +12300,11 @@ def _stamp_scheduled_run(config) -> None:
     ``systemd_timer.floor_to_heartbeat``'s docstring for why an un-floored stamp
     silently inflates the effective period every cycle.
 
-    Fires on every real dispatch (FULL and INTERIM), regardless of who asked, so
-    an operator-triggered run resets the cadence window instead of leaving it
-    stale.
+    Fires only on a SCHEDULED dispatch (the ``AUTO`` tick), on both the full and
+    the interim path.  A manual run does not reset the cadence window: the
+    scheduled tick keeps its content gate, so if the manual run already consumed
+    everything the next tick noops on its own — cheaply, and without the manual
+    run having to predict that.
     """
     from paramem.server import schedule_state as _schedule_state
     from paramem.server import systemd_timer as _systemd_timer
@@ -12373,8 +12331,11 @@ def _dispatch_to_executor(fn: Callable[[], None], status: str) -> str:
     would die in ``_ensure_staging_slot`` (``paramem/training/trainer.py``).
 
     Args:
-        fn: The zero-arg sync entry point (``_run_full_consolidation_sync``,
-            ``_extract_and_start_training``, ``_run_active_store_migration_sync``).
+        fn: The zero-arg sync entry point (``_extract_and_start_training``,
+            ``_run_active_store_migration_sync``), or a ``functools.partial``
+            that has already bound the entry point's arguments —
+            ``_run_full_consolidation_sync`` takes the fold's key source that
+            way, since the executor contract itself carries no arguments.
         status: The status string to return to the caller on submission.
 
     Returns:
@@ -12395,6 +12356,13 @@ def _triage_pending_sessions(config, buffer, store) -> "tuple[int, int]":
     ever attribute them) and HOLDABLE sessions past
     ``orphan_retirement_seconds`` are marked consolidated here so they cannot
     accumulate in the buffer forever.  Everything else is left pending.
+
+    An unconditional pre-stage of :func:`_dispatch_consolidation`, run on every
+    dispatch regardless of action.  Retiring what can never be attributed is a
+    side effect, not a gate: bypassing the content gate (which is what every
+    operator door does) must not also switch orphan retirement off.  The counts
+    it returns are what :func:`_consolidation_content_gate` decides on when it
+    runs.
 
     Args:
         config: Live server config.
@@ -12455,102 +12423,72 @@ def _triage_pending_sessions(config, buffer, store) -> "tuple[int, int]":
 
 
 def _consolidation_content_gate(
-    action: ConsolidationAction, config, *, force: bool
-) -> "tuple[str | None, bool]":
-    """The ONE "is there anything to consolidate?" check.
+    action: ConsolidationAction,
+    config,
+    *,
+    pending_count: int,
+    named_count: int,
+) -> "str | None":
+    """The ONE "is there anything to consolidate?" check — scheduled ticks only.
 
-    Both actions have an input set, and dispatching with an empty one seizes the
-    GPU to learn nothing:
+    Both resolved actions have an input set, and dispatching a scheduled tick
+    with an empty one seizes the GPU to learn nothing:
 
     - **INTERIM** — its only input is pending sessions.  With none there is
-      nothing to extract, and the tick would still mint an ``episodic_interim_*``
-      slot: a burnt ring slot and a wasted training run.  **Not bypassable, not
-      even for an explicit request** — hence ``force`` has no effect here.
+      nothing to extract and nothing to train.
     - **FULL** — its input is the content-bearing interim slots plus (at
       ``max_interim_count == 0``, where no interim slot is ever minted) the
-      pending NAMED sessions the fold consumes directly.  With neither, a
-      scheduled full fold would retrain every main tier on exactly what they
-      already hold.  **Bypassable when forced**: an explicitly requested
-      rebuild runs off the existing adapter weights, which are content by
-      definition — but the evaluation below still runs in full even when
-      forced, because the caller needs to know whether real input existed
-      (see ``has_content``), not just whether the dispatch may proceed.
+      pending NAMED sessions the fold consumes directly.  With neither, the
+      tick would retrain every main tier on exactly what it already holds.
 
     Interim slots are counted through the payload-aware primitive
     (``iter_interim_dirs(..., mode=config.consolidation.mode)``): a slot whose
-    payload write never landed is a directory, not content, and must not satisfy
-    the gate.  When content-bearing interim slots exist, the pending-session
-    triage is skipped entirely (for both forced and unforced FULL) — the
-    existing comment on that short-circuit still holds: at
-    ``max_interim_count > 0`` those sessions are left untouched for their own
-    interim tick.
+    payload write never landed is a directory, not content, and must not
+    satisfy the gate.
 
-    Takes *config* as a parameter (rather than re-reading ``_state["config"]``)
-    so it is a pure function of its arguments — testable in isolation and
-    guaranteed to see the same config object its one caller resolved ``AUTO``
-    against.
+    Only the ``AUTO`` dispatch calls this.  An operator door is a deliberate
+    request and runs regardless — "nothing new" is not a reason to refuse the
+    operation they asked for.  There is therefore no bypass flag: the bypass is
+    the arbitrator not asking.
+
+    The pending-session counts come from :func:`_triage_pending_sessions`,
+    which the arbitrator runs as an unconditional pre-stage.  Passing them in
+    (rather than triaging here) is what keeps orphan retirement independent of
+    whether this gate runs at all, and leaves this function a pure decision:
+    same arguments, same answer, no side effects.
 
     Args:
-        action: The RESOLVED action (never ``AUTO``).
-        config: Live server config — the SAME object the caller used to resolve
-            ``AUTO`` and to compute ``force``.
-        force: Arbitrator-local; True only for an explicitly requested FULL.
-            Never passed below this layer — the fold has no such parameter.
-            Widens what dispatches (a forced FULL proceeds even with nothing
-            found) but never changes what counts as content.
+        action: The RESOLVED action (``FULL`` or ``INTERIM``, never ``AUTO``).
+        config: Live server config — the SAME object the caller resolved
+            ``AUTO`` against.
+        pending_count: Pending sessions seen by the triage pre-stage, counted
+            BEFORE retirement.
+        named_count: How many of those classified NAMED (attributable).
 
     Returns:
-        ``(status, has_content)``. *status* is a terminal ``"noop_*"`` string
-        when there is nothing to consolidate and the dispatch is not forced
-        past it, ``None`` when the dispatch may proceed. *has_content* is
-        ``True`` iff content-bearing interim slots exist OR named pending
-        sessions exist — i.e. iff the dispatch has something real to consume,
-        independent of ``force``. The caller uses it to decide whether a
-        dispatch should advance the schedule stamp: only a dispatch that
-        consumes something may do so, and a forced FULL that passed only
-        because it was forced consumed nothing.
+        A terminal ``"noop_*"`` string when there is nothing to consolidate,
+        ``None`` when the tick may proceed.
     """
     from paramem.memory.interim_adapter import iter_interim_dirs
 
     if action is ConsolidationAction.FULL:
-        # Content-bearing interim slots are content: the fold folds them into
-        # main.  Short-circuits before the triage, so at max_interim_count > 0
-        # the pending sessions are left untouched for their own interim tick.
-        # Evaluated before the force check — force widens the dispatch
-        # decision, it never substitutes for evaluating whether real input
-        # exists.
+        # Content-bearing interim slots are content: the fold folds them into main.
         if any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
-            return None, True
+            return None
 
-    pending_count, named_count = _triage_pending_sessions(
-        config,
-        _state["session_buffer"],
-        _state.get("speaker_store"),
-    )
-    has_content = named_count > 0
-
-    if has_content:
+    if named_count > 0:
         logger.info("Consolidation dispatch: %d NAMED session(s) pending", named_count)
-        return None, True
-
-    if action is ConsolidationAction.FULL and force:
-        logger.info(
-            "Consolidation dispatch: forced full fold with nothing to consume — "
-            "content gate bypassed"
-        )
-        return None, False
+        return None
 
     if pending_count == 0:
         logger.info("Consolidation dispatch: no pending sessions — noop")
-        return "noop_no_pending", False
+        return "noop_no_pending"
     logger.info("Consolidation dispatch: no NAMED sessions remain — noop")
-    return "noop_no_named", False
+    return "noop_no_named"
 
 
 def _dispatch_consolidation(
     action: ConsolidationAction,
-    *,
-    apply_schedule_gate: bool,
 ) -> "tuple[str, ConsolidationAction]":
     """Gate + dispatch one consolidation run.  The single arbitrator.
 
@@ -12565,34 +12503,28 @@ def _dispatch_consolidation(
     2. **Idle debounce** — all actions.  This protects a live chat turn from a
        long GPU seizure; it is a safety property, not a schedule, so an explicit
        request defers on it too.
-    3. Retroactive orphan-session voice claim (cheap, side-effect only).
+    3. Retroactive orphan-session voice claim + :func:`_triage_pending_sessions`
+       — the two side-effect-only pre-stages, run on every dispatch.  Retiring
+       what can never be attributed does not depend on which door was used.
     4. ``pending_rehydration`` — an incoherent active store pre-empts every
        action until the migration completes.
-    5. The suspend/power-off catch-up gate — **only when**
-       *apply_schedule_gate* (the ``/scheduled-tick`` caller).  A deliberate
-       operator trigger is never refused for "not due yet".
-    6. Resolve ``AUTO`` via :func:`_is_full_cycle_due` — **the only call site,
-       and only on AUTO**.  An explicit FULL or INTERIM does not consult the
-       schedule gate at all: the bypass is the arbitrator not asking, not a flag
-       threaded through the gate.
-    7. :func:`_consolidation_content_gate` — the ONE content check.  Also
-       reports ``has_content``: whether the dispatch has something real to
-       consume, independent of ``force``.
-    8. Dispatch via :func:`_dispatch_to_executor`.  A FULL dispatch advances
-       the schedule stamp (:func:`_stamp_scheduled_run`) iff ``has_content`` —
-       a forced full fold that passed the gate only because it was forced
-       consumed nothing and must not perturb the cadence.  INTERIM always
-       stamps (it cannot dispatch without consuming pending sessions).
-
-    ``force`` is derived from the REQUESTED action (before AUTO resolves), so a
-    scheduled tick that resolves to FULL is never forced.  It is arbitrator-local
-    and is never passed downward.
+    5. **``AUTO`` only** — the suspend/power-off catch-up gate, the
+       ``FULL``/``INTERIM`` resolution via :func:`_is_full_cycle_due` (its only
+       call site), and :func:`_consolidation_content_gate`.  All three belong to
+       the schedule, and ``AUTO`` is the scheduled tick's action, so all three
+       are derived from the action rather than switched by a parameter.  An
+       operator door is a deliberate request: it is never re-decided by the
+       schedule and never refused for "nothing new".
+    6. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule stamp
+       (:func:`_stamp_scheduled_run`) on a scheduled dispatch only — a manual
+       run does not move the cadence window.
 
     Args:
-        action: ``AUTO`` (let the schedule decide), ``FULL`` (rebuild the main
-            tiers from stored knowledge — forced), or ``INTERIM`` (absorb
-            pending sessions into a new interim slot).
-        apply_schedule_gate: True only for the systemd heartbeat tick.
+        action: ``AUTO`` (the scheduled tick — let the schedule decide),
+            ``FULL`` (collapse the interim slots into main now), ``INTERIM``
+            (absorb pending sessions into a new interim slot), or ``RECONCILE``
+            (rebuild the main tiers from their own keys, leaving the interim
+            slots and pending sessions where they are).
 
     Returns:
         ``(status, action)`` — the terminal status string and the action as
@@ -12645,6 +12577,17 @@ def _dispatch_consolidation(
     # existing profile at high confidence. Cheap — centroids are cached.
     _retro_claim_orphan_sessions()
 
+    # Pending-session triage: retire what can never be attributed (and expired
+    # holdables), and count what remains.  A side-effect pre-stage like the
+    # retro-claim above, NOT a gate — it runs for every action, so no door can
+    # switch orphan retirement off by skipping the content gate.  The counts
+    # feed that gate when the scheduled tick reaches it.
+    _pending_count, _named_count = _triage_pending_sessions(
+        config,
+        _state["session_buffer"],
+        _state.get("speaker_store"),
+    )
+
     # Active-store migration gate: when a mode-switch was detected at startup
     # (or an in-progress migration was interrupted), every consolidation
     # dispatch routes to the migration sync until all tiers have cleared the
@@ -12661,19 +12604,19 @@ def _dispatch_consolidation(
         logger.info("Consolidation dispatch: active-store migration pending — running migration")
         return _dispatch_to_executor(_run_active_store_migration_sync, "started_migration"), action
 
-    # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
-    # rendered OnCalendar timer is a heartbeat wakeup only (see
-    # paramem.server.systemd_timer module docstring) — the durable
-    # last-ATTEMPT stamp (schedule_state.py) decides whether THIS tick
-    # actually dispatches. Calendar-exact cadences (the default "12h", and
-    # any anchored/exact-divisor cadence) get heartbeat_s=None and this
-    # entire block is a no-op — the timer alone remains the schedule.
-    #
-    # apply_schedule_gate=False (every operator endpoint) skips this ENTIRE
-    # block — including the seed path, deliberately: a deliberate trigger on a
-    # virgin install must run (and stamp via _stamp_scheduled_run() at the
-    # dispatch site below), not seed-and-skip.
-    if apply_schedule_gate:
+    # Everything from here to the content gate belongs to the SCHEDULE, so it
+    # is gated on the scheduled tick's own action.  AUTO is that action and the
+    # only one that carries it: an operator door names an intent and runs it.
+    _scheduled = action is ConsolidationAction.AUTO
+
+    if _scheduled:
+        # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
+        # rendered OnCalendar timer is a heartbeat wakeup only (see
+        # paramem.server.systemd_timer module docstring) — the durable
+        # last-ATTEMPT stamp (schedule_state.py) decides whether THIS tick
+        # actually dispatches. Calendar-exact cadences (the default "12h", and
+        # any anchored/exact-divisor cadence) get heartbeat_s=None and this
+        # entire block is a no-op — the timer alone remains the schedule.
         from paramem.server import schedule_state as _schedule_state
         from paramem.server import systemd_timer as _systemd_timer
         from paramem.server.schedule_grammar import compute_schedule_period_seconds as _sched_period
@@ -12694,13 +12637,6 @@ def _dispatch_consolidation(
             if not _sched_is_due(last_attempt, _sched_period(cadence)):
                 return "noop_not_due", action
 
-    # force is derived from what was REQUESTED, before AUTO resolves: a
-    # scheduled tick that lands on the full path is never forced.  It is
-    # arbitrator-local — it gates the content check below and goes no further;
-    # the fold entry is handed the mode and its fold inputs only.
-    force = action is ConsolidationAction.FULL
-
-    if action is ConsolidationAction.AUTO:
         action = (
             ConsolidationAction.FULL if _is_full_cycle_due(config) else ConsolidationAction.INTERIM
         )
@@ -12716,12 +12652,22 @@ def _dispatch_consolidation(
         )
         return "noop_no_interim_tier", action
 
-    _gate_status, _has_content = _consolidation_content_gate(action, config, force=force)
-    if _gate_status is not None:
-        return _gate_status, action
+    if _scheduled:
+        _gate_status = _consolidation_content_gate(
+            action,
+            config,
+            pending_count=_pending_count,
+            named_count=_named_count,
+        )
+        if _gate_status is not None:
+            return _gate_status, action
+        # This tick is going to dispatch, so it consumes its cadence window.  A
+        # manual run does not: the next scheduled tick keeps its own content
+        # gate and noops by itself if the manual run already took everything.
+        _stamp_scheduled_run(config)
 
-    if action is ConsolidationAction.FULL:
-        logger.info("Consolidation dispatch: running the full fold")
+    if action in (ConsolidationAction.FULL, ConsolidationAction.RECONCILE):
+        logger.info("Consolidation dispatch: running the full fold (%s)", action.value)
         # Do NOT clear last_consolidation_error here.  A failure row stays visible
         # until the next op of that type SUCCEEDS (auto-resolved in the success paths
         # of the fold itself).  Clear-on-attempt hid still-failing conditions.
@@ -12731,7 +12677,11 @@ def _dispatch_consolidation(
         # purely informational — the fold still dispatches.  Deduped by the oldest
         # interim stamp (stable per stuck cycle; reopens on a new cycle's failure).
         # NOT a scheduling state — does NOT bump per-session retry counters.
-        _overdue_key = _full_consolidation_overdue_key(config)
+        # RECONCILE is exempt: it does not absorb the interim slots, so the state
+        # of the interim backlog is not a property of the run being dispatched.
+        _overdue_key = (
+            _full_consolidation_overdue_key(config) if action is ConsolidationAction.FULL else None
+        )
         if _overdue_key is not None:
             logger.warning(
                 "Consolidation dispatch: full consolidation OVERDUE — oldest interim %s "
@@ -12750,20 +12700,21 @@ def _dispatch_consolidation(
                 },
             )
 
-        # A forced full fold keys its telemetry and outputs exactly like a
-        # scheduled one — same stamp, same family of rows.  There is no
-        # manual/forced flavour of a fold.  The schedule stamp itself only
-        # advances when the dispatch actually consumes something
-        # (``_has_content``, from the content gate above): an unforced FULL
-        # never reaches here without it, but a forced FULL that passed only
-        # because it was forced (nothing on disk, nothing pending) is a pure
-        # idempotent re-groom and must not perturb the cadence.
-        if _has_content:
-            _stamp_scheduled_run(config)
-        return _dispatch_to_executor(_run_full_consolidation_sync, "started_full"), action
+        # A manually triggered fold keys its telemetry and outputs exactly like
+        # a scheduled one — same stamp, same family of rows.  There is no
+        # manual flavour of a fold; the only thing the action decides below the
+        # arbitrator is the fold's KEY SOURCE, and RECONCILE is the one door
+        # that narrows it to the main tiers (leaving the interim slots on disk,
+        # since a fold that did not absorb them must not reap them).
+        _keys_from = "main_tiers" if action is ConsolidationAction.RECONCILE else "all_tiers"
+        return (
+            _dispatch_to_executor(
+                functools.partial(_run_full_consolidation_sync, _keys_from), "started_full"
+            ),
+            action,
+        )
 
     logger.info("Consolidation dispatch: starting interim extract + train")
-    _stamp_scheduled_run(config)
     return _dispatch_to_executor(_extract_and_start_training, "started"), action
 
 
@@ -14062,8 +14013,8 @@ def _extract_and_start_training():
         # and the temporal-query reader (filter_registry_by_date) — itself
         # retired in Plan A.3 — needed fields the writer never emitted.
         # Per-adapter indexed_key_registry.json files carry the unified simhash
-        # map; inference._load_simhash_registry reads the "simhash" key from
-        # each one at boot time.
+        # map; MemoryStore.read_simhash_registry_from_disk merges the "simhash"
+        # key out of each one for the source factory.
         _save_key_metadata(loop, config)
         # Per-tier graph.json is written by commit_tier_slot inside
         # run_consolidation_cycle; cycle_<N>/ snapshots are dropped.
@@ -14412,7 +14363,14 @@ def _finalize_full_status_only(
 
 
 def _finalize_full(
-    loop, result: dict, staged_e: dict, staged_r: dict, staged_b: dict, staged_stats: dict
+    loop,
+    result: dict,
+    staged_e: dict,
+    staged_r: dict,
+    staged_b: dict,
+    staged_stats: dict,
+    *,
+    absorbed_interims: bool,
 ) -> None:
     """CPU-only event-loop closure for the full-cycle ``full_trained`` terminal.
 
@@ -14442,6 +14400,11 @@ def _finalize_full(
         staged_b: Staged ``key -> bookkeeping-record`` map.
         staged_stats: ``{"boot_degraded", "store_load_degraded"}`` from the
             staged build.
+        absorbed_interims: Whether this fold's key source included the interim
+            slots (and therefore drained the ring).  Only such a fold may
+            auto-resolve the ring incidents — a reconcile leaves the backlog
+            exactly where it was, so clearing them would report a drain that
+            did not happen.
     """
     if loop.store.replay_enabled:
         # a. Atomically publish only when the registry build SUCCEEDED.
@@ -14493,29 +14456,33 @@ def _finalize_full(
             "mode", "full_trained"
         ) not in {"aborted"}:
             resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
-        # A completed fold drains the interim ring — overdue and ring-cap
-        # incidents are all resolved regardless of recall outcome.
-        resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
-        resolve_incidents_by_type(_full_state_dir, "interim_cap_reached")
-        resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
+        # A fold that absorbed the interim slots drains the ring — overdue and
+        # ring-cap incidents are all resolved regardless of recall outcome.  A
+        # reconcile did not touch them, so their incidents stand.
+        if absorbed_interims:
+            resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
+            resolve_incidents_by_type(_full_state_dir, "interim_cap_reached")
+            resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
     except Exception:
         logger.exception("Post-full-cycle run-status/incident bookkeeping failed (non-fatal)")
     _state["consolidating"] = False
     logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
 
-def _run_full_consolidation_sync() -> None:
-    """Submit a full-cycle consolidation: collapse interims into main.
+def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']") -> None:
+    """Submit a full-cycle consolidation over *keys_from*'s key source.
 
-    Runs ``loop.consolidate(mode=...)`` on the BG trainer so the GPU lock is held
-    for the entire per-tier rebuild (the train fold's entry guard requires this —
-    calling without the lock raises). In train mode the fold deletes each main
-    adapter, recreates it, trains on the cumulative keyed-pair set derived from
-    every interim slot's keys, and on success unloads the interim adapters and
-    reloads the router. On a failed recall-sanity check it rolls back to the
-    snapshot and aborts that tier. In simulate mode it merges the per-cycle
-    ``graph.json`` sidecars into the canonical main-tier graph without touching
-    PEFT weights.
+    Runs ``loop.consolidate(mode=..., keys_from=...)`` on the BG trainer so the
+    GPU lock is held for the entire per-tier rebuild (the train fold's entry
+    guard requires this — calling without the lock raises).  Both venues fold
+    the same input — the memory store, whose main-tier and interim-slot
+    registries and entries carry every active key — and both end by reloading
+    the router.  In train mode the fold additionally deletes each main adapter,
+    recreates it, trains it on the cumulative keyed-pair set, and persists the
+    weights; on a failed recall-sanity check it rolls back to the snapshot and
+    aborts that tier. In simulate mode it touches no PEFT weights and persists
+    each main tier as ``<adapter_dir>/<tier>/graph.json`` — the projection
+    ``DiskMemorySource`` reads back at the next hydration.
 
     Whether there is anything to consolidate is decided before dispatch; the fold
     itself has no content gate.
@@ -14523,6 +14490,20 @@ def _run_full_consolidation_sync() -> None:
     After a successful merge the main adapter manifests are stamped with
     the current registry hash, restoring boot-time mount-ability that
     interim cycles otherwise drift away from.
+
+    Args:
+        keys_from: The fold's key source, bound by the arbitrator at the
+            dispatch site (the executor contract carries no arguments, so it
+            arrives through a ``functools.partial``).
+
+            - ``"all_tiers"`` — collapse the interim slots into main: their keys
+              enter the fold, the slots are reaped afterwards, and at
+              ``max_interim_count == 0`` the pending sessions are consumed
+              directly by the pre-stage below.
+            - ``"main_tiers"`` — rebuild main memory from its own keys.  The
+              interim slots are left on disk untouched and the pending sessions
+              are left pending, so ``consume_pending`` is ``False`` here no
+              matter what ``max_interim_count`` says.
     """
     from paramem.server.consolidation import _save_key_metadata, session_retention_dir
 
@@ -14535,7 +14516,7 @@ def _run_full_consolidation_sync() -> None:
         model-handle refresh are owned by ``_run_stage_b_cycle``.
         """
         # ------------------------------------------------------------------
-        # Consume-pending pre-stage (max_interim_count == 0 only).
+        # Consume-pending pre-stage (max_interim_count == 0, absorbing folds only).
         #
         # At count == 0 no interim slots are ever minted, so pending sessions
         # must be extracted directly here, before the fold, depositing their
@@ -14544,6 +14525,8 @@ def _run_full_consolidation_sync() -> None:
         # trains them into the main tiers.  The standard full cycle (count > 0)
         # collapses already-trained interim slots into main and runs no
         # extraction chain at all — hence no pre-stage and no voice eviction.
+        # A main-tiers-only fold consumes nothing pending by definition, so the
+        # pre-stage does not run there at any count.
         #
         # HARD CONSTRAINT: the extraction stage is called with lock_held=True.
         # This closure already runs under the BG trainer worker's GPU lock
@@ -14559,7 +14542,9 @@ def _run_full_consolidation_sync() -> None:
         # prevents already-processed sessions from accumulating unboundedly.
         # ------------------------------------------------------------------
         _consume_pending = (
-            config.consolidation.max_interim_count == 0 and config.consolidation.mode != "simulate"
+            keys_from == "all_tiers"
+            and config.consolidation.max_interim_count == 0
+            and config.consolidation.mode != "simulate"
         )
         _cp_session_buffer = _state["session_buffer"]
         extraction: _PendingExtraction | None = None
@@ -14584,6 +14569,7 @@ def _run_full_consolidation_sync() -> None:
         try:
             result = loop.consolidate(
                 mode=config.consolidation.mode,
+                keys_from=keys_from,
                 trainer=bt,
                 router=_state.get("router"),
                 consume_pending=_consume_pending,
@@ -14610,11 +14596,13 @@ def _run_full_consolidation_sync() -> None:
 
         # Layering boundary. ``loop.consolidate(...)`` already
         # finished its internal finalize on its way out (registry rewrite,
-        # WEIGHT-LEVEL persist+verify of the rebuilt main slots, interim
-        # purge, router reload — see its internal finalize block) regardless of whether
-        # anything was rebuilt. The merged main weights are now durably saved
-        # BEFORE the interim slots are deleted, inside the method, so there is
-        # no crash window where the folded knowledge has no on-disk copy.
+        # persist of the rebuilt main tiers — weights in train, per-tier
+        # graph.json in simulate — then interim reap and router reload; see its
+        # internal finalize block) regardless of whether anything was rebuilt.
+        # The merged main tiers are durably saved BEFORE the interim slots are
+        # reaped, inside the method, and a fold that persisted nothing reaps
+        # nothing — so there is no crash window in which the folded knowledge
+        # has no on-disk copy.
         # The post-cycle work below (key-metadata persistence, session marking,
         # ``_finalize_full``) is bookkeeping whose precondition is
         # ``tiers_rebuilt != []``. Calling it on the no-op outcome violates that
@@ -14679,13 +14667,15 @@ def _run_full_consolidation_sync() -> None:
                 touch_last_consolidation=True,
             )
 
-        # The rebuilt main slots were already persisted+verified to disk inside
-        # the fold's finalize (between the registry rewrite
-        # and the interim purge), so the on-disk main meta.json carries a fresh
-        # window_stamp + registry_sha256 and the slots remount on restart. If
-        # that persist/verify had failed, the method would have raised and
-        # propagated to ``_run_stage_b_cycle``'s crash envelope (consolidation_crash
-        # incident, sessions left pending) — so reaching here means main is durable.
+        # The rebuilt main tiers were already persisted to disk inside the fold's
+        # finalize (between the registry rewrite and the interim reap). In the
+        # train venue that persist is verified and stamps each main slot's
+        # meta.json with a fresh window_stamp + registry_sha256, so the slots
+        # remount on restart; in the simulate venue it writes the per-tier
+        # graph.json projections. If the persist (or its verify) had failed, the
+        # method would have raised and propagated to ``_run_stage_b_cycle``'s
+        # crash envelope (consolidation_crash incident, sessions left pending) —
+        # so reaching here means main is durable.
 
         # Persist key metadata.
         #
@@ -14761,7 +14751,14 @@ def _run_full_consolidation_sync() -> None:
                 staged_stats = {"boot_degraded": None, "store_load_degraded": True}
 
         return "full_trained", functools.partial(
-            _finalize_full, loop, result, staged_e, staged_r, staged_b, staged_stats
+            _finalize_full,
+            loop,
+            result,
+            staged_e,
+            staged_r,
+            staged_b,
+            staged_stats,
+            absorbed_interims=keys_from == "all_tiers",
         )
 
     _run_stage_b_cycle(

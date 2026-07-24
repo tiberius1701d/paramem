@@ -1,15 +1,17 @@
 """Structural guard: ``_run_fold`` must not call persist functions directly.
 
-After B8b, all persist tails in :meth:`ConsolidationLoop._run_fold` route
-through :meth:`ConsolidationLoop._persist_fold`.  Direct calls to
+Every persist tail in :meth:`ConsolidationLoop._run_fold` routes through
+:meth:`ConsolidationLoop._persist_fold`.  Direct calls to
 ``save_memory_to_disk``, ``commit_tier_slot``, or ``self._save_adapters``
 inside the body of ``_run_fold`` are forbidden — they would re-introduce the
-fragmentation that this unification eliminates.
+fragmentation that the unified dispatch eliminates.
 
 The guard uses Python's AST to locate the ``_run_fold`` function body and
 scan for ``ast.Call`` nodes whose target matches the forbidden names.  This
-prevents drift: a future maintainer who adds a fourth persist venue must
-route through ``_persist_fold``, not add a fourth inline tail.
+prevents drift: the two fold scopes (``interim_slot`` / ``main_tiers``) are
+each written in two venues (weights / disk), and every one of those four
+combinations must reach disk through ``_persist_fold`` — never through an
+inline tail added back into the spine.
 
 Pattern mirrors :mod:`tests.test_extraction_pipeline_guard`.
 """
@@ -76,9 +78,10 @@ def _find_forbidden_direct_calls(
 def test_run_fold_has_no_direct_persist_calls() -> None:
     """``_run_fold`` must contain no direct calls to persist functions.
 
-    All three venue persist actions (graph_json / interim_slot / main_tiers)
-    must flow through ``_persist_fold``.  A direct call here means a fourth
-    inline persist tail has been re-introduced, fragmenting the unified dispatch.
+    Every persist action — both fold scopes (interim_slot / main_tiers) in both
+    venues (weights / disk) — must flow through ``_persist_fold``.  A direct call
+    here means an inline persist tail has been re-introduced, fragmenting the
+    unified dispatch.
 
     Failure message names the line and call so the developer knows exactly
     where to look.

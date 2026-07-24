@@ -1676,6 +1676,13 @@ class InferenceConfig:
     who want to validate parametric recall against the weights live
     on this path.  This is a temporary toggle until per-key probing is
     fast enough to drop the cache entirely.
+
+    Scope: this governs the READ path only — boot preload and the per-query
+    on-miss memoize.  The consolidation fold is a write path and populates
+    entries regardless (it mints them, and
+    ``ConsolidationLoop._hydrate_store_for_fold`` materialises the rest); its
+    own persist tail reads those entries back, so it cannot honour an empty
+    cache.
     """
 
     preload_cache: bool = True

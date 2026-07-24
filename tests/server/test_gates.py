@@ -82,7 +82,7 @@ def _make_registry(n: int, tmp_path: Path, fname: str = "key_metadata.json") -> 
     ``reinforcement_count``, ``last_reinforced_cycle``, ``last_seen``,
     ``first_seen``.  Crucially: NO ``simhash`` field anywhere — this file is
     never a SimHash source, only a key-population source (see
-    ``_load_simhash_registry`` / ``_registry_key_population`` in gates.py).
+    ``KeyRegistry.load_simhashes`` / ``_registry_key_population`` in gates.py).
 
     This is what ``live_registry_path`` (``live_config.paths.key_metadata``,
     ``paramem/server/app.py:8695``) actually points at in production — a flat
@@ -829,7 +829,7 @@ class TestGate4RecallCheckQuad:
 
 
 # ---------------------------------------------------------------------------
-# _load_simhash_registry / _registry_key_population — the shared helper and
+# KeyRegistry.load_simhashes / _registry_key_population — the shared helper and
 # the schema-mismatch bug it fixes
 # ---------------------------------------------------------------------------
 
@@ -882,34 +882,45 @@ class TestRegistryKeyPopulation:
 
 
 class TestLoadSimhashRegistry:
-    """_load_simhash_registry must refuse to silently coerce a non-KeyRegistry
-    file (e.g. key_metadata.json, accidentally pointed at) into a simhash map.
+    """The gates' fingerprint reader must refuse to silently coerce a
+    non-KeyRegistry file (e.g. key_metadata.json, accidentally pointed at)
+    into a simhash map.
+
+    The reader itself now lives on the class that owns the serialization
+    (``KeyRegistry.load_simhashes``) — gates.py no longer carries its own
+    copy — but the contract these assertions pin is unchanged.
     """
 
     def test_missing_file_returns_empty(self, tmp_path):
-        from paramem.server.gates import _load_simhash_registry
-
-        assert _load_simhash_registry(tmp_path / "missing.json") == {}
+        assert KeyRegistry.load_simhashes(tmp_path / "missing.json") == {}
 
     def test_key_metadata_shape_raises(self, tmp_path):
         """key_metadata.json has no per-key simhash field anywhere — passing
         it to this helper must raise, not silently return an empty/wrong map.
         """
-        from paramem.server.gates import _load_simhash_registry
-
         reg_path = _make_registry(5, tmp_path)
         with pytest.raises(ValueError, match="simhash"):
-            _load_simhash_registry(reg_path)
+            KeyRegistry.load_simhashes(reg_path)
 
     def test_keyregistry_shape_extracts_simhash(self, tmp_path):
-        from paramem.server.gates import _load_simhash_registry
-
         reg = KeyRegistry()
         reg.add("graph1")
         reg.set_simhash("graph1", 999)
         p = tmp_path / "indexed_key_registry.json"
         p.write_bytes(reg.save_bytes())
-        assert _load_simhash_registry(p) == {"graph1": 999}
+        assert KeyRegistry.load_simhashes(p) == {"graph1": 999}
+
+    def test_gates_module_has_no_private_copy(self):
+        """gates.py must not carry a second fingerprint-file reader.
+
+        The duplicate ``_load_simhash_registry`` leaf was collapsed into
+        ``KeyRegistry.load_simhashes``; re-adding one here would put the
+        file-shape knowledge, the encryption read and the wrong-file guard in
+        two places again.
+        """
+        import paramem.server.gates as gates_mod
+
+        assert not hasattr(gates_mod, "_load_simhash_registry")
 
 
 class TestGate4NoLongerAlwaysSkips:

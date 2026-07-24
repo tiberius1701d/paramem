@@ -4,9 +4,9 @@ Verifies that the router reads from the lifespan-owned MemoryStore
 (``store.put`` / ``iter_bookkeeping``) and does NOT pick up trial adapter
 keys when trial_adapter_dir is separate from config.adapter_dir.
 
-Also tests _load_simhash_registry with the unified registry layout so the
-SimHash unification refactor has end-to-end coverage:
-    write per-tier indexed_key_registry.json → _load_simhash_registry → merged dict.
+Also tests MemoryStore.read_simhash_registry_from_disk with the unified
+registry layout so the SimHash unification refactor has end-to-end coverage:
+    write per-tier indexed_key_registry.json → merged {key: fingerprint} dict.
 
 No GPU — all tests use in-memory construction.
 """
@@ -16,7 +16,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from paramem.server.inference import _load_simhash_registry
+import pytest
+
+from paramem.memory.store import MemoryStore
 from paramem.server.router import QueryRouter
 
 
@@ -129,8 +131,8 @@ class TestRouterReadsFromLoopCache:
         )
 
 
-class TestLoadSimhashRegistryPerTierPaths:
-    """_load_simhash_registry reads from per-tier indexed_key_registry.json files.
+class TestReadSimhashRegistryPerTierPaths:
+    """read_simhash_registry_from_disk reads per-tier indexed_key_registry.json files.
 
     After the SimHash unification refactor, fingerprints live in the ``"simhash"``
     key of each tier's ``indexed_key_registry.json`` rather than in a separate
@@ -156,7 +158,7 @@ class TestLoadSimhashRegistryPerTierPaths:
         self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})
         self._write_registry(adapter_dir / "procedural" / "indexed_key_registry.json", {"proc1": 3})
 
-        result = _load_simhash_registry(adapter_dir)
+        result = MemoryStore.read_simhash_registry_from_disk(adapter_dir)
 
         assert result == {"graph1": 1, "graph2": 2, "proc1": 3}
 
@@ -170,14 +172,14 @@ class TestLoadSimhashRegistryPerTierPaths:
             {"graph5": 5},
         )
 
-        result = _load_simhash_registry(adapter_dir)
+        result = MemoryStore.read_simhash_registry_from_disk(adapter_dir)
 
         assert "graph1" in result
         assert "graph5" in result
 
     def test_returns_empty_when_adapter_dir_absent(self, tmp_path):
         """Missing adapter_dir → empty dict (no crash)."""
-        result = _load_simhash_registry(tmp_path / "nonexistent")
+        result = MemoryStore.read_simhash_registry_from_disk(tmp_path / "nonexistent")
         assert result == {}
 
     def test_later_tier_wins_on_key_collision(self, tmp_path):
@@ -196,7 +198,7 @@ class TestLoadSimhashRegistryPerTierPaths:
             adapter_dir / "semantic" / "indexed_key_registry.json", {"graph1": 999}
         )
 
-        result = _load_simhash_registry(adapter_dir)
+        result = MemoryStore.read_simhash_registry_from_disk(adapter_dir)
 
         # Key is present; value is whichever was read last (semantic after episodic).
         assert "graph1" in result
@@ -214,21 +216,123 @@ class TestLoadSimhashRegistryPerTierPaths:
             json.dumps({"legacy_key": 42}), encoding="utf-8"
         )
 
-        result = _load_simhash_registry(adapter_dir)
+        result = MemoryStore.read_simhash_registry_from_disk(adapter_dir)
 
         assert "legacy_key" not in result, (
             "Reader picked up stale simhash_registry.json sidecar — "
             "must only read from indexed_key_registry.json"
         )
 
-    def test_malformed_tier_file_skipped(self, tmp_path):
-        """A malformed registry file is skipped; other tiers are still merged."""
+    def test_malformed_tier_file_raises(self, tmp_path):
+        """A malformed registry file is surfaced, not silently skipped.
+
+        The fingerprint map and the store's own registries come from the same
+        files through the same reader, so they cannot disagree about whether a
+        corrupt file exists: an unparseable registry raises here exactly as it
+        does on the boot path (``app._build_store_contents`` catches it and
+        marks ``store_load_degraded``).  Skipping it would hand back a partial
+        fingerprint map that silently un-gates every key of the failed tier.
+        """
         adapter_dir = tmp_path / "adapters"
         (adapter_dir / "episodic").mkdir(parents=True)
         (adapter_dir / "episodic" / "indexed_key_registry.json").write_bytes(b"not json!!!")
         self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})
 
-        result = _load_simhash_registry(adapter_dir)
+        with pytest.raises(json.JSONDecodeError):
+            MemoryStore.read_simhash_registry_from_disk(adapter_dir)
 
-        # episodic failed → skipped; semantic loaded fine.
-        assert "graph2" in result
+    def test_delegates_to_key_registry_leaf(self, tmp_path, monkeypatch):
+        """The walk reads each file through ``KeyRegistry.load_simhashes``.
+
+        The walk and the gates' single-path reader must share one leaf, so the
+        on-disk fingerprint shape is known in exactly one place.  This pins the
+        delegation: every path the walk visits goes through the leaf, and the
+        walk contributes only the tree traversal and the merge.
+        """
+        from paramem.training import key_registry as key_registry_mod
+
+        adapter_dir = tmp_path / "adapters"
+        self._write_registry(adapter_dir / "episodic" / "indexed_key_registry.json", {"graph1": 1})
+        self._write_registry(
+            adapter_dir / "episodic" / "interim_20260501T1200" / "indexed_key_registry.json",
+            {"graph5": 5},
+        )
+
+        seen: list[Path] = []
+        real_leaf = key_registry_mod.KeyRegistry.load_simhashes.__func__
+
+        def _spy(cls, path):
+            seen.append(Path(path))
+            return real_leaf(cls, path)
+
+        monkeypatch.setattr(key_registry_mod.KeyRegistry, "load_simhashes", classmethod(_spy))
+
+        result = MemoryStore.read_simhash_registry_from_disk(adapter_dir)
+
+        assert result == {"graph1": 1, "graph5": 5}
+        assert seen == [
+            adapter_dir / "episodic" / "indexed_key_registry.json",
+            adapter_dir / "semantic" / "indexed_key_registry.json",
+            adapter_dir / "procedural" / "indexed_key_registry.json",
+            adapter_dir / "episodic" / "interim_20260501T1200" / "indexed_key_registry.json",
+        ]
+
+    def test_foreign_registry_schema_raises(self, tmp_path):
+        """A tier file that is not a registry file at all is surfaced, not merged.
+
+        Same reasoning as the malformed-JSON case: handing back a partial map
+        silently un-gates every key of that tier.  The guard comes from the
+        shared leaf, so the walk and the gates agree on what a registry file is.
+        """
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True)
+        # key_metadata.json shape — bookkeeping, no fingerprints anywhere.
+        (adapter_dir / "episodic" / "indexed_key_registry.json").write_text(
+            json.dumps({"cycle_count": 1, "promoted_keys": [], "keys": {"graph1": {}}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="simhash"):
+            MemoryStore.read_simhash_registry_from_disk(adapter_dir)
+
+    def test_tier_file_without_a_simhash_section_raises(self, tmp_path):
+        """A tier file with no ``"simhash"`` section cannot answer — it is surfaced.
+
+        Every file ``KeyRegistry.save_bytes`` writes carries the section (an
+        untrained tier writes an EMPTY map, which is accepted below), so its
+        absence means the walk was handed something that is not one of ours.
+        Contributing "no fingerprints" for it would silently un-gate every key
+        of that tier.  The boot walk that must survive such a file reads
+        ``KeyRegistry.load``, which is deliberately tolerant; only the caller
+        that asks for fingerprints is told the file cannot answer.
+        """
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True)
+        (adapter_dir / "episodic" / "indexed_key_registry.json").write_text(
+            json.dumps(
+                {"active_keys": ["graph1"], "fidelity_history": {}, "health": None, "stale": {}}
+            ),
+            encoding="utf-8",
+        )
+        self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})
+
+        with pytest.raises(ValueError, match="simhash"):
+            MemoryStore.read_simhash_registry_from_disk(adapter_dir)
+
+    def test_untrained_tier_contributes_no_fingerprints(self, tmp_path):
+        """An empty ``"simhash"`` map is a truthful answer, not a foreign file.
+
+        A registered-but-never-trained tier serialises ``"simhash": {}`` —
+        ``data/ha/adapters/semantic`` on a live install — and the walk must
+        merge nothing for it rather than failing the whole tree.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "semantic").mkdir(parents=True)
+        (adapter_dir / "semantic" / "indexed_key_registry.json").write_bytes(
+            KeyRegistry().save_bytes()
+        )
+        self._write_registry(adapter_dir / "episodic" / "indexed_key_registry.json", {"graph2": 2})
+
+        assert MemoryStore.read_simhash_registry_from_disk(adapter_dir) == {"graph2": 2}

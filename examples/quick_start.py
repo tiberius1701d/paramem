@@ -13,9 +13,9 @@ Two-stage flow
   speaker identified by a synthetic 256-dim embedding.
 - Resolve the test speaker via the before/after ``/status`` speaker-delta
   (exactly one new speaker; abort if 0 or >1).
-- Wait for the idle-debounce window, then call ``POST /consolidate``; handle
-  ``deferred_idle`` retries; fail on ``noop_*`` (no sessions reached the
-  buffer).
+- Wait for the idle-debounce window, then call ``POST /consolidate/interim``;
+  handle ``deferred_idle`` retries; fail on ``noop_*`` (no sessions reached the
+  buffer, or the deployment mints no interim slots).
 - Poll ``/status.consolidating`` until the background cycle finishes.
 - Assert: ``keys_count >= 6`` (extraction is non-deterministic — a floor is
   asserted, not an exact count), AND extraction coverage of all 10 injected
@@ -25,7 +25,7 @@ Two-stage flow
 **Stage 2 — incremental (+5 keys on top)**
 
 - Inject 5 more distinct fictional fact turns (same test speaker).
-- Repeat debounce, consolidate, and wait-for-completion.
+- Repeat debounce, interim consolidation, and wait-for-completion.
 - Assert: ``keys_count`` grew by **at least 3** over the post-stage-1 count
   (incremental learning landed), AND extraction coverage of the 5 new facts,
   AND 100% keyed recall across ALL entries (proves both new keys recall and
@@ -76,10 +76,9 @@ Defaults to ``http://localhost:8420``.  Override via ``PARAMEM_URL`` env var.
 Debounce wait
 -------------
 After the last ``POST /chat`` the smoke sleeps ~35 s before calling
-``POST /consolidate``.  This satisfies the server's
-``consolidation.training_idle_debounce_s`` (default 30 s).  If
-``/consolidate`` returns ``deferred_idle`` after the wait, the smoke retries
-up to 3 times.
+``POST /consolidate/interim``.  This satisfies the server's
+``consolidation.training_idle_debounce_s`` (default 30 s).  If it returns
+``deferred_idle`` after the wait, the smoke retries up to 3 times.
 
 Usage::
 
@@ -361,15 +360,17 @@ def _consolidate_and_wait(
     ServerUnreachable: type,
     ServerUnavailable: type,
 ) -> None:
-    """Run debounce wait, POST /consolidate, and poll until the cycle finishes.
+    """Run debounce wait, POST /consolidate/interim, poll until the cycle finishes.
 
-    Flow: debounce sleep → POST /consolidate (with ``deferred_idle`` retries up
-    to ``_CONSOLIDATE_MAX_RETRIES``) → fail on ``noop_*`` (no sessions reached
-    the buffer) → poll ``/status.consolidating`` until False.
+    Flow: debounce sleep → POST /consolidate/interim (with ``deferred_idle``
+    retries up to ``_CONSOLIDATE_MAX_RETRIES``) → fail on ``noop_*`` → poll
+    ``/status.consolidating`` until False.
 
-    Designed for servers with ``refresh_cadence`` disabled: every
-    ``/consolidate`` is an interim cycle that consumes its pending session in one
-    pass, so no re-consolidation loop is needed.
+    ``/consolidate/interim`` is the door that absorbs the pending session in one
+    pass, so no re-consolidation loop is needed.  It requires a deployment that
+    mints interim slots (``consolidation.max_interim_count > 0``, the default);
+    at ``0`` it answers ``noop_no_interim_tier`` and the smoke fails with that
+    status rather than silently training nothing.
 
     Exits non-zero on persistent ``deferred_idle``, on any ``noop_*`` status, or
     if the cycle does not finish within ``_POLL_TIMEOUT`` seconds.
@@ -405,13 +406,13 @@ def _consolidate_and_wait(
     time.sleep(_DEBOUNCE_WAIT_S)
 
     # ------------------------------------------------------------------
-    # POST /consolidate — retry on deferred_idle.
+    # POST /consolidate/interim — retry on deferred_idle.
     # ------------------------------------------------------------------
     consolidate_status = "deferred_idle"
     for attempt in range(1, _CONSOLIDATE_MAX_RETRIES + 1):
         if attempt > 1:
             print(
-                f"[smoke]   /consolidate returned {consolidate_status!r} "
+                f"[smoke]   /consolidate/interim returned {consolidate_status!r} "
                 f"(attempt {attempt - 1}/{_CONSOLIDATE_MAX_RETRIES}); "
                 f"waiting {_DEBOUNCE_WAIT_S}s and retrying ..."
             )
@@ -419,21 +420,21 @@ def _consolidate_and_wait(
 
         try:
             consolidate_resp = post_json(
-                f"{base}/consolidate",
+                f"{base}/consolidate/interim",
                 body=None,
                 timeout=_CONSOLIDATE_TIMEOUT,
                 token=token,
             )
         except ServerHTTPError as exc:
-            print(f"[FAIL] {stage_label} /consolidate HTTP {exc.status_code}: {exc.body}")
+            print(f"[FAIL] {stage_label} /consolidate/interim HTTP {exc.status_code}: {exc.body}")
             sys.exit(1)
         except ServerUnreachable as exc:
-            print(f"[FAIL] {stage_label} /consolidate unreachable (timeout?): {exc}")
+            print(f"[FAIL] {stage_label} /consolidate/interim unreachable (timeout?): {exc}")
             sys.exit(1)
 
         consolidate_status = consolidate_resp.get("status", "unknown")
         print(
-            f"[smoke]   /consolidate → status={consolidate_status!r} "
+            f"[smoke]   /consolidate/interim → status={consolidate_status!r} "
             f"(attempt {attempt}/{_CONSOLIDATE_MAX_RETRIES})"
         )
 
@@ -442,20 +443,22 @@ def _consolidate_and_wait(
 
     if consolidate_status == "deferred_idle":
         print(
-            f"[FAIL] {stage_label}: /consolidate still returned {consolidate_status!r} after "
-            f"{_CONSOLIDATE_MAX_RETRIES} attempt(s).\n"
+            f"[FAIL] {stage_label}: /consolidate/interim still returned "
+            f"{consolidate_status!r} after {_CONSOLIDATE_MAX_RETRIES} attempt(s).\n"
             "       The server's idle-debounce window was not satisfied. "
             "Check consolidation.training_idle_debounce_s in server.yaml — "
             "if it is set higher than the default 30s, increase _DEBOUNCE_WAIT_S."
         )
         sys.exit(1)
 
-    # noop_no_pending / noop_no_speaker: injected turns did not reach the buffer.
+    # noop_no_interim_tier: the deployment mints no interim slots (count 0).
     if consolidate_status.startswith("noop_"):
         print(
-            f"[FAIL] {stage_label}: /consolidate returned {consolidate_status!r} — "
-            "no sessions were consolidated (the injected turns did not reach the buffer).\n"
-            "       Check server logs for 'session_buffer' entries."
+            f"[FAIL] {stage_label}: /consolidate/interim returned {consolidate_status!r} — "
+            "nothing was consolidated.\n"
+            "       noop_no_interim_tier means consolidation.max_interim_count is 0, where "
+            "the scheduled full fold is the only training venue.\n"
+            "       Otherwise check server logs for 'session_buffer' entries."
         )
         sys.exit(1)
 

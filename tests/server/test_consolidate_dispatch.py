@@ -6,15 +6,18 @@ verified in isolation.
 
 Coverage:
 - ``_consolidation_dispatch_guards`` shared guard helper
-- ``_dispatch_consolidation`` — the arbitrator: action resolution, the single
-  content gate, the executor submission ritual, and the concurrency guard
+- ``_dispatch_consolidation`` — the arbitrator: one action per door, the
+  schedule's three decisions (catch-up gate, AUTO resolution, content gate)
+  applied to ``AUTO`` alone, the executor submission ritual, and the
+  concurrency guard
 - ``_run_full_consolidation_sync`` noop terminal: an empty ``tiers_rebuilt``
   ends the cycle as a noop, and the sessions consumed by the pre-stage are
   still retired so they cannot accumulate unboundedly.
 
-The fold itself carries no flags: the arbitrator decides whether there is
-anything to consolidate, and ``loop.consolidate(mode=...)`` then does what it
-is told.
+The fold itself carries no caller intent: the arbitrator decides whether a
+scheduled tick has anything to consolidate, and
+``loop.consolidate(mode=..., keys_from=...)`` then does what it is told with
+the venue and key source it was handed.
 """
 
 from __future__ import annotations
@@ -83,7 +86,6 @@ def _make_dispatch_state(
         "drift_orphan": 0,
         "drift_genuine_loss": 0,
         "keys_per_tier": {},
-        "recall_per_tier": {},
         "rolled_back": False,
         "rollback_tier": None,
         "tier_delta": {},
@@ -167,6 +169,7 @@ def _make_arbitrator_state(
     named_sessions: int = 0,
     anon_sessions: int = 0,
     refresh_cadence: str = "12h",
+    period_seconds: "int | None" = None,
 ) -> dict:
     """``_state`` for arbitrator tests, with a REAL SessionBuffer and adapter dir.
 
@@ -189,6 +192,13 @@ def _make_arbitrator_state(
             observe the PERSISTED stamp (rather than just whether
             ``_stamp_scheduled_run`` was called) must pass a non-calendar-exact
             value (e.g. ``"every 5h"``).
+        period_seconds: ``config.consolidation.consolidation_period_seconds`` —
+            the full-fold period the deadline is measured against.  ``None``
+            (the default) is a manual-only cadence: no deadline, so
+            ``_is_full_cycle_due`` is False for any interim ring and
+            ``_full_consolidation_overdue_key`` returns ``None`` (no incident
+            I/O in the dispatch path).  A test that needs AUTO to resolve FULL
+            passes a small value together with an aged interim slot.
     """
     from paramem.server.session_buffer import SessionBuffer
 
@@ -199,9 +209,7 @@ def _make_arbitrator_state(
     cfg.consolidation.training_idle_debounce_s = 30
     cfg.consolidation.orphan_retirement_seconds = None
     cfg.consolidation.retain_sessions = False
-    # Manual-only period → _full_consolidation_overdue_key returns None (no
-    # incident I/O in the dispatch path).
-    cfg.consolidation.consolidation_period_seconds = None
+    cfg.consolidation.consolidation_period_seconds = period_seconds
     cfg.debug = False
     cfg.paths.data = tmp_path
     cfg.adapter_dir = tmp_path / "adapters"
@@ -271,7 +279,7 @@ class _ExecutorSpy:
         return len(self.submitted)
 
 
-def _dispatch(state, action, *, apply_schedule_gate=True, monkeypatch=None):
+def _dispatch(state, action, *, monkeypatch=None):
     """Run the arbitrator against *state*, capturing executor submissions.
 
     Returns ``(status, resolved_action, spy, due_calls)`` where ``due_calls``
@@ -293,10 +301,27 @@ def _dispatch(state, action, *, apply_schedule_gate=True, monkeypatch=None):
     monkeypatch.setattr(app_module, "_is_full_cycle_due", _counting_due)
     monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
     with patch("asyncio.get_running_loop", return_value=spy.loop):
-        status, resolved = app_module._dispatch_consolidation(
-            action, apply_schedule_gate=apply_schedule_gate
-        )
+        status, resolved = app_module._dispatch_consolidation(action)
     return status, resolved, spy, due_calls
+
+
+def _submitted_full_fold_key_sources(spy) -> list[str]:
+    """The ``keys_from`` each submitted full fold was bound to.
+
+    The arbitrator submits ``functools.partial(_run_full_consolidation_sync,
+    keys_from)``, so the key source it chose for the fold is readable off the
+    partial's bound arguments — which is what distinguishes a FULL dispatch
+    from a RECONCILE one below the arbitrator.
+    """
+    import paramem.server.app as app_module
+
+    sources = []
+    for fn in spy.submitted:
+        assert getattr(fn, "func", None) is app_module._run_full_consolidation_sync, (
+            f"not a full-fold submission: {fn!r}"
+        )
+        sources.append(fn.args[0])
+    return sources
 
 
 class TestConsolidationArbitrator:
@@ -332,13 +357,10 @@ class TestConsolidationArbitrator:
         """N=0, scheduled tick, only UNIDENTIFIABLE sessions pending → noop_no_named,
         no executor submission, AND the sessions are retired.
 
-        At max_interim_count==0 the interim path never runs — the full path's
-        content gate is the ONLY place session triage happens.  Before this
-        step, nothing retired UNIDENTIFIABLE/expired-HOLDABLE sessions at N=0;
-        they accumulated in the buffer forever.  This is the regression test
-        for that leak: it must fail if a future change moves the triage behind
-        the ``force`` check or reorders the FULL disjuncts to skip it when no
-        interim slots exist.
+        At max_interim_count==0 the interim path never runs, so nothing else
+        retires UNIDENTIFIABLE/expired-HOLDABLE sessions; before the triage
+        pre-stage existed they accumulated in the buffer forever.  This is the
+        regression test for that leak.
         """
         from paramem.server.app import ConsolidationAction
 
@@ -361,7 +383,6 @@ class TestConsolidationArbitrator:
 
     def test_count_zero_with_pending_dispatches_the_full_fold(self, tmp_path, monkeypatch) -> None:
         """N=0 + NAMED pending sessions → the full fold runs (and will consume them)."""
-        import paramem.server.app as app_module
         from paramem.server.app import ConsolidationAction
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=0, named_sessions=1)
@@ -371,18 +392,18 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert spy.submitted == [app_module._run_full_consolidation_sync]
+        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
         assert state["consolidating"] is True
 
     def test_full_due_with_content_bearing_interims_dispatches(self, tmp_path, monkeypatch) -> None:
-        """N>0, full cycle due, content-bearing interim slots → dispatches."""
+        """N>0, oldest interim past the full period, content-bearing → dispatches."""
         from paramem.server.app import ConsolidationAction
 
-        state = _make_arbitrator_state(tmp_path, max_interim_count=2)
+        state = _make_arbitrator_state(tmp_path, max_interim_count=2, period_seconds=1)
         adapter_dir = state["config"].adapter_dir
-        # n=3, N=2 → (n-1) % N == 0 → count-primary due.
+        # Aged stamps + a 1-second full period → the deadline has long passed.
         for i in range(3):
-            _make_interim_slot(adapter_dir, f"2026070{i + 1}T0000", payload="weights")
+            _make_interim_slot(adapter_dir, f"2020010{i + 1}T0000", payload="weights")
 
         status, resolved, spy, due_calls = _dispatch(
             state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
@@ -390,7 +411,7 @@ class TestConsolidationArbitrator:
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert spy.call_count == 1
+        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
         assert due_calls == [True]
 
     def test_payload_less_interim_dirs_do_not_satisfy_the_content_gate(
@@ -417,9 +438,7 @@ class TestConsolidationArbitrator:
         # the tick and a full GPU retrain is the content gate.
         monkeypatch.setattr(app_module, "_is_full_cycle_due", lambda config: True)
         with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, resolved = app_module._dispatch_consolidation(
-                ConsolidationAction.AUTO, apply_schedule_gate=True
-            )
+            status, resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
 
         assert status == "noop_no_pending"
         assert resolved is ConsolidationAction.FULL
@@ -442,9 +461,7 @@ class TestConsolidationArbitrator:
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
         monkeypatch.setattr(app_module, "_is_full_cycle_due", lambda config: True)
         with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, _resolved = app_module._dispatch_consolidation(
-                ConsolidationAction.AUTO, apply_schedule_gate=True
-            )
+            status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
 
         assert status == "started_full"
         assert spy.call_count == 1
@@ -464,40 +481,63 @@ class TestConsolidationArbitrator:
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
         monkeypatch.setattr(app_module, "_is_full_cycle_due", lambda config: True)
         with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, _resolved = app_module._dispatch_consolidation(
-                ConsolidationAction.AUTO, apply_schedule_gate=True
-            )
+            status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
 
         assert status == "noop_no_pending"
         assert spy.call_count == 0
 
-    def test_forced_full_runs_with_no_interims_and_no_pending(self, tmp_path, monkeypatch) -> None:
-        """An explicitly requested FULL runs on an empty store — that is what forcing means.
+    def test_full_runs_with_no_interims_and_no_pending(self, tmp_path, monkeypatch) -> None:
+        """An explicitly requested FULL runs on an empty store.
 
         Its input is the existing adapter weights, which are content by
-        definition.  The schedule gate is never consulted.
+        definition.  Neither the schedule gate nor the content gate is
+        consulted — an operator door is a deliberate request.
         """
-        import paramem.server.app as app_module
         from paramem.server.app import ConsolidationAction
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
         status, resolved, spy, due_calls = _dispatch(
             state,
             ConsolidationAction.FULL,
-            apply_schedule_gate=False,
             monkeypatch=monkeypatch,
         )
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
-        assert spy.submitted == [app_module._run_full_consolidation_sync]
+        assert _submitted_full_fold_key_sources(spy) == ["all_tiers"]
         assert due_calls == [], "_is_full_cycle_due must not be consulted for an explicit FULL"
 
-    def test_fold_entry_takes_mode_and_fold_inputs_only(self, tmp_path) -> None:
-        """The arbitrator's bypass decision stays in the arbitrator.
+    def test_reconcile_dispatches_the_fold_over_the_main_tiers_only(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """RECONCILE reaches the fold with the narrowed key source.
+
+        This is the whole difference between the two full-fold doors below the
+        arbitrator: same entry point, same status, ``keys_from="main_tiers"``.
+        """
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
+
+        status, resolved, spy, due_calls = _dispatch(
+            state,
+            ConsolidationAction.RECONCILE,
+            monkeypatch=monkeypatch,
+        )
+
+        assert status == "started_full"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
+        assert due_calls == [], "_is_full_cycle_due must not be consulted for an explicit RECONCILE"
+
+    def test_fold_entry_takes_venue_key_source_and_fold_inputs_only(self, tmp_path) -> None:
+        """The arbitrator's intent stays in the arbitrator.
 
         The fold entry's parameter set is pinned by exact set equality, so any
         caller-intent parameter leaking down from the dispatch layer fails here.
+        ``keys_from`` is not caller intent: it names the fold's key source, and
+        two different doors map onto the same two values.
         """
         import inspect
 
@@ -507,53 +547,59 @@ class TestConsolidationArbitrator:
         assert set(params) == {
             "self",
             "mode",
+            "keys_from",
             "consume_pending",
             "trainer",
             "router",
             "recall_sanity_threshold",
         }, f"unexpected fold-entry parameters: {sorted(params)}"
 
-    def test_interim_with_no_pending_is_not_bypassable(self, tmp_path, monkeypatch) -> None:
-        """An explicitly requested INTERIM with zero pending sessions noops.
+    def test_interim_with_no_pending_still_dispatches(self, tmp_path, monkeypatch) -> None:
+        """An explicitly requested INTERIM with zero pending sessions runs.
 
-        Force does not apply to INTERIM: its only input is pending sessions, and
-        minting an empty interim slot burns a ring slot and a training run for
-        nothing.
+        The content gate belongs to the schedule; a door the operator opened is
+        not refused for "nothing is waiting".  It is not a burnt ring slot
+        either: with an empty batch the extraction phase finds no relations and
+        returns before any slot is minted (``_extract_and_start_training``).
         """
+        import paramem.server.app as app_module
         from paramem.server.app import ConsolidationAction
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
         status, resolved, spy, due_calls = _dispatch(
             state,
             ConsolidationAction.INTERIM,
-            apply_schedule_gate=False,
             monkeypatch=monkeypatch,
         )
 
-        assert status == "noop_no_pending"
+        assert status == "started"
         assert resolved is ConsolidationAction.INTERIM
-        assert spy.call_count == 0
+        assert spy.submitted == [app_module._extract_and_start_training]
         assert due_calls == [], "_is_full_cycle_due must not be consulted for an explicit INTERIM"
 
-    def test_interim_with_only_unattributable_sessions_returns_noop_no_named(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """Pending but unattributable → noop_no_named, and they are retired."""
+    def test_unattributable_sessions_are_retired_on_every_door(self, tmp_path, monkeypatch) -> None:
+        """Orphan retirement is a pre-stage, not part of the content gate.
+
+        Every door bypasses the content gate, so if triage lived inside it, an
+        operator-only deployment would never retire an unattributable session
+        again.  Pinned on each door in turn.
+        """
         from paramem.server.app import ConsolidationAction
 
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, anon_sessions=2)
-        status, _resolved, spy, _ = _dispatch(
-            state,
+        for action in (
+            ConsolidationAction.AUTO,
+            ConsolidationAction.FULL,
             ConsolidationAction.INTERIM,
-            apply_schedule_gate=False,
-            monkeypatch=monkeypatch,
-        )
+            ConsolidationAction.RECONCILE,
+        ):
+            state = _make_arbitrator_state(tmp_path / action.value, anon_sessions=2)
+            assert len(state["session_buffer"].pending_facts()) == 2, "fixture sanity"
 
-        assert status == "noop_no_named"
-        assert spy.call_count == 0
-        assert state["session_buffer"].pending_facts() == [], (
-            "UNIDENTIFIABLE sessions must be retired, not left to accumulate"
-        )
+            _dispatch(state, action, monkeypatch=monkeypatch)
+
+            assert state["session_buffer"].pending_facts() == [], (
+                f"{action.value}: UNIDENTIFIABLE sessions must be retired on every dispatch"
+            )
 
     def test_interim_with_named_sessions_dispatches_the_interim_path(
         self, tmp_path, monkeypatch
@@ -566,7 +612,6 @@ class TestConsolidationArbitrator:
         status, resolved, spy, _ = _dispatch(
             state,
             ConsolidationAction.INTERIM,
-            apply_schedule_gate=False,
             monkeypatch=monkeypatch,
         )
 
@@ -577,8 +622,8 @@ class TestConsolidationArbitrator:
     def test_interim_at_count_zero_is_refused(self, tmp_path, monkeypatch) -> None:
         """An explicit INTERIM at max_interim_count==0 → noop_no_interim_tier.
 
-        There is no interim tier at N=0; the request is meaningless.  NAMED
-        sessions are pending here, so only the tier check can stop it.
+        There is no interim tier at N=0; the request is meaningless.  This is a
+        tier check, not the content gate: NAMED sessions are pending here.
         """
         from paramem.server.app import ConsolidationAction
 
@@ -586,7 +631,6 @@ class TestConsolidationArbitrator:
         status, _resolved, spy, _ = _dispatch(
             state,
             ConsolidationAction.INTERIM,
-            apply_schedule_gate=False,
             monkeypatch=monkeypatch,
         )
 
@@ -600,17 +644,20 @@ class TestConsolidationArbitrator:
         """Identical inputs → identical dispatch decision in both venues.
 
         The content gate reads each venue's own payload, so the SAME logical
-        input (three content-bearing interim slots) must produce the same
-        outcome in simulate and in train.
+        input (three content-bearing interim slots, aged past the full period)
+        must produce the same outcome in simulate and in train.
         """
         from paramem.server.app import ConsolidationAction
 
         payload = "graph" if consolidation_mode == "simulate" else "weights"
         state = _make_arbitrator_state(
-            tmp_path, consolidation_mode=consolidation_mode, max_interim_count=2
+            tmp_path,
+            consolidation_mode=consolidation_mode,
+            max_interim_count=2,
+            period_seconds=1,
         )
         for i in range(3):
-            _make_interim_slot(state["config"].adapter_dir, f"2026070{i + 1}T0000", payload=payload)
+            _make_interim_slot(state["config"].adapter_dir, f"2020010{i + 1}T0000", payload=payload)
 
         status, resolved, spy, due_calls = _dispatch(
             state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
@@ -677,7 +724,6 @@ class TestConsolidationArbitrator:
         status, _resolved, spy, _ = _dispatch(
             state,
             ConsolidationAction.FULL,
-            apply_schedule_gate=False,
             monkeypatch=monkeypatch,
         )
 
@@ -686,19 +732,16 @@ class TestConsolidationArbitrator:
 
 
 # ---------------------------------------------------------------------------
-# TestStampPredicate — a dispatch advances the schedule stamp iff it consumes
-# something.  A forced FULL that passed the content gate only because it was
-# forced (nothing on disk, nothing pending) is a pure idempotent re-groom and
-# must not perturb the cadence.
+# TestStampPredicate — the schedule stamp belongs to the schedule.  A manual
+# run does not move the cadence window; the next scheduled tick still has its
+# content gate and noops on its own if the manual run consumed everything.
 # ---------------------------------------------------------------------------
 
 
 class TestStampPredicate:
-    """``_stamp_scheduled_run`` fires iff the dispatch has real content to consume."""
+    """``_stamp_scheduled_run`` fires iff the dispatch came from the schedule."""
 
-    def _dispatch_and_track_stamp(
-        self, state, action, *, apply_schedule_gate, monkeypatch
-    ) -> "tuple[str, object, int]":
+    def _dispatch_and_track_stamp(self, state, action, *, monkeypatch) -> "tuple[str, object, int]":
         """Run the arbitrator, counting real (unmocked) ``_stamp_scheduled_run`` calls.
 
         The real function still runs (so the persisted stamp can be checked
@@ -718,127 +761,85 @@ class TestStampPredicate:
         monkeypatch.setattr(app_module, "_stamp_scheduled_run", _counting_stamp)
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
         with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, resolved = app_module._dispatch_consolidation(
-                action, apply_schedule_gate=apply_schedule_gate
-            )
+            status, resolved = app_module._dispatch_consolidation(action)
         return status, resolved, len(stamp_calls)
 
-    def test_forced_full_with_content_bearing_interims_stamps(self, tmp_path, monkeypatch) -> None:
-        """Forced FULL, content-bearing interim slots present → dispatches AND stamps.
-
-        The fold absorbs and purges every interim slot on the success path
-        (``unload_interim_adapters`` in ``paramem/training/consolidation.py``),
-        so this fold does exactly what the scheduled cycle would have done.
-        """
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(tmp_path, max_interim_count=2)
-        for i in range(2):
-            _make_interim_slot(
-                state["config"].adapter_dir, f"2026070{i + 1}T0000", payload="weights"
-            )
-
-        status, resolved, stamp_calls = self._dispatch_and_track_stamp(
-            state, ConsolidationAction.FULL, apply_schedule_gate=False, monkeypatch=monkeypatch
-        )
-
-        assert status == "started_full"
-        assert resolved is ConsolidationAction.FULL
-        assert stamp_calls == 1
-
-    def test_forced_full_with_zero_interims_and_zero_pending_does_not_stamp(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("action_name", ["FULL", "INTERIM", "RECONCILE"])
+    def test_no_manual_door_moves_the_cadence_window(
+        self, tmp_path, monkeypatch, action_name
     ) -> None:
-        """Forced FULL, nothing on disk and nothing pending → dispatches but does NOT stamp.
+        """Every operator door dispatches WITHOUT stamping.
 
-        This is ``/reconsolidate``'s "rebuild from stored knowledge" case: it
-        consumes nothing, so it must not perturb the cadence.  Checked two
-        ways — the wrapped ``_stamp_scheduled_run`` is never called, AND
-        (using a non-calendar-exact cadence, where the stamp is a real
+        Checked two ways — the wrapped ``_stamp_scheduled_run`` is never called,
+        AND (using a non-calendar-exact cadence, where the stamp is a real
         on-disk write) the persisted ``last_scheduled_run`` is byte-identical
         before and after.
         """
         from paramem.server.app import ConsolidationAction
         from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
 
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, refresh_cadence="every 5h")
+        state = _make_arbitrator_state(
+            tmp_path,
+            max_interim_count=2,
+            named_sessions=1,
+            refresh_cadence="every 5h",
+        )
+        for i in range(2):
+            _make_interim_slot(
+                state["config"].adapter_dir, f"2026070{i + 1}T0000", payload="weights"
+            )
         state_dir = state["config"].paths.data / "state"
         seeded_stamp = time.time() - 6 * 3600
         write_last_scheduled_run(state_dir, seeded_stamp)
 
         status, resolved, stamp_calls = self._dispatch_and_track_stamp(
-            state, ConsolidationAction.FULL, apply_schedule_gate=False, monkeypatch=monkeypatch
+            state, getattr(ConsolidationAction, action_name), monkeypatch=monkeypatch
         )
 
-        assert status == "started_full"
-        assert resolved is ConsolidationAction.FULL
-        assert stamp_calls == 0, "_stamp_scheduled_run must not be called for a forced no-op FULL"
-        assert read_last_scheduled_run(state_dir) == seeded_stamp, (
-            "the persisted last_scheduled_run must be unchanged by a forced FULL "
-            "that consumed nothing"
-        )
+        assert status in {"started", "started_full"}
+        assert resolved is getattr(ConsolidationAction, action_name)
+        assert stamp_calls == 0, "a manual run must not reset the cadence window"
+        assert read_last_scheduled_run(state_dir) == seeded_stamp
 
-    def test_forced_full_with_zero_interims_but_named_pending_stamps(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """Forced FULL, no interims but NAMED pending sessions → dispatches AND stamps.
-
-        The fold will consume them (directly, at ``max_interim_count == 0``,
-        or on the next interim tick otherwise) — either way this dispatch had
-        real input.
-        """
+    def test_scheduled_full_stamps(self, tmp_path, monkeypatch) -> None:
+        """AUTO resolving to FULL stamps: it IS the scheduled cycle."""
         from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(
-            tmp_path, max_interim_count=0, named_sessions=1, refresh_cadence="every 5h"
-        )
-        state_dir = state["config"].paths.data / "state"
-
-        status, resolved, stamp_calls = self._dispatch_and_track_stamp(
-            state, ConsolidationAction.FULL, apply_schedule_gate=False, monkeypatch=monkeypatch
-        )
-
-        assert status == "started_full"
-        assert resolved is ConsolidationAction.FULL
-        assert stamp_calls == 1
-
         from paramem.server.schedule_state import read_last_scheduled_run
 
-        assert read_last_scheduled_run(state_dir) is not None
-
-    def test_auto_resolved_full_still_stamps(self, tmp_path, monkeypatch) -> None:
-        """AUTO→FULL is never forced; when it dispatches it always has real
-        content (the gate requires it), so it always stamps — unchanged.
-        """
-        from paramem.server.app import ConsolidationAction
-
-        state = _make_arbitrator_state(tmp_path, max_interim_count=2, refresh_cadence="every 5h")
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=2, refresh_cadence="every 5h", period_seconds=1
+        )
         for i in range(3):
             _make_interim_slot(
-                state["config"].adapter_dir, f"2026070{i + 1}T0000", payload="weights"
+                state["config"].adapter_dir, f"2020010{i + 1}T0000", payload="weights"
             )
+        # Seed the catch-up stamp far enough back that this tick is due.
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        write_last_scheduled_run(state["config"].paths.data / "state", time.time() - 6 * 3600)
 
         status, resolved, stamp_calls = self._dispatch_and_track_stamp(
-            state, ConsolidationAction.AUTO, apply_schedule_gate=False, monkeypatch=monkeypatch
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
         )
 
         assert status == "started_full"
         assert resolved is ConsolidationAction.FULL
         assert stamp_calls == 1
+        assert read_last_scheduled_run(state["config"].paths.data / "state") is not None
 
-    def test_interim_still_stamps(self, tmp_path, monkeypatch) -> None:
-        """INTERIM is unchanged: it always stamps when it dispatches — it
-        cannot reach dispatch without NAMED pending sessions (the content
-        gate refuses an empty interim tick even when explicitly requested).
-        """
+    def test_scheduled_interim_stamps(self, tmp_path, monkeypatch) -> None:
+        """AUTO resolving to INTERIM stamps for the same reason."""
         from paramem.server.app import ConsolidationAction
 
         state = _make_arbitrator_state(
             tmp_path, max_interim_count=7, named_sessions=1, refresh_cadence="every 5h"
         )
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        write_last_scheduled_run(state["config"].paths.data / "state", time.time() - 6 * 3600)
 
         status, resolved, stamp_calls = self._dispatch_and_track_stamp(
-            state, ConsolidationAction.INTERIM, apply_schedule_gate=False, monkeypatch=monkeypatch
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
         )
 
         assert status == "started"
@@ -881,32 +882,81 @@ def _route_client(state, monkeypatch) -> "tuple[object, list[tuple[object, str]]
     return TestClient(app_module.app, raise_server_exceptions=False), submitted
 
 
+def _route_key_sources(submitted) -> list[str]:
+    """The ``keys_from`` bound to each full fold that reached the executor ritual."""
+    import paramem.server.app as app_module
+
+    sources = []
+    for fn, _status in submitted:
+        assert getattr(fn, "func", None) is app_module._run_full_consolidation_sync, (
+            f"not a full-fold submission: {fn!r}"
+        )
+        sources.append(fn.args[0])
+    return sources
+
+
 class TestConsolidationRoutes:
     """The four consolidation routes: intent → arbitrator call → status/action."""
 
-    def test_reconsolidate_rebuilds_main_memory_when_the_schedule_would_not(
+    def test_consolidate_collapses_the_interims_whatever_the_schedule_says(
         self, tmp_path, monkeypatch
     ) -> None:
-        """``/reconsolidate`` runs the full fold where the schedule says "interim".
+        """``/consolidate`` runs the full fold where the schedule says "interim".
 
-        One content-bearing interim slot at N=7: ``_is_full_cycle_due`` is False,
-        so an AUTO dispatch would resolve INTERIM.  The intent "rebuild main
-        memory from stored knowledge" must not be re-decided by the schedule.
+        One content-bearing interim slot at N=7 with no deadline:
+        ``_is_full_cycle_due`` is False, so a scheduled tick would resolve
+        INTERIM.  The operator asked to collapse the interims now, and gets
+        exactly that — this is the defect the door fixes: with
+        ``refresh_cadence: ""`` an AUTO-dispatching ``/consolidate`` could never
+        reach a full cycle at all.
         """
         import paramem.server.app as app_module
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
         _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
         assert app_module._is_full_cycle_due(state["config"]) is False, (
-            "fixture guard: AUTO must resolve INTERIM here for this test to mean anything"
+            "fixture guard: a scheduled tick must resolve INTERIM here"
         )
+
+        client, submitted = _route_client(state, monkeypatch)
+        resp = client.post("/consolidate")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "started_full", "action": "full"}
+        assert _route_key_sources(submitted) == ["all_tiers"]
+
+    def test_consolidate_runs_with_nothing_new_to_consume(self, tmp_path, monkeypatch) -> None:
+        """Nothing on disk, nothing pending → ``/consolidate`` still dispatches.
+
+        The content gate belongs to the schedule; a deliberate request is not
+        refused for "nothing new".
+        """
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+
+        client, submitted = _route_client(state, monkeypatch)
+        resp = client.post("/consolidate")
+
+        assert resp.json() == {"status": "started_full", "action": "full"}
+        assert _route_key_sources(submitted) == ["all_tiers"]
+
+    def test_reconsolidate_reports_reconcile_and_narrows_the_key_source(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``/reconsolidate`` is its own action, and the fold is told so.
+
+        Same entry point and same status as ``/consolidate`` — the difference
+        is the key source it binds, which is what leaves the interim slots
+        alone.
+        """
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
 
         client, submitted = _route_client(state, monkeypatch)
         resp = client.post("/reconsolidate")
 
         assert resp.status_code == 200
-        assert resp.json() == {"status": "started_full", "action": "full"}
-        assert submitted == [(app_module._run_full_consolidation_sync, "started_full")]
+        assert resp.json() == {"status": "started_full", "action": "reconcile"}
+        assert _route_key_sources(submitted) == ["main_tiers"]
 
     def test_reconsolidate_runs_with_nothing_new_to_consume(self, tmp_path, monkeypatch) -> None:
         """Nothing on disk, nothing pending → ``/reconsolidate`` still dispatches.
@@ -915,23 +965,21 @@ class TestConsolidationRoutes:
         to refuse it.  This is what it is for after a model/prompt/extraction
         change.
         """
-        import paramem.server.app as app_module
-
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
 
         client, submitted = _route_client(state, monkeypatch)
         resp = client.post("/reconsolidate")
 
-        assert resp.json() == {"status": "started_full", "action": "full"}
-        assert submitted == [(app_module._run_full_consolidation_sync, "started_full")]
+        assert resp.json() == {"status": "started_full", "action": "reconcile"}
+        assert _route_key_sources(submitted) == ["main_tiers"]
 
-    def test_reconsolidate_status_is_indistinguishable_from_a_scheduled_full(
+    def test_the_two_full_fold_doors_differ_only_in_the_key_source(
         self, tmp_path, monkeypatch
     ) -> None:
-        """A forced full fold reports ``started_full`` — the same family as a scheduled one.
+        """There is no manual flavour of a fold: same status, same entry point.
 
-        There is no manual/forced flavour of a fold: the telemetry, the outputs
-        and the status string are the scheduled ones.
+        The only thing that differs below the arbitrator is which keys the fold
+        owns — and, following from that, whether the interim slots are reaped.
         """
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
         for i in range(8):
@@ -939,30 +987,34 @@ class TestConsolidationRoutes:
                 state["config"].adapter_dir, f"202607{i + 1:02d}T0000", payload="weights"
             )
 
-        client, _submitted = _route_client(state, monkeypatch)
-        scheduled = client.post("/consolidate").json()
-        forced = client.post("/reconsolidate").json()
+        client, submitted = _route_client(state, monkeypatch)
+        collapse = client.post("/consolidate").json()
+        rebuild = client.post("/reconsolidate").json()
 
-        assert scheduled == forced == {"status": "started_full", "action": "full"}
+        assert collapse["status"] == rebuild["status"] == "started_full"
+        assert (collapse["action"], rebuild["action"]) == ("full", "reconcile")
+        assert _route_key_sources(submitted) == ["all_tiers", "main_tiers"]
 
     def test_interim_route_absorbs_conversations_at_the_full_due_boundary(
         self, tmp_path, monkeypatch
     ) -> None:
-        """``/consolidate/interim`` bypasses the schedule gate when a full fold is due.
+        """``/consolidate/interim`` is not re-decided when a full fold is due.
 
-        Eight content-bearing slots at N=7 → ``_is_full_cycle_due`` is True, so
-        an AUTO dispatch would resolve FULL.  The operator asked for "absorb the
-        recent conversations", and gets exactly that.
+        Aged content-bearing slots past the full period → ``_is_full_cycle_due``
+        is True, so a scheduled tick would resolve FULL.  The operator asked for
+        "absorb the recent conversations", and gets exactly that.
         """
         import paramem.server.app as app_module
 
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=7, named_sessions=1, period_seconds=1
+        )
         for i in range(8):
             _make_interim_slot(
-                state["config"].adapter_dir, f"202607{i + 1:02d}T0000", payload="weights"
+                state["config"].adapter_dir, f"202001{i + 1:02d}T0000", payload="weights"
             )
         assert app_module._is_full_cycle_due(state["config"]) is True, (
-            "fixture guard: AUTO must resolve FULL here for this test to mean anything"
+            "fixture guard: a scheduled tick must resolve FULL here"
         )
 
         client, submitted = _route_client(state, monkeypatch)
@@ -977,8 +1029,8 @@ class TestConsolidationRoutes:
     ) -> None:
         """At ``max_interim_count == 0`` there is no interim tier — the call is refused.
 
-        NAMED sessions are pending, so only the missing tier can stop it.  The
-        operator is told which, and nothing is submitted.
+        A tier check, not a content check: the tier the request names does not
+        exist, so there is no operation to run.
         """
         state = _make_arbitrator_state(tmp_path, max_interim_count=0, named_sessions=1)
 
@@ -989,40 +1041,25 @@ class TestConsolidationRoutes:
         assert resp.json() == {"status": "noop_no_interim_tier", "action": "interim"}
         assert submitted == []
 
-    def test_interim_route_with_nothing_pending_is_a_noop(self, tmp_path, monkeypatch) -> None:
-        """No pending sessions → ``noop_no_pending``; the content gate is not bypassable."""
+    def test_scheduled_tick_is_the_only_door_the_content_gate_stops(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Nothing new to consume: the tick noops, the operator doors run."""
+        import paramem.server.app as app_module
+
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
 
         client, submitted = _route_client(state, monkeypatch)
-        resp = client.post("/consolidate/interim")
+        tick = client.post("/scheduled-tick").json()
 
-        assert resp.json() == {"status": "noop_no_pending", "action": "interim"}
+        assert tick == {"status": "noop_no_pending", "action": "interim"}
         assert submitted == []
 
-    @pytest.mark.parametrize(
-        ("interims", "expected_status", "expected_action"),
-        [(1, "started", "interim"), (8, "started_full", "full")],
-    )
-    def test_consolidate_route_still_resolves_via_the_schedule(
-        self, tmp_path, monkeypatch, interims, expected_status, expected_action
-    ) -> None:
-        """``/consolidate`` (no body) is unchanged: ``_is_full_cycle_due`` decides.
-
-        Every existing caller posts no body and keeps working — the schedule
-        picks the action and ``action`` in the response reports which one ran.
-        """
-        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
-        for i in range(interims):
-            _make_interim_slot(
-                state["config"].adapter_dir, f"2026070{i + 1:02d}T0000", payload="weights"
-            )
-
-        client, submitted = _route_client(state, monkeypatch)
-        resp = client.post("/consolidate")
-
-        assert resp.status_code == 200
-        assert resp.json() == {"status": expected_status, "action": expected_action}
-        assert len(submitted) == 1
+        assert client.post("/consolidate").json()["status"] == "started_full"
+        state["consolidating"] = False
+        assert client.post("/consolidate/interim").json()["status"] == "started"
+        assert submitted[0][0].func is app_module._run_full_consolidation_sync
+        assert submitted[1][0] is app_module._extract_and_start_training
 
     def test_consolidate_route_ignores_a_stray_body(self, tmp_path, monkeypatch) -> None:
         """No route declares a body — a caller that posts one is not rejected for it.
@@ -1036,7 +1073,7 @@ class TestConsolidationRoutes:
         resp = client.post("/consolidate", json={})
 
         assert resp.status_code == 200
-        assert resp.json()["status"] == "started"
+        assert resp.json()["status"] == "started_full"
 
     def test_reconsolidate_surfaces_a_deferral(self, tmp_path, monkeypatch) -> None:
         """A busy server defers: HTTP 200, ``deferred_*`` in ``status``, nothing submitted.
@@ -1053,7 +1090,7 @@ class TestConsolidationRoutes:
         resp = client.post("/reconsolidate")
 
         assert resp.status_code == 200
-        assert resp.json() == {"status": "deferred_idle", "action": "full"}
+        assert resp.json() == {"status": "deferred_idle", "action": "reconcile"}
         assert submitted == []
 
 
@@ -1063,9 +1100,10 @@ class TestConsolidationRoutes:
 
 
 class TestFullConsolidationFoldEntry:
-    """_run_full_consolidation_sync drives the fold entry with its mode and fold inputs."""
+    """_run_full_consolidation_sync drives the fold entry with its venue, key source
+    and fold inputs."""
 
-    def _run_sync(self, state: dict, monkeypatch) -> None:
+    def _run_sync(self, state: dict, monkeypatch, keys_from: str = "all_tiers") -> None:
         """Run _run_full_consolidation_sync with an inlined BackgroundTrainer."""
         import paramem.server.app as app_module
 
@@ -1076,13 +1114,16 @@ class TestFullConsolidationFoldEntry:
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
         with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync(keys_from)
 
-    def test_fold_called_with_mode_and_fold_inputs_only(self, monkeypatch, tmp_path) -> None:
-        """The fold receives the configured mode and the collaborators it trains with.
+    def test_fold_called_with_venue_key_source_and_fold_inputs_only(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The fold receives the configured venue, its key source and its collaborators.
 
-        The kwarg set is pinned by exact equality — the mode, the config-derived
-        ``consume_pending`` decision and the two collaborators the fold runs on.
+        The kwarg set is pinned by exact equality — the mode, the key source,
+        the config-derived ``consume_pending`` decision and the two
+        collaborators the fold runs on.
         """
         state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
 
@@ -1096,13 +1137,86 @@ class TestFullConsolidationFoldEntry:
         loop.consolidate.assert_called_once()
         args, kwargs = loop.consolidate.call_args
         assert args == (), "the fold entry is keyword-only"
-        assert set(kwargs) == {"mode", "trainer", "router", "consume_pending"}, (
+        assert set(kwargs) == {"mode", "keys_from", "trainer", "router", "consume_pending"}, (
             f"unexpected fold-entry kwargs: {sorted(kwargs)}"
         )
         assert kwargs["mode"] == "train"
+        assert kwargs["keys_from"] == "all_tiers"
         assert kwargs["consume_pending"] is False, (
             "max_interim_count=7 → the fold must not consume pending sessions"
         )
+
+    def test_main_tiers_fold_forwards_its_key_source(self, monkeypatch, tmp_path) -> None:
+        """A reconcile reaches the fold as ``keys_from="main_tiers"``."""
+        state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
+
+        with (
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._revalidate_main_adapter_manifests"),
+        ):
+            self._run_sync(state, monkeypatch, keys_from="main_tiers")
+
+        _, kwargs = state["consolidation_loop"].consolidate.call_args
+        assert kwargs["keys_from"] == "main_tiers"
+
+    def test_main_tiers_fold_never_consumes_pending_sessions(self, monkeypatch, tmp_path) -> None:
+        """At ``max_interim_count == 0`` the absorbing fold consumes pending sessions.
+
+        A main-tiers fold must not, whatever the count says: it leaves the
+        pending conversations pending, so it must not run the extraction
+        pre-stage either.
+        """
+        import paramem.server.app as app_module
+
+        extract_calls: list[object] = []
+
+        def _record_extract(loop, *, lock_held):
+            extract_calls.append(loop)
+            raise AssertionError("the extraction pre-stage must not run for a main-tiers fold")
+
+        absorbing = _make_dispatch_state(
+            consolidation_mode="train", max_interim_count=0, tmp_path=tmp_path
+        )
+        reconciling = _make_dispatch_state(
+            consolidation_mode="train", max_interim_count=0, tmp_path=tmp_path
+        )
+
+        with (
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._revalidate_main_adapter_manifests"),
+            patch.object(app_module, "_extract_pending_sessions", _record_extract),
+        ):
+            self._run_sync(reconciling, monkeypatch, keys_from="main_tiers")
+
+        _, kwargs = reconciling["consolidation_loop"].consolidate.call_args
+        assert kwargs["consume_pending"] is False
+        assert extract_calls == []
+
+        # Same config, absorbing fold: consume_pending is back on, so the
+        # False above is the key source's doing and not the config's.
+        with (
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._revalidate_main_adapter_manifests"),
+            patch.object(
+                app_module,
+                "_extract_pending_sessions",
+                MagicMock(
+                    return_value=app_module._PendingExtraction(
+                        episodic_rels=[],
+                        procedural_rels=[],
+                        session_ids=[],
+                        failed_session_ids=set(),
+                        speaker_ids=[],
+                        evicted_voice=False,
+                        aborted=None,
+                    )
+                ),
+            ),
+        ):
+            self._run_sync(absorbing, monkeypatch, keys_from="all_tiers")
+
+        _, kwargs = absorbing["consolidation_loop"].consolidate.call_args
+        assert kwargs["consume_pending"] is True
 
     def test_simulate_mode_uses_the_same_entry(self, monkeypatch, tmp_path) -> None:
         """Simulate mode routes through the identical call — only ``mode`` differs."""

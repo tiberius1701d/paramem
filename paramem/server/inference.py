@@ -44,7 +44,6 @@ Fallback chain at every escalation point: HA → cloud → local base model
 callers own the cloud fallback.
 """
 
-import json
 import logging
 from dataclasses import dataclass, field
 
@@ -804,10 +803,10 @@ def _probe_and_reason(
     dispatches to ``MemoryStore.probe`` for cache resolution + on-miss source
     delegation, then reassembles per-layer facts for context augmentation.
 
-    Cache hits return in O(1).  On cache miss the mode-appropriate
-    :class:`MemorySource` resolves the entry (``WeightMemorySource`` in train
-    mode, ``DiskMemorySource`` in simulate mode) and the result is memoized
-    back into the cache when ``config.inference.preload_cache`` is True.
+    Cache hits return in O(1).  On cache miss the :class:`MemorySource` built
+    by :func:`~paramem.memory.source.build_memory_source` resolves the entry and
+    the result is memoized back into the cache when
+    ``config.inference.preload_cache`` is True.
 
     After probing, restores the model to the ``episodic`` adapter so the next
     query starts from a predictable state. The reasoning phase uses
@@ -823,13 +822,8 @@ def _probe_and_reason(
     """
     from peft import PeftModel
 
-    from paramem.memory.source import (
-        DiskMemorySource,
-        WeightMemorySource,
-    )
+    from paramem.memory.source import build_memory_source
     from paramem.models.loader import switch_adapter
-
-    registry = _load_simhash_registry(config.adapter_dir)
 
     LAYER_LABELS = {
         "procedural": "Behavioral preferences",
@@ -845,23 +839,18 @@ def _probe_and_reason(
     for step in plan.steps:
         keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
 
-    # Mode-aware on-miss source.  Simulate mode persists facts to disk via
-    # graph.json (DiskMemorySource).  Train mode persists facts in adapter
-    # weights (WeightMemorySource — probes the weights for the entry).  The
-    # MemoryStore cache is RAM-only and is the fast path; the source is
-    # the slow-path fallback when a key isn't already cached.
+    # Mode-aware on-miss source from the one factory.  The MemoryStore cache is
+    # RAM-only and is the fast path; the source is the slow-path fallback when a
+    # key isn't already cached.  ``None`` (train mode, no model) leaves the probe
+    # cache-only.
     _active_mode = effective_mode if effective_mode else config.consolidation.mode
-    if _active_mode == "simulate":
-        source = DiskMemorySource(config.adapter_dir)
-    elif model is not None:
-        source = WeightMemorySource(
-            model,
-            tokenizer,
-            registry=registry,
-            batch_size=config.consolidation.recall_probe_batch_size,
-        )
-    else:
-        source = None
+    source = build_memory_source(
+        mode=_active_mode,
+        adapter_dir=config.adapter_dir,
+        batch_size=config.consolidation.recall_probe_batch_size,
+        model=model,
+        tokenizer=tokenizer,
+    )
 
     probe_results = memory_store.probe(
         keys_by_adapter,
@@ -1168,66 +1157,6 @@ def _maybe_escalate(
     # All escalation paths exhausted — return pre-escalation text from local model
     local_text = response.split("[ESCALATE]")[0].strip()
     return ChatResult(text=local_text or "I'm not sure about that.", probed_keys=probed_keys or [])
-
-
-def _load_simhash_registry(adapter_dir) -> dict:
-    """Load combined SimHash dict by merging per-adapter indexed_key_registry.json files.
-
-    Returns ``{key: simhash}`` across all main and interim adapter slots.
-
-    Reads the ``"simhash"`` map from each tier's
-    ``<adapter_dir>/<tier>/indexed_key_registry.json`` for the three main
-    tiers (episodic, semantic, procedural) and from each interim slot under
-    ``<adapter_dir>/episodic/interim_<stamp>/indexed_key_registry.json``.
-
-    The registry file is the single source of truth for per-key fingerprints
-    (active∪stale superset) since the SimHash unification refactor.  The
-    separate ``simhash_registry.json`` sidecar is no longer written.
-
-    When a key appears in multiple tier files (a transient state during
-    promotion) the later read wins — the content is the same regardless of
-    which tier holds the key.
-    """
-    from pathlib import Path as _Path
-
-    registry: dict = {}
-    adapter_dir = _Path(adapter_dir)
-    if not adapter_dir.exists():
-        return registry
-
-    from paramem.backup.encryption import read_maybe_encrypted
-
-    def _merge_registry_file(p: _Path) -> None:
-        """Extract the ``"simhash"`` map from one indexed_key_registry.json."""
-        try:
-            raw = json.loads(read_maybe_encrypted(p).decode("utf-8"))
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to read registry file %s — skipping", p.name)
-            return
-        if not isinstance(raw, dict):
-            return
-        simhash_map = raw.get("simhash", {})
-        if not isinstance(simhash_map, dict):
-            return
-        for key, fp in simhash_map.items():
-            if isinstance(fp, int):
-                registry[key] = fp
-
-    # Per-tier main paths.
-    for tier in ("episodic", "semantic", "procedural"):
-        p = adapter_dir / tier / "indexed_key_registry.json"
-        if p.exists():
-            _merge_registry_file(p)
-
-    # Interim adapter slots.
-    from paramem.memory.interim_adapter import iter_interim_dirs
-
-    for _name, interim_dir in iter_interim_dirs(adapter_dir):
-        p = interim_dir / "indexed_key_registry.json"
-        if p.exists():
-            _merge_registry_file(p)
-
-    return registry
 
 
 def _build_messages(

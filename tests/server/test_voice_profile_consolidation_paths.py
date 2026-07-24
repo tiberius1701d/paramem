@@ -522,7 +522,7 @@ def _run_consume_pending_cycle(config, loop):
     pending = _make_pending(source_type="document", n=1)
     with _patch_extraction_stage(pending, config) as (mock_profile, mock_buffer):
         with patch("paramem.server.app._run_stage_b_cycle", side_effect=_capture):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
         outcome, _finalizer = captured["body"](loop, MagicMock())
 
     return outcome, mock_profile.call_args_list, mock_buffer

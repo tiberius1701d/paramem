@@ -1570,7 +1570,7 @@ class TestStoreLoadDegradedDispatchGuard:
             ),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result == "migration_skipped_degraded", (
@@ -1618,7 +1618,7 @@ class TestStoreLoadDegradedDispatchGuard:
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result == "started_migration", (

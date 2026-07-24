@@ -956,22 +956,44 @@ class TestProbeKeysFromGraph:
 # ---------------------------------------------------------------------------
 
 
-def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
-    """Build the minimal ConsolidationLoop required by consolidate.
+def _make_bare_loop(tmp_path: Path, *, min_tier_key_floor: int = 0) -> ConsolidationLoop:
+    """Build the minimal ConsolidationLoop the disk-venue full fold needs.
 
-    Attributes set:
+    The disk venue runs the SAME spine as the weights venue, so this loop
+    carries everything the spine touches outside the weight-only blocks:
+
       - ``output_dir`` — used as the adapter_dir root.
       - ``merger`` — a model-free ``GraphMerger`` so the merge topology
         can run without a GPU or loaded model (``merger.model=None`` means the
         model-gated Case-2 branch is skipped; production-correct for simulate mode).
+      - ``store`` — a real :class:`MemoryStore` with the three main-tier
+        registries loaded.  **This is the fold's input in BOTH venues**; the
+        disk venue is not store-free.
+      - key counters / ``promoted_keys`` / ``cycle_count`` — mutated by the
+        keyed-entry builder and the promotion pass.
+      - ``procedural_config`` — read by ``partition_relations`` to decide
+        whether procedural is a live tier.
       - ``save_cycle_snapshots`` — False so ``snapshot_dir_for`` returns None.
       - ``_debug_base`` — None, so no artifact root is ever opened.
-      - ``config`` — minimal ``ConsolidationConfig`` with base defaults
-        (cloud master switch off, refinement_enrichment="off", refinement_normalization="off")
+      - ``config`` — ``ConsolidationConfig`` with base defaults (cloud master
+        switch off, refinement_enrichment="off", refinement_normalization="off")
         so enrichment and normalization are suppressed without explicit flags.
+      - ``training_config`` — read by ``_hydrate_store_for_fold`` for the
+        recall-probe batch size.  The disk venue never batches a generate call,
+        but the source factory takes the same arguments in both venues so the
+        signature does not fork; production always carries this object.
 
-    All other attributes are left unset; any unintended access will raise
-    AttributeError rather than silently returning a MagicMock value.
+    Args:
+        tmp_path: Adapter root for this loop.
+        min_tier_key_floor: Whole-fold accumulate floor.  Defaults to 0 so a
+            small fixture reaches the persist tail; pass the production default
+            (30) to exercise the accumulate guard.
+
+    Model/tokenizer stay ``None`` — the disk venue holds no PeftModel, which is
+    exactly what production does (``app.py`` leaves ``loop.model`` a bare base
+    model or ``None`` in simulate).  All other attributes are left unset; any
+    unintended access raises AttributeError rather than silently returning a
+    MagicMock value.
     """
     from paramem.graph.merger import GraphMerger
 
@@ -992,23 +1014,133 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     # production path reaches the tier without them.
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50
-    loop.config = ConsolidationConfig()
+    loop.config = ConsolidationConfig(min_tier_key_floor=min_tier_key_floor)
+    loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False, batch_size=1)
+
+    store = MemoryStore(replay_enabled=True)
+    for tier in ("episodic", "semantic", "procedural"):
+        store.load_registry(tier, KeyRegistry())
+    loop.store = store
+
+    loop.cycle_count = 0
+    loop._indexed_next_index = 1
+    loop._procedural_next_index = 1
+    loop.promoted_keys: set = set()
+    loop.procedural_config = AdapterConfig(
+        rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"]
+    )
     return loop
 
 
-def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> Path:
-    """Write a simulate-mode interim graph.json under adapter_dir/episodic/interim_<stamp>/.
+def _seed_store_tier(
+    loop: ConsolidationLoop,
+    tier: str,
+    triples: list[dict],
+    *,
+    entries: bool = True,
+) -> None:
+    """Register *triples* in ``loop.store`` under *tier*, as boot hydration does.
+
+    Writes exactly what a hydrated store carries for a keyed fact: the tier's
+    :class:`KeyRegistry`, the entry payload plus its SimHash, and the per-key
+    bookkeeping record.  This is the fold's input in BOTH venues, so every
+    fixture that wants the fold to see a fact goes through here — the disk
+    venue's ``graph.json`` files are the hydration *source* and the post-fold
+    *sink*, never the fold's direct input.
 
     Args:
-        adapter_dir: The loop's output_dir.
+        loop: The loop under test; ``loop.store`` receives the state and
+            ``loop._indexed_next_index`` is advanced past every seeded
+            ``graphN`` key so a later mint cannot collide with a seeded one
+            (production derives the counter from the live registry the same
+            way, via ``seed_key_metadata``).
+        tier: Store tier / adapter name to register the keys under.
+        triples: Dicts with ``key``, ``subject``, ``predicate``, ``object``,
+            and optionally ``speaker_id`` / ``relation_type`` /
+            ``reinforcement_count`` (the promotion driver).
+        entries: When ``False``, register the key and its fingerprint and write
+            its bookkeeping, but leave the entry cache empty for it.  That is
+            the per-key shape of a partial boot preload
+            (``app._build_store_contents`` always returns the full registry and
+            the full bookkeeping, and only the entry probe comes back short —
+            reported as ``boot_degraded={"reason": "preload_partial"}``).  The
+            key is live and serving; only its content is missing.
+    """
+    from paramem.memory.entry import entry_simhash
+
+    if not loop.store.has_registry(tier):
+        loop.store.load_registry(tier, KeyRegistry())
+    for t in triples:
+        entry = {
+            "key": t["key"],
+            "subject": t["subject"],
+            "predicate": t.get("predicate", ""),
+            "object": t["object"],
+            "speaker_id": t.get("speaker_id", ""),
+        }
+        if entries:
+            loop.store.put(tier, t["key"], entry, simhash=entry_simhash(entry))
+        else:
+            loop.store.registry(tier).add(t["key"])
+            loop.store.put_simhash(tier, t["key"], entry_simhash(entry))
+        loop.store.set_bookkeeping(
+            t["key"],
+            speaker_id=t.get("speaker_id", ""),
+            relation_type=t.get("relation_type", "factual"),
+            first_seen="",
+            reinforcement_count=t.get("reinforcement_count", 1),
+            allow_empty_speaker=not t.get("speaker_id", ""),
+        )
+        if t["key"].startswith("graph") and t["key"][len("graph") :].isdigit():
+            loop._indexed_next_index = max(
+                loop._indexed_next_index, int(t["key"][len("graph") :]) + 1
+            )
+
+
+def _write_interim_graph(
+    loop: ConsolidationLoop,
+    stamp: str,
+    triples: list[dict],
+    *,
+    store_state: str = "hydrated",
+) -> Path:
+    """Seed one simulate-venue interim slot: on-disk graph.json plus store state.
+
+    Mirrors what ``commit_tier_slot(mode="simulate")`` writes and what boot
+    hydration (``MemoryStore.load_registries_from_disk`` +
+    :class:`DiskMemorySource`) then loads back — the slot dir carries the
+    payload, the store carries the registry, entries, and bookkeeping.  The
+    full fold reads the STORE in both venues; the slot dir exists so the
+    post-fold reap has something to remove.
+
+    Args:
+        loop: The loop under test.  ``loop.output_dir`` is the adapter root and
+            ``loop.store`` receives the slot's registry/entries/bookkeeping.
         stamp: Sub-interval stamp, e.g. ``"20260101T0000"``.
         triples: List of dicts with ``key``, ``subject``, ``predicate``,
-            ``object``, and optionally ``speaker_id``.
+            ``object``, and optionally ``speaker_id`` / ``relation_type``.
+        store_state: Which boot outcome the store reflects.
+
+            - ``"hydrated"`` (default) — registry, entries, and bookkeeping all
+              present: a clean boot.
+            - ``"registry_only"`` — registry, fingerprints, and bookkeeping
+              present but the entry cache empty for these keys: a **partial
+              preload** (``boot_degraded={"reason": "preload_partial"}``).  The
+              keys are live and serving; only their content is missing, and the
+              slot's ``graph.json`` still holds it.
+            - ``"absent"`` — the store knows nothing of the slot at all: a
+              registry read that failed outright (``store_load_degraded``).  The
+              payload is on disk and only on disk.
 
     Returns:
         The interim directory path.
     """
-    interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
+    from paramem.memory.persistence import save_memory_to_disk as _save
+
+    if store_state not in ("hydrated", "registry_only", "absent"):
+        raise ValueError(f"unknown store_state: {store_state!r}")
+
+    interim_dir = loop.output_dir / "episodic" / f"interim_{stamp}"
     interim_dir.mkdir(parents=True, exist_ok=True)
     graph = nx.MultiDiGraph()
     for t in triples:
@@ -1021,9 +1153,15 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
                 "speaker_id": t.get("speaker_id", ""),
             },
         )
-    from paramem.memory.persistence import save_memory_to_disk as _save
-
     _save(graph, interim_dir / "graph.json")
+
+    if store_state != "absent":
+        _seed_store_tier(
+            loop,
+            f"episodic_interim_{stamp}",
+            triples,
+            entries=(store_state == "hydrated"),
+        )
     return interim_dir
 
 
@@ -1056,7 +1194,7 @@ class TestConsolidateSimulateFold:
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
             {"key": "graph2", "subject": "Alice", "predicate": "works_at", "object": "Acme"},
         ]
-        interim_dir = _write_interim_graph(tmp_path, "20260101T0000", triples)
+        interim_dir = _write_interim_graph(loop, "20260101T0000", triples)
 
         result = loop.consolidate(mode="simulate")
 
@@ -1077,12 +1215,12 @@ class TestConsolidateSimulateFold:
 
         loop = _make_bare_loop(tmp_path)
         slot_a = _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
             [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
         )
         slot_b = _write_interim_graph(
-            tmp_path,
+            loop,
             "20260102T0000",
             [{"key": "graph2", "subject": "Bob", "predicate": "works_at", "object": "Acme"}],
         )
@@ -1118,8 +1256,8 @@ class TestConsolidateSimulateFold:
             "predicate": "lives_in",
             "object": "Berlin",
         }
-        _write_interim_graph(tmp_path, "20260101T0000", [shared_triple])
-        _write_interim_graph(tmp_path, "20260102T0000", [shared_triple])
+        _write_interim_graph(loop, "20260101T0000", [shared_triple])
+        _write_interim_graph(loop, "20260102T0000", [shared_triple])
 
         loop.consolidate(mode="simulate")
 
@@ -1143,7 +1281,7 @@ class TestConsolidateSimulateFold:
         loop = _make_bare_loop(tmp_path)
         dirs = [
             _write_interim_graph(
-                tmp_path,
+                loop,
                 f"2026010{i}T0000",
                 [{"key": f"graph{i}", "subject": f"E{i}", "predicate": "p", "object": f"O{i}"}],
             )
@@ -1161,17 +1299,17 @@ class TestConsolidateSimulateFold:
     def test_result_contains_tier_delta(self, tmp_path):
         """Result dict contains 'tier_delta' with episodic before/after counts.
 
-        Every fold emits tier_delta.  For the
-        simulate path staled_by_reason is {} in this fixture because no dedup
-        collapse occurs (the single interim slot has a unique triple) and the
-        simulate-mode store has no entries for removal_ledger attribution.
+        Every fold emits tier_delta, from the same ``_build_tier_delta`` call in
+        both venues.  ``staled_by_reason`` is ``{}`` in this fixture because no
+        dedup collapse occurs (the single interim slot has a unique triple), so
+        the removal ledger is empty.
         """
 
         loop = _make_bare_loop(tmp_path)
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
-            [{"key": "graph1", "subject": "Alice", "predicate": "likes", "object": "Tea"}],
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
         )
 
         result = loop.consolidate(mode="simulate")
@@ -1189,30 +1327,54 @@ class TestConsolidateSimulateFold:
             f"tier_delta['episodic'] must have staled_by_reason; got {ep!r}"
         )
         assert ep["staled_by_reason"] == {}, (
-            "simulate path: staled_by_reason must be empty — no dedup collapse in this fixture"
-            " and simulate-mode store has no entries for removal_ledger attribution"
+            "no dedup collapse in this fixture, so the removal ledger is empty"
         )
-        assert ep["active_before"] == 0, "No main graph before → active_before == 0"
-        assert ep["active_after"] == 1, "One triple merged → active_after == 1"
+        assert ep["active_after"] == 1, "One interim key folded into episodic → active_after == 1"
 
-    def test_simulate_fold_with_no_interims_persists_groomed_graph(self, tmp_path):
-        """No interims and an empty main graph: the groomed graph is still persisted.
+    def test_simulate_fold_with_nothing_to_fold_is_a_noop(self, tmp_path):
+        """Empty store, no interims: nothing is rebuilt and nothing is written.
 
-        The fold carries no content gate — it re-runs the merger topology over
-        whatever it is given and writes the result back to disk.  Deciding that
-        there is nothing worth folding is the dispatcher's job, not the fold's.
+        Same contract as the weights venue — a tier with no keys is skipped, so
+        ``tiers_rebuilt`` is empty and the persist tail never fires.  ``app.py``
+        reads exactly that (``tiers_rebuilt == []`` → ``noop``).  Persisting an
+        empty projection over whatever is on disk would be a write with no
+        content behind it.
         """
         loop = _make_bare_loop(tmp_path)
-        # No interim slots, no pre-existing main graph.
+        # No interim slots, no store content.
 
         result = loop.consolidate(mode="simulate")
 
-        assert result["tiers_rebuilt"] == ["episodic"], (
-            "the fold must groom and persist even with no interims; "
-            f"got {result['tiers_rebuilt']!r}"
+        assert result["tiers_rebuilt"] == [], (
+            f"nothing in the store → nothing rebuilt; got {result['tiers_rebuilt']!r}"
         )
-        main_graph_path = tmp_path / "episodic" / "graph.json"
-        assert main_graph_path.exists(), "main graph.json must be written even with no interims"
+        assert not (tmp_path / "episodic" / "graph.json").exists(), (
+            "a fold that rebuilt nothing must not write a tier graph"
+        )
+
+    def test_below_floor_fold_returns_accumulating(self, tmp_path):
+        """The key floor is general — the disk venue does not bypass it.
+
+        With the production floor, a fold whose whole trainable set is below it
+        returns ``status="accumulating"`` and rebuilds nothing, in either venue.
+        """
+        loop = _make_bare_loop(tmp_path, min_tier_key_floor=30)
+        _write_interim_graph(
+            loop,
+            "20260101T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
+
+        result = loop.consolidate(mode="simulate")
+
+        assert result["status"] == "accumulating", (
+            f"1 key < floor 30 must accumulate; got {result.get('status')!r}"
+        )
+        assert result["accumulating_reason"]["floor"] == 30
+        assert result["tiers_rebuilt"] == []
+        # The accumulating return carries the same schema as the terminal ones.
+        assert result["tier_delta"] == {}
+        assert not (tmp_path / "episodic" / "graph.json").exists()
 
     def test_current_interim_stamp_stays_none_across_the_fold(self, tmp_path):
         """The full fold never labels its debug artifacts with an interim stamp.
@@ -1254,7 +1416,7 @@ class TestConsolidateSimulateFold:
 
         # Slot A: subject/object in title-case (will be registered first).
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
             [
                 {
@@ -1271,7 +1433,7 @@ class TestConsolidateSimulateFold:
         # These canonicalize to the same triple, so Case-1 fires and the
         # merger records pre_surfaces with the differing incoming and surviving surfaces.
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260102T0000",
             [
                 {
@@ -1317,8 +1479,11 @@ class TestConsolidateSimulateFold:
         merged interim edges in the persisted output.
 
         Strategy: monkeypatch GraphTierRefiner.run_enrichment to add a sentinel
-        edge to loop.merger.graph and return new_edges=1.  After the simulate
-        fold, assert:
+        edge to loop.merger.graph and return new_edges=1.  The sentinel is
+        KEYLESS, exactly like a real enrichment edge: the fold mints its key in
+        ``_build_all_edge_entries_into`` and registers it in the store, which is
+        what carries it into the persisted per-tier projection.  After the
+        simulate fold, assert:
         (a) the sentinel edge is present in the persisted graph.json, and
         (b) the merged interim edge is also present (sentinel coexists with merged content),
         (c) tier_delta["episodic"]["minted"] == 1 (sourced from enrichment new_edges).
@@ -1328,12 +1493,13 @@ class TestConsolidateSimulateFold:
         loop = _make_bare_loop(tmp_path)
         # refinement_enrichment="on" + the cloud master switch on so consolidate
         # calls GraphTierRefiner.run_enrichment; base defaults (off/False) would skip it.
-        loop.config = ConsolidationConfig(refinement_enrichment="on")
+        # min_tier_key_floor=0 so this 2-key fixture reaches the persist tail.
+        loop.config = ConsolidationConfig(refinement_enrichment="on", min_tier_key_floor=0)
         loop.cloud_enabled = True
 
         # Seed one interim slot so there is merged content to coexist with.
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
             [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
         )
@@ -1341,10 +1507,9 @@ class TestConsolidateSimulateFold:
         # Sentinel values for the edge the enrichment mock will inject.
         SENTINEL_SUBJECT = "__enr_sentinel__"
         SENTINEL_OBJECT = "__enr_sentinel_obj__"
-        SENTINEL_KEY = "__enr_sentinel_key__"
 
         def _fake_enrichment(refiner_self=None):
-            """Add a sentinel edge to loop.merger.graph and return new_edges=1.
+            """Add a keyless sentinel edge to loop.merger.graph; return new_edges=1.
 
             Must run on the populated merged graph (after reset+merge), otherwise
             the merger's graph is empty and the sentinel is wiped by reset_graph().
@@ -1354,11 +1519,9 @@ class TestConsolidateSimulateFold:
             loop.merger.graph.add_edge(
                 SENTINEL_SUBJECT,
                 SENTINEL_OBJECT,
-                **{
-                    _IK_KEY_ATTR: SENTINEL_KEY,
-                    "predicate": "enriched_by",
-                    "speaker_id": "",
-                },
+                predicate="enriched_by",
+                relation_type="factual",
+                speaker_id="",
             )
             return {
                 "chunks": 1,
@@ -1379,10 +1542,11 @@ class TestConsolidateSimulateFold:
         main_graph_path = tmp_path / "episodic" / "graph.json"
         assert main_graph_path.exists(), "Main graph.json must be written"
         merged = load_memory_from_disk(main_graph_path)
-        keys_in_graph = {e["key"] for e in iter_entries(merged)}
-        assert SENTINEL_KEY in keys_in_graph, (
+        entries_in_graph = list(iter_entries(merged))
+        keys_in_graph = {e["key"] for e in entries_in_graph}
+        assert any(e["predicate"] == "enriched_by" for e in entries_in_graph), (
             f"Sentinel enrichment edge must survive into persisted graph.json; "
-            f"keys present: {sorted(keys_in_graph)}\n"
+            f"entries present: {entries_in_graph}\n"
             "On the buggy code (enrichment before reset_graph) the sentinel is wiped "
             "by reset_graph() and is absent here."
         )
@@ -1402,7 +1566,7 @@ class TestConsolidateSimulateFold:
         )
 
     def test_simulate_merge_produces_person_node_with_speaker_id(self, tmp_path):
-        """Simulate path via GraphMerger.merge_relations stamps entity_type='person' + speaker_id.
+        """Disk-venue materialize stamps entity_type='person' + speaker_id on the merged graph.
 
         Regression guard: before routing consolidate through
         GraphMerger.merge_relations, the simulate path used entities=[] directly
@@ -1411,20 +1575,18 @@ class TestConsolidateSimulateFold:
         node) would be stored as entity_type='concept' with no speaker_id
         attribute, causing keyless-edge attribution to fall back to speaker_id="".
 
-        After the fix, the simulate path calls GraphMerger.merge_relations which
-        calls the module-level _synth_speaker_entities; the subject node receives
-        entity_type='person' and speaker_id from the synthesised Entity.
-
-        Uses the session_id="__simulate_consolidation_merge__" path, which is
-        the simulate full-fold session identifier.
+        Asserted on ``loop.merger.graph`` rather than on the persisted artifact:
+        the per-tier ``graph.json`` is an edge projection of the store
+        (``build_tier_graph_from_store``) and carries no node attributes in
+        either venue, so the merged graph is where this invariant is observable.
         """
         loop = _make_bare_loop(tmp_path)
 
-        # Write an interim slot whose triple has subject == speaker_id.
+        # Seed an interim slot whose triple has subject == speaker_id.
         # paramem.graph.merger._synth_speaker_entities fires when _r.speaker_id != "" AND
         # _r.subject == _r.speaker_id.  We use "speaker0" for both.
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
             [
                 {
@@ -1437,35 +1599,29 @@ class TestConsolidateSimulateFold:
             ],
         )
 
-        loop.consolidate(mode="simulate")
-
-        # merger.graph is cleared by the cycle-end finally; read the persisted graph.json instead.
-        from paramem.memory.persistence import load_memory_from_disk
-
-        main_path = tmp_path / "episodic" / "graph.json"
-        assert main_path.exists(), "graph.json must be written after the simulate fold"
-        saved_graph = load_memory_from_disk(main_path)
+        loop._materialize_consolidation_graph(source="disk")
 
         # §0 invariant (Step 2): speaker node key is the lowercase speaker_id.
         # Under the lowercase-uniform design entity.speaker_id == node key == "speaker0".
         node_key = "speaker0"
-        assert node_key in saved_graph.nodes, (
-            f"Speaker subject node {node_key!r} missing from merged graph after simulate path; "
-            f"nodes present: {list(saved_graph.nodes)}"
+        assert node_key in loop.merger.graph.nodes, (
+            f"Speaker subject node {node_key!r} missing from merged graph after disk "
+            f"materialize; nodes present: {list(loop.merger.graph.nodes)}"
         )
-        node_data = saved_graph.nodes[node_key]
+        node_data = loop.merger.graph.nodes[node_key]
         assert node_data.get("entity_type") == "person", (
-            f"Simulate path: expected entity_type='person' on speaker subject node; "
+            f"Disk venue: expected entity_type='person' on speaker subject node; "
             f"got entity_type={node_data.get('entity_type')!r}. "
             "Regression: before GraphMerger.merge_relations routing, simulate used "
             "entities=[] so speaker nodes received entity_type='concept' with no speaker_id."
         )
         assert node_data.get("speaker_id") == "speaker0", (
-            f"Simulate path: expected speaker_id='speaker0' (cased, in node attribute); "
+            f"Disk venue: expected speaker_id='speaker0' (in node attribute); "
             f"got speaker_id={node_data.get('speaker_id')!r}. "
             "Regression: paramem.graph.merger._synth_speaker_entities was not applied "
-            "to the simulate path."
+            "to the disk venue."
         )
+        loop.merger.reset_graph()
 
 
 # ---------------------------------------------------------------------------
@@ -1682,12 +1838,12 @@ class TestBuildTierDelta:
         loop = _make_bare_loop(tmp_path)
 
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260201T0000",
             [{"key": "graph1", "subject": "Alice", "predicate": "works at", "object": "Acme Corp"}],
         )
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260202T0000",
             [{"key": "graph2", "subject": "alice", "predicate": "works at", "object": "acme corp"}],
         )
@@ -2338,7 +2494,7 @@ class TestGraphLifecycle:
         # No pre-existing graph.json — load_memory_from_disk returns an empty
         # MultiDiGraph when the file is absent; the fold creates the file itself.
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
             [{"key": "graph1", "subject": "Alice", "predicate": "knows", "object": "Bob"}],
         )
@@ -2387,7 +2543,7 @@ class TestGraphLifecycle:
 
         # Fold 1: one triple Alice→Bob.
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260101T0000",
             [{"key": "graph1", "subject": "Alice", "predicate": "knows", "object": "Bob"}],
         )
@@ -2404,7 +2560,7 @@ class TestGraphLifecycle:
         # The canonical graph.json was written by fold-1 (Alice→Bob).  This
         # simulates a fresh cycle where only Carol's fact is new.
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260102T0000",
             [{"key": "graph2", "subject": "Carol", "predicate": "lives_in", "object": "Berlin"}],
         )
@@ -2569,146 +2725,6 @@ class TestGraphLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# TestCollectDiskFoldRelations
-# ---------------------------------------------------------------------------
-
-
-class TestCollectDiskFoldRelations:
-    """Unit tests for :meth:`ConsolidationLoop._collect_disk_fold_relations`.
-
-    Verifies:
-    - ``active_before_count`` is the canonical graph's pre-merge edge count.
-    - Train-mode interim slots (no ``graph.json``) are skipped.
-    - ``interim_dirs`` contains only simulate-mode slots that have a ``graph.json``.
-    - Relations are built from BOTH the canonical graph and simulate-mode interim slots.
-    - Missing canonical graph returns ``active_before_count=0`` (empty graph).
-    """
-
-    def test_active_before_count_from_canonical_graph(self, tmp_path):
-        """active_before_count reflects the canonical episodic/graph.json edge count.
-
-        Writes a canonical graph.json with 2 edges and one interim slot with
-        1 edge.  active_before_count must equal 2 (canonical pre-merge count),
-        NOT 3 (total after merging interim).
-        """
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
-
-        # Write canonical graph with 2 edges.
-        canonical_path = tmp_path / "episodic" / "graph.json"
-        canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        canonical_g = nx.MultiDiGraph()
-        canonical_g.add_edge("A", "B", **{_IK_KEY_ATTR: "k1", "predicate": "p1", "speaker_id": ""})
-        canonical_g.add_edge("C", "D", **{_IK_KEY_ATTR: "k2", "predicate": "p2", "speaker_id": ""})
-        save_memory_to_disk(canonical_g, canonical_path)
-
-        # Write one simulate-mode interim slot with 1 edge.
-        _write_interim_graph(
-            tmp_path,
-            "20260301T0000",
-            [
-                {"key": "k3", "subject": "E", "predicate": "p3", "object": "F"},
-            ],
-        )
-
-        loop = _make_bare_loop(tmp_path)
-        inp = loop._collect_disk_fold_relations(tmp_path)
-
-        assert inp.active_before_count == 2, (
-            f"active_before_count must equal canonical graph edge count (2); "
-            f"got {inp.active_before_count}"
-        )
-
-    def test_no_canonical_graph_returns_zero_active_before(self, tmp_path):
-        """When canonical episodic/graph.json does not exist, active_before_count == 0.
-
-        The first fold has no prior canonical graph; load_memory_from_disk returns
-        an empty graph whose edge count is 0.
-        """
-        _write_interim_graph(
-            tmp_path,
-            "20260301T0000",
-            [
-                {"key": "k1", "subject": "A", "predicate": "p1", "object": "B"},
-            ],
-        )
-
-        loop = _make_bare_loop(tmp_path)
-        inp = loop._collect_disk_fold_relations(tmp_path)
-
-        assert inp.active_before_count == 0, (
-            f"No canonical graph → active_before_count must be 0; got {inp.active_before_count}"
-        )
-
-    def test_train_mode_slot_skipped_no_graph_json(self, tmp_path):
-        """Train-mode interim slots (no graph.json) are skipped.
-
-        Creates one simulate-mode slot (has graph.json) and one train-mode slot
-        (directory with no graph.json, only a sentinel file).  Only the simulate
-        slot must appear in interim_dirs.
-        """
-        # Simulate-mode slot: has graph.json.
-        simulate_dir = _write_interim_graph(
-            tmp_path,
-            "20260301T0000",
-            [
-                {"key": "k1", "subject": "A", "predicate": "p1", "object": "B"},
-            ],
-        )
-
-        # Train-mode slot: directory with no graph.json (mimics a PEFT weights slot).
-        train_slot_dir = tmp_path / "episodic" / "interim_20260302T0000"
-        train_slot_dir.mkdir(parents=True, exist_ok=True)
-        # Place a sentinel file (not graph.json) to confirm the directory exists.
-        (train_slot_dir / "adapter_config.json").write_text('{"r": 8}')
-
-        loop = _make_bare_loop(tmp_path)
-        inp = loop._collect_disk_fold_relations(tmp_path)
-
-        assert simulate_dir in inp.interim_dirs, (
-            "Simulate-mode slot (has graph.json) must appear in interim_dirs"
-        )
-        assert train_slot_dir not in inp.interim_dirs, (
-            "Train-mode slot (no graph.json) must be skipped"
-        )
-        # Relations from simulate slot are present; train slot contributes nothing.
-        rel_keys = {r.indexed_key for r in inp.relations}
-        assert "k1" in rel_keys, "Relation from simulate slot must be collected"
-
-    def test_relations_from_canonical_and_interim_slots(self, tmp_path):
-        """Relations are built from both the canonical graph and simulate-mode interim slots.
-
-        Writes a canonical graph with key k1 and an interim slot with key k2.
-        The returned relations must contain both.
-        """
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
-
-        canonical_path = tmp_path / "episodic" / "graph.json"
-        canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        canonical_g = nx.MultiDiGraph()
-        canonical_g.add_edge("A", "B", **{_IK_KEY_ATTR: "k1", "predicate": "p1", "speaker_id": ""})
-        save_memory_to_disk(canonical_g, canonical_path)
-
-        _write_interim_graph(
-            tmp_path,
-            "20260301T0000",
-            [
-                {"key": "k2", "subject": "C", "predicate": "p2", "object": "D"},
-            ],
-        )
-
-        loop = _make_bare_loop(tmp_path)
-        inp = loop._collect_disk_fold_relations(tmp_path)
-
-        rel_keys = {r.indexed_key for r in inp.relations}
-        assert "k1" in rel_keys, "Canonical graph relation (k1) must be collected"
-        assert "k2" in rel_keys, "Interim slot relation (k2) must be collected"
-
-
-# ---------------------------------------------------------------------------
 # TestMaterializeConsolidationGraphDiskSource (source="disk" axis)
 # ---------------------------------------------------------------------------
 
@@ -2717,39 +2733,50 @@ class TestMaterializeConsolidationGraphDiskSource:
     """Unit tests for :meth:`ConsolidationLoop._materialize_consolidation_graph` with
     ``source="disk"``.
 
+    ``source`` is a WEIGHT-PROBE gate, not a merge-input selector: the
+    registry-true re-merge (``_build_registry_true_relations``) runs in BOTH
+    venues over the same store.  These tests pin that, so a store-seeded disk
+    fold can never silently degrade to an empty merge input again.
+
     Verifies:
     - ``recall_miss_keys`` is always ``set()`` (no weight reconstruction).
-    - ``recon_relations`` is always ``[]`` (no registry-true re-merge).
-    - Disk relations fed via ``extra_relations`` appear in ``merger.graph`` after the call.
-    - The ``source="weights"`` default path is unchanged (existing callers byte-identical).
+    - ``recon_relations`` carries the store's active keys on the disk path.
+    - ``extra_relations`` merge ALONGSIDE the store relations, not instead of them.
+    - The ``source="weights"`` default path still runs the weight probe.
     """
+
+    @staticmethod
+    def _relation(subject: str, predicate: str, obj: str, key: str):
+        """Build one supplemental :class:`Relation` for the extra_relations channel."""
+        from paramem.graph.schema import Relation
+
+        return Relation(
+            subject=subject,
+            predicate=predicate,
+            object=obj,
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="",
+            indexed_key=key,
+        )
 
     def test_disk_source_recall_miss_empty(self, tmp_path):
         """source='disk': recall_miss_keys is always the empty set.
 
         The disk path skips weight reconstruction entirely; no adapter weights are
-        probed, so no failures can occur.  recall_miss_keys must be set() regardless
-        of the extra_relations content.
+        probed, so no failures can occur.  recall_miss_keys must be set() even
+        with a populated store and supplemental relations.
         """
-        from paramem.graph.schema import Relation
-
         loop = _make_bare_loop(tmp_path)
-        # Provide some disk relations.
-        relations = [
-            Relation(
-                subject="Alice",
-                predicate="lives_in",
-                object="Berlin",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="",
-                indexed_key="k1",
-            )
-        ]
+        _seed_store_tier(
+            loop,
+            "episodic",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
 
-        recall_miss_keys, recon_relations = loop._materialize_consolidation_graph(
+        recall_miss_keys, _ = loop._materialize_consolidation_graph(
             source="disk",
-            extra_relations=relations,
+            extra_relations=[self._relation("Bob", "works_at", "Acme", "k1")],
         )
         # Reset graph so it doesn't leak (the loop's finally would do this in production).
         loop.merger.reset_graph()
@@ -2757,60 +2784,78 @@ class TestMaterializeConsolidationGraphDiskSource:
         assert recall_miss_keys == set(), (
             f"source='disk': recall_miss_keys must be empty set(); got {recall_miss_keys!r}"
         )
-        assert recon_relations == [], (
-            f"source='disk': recon_relations must be [] (no registry-true re-merge); "
-            f"got {recon_relations!r}"
+
+    def test_disk_source_builds_registry_true_relations_from_store(self, tmp_path):
+        """source='disk': the store's active keys ARE the merge input.
+
+        ``_build_registry_true_relations`` is called in both venues.  With a
+        populated store the disk path must return those relations in
+        ``recon_relations`` — an empty result here means the fold would rebuild
+        the main tiers from nothing.
+        """
+        loop = _make_bare_loop(tmp_path)
+        _seed_store_tier(
+            loop,
+            "episodic",
+            [
+                {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+                {"key": "graph2", "subject": "Alice", "predicate": "works_at", "object": "Acme"},
+            ],
         )
 
-    def test_disk_source_merges_extra_relations_into_graph(self, tmp_path):
-        """source='disk': extra_relations appear in merger.graph after the call.
+        _, recon_relations = loop._materialize_consolidation_graph(source="disk")
+        loop.merger.reset_graph()
 
-        Disk relations are the ONLY merge input for the disk path.  After the call,
-        merger.graph must contain an edge for each supplied relation.
+        assert {r.indexed_key for r in recon_relations} == {"graph1", "graph2"}, (
+            "source='disk': recon_relations must carry every active store key; "
+            f"got {[r.indexed_key for r in recon_relations]!r}"
+        )
+        assert {(r.subject, r.predicate, r.object) for r in recon_relations} == {
+            ("Alice", "lives_in", "Berlin"),
+            ("Alice", "works_at", "Acme"),
+        }
+
+    def test_disk_source_merges_store_and_extra_relations_into_graph(self, tmp_path):
+        """source='disk': store relations AND extra_relations both reach merger.graph.
+
+        The supplemental channel is additive — it does not replace the
+        registry-true merge input.  Both sets of indexed keys must be keyed onto
+        the merged graph.
         """
-        from paramem.graph.schema import Relation
-
         loop = _make_bare_loop(tmp_path)
-        relations = [
-            Relation(
-                subject="Bob",
-                predicate="works_at",
-                object="Acme",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="",
-                indexed_key="k2",
-            ),
-            Relation(
-                subject="Carol",
-                predicate="visits",
-                object="London",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="",
-                indexed_key="k3",
-            ),
-        ]
+        _seed_store_tier(
+            loop,
+            "episodic",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
 
         loop._materialize_consolidation_graph(
             source="disk",
-            extra_relations=relations,
+            extra_relations=[
+                self._relation("Bob", "works_at", "Acme", "k2"),
+                self._relation("Carol", "visits", "London", "k3"),
+            ],
         )
 
-        # merger.graph must have at least 2 edges (one per relation).
-        n_edges = loop.merger.graph.number_of_edges()
-        assert n_edges >= 2, (
-            f"source='disk': merger.graph must have edges for each extra_relation; "
-            f"got {n_edges} edges (expected >= 2)"
-        )
+        merged_keys = {
+            data.get(_IK_KEY_ATTR)
+            for _s, _o, data in loop.merger.graph.edges(data=True)
+            if data.get(_IK_KEY_ATTR)
+        }
         # Reset to avoid leaking into other tests.
         loop.merger.reset_graph()
 
-    def test_disk_source_empty_extra_relations_noop(self, tmp_path):
-        """source='disk' with empty extra_relations: merger.graph stays empty, no crash.
+        assert merged_keys == {"graph1", "k2", "k3"}, (
+            "source='disk': the merged graph must carry the store's keys AND the "
+            f"supplemental ones; got {merged_keys!r}"
+        )
 
-        An empty extra_relations list is a valid no-op (a fold over an empty
-        canonical graph with no interim slots).
+    def test_disk_source_empty_store_and_extra_relations_noop(self, tmp_path):
+        """source='disk' with an empty store and no extras: empty result, no crash.
+
+        The genuine "nothing to fold" case — an empty store IS an empty merge
+        input, which is correct; the defect this class guards against is an empty
+        merge input from a POPULATED store.
         """
         loop = _make_bare_loop(tmp_path)
 
@@ -2822,6 +2867,7 @@ class TestMaterializeConsolidationGraphDiskSource:
 
         assert recall_miss_keys == set()
         assert recon_relations == []
+        assert loop.merger.graph.number_of_edges() == 0
 
     def test_weights_source_default_unchanged(self, tmp_path):
         """source='weights' (default) falls through to the existing weights path.
@@ -2874,15 +2920,12 @@ class TestMaterializeConsolidationGraphDiskSource:
 
 
 class TestSimulateFoldReturnSchema:
-    """Assert that consolidate returns the FULL train schema.
+    """The disk venue returns the SAME schema as the weights venue.
 
-    The train return dict carries ``drift_intended_removal``,
-    ``drift_intended_removal_by_reason``, ``recall_miss_keys``, and ``tier_keyed``.
-    The simulate path must return zero/empty equivalents so callers never KeyError
-    post-collapse.
-
-    Both the noop path (no interim slots) and the active path (slots present) are
-    covered.
+    One schema, both venues, every terminal return — including the accumulating
+    early return — so callers never KeyError on a venue they did not expect.
+    Covered: the noop return (nothing in the store) and the active return
+    (interim slots folded into main).
     """
 
     _REQUIRED_KEYS = frozenset(
@@ -2896,19 +2939,21 @@ class TestSimulateFoldReturnSchema:
             "drift_intended_removal_by_reason",
             "recall_miss_keys",
             "keys_per_tier",
-            "recall_per_tier",
             "tier_keyed",
             "rolled_back",
             "rollback_tier",
+            "tier_delta",
         }
     )
 
     def test_empty_input_return_has_full_schema(self, tmp_path):
-        """A fold over an empty graph with no interim slots carries all required keys.
+        """A fold over an empty store carries all required keys.
 
-        Nothing to merge is still a completed fold: the result must include
-        drift_intended_removal, drift_intended_removal_by_reason, recall_miss_keys,
-        and tier_keyed with zero/empty values.
+        Nothing to fold is still a completed fold: the result must include
+        drift_intended_removal, drift_intended_removal_by_reason,
+        recall_miss_keys, and tier_keyed with zero/empty values.  ``tier_keyed``
+        is the per-tier assignment map — empty lists, not an empty dict, because
+        the spine always builds all three tiers.
         """
         loop = _make_bare_loop(tmp_path)
         result = loop.consolidate(mode="simulate")
@@ -2921,17 +2966,18 @@ class TestSimulateFoldReturnSchema:
         assert result["drift_intended_removal"] == 0
         assert result["drift_intended_removal_by_reason"] == {}
         assert result["recall_miss_keys"] == []
-        assert result["tier_keyed"] == {}
+        assert result["tier_keyed"] == {"episodic": [], "semantic": [], "procedural": []}
 
     def test_active_return_has_full_schema(self, tmp_path):
         """Active return (interim slots present) carries all required keys.
 
-        After a successful merge, the result must include all required schema
-        keys — including the schema additions with their zero/empty values.
+        After a successful fold, the result must include all required schema
+        keys, and ``tier_keyed`` must carry the folded key on the main tier it
+        was assigned to.
         """
         loop = _make_bare_loop(tmp_path)
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260301T0000",
             [
                 {"key": "k1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
@@ -2948,21 +2994,21 @@ class TestSimulateFoldReturnSchema:
         assert result["drift_intended_removal"] == 0
         assert result["drift_intended_removal_by_reason"] == {}
         assert result["recall_miss_keys"] == []
-        assert result["tier_keyed"] == {}
-        # Sanity: active path does produce a tier_delta.
-        assert "tier_delta" in result
+        assert [e["key"] for e in result["tier_keyed"]["episodic"]] == ["k1"], (
+            f"interim key must be rebooked onto episodic; got {result['tier_keyed']!r}"
+        )
 
     def test_drift_genuine_loss_is_zero_for_disk_source(self, tmp_path):
-        """drift_genuine_loss is always 0 for the disk-source (simulate) path.
+        """drift_genuine_loss is 0 for the disk venue: nothing can fail reconstruction.
 
-        The simulate venue has an empty store; the recall-miss set is empty
-        (no weight reconstruction); drift_genuine_loss == 0 reproduces the
-        invariant: the simulate path has an empty store and no weight reconstruction,
-        so the recall-miss set is empty and drift_genuine_loss is always 0.
+        Genuine loss counts active keys that had registry content but produced no
+        merged edge.  The disk venue runs no weight reconstruction, so every
+        active key reaches the merge through its registry-true relation and the
+        bucket is empty by construction.
         """
         loop = _make_bare_loop(tmp_path)
         _write_interim_graph(
-            tmp_path,
+            loop,
             "20260301T0000",
             [
                 {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "Tea"},
@@ -2973,6 +3019,325 @@ class TestSimulateFoldReturnSchema:
         result = loop.consolidate(mode="simulate")
 
         assert result["drift_genuine_loss"] == 0, (
-            f"Disk-source (simulate) path: drift_genuine_loss must always be 0; "
-            f"got {result['drift_genuine_loss']!r}"
+            f"Disk venue: drift_genuine_loss must be 0; got {result['drift_genuine_loss']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSimulateFoldSpineStages (spine stages that are NOT weight-only)
+# ---------------------------------------------------------------------------
+
+
+class TestSimulateFoldSpineStages:
+    """Spine stages the disk venue runs identically to the weights venue.
+
+    Promotion, the per-tier floor, the router reload, and the persist/reap pair
+    are store operations, not weight operations, so the disk venue runs them —
+    and their artifacts must show up in the venue's own sink (the per-tier
+    ``graph.json`` projections), not only in episodic's.
+    """
+
+    def test_all_three_tier_graphs_written(self, tmp_path):
+        """Every main tier the fold rebuilt gets its own ``<tier>/graph.json``.
+
+        The disk venue's sink is three per-tier projections, not one canonical
+        episodic graph.  A key that lives in semantic or procedural must be
+        readable back from ITS tier's file — that path is what
+        ``DiskMemorySource`` probes for the tier at the next hydration.
+        """
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
+
+        loop = _make_bare_loop(tmp_path)
+        _seed_store_tier(
+            loop,
+            "episodic",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
+        _seed_store_tier(
+            loop,
+            "semantic",
+            [{"key": "graph2", "subject": "Alice", "predicate": "works_at", "object": "Acme"}],
+        )
+        _seed_store_tier(
+            loop,
+            "procedural",
+            [
+                {
+                    "key": "proc1",
+                    "subject": "speaker0",
+                    "predicate": "prefers",
+                    "object": "short answers",
+                    "relation_type": "preference",
+                }
+            ],
+        )
+
+        result = loop.consolidate(mode="simulate")
+
+        assert set(result["tiers_rebuilt"]) == {"episodic", "semantic", "procedural"}
+        for tier, expected_key in (
+            ("episodic", "graph1"),
+            ("semantic", "graph2"),
+            ("procedural", "proc1"),
+        ):
+            path = tmp_path / tier / "graph.json"
+            assert path.exists(), f"{tier}/graph.json must be written by the simulate fold"
+            keys = {e["key"] for e in iter_entries(load_memory_from_disk(path))}
+            assert keys == {expected_key}, (
+                f"{tier}/graph.json must carry exactly its own tier's keys; got {keys!r}"
+            )
+
+    def test_promotion_runs_on_the_disk_venue(self, tmp_path):
+        """A mature episodic key is promoted to semantic in the disk venue too.
+
+        Promotion is a pure store move with no weight dependency, so
+        ``scope.promote`` is True in both venues.  The promoted key must end up
+        in the semantic registry AND in ``semantic/graph.json``.
+        """
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
+
+        loop = _make_bare_loop(tmp_path)
+        # promotion_threshold defaults to 3 — seed one key at the threshold and
+        # one below it, so the assertion distinguishes promotion from a blanket move.
+        _seed_store_tier(
+            loop,
+            "episodic",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "reinforcement_count": loop.config.promotion_threshold,
+                },
+                {
+                    "key": "graph2",
+                    "subject": "Bob",
+                    "predicate": "works_at",
+                    "object": "Acme",
+                    "reinforcement_count": 1,
+                },
+            ],
+        )
+
+        loop.consolidate(mode="simulate")
+
+        assert loop.store.tier_for_active_key("graph1") == "semantic", (
+            "the mature key must be promoted to semantic on the disk venue"
+        )
+        assert loop.store.tier_for_active_key("graph2") == "episodic", (
+            "the immature key must stay in episodic"
+        )
+        semantic_keys = {
+            e["key"]
+            for e in iter_entries(load_memory_from_disk(tmp_path / "semantic" / "graph.json"))
+        }
+        assert semantic_keys == {"graph1"}, (
+            f"the promoted key must be projected into semantic/graph.json; got {semantic_keys!r}"
+        )
+
+    def test_tier_floor_graduation_on_the_disk_venue(self, tmp_path):
+        """A semantic tier at the floor graduates instead of being parked.
+
+        Only the fast-start WEIGHT copy is venue-gated; parking and graduation
+        are store operations that run in both venues.  With enough keys to reach
+        the floor the tier keeps them (graduates); the below-floor branch —
+        already covered by ``test_below_floor_fold_returns_accumulating`` — would
+        park them back into episodic instead.
+        """
+        loop = _make_bare_loop(tmp_path, min_tier_key_floor=2)
+        loop.config.tier_fast_start = True  # must NOT reach the weight copy
+        _seed_store_tier(
+            loop,
+            "semantic",
+            [
+                {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+                {"key": "graph2", "subject": "Alice", "predicate": "works_at", "object": "Acme"},
+            ],
+        )
+
+        result = loop.consolidate(mode="simulate")
+
+        assert [e["key"] for e in result["tier_keyed"]["semantic"]] == ["graph1", "graph2"], (
+            f"at the floor the tier graduates and keeps its keys; got {result['tier_keyed']!r}"
+        )
+        assert result["tier_keyed"]["episodic"] == [], "nothing may be parked at the floor"
+        assert loop.store.tier_for_active_key("graph1") == "semantic"
+        assert (tmp_path / "semantic" / "graph.json").exists()
+
+    def test_router_reload_fires_on_the_simulate_fold(self, tmp_path):
+        """The router is reloaded after a simulate fold, exactly as after a train fold.
+
+        The router serves from whatever the fold just published; a simulate fold
+        publishes new per-tier graph.json projections, so it owes the router the
+        same reload.
+        """
+        loop = _make_bare_loop(tmp_path)
+        _seed_store_tier(
+            loop,
+            "episodic",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
+        router = MagicMock()
+
+        loop.consolidate(mode="simulate", router=router)
+
+        assert router.reload.called, "the simulate fold must reload the router"
+
+    def test_interim_slot_survives_a_fold_that_persisted_nothing(self, tmp_path):
+        """Reap is gated on the same predicate as persist — no persist, no reap.
+
+        A slot whose content the store cannot see (boot-degraded hydration)
+        contributes no keys, so the fold rebuilds nothing and writes nothing.
+        Reaping it anyway would delete the only copy of its facts: on the disk
+        venue the slot's ``graph.json`` IS the payload.
+        """
+        loop = _make_bare_loop(tmp_path)
+        interim_dir = _write_interim_graph(
+            loop,
+            "20260101T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+            store_state="absent",
+        )
+
+        result = loop.consolidate(mode="simulate")
+
+        assert result["tiers_rebuilt"] == [], "nothing visible in the store → nothing rebuilt"
+        assert not (tmp_path / "episodic" / "graph.json").exists(), (
+            "a fold that rebuilt nothing must not write a tier graph"
+        )
+        assert interim_dir.exists(), (
+            "the fold persisted nothing, so it must not reap the slot it could not fold"
+        )
+        assert (interim_dir / "graph.json").exists(), "the slot payload must survive intact"
+
+
+class TestFoldHydratesAPartiallyPreloadedStore:
+    """A fold entered with a partially-hydrated store must not lose the rest.
+
+    The failure this locks down: ``store.get`` is cache-only, so every fold site
+    that reads entry content used to drop a live key whose entry the boot preload
+    had not materialised.  A dropped key never reaches ``serve_assignment``, and
+    the finalize step rewrites every main-tier registry FROM ``serve_assignment``
+    and flushes it — so the key was deregistered on disk and the drift partition
+    filed it as an orphan.  The content was still in the venue's source of truth
+    the whole time; nothing ever asked for it.
+
+    ``app._build_store_contents`` reports exactly this state as
+    ``boot_degraded={"reason": "preload_partial"}``, and a full cold cache is NOT
+    a substitute: that one is caught upstream by the ``min_tier_key_floor``
+    accumulate guard.  Both venues are covered — the disk venue reads the
+    per-tier ``graph.json``, the weights venue re-probes the adapters.
+    """
+
+    _TRIPLES = [
+        {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+        {"key": "graph2", "subject": "Bob", "predicate": "works_at", "object": "Acme"},
+    ]
+
+    def test_disk_venue_hydrates_the_missing_entry_from_graph_json(self, tmp_path):
+        """Simulate venue: the un-preloaded key is read back out of graph.json.
+
+        ``graph1`` is fully hydrated; ``graph2`` is registered and fingerprinted
+        but has no entry.  Both live in the slot's ``graph.json``, which is what
+        :class:`DiskMemorySource` reads.  After the fold both keys must be
+        active, both must be in the rebuilt tier graph, and neither may have
+        been staled.
+        """
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
+
+        loop = _make_bare_loop(tmp_path)
+        _write_interim_graph(loop, _STAMP, self._TRIPLES, store_state="hydrated")
+        # Re-seed graph2 without its entry: registry + fingerprint + bookkeeping
+        # present, entry cache empty — the partial-preload shape.
+        loop.store._entries[f"episodic_interim_{_STAMP}"].pop("graph2")
+
+        assert loop.store.get("graph2") is None, "fixture must start with graph2 un-hydrated"
+
+        result = loop.consolidate(mode="simulate")
+
+        keyed = {e["key"] for tier in result["tier_keyed"].values() for e in tier}
+        assert keyed == {"graph1", "graph2"}, (
+            f"the un-hydrated key must be hydrated from graph.json and folded, not "
+            f"dropped; tier_keyed carried {keyed}"
+        )
+        assert loop.store.tier_for_active_key("graph2") is not None, (
+            "graph2 must still be an active registered key after the fold"
+        )
+        assert not loop.store.is_stale("graph2"), "graph2 must not have been staled"
+        merged = load_memory_from_disk(tmp_path / "episodic" / "graph.json")
+        assert {e["key"] for e in iter_entries(merged)} == {"graph1", "graph2"}, (
+            "the rewritten tier graph must carry both keys"
+        )
+
+    def test_weights_venue_hydrates_the_missing_entry_from_the_adapter(self, tmp_path):
+        """Train venue: the un-preloaded key is re-probed out of the adapter weights.
+
+        Same partial-preload shape, but ``scope.source == "weights"``, so the
+        content comes back through :class:`WeightMemorySource` →
+        ``probe_keys_grouped_by_adapter`` (stubbed here — the GPU probe is the
+        one thing this test does not run).  The key must survive the fold.
+        """
+        loop = _build_loop(tmp_path)
+        _seed_store_tier(loop, "episodic", self._TRIPLES[:1])
+        _seed_store_tier(loop, "episodic", self._TRIPLES[1:], entries=False)
+
+        # Replace the fixture's keyless graph with the two keyed edges the
+        # registry-true re-merge would produce, so the keyed branch of
+        # _build_all_edge_entries_into — one of the three fold sites that read
+        # entry content — is the thing under test.
+        keyed_graph = nx.MultiDiGraph()
+        for triple in self._TRIPLES:
+            keyed_graph.add_node(triple["subject"], attributes={"name": triple["subject"]})
+            keyed_graph.add_node(triple["object"], attributes={"name": triple["object"]})
+            eid = keyed_graph.add_edge(
+                triple["subject"],
+                triple["object"],
+                predicate=triple["predicate"],
+                relation_type="factual",
+            )
+            keyed_graph[triple["subject"]][triple["object"]][eid][_IK_KEY_ATTR] = triple["key"]
+        loop.merger.graph = keyed_graph
+
+        assert loop.store.get("graph2") is None, "fixture must start with graph2 un-hydrated"
+
+        probed: dict = {}
+
+        def _fake_probe(model, tokenizer, keys_by_adapter, **kwargs):
+            """Stand in for the adapter probe: the weights still hold graph2."""
+            probed.update(keys_by_adapter)
+            out: dict = {}
+            for keys in keys_by_adapter.values():
+                for key in keys:
+                    triple = next((t for t in self._TRIPLES if t["key"] == key), None)
+                    out[key] = None if triple is None else {**triple, "confidence": 1.0}
+            return out
+
+        # The consolidate(mode="train") entry guard requires the caller to hold
+        # _gpu_thread_lock; a mock whose acquire() reports False satisfies it
+        # (patch.object cannot patch a C-level threading.Lock attribute).
+        _mock_lock = MagicMock()
+        _mock_lock.acquire.return_value = False
+        patches = _patches_for_train_mode()
+        with (
+            patch("paramem.server.gpu_lock._gpu_thread_lock", _mock_lock),
+            patch("paramem.memory.probe.probe_keys_grouped_by_adapter", _fake_probe),
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+        ):
+            result = loop.consolidate(mode="train")
+
+        assert "graph2" in {k for keys in probed.values() for k in keys}, (
+            "the fold must ask the weight source for the un-hydrated key"
+        )
+        keyed = {e["key"] for tier in result["tier_keyed"].values() for e in tier}
+        assert "graph2" in keyed, (
+            f"the un-hydrated key must be re-probed from the weights and folded, not "
+            f"dropped; tier_keyed carried {keyed}"
+        )
+        assert loop.store.tier_for_active_key("graph2") is not None, (
+            "graph2 must still be an active registered key after the fold"
+        )
+        assert not loop.store.is_stale("graph2"), "graph2 must not have been staled"

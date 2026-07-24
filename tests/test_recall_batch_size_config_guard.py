@@ -50,6 +50,7 @@ _RECALL_PROBE_FUNC_NAMES = frozenset(
         "probe_entries",
         "probe_keys_grouped_by_adapter",
         "WeightMemorySource",
+        "build_memory_source",
         "evaluate_indexed_recall",
         "evaluate_gates",
         "_gate_4_recall_check",

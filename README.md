@@ -208,7 +208,7 @@ python examples/quick_start.py
 
 `quick_start.py` is a REST integration smoke, not a standalone trainer. Against
 a running server it runs a two-stage check. It injects facts via `POST /chat`,
-triggers the real pipeline via `POST /consolidate` (extraction → indexed-key
+triggers the real pipeline via `POST /consolidate/interim` (extraction → indexed-key
 training, all per `server.yaml`), then verifies recall **deterministically**:
 it enumerates the trained keys via `POST /debug/dump` and recalls each via
 `POST /debug/recall` (exact-match against the registry, temperature 0). Stage 2

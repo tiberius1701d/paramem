@@ -7,6 +7,7 @@ Covers:
   returns partial results without raising.
 - WeightMemorySource.probe: forwards should_abort to the underlying function.
 - DiskMemorySource.probe: accepts and ignores should_abort (CPU path).
+- build_memory_source: the single mode → MemorySource selection contract.
 
 All tests are CPU-only — model and tokenizer are MagicMocks.
 The QA-shape probe_key tests (TestProbeKeyFormatFields) were removed on
@@ -344,3 +345,72 @@ class TestDiskMemorySourceAbortIgnored:
         assert result == {}
         # The abort callable was NOT called (DiskMemorySource ignores it).
         assert abort_called == []
+
+
+class TestBuildMemorySource:
+    """build_memory_source is the one mode → MemorySource construction site.
+
+    Every consumer (boot / post-fold store hydration, the per-query on-miss
+    probe, the per-fold hydration) names a mode and takes the source back, so
+    these cases pin the whole selection contract in one place.
+    """
+
+    def test_simulate_mode_returns_disk_source(self, tmp_path) -> None:
+        """Simulate mode reads graph.json — no model needed, none consulted."""
+        from paramem.memory.source import DiskMemorySource, build_memory_source
+
+        source = build_memory_source(mode="simulate", adapter_dir=tmp_path, batch_size=16)
+
+        assert isinstance(source, DiskMemorySource)
+        assert source.store_dir == tmp_path
+
+    def test_train_mode_returns_weight_source_with_derived_registry(self, tmp_path) -> None:
+        """Train mode wires the model plus the SimHash registry read from adapter_dir.
+
+        The registry is DERIVED inside the factory — no caller passes one — so a
+        fingerprint written to a tier's ``indexed_key_registry.json`` must reach
+        the source's gate without any caller involvement.
+        """
+        from paramem.memory.source import WeightMemorySource, build_memory_source
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 4242)
+        reg_path = tmp_path / "episodic" / "indexed_key_registry.json"
+        reg_path.parent.mkdir(parents=True)
+        reg_path.write_bytes(reg.save_bytes())
+
+        model = _make_model_with_adapters("episodic")
+        tokenizer = MagicMock()
+        source = build_memory_source(
+            mode="train",
+            adapter_dir=tmp_path,
+            batch_size=16,
+            model=model,
+            tokenizer=tokenizer,
+        )
+
+        assert isinstance(source, WeightMemorySource)
+        assert source.model is model
+        assert source.tokenizer is tokenizer
+        assert source.batch_size == 16
+        assert source.registry == {"graph1": 4242}
+
+    def test_train_mode_without_a_model_returns_none(self, tmp_path) -> None:
+        """No local model → no source of truth for the weights venue.
+
+        Cloud-only boot and a failed model load both land here; the caller
+        decides whether to skip (boot preload) or stay cache-only (per query).
+        """
+        from paramem.memory.source import build_memory_source
+
+        assert build_memory_source(mode="train", adapter_dir=tmp_path, batch_size=16) is None
+
+    def test_simulate_mode_without_a_model_still_returns_a_source(self, tmp_path) -> None:
+        """The no-model short-circuit is train-only — simulate never needs one."""
+        from paramem.memory.source import DiskMemorySource, build_memory_source
+
+        source = build_memory_source(mode="simulate", adapter_dir=tmp_path, batch_size=16)
+
+        assert isinstance(source, DiskMemorySource)

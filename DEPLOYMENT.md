@@ -166,7 +166,7 @@ python examples/quick_start.py
 ```
 
 `quick_start.py` injects facts via `POST /chat`, runs the real pipeline via
-`POST /consolidate` (extraction → indexed-key training → recall, all per
+`POST /consolidate/interim` (extraction → indexed-key training → recall, all per
 `server.yaml`), then asserts recall via `POST /debug/probe`, exiting non-zero
 on failure. Prerequisites: server running, `debug: true` in the active
 `server.yaml`, and `PARAMEM_API_TOKEN` set (env or `.env`).
@@ -401,18 +401,18 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 - **Bounded ring overflow (`interim_overflow_slack`, default 0):** when the interim ring is full (`max_interim_count` slots) up to `interim_overflow_slack` additional later-stamped overflow slots may be minted — each its own adapter, preserving temporal order — instead of immediately keeping sessions pending; the slack is included in the boot-time VRAM budget so the extension is proven to fit before the server starts. When the ring *and* its overflow are exhausted, new sessions are kept pending (lossless), not dropped. Two incidents surface the state: `interim_cap_reached` (warning) when an overflow slot was minted, `interim_overflow_pending` (failed) when capacity is fully exhausted and sessions are held pending. Both auto-resolve on the next successful full fold, which purges the ring.
 - **Full-fold-only mode (`max_interim_count: 0`):** no interim adapters are minted; every cycle's sessions stay pending in the session buffer and the scheduled full fold extracts and trains them directly into the main tiers. The full cycle runs every `refresh_cadence` itself — the derived period is `refresh_cadence`, not `refresh_cadence × 0`. A non-empty `refresh_cadence` is required: the server refuses to start without one, because at count 0 the full fold is the only training venue and pending sessions would otherwise accumulate unboundedly. It also **requires `consolidation.mode: train`** — the pairing `max_interim_count: 0` + `mode: simulate` is rejected at config load, because in simulate mode the full fold does not consume pending sessions and there is no interim venue either, so ingestion would stall silently.
 - **`consolidation.mode` is a closed vocabulary:** `train` (persist to LoRA weights) or `simulate` (persist `graph.json` per tier). Any other value is rejected at config load rather than being silently treated as `simulate`.
-- **Nothing new → no cycle:** a scheduled consolidation is skipped when there is nothing to consume — no content-bearing interim slot and no attributable pending session. This holds for both the interim and the full path, and in both `train` and `simulate` mode. Only `POST /reconsolidate` deliberately runs on an empty queue.
+- **Nothing new → no cycle:** a *scheduled* consolidation is skipped when there is nothing to consume — no content-bearing interim slot and no attributable pending session. This holds for both the interim and the full path, and in both `train` and `simulate` mode. The content gate belongs to the schedule: an endpoint you call yourself is a deliberate request and runs regardless.
 
 **Triggering consolidation.** Four endpoints, none of which takes a request body; each returns **HTTP 200** with a `status` and an `action` field:
 
 | Endpoint | What it does |
 |---|---|
-| `POST /consolidate` | Run the scheduled consolidation now. The schedule decides whether that is an interim absorb or a full rebuild (`action` reports which). Skipped when there is nothing new. |
+| `POST /consolidate` | Collapse the recent conversations into main memory now: every interim slot is folded into the mains, which are re-groomed and re-learned, and the absorbed slots are reaped. |
 | `POST /consolidate/interim` | Absorb recent conversations into memory now. Main memory is untouched. |
-| `POST /reconsolidate` | Rebuild main memory from stored knowledge; runs even when nothing is new. Use after changing the base model, the extraction prompts, or the extraction config. |
-| `POST /scheduled-tick` | The systemd user-timer entrypoint. |
+| `POST /reconsolidate` | Rebuild main memory from **its own** stored knowledge. The interim slots are neither folded in nor reaped and the pending conversations stay pending, so nothing is lost by running it. Use after changing the base model, the extraction prompts, or the extraction config. |
+| `POST /scheduled-tick` | The systemd user-timer entrypoint — the only door the schedule decides for (`action` reports whether the tick resolved to an interim absorb or a full fold), and the only one skipped when there is nothing new. |
 
-Typical operator flow: `POST /consolidate/interim` → poll `GET /status` until `consolidating` is false → `POST /reconsolidate` when the mains should be rebuilt from everything stored.
+Typical operator flow: `POST /consolidate/interim` → poll `GET /status` until `consolidating` is false → `POST /consolidate` when the interim slots should be folded into the mains, or `POST /reconsolidate` when the mains should be rebuilt from what they already hold.
 
 **A refusal is not an error.** These endpoints are non-blocking: they submit the run and return immediately. When the server is busy (another fold running, someone chatting, the GPU held, cloud-only mode) the response is still **200** with `status: "deferred_*"`; when there is nothing to do it is **200** with `status: "noop_*"`. `curl --fail` therefore does **not** exit non-zero on a deferral — read `status`. The only 4xx from this family is **409 `trial_active`** while a migration TRIAL is in progress.
 - **Atomic full-cycle finalize:** at the full-consolidation boundary, all interim adapters are rebuilt into the mains via replay on `all_active_keys ∪ all_interim_keys` (facts are regenerated from the merged graph each cycle, not loaded from a stored file), recall-sanity-checked, and purged. On sanity-check failure the cycle rolls back to the pre-finalize snapshot — mains and interim state are preserved.
@@ -824,10 +824,10 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | GET | `/status` | chat | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA, deferred-mode `hold` block (owner PID + liveness + age + cmd hint) |
 | GET | `/push/vapid-public-key` | chat | Return the VAPID EC P-256 application server public key for `PushManager.subscribe()`. 503 when push is disabled. See [Enabling Web Push](#enabling-web-push). |
 | POST | `/push/subscribe` | chat | Register a browser push subscription for the authenticated speaker. Requires a per-user token (shared tokens have no bound speaker_id). See [Enabling Web Push](#enabling-web-push). |
-| POST | `/consolidate` | admin | Run the scheduled consolidation now — the schedule decides whether that is an interim absorb or a full rebuild. Skipped when there is nothing new to consume. Non-blocking: returns immediately, poll `GET /status` → `consolidating`. |
-| POST | `/consolidate/interim` | admin | Absorb recent conversations into memory now, without waiting for the schedule. Noops when no attributable conversations are pending. |
-| POST | `/reconsolidate` | admin | Rebuild main memory from stored knowledge — runs even when nothing is new. Use after changing the base model, the extraction prompts, or the extraction config. |
-| POST | `/scheduled-tick` | admin | Systemd user-timer entrypoint (`paramem-consolidate.timer`). Dispatches the same way `/consolidate` does, but additionally honours the catch-up gate so a heartbeat wakeup that is not yet due does not fire a cycle. 409 `trial_active` while a migration TRIAL is in progress. |
+| POST | `/consolidate` | admin | Collapse the interim slots into main memory now. Non-blocking: returns immediately, poll `GET /status` → `consolidating`. |
+| POST | `/consolidate/interim` | admin | Absorb recent conversations into memory now, without waiting for the schedule. With an empty queue the extraction pass finds nothing and no interim slot is minted. |
+| POST | `/reconsolidate` | admin | Rebuild main memory from its own stored knowledge — runs even when nothing is new, and leaves the interim slots and pending conversations untouched. Use after changing the base model, the extraction prompts, or the extraction config. |
+| POST | `/scheduled-tick` | admin | Systemd user-timer entrypoint (`paramem-consolidate.timer`). The schedule's own door: it resolves the tick to an interim absorb or a full fold, honours the catch-up gate so a heartbeat wakeup that is not yet due fires no cycle, and is skipped when there is nothing new to consume. 409 `trial_active` while a migration TRIAL is in progress. |
 | POST | `/refresh-ha` | admin | Rebuild the HA entity graph from `/api/states` + `/api/services`. |
 | POST | `/ingest-sessions` | admin | Enqueue pre-chunked document segments for the next consolidation cycle (operator CLI: `scripts/ingest_docs.py`). Idempotent — chunks already in the ingest registry are skipped. |
 | POST | `/ingest-sessions/cancel` | admin | Discard queued ingest sessions by session ID without running consolidation. |

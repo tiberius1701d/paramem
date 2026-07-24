@@ -1220,6 +1220,41 @@ class MemoryStore:
     # On-disk registries — load registries + simhashes from the adapter dir
     # ------------------------------------------------------------------
     @staticmethod
+    def _iter_tier_registry_paths(adapter_dir):
+        """Yield ``(tier_name, registry_path)`` for every tier under *adapter_dir*.
+
+        The single description of where an adapter tree keeps its
+        ``indexed_key_registry.json`` files: the three main tiers first (in
+        fixed order), then every interim slot found on disk.  Both on-disk
+        readers — :meth:`read_registries_from_disk` and
+        :meth:`read_simhash_registry_from_disk` — walk this one generator, so
+        they cannot disagree about which files belong to the store.
+
+        Main-tier paths are yielded whether or not the file exists (the
+        readers turn an absent file into an empty registry / empty fingerprint
+        map); interim tiers are yielded only for directories that exist.
+
+        Args:
+            adapter_dir: Path to the adapter root directory.
+
+        Yields:
+            ``(tier_name, path)`` where ``tier_name`` is the PEFT adapter name
+            (``"episodic"`` … or ``"episodic_interim_<stamp>"``).
+        """
+        from pathlib import Path
+
+        from paramem.memory.interim_adapter import iter_interim_dirs
+
+        adapter_dir = Path(adapter_dir)
+        for tier in ("episodic", "semantic", "procedural"):
+            yield tier, adapter_dir / tier / "indexed_key_registry.json"
+        # Interim tiers — dynamic; yielded when their dirs exist.  Tier key is
+        # the PEFT adapter name so callers using ``peft_config`` keys can
+        # address the store consistently.
+        for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
+            yield interim_name, interim_dir / "indexed_key_registry.json"
+
+    @staticmethod
     def read_registries_from_disk(adapter_dir) -> "dict[str, KeyRegistry]":
         """Read per-tier ``indexed_key_registry.json`` files from disk into a
         fresh ``dict[str, KeyRegistry]`` without touching any live store.
@@ -1231,7 +1266,7 @@ class MemoryStore:
         :meth:`swap`.  The boot / in-process-reload path still uses the
         instance method (which delegates here and then installs).
 
-        Reads:
+        Reads every path :meth:`_iter_tier_registry_paths` yields:
 
         * ``<adapter_dir>/<tier>/indexed_key_registry.json`` for each main tier
           and every ``episodic_interim_<stamp>`` slot.
@@ -1252,27 +1287,54 @@ class MemoryStore:
             :meth:`KeyRegistry.load` returns an empty registry for missing
             files).  Interim tiers appear only when their directories exist.
         """
-        from pathlib import Path
-
-        from paramem.memory.interim_adapter import iter_interim_dirs
         from paramem.training.key_registry import KeyRegistry
 
-        adapter_dir = Path(adapter_dir)
-        registries: dict[str, KeyRegistry] = {}
+        return {
+            tier: KeyRegistry.load(reg_path)
+            for tier, reg_path in MemoryStore._iter_tier_registry_paths(adapter_dir)
+        }
 
-        # Main tiers — registries live at <adapter_dir>/<tier>/indexed_key_registry.json
-        for tier in ("episodic", "semantic", "procedural"):
-            reg_path = adapter_dir / tier / "indexed_key_registry.json"
-            registries[tier] = KeyRegistry.load(reg_path)
+    @staticmethod
+    def read_simhash_registry_from_disk(adapter_dir) -> "dict[str, int]":
+        """Merge every tier registry under *adapter_dir* into one ``{key: fp}`` map.
 
-        # Interim tiers — dynamic; loaded when their dirs exist.  Tier key is
-        # the PEFT adapter name so callers using ``peft_config`` keys can
-        # address the store consistently.
-        for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
-            reg_path = interim_dir / "indexed_key_registry.json"
-            registries[interim_name] = KeyRegistry.load(reg_path)
+        The flat projection of :meth:`read_registries_from_disk` — same disk
+        walk (:meth:`_iter_tier_registry_paths`: main tiers + every interim
+        slot), same files, only the shape differs.  Callers that need per-key
+        fingerprints without a live store use this; there is deliberately no
+        second walk of the adapter tree.
 
-        return registries
+        Per file it calls the one leaf,
+        :meth:`paramem.training.key_registry.KeyRegistry.load_simhashes`, so
+        the fingerprint-file shape is known in exactly one place — the same
+        leaf the trial-consolidation gates use on a single path.
+
+        The map carries the active∪stale fingerprint superset, exactly as
+        serialised under the ``"simhash"`` key of each registry file.  When a
+        key appears in more than one tier file (transient during promotion) the
+        later read wins — the fingerprint content is identical either way.
+
+        Args:
+            adapter_dir: Path to the adapter root directory.
+
+        Returns:
+            ``{key: fingerprint}`` across every tier.  Empty when the directory
+            holds no registry files.
+
+        Raises:
+            Whatever :meth:`KeyRegistry.load_simhashes` raises on an
+            unparseable (``json.JSONDecodeError``) or non-registry
+            (``ValueError``) file — a corrupt registry is a data-integrity
+            fault, surfaced here exactly as it is on the boot path rather than
+            silently skipped, because a partial map silently un-gates every key
+            of the failed tier.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        merged: dict[str, int] = {}
+        for _tier, reg_path in MemoryStore._iter_tier_registry_paths(adapter_dir):
+            merged.update(KeyRegistry.load_simhashes(reg_path))
+        return merged
 
     def load_registries_from_disk(self, adapter_dir) -> None:
         """Load per-tier ``indexed_key_registry.json`` into the store.

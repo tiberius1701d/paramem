@@ -40,6 +40,14 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         # the interim-slot scan primitive: the venue→payload mapping (simulate → graph.json,
         # train → adapter weights) lives here in ONE place so no caller re-implements it.
         ("paramem/memory/interim_adapter.py", "iter_interim_dirs"),
+        # the single MemorySource construction site: mode → class (simulate →
+        # DiskMemorySource, train → WeightMemorySource) is decided here and
+        # nowhere else.  Every consumer — boot/post-fold store hydration
+        # (app._build_store_contents), the per-query on-miss probe
+        # (inference._probe_and_reason), and the per-fold hydration
+        # (ConsolidationLoop._hydrate_store_for_fold) — names the mode and takes
+        # the source back, so none of them carries a fork of its own.
+        ("paramem/memory/source.py", "build_memory_source"),
         # the single public fold entry: it translates the caller's mode string into a
         # FoldScope once — train retrains adapters, simulate writes graph.json.  A
         # persistence-tail divergence only; the grooming spine is shared.
@@ -51,15 +59,9 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         # 2-way storage mode: simulate reads the persisted interim-slot graph.json, train
         # reconstructs from adapter weights. Intentional, mirrors active_store_migration's split.
         ("paramem/server/app.py", "_run"),
-        # Memory store hydration source selection reads consolidation.mode, not runtime mode.
-        # Moved from _hydrate_memory_store_in_place into the store-free builder so both
-        # boot-preload and post-fold reconcile share the same selection logic.
-        ("paramem/server/app.py", "_build_store_contents"),
         # migration tooling — mode-switch detection and graph migration
         ("paramem/server/active_store_migration.py", "detect_mode_switch"),
         ("paramem/server/active_store_migration.py", "migrate"),
-        # inference — simulate-mode probe path
-        ("paramem/server/inference.py", "_probe_and_reason"),
         # migration tooling — detect_simulate_mode reads candidate YAML mode key
         ("paramem/server/migration.py", "detect_simulate_mode"),
         # integrity checker — required/optional matrix depends on persist mode

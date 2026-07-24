@@ -534,8 +534,8 @@ class TestProbeAndReasonDispatch:
             lambda model, name: None,
         )
         monkeypatch.setattr(
-            "paramem.server.inference._load_simhash_registry",
-            lambda path: {},
+            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
+            staticmethod(lambda path: {}),
         )
         monkeypatch.setattr(
             "paramem.server.inference.is_self_referential",
@@ -630,8 +630,8 @@ class TestProbeAndReasonDispatch:
             lambda model, name: None,
         )
         monkeypatch.setattr(
-            "paramem.server.inference._load_simhash_registry",
-            lambda path: {},
+            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
+            staticmethod(lambda path: {}),
         )
         monkeypatch.setattr(
             "paramem.server.inference.is_self_referential",

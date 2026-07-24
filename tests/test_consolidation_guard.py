@@ -161,9 +161,9 @@ class TestEndpointGuards:
 
         state = self._make_state("LIVE")
 
-        def _fake_dispatch(action, *, apply_schedule_gate):
-            # /scheduled-tick must apply the suspend/power-off catch-up gate.
-            assert apply_schedule_gate is True
+        def _fake_dispatch(action):
+            # /scheduled-tick is the schedule's door: AUTO is what carries the
+            # suspend/power-off catch-up gate.
             assert action is app_module.ConsolidationAction.AUTO
             return "deferred", action
 

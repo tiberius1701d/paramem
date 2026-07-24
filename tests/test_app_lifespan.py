@@ -133,7 +133,7 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result == "deferred_idle", (
@@ -158,7 +158,7 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result != "deferred_idle", (
@@ -181,7 +181,7 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result != "deferred_idle", f"debounce_s=0 must disable gate; got {result!r}"
@@ -199,7 +199,7 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result != "deferred_idle", f"No chat yet must not defer; got {result!r}"

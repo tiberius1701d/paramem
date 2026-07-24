@@ -1327,9 +1327,7 @@ class TestTickGateNoNamed:
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
         ):
-            status, _action = _app._dispatch_consolidation(
-                _app.ConsolidationAction.AUTO, apply_schedule_gate=True
-            )
+            status, _action = _app._dispatch_consolidation(_app.ConsolidationAction.AUTO)
             return status
 
     def test_all_unidentifiable_returns_noop_no_named(self, tmp_path):
@@ -1941,19 +1939,29 @@ class TestFullCycleGateHelpers:
         cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
         assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_n_plus_one_interims_returns_true(self, tmp_path):
-        """N+1 interims on disk: count/phase primary fires (first slot of next cycle)."""
+    def test_is_full_cycle_due_n_plus_one_interims_returns_false_before_the_deadline(
+        self, tmp_path
+    ):
+        """N+1 interims on disk are NOT due on their own — the deadline decides.
+
+        The retired count gate fired here.  It was unreachable in every real
+        configuration (``consolidation_period_seconds`` is derived as
+        ``refresh_cadence x N``, so the deadline always lands inside the window
+        in which the (N+1)-th slot would be minted, and that tick folds the
+        ring away), and a second signal that can never fire is a second answer
+        to "is the fold due?".
+        """
         from paramem.server.app import _is_full_cycle_due
 
         N = 3
         for i in range(N + 1):
             self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
-        # Large period so only count signal fires, not deadline.
+        # Large period so the deadline is nowhere near.
         cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
-        assert _is_full_cycle_due(cfg) is True
+        assert _is_full_cycle_due(cfg) is False
 
     def test_is_full_cycle_due_n_minus_1_interims_returns_false(self, tmp_path):
-        """Fewer than N interims (n < N): neither primary nor deadline fires."""
+        """Fewer than N interims, deadline far away: not due."""
         from paramem.server.app import _is_full_cycle_due
 
         N = 7
@@ -2050,21 +2058,21 @@ class TestFullCycleGateHelpers:
         assert _is_full_cycle_due(cfg) is False
 
     def test_is_full_cycle_due_main_slot_does_not_affect_gate(self, tmp_path):
-        """Main slot presence / window_stamp does NOT influence the new gate.
+        """Main slot presence / window_stamp does NOT influence the gate.
 
-        The gate counts interim dirs, not main slots.  Even if a main slot is
-        present and current, the gate fires when the interim count hits N+1.
-        This test verifies that the gate ignores main-slot state entirely.
+        The gate ages the oldest interim slot; a main slot — even one stamped
+        as if a fold just ran — is not part of that question.  An up-to-date
+        main slot must therefore not suppress a fold whose deadline has passed.
         """
         from paramem.server.app import _is_full_cycle_due
 
         N = 2
         # Write a main slot (up-to-date, as if a fold just ran).
         self._write_meta(tmp_path / "episodic" / "20260620-080000", window_stamp="20260620T0000")
-        # Add N+1 interims — the count/phase primary must fire.
         for i in range(N + 1):
-            self._make_interim_dir(tmp_path, f"20260620T{i:04d}")
-        cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
+            self._make_interim_dir(tmp_path, f"20200101T{i:04d}")
+        # 1-second period: the 2020 stamps are astronomically past the deadline.
+        cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=1)
         assert _is_full_cycle_due(cfg) is True
 
 
@@ -2101,13 +2109,20 @@ class TestInterimSlotPayloadFilter:
             (d / f"{stamp}-slot" / "adapter_model.safetensors").write_bytes(b"")
         return d
 
-    def _cfg(self, adapter_dir, *, mode: str, max_interim_count: int = 3):
-        """Config mock for the four schedule-side helpers."""
+    def _cfg(self, adapter_dir, *, mode: str, max_interim_count: int = 3, period_seconds=None):
+        """Config mock for the four schedule-side helpers.
+
+        ``period_seconds`` defaults to ten years — far enough out that the
+        deadline never fires, so a test that wants the gate to say "due" makes
+        that explicit by passing a short period.
+        """
         cfg = MagicMock()
         cfg.adapter_dir = adapter_dir
         cfg.consolidation.mode = mode
         cfg.consolidation.max_interim_count = max_interim_count
-        cfg.consolidation.consolidation_period_seconds = 10 * 365 * 86400
+        cfg.consolidation.consolidation_period_seconds = (
+            10 * 365 * 86400 if period_seconds is None else period_seconds
+        )
         cfg.consolidation.refresh_cadence = "every 12h"
         return cfg
 
@@ -2164,42 +2179,47 @@ class TestInterimSlotPayloadFilter:
             list(iter_interim_dirs(tmp_path, mode="graph_json"))
 
     def test_payload_less_dir_does_not_trigger_full_cycle(self, tmp_path):
-        """N+1 payload-less dirs must NOT satisfy the count/phase gate.
+        """Aged payload-less dirs must NOT satisfy the gate.
 
-        Pre-fix, `_is_full_cycle_due` counted directories, so empty shells alone
-        could trigger a full consolidation cycle.
+        Pre-fix, `_is_full_cycle_due` scanned directories, so empty shells
+        alone — however old — could trigger a full consolidation cycle.
         """
         from paramem.server.app import _is_full_cycle_due
 
-        N = 3
-        for i in range(N + 1):
-            self._slot(tmp_path, f"20260701T{i:02d}00", payload=None)
+        for i in range(4):
+            self._slot(tmp_path, f"20200101T{i:02d}00", payload=None)
 
-        cfg = self._cfg(tmp_path, mode="train", max_interim_count=N)
+        cfg = self._cfg(tmp_path, mode="train", max_interim_count=3, period_seconds=1)
         assert _is_full_cycle_due(cfg) is False
 
     def test_payload_bearing_dirs_still_trigger_full_cycle(self, tmp_path):
-        """The same N+1 slots WITH payloads do fire the gate (math unchanged)."""
+        """The same aged slots WITH payloads do fire the gate."""
         from paramem.server.app import _is_full_cycle_due
 
-        N = 3
-        for i in range(N + 1):
-            self._slot(tmp_path, f"20260701T{i:02d}00", payload="weights")
+        for i in range(4):
+            self._slot(tmp_path, f"20200101T{i:02d}00", payload="weights")
 
-        cfg = self._cfg(tmp_path, mode="train", max_interim_count=N)
+        cfg = self._cfg(tmp_path, mode="train", max_interim_count=3, period_seconds=1)
         assert _is_full_cycle_due(cfg) is True
 
     def test_gate_counts_the_configured_venue_only(self, tmp_path):
         """A train-venue payload does not count in simulate mode, and vice versa."""
         from paramem.server.app import _is_full_cycle_due
 
-        N = 2
-        for i in range(N + 1):
-            self._slot(tmp_path, f"20260701T{i:02d}00", payload="weights")
+        for i in range(3):
+            self._slot(tmp_path, f"20200101T{i:02d}00", payload="weights")
 
-        assert _is_full_cycle_due(self._cfg(tmp_path, mode="train", max_interim_count=N)) is True
         assert (
-            _is_full_cycle_due(self._cfg(tmp_path, mode="simulate", max_interim_count=N)) is False
+            _is_full_cycle_due(
+                self._cfg(tmp_path, mode="train", max_interim_count=2, period_seconds=1)
+            )
+            is True
+        )
+        assert (
+            _is_full_cycle_due(
+                self._cfg(tmp_path, mode="simulate", max_interim_count=2, period_seconds=1)
+            )
+            is False
         )
 
     def test_schedule_helpers_agree_on_the_same_set(self, tmp_path):
@@ -2252,32 +2272,23 @@ class TestInterimSlotPayloadFilter:
         assert not graph_slot.exists()
         assert not weight_slot.exists()
 
-    def test_collect_disk_fold_relations_skips_payload_less_slots(self, tmp_path):
-        """The simulate fold collector sources its filter from the primitive."""
-        import networkx as nx
+    def test_reap_without_a_peft_model_still_removes_every_slot(self, tmp_path):
+        """The disk venue holds no PeftModel, and the on-disk reap is unconditional.
 
-        from paramem.memory.persistence import save_memory_to_disk
-        from paramem.training.consolidation import ConsolidationLoop
+        ``unload_interim_adapters`` is the ONE reaper for both venues.  With a
+        bare (non-PeftModel) model it skips the PEFT half and still removes every
+        slot dir, payload-bearing or not — there is no second disk-venue reaper.
+        """
+        from paramem.memory.interim_adapter import unload_interim_adapters
 
-        (tmp_path / "episodic").mkdir(parents=True, exist_ok=True)
-        self._slot(tmp_path, "20260701T0000", payload=None)
+        shell = self._slot(tmp_path, "20260701T0000", payload=None)
         graph_slot = self._slot(tmp_path, "20260701T1200", payload="graph")
 
-        g = nx.MultiDiGraph()
-        g.add_edge(
-            "speaker1",
-            "berlin",
-            ik_key="graph1",
-            predicate="lives in",
-            speaker_id="speaker1",
-        )
-        save_memory_to_disk(g, graph_slot / "graph.json")
+        unloaded = unload_interim_adapters(object(), tmp_path)
 
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        result = loop._collect_disk_fold_relations(tmp_path)
-
-        assert [r.indexed_key for r in result.relations] == ["graph1"]
-        assert result.interim_dirs == [graph_slot]
+        assert unloaded == [], "no PEFT adapters exist in the disk venue"
+        assert not shell.exists()
+        assert not graph_slot.exists()
 
 
 class TestRunFullConsolidationSyncAccumulating:
@@ -2361,7 +2372,7 @@ class TestRunFullConsolidationSyncAccumulating:
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
         with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         state["session_buffer"].mark_consolidated.assert_not_called()
 
@@ -2379,7 +2390,7 @@ class TestRunFullConsolidationSyncAccumulating:
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
         with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         assert state["last_consolidation"] == prior_stamp, (
             "_state['last_consolidation'] must NOT be updated on accumulating return; "
@@ -2408,7 +2419,7 @@ class TestRunFullConsolidationSyncAccumulating:
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
         with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         runs = read_last_runs(tmp_path / "state")
         assert "consolidation" in runs, (
@@ -2446,7 +2457,7 @@ class TestRunFullConsolidationSyncAccumulating:
             patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
             patch("paramem.training.consolidation.ConsolidationLoop._save_adapters", save_spy),
         ):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         save_spy.assert_not_called()
 
@@ -2547,7 +2558,7 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
             patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
             patch("paramem.server.consolidation._save_key_metadata", save_spy),
         ):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         # Non-vacuity witness: the BG job ran and reached the full_trained bookkeeping
         # path.  If the job did not run, this assertion fails before the guard below.
@@ -2582,7 +2593,7 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
             patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
             patch("paramem.server.consolidation._save_key_metadata", save_spy),
         ):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         save_spy.assert_called_once()
 
@@ -2617,7 +2628,7 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
             patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
             patch("paramem.server.consolidation._save_key_metadata", save_spy),
         ):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
         # Non-vacuity witness: the BG job ran and reached the full_trained bookkeeping
         # path.  If the job did not run, this assertion fails before the buffer check.
@@ -5235,27 +5246,29 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # Hydration-miss key is NOT classified as orphan
+    # Content-free live key is NOT classified as orphan
     # -------------------------------------------------------------------------
 
-    def test_hydration_miss_not_classified_as_orphan(self, tmp_path):
-        """A live active key whose store.get() returns None (hydration-miss
-        under boot_degraded) but whose bookkeeping carries SPO must NOT be
-        classified as drift_orphan.
+    def test_content_free_live_key_not_classified_as_orphan(self, tmp_path):
+        """A live key with no content in the store AND none in the weights must
+        NOT be classified as drift_orphan when its bookkeeping carries SPO.
 
-        SCOPE NOTE: The hydration-miss fix applies to _build_registry_true_relations
-        (so the key enters the merge as a registry-true Relation) and to the
-        drift-partition classification (so it lands in genuine_loss, not orphan).
-        The edge-walk tier_keyed build has a pre-existing gap
-        (store.get(key)==None → skip) that is deferred.  Thus graph_hydration_miss:
+        The fold hydrates the store from the venue's ``MemorySource`` before
+        reading it (``_hydrate_store_for_fold``), so an empty entry cache is no
+        longer enough to reach this state — the weight probe is stubbed to
+        return a miss as well, which is the only way a live key can end the fold
+        with no content anywhere.  Such a key:
           - Is NOT classified as drift_orphan (bookkeeping has SPO).
-          - IS classified as drift_genuine_loss (hydration-miss bucket).
-          - Is NOT in tier_keyed (entry-None skip; pre-existing, deferred).
+          - IS classified as drift_genuine_loss.
+          - Is NOT in tier_keyed (nothing to replay).
 
-        Setup: two keys — "graph_ok" has a normal content entry; "graph_hydration_miss"
-        is active in the registry but has NO content entry (simulating a missed boot
-        preload) while its bookkeeping carries valid SPO.
+        Setup: two keys — "graph_ok" has a normal content entry;
+        "graph_no_content" is active in the registry, absent from the entry
+        cache, and unrecoverable from the source, while its bookkeeping carries
+        valid SPO.
         """
+        from unittest.mock import patch
+
         import networkx as nx
 
         from paramem.graph.reconstruct import ReconstructionResult
@@ -5286,14 +5299,14 @@ class TestConsolidateInterimAdaptersFullFlow:
             "graph_ok", speaker_id="speaker0", relation_type="factual", first_seen=""
         )
 
-        # graph_hydration_miss: registered in the store but NO content entry.
+        # graph_no_content: registered in the store but NO content entry.
         # Register it first (put with register=True), then delete the entry cache
-        # to simulate a hydration miss while keeping the registry alive.
+        # so only the registry keeps it alive.
         loop.store.put(
             "episodic",
-            "graph_hydration_miss",
+            "graph_no_content",
             {
-                "key": "graph_hydration_miss",
+                "key": "graph_no_content",
                 "subject": "Bob",
                 "predicate": "works_at",
                 "object": "Acme",
@@ -5301,11 +5314,11 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        # Drop the content entry (simulates boot_degraded cache miss).
-        loop.store._entries["episodic"].pop("graph_hydration_miss", None)
+        # Drop the content entry.
+        loop.store._entries["episodic"].pop("graph_no_content", None)
         # Bookkeeping carries the SPO (populated independently of _entries).
         loop.store.set_bookkeeping(
-            "graph_hydration_miss",
+            "graph_no_content",
             speaker_id="speaker0",
             relation_type="factual",
             reinforcement_count=1,
@@ -5314,23 +5327,31 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
         # Manually add SPO fields to bookkeeping so the drift-partition
         # classification finds them and routes to genuine_loss rather than orphan.
-        # Note: _build_registry_true_relations no longer reads SPO from bookkeeping
-        # (hydration-miss keys are skipped there); only the drift partition uses these.
-        loop.store._bookkeeping["graph_hydration_miss"]["subject"] = "Bob"
-        loop.store._bookkeeping["graph_hydration_miss"]["predicate"] = "works_at"
-        loop.store._bookkeeping["graph_hydration_miss"]["object"] = "Acme"
+        # Note: _build_registry_true_relations does not read SPO from bookkeeping
+        # (content-free keys are skipped there); only the drift partition uses these.
+        loop.store._bookkeeping["graph_no_content"]["subject"] = "Bob"
+        loop.store._bookkeeping["graph_no_content"]["predicate"] = "works_at"
+        loop.store._bookkeeping["graph_no_content"]["object"] = "Acme"
 
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+        # The weights hold nothing for it either, so the fold's hydration pass
+        # cannot recover it — the only route to a content-free live key.
+        with patch(
+            "paramem.memory.probe.probe_keys_grouped_by_adapter",
+            side_effect=lambda model, tokenizer, keys_by_adapter, **kw: {
+                k: None for keys in keys_by_adapter.values() for k in keys
+            },
+        ):
+            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # Hydration-miss must NOT be classified as orphan: the drift partition finds
-        # SPO in bookkeeping (injected above) and routes to genuine_loss.
+        # Must NOT be classified as orphan: the drift partition finds SPO in
+        # bookkeeping (injected above) and routes to genuine_loss.
         assert result["drift_orphan"] == 0, (
-            f"Expected drift_orphan=0 (hydration-miss is NOT an orphan); "
-            f"got drift_orphan={result['drift_orphan']}"
+            f"Expected drift_orphan=0 (a content-free key with SPO bookkeeping is NOT "
+            f"an orphan); got drift_orphan={result['drift_orphan']}"
         )
-        # Hydration-miss goes to genuine_loss bucket (not orphan, not deduplicated).
+        # Goes to the genuine_loss bucket (not orphan, not deduplicated).
         assert result["drift_genuine_loss"] == 1, (
-            f"Expected drift_genuine_loss=1 (hydration-miss key classified as retry); "
+            f"Expected drift_genuine_loss=1 (content-free key classified as retry); "
             f"got drift_genuine_loss={result['drift_genuine_loss']}"
         )
         # graph_ok must survive into tier_keyed.
@@ -7380,6 +7401,8 @@ class TestTierFloor:
         *,
         probe_side_effect=None,
         train_adapter_spy=None,
+        keys_from="all_tiers",
+        unload_spy=None,
     ):
         """Run consolidate with heavy ops mocked.
 
@@ -7391,6 +7414,10 @@ class TestTierFloor:
             Defaults to returning all keys (pass-all probe).
         train_adapter_spy: mock.MagicMock or None.  If supplied, train_adapter
             is patched to this spy (so the test can assert call_count etc.).
+        keys_from: The fold's key source ("all_tiers" | "main_tiers").
+        unload_spy: mock.MagicMock or None.  If supplied, the interim reap
+            (``unload_interim_adapters``) is patched to this spy so the test can
+            assert whether the fold reaped the slots.
         """
         from unittest.mock import MagicMock, patch
 
@@ -7401,6 +7428,8 @@ class TestTierFloor:
             probe_side_effect = lambda adapter_name, entries: {e["key"] for e in entries}  # noqa: E731
         if train_adapter_spy is None:
             train_adapter_spy = MagicMock(return_value={"aborted": False})
+        if unload_spy is None:
+            unload_spy = MagicMock(return_value=[])
 
         _gpu_thread_lock.acquire()
         try:
@@ -7446,9 +7475,11 @@ class TestTierFloor:
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", unload_spy),
             ):
-                return loop.consolidate(mode="train", trainer=None, router=None)
+                return loop.consolidate(
+                    mode="train", keys_from=keys_from, trainer=None, router=None
+                )
         finally:
             _gpu_thread_lock.release()
 
@@ -15017,7 +15048,7 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result == "started_full"
@@ -15057,7 +15088,7 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+                app_module.ConsolidationAction.AUTO
             )
 
         assert result == "started_full"
@@ -15099,9 +15130,7 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("paramem.server.retry_state.bump_retry_count") as mock_bump,
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
-            )
+            app_module._dispatch_consolidation(app_module.ConsolidationAction.AUTO)
 
         mock_bump.assert_not_called()
 
@@ -15111,14 +15140,15 @@ class TestFullCycleDispatcherOverdueIncident:
 # ---------------------------------------------------------------------------
 
 
-class TestTwoTickSequencing:
-    """The gate reads the pre-mint on-disk count so T0 (mint) stays interim
-    and T1 (count now N+1) routes to the full fold.
+class TestDeadlineSequencing:
+    """The gate ages the OLDEST payload-bearing interim slot against the full period.
 
-    Uses ``_is_full_cycle_due`` directly with synth dirs at count=N (False)
-    and count=N+1 (True) to lock the sequencing at the gate level.
-    Reuses the ``_make_config`` and ``_make_interim_dir`` helpers via inline
-    helpers (mirrors TestFullCycleGateHelpers without inheritance).
+    Uses ``_is_full_cycle_due`` directly with synth dirs on either side of the
+    deadline, to lock the tick sequencing at the gate level: a ring whose
+    oldest slot is still inside the period stays on the interim path; once that
+    slot ages past it, the next tick folds.  Reuses the ``_make_config`` and
+    ``_make_interim_dir`` shapes of TestFullCycleGateHelpers without
+    inheritance.
     """
 
     def _make_config(
@@ -15142,28 +15172,11 @@ class TestTwoTickSequencing:
         slot.mkdir(parents=True, exist_ok=True)
         (slot / "adapter_model.safetensors").write_bytes(b"")
 
-    def test_count_n_is_not_due(self, tmp_path):
-        """Exactly N interim dirs on disk (T0 pre-mint state): gate returns False.
+    def test_inside_the_period_is_not_due(self, tmp_path):
+        """A ring whose oldest slot is still inside the full period: interim path.
 
-        The mint happens on the CURRENT tick; the gate reads the pre-mint count,
-        so T0 is directed to the interim path (count = N, not due).
-        """
-        from paramem.server.app import _is_full_cycle_due
-
-        N = 3
-        for i in range(N):
-            self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
-        cfg = self._make_config(tmp_path, N=N)
-        assert _is_full_cycle_due(cfg) is False, (
-            f"count={N} (pre-mint) must NOT trigger the full fold; "
-            "T1 (after mint, count=N+1) is the full-fold tick"
-        )
-
-    def test_count_n_plus_one_is_due(self, tmp_path):
-        """N+1 interim dirs on disk (T1 post-mint state): gate returns True.
-
-        After T0 minted the (N+1)-th interim, T1 reads count=N+1 and routes
-        to the full fold.
+        Slot COUNT plays no part: N+1 slots here, and the answer is still
+        "not due" — the retired count gate is what used to say otherwise.
         """
         from paramem.server.app import _is_full_cycle_due
 
@@ -15171,8 +15184,18 @@ class TestTwoTickSequencing:
         for i in range(N + 1):
             self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
         cfg = self._make_config(tmp_path, N=N)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_past_the_deadline_is_due(self, tmp_path):
+        """Once the oldest slot ages past the full period, the next tick folds."""
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 3
+        for i in range(N):
+            self._make_interim_dir(tmp_path, f"20200101T{i * 12:04d}")
+        cfg = self._make_config(tmp_path, N=N, period_seconds=1)
         assert _is_full_cycle_due(cfg) is True, (
-            f"count={N + 1} (post-mint) MUST trigger the full fold on T1"
+            "the oldest un-folded interim may not age past the full period"
         )
 
 
@@ -16640,8 +16663,8 @@ class TestConsumePendingFullFold:
     """Tests for consume_pending wiring in the full-fold branch of _run_fold.
 
     Verifies that:
-    1. The full-fold FoldScope sets consume_pending=True and
-       extra_relations_source="pending" when consume_pending=True is passed.
+    1. The full-fold FoldScope sets consume_pending=True when consume_pending=True
+       is passed.
     2. When consume_pending=True, the full fold's fresh-derivation branch calls
        _capture_pending_relations and passes the result as extra_relations
        to _materialize_consolidation_graph.
@@ -16792,7 +16815,7 @@ class TestConsumePendingFullFold:
         return result, materialize_calls
 
     def test_full_fold_scope_consume_pending_set_when_consume_pending_true(self, tmp_path):
-        """FoldScope has consume_pending=True and extra_relations_source='pending' when passed."""
+        """FoldScope carries consume_pending=True when the caller passes it."""
         from unittest.mock import patch
 
         import networkx as nx
@@ -16836,11 +16859,10 @@ class TestConsumePendingFullFold:
         assert len(captured_scopes) == 1
         scope = captured_scopes[0]
         assert scope.consume_pending is True
-        assert scope.extra_relations_source == "pending"
         assert scope.persist == "main_tiers"
 
     def test_full_fold_scope_consume_pending_false_when_consume_pending_false(self, tmp_path):
-        """FoldScope has consume_pending=False and extra_relations_source='none' by default."""
+        """FoldScope carries consume_pending=False by default."""
         from unittest.mock import patch
 
         import networkx as nx
@@ -16881,7 +16903,6 @@ class TestConsumePendingFullFold:
         assert len(captured_scopes) == 1
         scope = captured_scopes[0]
         assert scope.consume_pending is False
-        assert scope.extra_relations_source == "none"
 
     def test_full_fold_captures_pending_relations_into_materialize(self, tmp_path):
         """Full-fold fresh-derivation passes captured pending relations to _materialize."""
@@ -17085,10 +17106,12 @@ class TestDispatchCountZeroRoutesToFull:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result, _action = _app._dispatch_consolidation(
-                _app.ConsolidationAction.AUTO, apply_schedule_gate=True
-            )
-        full_count = submitted.count(_app._run_full_consolidation_sync)
+            result, _action = _app._dispatch_consolidation(_app.ConsolidationAction.AUTO)
+        # The full fold is submitted as a partial that binds the fold's key
+        # source; the interim path is submitted bare.
+        full_count = sum(
+            1 for fn in submitted if getattr(fn, "func", None) is _app._run_full_consolidation_sync
+        )
         interim_count = submitted.count(_app._extract_and_start_training)
         return result, full_count, interim_count
 
@@ -17154,6 +17177,14 @@ class TestDispatchCountZeroRoutesToFull:
 
 
 class TestSchedulerCatchUpGate:
+    """The catch-up gate belongs to AUTO — the scheduled tick's action.
+
+    An operator door names an intent and is never refused for "not due yet",
+    and (since a manual run does not move the cadence window) never writes the
+    stamp either.  These tests pin both halves against the SAME stamp and
+    cadence, so the action — not a flag — is what differs.
+    """
+
     def _make_state(self, tmp_path, *, refresh_cadence: str) -> dict:
         from paramem.server.config import ConsolidationScheduleConfig, ServerConfig
 
@@ -17174,9 +17205,15 @@ class TestSchedulerCatchUpGate:
         _slot.mkdir(parents=True, exist_ok=True)
         (_slot / "adapter_model.safetensors").write_bytes(b"")
 
+        # The triage pre-stage reads the buffer on every dispatch; nothing is
+        # pending in these tests, so the interim slot above is what satisfies
+        # the content gate on the scheduled path.
+        buffer = MagicMock()
+        buffer.pending_facts.return_value = []
+
         return {
             "config": config,
-            "session_buffer": MagicMock(),
+            "session_buffer": buffer,
             "speaker_store": None,
             "consolidating": False,
             "mode": "local",
@@ -17190,8 +17227,8 @@ class TestSchedulerCatchUpGate:
     def _state_dir(self, tmp_path):
         return tmp_path / "state"
 
-    def _call_tick_dispatching(self, state: dict, *, apply_schedule_gate: bool = True) -> tuple:
-        """Run the tick with _is_full_cycle_due forced True so a real dispatch
+    def _call_dispatching(self, state: dict, action=None) -> tuple:
+        """Run a dispatch with _is_full_cycle_due forced True so a real dispatch
         is SCHEDULED when the catch-up gate lets the tick through. Returns
         (result, dispatch_call_count).
 
@@ -17204,6 +17241,9 @@ class TestSchedulerCatchUpGate:
         from unittest.mock import patch
 
         import paramem.server.app as app_module
+
+        if action is None:
+            action = app_module.ConsolidationAction.AUTO
 
         mock_loop = MagicMock()
         mock_future = MagicMock()
@@ -17219,15 +17259,12 @@ class TestSchedulerCatchUpGate:
             patch("paramem.server.app._run_full_consolidation_sync"),
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO,
-                apply_schedule_gate=apply_schedule_gate,
-            )
+            result, _action = app_module._dispatch_consolidation(action)
         return result, mock_loop.run_in_executor.call_count
 
-    def _call_tick_gate_only(self, state: dict, *, apply_schedule_gate: bool = True) -> str:
-        """Run the tick with no further patching — used for the noop/seed
-        assertions that must never reach _is_full_cycle_due.
+    def _call_tick_gate_only(self, state: dict) -> str:
+        """Run the scheduled tick with no further patching — used for the
+        noop/seed assertions that must never reach _is_full_cycle_due.
         """
         from unittest.mock import patch
 
@@ -17244,8 +17281,7 @@ class TestSchedulerCatchUpGate:
             ),
         ):
             status, _action = app_module._dispatch_consolidation(
-                app_module.ConsolidationAction.AUTO,
-                apply_schedule_gate=apply_schedule_gate,
+                app_module.ConsolidationAction.AUTO
             )
             return status
 
@@ -17263,7 +17299,7 @@ class TestSchedulerCatchUpGate:
         old_stamp = time.time() - 6 * 3600
         write_last_scheduled_run(state_dir, old_stamp)
 
-        result, full_call_count = self._call_tick_dispatching(state)
+        result, full_call_count = self._call_dispatching(state)
 
         assert result == "started_full"
         assert full_call_count == 1
@@ -17287,38 +17323,37 @@ class TestSchedulerCatchUpGate:
         assert result == "noop_not_due"
         assert read_last_scheduled_run(state_dir) == recent_stamp
 
-    def test_apply_schedule_gate_false_dispatches_when_not_due(self, tmp_path):
-        """The manual-trigger escape hatch (apply_schedule_gate=False) must
-        dispatch even when the catch-up gate would otherwise block.
+    def test_manual_action_dispatches_when_the_tick_would_not(self, tmp_path):
+        """An operator action dispatches where the scheduled tick is blocked.
 
         Same stamp/cadence as test_not_due_stamp_blocks_and_leaves_stamp_unchanged
-        (last attempt 2h ago, 'every 5h' → not due under the gate) — proves
-        the flag, not the schedule, controls the outcome. Also proves the
-        dispatch still resets the stamp (a manual run must not leave the
-        cadence window stale for the next heartbeat).
+        (last attempt 2h ago, 'every 5h' → not due) — so the ACTION, not the
+        schedule, decides.  And the manual run leaves the cadence window
+        exactly where it was: the next scheduled tick still has its own content
+        gate, so nothing needs to be stamped on the manual run's behalf.
         """
+        import paramem.server.app as app_module
         from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
 
         state_dir = self._state_dir(tmp_path)
 
-        # apply_schedule_gate=True (default) — not due, blocked, no dispatch.
+        # AUTO — not due, blocked, no dispatch.
         state_gated = self._make_state(tmp_path, refresh_cadence="every 5h")
         recent_stamp = time.time() - 2 * 3600
         write_last_scheduled_run(state_dir, recent_stamp)
-        result_gated = self._call_tick_gate_only(state_gated, apply_schedule_gate=True)
-        assert result_gated == "noop_not_due"
+        assert self._call_tick_gate_only(state_gated) == "noop_not_due"
         assert read_last_scheduled_run(state_dir) == recent_stamp
 
-        # apply_schedule_gate=False — same stamp, same cadence — dispatches.
-        state_ungated = self._make_state(tmp_path, refresh_cadence="every 5h")
-        result, dispatch_count = self._call_tick_dispatching(
-            state_ungated, apply_schedule_gate=False
+        # FULL — same stamp, same cadence — dispatches, stamp untouched.
+        state_manual = self._make_state(tmp_path, refresh_cadence="every 5h")
+        result, dispatch_count = self._call_dispatching(
+            state_manual, app_module.ConsolidationAction.FULL
         )
         assert result == "started_full"
         assert dispatch_count == 1
-        new_stamp = read_last_scheduled_run(state_dir)
-        assert new_stamp is not None
-        assert new_stamp != recent_stamp, "manual dispatch must reset the cadence window"
+        assert read_last_scheduled_run(state_dir) == recent_stamp, (
+            "a manual dispatch must not move the cadence window"
+        )
 
     def test_absent_stamp_seeds_without_dispatching(self, tmp_path):
         """No stamp file yet (fresh install / first tick after upgrade) →
@@ -17337,29 +17372,30 @@ class TestSchedulerCatchUpGate:
         assert result == "noop_scheduler_seeded"
         assert read_last_scheduled_run(state_dir) is not None
 
-    def test_apply_schedule_gate_false_virgin_install_dispatches_and_stamps(self, tmp_path):
-        """Virgin install (absent stamp) + apply_schedule_gate=False (manual
-        trigger) → dispatches and writes a stamp — does NOT seed-and-skip.
-        The seed-and-noop behaviour is specific to the scheduled-tick path;
-        a manual /consolidate on a fresh install must run.
+    def test_manual_action_on_a_virgin_install_dispatches(self, tmp_path):
+        """Virgin install (absent stamp) + an operator action → dispatches.
+
+        The seed-and-noop behaviour is specific to the scheduled tick; a manual
+        run on a fresh install must run, and still writes no stamp.
         """
+        import paramem.server.app as app_module
         from paramem.server.schedule_state import read_last_scheduled_run
 
         state = self._make_state(tmp_path, refresh_cadence="every 5h")
         state_dir = self._state_dir(tmp_path)
         assert read_last_scheduled_run(state_dir) is None
 
-        result, dispatch_count = self._call_tick_dispatching(state, apply_schedule_gate=False)
+        result, dispatch_count = self._call_dispatching(state, app_module.ConsolidationAction.FULL)
 
         assert result == "started_full"
         assert dispatch_count == 1
-        assert read_last_scheduled_run(state_dir) is not None
+        assert read_last_scheduled_run(state_dir) is None
 
     # -----------------------------------------------------------------
-    # Route-level: POST /consolidate (manual, gate OFF) vs
-    # POST /scheduled-tick (systemd-driven, gate ON) — proves the flag is
+    # Route-level: POST /consolidate (an operator door) vs
+    # POST /scheduled-tick (the schedule's door) — proves the action is
     # actually wired at the endpoint level, not just exercised via the
-    # dispatcher's default parameter.
+    # dispatcher directly.
     # -----------------------------------------------------------------
 
     def _make_client(self, monkeypatch, state: dict):
@@ -17394,7 +17430,6 @@ class TestSchedulerCatchUpGate:
         with (
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("paramem.server.app._is_full_cycle_due", return_value=True),
             patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
             patch("paramem.server.app._run_full_consolidation_sync"),
             patch("asyncio.get_running_loop", return_value=mock_loop),
@@ -17406,16 +17441,14 @@ class TestSchedulerCatchUpGate:
         assert mock_loop.run_in_executor.call_count == 1, (
             "POST /consolidate must dispatch inside the due-window, not just avoid an error"
         )
-        new_stamp = read_last_scheduled_run(state_dir)
-        assert new_stamp is not None
-        assert new_stamp != recent_stamp
+        assert read_last_scheduled_run(state_dir) == recent_stamp
 
     def test_scheduled_tick_route_returns_noop_not_due_inside_same_window(
         self, tmp_path, monkeypatch
     ):
         """POST /scheduled-tick with the IDENTICAL stamp/cadence as the
         /consolidate test above → noop_not_due, no dispatch — proves the
-        two routes genuinely differ only by apply_schedule_gate.
+        two routes genuinely differ by the action they dispatch.
         """
         from unittest.mock import patch
 
@@ -17472,9 +17505,10 @@ class TestSchedulerCatchUpGate:
         assert resp.json()["status"] == "noop_scheduler_seeded"
         assert read_last_scheduled_run(state_dir) is not None
 
-    def test_consolidate_route_virgin_install_dispatches_and_stamps(self, tmp_path, monkeypatch):
+    def test_consolidate_route_virgin_install_dispatches(self, tmp_path, monkeypatch):
         """POST /consolidate on a virgin install (absent stamp) → dispatches
-        and writes a stamp — the manual trigger does not seed-and-skip.
+        without seeding a stamp — the manual trigger neither seed-and-skips
+        nor moves the cadence window.
         """
         from unittest.mock import patch
 
@@ -17493,7 +17527,6 @@ class TestSchedulerCatchUpGate:
         with (
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("paramem.server.app._is_full_cycle_due", return_value=True),
             patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
             patch("paramem.server.app._run_full_consolidation_sync"),
             patch("asyncio.get_running_loop", return_value=mock_loop),
@@ -17503,7 +17536,7 @@ class TestSchedulerCatchUpGate:
         assert resp.status_code == 200
         assert resp.json()["status"] == "started_full"
         assert mock_loop.run_in_executor.call_count == 1
-        assert read_last_scheduled_run(state_dir) is not None
+        assert read_last_scheduled_run(state_dir) is None
 
     def test_dispatch_guards_still_short_circuit_ahead_of_gate_both_routes(
         self, tmp_path, monkeypatch
@@ -17540,7 +17573,7 @@ class TestSchedulerCatchUpGate:
         old_stamp = time.time() - 5 * 86400
         write_last_scheduled_run(state_dir, old_stamp)
 
-        result, full_call_count = self._call_tick_dispatching(state)
+        result, full_call_count = self._call_dispatching(state)
 
         assert result == "started_full"
         assert full_call_count == 1, "many missed periods must coalesce into exactly one dispatch"
@@ -17658,7 +17691,7 @@ class TestRunFullCycleConsumePending:
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
         with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync()
+            app_module._run_full_consolidation_sync("all_tiers")
 
     def test_count_zero_extract_session_called_per_pending(self, monkeypatch, tmp_path):
         """At count==0, extract_session is called once per pending NAMED session."""
@@ -17978,26 +18011,35 @@ class TestRunFullCycleConsumePending:
 class TestConsolidateEntry:
     """``ConsolidationLoop.consolidate`` is the only public fold entry.
 
-    The fold takes the caller's *mode*, the config-derived *consume_pending*
-    decision, and its training collaborators. Each signature below the
-    dispatch layer is pinned by exact set equality, so every gate stays
-    unbypassable.
+    The fold takes the caller's *mode*, its *keys_from* key source, the
+    config-derived *consume_pending* decision, and its training collaborators.
+    Each signature below the dispatch layer is pinned by exact set equality, so
+    every gate stays unbypassable.
     """
 
-    def test_consolidate_takes_mode_and_fold_inputs_only(self):
-        """The entry's parameter set is the mode plus its training collaborators, pinned exactly."""
+    def test_consolidate_takes_venue_key_source_and_fold_inputs_only(self):
+        """The entry's parameter set is pinned exactly.
+
+        ``keys_from`` names the fold's key source — WHAT it folds — not who
+        asked for it: two doors map onto its two values, and the fold cannot
+        tell which one it was.
+        """
         import inspect
 
         params = inspect.signature(ConsolidationLoop.consolidate).parameters
         assert set(params) == {
             "self",
             "mode",
+            "keys_from",
             "consume_pending",
             "trainer",
             "router",
             "recall_sanity_threshold",
         }, f"unexpected fold-entry parameters: {sorted(params)}"
         assert params["mode"].default is inspect.Parameter.empty, "mode is required"
+        assert params["keys_from"].default == "all_tiers", (
+            "the absorbing fold is the default key source"
+        )
 
     def test_fold_spine_and_save_take_fold_inputs_only(self):
         """The spine, the persist tail and the adapter save take fold inputs only.
@@ -18030,7 +18072,6 @@ class TestConsolidateEntry:
             "adapter_name",
             "stamp",
             "all_keyed",
-            "graph_path",
         }, "unexpected _persist_fold parameters"
 
         assert set(inspect.signature(ConsolidationLoop._save_adapters).parameters) == {"self"}, (
@@ -18049,3 +18090,112 @@ class TestConsolidateEntry:
         assert not _gpu_thread_lock.locked(), (
             "the entry guard must release the lock it probed before raising"
         )
+
+
+# ---------------------------------------------------------------------------
+# The fold's key source: one filter over one fold
+# ---------------------------------------------------------------------------
+
+
+class TestFoldKeySource:
+    """``FoldScope.keys_from`` scopes what the main-tiers fold owns.
+
+    ``"all_tiers"`` is the absorbing fold: the interim slots' keys enter the
+    merge and the slots are reaped afterwards.  ``"main_tiers"`` rebuilds main
+    memory from its own keys: the interim keys never enter the fold, so they
+    are neither retrained nor counted as drift, and the slots stay on disk —
+    disposal follows from the key source, not from a flag of its own.
+    """
+
+    INTERIM_TIER = "episodic_interim_20260701T1200"
+
+    def _make_loop_with_an_interim_slot(self, tmp_path):
+        """Loop with two episodic keys in the merged graph and one interim key beside them."""
+        loop = TestTierFloor._make_loop(tmp_path, min_tier_key_floor=0, tier_fast_start=False)
+        TestTierFloor._seed_keys(loop, "episodic", ["graph1", "graph2"])
+        TestTierFloor._seed_keys(loop, self.INTERIM_TIER, ["graph9"])
+        TestTierFloor._build_merger_graph(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"pred_{k}",
+                    "object": f"obj_{k}",
+                }
+                for k in ("graph1", "graph2")
+            ],
+        )
+        return loop
+
+    def test_main_tiers_fold_excludes_the_interim_keys(self, tmp_path):
+        """``_fold_active_keys`` is the one place the key source becomes keys."""
+        from paramem.training.consolidation import FoldScope
+
+        loop = self._make_loop_with_an_interim_slot(tmp_path)
+
+        def _scope(keys_from):
+            return FoldScope(
+                name="full", source="weights", persist="main_tiers", keys_from=keys_from
+            )
+
+        assert set(loop._fold_active_keys(_scope("all_tiers"))) == {"graph1", "graph2", "graph9"}
+        assert set(loop._fold_active_keys(_scope("main_tiers"))) == {"graph1", "graph2"}
+
+    def test_main_tiers_fold_leaves_the_interim_slots_alone(self, tmp_path):
+        """The reap follows the key source: no absorb, no reap, no registry drop.
+
+        The interim slot is the only copy of its content until some fold merges
+        it into main, so a fold that did not read it must not destroy it.
+        """
+        from unittest.mock import MagicMock
+
+        loop = self._make_loop_with_an_interim_slot(tmp_path)
+        unload_spy = MagicMock(return_value=[])
+
+        result = TestTierFloor._run_full_fold_mocked(
+            loop, keys_from="main_tiers", unload_spy=unload_spy
+        )
+
+        assert result["tiers_rebuilt"], "fixture guard: the fold must have persisted something"
+        unload_spy.assert_not_called()
+        assert self.INTERIM_TIER in loop.store.tiers_with_registry(), (
+            "the interim tier's registry must survive a fold that did not absorb it"
+        )
+        assert "graph9" in loop.store.active_keys_in_tier(self.INTERIM_TIER)
+
+    def test_all_tiers_fold_absorbs_and_reaps(self, tmp_path):
+        """The absorbing fold is unchanged: it reads the slot and then reaps it."""
+        from unittest.mock import MagicMock
+
+        loop = self._make_loop_with_an_interim_slot(tmp_path)
+        unload_spy = MagicMock(return_value=[])
+
+        result = TestTierFloor._run_full_fold_mocked(
+            loop, keys_from="all_tiers", unload_spy=unload_spy
+        )
+
+        assert result["tiers_rebuilt"], "fixture guard: the fold must have persisted something"
+        assert unload_spy.call_count == 1
+        assert self.INTERIM_TIER not in loop.store.tiers_with_registry()
+
+    def test_interim_keys_are_not_drift_for_a_main_tiers_fold(self, tmp_path):
+        """A key the fold never read cannot have drifted out of its merged graph.
+
+        The interim key has no edge in the merged graph.  For the absorbing
+        fold that is real drift (it read the key and did not key it); for the
+        main-tiers fold the key was never in scope, and reporting it as drift
+        would be a fabricated loss signal.
+        """
+        loop_all = self._make_loop_with_an_interim_slot(tmp_path / "all")
+        loop_main = self._make_loop_with_an_interim_slot(tmp_path / "main")
+
+        drift_all = TestTierFloor._run_full_fold_mocked(loop_all, keys_from="all_tiers")[
+            "graph_drift_count"
+        ]
+        drift_main = TestTierFloor._run_full_fold_mocked(loop_main, keys_from="main_tiers")[
+            "graph_drift_count"
+        ]
+
+        assert drift_all == 1, "the absorbing fold read graph9 and produced no keyed edge for it"
+        assert drift_main == 0

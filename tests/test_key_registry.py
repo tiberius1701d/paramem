@@ -2,6 +2,8 @@
 
 import json as _json
 
+import pytest
+
 from paramem.training.key_registry import KeyRegistry
 
 
@@ -572,3 +574,138 @@ class TestSaveBytesBoundary:
         assert "speaker_id" not in payload
         assert "first_seen_cycle" not in payload
         assert "bookkeeping" not in payload
+
+
+class TestLoadSimhashes:
+    """``KeyRegistry.load_simhashes`` — the single on-disk fingerprint reader.
+
+    It is the leaf both the trial-consolidation gates (one handed-in path) and
+    ``MemoryStore.read_simhash_registry_from_disk`` (the adapter-tree walk)
+    call, so the encryption read, the file shape and the wrong-file guard live
+    here and nowhere else.
+    """
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        """Absent file = fresh install / untrained tier, not an error."""
+        assert KeyRegistry.load_simhashes(tmp_path / "missing.json") == {}
+
+    def test_returns_active_and_stale_superset(self, tmp_path):
+        """The map is the active∪stale superset, exactly what save_bytes writes."""
+        path = tmp_path / "indexed_key_registry.json"
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 111)
+        reg.add("graph2")
+        reg.set_simhash("graph2", 222)
+        reg.stale("graph2")
+        path.write_bytes(reg.save_bytes())
+
+        assert KeyRegistry.load_simhashes(path) == {"graph1": 111, "graph2": 222}
+
+    def test_matches_load_plus_known_simhashes(self, tmp_path):
+        """No drift against the full loader: same file, same fingerprint map.
+
+        Both go through the same payload parse/deserialize, so this pins the
+        collapse — a second reader would show up here first.
+        """
+        path = tmp_path / "indexed_key_registry.json"
+        reg = KeyRegistry()
+        for i, fp in enumerate([11, 22, 33]):
+            reg.add(f"graph{i}")
+            reg.set_simhash(f"graph{i}", fp)
+        reg.stale("graph1")
+        path.write_bytes(reg.save_bytes())
+
+        assert KeyRegistry.load_simhashes(path) == KeyRegistry.load(path)._known_simhashes()
+
+    def test_non_integer_fingerprints_dropped(self, tmp_path):
+        """A non-int fingerprint is not a fingerprint — it is dropped, as in load()."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(
+            _json.dumps(
+                {"active_keys": ["graph1", "graph2"], "simhash": {"graph1": 1, "graph2": "x"}}
+            )
+        )
+
+        assert KeyRegistry.load_simhashes(path) == {"graph1": 1}
+
+    def test_absent_simhash_section_raises(self, tmp_path):
+        """A file with no ``"simhash"`` section cannot answer — it must raise.
+
+        Returning ``{}`` here would un-gate every key of that tier.  Every
+        registry ``save_bytes`` writes carries the section, so its absence
+        means the caller was handed a foreign file.
+        """
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(
+            _json.dumps(
+                {
+                    "active_keys": ["graph1"],
+                    "fidelity_history": {},
+                    "health": None,
+                    "stale": {},
+                }
+            )
+        )
+
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_simhashes(path)
+
+    def test_empty_simhash_section_returns_empty(self, tmp_path):
+        """An untrained tier serialises ``"simhash": {}`` — a truthful empty map.
+
+        ``KeyRegistry()`` with no keys is what a registered-but-never-trained
+        tier writes, and reading it back is not an error.
+        """
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_bytes(KeyRegistry().save_bytes())
+
+        assert KeyRegistry.load_simhashes(path) == {}
+
+    def test_load_stays_tolerant_of_an_absent_simhash_section(self, tmp_path):
+        """``load`` keeps the tolerance ``load_simhashes`` refuses.
+
+        The boot walk (``MemoryStore.read_registries_from_disk``) must not die
+        on a file without fingerprints; only the caller that specifically asks
+        for fingerprints is told the file cannot answer.
+        """
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"active_keys": ["graph1"]}))
+
+        assert KeyRegistry.load(path).list_active() == ["graph1"]
+
+    def test_key_metadata_shape_raises(self, tmp_path):
+        """key_metadata.json carries bookkeeping, never a fingerprint.
+
+        Pointing the reader at it must fail loudly — silently returning ``{}``
+        would un-gate every key the caller meant to verify.
+        """
+        path = tmp_path / "key_metadata.json"
+        path.write_text(
+            _json.dumps(
+                {
+                    "cycle_count": 3,
+                    "promoted_keys": [],
+                    "keys": {"graph1": {"speaker_id": "speaker0", "relation_type": "unknown"}},
+                }
+            )
+        )
+
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_simhashes(path)
+
+    def test_non_dict_simhash_section_raises(self, tmp_path):
+        """A ``"simhash"`` field that is not a map is a schema fault, not empty."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"active_keys": ["graph1"], "simhash": 5}))
+
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_simhashes(path)
+
+    def test_non_dict_payload_raises(self, tmp_path):
+        """A JSON document that is not an object at all is not a registry file."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps(["graph1", "graph2"]))
+
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load_simhashes(path)

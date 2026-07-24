@@ -268,35 +268,26 @@ class FoldScope:
     Attributes:
         name: Human-readable label (``"interim"`` | ``"full"``).  Used in log
             messages and debug artifacts only; has no dispatch semantics.
-        source: Materialize axis forwarded to
+        source: **The venue discriminator.**  ``"weights"`` is the train venue:
+            adapter weights exist, so the fold reconstructs from them, trains,
+            and saves them.  ``"disk"`` is the simulate venue: no weights exist,
+            so the weight-only blocks are skipped and the persist medium is
+            per-tier ``graph.json``.  Both venues read the same
+            :class:`~paramem.memory.store.MemoryStore` for their fold input —
+            ``source`` selects the weight *probe*, never the input medium.
+            Also forwarded to
             :meth:`~ConsolidationLoop._materialize_consolidation_graph`.
-            ``"weights"`` reconstructs from adapter weights (train path);
-            ``"disk"`` loads relations from ``graph.json`` files (simulate path).
         persist: Persist venue, dispatched at the end of the spine.
 
             - ``"interim_slot"`` — call
               :func:`~paramem.memory.persistence.commit_tier_slot` (interim cycle).
-            - ``"main_tiers"`` — call :meth:`~ConsolidationLoop._save_adapters`
-              (full-fold train path).
-            - ``"graph_json"`` — write
-              :func:`~paramem.memory.persistence.save_memory_to_disk` **directly**
-              on ``self.merger.graph`` (simulate full fold).  MUST NOT derive the
-              graph from ``tier_keyed``: for ``source="disk"`` disk relations carry
-              ``ik_key``, the keyed branch of ``_build_all_edge_entries_into`` does
-              ``store.get(key)`` against the empty simulate store and silently skips
-              unmatched edges → ``tier_keyed`` is empty.
+            - ``"main_tiers"`` — full fold.  Writes adapter weights via
+              :meth:`~ConsolidationLoop._save_adapters` when ``source ==
+              "weights"``, per-tier ``graph.json`` projected from the store
+              otherwise.
         tier: Target adapter name for the interim scope (e.g.
             ``"episodic_interim_YYYYMMDDTHHMM"``).  ``None`` for the full fold
             (all tiers are rebuilt).
-        extra_relations_source: Origin of supplemental relations injected via the
-            ``extra_relations`` channel of
-            :meth:`~ConsolidationLoop._materialize_consolidation_graph`.
-
-            - ``"pending"`` — relations captured from ``merger.graph`` (interim
-              cycle pending-session content).
-            - ``"disk"`` — relations from ``_collect_disk_fold_relations``
-              (simulate full fold).
-            - ``"none"`` — no supplemental relations (full-fold train path).
         defer: Forwarded as the ``defer`` flag to
             :meth:`~ConsolidationLoop._build_all_edge_entries_into`.  ``True``
             for the interim slot (atomicity: registry entry deferred until after
@@ -310,31 +301,47 @@ class FoldScope:
             :meth:`~ConsolidationLoop._refine_consolidation_graph`.
         promote: When ``True``, call
             :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
-            Refine stage.  ``True`` for the full-fold train path only — the
-            simulate path skips it because there are no weight-resident keys to
-            promote.
+            Refine stage.  ``True`` for the full fold in BOTH venues —
+            promotion is a pure store operation with no weight dependency.
         tier_floor: When ``True``, run the per-tier floor park/graduate pass
             as a second pass after the build-entries stage.  ``True`` for the
-            full-fold train path only.
+            full fold in BOTH venues — parking and graduation are pure store
+            operations; only the fast-start *weight copy* is venue-gated.
         subtractive_scope: Forwarded to
             :meth:`~ConsolidationLoop._apply_subtractive_removals_to_store`
             (``"interim"`` | ``"fold"``).
-        consume_pending: When ``True``, the full fold extracts pending sessions
-            in-fold and merges them before training (the ``max_interim_count == 0``
-            consume-pending mode, set by the server).
-        cross_tier_resume: When ``True``, the fold would checkpoint completed
-            tiers for cross-tier crash resume.  Declared but not yet wired —
-            no code path currently sets or reads it.
+        consume_pending: When ``True``, the fold snapshots the pending-session
+            relations sitting in ``merger.graph`` via
+            :meth:`~ConsolidationLoop._capture_pending_relations` and feeds them
+            to :meth:`~ConsolidationLoop._materialize_consolidation_graph`
+            through its ``extra_relations`` channel, so they survive the graph
+            reset.  ``True`` for every interim cycle (the pending session IS the
+            cycle's content) and for the full fold in the
+            ``max_interim_count == 0`` consume-pending mode the server selects.
+            ``False`` means no supplemental relations enter the merge.
+        keys_from: **The key source of a ``main_tiers`` fold** — which of the
+            store's registered tiers this fold owns, resolved live by
+            :meth:`~ConsolidationLoop._fold_active_keys`.
+
+            - ``"all_tiers"`` — every active key, interim slots included.  The
+              slots are folded into main and reaped afterwards.
+            - ``"main_tiers"`` — ``episodic`` / ``semantic`` / ``procedural``
+              only.  Interim keys never enter the merge, so they are neither
+              retrained nor drift-partitioned, and the slots are left on disk:
+              a fold that did not absorb them must not reap them.  Interim
+              disposal follows from this field and is NOT a second flag.
+
+            Ignored by the ``interim_slot`` scope, which is scoped to its own
+            slot by ``tier`` instead.
     """
 
     # --- identity / dispatch ---
     name: str  # "interim" | "full"  (log/debug label only)
     source: "Literal['weights', 'disk']"
-    persist: "Literal['interim_slot', 'main_tiers', 'graph_json']"
+    persist: "Literal['interim_slot', 'main_tiers']"
 
     # --- materialize scoping ---
     tier: "str | None" = None
-    extra_relations_source: "Literal['pending', 'disk', 'none']" = "none"
     defer: bool = False
     tag_new: bool = False
 
@@ -347,38 +354,11 @@ class FoldScope:
     tier_floor: bool = False
     subtractive_scope: "Literal['interim', 'fold']" = "fold"
 
-    # --- pending capture / resume ---
-    consume_pending: bool = False  # extract pending sessions in-fold
-    cross_tier_resume: bool = False  # checkpoint completed tiers (not yet wired)
+    # --- pending capture ---
+    consume_pending: bool = False  # merge pending-session relations in-fold
 
-
-@dataclass(frozen=True)
-class DiskFoldInput:
-    """Collected input for a disk-source (simulate-mode) full fold.
-
-    Produced by :meth:`ConsolidationLoop._collect_disk_fold_relations` and
-    consumed by :meth:`ConsolidationLoop._run_fold` (via the ``"disk"``
-    persist venue) so that ``active_before_count`` is captured BEFORE
-    :meth:`~ConsolidationLoop._materialize_consolidation_graph` resets the
-    merger graph (after the reset the pre-merge edge count is unrecoverable).
-
-    Attributes:
-        relations: All :class:`~paramem.graph.schema.Relation` objects
-            collected from the canonical ``episodic/graph.json`` and every
-            simulate-mode interim slot ``graph.json``.  Fed into
-            ``_materialize_consolidation_graph`` via ``extra_relations``.
-        interim_dirs: Directories that were merged, in iteration order.
-            The caller uses this list for the post-persist ``shutil.rmtree``
-            cleanup step.
-        active_before_count: Number of edges in the canonical graph BEFORE
-            the reset/merge, captured from the just-loaded canonical graph.
-            Required by :meth:`~ConsolidationLoop._build_tier_delta` as the
-            ``active_before`` input for the ``episodic`` tier.
-    """
-
-    relations: list  # list[Relation] — avoids forward-ref in frozen dataclass
-    interim_dirs: list  # list[Path]
-    active_before_count: int
+    # --- key source (main_tiers scope) ---
+    keys_from: "Literal['all_tiers', 'main_tiers']" = "all_tiers"
 
 
 class ConsolidationLoop:
@@ -878,6 +858,35 @@ class ConsolidationLoop:
         """Every active key across every registered tier — order is tier-then-insertion."""
         return self.store.all_active_keys()
 
+    def _fold_active_keys(self, scope: "FoldScope") -> list[str]:
+        """The active keys a ``main_tiers`` fold owns, per ``scope.keys_from``.
+
+        The one place the fold's key source is turned into keys.  Read LIVE
+        from the store on every call (the spine calls it twice: once for the
+        merge input, once as the drift-partition universe, and the store is
+        mutated in between by minting, promotion and soft-staling — a cached
+        snapshot would misclassify all three).
+
+        ``"all_tiers"`` returns :meth:`MemoryStore.all_active_keys` verbatim,
+        so the absorbing fold sees exactly what it always saw; ``"main_tiers"``
+        returns the three main tiers' keys via
+        :meth:`MemoryStore.active_keys_in_tier`, leaving every interim slot's
+        keys out of the fold entirely.
+
+        Args:
+            scope: The immutable :class:`FoldScope` for the current fold.
+
+        Returns:
+            Active key strings in tier-then-insertion order.
+        """
+        if scope.keys_from == "all_tiers":
+            return self.store.all_active_keys()
+        return [
+            key
+            for tier in ("episodic", "semantic", "procedural")
+            for key in self.store.active_keys_in_tier(tier)
+        ]
+
     def _recall_passing_keys(
         self,
         state: "object | None",
@@ -993,8 +1002,13 @@ class ConsolidationLoop:
             tier_keyed: Per-tier keyed-entry lists (full post-consolidation set).
             passing_sets_by_tier: Per-tier sets of keys that passed the recall
                 gate.  A ``None`` entry for a tier triggers the probe fallback.
-                Pass ``None`` for the entire dict to skip recall gating (legacy /
-                non-production caller).
+                Pass ``None`` for the entire dict to skip recall gating: every
+                key in ``tier_keyed`` is admitted without a verdict.  That is the
+                DISK VENUE's production contract — recall gating is a verdict on
+                adapter weights, and the disk venue has none to probe, so there
+                is nothing a probe could add and nothing a missing verdict could
+                hide.  Distinct from a per-tier ``None`` (weights venue, verdict
+                absent for that tier), which triggers ``_probe_passing_keys``.
             soft_stale_by_tier: Per-tier dict of soft-staled keys captured at the
                 drift-partition step.  Keys map to
                 ``{"stale_cycles": int, "simhash": int | None}``.  When ``None``
@@ -2351,7 +2365,7 @@ class ConsolidationLoop:
                     source=_interim_source,
                     persist="interim_slot",
                     tier=adapter_name,
-                    extra_relations_source="pending",
+                    consume_pending=True,
                     defer=True,
                     tag_new=True,
                     normalize=False,  # normalization is full-fold only
@@ -2485,103 +2499,6 @@ class ConsolidationLoop:
         """
         return self.extraction.config
 
-    def _collect_disk_fold_relations(self, adapter_dir: "Path") -> "DiskFoldInput":
-        """Load all :class:`Relation` objects from the canonical graph and interim slots.
-
-        Extracts the disk-relation BUILD for the simulate-mode full fold.  Returns a
-        :class:`DiskFoldInput` containing the collected relations, the list of interim
-        directories merged (for post-persist ``shutil.rmtree``), and the pre-merge
-        edge count from the canonical graph (captured BEFORE
-        :meth:`_materialize_consolidation_graph` resets the merger — after the reset
-        the count is unrecoverable).
-
-        Steps:
-
-        1. Load the canonical ``episodic/graph.json`` via
-           :func:`~paramem.memory.persistence.load_memory_from_disk`.  Capture its
-           edge count as ``active_before_count`` (must be captured here, before
-           the merger reset in :meth:`_materialize_consolidation_graph`).
-        2. Build :class:`Relation` objects from every edge in the canonical graph.
-        3. For each simulate-venue ``episodic/interim_<stamp>`` slot via
-           :func:`~paramem.memory.interim_adapter.iter_interim_dirs` with
-           ``mode="simulate"`` (the primitive yields only slots carrying a
-           ``graph.json``; train-mode slots hold PEFT weights instead and are
-           not part of this venue): build :class:`Relation` objects from the
-           slot graph.
-        4. Return a :class:`DiskFoldInput` with the accumulated relations, the interim
-           directory list, and the pre-merge edge count.
-
-        Args:
-            adapter_dir: The loop's ``output_dir``, used as the adapter root.
-
-        Returns:
-            A :class:`DiskFoldInput` with ``relations``, ``interim_dirs``, and
-            ``active_before_count``.
-        """
-        from paramem.memory.interim_adapter import iter_interim_dirs
-        from paramem.memory.persistence import iter_entries, load_memory_from_disk
-
-        canonical_graph_path = adapter_dir / "episodic" / "graph.json"
-        # Capture the pre-merge edge count BEFORE _materialize resets the merger.
-        # load_memory_from_disk returns an empty graph when the file does not exist
-        # (first fold, no prior canonical graph).
-        _canonical_graph_before = load_memory_from_disk(canonical_graph_path)
-        active_before_count = _canonical_graph_before.number_of_edges()
-
-        _all_relations: list[Relation] = []
-        interim_dirs: list[Path] = []
-
-        # Build Relations from the canonical graph.
-        for _entry in iter_entries(_canonical_graph_before):
-            _pred = _entry.get("predicate", "")
-            if not _pred:
-                continue
-            _all_relations.append(
-                Relation(
-                    subject=_entry["subject"],
-                    predicate=_pred,
-                    object=_entry["object"],
-                    relation_type=_FALLBACK_RTYPE,  # graph.json edges carry no relation_type
-                    confidence=1.0,
-                    speaker_id=_entry.get("speaker_id", ""),
-                    indexed_key=_entry["key"],
-                )
-            )
-
-        # Build Relations from each simulate-mode interim slot.  The payload
-        # filter lives in iter_interim_dirs: mode="simulate" yields only slots
-        # that carry a graph.json.
-        for _interim_name, interim_dir in iter_interim_dirs(adapter_dir, mode="simulate"):
-            interim_graph_path = interim_dir / "graph.json"
-            slot_graph = load_memory_from_disk(interim_graph_path)
-            for _entry in iter_entries(slot_graph):
-                _pred = _entry.get("predicate", "")
-                if not _pred:
-                    continue
-                _all_relations.append(
-                    Relation(
-                        subject=_entry["subject"],
-                        predicate=_pred,
-                        object=_entry["object"],
-                        relation_type=_FALLBACK_RTYPE,  # type: ignore[arg-type]
-                        confidence=1.0,
-                        speaker_id=_entry.get("speaker_id", ""),
-                        indexed_key=_entry["key"],
-                    )
-                )
-            interim_dirs.append(interim_dir)
-            logger.debug(
-                "_collect_disk_fold_relations: queued %d entries from %s",
-                slot_graph.number_of_edges(),
-                interim_dir,
-            )
-
-        return DiskFoldInput(
-            relations=_all_relations,
-            interim_dirs=interim_dirs,
-            active_before_count=active_before_count,
-        )
-
     def _capture_pending_relations(self) -> "list[Relation]":
         """Snapshot current merger.graph edges into a list[Relation].
 
@@ -2589,11 +2506,11 @@ class ConsolidationLoop:
         so the pending-session content survives the reset and re-enters the merge
         via the ``extra_relations`` channel.
 
-        Shared by the interim fold and the consume-pending full fold.
-        The interim fold calls this when ``scope.extra_relations_source == "pending"``.
-        The full fold calls this when ``scope.consume_pending`` is ``True`` (the
-        consume-pending full fold, where app.py has pre-populated
-        ``merger.graph`` with pending-session relations).
+        Both fold scopes call this on ``scope.consume_pending`` — the one gate.
+        The interim fold always sets it (the pending session IS that cycle's
+        content); the full fold sets it in the ``max_interim_count == 0``
+        consume-pending mode, where app.py has pre-populated ``merger.graph``
+        with the pending-session relations before entering the fold.
 
         Returns an empty list when the graph is absent or has no edges; both
         ``None`` and ``[]`` are valid no-ops for the ``if extra_relations`` check
@@ -2663,8 +2580,14 @@ class ConsolidationLoop:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _interim_venue_from_scope(scope: "FoldScope") -> "Literal['train', 'simulate']":
-        """Derive the ``commit_tier_slot`` venue string from *scope*.
+    def _venue_from_scope(scope: "FoldScope") -> "Literal['train', 'simulate']":
+        """Derive the venue string every mode-keyed collaborator expects from *scope*.
+
+        Two consumers:
+        :func:`~paramem.memory.persistence.commit_tier_slot` (``mode=``) and
+        :func:`~paramem.memory.source.build_memory_source` (``mode=``).  Both
+        take the same ``"train"`` / ``"simulate"`` vocabulary, so the fold
+        translates its structural venue exactly once, here.
 
         This is a derivation, not a mode fork: the result flows from the
         structural ``scope.source`` enum — no ``mode == "train"`` comparison
@@ -2678,6 +2601,90 @@ class ConsolidationLoop:
             "weights"``); ``"simulate"`` otherwise.
         """
         return "train" if scope.source == "weights" else "simulate"
+
+    def _hydrate_store_for_fold(self, scope: "FoldScope") -> None:
+        """Materialise every live key's entry into the store before the fold reads it.
+
+        The fold reads entry content through ``store.get`` at three places —
+        :meth:`_build_registry_true_relations`, the keyed branch of
+        :meth:`_build_all_edge_entries_into`, and the interim recital-dedup
+        scope test.  ``store.get`` is cache-only: on a miss it returns ``None``
+        and each of those places drops the key.  A dropped key does not reach
+        ``serve_assignment``, and the finalize step rewrites every main-tier
+        registry from ``serve_assignment`` — so a key the cache happened not to
+        hold is *deregistered and flushed to disk*, and the drift partition
+        buckets it as an orphan.  That is silent data loss, and the store can
+        legitimately be partially hydrated: ``app._build_store_contents``
+        reports exactly this as ``boot_degraded={"reason": "preload_partial"}``
+        when the boot probe materialises only some of the active keys.
+
+        So the fold hydrates first.  Every active key of every registered tier
+        is resolved through :meth:`~paramem.memory.store.MemoryStore.probe`
+        against the venue's :class:`~paramem.memory.source.MemorySource`: cache
+        hits cost nothing, misses are materialised from the source of truth
+        (adapter weights or ``graph.json``) in one batched pass, and only a key
+        that no venue can produce is left for the three sites to drop — which
+        is then a true orphan rather than a cache artifact.
+
+        ``memoize=True`` is not conditional on ``inference.preload_cache``.
+        That toggle governs the *read* path (boot preload + per-query on-miss
+        caching); the fold is a *write* path that already puts every minted
+        entry into the store unconditionally, and its own persist tail reads
+        those entries back — ``_persist_fold`` projects the store through
+        :func:`~paramem.memory.persistence.build_tier_graph_from_store`, which
+        raises ``KeyError`` on an active key with no entry.  Hydrating without
+        memoizing would therefore break the disk venue's persist, and re-probe
+        the same keys once per read site on the weights venue.
+
+        **BASE-MODEL HOLDER** — the :class:`WeightMemorySource` built here
+        captures the base model.  It is a frame-local, built from ``self.model``
+        at call time (which the fold rebinds around adapter creation, so it must
+        never be cached on ``self``) and dropped when this method returns, the
+        same no-frame-retention pattern ``app._preload_memory_store`` uses.
+
+        Args:
+            scope: The immutable :class:`FoldScope` for the current fold.  Its
+                ``source`` selects the venue via :meth:`_venue_from_scope`.
+
+        A source probe that raises is NOT swallowed: proceeding into the fold
+        with an unknown-partial store is the data loss this method exists to
+        prevent, so the exception aborts the fold before anything is rewritten.
+
+        Args:
+            scope: The immutable :class:`FoldScope` for the current fold.  Its
+                ``source`` selects the venue via :meth:`_venue_from_scope`.
+        """
+        from paramem.memory.source import build_memory_source
+
+        venue = self._venue_from_scope(scope)
+        keys_by_tier = {
+            tier: keys
+            for tier in self.store.tiers_with_registry()
+            if (keys := self.store.active_keys_in_tier(tier))
+        }
+        if not keys_by_tier:
+            return
+
+        source = build_memory_source(
+            mode=venue,
+            adapter_dir=self.output_dir,
+            batch_size=self.training_config.recall_probe_batch_size,
+            model=self.model,
+            tokenizer=self.tokenizer,
+        )
+        if source is not None:
+            self.store.probe(keys_by_tier, source=source, memoize=True)
+            source = None
+
+        dropped = [k for keys in keys_by_tier.values() for k in keys if self.store.get(k) is None]
+        if dropped:
+            logger.warning(
+                "_hydrate_store_for_fold: %d live key(s) have no content in the store "
+                "and none in the %s source — this fold will drop them: %s",
+                len(dropped),
+                venue,
+                sorted(dropped)[:10],
+            )
 
     def _verify_committed_slot(
         self,
@@ -2743,51 +2750,56 @@ class ConsolidationLoop:
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
         all_keyed: "list[dict] | None" = None,
-        # graph_json input
-        graph_path: "Path | None" = None,
     ) -> None:
-        """Single persist tail for all three fold venues.
+        """Single persist tail for both fold scopes, in both venues.
 
-        Dispatches on ``scope.persist`` only — never on a ``mode == "train"``
-        / ``mode == "simulate"`` literal (the mode-fork guard is satisfied).
-        Each branch writes its venue artifact and runs disk-integrity
-        verification where adapter weights were written:
+        Dispatches on ``scope.persist`` for the scope and on ``scope.source``
+        for the venue — never on a ``mode == "train"`` / ``mode == "simulate"``
+        literal (the mode-fork guard is satisfied).  Each branch writes its
+        venue artifact and runs disk-integrity verification where adapter
+        weights were written:
 
-        - ``graph_json``: no weights, no verify.
-        - ``interim_slot`` (train): passes a
+        - ``interim_slot`` (weights): passes a
           :meth:`_verify_committed_slot` callback into
           :func:`~paramem.memory.persistence.commit_tier_slot` so the slot
           is reloaded and probed before the registry flush (commit signal).
           A failed probe propagates; ``commit_tier_slot``'s ``finally``
           orphan-cleanup removes the half-committed slot.
-        - ``interim_slot`` (simulate): ``verify=None`` — no weights, no probe.
-        - ``main_tiers``: disk verify is already inside :meth:`_save_adapters`.
+        - ``interim_slot`` (disk): ``verify=None`` — no weights, no probe;
+          ``commit_tier_slot`` writes the slot ``graph.json`` instead.
+        - ``main_tiers`` (weights): :meth:`_save_adapters` rebuilds the main
+          adapter slots; its disk verify is already inside that method.
+        - ``main_tiers`` (disk): each main tier's slice of the store is
+          projected with
+          :func:`~paramem.memory.persistence.build_tier_graph_from_store` and
+          written to ``<output_dir>/<tier>/graph.json`` — the exact path
+          :class:`~paramem.memory.source.DiskMemorySource` reads back, so the
+          round trip is symmetric.  All three main tiers are written
+          unconditionally, mirroring the unconditional per-tier registry
+          rewrite that immediately precedes this call in the spine.
 
-        Called once by :meth:`_run_fold` in place of the three independent
-        persist tails that previously closed each of the graph-json,
-        interim-slot, and main-tiers early-return blocks.  The surrounding
-        venue-specific grooming (refine,
-        build-entries, train, result-dict assembly) stays inline in
+        Called by :meth:`_run_fold` in place of the independent persist tails
+        that previously closed each fold branch.  The surrounding grooming
+        (refine, build-entries, train, result-dict assembly) stays inline in
         :meth:`_run_fold`; only the **save action** is unified here.
 
         Args:
-            scope: Immutable :class:`FoldScope` describing this fold.  The
-                ``persist`` field selects the dispatch branch.
+            scope: Immutable :class:`FoldScope` describing this fold.
+                ``persist`` selects the scope branch, ``source`` the venue.
             adapter_name: Interim adapter name (``interim_slot`` path only).
             stamp: Sub-interval stamp forwarded to
                 :func:`~paramem.memory.persistence.commit_tier_slot`
                 (``interim_slot`` path only).
             all_keyed: Full keyed-pair list for the interim slot
                 (``interim_slot`` path only).
-            graph_path: Destination path for the merged graph
-                (``graph_json`` path only).
         """
-        from paramem.memory.persistence import commit_tier_slot, save_memory_to_disk
+        from paramem.memory.persistence import (
+            build_tier_graph_from_store,
+            commit_tier_slot,
+            save_memory_to_disk,
+        )
 
-        if scope.persist == "graph_json":
-            # graph-json simulate: write merger.graph directly (not tier_keyed).  No weights.
-            save_memory_to_disk(self.merger.graph, graph_path)  # type: ignore[arg-type]
-        elif scope.persist == "interim_slot":
+        if scope.persist == "interim_slot":
             # interim slot: commit adapter weights (train) or graph.json (simulate).
             # The mode-fork lives inside commit_tier_slot, which is allowlisted.
             # For train interim, pass a verify callback so the slot is probed
@@ -2804,15 +2816,43 @@ class ConsolidationLoop:
                 tier="episodic",
                 adapter_name=adapter_name,  # type: ignore[arg-type]
                 stamp=stamp,  # type: ignore[arg-type]
-                mode=self._interim_venue_from_scope(scope),
+                mode=self._venue_from_scope(scope),
                 all_keyed=_keyed,
                 output_dir=self.output_dir,
                 verify=_verify,
             )
         elif scope.persist == "main_tiers":
-            # main tiers full fold: rebuild main adapter weights.  Disk verify is inside
-            # _save_adapters (already had it pre-unification).
-            self._save_adapters()
+            if scope.source == "weights":
+                # Rebuild main adapter weights.  Disk verify is inside
+                # _save_adapters (already had it pre-unification).
+                self._save_adapters()
+            else:
+                # No weights: project the store's per-tier slice to graph.json.
+                #
+                # No empty-projection guard here, and that is deliberate — the
+                # two call sites of build_tier_graph_from_store are consistent,
+                # not divergent.  commit_tier_slot's `if all_keyed:` branch is an
+                # INPUT fallback: it takes a caller-supplied keyed list and, when
+                # that list is empty, falls back to this same canonical store
+                # projection rather than writing the caller's emptiness.  This
+                # branch has no second input — it starts at the authority the
+                # fallback reaches for, so there is nothing to fall back FROM.
+                # Neither site suppresses an empty projection of a genuinely
+                # empty store slice, and neither should: after the fold the store
+                # is the post-fold truth, and a tier that ends with no keys must
+                # end with no graph.json content.  Keeping the previous file
+                # would resurrect retired keys on the next boot, since
+                # DiskMemorySource hydrates entries from exactly these files.
+                from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+                for _pf_tier in ("episodic", "semantic", "procedural"):
+                    _pf_root = adapter_slot_root_for_name(self.output_dir, _pf_tier)
+                    _pf_root.mkdir(parents=True, exist_ok=True)
+                    save_memory_to_disk(
+                        build_tier_graph_from_store(self.store, _pf_tier),
+                        _pf_root / "graph.json",
+                    )
+                    logger.info("_persist_fold: tier graph written to %s", _pf_root / "graph.json")
 
     def _run_fold(
         self,
@@ -2831,42 +2871,51 @@ class ConsolidationLoop:
     ) -> dict:
         """Scope-parameterized consolidation fold spine — the single shared pipeline.
 
-        All three consolidation paths route through this method:
+        Two scopes route through this method, each in either venue:
 
         - ``scope.persist == "interim_slot"`` (interim mini-fold): single-tier
-          training + :func:`~paramem.memory.persistence.commit_tier_slot`.
+          fold + :func:`~paramem.memory.persistence.commit_tier_slot`.
           Replaces the pipeline body of ``run_consolidation_cycle``.
-        - ``scope.persist == "main_tiers"`` (full-fold train): multi-tier rebuild
-          + :meth:`_save_adapters`.  Reached via :meth:`consolidate` in train mode.
-        - ``scope.persist == "graph_json"`` (full-fold simulate): disk-source merge
-          + :func:`~paramem.memory.persistence.save_memory_to_disk`.
-          Reached via :meth:`consolidate` in simulate mode.
+        - ``scope.persist == "main_tiers"`` (full fold): multi-tier rebuild
+          + :meth:`_persist_fold`.  Reached via :meth:`consolidate`.
 
         The fold does what it is told.  Whether there is anything to do at all is
         decided by the caller — the spine carries no content gate and no notion of
         who asked for the fold.
 
-        The three paths differ ONLY in ``scope.source`` (weights vs disk) and the
-        persist tail (``scope.persist``).  All grooming stages
-        (:meth:`_materialize_consolidation_graph`, :meth:`_refine_consolidation_graph`,
-        :meth:`_build_all_edge_entries_into`, :meth:`_apply_subtractive_removals_to_store`)
-        are shared and unconditional.
+        **Both venues read the same store and run the same stage spine.**  The
+        fold input is :class:`~paramem.memory.store.MemoryStore` in both cases —
+        registry-true relations from ``_build_registry_true_relations``, hydrated
+        from the per-tier and per-interim-slot registries at boot and after every
+        cycle.  The fold does not trust that hydration to be complete: each
+        fresh-derivation path opens with :meth:`_hydrate_store_for_fold`, which
+        materialises every live key still missing from the entry cache out of the
+        venue's source of truth.  All grooming stages
+        (:meth:`_materialize_consolidation_graph`,
+        :meth:`_refine_consolidation_graph`, :meth:`_promote_mature_keys_inline`,
+        :meth:`_build_all_edge_entries_into`, the tier floor, the drift partition,
+        :meth:`_apply_subtractive_removals_to_store`, the registry rewrite,
+        :meth:`_build_tier_delta`) are shared and venue-agnostic.
 
-        Promotion (:meth:`_promote_mature_keys_inline`) and the tier-floor pass are
-        scope-gated via ``scope.promote`` and ``scope.tier_floor`` respectively — both
-        are weight-venue stages that the simulate path correctly skips by scope design.
+        The two venues fork on ``scope.source`` at exactly two kinds of site:
 
-        **Return schema:** always returns the FULL train schema.
-        The ``graph_json`` persist path returns zero/empty equivalents for fields that
-        have no meaning for the disk venue (``drift_intended_removal``,
-        ``recall_miss_keys``, ``tier_keyed``, etc.) so callers never ``KeyError``
-        after the collapse.
+        1. **Weight-only blocks with no simulate meaning** — the recall-miss
+           reconstruction probe, ``main_tier_backup_scope``, the per-tier
+           training loop, the fast-start weight copy, the PEFT interim unload,
+           and the closing ``switch_adapter``.  In the disk venue ``self.model``
+           is a bare base model with no ``peft_config``, so these are skipped.
+        2. **The persist medium** — adapter weights vs per-tier ``graph.json``,
+           dispatched inside :meth:`_persist_fold`.
+
+        **Return schema:** always the same schema, in both venues and from every
+        terminal return (including the accumulating early return).
 
         **Mode-fork-guard invariant:** this method and all callers dispatch on
         ``scope.source`` / ``scope.persist`` structural enum attributes — never on
         a ``mode == "simulate"`` / ``mode == "train"`` string literal.  The
-        ``mode`` string is computed internally only where required by lower-level
-        helpers (``commit_tier_slot``) that are themselves in the allowlist.
+        ``mode`` string is computed internally, via :meth:`_venue_from_scope`,
+        only where required by lower-level collaborators (``commit_tier_slot``,
+        ``build_memory_source``) that are themselves in the allowlist.
 
         Args:
             scope: Immutable :class:`FoldScope` descriptor.  Selects pipeline stages
@@ -2874,12 +2923,14 @@ class ConsolidationLoop:
                 never by app-layer callers.
             trainer: :class:`~paramem.server.background_trainer.BackgroundTrainer`
                 instance.  Required for the per-tier re-arm pattern in the
-                ``main_tiers`` path; ``None`` for ``graph_json`` and for ``interim_slot``
-                paths that do not need the abort-for-inference machinery.
+                ``main_tiers`` weights venue; ``None`` for the disk venue and for
+                ``interim_slot`` paths that do not need the abort-for-inference
+                machinery.
             router: Router instance whose ``reload()`` is called at fold completion
-                (``main_tiers`` path only).  ``None`` is safe — skipped.
-            recall_sanity_threshold: Override for the recall gate (``main_tiers`` path).
-                Reads ``self.config.recall_sanity_threshold`` when ``None``.
+                (``main_tiers`` path, both venues).  ``None`` is safe — skipped.
+            recall_sanity_threshold: Override for the recall gate (``main_tiers``
+                weights venue).  Reads ``self.config.recall_sanity_threshold``
+                when ``None``.
             adapter_name: Interim adapter name (``interim_slot`` path only).  Matches
                 ``scope.tier``.
             stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
@@ -2906,12 +2957,14 @@ class ConsolidationLoop:
                     "drift_intended_removal_by_reason": dict,
                     "recall_miss_keys": list[str],
                     "keys_per_tier": dict[str, int],
-                    "recall_per_tier": dict[str, float],
                     "tier_keyed": dict,
                     "rolled_back": bool,
                     "rollback_tier": str | None,
                     "tier_delta": dict,
                 }
+
+            The accumulating early return additionally carries ``status`` and
+            ``accumulating_reason``.
 
             The ``interim_slot`` path additionally carries::
 
@@ -2926,118 +2979,8 @@ class ConsolidationLoop:
                     "recall_failed_session_ids": list[str],
                 }
         """
-        import shutil as _shutil
-
         if recall_sanity_threshold is None:
             recall_sanity_threshold = self.config.recall_sanity_threshold
-
-        # ------------------------------------------------------------------
-        # graph-json simulate full fold (scope.persist == "graph_json")
-        # ------------------------------------------------------------------
-        # Source: disk (graph.json files); no weight reconstruction.
-        # Persist: save_memory_to_disk(merger.graph, canonical_graph_path).
-        # No training, no registry mutation, no tier-floor.
-        # Replaces the deleted consolidate_interim_to_canonical_graph body.
-        # ------------------------------------------------------------------
-        if scope.persist == "graph_json":
-            adapter_dir = self.output_dir
-            canonical_graph_path = adapter_dir / "episodic" / "graph.json"
-
-            # Collect disk relations + pre-merge edge count BEFORE _materialize
-            # resets the merger graph (after the reset the count is unrecoverable).
-            inp = self._collect_disk_fold_relations(adapter_dir)
-
-            logger.info(
-                "_run_fold[graph_json]: collected %d relations from canonical graph"
-                " + %d interim slot(s)",
-                len(inp.relations),
-                len(inp.interim_dirs),
-            )
-
-            try:
-                # Materialize: merge disk relations via the shared helper.
-                # source="disk" skips weight reconstruction; feeds inp.relations as
-                # extra_relations; merger.reset_graph() runs inside;
-                # recall_miss_keys=set() (no recall probe on the simulate path).
-                # The persist tail writes merger.graph DIRECTLY via save_memory_to_disk
-                # — NOT via tier_keyed.  Disk edges carry ik_key; the keyed branch of
-                # _build_all_edge_entries_into does store.get against the empty simulate
-                # store and silently skips unmatched edges → tier_keyed would be empty.
-                self._materialize_consolidation_graph(
-                    source="disk",
-                    extra_relations=inp.relations,
-                )
-
-                # Capture edge count BEFORE refine so we can compute minted edges.
-                # minted_count = enrichment new_edges (refine-added beyond the post-merge
-                # count).  NOTE: also nets normalization removals that reduce the
-                # post-merge edge count before enrichment adds edges; this is a known
-                # approximation (same as the previous inline body).
-                _after_merge_count = self.merger.graph.number_of_edges()
-                self._refine_consolidation_graph(
-                    [],
-                    normalize=scope.normalize,
-                    enrich=scope.enrich,
-                )
-
-                # Write merger.graph directly (not tier_keyed).
-                canonical_graph_path.parent.mkdir(parents=True, exist_ok=True)
-                self._persist_fold(scope, graph_path=canonical_graph_path)
-                _after_count = self.merger.graph.number_of_edges()
-                _minted_count = max(0, _after_count - _after_merge_count)
-                _collapsed_count = sum(
-                    1
-                    for _rl_e in self.merger.removal_ledger.values()
-                    if _rl_e.get("reason") == "dedup"
-                )
-                logger.info(
-                    "_run_fold[graph_json]: wrote merged graph to %s"
-                    " (%d edges, %d interim slot(s), %d dedup collapse(s))",
-                    canonical_graph_path,
-                    _after_count,
-                    len(inp.interim_dirs),
-                    _collapsed_count,
-                )
-
-                _sim_tier_delta = self._build_tier_delta(
-                    active_before={"episodic": inp.active_before_count},
-                    active_after={"episodic": _after_count},
-                    minted_by_tier={"episodic": _minted_count},
-                )
-                on_tier_delta(_sim_tier_delta)
-                on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
-
-                for _idir in inp.interim_dirs:
-                    try:
-                        _shutil.rmtree(_idir, ignore_errors=True)
-                        logger.debug("_run_fold[graph_json]: removed interim slot %s", _idir)
-                    except Exception as _rm_exc:
-                        logger.warning(
-                            "_run_fold[graph_json]: failed to remove %s: %s",
-                            _idir,
-                            _rm_exc,
-                        )
-
-                self._current_interim_stamp = None  # type: ignore[assignment]
-
-                return {
-                    "tiers_rebuilt": ["episodic"],
-                    "graph_drift_count": _collapsed_count,
-                    "drift_deduplicated": _collapsed_count,
-                    "drift_orphan": 0,
-                    "drift_genuine_loss": 0,
-                    "drift_intended_removal": 0,
-                    "drift_intended_removal_by_reason": {},
-                    "recall_miss_keys": [],
-                    "keys_per_tier": {"episodic": _after_count},
-                    "recall_per_tier": {"episodic": 1.0},  # graph merge is lossless
-                    "tier_keyed": {},
-                    "rolled_back": False,
-                    "rollback_tier": None,
-                    "tier_delta": _sim_tier_delta,
-                }
-            finally:
-                self.merger.reset_graph()
 
         # ------------------------------------------------------------------
         # interim mini-fold (scope.persist == "interim_slot")
@@ -3181,8 +3124,14 @@ class ConsolidationLoop:
                     # on resume below.
                 else:
                     # -------------------------------------------------------------
-                    # FRESH-DERIVATION PATH: materialize -> refine -> build set.
+                    # FRESH-DERIVATION PATH: hydrate -> materialize -> refine -> build set.
                     # -------------------------------------------------------------
+                    # --- Hydrate: every live key must have content before the
+                    # store is read, or the finalize step deregisters whatever
+                    # the cache happened to be missing.  Runs AFTER the interim
+                    # slot is minted so the weight source sees the current model.
+                    self._hydrate_store_for_fold(scope)
+
                     # --- Materialize: recall-miss diagnostic + rebuild keying surface ---
                     # Scoped to the current slot: reconstruct only the slot's registered keys
                     # (tier=adapter_name) for the recall-miss diagnostic, then reset and re-merge:
@@ -3190,9 +3139,7 @@ class ConsolidationLoop:
                     #   (b) the pending-session relations captured from merger.graph before the
                     #       reset (extra_relations), so they survive the graph reset.
                     _extra: "list[Relation] | None" = (
-                        self._capture_pending_relations()
-                        if scope.extra_relations_source == "pending"
-                        else None
+                        self._capture_pending_relations() if scope.consume_pending else None
                     )
 
                     _slot_keys: "list[str]" = list(
@@ -3216,6 +3163,9 @@ class ConsolidationLoop:
                     _slot_keys_set = set(_slot_keys)
 
                     def _dedup_touches_session(_dk: str) -> bool:
+                        # _hydrate_store_for_fold ran above, so a miss here means
+                        # the venue's source of truth holds no content for this
+                        # live key — it cannot be a dedup target for anything.
                         _dk_entry = self.store.get(_dk)
                         if _dk_entry is None:
                             return False
@@ -3532,7 +3482,7 @@ class ConsolidationLoop:
                     switch_adapter(self.model, "episodic")
 
                 _interim_mode_label = "trained" if scope.source == "weights" else "simulated"
-                _interim_venue = self._interim_venue_from_scope(scope)
+                _interim_venue = self._venue_from_scope(scope)
                 logger.info(
                     "_run_fold[interim]: %s %s — %d new keys, %d total interim keys",
                     _interim_mode_label,
@@ -3565,7 +3515,6 @@ class ConsolidationLoop:
                         "episodic": len(_tier_keyed["episodic"]),
                         "procedural": len(_tier_keyed["procedural"]),
                     },
-                    "recall_per_tier": {},
                     "tier_keyed": _tier_keyed,
                     "rolled_back": False,
                     "rollback_tier": None,
@@ -3578,12 +3527,14 @@ class ConsolidationLoop:
                 self.merger.reset_graph()
 
         # ------------------------------------------------------------------
-        # main-tiers full-fold train (scope.persist == "main_tiers")
+        # main-tiers full fold (scope.persist == "main_tiers")
         # ------------------------------------------------------------------
-        # Source: weights (reconstruct all tiers from adapter weights).
-        # Persist: _save_adapters (rebuild main adapter weights + manifest).
-        # Multi-tier training loop; promote=scope.promote, tier_floor=scope.tier_floor.
-        # The full-fold train venue; reached via consolidate(mode="train").
+        # Store-sourced in both venues.  The weights venue additionally probes
+        # the adapters for recall misses, backs the main tiers up, retrains
+        # them, and saves the weights; the disk venue skips those blocks and
+        # persists per-tier graph.json instead (see _persist_fold).  Every
+        # other stage — promote, tier floor, drift partition, registry
+        # rewrite, tier delta — runs identically in both.
         # ------------------------------------------------------------------
         from paramem.memory.interim_adapter import (
             INTERIM_NAME_PREFIX,
@@ -3667,8 +3618,14 @@ class ConsolidationLoop:
                 _dataset_fingerprints = _resume_fingerprints
             else:
                 # -----------------------------------------------------------------
-                # FRESH-DERIVATION PATH: reconstruct → promote → tier-floor → assign.
+                # FRESH-DERIVATION PATH: hydrate → reconstruct → promote → tier-floor
+                # → assign.
                 # -----------------------------------------------------------------
+                # --- Hydrate: every live key must have content before the store
+                # is read, or the finalize step below rewrites each main-tier
+                # registry without whatever the cache happened to be missing.
+                self._hydrate_store_for_fold(scope)
+
                 # Capture pending-session relations from merger.graph BEFORE
                 # _materialize_consolidation_graph resets the graph (ordering:
                 # capture-before-reset, re-merge-after-reset via extra_relations).
@@ -3686,6 +3643,7 @@ class ConsolidationLoop:
                     )
                 recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
                     source=scope.source,
+                    keys=self._fold_active_keys(scope),
                     resolve_contradictions_recon=(self.config.refinement_contradiction == "on"),
                     resolve_contradictions_extra=(self.config.refinement_contradiction == "on"),
                     extra_relations=_pending_extra,
@@ -3738,6 +3696,10 @@ class ConsolidationLoop:
                     tier_dir = self.output_dir / tier_name
                     if not tier_dir.is_dir():
                         return False
+                    if scope.source != "weights":
+                        # Disk venue: the tier's payload is graph.json, not a
+                        # timestamped weight slot.
+                        return (tier_dir / "graph.json").exists()
                     return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
 
                 if scope.tier_floor:
@@ -3763,7 +3725,12 @@ class ConsolidationLoop:
                         else:
                             _tier_is_live = _tier_has_disk_slot(_pt)
                             if not _tier_is_live:
-                                if self.config.tier_fast_start:
+                                # Fast start is a WEIGHT copy (episodic LoRA →
+                                # new tier) gated on a weight recall probe, so
+                                # it exists only in the weights venue.  The disk
+                                # venue graduates by rebooking the keys, which
+                                # is all graduation means without weights.
+                                if self.config.tier_fast_start and scope.source == "weights":
                                     logger.info(
                                         "_run_fold[main_tiers]: tier %s graduating (fast-start)"
                                         " — %d key(s) >= floor %d; will copy episodic weights",
@@ -3775,7 +3742,7 @@ class ConsolidationLoop:
                                 else:
                                     logger.info(
                                         "_run_fold[main_tiers]: tier %s graduating"
-                                        " (train-from-scratch) — %d key(s) >= floor %d",
+                                        " — %d key(s) >= floor %d; keys rebooked to the tier",
                                         _pt,
                                         len(_pt_entries),
                                         _floor,
@@ -3817,18 +3784,19 @@ class ConsolidationLoop:
                         for t in ("semantic", "procedural")
                         if len(serve_assignment[t]) > 0
                     }
-                    for _bname in (
-                        "episodic_backup",
-                        "semantic_backup",
-                        "procedural_backup",
-                    ):
-                        if _bname in self.model.peft_config:
-                            self.model.delete_adapter(_bname)
-                            logger.debug(
-                                "_run_fold[main_tiers]: cleaned up stale backup %s"
-                                " (left by prior aborted fold) on accumulating return",
-                                _bname,
-                            )
+                    if scope.source == "weights":
+                        for _bname in (
+                            "episodic_backup",
+                            "semantic_backup",
+                            "procedural_backup",
+                        ):
+                            if _bname in self.model.peft_config:
+                                self.model.delete_adapter(_bname)
+                                logger.debug(
+                                    "_run_fold[main_tiers]: cleaned up stale backup %s"
+                                    " (left by prior aborted fold) on accumulating return",
+                                    _bname,
+                                )
                     return {
                         "status": "accumulating",
                         "accumulating_reason": {
@@ -3846,9 +3814,9 @@ class ConsolidationLoop:
                         "recall_miss_keys": [],
                         "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
                         "tier_keyed": serve_assignment,
-                        "recall_per_tier": {},
                         "rolled_back": False,
                         "rollback_tier": None,
+                        "tier_delta": {},
                     }
                 # end of fresh-derivation path.
                 # Compute dataset fingerprints and persist the fold assignment marker
@@ -3885,8 +3853,9 @@ class ConsolidationLoop:
                     scope=scope.subtractive_scope
                 )
 
-                active_keys = self.store.all_active_keys()
-                _drift_keys = [k for k in active_keys if k not in _all_keyed]
+                # Drift is measured against the keys THIS fold owns: a key the
+                # fold never read cannot have drifted out of its merged graph.
+                _drift_keys = [k for k in self._fold_active_keys(scope) if k not in _all_keyed]
 
                 _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
                 _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
@@ -3980,7 +3949,7 @@ class ConsolidationLoop:
                     logger.info(
                         "graph_drift_key key=%s bucket=genuine_loss"
                         " subject=%r predicate=%r object=%r"
-                        " (reconstruction failure or hydration-miss — retrained with"
+                        " (reconstruction failure — retrained with"
                         " registry-true content; not a data loss)",
                         _dk,
                         (_dk_entry or {}).get("subject", ""),
@@ -4040,464 +4009,502 @@ class ConsolidationLoop:
 
                 on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
-            # --- Build per-tier TrainingJob objects ---
-            from paramem.server.background_trainer import TrainingJob
+            tiers_rebuilt: list[str] = []
+            last_per_key_by_tier: dict[str, "list | None"] = {}
 
-            refresh_training_config = self.training_config
+            if scope.source != "weights":
+                # Disk venue: no adapter weights exist, so there is nothing to
+                # back up, retrain, or fast-start-copy.  A tier counts as rebuilt
+                # when it carries keys to project — the same predicate the
+                # weights venue applies before it trains a tier.
+                tiers_rebuilt = [
+                    t for t in ("episodic", "semantic", "procedural") if serve_assignment[t]
+                ]
+            else:
+                # --- Build per-tier TrainingJob objects ---
+                from paramem.server.background_trainer import TrainingJob
 
-            jobs_by_tier = {
-                "episodic": TrainingJob(
-                    entries=train_assignment["episodic"],
-                    adapter_name="episodic",
-                    adapter_config=self.episodic_config,
-                    inference_fallback_adapter="episodic_backup",
-                ),
-                "semantic": TrainingJob(
-                    entries=train_assignment["semantic"],
-                    adapter_name="semantic",
-                    adapter_config=self.semantic_config,
-                    inference_fallback_adapter="semantic_backup",
-                ),
-                "procedural": TrainingJob(
-                    entries=train_assignment["procedural"],
-                    adapter_name="procedural",
-                    adapter_config=self.procedural_config or self.episodic_config,
-                    inference_fallback_adapter="procedural_backup",
-                ),
-            }
+                refresh_training_config = self.training_config
 
-            # --- Per-tier fresh-adapter rebuild ---
-            tier_config_for_backup = {
-                "episodic": self.episodic_config,
-                "semantic": self.semantic_config,
-                "procedural": self.procedural_config or self.episodic_config,
-            }
-            # --- Backup-creation window telemetry (adapter-attributable) ---
-            # The only measurement in this module that is attributable to
-            # adapter VRAM cost — main_tier_backup_scope creates up to three
-            # transient <tier>_backup adapters. free_before is sampled
-            # immediately before the CM opens; free_after is the first
-            # statement inside its body, after backup creation.
-            _telemetry_free_before = (
-                torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
-            )
-            with main_tier_backup_scope(self.model, tier_config_for_backup) as _bscope:
-                self.model = _bscope.model
-                if torch.cuda.is_available() and _telemetry_free_before is not None:
-                    _telemetry_free_after, _telemetry_total = torch.cuda.mem_get_info()
-                    _telemetry_adapter_count = len(self.model.peft_config)
-                    _telemetry_interim_count = len(
-                        [a for a in self.model.peft_config if a.startswith(INTERIM_NAME_PREFIX)]
-                    )
-                    logger.info(
-                        "_run_fold[main_tiers]: telemetry backup_creation — "
-                        "free_before=%d free_after=%d adapter_count=%d interim_count=%d",
-                        _telemetry_free_before,
-                        _telemetry_free_after,
-                        _telemetry_adapter_count,
-                        _telemetry_interim_count,
-                    )
-                    if self._telemetry_dir is not None:
-                        try:
-                            record_fold_telemetry(
-                                self._telemetry_dir,
-                                cycle_stamp=_telemetry_run_stamp_c,
-                                kind="backup_creation",
-                                record={
-                                    "fold_stamp": _fold_stamp_c,
-                                    "free_before": _telemetry_free_before,
-                                    "free_after": _telemetry_free_after,
-                                    "total": _telemetry_total,
-                                    "adapter_count": _telemetry_adapter_count,
-                                    "interim_count": _telemetry_interim_count,
-                                },
-                            )
-                        except Exception:  # noqa: BLE001  # boundary: telemetry runs
-                            # inside the CM's entered body — a write failure must
-                            # never replace an in-flight exception (e.g. an
-                            # AbortedDuringConsolidation raised later in the tier
-                            # loop). Losing a telemetry record is strictly
-                            # preferable to a misrouted abort.
-                            logger.warning(
-                                "_run_fold[main_tiers]: telemetry write failed for backup_creation",
-                                exc_info=True,
-                            )
-                tiers_rebuilt: list[str] = []
-                recall_per_tier: dict[str, float] = {}
-                last_per_key_by_tier: dict[str, "list | None"] = {}
+                jobs_by_tier = {
+                    "episodic": TrainingJob(
+                        entries=train_assignment["episodic"],
+                        adapter_name="episodic",
+                        adapter_config=self.episodic_config,
+                        inference_fallback_adapter="episodic_backup",
+                    ),
+                    "semantic": TrainingJob(
+                        entries=train_assignment["semantic"],
+                        adapter_name="semantic",
+                        adapter_config=self.semantic_config,
+                        inference_fallback_adapter="semantic_backup",
+                    ),
+                    "procedural": TrainingJob(
+                        entries=train_assignment["procedural"],
+                        adapter_name="procedural",
+                        adapter_config=self.procedural_config or self.episodic_config,
+                        inference_fallback_adapter="procedural_backup",
+                    ),
+                }
 
-                # Completed-tier set from resume marker (empty on fresh fold).
-                _completed_in_marker: set[str] = (
-                    set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
-                    if _resume_c
-                    else set()
+                # --- Per-tier fresh-adapter rebuild ---
+                tier_config_for_backup = {
+                    "episodic": self.episodic_config,
+                    "semantic": self.semantic_config,
+                    "procedural": self.procedural_config or self.episodic_config,
+                }
+
+                # --- Backup-creation window telemetry (adapter-attributable) ---
+                # The only measurement in this module that is attributable to
+                # adapter VRAM cost — main_tier_backup_scope creates up to three
+                # transient <tier>_backup adapters. free_before is sampled
+                # immediately before the CM opens; free_after is the first
+                # statement inside its body, after backup creation.
+                _telemetry_free_before = (
+                    torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
                 )
-                _marker_checkpoints: dict[str, str] = (
-                    _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
-                    if _resume_c
-                    else {}
-                )
-
-                for tier in ("episodic", "semantic", "procedural"):
-                    backup_name = f"{tier}_backup"
-                    job = jobs_by_tier[tier]
-
-                    if not job.entries and tier not in _fast_start_graduating:
-                        logger.info(
-                            "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild", tier
+                with main_tier_backup_scope(self.model, tier_config_for_backup) as _bscope:
+                    self.model = _bscope.model
+                    if torch.cuda.is_available() and _telemetry_free_before is not None:
+                        _telemetry_free_after, _telemetry_total = torch.cuda.mem_get_info()
+                        _telemetry_adapter_count = len(self.model.peft_config)
+                        _telemetry_interim_count = len(
+                            [a for a in self.model.peft_config if a.startswith(INTERIM_NAME_PREFIX)]
                         )
-                        continue
-
-                    # --- Crash-resume: reload completed tiers from durable checkpoint ---
-                    if _resume_c and tier in _completed_in_marker:
-                        # The checkpoint path stored in the marker (may be absent for
-                        # fast-start tiers, which have no checkpoint-N dir).
-                        _ckpt_path = _marker_checkpoints.get(tier)
                         logger.info(
-                            "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
-                            " durable checkpoint (no retrain); checkpoint=%s",
-                            tier,
-                            _ckpt_path or "production-slot",
+                            "_run_fold[main_tiers]: telemetry backup_creation — "
+                            "free_before=%d free_after=%d adapter_count=%d interim_count=%d",
+                            _telemetry_free_before,
+                            _telemetry_free_after,
+                            _telemetry_adapter_count,
+                            _telemetry_interim_count,
                         )
-                        # Delete the stale production slot (pre-crash _save_adapters never
-                        # ran — weights are stale) and reload from the checkpoint dir or the
-                        # existing production slot for fast-start tiers.
-                        # Per-tier backups created above (lines 4533-4551) mean the deleted
-                        # slot is never the last adapter on the PeftModel (no base-unwrap needed).
-                        if tier in self.model.peft_config:
-                            if backup_name in self.model.peft_config:
-                                from paramem.models.loader import switch_adapter as _sw_pre
-
-                                _sw_pre(self.model, backup_name)
-                            self.model.delete_adapter(tier)
-                            logger.debug(
-                                "_run_fold[main_tiers]: crash-resume deleted stale slot %s", tier
-                            )
-                        if _ckpt_path and Path(_ckpt_path).is_dir():
-                            # checkpoint-N dir present — load the staged adapter
-                            # from it.  HF Trainer saves all PEFT adapters under
-                            # checkpoint-N/<adapter_name>/ (one subdir per adapter).
-                            # The training adapter staging slot is "in_training"
-                            # (trainer._STAGING_ADAPTER), so the weights live at
-                            # checkpoint-N/in_training/adapter_model.safetensors.
-                            # Decrypt into /dev/shm when security is ON (mirrors
-                            # trainer.py:962-976).
-                            from paramem.backup import key_store as _ks
-                            from paramem.training.trainer import _STAGING_ADAPTER as _STAGING_SLOT
-
-                            # Resolve to the staging-adapter subdir within the checkpoint.
-                            _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
-                            _ckpt_effective = (
-                                str(_ckpt_staging_path)
-                                if _ckpt_staging_path.is_dir()
-                                else _ckpt_path
-                            )
-                            _ckpt_shm_dir = None
-                            if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-                                from paramem.backup.checkpoint_shard import (
-                                    materialize_checkpoint_to_shm,
-                                )
-
-                                _ckpt_shm_dir = materialize_checkpoint_to_shm(Path(_ckpt_effective))
-                                _ckpt_load_path = str(_ckpt_shm_dir)
-                            else:
-                                _ckpt_load_path = _ckpt_effective
+                        if self._telemetry_dir is not None:
                             try:
-                                self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
-                                logger.info(
-                                    "_run_fold[main_tiers]: crash-resume loaded %s from"
-                                    " checkpoint %s (staging slot=%s)",
-                                    tier,
-                                    _ckpt_path,
-                                    _STAGING_SLOT,
+                                record_fold_telemetry(
+                                    self._telemetry_dir,
+                                    cycle_stamp=_telemetry_run_stamp_c,
+                                    kind="backup_creation",
+                                    record={
+                                        "fold_stamp": _fold_stamp_c,
+                                        "free_before": _telemetry_free_before,
+                                        "free_after": _telemetry_free_after,
+                                        "total": _telemetry_total,
+                                        "adapter_count": _telemetry_adapter_count,
+                                        "interim_count": _telemetry_interim_count,
+                                    },
                                 )
-                            finally:
-                                if _ckpt_shm_dir is not None and Path(str(_ckpt_shm_dir)).exists():
-                                    import shutil as _s
+                            except Exception:  # noqa: BLE001  # boundary: telemetry runs
+                                # inside the CM's entered body — a write failure must
+                                # never replace an in-flight exception (e.g. an
+                                # AbortedDuringConsolidation raised later in the tier
+                                # loop). Losing a telemetry record is strictly
+                                # preferable to a misrouted abort.
+                                logger.warning(
+                                    "_run_fold[main_tiers]: telemetry write failed"
+                                    " for backup_creation",
+                                    exc_info=True,
+                                )
 
-                                    _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
-                        else:
-                            # no checkpoint dir (fast-start tier, or checkpoint missing).
-                            # Reload from the EXISTING production slot on disk — it was not
-                            # overwritten (final _save_adapters never ran on crash).
-                            from paramem.memory.interim_adapter import (
-                                adapter_slot_root_for_name as _asr_fn,
-                            )
-                            from paramem.models.loader import load_adapter as _la
-
-                            _prod_root = _asr_fn(self.output_dir, tier)
-                            _la(self.model, _prod_root.parent, tier)
-                            logger.info(
-                                "_run_fold[main_tiers]: crash-resume (fast-start/no-ckpt)"
-                                " loaded %s from production slot %s",
-                                tier,
-                                _prod_root.parent,
-                            )
-                        from paramem.models.loader import switch_adapter as _sw_resume
-
-                        _sw_resume(self.model, tier)
-                        last_per_key_by_tier[tier] = None
-                        tiers_rebuilt.append(tier)
-                        continue
-
-                    if backup_name in self.model.peft_config:
-                        from paramem.models.loader import switch_adapter as _sw_backup
-
-                        _sw_backup(self.model, backup_name)
-
-                    if tier in self.model.peft_config:
-                        self.model.delete_adapter(tier)
-                        logger.debug("_run_fold[main_tiers]: deleted adapter %s", tier)
-
-                    tier_cfg = (
-                        self.episodic_config
-                        if tier == "episodic"
-                        else (
-                            self.semantic_config
-                            if tier == "semantic"
-                            else (self.procedural_config or self.episodic_config)
-                        )
+                    # Completed-tier set from resume marker (empty on fresh fold).
+                    _completed_in_marker: set[str] = (
+                        set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
+                        if _resume_c
+                        else set()
                     )
-                    self.model = create_adapter(self.model, tier_cfg, tier)
-                    logger.debug("_run_fold[main_tiers]: created fresh adapter %s", tier)
+                    _marker_checkpoints: dict[str, str] = (
+                        _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
+                        if _resume_c
+                        else {}
+                    )
 
-                    from paramem.models.loader import switch_adapter as _sw
+                    for tier in ("episodic", "semantic", "procedural"):
+                        backup_name = f"{tier}_backup"
+                        job = jobs_by_tier[tier]
 
-                    _sw(self.model, tier)
-
-                    # --- Fast-start graduation branch ---
-                    if tier in _fast_start_graduating:
-                        from paramem.models.loader import copy_adapter_weights as _copy_aw
-                        from paramem.models.loader import (
-                            copy_adapter_weights_subset as _copy_aw_subset,
-                        )
-
-                        if tier == "procedural":
-                            _copy_aw_subset(self.model, src="episodic", dst=tier)
+                        if not job.entries and tier not in _fast_start_graduating:
                             logger.info(
-                                "_run_fold[main_tiers]: fast-start graduation — "
-                                "copied episodic attn weights into procedural"
-                                " (mlp stays zero-init)"
-                            )
-                        else:
-                            _copy_aw(self.model, src="episodic", dst=tier)
-                            logger.info(
-                                "_run_fold[main_tiers]: fast-start graduation — "
-                                "copied episodic weights into %s (full param set)",
+                                "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild",
                                 tier,
-                            )
-
-                        _serve_entries = serve_assignment[tier]
-                        _probe_passing = self._probe_passing_keys(tier, _serve_entries)
-                        _probe_rate = (
-                            len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
-                        )
-                        logger.info(
-                            "_run_fold[main_tiers]: fast-start graduation probe %s"
-                            " — %d/%d passed (%.3f), threshold %.3f",
-                            tier,
-                            len(_probe_passing),
-                            len(_serve_entries),
-                            _probe_rate,
-                            recall_sanity_threshold,
-                        )
-
-                        if _probe_rate >= recall_sanity_threshold:
-                            for _fse in _serve_entries:
-                                self.store.move(_fse["key"], tier)
-                            last_per_key_by_tier[tier] = None
-                            tiers_rebuilt.append(tier)
-                            # mark fast-start tier complete (no checkpoint-N dir
-                            # exists; _mark_tier_complete stores None for reload-from-
-                            # production-slot on a subsequent crash-resume).
-                            self._mark_tier_complete(tier, None)
-                            logger.info(
-                                "_run_fold[main_tiers]: fast-start graduation accepted"
-                                " for %s (%d keys rebooked)",
-                                tier,
-                                len(_serve_entries),
                             )
                             continue
 
-                        logger.warning(
-                            "_run_fold[main_tiers]: fast-start probe FAILED for %s"
-                            " (%.3f < %.3f) — falling back to train-from-scratch",
-                            tier,
-                            _probe_rate,
-                            recall_sanity_threshold,
-                        )
-                        _fast_start_graduating.discard(tier)
-                        job.entries = list(_serve_entries)
-                        for _fse in _serve_entries:
-                            self.store.move(_fse["key"], tier)
-                        if tier in self.model.peft_config:
-                            if backup_name in self.model.peft_config:
-                                _sw(self.model, backup_name)
-                            self.model.delete_adapter(tier)
-                        self.model = create_adapter(self.model, tier_cfg, tier)
-                        _sw(self.model, tier)
-                        logger.debug(
-                            "_run_fold[main_tiers]: recreated fresh adapter %s for"
-                            " fallback training",
-                            tier,
-                        )
+                        # --- Crash-resume: reload completed tiers from durable checkpoint ---
+                        if _resume_c and tier in _completed_in_marker:
+                            # The checkpoint path stored in the marker (may be absent for
+                            # fast-start tiers, which have no checkpoint-N dir).
+                            _ckpt_path = _marker_checkpoints.get(tier)
+                            logger.info(
+                                "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
+                                " durable checkpoint (no retrain); checkpoint=%s",
+                                tier,
+                                _ckpt_path or "production-slot",
+                            )
+                            # Delete the stale production slot (pre-crash _save_adapters never
+                            # ran — weights are stale) and reload from the checkpoint dir or the
+                            # existing production slot for fast-start tiers.
+                            # The per-tier backups created above mean the deleted
+                            # slot is never the last adapter on the PeftModel
+                            # (no base-unwrap needed).
+                            if tier in self.model.peft_config:
+                                if backup_name in self.model.peft_config:
+                                    from paramem.models.loader import switch_adapter as _sw_pre
 
-                    prior_job = None
-                    recall_state = None
-                    if trainer is not None:
-                        prior_job = trainer._current_job
-                        trainer._current_job = job
-                        trainer._set_is_training(True)
-                    # --- Per-tier device-saturation telemetry ---
-                    # max_memory_allocated() is a process-wide PyTorch-allocator
-                    # counter, polluted by the per-epoch recall probe's
-                    # model.generate() and by inference served during
-                    # BackgroundTrainer step-yields — NOT an adapter cost.
-                    # Bare snapshots only (never vram_measure: that captures
-                    # endpoint free-deltas, not the intra-training peak this
-                    # needs, and its OOM->VramExhausted transform is beside the
-                    # point here since abort/rollback is gated on
-                    # _tier_metrics.get("aborted"), a normal return value).
-                    _telemetry_tier_free_before: int | None = None
-                    _telemetry_tier_total: int | None = None
-                    if torch.cuda.is_available():
-                        torch.cuda.reset_peak_memory_stats()
-                        _telemetry_tier_free_before, _telemetry_tier_total = (
-                            torch.cuda.mem_get_info()
-                        )
-                    try:
-                        _tier_metrics, recall_state = self._train_tier_adapter(
-                            job.entries,
-                            adapter_name=tier,
-                            adapter_config=tier_cfg,
-                            training_config=refresh_training_config,
-                            output_dir=self.output_dir / "consolidation_refresh" / tier,
-                            run_name=f"consolidate-{tier}",
-                            phase_name=f"consolidate-{tier}",
-                            retain_scratch_until_external_commit=True,
-                        )
-                        if _tier_metrics is not None:
-                            if _tier_metrics.get("aborted"):
-                                logger.info(
-                                    "_run_fold[main_tiers]: training aborted on tier %s "
-                                    "— restoring all tiers from backups",
+                                    _sw_pre(self.model, backup_name)
+                                self.model.delete_adapter(tier)
+                                logger.debug(
+                                    "_run_fold[main_tiers]: crash-resume deleted stale slot %s",
                                     tier,
                                 )
-                                raise AbortedDuringConsolidation(
-                                    f"training aborted on tier {tier!r}"
+                            if _ckpt_path and Path(_ckpt_path).is_dir():
+                                # checkpoint-N dir present — load the staged adapter
+                                # from it.  HF Trainer saves all PEFT adapters under
+                                # checkpoint-N/<adapter_name>/ (one subdir per adapter).
+                                # The training adapter staging slot is "in_training"
+                                # (trainer._STAGING_ADAPTER), so the weights live at
+                                # checkpoint-N/in_training/adapter_model.safetensors.
+                                # Decrypt into /dev/shm when security is ON (mirrors
+                                # trainer.py:962-976).
+                                from paramem.backup import key_store as _ks
+                                from paramem.training.trainer import (
+                                    _STAGING_ADAPTER as _STAGING_SLOT,
+                                )
+
+                                # Resolve to the staging-adapter subdir within the checkpoint.
+                                _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
+                                _ckpt_effective = (
+                                    str(_ckpt_staging_path)
+                                    if _ckpt_staging_path.is_dir()
+                                    else _ckpt_path
+                                )
+                                _ckpt_shm_dir = None
+                                if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+                                    from paramem.backup.checkpoint_shard import (
+                                        materialize_checkpoint_to_shm,
+                                    )
+
+                                    _ckpt_shm_dir = materialize_checkpoint_to_shm(
+                                        Path(_ckpt_effective)
+                                    )
+                                    _ckpt_load_path = str(_ckpt_shm_dir)
+                                else:
+                                    _ckpt_load_path = _ckpt_effective
+                                try:
+                                    self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
+                                    logger.info(
+                                        "_run_fold[main_tiers]: crash-resume loaded %s from"
+                                        " checkpoint %s (staging slot=%s)",
+                                        tier,
+                                        _ckpt_path,
+                                        _STAGING_SLOT,
+                                    )
+                                finally:
+                                    if (
+                                        _ckpt_shm_dir is not None
+                                        and Path(str(_ckpt_shm_dir)).exists()
+                                    ):
+                                        import shutil as _s
+
+                                        _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
+                            else:
+                                # no checkpoint dir (fast-start tier, or checkpoint missing).
+                                # Reload from the EXISTING production slot on disk — it was not
+                                # overwritten (final _save_adapters never ran on crash).
+                                from paramem.memory.interim_adapter import (
+                                    adapter_slot_root_for_name as _asr_fn,
+                                )
+                                from paramem.models.loader import load_adapter as _la
+
+                                _prod_root = _asr_fn(self.output_dir, tier)
+                                _la(self.model, _prod_root.parent, tier)
+                                logger.info(
+                                    "_run_fold[main_tiers]: crash-resume (fast-start/no-ckpt)"
+                                    " loaded %s from production slot %s",
+                                    tier,
+                                    _prod_root.parent,
+                                )
+                            from paramem.models.loader import switch_adapter as _sw_resume
+
+                            _sw_resume(self.model, tier)
+                            last_per_key_by_tier[tier] = None
+                            tiers_rebuilt.append(tier)
+                            continue
+
+                        if backup_name in self.model.peft_config:
+                            from paramem.models.loader import switch_adapter as _sw_backup
+
+                            _sw_backup(self.model, backup_name)
+
+                        if tier in self.model.peft_config:
+                            self.model.delete_adapter(tier)
+                            logger.debug("_run_fold[main_tiers]: deleted adapter %s", tier)
+
+                        tier_cfg = (
+                            self.episodic_config
+                            if tier == "episodic"
+                            else (
+                                self.semantic_config
+                                if tier == "semantic"
+                                else (self.procedural_config or self.episodic_config)
+                            )
+                        )
+                        self.model = create_adapter(self.model, tier_cfg, tier)
+                        logger.debug("_run_fold[main_tiers]: created fresh adapter %s", tier)
+
+                        from paramem.models.loader import switch_adapter as _sw
+
+                        _sw(self.model, tier)
+
+                        # --- Fast-start graduation branch ---
+                        if tier in _fast_start_graduating:
+                            from paramem.models.loader import copy_adapter_weights as _copy_aw
+                            from paramem.models.loader import (
+                                copy_adapter_weights_subset as _copy_aw_subset,
+                            )
+
+                            if tier == "procedural":
+                                _copy_aw_subset(self.model, src="episodic", dst=tier)
+                                logger.info(
+                                    "_run_fold[main_tiers]: fast-start graduation — "
+                                    "copied episodic attn weights into procedural"
+                                    " (mlp stays zero-init)"
                                 )
                             else:
+                                _copy_aw(self.model, src="episodic", dst=tier)
                                 logger.info(
-                                    "_run_fold[main_tiers]: trained %s on %d keys",
+                                    "_run_fold[main_tiers]: fast-start graduation — "
+                                    "copied episodic weights into %s (full param set)",
                                     tier,
-                                    len(job.entries),
                                 )
-                    finally:
-                        if trainer is not None:
-                            trainer._set_is_training(False)
-                            trainer._current_job = prior_job
-                        if torch.cuda.is_available() and _telemetry_tier_free_before is not None:
-                            _telemetry_tier_peak = torch.cuda.max_memory_allocated()
-                            # peak_reserved is the OOM-relevant quantity: the
-                            # caching allocator raises when it cannot reserve,
-                            # not when driver-free (mem_get_info) drops —
-                            # driver-free counts cached-but-unused allocator
-                            # segments as used, which peak_reserved does not.
-                            _telemetry_tier_peak_reserved = torch.cuda.max_memory_reserved()
-                            _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
-                            logger.info(
-                                "_run_fold[main_tiers]: telemetry tier_train[%s] "
-                                "(device-saturation indicator, not adapter cost) — "
-                                "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
-                                tier,
-                                _telemetry_tier_free_before,
-                                _telemetry_tier_free_after,
-                                _telemetry_tier_peak,
-                                _telemetry_tier_peak_reserved,
+
+                            _serve_entries = serve_assignment[tier]
+                            _probe_passing = self._probe_passing_keys(tier, _serve_entries)
+                            _probe_rate = (
+                                len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
                             )
-                            if self._telemetry_dir is not None:
-                                try:
-                                    record_fold_telemetry(
-                                        self._telemetry_dir,
-                                        cycle_stamp=_telemetry_run_stamp_c,
-                                        kind="tier_train",
-                                        record={
-                                            "tier": tier,
-                                            "fold_stamp": _fold_stamp_c,
-                                            "free_before": _telemetry_tier_free_before,
-                                            "free_after": _telemetry_tier_free_after,
-                                            "peak_alloc": _telemetry_tier_peak,
-                                            "peak_reserved": _telemetry_tier_peak_reserved,
-                                            "total": _telemetry_tier_total,
-                                            "adapter_count": len(self.model.peft_config),
-                                            "interim_count": len(
-                                                [
-                                                    a
-                                                    for a in self.model.peft_config
-                                                    if a.startswith(INTERIM_NAME_PREFIX)
-                                                ]
-                                            ),
-                                            "epochs": refresh_training_config.num_epochs,
-                                        },
-                                    )
-                                except Exception:  # noqa: BLE001  # boundary: this
-                                    # finally runs on the abort path too — e.g.
-                                    # AbortedDuringConsolidation is raised in the try
-                                    # above and would reach main_tier_backup_scope's
-                                    # except only if this finally does not itself
-                                    # raise. A telemetry write failure here (disk
-                                    # full, permissions, corrupt store) must never
-                                    # replace the in-flight exception and misroute an
-                                    # abort to the crash-incident path. Losing a
-                                    # telemetry record is strictly preferable.
-                                    logger.warning(
-                                        "_run_fold[main_tiers]: telemetry write failed for tier %s",
+                            logger.info(
+                                "_run_fold[main_tiers]: fast-start graduation probe %s"
+                                " — %d/%d passed (%.3f), threshold %.3f",
+                                tier,
+                                len(_probe_passing),
+                                len(_serve_entries),
+                                _probe_rate,
+                                recall_sanity_threshold,
+                            )
+
+                            if _probe_rate >= recall_sanity_threshold:
+                                for _fse in _serve_entries:
+                                    self.store.move(_fse["key"], tier)
+                                last_per_key_by_tier[tier] = None
+                                tiers_rebuilt.append(tier)
+                                # mark fast-start tier complete (no checkpoint-N dir
+                                # exists; _mark_tier_complete stores None for reload-from-
+                                # production-slot on a subsequent crash-resume).
+                                self._mark_tier_complete(tier, None)
+                                logger.info(
+                                    "_run_fold[main_tiers]: fast-start graduation accepted"
+                                    " for %s (%d keys rebooked)",
+                                    tier,
+                                    len(_serve_entries),
+                                )
+                                continue
+
+                            logger.warning(
+                                "_run_fold[main_tiers]: fast-start probe FAILED for %s"
+                                " (%.3f < %.3f) — falling back to train-from-scratch",
+                                tier,
+                                _probe_rate,
+                                recall_sanity_threshold,
+                            )
+                            _fast_start_graduating.discard(tier)
+                            job.entries = list(_serve_entries)
+                            for _fse in _serve_entries:
+                                self.store.move(_fse["key"], tier)
+                            if tier in self.model.peft_config:
+                                if backup_name in self.model.peft_config:
+                                    _sw(self.model, backup_name)
+                                self.model.delete_adapter(tier)
+                            self.model = create_adapter(self.model, tier_cfg, tier)
+                            _sw(self.model, tier)
+                            logger.debug(
+                                "_run_fold[main_tiers]: recreated fresh adapter %s for"
+                                " fallback training",
+                                tier,
+                            )
+
+                        prior_job = None
+                        recall_state = None
+                        if trainer is not None:
+                            prior_job = trainer._current_job
+                            trainer._current_job = job
+                            trainer._set_is_training(True)
+                        # --- Per-tier device-saturation telemetry ---
+                        # max_memory_allocated() is a process-wide PyTorch-allocator
+                        # counter, polluted by the per-epoch recall probe's
+                        # model.generate() and by inference served during
+                        # BackgroundTrainer step-yields — NOT an adapter cost.
+                        # Bare snapshots only (never vram_measure: that captures
+                        # endpoint free-deltas, not the intra-training peak this
+                        # needs, and its OOM->VramExhausted transform is beside the
+                        # point here since abort/rollback is gated on
+                        # _tier_metrics.get("aborted"), a normal return value).
+                        _telemetry_tier_free_before: int | None = None
+                        _telemetry_tier_total: int | None = None
+                        if torch.cuda.is_available():
+                            torch.cuda.reset_peak_memory_stats()
+                            _telemetry_tier_free_before, _telemetry_tier_total = (
+                                torch.cuda.mem_get_info()
+                            )
+                        try:
+                            _tier_metrics, recall_state = self._train_tier_adapter(
+                                job.entries,
+                                adapter_name=tier,
+                                adapter_config=tier_cfg,
+                                training_config=refresh_training_config,
+                                output_dir=self.output_dir / "consolidation_refresh" / tier,
+                                run_name=f"consolidate-{tier}",
+                                phase_name=f"consolidate-{tier}",
+                                retain_scratch_until_external_commit=True,
+                            )
+                            if _tier_metrics is not None:
+                                if _tier_metrics.get("aborted"):
+                                    logger.info(
+                                        "_run_fold[main_tiers]: training aborted on tier %s "
+                                        "— restoring all tiers from backups",
                                         tier,
-                                        exc_info=True,
                                     )
+                                    raise AbortedDuringConsolidation(
+                                        f"training aborted on tier {tier!r}"
+                                    )
+                                else:
+                                    logger.info(
+                                        "_run_fold[main_tiers]: trained %s on %d keys",
+                                        tier,
+                                        len(job.entries),
+                                    )
+                        finally:
+                            if trainer is not None:
+                                trainer._set_is_training(False)
+                                trainer._current_job = prior_job
+                            if (
+                                torch.cuda.is_available()
+                                and _telemetry_tier_free_before is not None
+                            ):
+                                _telemetry_tier_peak = torch.cuda.max_memory_allocated()
+                                # peak_reserved is the OOM-relevant quantity: the
+                                # caching allocator raises when it cannot reserve,
+                                # not when driver-free (mem_get_info) drops —
+                                # driver-free counts cached-but-unused allocator
+                                # segments as used, which peak_reserved does not.
+                                _telemetry_tier_peak_reserved = torch.cuda.max_memory_reserved()
+                                _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
+                                logger.info(
+                                    "_run_fold[main_tiers]: telemetry tier_train[%s] "
+                                    "(device-saturation indicator, not adapter cost) — "
+                                    "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
+                                    tier,
+                                    _telemetry_tier_free_before,
+                                    _telemetry_tier_free_after,
+                                    _telemetry_tier_peak,
+                                    _telemetry_tier_peak_reserved,
+                                )
+                                if self._telemetry_dir is not None:
+                                    try:
+                                        record_fold_telemetry(
+                                            self._telemetry_dir,
+                                            cycle_stamp=_telemetry_run_stamp_c,
+                                            kind="tier_train",
+                                            record={
+                                                "tier": tier,
+                                                "fold_stamp": _fold_stamp_c,
+                                                "free_before": _telemetry_tier_free_before,
+                                                "free_after": _telemetry_tier_free_after,
+                                                "peak_alloc": _telemetry_tier_peak,
+                                                "peak_reserved": _telemetry_tier_peak_reserved,
+                                                "total": _telemetry_tier_total,
+                                                "adapter_count": len(self.model.peft_config),
+                                                "interim_count": len(
+                                                    [
+                                                        a
+                                                        for a in self.model.peft_config
+                                                        if a.startswith(INTERIM_NAME_PREFIX)
+                                                    ]
+                                                ),
+                                                "epochs": refresh_training_config.num_epochs,
+                                            },
+                                        )
+                                    except Exception:  # noqa: BLE001  # boundary: this
+                                        # finally runs on the abort path too — e.g.
+                                        # AbortedDuringConsolidation is raised in the try
+                                        # above and would reach main_tier_backup_scope's
+                                        # except only if this finally does not itself
+                                        # raise. A telemetry write failure here (disk
+                                        # full, permissions, corrupt store) must never
+                                        # replace the in-flight exception and misroute an
+                                        # abort to the crash-incident path. Losing a
+                                        # telemetry record is strictly preferable.
+                                        logger.warning(
+                                            "_run_fold[main_tiers]: telemetry write failed"
+                                            " for tier %s",
+                                            tier,
+                                            exc_info=True,
+                                        )
 
-                    last_per_key_by_tier[tier] = (
-                        recall_state.last_per_key if recall_state is not None else None
-                    )
-                    if recall_state is not None and recall_state.last_per_key is not None:
-                        on_recall_probe(
-                            recall_state.last_per_key,
-                            phase="train_fill",
-                            adapter_name=tier,
+                        last_per_key_by_tier[tier] = (
+                            recall_state.last_per_key if recall_state is not None else None
                         )
-                    tiers_rebuilt.append(tier)
-                    # Mark this tier complete in the fold_resume.json marker so that a
-                    # crash AFTER training but BEFORE _save_adapters can reload it without
-                    # retraining on the next re-entry.  Locate the retained checkpoint-N dir
-                    # (retain_scratch_until_external_commit=True keeps it alive until
-                    # _save_adapters below).
-                    _tier_ckpt_path = self._latest_checkpoint_in_dir(
-                        self.output_dir / "consolidation_refresh" / tier
-                    )
-                    self._mark_tier_complete(tier, _tier_ckpt_path)
+                        if recall_state is not None and recall_state.last_per_key is not None:
+                            on_recall_probe(
+                                recall_state.last_per_key,
+                                phase="train_fill",
+                                adapter_name=tier,
+                            )
+                        tiers_rebuilt.append(tier)
+                        # Mark this tier complete in the fold_resume.json marker so that a
+                        # crash AFTER training but BEFORE _save_adapters can reload it without
+                        # retraining on the next re-entry.  Locate the retained checkpoint-N dir
+                        # (retain_scratch_until_external_commit=True keeps it alive until
+                        # _save_adapters below).
+                        _tier_ckpt_path = self._latest_checkpoint_in_dir(
+                            self.output_dir / "consolidation_refresh" / tier
+                        )
+                        self._mark_tier_complete(tier, _tier_ckpt_path)
 
-                if trainer is not None:
-                    trainer._set_is_training(False)
+                    if trainer is not None:
+                        trainer._set_is_training(False)
 
             # --- Atomic finalize ---
+            # Interim disposal follows from the key source, not from a flag of
+            # its own: a fold whose keys came from the main tiers alone never
+            # read the interim slots, so it must leave both their registries and
+            # their on-disk payload exactly where they are.
+            _absorbed_interims = scope.keys_from == "all_tiers"
+
             if self.store.replay_enabled:
-                passing_sets_by_tier: dict[str, "set[str] | None"] = {}
-                for _tier in ("episodic", "semantic", "procedural"):
-                    _lpk = last_per_key_by_tier.get(_tier)
-                    if _lpk is not None:
-                        _serve_keys = {e["key"] for e in serve_assignment[_tier]}
-                        passing_sets_by_tier[_tier] = {
-                            r["key"] for r in _lpk if r["exact_match"]
-                        } & _serve_keys
-                    else:
-                        passing_sets_by_tier[_tier] = None
+                # Recall gating is a weight verdict.  The disk venue has no
+                # weights to verify against, so it passes None for the whole
+                # dict — the documented "skip recall gating" signal, distinct
+                # from a per-tier None (which triggers the weight probe).
+                passing_sets_by_tier: "dict[str, set[str] | None] | None" = None
+                if scope.source == "weights":
+                    passing_sets_by_tier = {}
+                    for _tier in ("episodic", "semantic", "procedural"):
+                        _lpk = last_per_key_by_tier.get(_tier)
+                        if _lpk is not None:
+                            _serve_keys = {e["key"] for e in serve_assignment[_tier]}
+                            passing_sets_by_tier[_tier] = {
+                                r["key"] for r in _lpk if r["exact_match"]
+                            } & _serve_keys
+                        else:
+                            passing_sets_by_tier[_tier] = None
 
                 self._reset_main_tier_registries_and_simhashes(
                     serve_assignment,
                     passing_sets_by_tier,
                     soft_stale_by_tier=soft_stale_by_tier,
                 )
-                self._drop_interim_tier_registries()
+                if _absorbed_interims:
+                    self._drop_interim_tier_registries()
                 for _reg_tier in ("episodic", "semantic", "procedural"):
                     _reg_tier_dir = self.output_dir / _reg_tier
                     _reg_tier_dir.mkdir(parents=True, exist_ok=True)
@@ -4508,11 +4515,20 @@ class ConsolidationLoop:
                         _reg_path,
                     )
 
-            if self.store.replay_enabled and tiers_rebuilt:
+            # ONE predicate for persist AND reap.  A fold that wrote nothing must
+            # not destroy what it read: the interim slots are the only copy of
+            # their content until the merged main tiers are on disk (in the disk
+            # venue the slot's graph.json IS the payload; in the weights venue it
+            # is the slot adapter).  Reaping them after a no-persist fold is data
+            # loss by construction, so the two guards are the same expression,
+            # bound once so they cannot drift apart.
+            _fold_persisted = self.store.replay_enabled and bool(tiers_rebuilt)
+
+            if _fold_persisted:
                 self._persist_fold(scope)
-                logger.info("_run_fold[main_tiers]: merged main weights persisted+verified")
+                logger.info("_run_fold[main_tiers]: merged main tiers persisted")
                 # Clean fold-resume marker + retained scratch checkpoints after
-                # _save_adapters succeeds.  On _save_adapters FAILURE (the except
+                # the persist succeeds.  On persist FAILURE (the except
                 # above re-raises) the marker is intentionally LEFT so a retry can
                 # resume completed tiers without retraining.
                 self._clear_fold_resume()
@@ -4534,8 +4550,19 @@ class ConsolidationLoop:
                     sum(len(v) for v in soft_stale_by_tier.values()),
                 )
 
-            unload_interim_adapters(self.model, self.output_dir)
-            logger.info("_run_fold[main_tiers]: interim adapters unloaded")
+            if not _absorbed_interims:
+                logger.info(
+                    "_run_fold[main_tiers]: rebuilt from the main tiers' own keys"
+                    " — interim slots untouched (not folded in, so not reaped)"
+                )
+            elif _fold_persisted:
+                unload_interim_adapters(self.model, self.output_dir)
+                logger.info("_run_fold[main_tiers]: interim slots reaped")
+            else:
+                logger.info(
+                    "_run_fold[main_tiers]: nothing persisted — interim slots kept"
+                    " (their content is still the only copy)"
+                )
 
             if router is not None:
                 try:
@@ -4544,7 +4571,7 @@ class ConsolidationLoop:
                 except Exception:
                     logger.exception("_run_fold[main_tiers]: router reload failed")
 
-            if "episodic" in self.model.peft_config:
+            if scope.source == "weights" and "episodic" in self.model.peft_config:
                 from paramem.models.loader import switch_adapter as _sw2
 
                 _sw2(self.model, "episodic")
@@ -4579,7 +4606,6 @@ class ConsolidationLoop:
                 "recall_miss_keys": sorted(recall_miss_keys),
                 "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
                 "tier_keyed": serve_assignment,
-                "recall_per_tier": recall_per_tier,
                 "rolled_back": False,
                 "rollback_tier": None,
                 "tier_delta": _train_tier_delta,
@@ -4592,6 +4618,7 @@ class ConsolidationLoop:
         self,
         *,
         mode: str,
+        keys_from: "Literal['all_tiers', 'main_tiers']" = "all_tiers",
         consume_pending: bool = False,
         trainer=None,
         router=None,
@@ -4604,18 +4631,24 @@ class ConsolidationLoop:
         no content gate, no notion of who asked for the fold, and no way to bypass
         the per-tier floor or the whole-fold accumulate guard.
 
-        Two venues, selected by *mode*:
+        Both venues run the SAME stage spine over the SAME input — the
+        :class:`~paramem.memory.store.MemoryStore`, whose main-tier and
+        interim-slot registries are hydrated at boot and after every cycle.
+        Materialize → refine → promote → build entries → tier floor → drift
+        partition → registry rewrite → persist → interim unload → router reload
+        → tier delta is one code path.  *mode* selects only:
 
-        - **train**: reconstruct every active key from adapter weights, re-merge
-          registry-true relations, rebuild the main ``episodic`` / ``semantic`` /
-          ``procedural`` adapters, persist + verify them, then unload the interim
-          slots and reload the router.  Requires the caller to already hold
-          ``_gpu_thread_lock`` (submit via ``BackgroundTrainer.submit()``); the entry
-          guard below raises when it does not.  On a failed per-tier recall-sanity
-          check the tier is restored from its backup slot and the fold aborts.
-        - **simulate**: merge the canonical ``episodic/graph.json`` with every
-          simulate-mode interim slot graph, run the same grooming topology, and write
-          the merged graph back to disk.  No model, no GPU, no registry mutation.
+        - **train** (``source="weights"``): additionally probes the adapters for
+          recall misses, backs the main tiers up, retrains
+          ``episodic`` / ``semantic`` / ``procedural``, and persists + verifies
+          the weights.  Requires the caller to already hold ``_gpu_thread_lock``
+          (submit via ``BackgroundTrainer.submit()``); the entry guard below
+          raises when it does not.  On a failed per-tier recall-sanity check the
+          tier is restored from its backup slot and the fold aborts.
+        - **simulate** (``source="disk"``): skips those weight-only blocks and
+          persists each main tier as ``<adapter_dir>/<tier>/graph.json``, the
+          path :class:`~paramem.memory.source.DiskMemorySource` reads back.  No
+          model, no GPU.
 
         Both venues route through :meth:`_run_fold`; the ``mode`` string is translated
         into a :class:`FoldScope` here and never travels further (the mode-fork guard
@@ -4625,6 +4658,12 @@ class ConsolidationLoop:
             mode: ``"train"`` or ``"simulate"``.  Required — ``ConsolidationConfig``
                 carries no ``mode`` field; the server passes
                 ``config.consolidation.mode``.
+            keys_from: The fold's key source (see :class:`FoldScope`).
+                ``"all_tiers"`` (the default) folds the interim slots into main
+                and reaps them; ``"main_tiers"`` rebuilds main memory from its
+                own keys and leaves every interim slot on disk.  It is a filter
+                on one fold, not a second ingest path: both values run the same
+                spine over the same store.
             consume_pending: When ``True`` (train only), the fold snapshots the
                 pending-session relations already deposited in ``merger.graph`` by the
                 caller's extraction pre-stage and trains them into the main tiers.  The
@@ -4634,14 +4673,13 @@ class ConsolidationLoop:
                 holding the GPU lock (train only).  Required for the per-tier re-arm
                 pattern.
             router: Router instance whose ``reload()`` is called at the end of the
-                atomic finalize sequence (train only).  ``None`` is safe — skipped.
+                atomic finalize sequence (both venues).  ``None`` is safe — skipped.
             recall_sanity_threshold: Override for the recall gate (train only).  When
                 ``None``, ``self.config.recall_sanity_threshold`` is used.
 
         Returns:
-            The full-fold result dict (see :meth:`_run_fold`).  ``tier_delta`` is
-            always present; the simulate venue returns zero/empty equivalents for the
-            weight-venue fields.
+            The full-fold result dict (see :meth:`_run_fold`) — one schema for both
+            venues and every terminal return.
 
         Raises:
             ValueError: When ``consume_pending`` is requested on the simulate venue.
@@ -4665,22 +4703,25 @@ class ConsolidationLoop:
             # Every artifact the fold and its nested passes emit lands in this
             # cycle's debug root; a calibration run, when one is open, adds its
             # own root independently.
+            # promote/tier_floor are ON: both are pure store operations, so they
+            # belong to this venue exactly as much as to the weights venue.
             with self._artifact_scope():
                 return self._run_fold(
                     FoldScope(
                         name="full",
                         source="disk",
-                        persist="graph_json",
+                        persist="main_tiers",
                         tier=None,
-                        extra_relations_source="disk",
                         defer=False,
                         tag_new=False,
                         normalize=(self.config.refinement_normalization == "on"),
                         enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
-                        promote=False,
-                        tier_floor=False,
+                        promote=True,
+                        tier_floor=True,
                         subtractive_scope="fold",
+                        keys_from=keys_from,
                     ),
+                    router=router,
                 )
 
         from paramem.server.gpu_lock import _gpu_thread_lock
@@ -4706,7 +4747,6 @@ class ConsolidationLoop:
                     source="weights",
                     persist="main_tiers",
                     tier=None,
-                    extra_relations_source="pending" if consume_pending else "none",
                     defer=False,
                     tag_new=False,
                     normalize=(self.config.refinement_normalization == "on"),
@@ -4715,6 +4755,7 @@ class ConsolidationLoop:
                     tier_floor=True,
                     subtractive_scope="fold",
                     consume_pending=consume_pending,
+                    keys_from=keys_from,
                 ),
                 trainer=trainer,
                 router=router,
@@ -5101,7 +5142,10 @@ class ConsolidationLoop:
                 # ---- Keyed branch: existing key, anti-forgetting replay ----
                 entry = self.store.get(key)
                 if entry is None:
-                    # Key is registered but has no content entry — skip.
+                    # Registered but content-free EVERYWHERE: the fold hydrated
+                    # the store from the venue's source of truth before reaching
+                    # here (_hydrate_store_for_fold), so this is not a cache
+                    # artifact and the key genuinely has nothing to replay.
                     logger.debug(
                         "_build_all_edge_entries_into: key %s has no content entry — skipping",
                         key,
@@ -5272,9 +5316,11 @@ class ConsolidationLoop:
         lossy reconstruction result.
 
         For each key the content is sourced from the store entry
-        (``store.get(key)``).  When the entry is absent (hydration miss on a
-        LIVE active key, e.g. under ``boot_degraded``), the key is logged as
-        an orphan and skipped.  Bookkeeping never carries SPO.
+        (``store.get(key)``).  The fold hydrates the store from the venue's
+        :class:`~paramem.memory.source.MemorySource` before this runs
+        (:meth:`_hydrate_store_for_fold`), so an absent entry means no venue
+        holds content for that live key; it is logged as an orphan and skipped.
+        Bookkeeping never carries SPO.
 
         ``relation_type``, ``speaker_id``, ``last_seen``, and ``first_seen``
         always come from bookkeeping (never from the entry payload which
@@ -5311,7 +5357,7 @@ class ConsolidationLoop:
                 pred = entry.get("predicate", "")
                 obj = entry.get("object", "")
             else:
-                # Hydration-miss — entry cache is empty for this live key.
+                # No content in the store and none in the source of truth.
                 # Bookkeeping never carries SPO; log and skip (orphan).
                 logger.debug(
                     "_build_registry_true_relations: key=%s has no entry — skipping (orphan)",
@@ -5361,12 +5407,14 @@ class ConsolidationLoop:
         This is the *Materialize* stage of the fold pipeline:
 
         1. Probe every active key from adapter weights via :func:`reconstruct_graph`
-           (``strict=False``).  Skipped when ``source="disk"`` (no weight reconstruction
-           for the simulate venue — disk relations are supplied via ``extra_relations``).
+           (``strict=False``).  Skipped when ``source="disk"`` — that venue has no
+           adapter weights to probe.
         2. Compute ``recall_miss_keys`` — keys whose reconstructed SPO disagrees with
            registry-true SPO, or whose reconstruction failed outright.  The set is
-           computed against ``store.all_active_keys()`` BEFORE the graph reset, so
-           only registered keys can appear in the miss set.
+           computed over the CALLER'S key set (*keys*, defaulting to
+           ``store.all_active_keys()``) BEFORE the graph reset, so only registered
+           keys the caller actually folds can appear in the miss set.  Skipped with
+           step 1; ``set()`` for ``source="disk"``.
         3. Reset the merger's keying graph to empty (``merger.reset_graph()``).
         4. Build registry-true :class:`Relation` objects via
            :meth:`_build_registry_true_relations` and re-merge them into the fresh
@@ -5387,7 +5435,7 @@ class ConsolidationLoop:
         **INVARIANT — extra_relations and the recall-miss set:**
         ``extra_relations`` participate in the MERGE / Case-1-adopt step ONLY.
         They MUST NOT enter the ``recall_miss_keys`` set.  That set is computed
-        against ``store.all_active_keys()`` in step 2, BEFORE the reset — pending
+        over the resolved *keys* in step 2, BEFORE the reset — pending
         unregistered relations (not yet in the registry) therefore cannot distort it.
         Both ``extra_relations=None`` and ``extra_relations=[]`` are valid no-ops for
         the fold caller (fold passes ``None``; the check is ``if extra_relations``).
@@ -5399,7 +5447,7 @@ class ConsolidationLoop:
         :meth:`_build_all_edge_entries_into` so the dedup-target (main-tier)
         keyed edges are neither minted nor keyed-replayed into the training
         set.  The merge fires ONLY when ``dedup_target_keys is not None`` —
-        ``None`` is a true no-op (the full-fold and simulate callers never
+        ``None`` is a true no-op (the full-fold callers never
         pass this param, so their behavior is byte-identical to before this
         change).  Never pass ``None`` to :meth:`_build_registry_true_relations`
         as the resolved ``keys=`` argument here — that means "all active
@@ -5432,53 +5480,44 @@ class ConsolidationLoop:
         walk (correct default).
 
         Args:
-            source: Materialize axis — ``"weights"`` (default) or ``"disk"``.
+            source: **Weight-probe gate only.**  It does NOT select the merge
+                input — :meth:`_build_registry_true_relations` reads the store
+                in both venues, and the store is populated in both venues
+                (``MemoryStore.load_registries_from_disk`` hydrates every main
+                and interim tier regardless of venue; the per-entry payload
+                comes from the venue's
+                :class:`~paramem.memory.source.MemorySource`).
 
-                - ``"weights"``: today's behaviour byte-for-byte.  Calls
-                  :func:`reconstruct_graph`, computes ``recall_miss_keys``, resets
-                  the merger, builds registry-true :class:`Relation` objects via
-                  :meth:`_build_registry_true_relations` and re-merges them.
-                - ``"disk"``: skips weight reconstruction entirely (no adapter weights
-                  available in the simulate venue).  ``recall_miss_keys`` is the empty
-                  ``set()`` — a retrain signal is meaningless when no retraining
-                  occurs.  The disk :class:`Relation` objects are supplied by the
-                  caller via ``extra_relations`` and enter the merge via the same
-                  ``extra_relations`` channel.  :meth:`_build_registry_true_relations`
-                  is NOT called (returns ``[]`` from the empty simulate store — calling
-                  it would silently zero the merge input).  ``recon_relations`` returns
-                  ``[]``, making :meth:`_refine_consolidation_graph`'s recurrence-bump
-                  guard a no-op (correct: simulate store has no registered keys to bump).
-
-                **Persist contract:** for ``source="disk"`` the persist tail
-                MUST write ``save_memory_to_disk(self.merger.graph, path)`` DIRECTLY —
-                NOT derive the graph from ``tier_keyed``.  Disk relations carry ``ik_key``;
-                the keyed branch of ``_build_all_edge_entries_into`` does ``store.get(key)``
-                against the empty simulate store and silently skips unmatched edges, making
-                ``tier_keyed`` empty.  The direct graph write is the only correct path.
+                - ``"weights"``: run steps 1-2 — probe adapter weights via
+                  :func:`reconstruct_graph` and compute ``recall_miss_keys``.
+                - ``"disk"``: skip steps 1-2 (no adapter weights exist).
+                  ``recall_miss_keys`` is ``set()`` — a retrain signal is
+                  meaningless for a venue that does not retrain.  Every other
+                  step runs identically.
             tier: Forwarded to :func:`reconstruct_graph` as ``tier``.  When
-                ``None`` (the default), all tiers are probed — byte-identical to
-                the original inline fold behaviour.  Ignored when ``source="disk"``.
-            keys: Forwarded to :meth:`_build_registry_true_relations` as ``keys``.
-                When ``None`` (the default), all active keys are processed —
-                byte-identical to the original inline fold behaviour.  Ignored when
-                ``source="disk"``.
+                ``None`` (the default), all tiers are probed.  Ignored when
+                ``source="disk"`` (no reconstruction runs).
+            keys: **The caller's key set for this materialize.**  Scopes both
+                the registry-true merge input
+                (:meth:`_build_registry_true_relations`) and the recall-miss
+                comparison, so a key the caller did not fold can neither enter
+                the merge nor be reported as a recall miss.  When ``None`` (the
+                default) it resolves to ``store.all_active_keys()``.  Honoured
+                in BOTH venues.
             extra_relations: Optional list of :class:`Relation` objects to merge
                 into the fresh keying graph after the registry-true re-merge.
                 Intended for the interim mini-fold: the caller captures the
                 pending-session relations from ``self.merger.graph`` BEFORE calling
                 this method (since the reset inside will wipe them) and passes them
                 here so they survive the reset and co-reside with the slot's
-                recalled facts.  The fold caller passes ``None`` (no-op).
-                For ``source="disk"`` callers, pass the disk-loaded :class:`Relation`
-                objects here — they are the ONLY merge input for the disk path.
+                recalled facts.  The non-consume-pending fold caller passes
+                ``None`` (no-op).
             dedup_target_keys: Optional list of active-key strings identifying
                 main-tier facts to merge as dedup targets — see the INVARIANT
                 above.  ``None`` (the default) is a true no-op: no dedup merge
-                runs.  The full-fold and simulate (``source="disk"``) callers
-                never pass this param, so their behavior is byte-identical to
-                before this parameter existed.  The interim fresh-derivation
-                caller always passes the caller-scoped subset (session-touched
-                main-tier keys; possibly empty).  Ignored when ``source="disk"``.
+                runs.  The full-fold callers never pass this param.  The interim
+                fresh-derivation caller always passes the caller-scoped subset
+                (session-touched main-tier keys; possibly empty).
             resolve_contradictions_recon: Forwarded to
                 :meth:`~paramem.graph.merger.GraphMerger.merge_relations` for
                 the registry-true recon merge.  Driven by
@@ -5488,7 +5527,6 @@ class ConsolidationLoop:
                 A legacy relation coexists with its rivals only when every rival
                 is also undated; a genuinely dated rival always outranks it
                 (dated wins over undated) and the legacy relation is retired.
-                Ignored when ``source="disk"`` (no recon merge performed).
             resolve_contradictions_extra: Forwarded to
                 :meth:`~paramem.graph.merger.GraphMerger.merge_relations` for
                 the ``extra_relations`` (pending-session) merge.  Driven by
@@ -5505,56 +5543,8 @@ class ConsolidationLoop:
               fed into the registry-true re-merge (registry-true SPO, with
               ``indexed_key`` set).  ``extra_relations`` are NOT included here —
               they travel through a separate merge call inside this method.
-              Always ``[]`` for ``source="disk"``.
         """
-        # --- Disk-source path: skip weight reconstruction entirely ---
-        # For the simulate venue (source="disk") there are no adapter weights to probe.
-        # The disk-loaded Relations are supplied via extra_relations and enter the merge
-        # through the existing extra_relations channel below.
-        # recall_miss_keys is empty: a retrain signal is meaningless for a venue that
-        # does not retrain.
-        # _build_registry_true_relations is NOT called: it reads self.store (empty in
-        # simulate) and would return [], silently zeroing the merge input.
-        if source == "disk":
-            self.merger.reset_graph()
-            logger.info(
-                "_materialize_consolidation_graph(source=disk): keying graph reset;"
-                " merging %d disk relations via extra_relations channel",
-                len(extra_relations) if extra_relations else 0,
-            )
-            # Emit debug snapshot of the empty (pre-merge) graph so the artifact
-            # chain matches the weights path (reconstructed → merged → enriched).
-            on_fold_graph(self.merger.graph, label="reconstructed")
-            # Merge the disk-loaded relations through the extra_relations channel.
-            # resolve_contradictions mirrors the train path: driven by
-            # config.refinement_contradiction.  With timestamp="" (default), legacy
-            # relations (last_seen="") never fabricate a NOW recency value; a legacy
-            # relation coexists only when every rival is also undated, and is
-            # retired when a genuinely dated rival outranks it (dated wins over
-            # undated) — simulate==train invariant holds.
-            # The gradient-checkpointing guard fires when resolve_contradictions
-            # is True and a model is present — the contradiction path calls
-            # model.generate().
-            _disk_resolve_contradictions = self.config.refinement_contradiction == "on"
-            _disk_needs_guard = (
-                getattr(self, "model", None) is not None and _disk_resolve_contradictions
-            )
-            if _disk_needs_guard:
-                self._disable_gradient_checkpointing()
-            try:
-                self.merger.merge_relations(
-                    extra_relations or [],
-                    session_id="__simulate_consolidation_merge__",
-                    log_label="disk relations (simulate full fold)",
-                    resolve_contradictions=_disk_resolve_contradictions,
-                )
-            finally:
-                if _disk_needs_guard:
-                    self._enable_gradient_checkpointing()
-            on_fold_graph(self.merger.graph, label="merged")
-            return set(), []
-
-        # --- Reconstruct all active keys from adapter weights ---
+        # --- Reconstruct all active keys from adapter weights (weights venue) ---
         # Probes every active key across all tiers; recovers (subject, predicate, object)
         # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
         # strict=False: failures are logged and recorded in recon_result.failures; the
@@ -5563,60 +5553,77 @@ class ConsolidationLoop:
         # reconstructed SPO disagrees with registry-true SPO, or whose reconstruction
         # failed outright).  A recall miss is a retry signal; the key stays in the
         # training set with its registry-true content.  It does NOT drop the key.
-        recon_result = reconstruct_graph(self, tier=tier, strict=False)
-        if recon_result.failures:
-            logger.warning(
-                "_materialize_consolidation_graph: %d key(s) failed reconstruction "
-                "(retry signal — keys kept in training set with registry-true content)",
-                len(recon_result.failures),
-            )
+        # The disk venue has no adapter weights, so it skips the probe outright:
+        # recall_miss_keys stays empty and _recon_graph stays None.
+        # The caller's key set, resolved once: it scopes the recall-miss
+        # comparison AND the merge input, so the two can never describe
+        # different key sets.
+        scoped_keys: list[str] = (
+            list(keys) if keys is not None else list(self.store.all_active_keys())
+        )
 
-        # --- Compute recall-health/retry set BEFORE reset_graph() ---
-        # This MUST run after reconstruct_graph (which produces recon_result.graph
-        # as a SEPARATE nx.MultiDiGraph, distinct from self.merger.graph) and BEFORE
-        # reset_graph() (which clears self.merger.graph).  The ordering is safe because
-        # recon_result.graph is a freshly constructed MultiDiGraph
-        # (reconstruct.py:142) unaffected by the subsequent reset.
-        #
-        # Build a lookup of reconstructed SPO per key from the recon graph.
-        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
+        recall_miss_keys: set[str] = set()
+        _recon_graph = None
+        if source == "weights":
+            recon_result = reconstruct_graph(self, tier=tier, strict=False)
+            if recon_result.failures:
+                logger.warning(
+                    "_materialize_consolidation_graph: %d key(s) failed reconstruction "
+                    "(retry signal — keys kept in training set with registry-true content)",
+                    len(recon_result.failures),
+                )
 
-        _recon_spo_by_key: dict[str, tuple[str, str, str]] = {}
-        for _rh_subj, _rh_obj, _rh_data in recon_result.graph.edges(data=True):
-            _rh_key = _rh_data.get(_IK_ATTR, "")
-            _rh_pred = _rh_data.get("predicate", "")
-            if _rh_key and _rh_pred:
-                _recon_spo_by_key[_rh_key] = (_rh_subj, _rh_pred, _rh_obj)
+            # --- Compute recall-health/retry set BEFORE reset_graph() ---
+            # This MUST run after reconstruct_graph (which produces recon_result.graph
+            # as a SEPARATE nx.MultiDiGraph, distinct from self.merger.graph) and BEFORE
+            # reset_graph() (which clears self.merger.graph).  The ordering is safe because
+            # recon_result.graph is a freshly constructed MultiDiGraph
+            # (reconstruct.py:142) unaffected by the subsequent reset.
+            #
+            # Build a lookup of reconstructed SPO per key from the recon graph.
+            from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
-        # recall_miss_keys: keys whose reconstruction failed OR whose reconstructed
-        # SPO disagrees with registry-true SPO.  These are flagged for retrain but
-        # their registry-true triple still enters the merge input (never dropped).
-        recall_miss_keys: set[str] = {f["key"] for f in recon_result.failures}
-        for _rh_key in self.store.all_active_keys():
-            _rt_entry = self.store.get(_rh_key)
-            _rt_subj = (_rt_entry or {}).get("subject", "") if _rt_entry else ""
-            _rt_pred = (_rt_entry or {}).get("predicate", "") if _rt_entry else ""
-            _rt_obj = (_rt_entry or {}).get("object", "") if _rt_entry else ""
-            _recon_spo = _recon_spo_by_key.get(_rh_key)
-            if _recon_spo is None:
-                # No recon edge: counts as failure (already in recon_result.failures or missing).
-                recall_miss_keys.add(_rh_key)
-            else:
-                _r_subj, _r_pred, _r_obj = _recon_spo
-                if (
-                    _r_subj != _rt_subj
-                    or canonical(_r_pred) != canonical(_rt_pred)
-                    or _r_obj != _rt_obj
-                ):
+            _recon_spo_by_key: dict[str, tuple[str, str, str]] = {}
+            for _rh_subj, _rh_obj, _rh_data in recon_result.graph.edges(data=True):
+                _rh_key = _rh_data.get(_IK_ATTR, "")
+                _rh_pred = _rh_data.get("predicate", "")
+                if _rh_key and _rh_pred:
+                    _recon_spo_by_key[_rh_key] = (_rh_subj, _rh_pred, _rh_obj)
+
+            # recall_miss_keys: keys whose reconstruction failed OR whose reconstructed
+            # SPO disagrees with registry-true SPO.  These are flagged for retrain but
+            # their registry-true triple still enters the merge input (never dropped).
+            _scoped_key_set = set(scoped_keys)
+            recall_miss_keys: set[str] = {
+                f["key"] for f in recon_result.failures if f["key"] in _scoped_key_set
+            }
+            for _rh_key in scoped_keys:
+                _rt_entry = self.store.get(_rh_key)
+                _rt_subj = (_rt_entry or {}).get("subject", "") if _rt_entry else ""
+                _rt_pred = (_rt_entry or {}).get("predicate", "") if _rt_entry else ""
+                _rt_obj = (_rt_entry or {}).get("object", "") if _rt_entry else ""
+                _recon_spo = _recon_spo_by_key.get(_rh_key)
+                if _recon_spo is None:
+                    # No recon edge: counts as a failure (already in
+                    # recon_result.failures, or missing outright).
                     recall_miss_keys.add(_rh_key)
+                else:
+                    _r_subj, _r_pred, _r_obj = _recon_spo
+                    if (
+                        _r_subj != _rt_subj
+                        or canonical(_r_pred) != canonical(_rt_pred)
+                        or _r_obj != _rt_obj
+                    ):
+                        recall_miss_keys.add(_rh_key)
 
-        if recall_miss_keys:
-            logger.info(
-                "_materialize_consolidation_graph: %d key(s) in recall-miss set "
-                "(kept in training with registry-true content): %s",
-                len(recall_miss_keys),
-                sorted(recall_miss_keys),
-            )
+            if recall_miss_keys:
+                logger.info(
+                    "_materialize_consolidation_graph: %d key(s) in recall-miss set "
+                    "(kept in training with registry-true content): %s",
+                    len(recall_miss_keys),
+                    sorted(recall_miss_keys),
+                )
+            _recon_graph = recon_result.graph
 
         # --- Reset keying graph and re-merge registry-true relations ---
         # Reset the merger's keying surface to EMPTY before re-merging so
@@ -5648,9 +5655,15 @@ class ConsolidationLoop:
         # in merger.collapsed.  The drift-partition step below soft-stales that key.
         # Debug: snapshot the reconstructed graph (before re-merge mutates the
         # keying surface).  Self-gated; no-op when save_cycle_snapshots=False.
-        on_fold_graph(recon_result.graph, label="reconstructed")
+        # The disk venue ran no reconstruction, so it snapshots the just-reset
+        # (empty) keying graph — the artifact chain (reconstructed → merged →
+        # enriched) is emitted in both venues.
+        on_fold_graph(
+            self.merger.graph if _recon_graph is None else _recon_graph,
+            label="reconstructed",
+        )
 
-        recon_relations: list[Relation] = self._build_registry_true_relations(keys=keys)
+        recon_relations: list[Relation] = self._build_registry_true_relations(keys=scoped_keys)
 
         # Merge registry-true reconstructed relations.  merger.merge_relations
         # synthesises speaker entities from the relation list (same logic as the

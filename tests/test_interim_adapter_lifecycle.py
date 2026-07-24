@@ -40,11 +40,17 @@ from paramem.server.schedule_grammar import compute_schedule_period_seconds
 def _make_stub_peft_model(*adapter_names: str) -> MagicMock:
     """Return a MagicMock that behaves like a minimal PeftModel.
 
+    ``spec=PeftModel`` so ``isinstance(model, PeftModel)`` holds — the PEFT half
+    of ``unload_interim_adapters`` is gated on exactly that check (the disk venue
+    passes a bare base model and must skip it).
+
     peft_config is a real dict keyed by adapter_names so membership tests,
     iteration, and deletion all work correctly without touching torch.
     delete_adapter removes the key from the dict, mirroring PEFT behaviour.
     """
-    model = MagicMock()
+    from peft import PeftModel
+
+    model = MagicMock(spec=PeftModel)
     model.peft_config = {name: MagicMock() for name in adapter_names}
 
     def _delete_adapter(name: str) -> None:

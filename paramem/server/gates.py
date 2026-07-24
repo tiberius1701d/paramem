@@ -25,6 +25,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
 
+# Torch-free (stdlib-only at module level), so importing it here keeps the
+# "no GPU framework at import time" contract above intact.  KeyRegistry owns
+# the indexed_key_registry.json serialization, hence also the single reader
+# for its SimHash map (``KeyRegistry.load_simhashes``).
+from paramem.training.key_registry import KeyRegistry
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -735,65 +741,6 @@ def _find_tier_registry(trial_adapter_dir: Path) -> tuple[str, Path] | None:
     return None
 
 
-def _load_simhash_registry(path: Path) -> dict[str, int]:
-    """Extract the ``{key: simhash}`` fingerprint map from a registry file.
-
-    Reads the on-disk :class:`~paramem.training.key_registry.KeyRegistry`
-    serialization written by ``KeyRegistry.save_bytes()``
-    (``paramem/training/key_registry.py:393-399``)::
-
-        {"active_keys": [...], "fidelity_history": {...}, "health": ...,
-         "stale": {...}, "simhash": {key: int}}
-
-    and returns the ``"simhash"`` map verbatim — the active-plus-stale
-    fingerprint superset.  This is the ``indexed_key_registry.json`` shape
-    written by every tier, trial (``trial_adapter_dir/<kind>/``) and live
-    (``config.adapter_dir/<kind>/``) alike, and is the ONLY source of
-    per-key SimHash fingerprints anywhere in the system.
-
-    Deliberately does NOT understand ``key_metadata.json``
-    (``_save_key_metadata``, ``paramem/server/consolidation.py:436-440`` —
-    ``{"cycle_count", "promoted_keys", "keys": {key: bookkeeping}}``): that
-    file carries per-key bookkeeping (``speaker_id``, ``relation_type``,
-    ``reinforcement_count``, ``last_reinforced_cycle``, ``last_seen``,
-    ``first_seen`` — see ``paramem/memory/store.py::bookkeeping_for_key``),
-    never a SimHash fingerprint.  A file lacking a dict-valued ``"simhash"``
-    field raises rather than silently returning an empty or wrong map — a
-    caller that points this helper at the wrong file finds out immediately,
-    not via a gate that mysteriously never fails.
-
-    Parameters
-    ----------
-    path:
-        Path to one tier's ``indexed_key_registry.json``.
-
-    Returns
-    -------
-    dict[str, int]
-        ``{key: simhash}``.  Empty when *path* does not exist (fresh
-        install / tier not yet trained).
-
-    Raises
-    ------
-    ValueError
-        When the parsed JSON is not a dict, or lacks a dict-valued
-        ``"simhash"`` field — i.e. it is not a KeyRegistry-shaped file.
-    """
-    if not path.exists():
-        return {}
-
-    from paramem.backup.encryption import read_maybe_encrypted as _rme
-
-    raw = json.loads(_rme(path))
-    if not isinstance(raw, dict) or not isinstance(raw.get("simhash"), dict):
-        raise ValueError(
-            f"{path} is not a KeyRegistry-shaped registry file "
-            "(missing dict-valued 'simhash' field) — refusing to silently "
-            "coerce a different registry schema into a simhash map"
-        )
-    return {k: v for k, v in raw["simhash"].items() if isinstance(v, int)}
-
-
 def _gate_3_reload_smoke(
     *,
     session_buffer_empty: bool,
@@ -828,7 +775,7 @@ def _gate_3_reload_smoke(
     enforcement of a specific kind.
 
     Probes via ``probe_entries`` with ``registry=`` wired to the trial
-    tier's own SimHash map (:func:`_load_simhash_registry` on
+    tier's own SimHash map (:meth:`KeyRegistry.load_simhashes` on
     ``tier_registry_path``), so ``verify_confidence`` actually scores the
     recalled content against the trained fingerprint instead of trivially
     returning 1.0 (its no-registry default). ``probe_entries`` returns
@@ -928,7 +875,7 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        simhash_map = _load_simhash_registry(tier_registry_path)
+        simhash_map = KeyRegistry.load_simhashes(tier_registry_path)
     except ValueError as exc:
         return GateResult(
             gate=3,
@@ -1022,7 +969,7 @@ def _gate_4_recall_check(
     from. It carries per-key bookkeeping, never a SimHash fingerprint, so
     it cannot verify recall content. Verification uses the trial adapter's
     own per-tier ``indexed_key_registry.json`` SimHash maps instead (see
-    :func:`_load_simhash_registry`) — full-replay training means those
+    :meth:`KeyRegistry.load_simhashes`) — full-replay training means those
     files carry ground-truth fingerprints for the whole live key
     population, not just newly-added keys.
 
@@ -1120,7 +1067,7 @@ def _gate_4_recall_check(
     # --- Load the verification source: the TRIAL adapter's own SimHash fingerprints ---
     # live_registry_path (key_metadata.json) supplies the SAMPLE POPULATION only —
     # it carries per-key bookkeeping (paramem/memory/store.py::bookkeeping_for_key),
-    # never a SimHash fingerprint (see _load_simhash_registry docstring). Indexed-key
+    # never a SimHash fingerprint (see KeyRegistry.load_simhashes docstring). Indexed-key
     # training is full-replay (old ∪ new keys retrained together every cycle — see
     # CLAUDE.md), so the trial adapter's freshly-written per-tier
     # indexed_key_registry.json files carry ground-truth fingerprints for every
@@ -1130,7 +1077,7 @@ def _gate_4_recall_check(
     try:
         for kind in _ADAPTER_KIND_SUBDIRS:
             trial_simhash.update(
-                _load_simhash_registry(trial_adapter_dir / kind / "indexed_key_registry.json")
+                KeyRegistry.load_simhashes(trial_adapter_dir / kind / "indexed_key_registry.json")
             )
     except ValueError as exc:
         return GateResult(

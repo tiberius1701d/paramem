@@ -402,6 +402,8 @@ class TestMigrationSchedulerDegraded:
         Calls the real _dispatch_consolidation production code
         with store_load_degraded=True and pending_rehydration=True.
         """
+        from paramem.server.session_buffer import SessionBuffer
+
         state = _make_minimal_state(tmp_path)
         state["store_load_degraded"] = True
         state["pending_rehydration"] = True
@@ -410,14 +412,17 @@ class TestMigrationSchedulerDegraded:
         # mode must be "local" so the early cloud-only guard does not short-circuit
         state["mode"] = "local"
         state["cloud_only_reason"] = None
-        state["session_buffer"] = None
+        # A real (empty) buffer: the triage pre-stage runs on every dispatch,
+        # ahead of the migration gate, so the buffer is read before this test's
+        # branch is reached.
+        state["session_buffer"] = SessionBuffer(
+            tmp_path / "sessions", state_dir=tmp_path / "state", debug=False
+        )
         state["speaker_store"] = None
 
         monkeypatch.setattr(app_module, "_state", state)
 
-        result, _action = app_module._dispatch_consolidation(
-            app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
-        )
+        result, _action = app_module._dispatch_consolidation(app_module.ConsolidationAction.AUTO)
         assert result == "migration_skipped_degraded", (
             f"Expected 'migration_skipped_degraded' but got {result!r}"
         )

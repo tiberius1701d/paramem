@@ -173,8 +173,6 @@ def main() -> int:
     all_interim_adapters_gone = not any(n.startswith("episodic_interim_") for n in adapters_after)
     no_interim_dirs_left = not interim_dirs_after
     tier_adapters_present = {"episodic", "semantic", "procedural"}.issubset(set(adapters_after))
-    recall_per_tier = step7_result.get("recall_per_tier", {})
-    min_recall = min(recall_per_tier.values()) if recall_per_tier else 0.0
 
     summary = {
         "step6_a_mode": result_a.get("mode"),
@@ -184,7 +182,6 @@ def main() -> int:
         "all_interim_adapters_gone": all_interim_adapters_gone,
         "no_interim_dirs_left": no_interim_dirs_left,
         "tier_adapters_present": tier_adapters_present,
-        "min_recall": min_recall,
         "keys_before": len(keys_before),
         "keys_after": len(keys_after),
     }
