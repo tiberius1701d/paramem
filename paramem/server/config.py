@@ -24,6 +24,46 @@ logger = logging.getLogger(__name__)
 # Pattern for ${VAR_NAME} env var references in YAML values
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
+# Project root — the nearest ``pyproject.toml`` ancestor. ParaMem deploys from
+# a repo checkout (editable install under systemd), so this always resolves;
+# there is no packaged copy. Anchors the default asset/data locations below so
+# they resolve identically regardless of the process's working directory.
+_PROJECT_ROOT = find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2]
+
+# Absolute path to the operator-local server config (see ``_PROJECT_ROOT``).
+DEFAULT_SERVER_CONFIG_PATH = _PROJECT_ROOT / "configs" / "server.yaml"
+
+# Absolute path to the shipped prompt templates (see ``_PROJECT_ROOT``).
+_PROMPTS_DIR = _PROJECT_ROOT / "configs" / "prompts"
+
+# THE single declaration of ParaMem's data root — the directory that holds the
+# household's personal knowledge (adapters, registry, sessions, state).
+# Deliberately private: every consumer reads it through :func:`default_data_dir`
+# so the value is resolved at call time and there is exactly ONE place to
+# repoint it. ``tests/conftest.py`` repoints it at a per-test tmp tree, which is
+# what keeps the whole test suite off the operator's live store; a module that
+# bound the value at import time (``from ... import DEFAULT_DATA_DIR``) would
+# escape that redirect, so the constant is not exported.
+_DATA_ROOT = _PROJECT_ROOT / "data" / "ha"
+
+
+def default_data_dir() -> Path:
+    """Return the absolute default data root (``<project root>/data/ha``).
+
+    The fallback consulted wherever a loaded ``config.paths.data`` is not
+    available (``config`` is ``None`` or a test mock), and the base every
+    :class:`PathsConfig` default is derived from. Always call it — never cache
+    the result in a module-level binding: the value is a single mutable seam so
+    that tests can redirect the whole process away from the operator's live
+    knowledge store.
+
+    Returns
+    -------
+    Path
+        Absolute path to the data root.
+    """
+    return _DATA_ROOT
+
 
 def _interpolate_env_vars(value):
     """Recursively replace ${VAR_NAME} with os.environ values.
@@ -448,12 +488,20 @@ class ServerNetConfig:
 
 @dataclass
 class PathsConfig:
-    """Mount points for persistent data, sessions, debug output, and prompts."""
+    """Mount points for persistent data, sessions, debug output, and prompts.
 
-    data: Path = Path("data/ha")
-    sessions: Path = Path("data/ha/sessions")
-    debug: Path = Path("data/ha/debug")
-    prompts: Path = Path("configs/prompts")
+    Every default is ABSOLUTE and derived from :func:`default_data_dir` (data
+    tree) or ``_PROJECT_ROOT`` (shipped assets), evaluated at construction
+    time. A default-constructed ``PathsConfig`` therefore addresses the same
+    tree regardless of the process's working directory — and follows the single
+    data-root seam, so a test that never touches the loader still cannot reach
+    the operator's live store.
+    """
+
+    data: Path = field(default_factory=default_data_dir)
+    sessions: Path = field(default_factory=lambda: default_data_dir() / "sessions")
+    debug: Path = field(default_factory=lambda: default_data_dir() / "debug")
+    prompts: Path = field(default_factory=lambda: _PROMPTS_DIR)
     # Bounded machine-lifetime telemetry ring (VRAM/adapter integers only —
     # see paramem/server/fold_telemetry.py). Separate root from ``data``: a
     # knowledge wipe deletes ``state/``, but telemetry describes the machine,
@@ -461,14 +509,14 @@ class PathsConfig:
     # regardless of ``debug`` — it is not a privacy/artifact-persistence
     # switch. Deliberately absent from ``infra_paths()`` (encryption.py) so
     # it stays plaintext and greppable during an incident.
-    telemetry: Path = Path("data/ha/telemetry")
+    telemetry: Path = field(default_factory=lambda: default_data_dir() / "telemetry")
     # Calibration workspace: ``prompts/`` holds the operator's prompt
     # variants (resolved by name from a calibration request, never mixed
     # into the shipped ``prompts`` dir), ``artifacts/`` receives every
     # artifact a calibration run produces. Deliberately outside ``debug``:
     # calibration output must not depend on, or pollute, the production
     # debug switch. Throwaway by nature — gitignored.
-    calibration: Path = Path("data/ha/calibration")
+    calibration: Path = field(default_factory=lambda: default_data_dir() / "calibration")
 
     @property
     def calibration_prompts(self) -> Path:
@@ -1812,22 +1860,6 @@ class ServerConfig:
         return GraphConfig(
             entity_similarity_threshold=self.consolidation.entity_similarity_threshold,
         )
-
-
-# Project root — the nearest ``pyproject.toml`` ancestor. ParaMem deploys from
-# a repo checkout (editable install under systemd), so this always resolves;
-# there is no packaged copy. Anchors the default asset/data locations below so
-# they resolve identically regardless of the process's working directory.
-_PROJECT_ROOT = find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2]
-
-# Absolute path to the operator-local server config (see ``_PROJECT_ROOT``).
-DEFAULT_SERVER_CONFIG_PATH = _PROJECT_ROOT / "configs" / "server.yaml"
-
-# Absolute fallback data root, mirroring the absolutized ``PathsConfig.data``
-# default. Consulted only where a loaded ``config.paths.data`` is unavailable
-# (``config`` is ``None`` or a test mock); a loaded config supplies its own
-# resolved ``paths.data`` and this constant is not used.
-DEFAULT_DATA_DIR = _PROJECT_ROOT / "data" / "ha"
 
 
 def load_server_config(path: str | Path = DEFAULT_SERVER_CONFIG_PATH) -> ServerConfig:

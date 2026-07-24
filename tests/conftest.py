@@ -170,6 +170,40 @@ def _isolate_paramem_security_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_data_root(monkeypatch, tmp_path):
+    """Repoint the default data root at a per-test tmp tree.
+
+    ``data/ha`` is the operator's LIVE personal-knowledge store: adapters,
+    the SimHash registry, session transcripts, speaker profiles, backups.
+    Every one of those files is age-encrypted on a deployed host, and
+    ``_isolate_paramem_security_env`` above deliberately removes the daily
+    passphrase — so a test that reaches the live tree either raises a decrypt
+    error (how this defect was found: three ``test_abstention.py`` cases drove
+    ``handle_chat`` with a default-constructed ``ServerConfig`` and hit
+    ``data/ha/adapters/episodic/indexed_key_registry.json``) or, worse,
+    silently reads or overwrites the household's real memory.
+
+    :func:`paramem.server.config.default_data_dir` is the ONE place that root
+    is declared, and every default in :class:`~paramem.server.config.PathsConfig`
+    plus every ``config is None`` fallback in the server resolves through it at
+    CALL time. Repointing the module-level ``_DATA_ROOT`` here therefore moves
+    the whole process, whatever a test builds its config from and whichever
+    module asks — no per-call-site opt-in, no importer list to maintain.
+
+    Scope note (verified, not assumed): this covers DEFAULTS. A config that
+    names its data paths explicitly keeps them — ``tests/fixtures/server.yaml``
+    points at ``tests/fixtures/sandbox/data/ha`` (safe, gitignored), while the
+    operator-local ``configs/server.yaml`` points at the live tree, so loading
+    THAT file in a test still yields live paths. See
+    ``tests/test_data_root_isolation.py`` for the invariant this fixture is
+    pinned by.
+    """
+    from paramem.server import config as server_config
+
+    monkeypatch.setattr(server_config, "_DATA_ROOT", tmp_path / "data" / "ha")
+
+
+@pytest.fixture(autouse=True)
 def _admin_scope_default():
     """Grant admin scope by default on the module-singleton ``app_module.app``.
 

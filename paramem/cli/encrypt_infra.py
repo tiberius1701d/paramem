@@ -30,7 +30,7 @@ from pathlib import Path
 from paramem.backup.age_envelope import is_age_envelope
 from paramem.backup.encryption import _atomic_write_bytes, envelope_encrypt_bytes, infra_paths
 from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
-from paramem.server.config import DEFAULT_DATA_DIR, DEFAULT_SERVER_CONFIG_PATH
+from paramem.server.config import DEFAULT_SERVER_CONFIG_PATH, default_data_dir
 
 # DAILY_KEY_PATH_DEFAULT is intentionally NOT imported as a local binding
 # here: tests monkeypatch ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT``
@@ -113,7 +113,7 @@ def _load_config(config_path: Path):
 
         # Return a minimal stand-in.
         class _FallbackPaths:
-            data = DEFAULT_DATA_DIR
+            data = default_data_dir()
 
         class _FallbackCfg:
             paths = _FallbackPaths()

@@ -58,10 +58,10 @@ from paramem.server import calibrate as calibrate_module
 from paramem.server.active_store_migration import migrate
 from paramem.server.background_trainer import BackgroundTrainer
 from paramem.server.config import (
-    DEFAULT_DATA_DIR,
     DEFAULT_SERVER_CONFIG_PATH,
     TTSConfig,
     TTSVoiceConfig,
+    default_data_dir,
     load_server_config,
 )
 from paramem.server.consolidation import create_consolidation_loop
@@ -7941,7 +7941,7 @@ async def migration_preview(request: PreviewRequest):
     tier_diff = compute_tier_diff(live_yaml, parsed_candidate)
 
     # --- Shape-change detection ---
-    adapter_dir = config.adapter_dir if config is not None else DEFAULT_DATA_DIR / "adapters"
+    adapter_dir = config.adapter_dir if config is not None else default_data_dir() / "adapters"
     live_registry_sha256 = ""
     if config is not None:
         registry_path = None
@@ -7985,7 +7985,7 @@ async def migration_preview(request: PreviewRequest):
     try:
         _backups_root_for_pf = (config.paths.data / "backups").resolve()
     except (AttributeError, TypeError):
-        _backups_root_for_pf = (DEFAULT_DATA_DIR / "backups").resolve()
+        _backups_root_for_pf = (default_data_dir() / "backups").resolve()
 
     pre_flight = None
     try:
@@ -8202,8 +8202,8 @@ async def migration_confirm(request: ConfirmRequest):
         state_dir = (config.paths.data / "state").resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
-        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+        state_dir = (default_data_dir() / "state").resolve()
+        backups_root = (default_data_dir() / "backups").resolve()
 
     trial_adapter_dir = str((state_dir / "trial_adapter").resolve())
     trial_graph_dir = str((state_dir / "trial_graph").resolve())
@@ -8842,7 +8842,7 @@ async def _run_trial_consolidation() -> None:
             trial_adapter_dir = (
                 Path(trial_adapter_dir_str)
                 if trial_adapter_dir_str
-                else DEFAULT_DATA_DIR / "state" / "trial_adapter"
+                else default_data_dir() / "state" / "trial_adapter"
             )
 
             # Use loop.model (the PeftModel wrapper) instead of the raw
@@ -10044,8 +10044,8 @@ async def migration_accept():
         state_dir = (config.paths.data / "state").resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
-        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+        state_dir = (default_data_dir() / "state").resolve()
+        backups_root = (default_data_dir() / "backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
 
@@ -10384,8 +10384,8 @@ async def migration_rollback():
         state_dir = (config.paths.data / "state").resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
-        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+        state_dir = (default_data_dir() / "state").resolve()
+        backups_root = (default_data_dir() / "backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
 
@@ -11185,9 +11185,9 @@ async def backup_list(kind: str | None = None):
         try:
             backups_root = (config.paths.data / "backups").resolve()
         except (AttributeError, TypeError):
-            backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+            backups_root = (default_data_dir() / "backups").resolve()
     else:
-        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+        backups_root = (default_data_dir() / "backups").resolve()
 
     # Validate and coerce kind query parameter.
     kind_enum = None
@@ -11521,9 +11521,9 @@ async def backup_restore(req: BackupRestoreRequest):
         try:
             backups_root = (config.paths.data / "backups").resolve()
         except (AttributeError, TypeError):
-            backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+            backups_root = (default_data_dir() / "backups").resolve()
     else:
-        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+        backups_root = (default_data_dir() / "backups").resolve()
 
     # --- Step 2: Locate slot ---
     all_records = enumerate_backups(backups_root, kind=None)
@@ -11557,9 +11557,9 @@ async def backup_restore(req: BackupRestoreRequest):
             try:
                 data_dir = config.paths.data.resolve()
             except (AttributeError, TypeError):
-                data_dir = DEFAULT_DATA_DIR.resolve()
+                data_dir = default_data_dir().resolve()
         else:
-            data_dir = DEFAULT_DATA_DIR.resolve()
+            data_dir = default_data_dir().resolve()
 
         try:
             result = _restore_bundle(
@@ -11841,8 +11841,8 @@ async def backup_prune(req: BackupPruneRequest):
     else:
         from paramem.server.config import ServerBackupsConfig
 
-        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
-        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
+        backups_root = (default_data_dir() / "backups").resolve()
+        state_dir = (default_data_dir() / "state").resolve()
         backups_cfg = ServerBackupsConfig()
 
     try:

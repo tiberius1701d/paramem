@@ -248,10 +248,12 @@ class TestConsolidationIntegration:
     def _make_config(tmp_path):
         from paramem.server.config import PathsConfig, ServerConfig
 
-        # Override every path that ConsolidationLoop or its callees may
-        # write/read. PathsConfig defaults are RELATIVE ("data/ha", etc.) and
-        # resolve against cwd, so leaving any of debug/sessions/simulate at
-        # default routes test side-effects into the live data dir.
+        # Give ConsolidationLoop and its callees one tmp tree they all share,
+        # so this test's artifacts are inspectable in one place and torn down
+        # with tmp_path.  (Isolation from the operator's live data dir is not
+        # this call site's job: conftest's ``_isolate_data_root`` already
+        # repoints the default data root at a per-test tmp tree — see
+        # tests/test_data_root_isolation.py.)
         config = ServerConfig()
         ha = tmp_path / "ha"
         config.paths = PathsConfig(

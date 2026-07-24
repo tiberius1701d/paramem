@@ -19,9 +19,9 @@ from pathlib import Path
 import pytest
 
 from paramem.server.config import (
-    DEFAULT_DATA_DIR,
     DEFAULT_SERVER_CONFIG_PATH,
     PathsConfig,
+    default_data_dir,
     load_server_config,
 )
 
@@ -658,16 +658,23 @@ class TestDefaultServerConfigPathIsCwdIndependent:
         cfg = load_server_config("configs/server.yaml")
         assert cfg.paths.data.is_absolute()
 
-    def test_default_data_dir_is_absolute_and_repo_anchored(self):
-        # The data-root fallback used where a loaded ``config.paths.data`` is
-        # unavailable (config is None / a test mock). It replaced cwd-relative
-        # ``Path("data/ha/...")`` literals scattered across the server, so it
-        # must be absolute and share the repo root with the config path.
-        assert DEFAULT_DATA_DIR.is_absolute()
-        assert DEFAULT_DATA_DIR.name == "ha"
-        assert DEFAULT_DATA_DIR.parent.name == "data"
-        assert DEFAULT_DATA_DIR.parent.parent == DEFAULT_SERVER_CONFIG_PATH.parent.parent
-        assert (DEFAULT_DATA_DIR.parent.parent / "pyproject.toml").is_file()
+    def test_default_data_dir_is_absolute_and_root_anchored(self):
+        # The data-root accessor used where a loaded ``config.paths.data`` is
+        # unavailable (config is None / a test mock), and the base of every
+        # PathsConfig default. It replaced cwd-relative ``Path("data/ha/...")``
+        # literals scattered across the server, so it must be absolute and
+        # anchored on a root — never a bare relative name.
+        #
+        # The anchor asserted here is NOT the repo root: conftest's
+        # ``_isolate_data_root`` repoints the accessor at a tmp tree for every
+        # test (see tests/test_data_root_isolation.py), and asserting the repo
+        # root would only pass by defeating that isolation.
+        data_dir = default_data_dir()
+        assert data_dir.is_absolute()
+        assert data_dir.name == "ha"
+        assert data_dir.parent.name == "data"
+        assert DEFAULT_SERVER_CONFIG_PATH.is_absolute()
+        assert (DEFAULT_SERVER_CONFIG_PATH.parent.parent / "pyproject.toml").is_file()
 
     def test_fixture_telemetry_path_is_absolute(self):
         # paths.telemetry must go through the same relative-path anchoring
