@@ -95,9 +95,9 @@ class TestRelationToEntryDict:
     the identity form the merger stamps onto the cumulative edge."""
 
     def test_canonicalizes_predicate(self):
-        rel = _mock_relation("Alice", "lives in", "Berlin")
+        rel = _mock_relation("Alice", "lives_in", "Berlin")
         result = _relation_to_entry_dict(rel)
-        assert result["predicate"] == "lives_in"
+        assert result["predicate"] == "lives in"
 
     def test_leaves_subject_and_object_untouched(self):
         """Subject/object are display surfaces — not canonicalized."""
@@ -109,14 +109,14 @@ class TestRelationToEntryDict:
     def test_does_not_mutate_the_source_relation(self):
         """r.predicate itself must stay raw — load-bearing provenance for
         merger.removal_ledger's pre_surfaces.incoming (merger.py:815)."""
-        rel = _mock_relation("Alice", "lives in", "Berlin")
+        rel = _mock_relation("Alice", "lives_in", "Berlin")
         _relation_to_entry_dict(rel)
-        assert rel.predicate == "lives in"
+        assert rel.predicate == "lives_in"
 
     def test_idempotent_on_already_canonical_predicate(self):
-        rel = _mock_relation("Bob", "works_at", "ACME")
+        rel = _mock_relation("Bob", "works at", "ACME")
         result = _relation_to_entry_dict(rel)
-        assert result["predicate"] == "works_at"
+        assert result["predicate"] == "works at"
 
     def test_preserves_relation_type(self):
         rel = _mock_relation("Alice", "lives in", "Berlin", relation_type="location")
@@ -338,7 +338,7 @@ class TestEntriesFromGraph:
         loop = _make_loop()
         graph = self._make_session_graph(with_attributes=True)
         episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
-        # _flatten_entity_attributes projects email → has_email relation
+        # _flatten_entity_attributes projects email → "has email" relation
         predicates = [r["predicate"] for r in episodic]
         assert any("email" in p for p in predicates), (
             "email attribute not projected into relation set — scalar-PII keying silently dropped"
@@ -351,14 +351,34 @@ class TestEntriesFromGraph:
         loop._entries_from_graph(graph, procedural_enabled=False)
         loop.model.generate.assert_not_called()
 
-    def test_raw_space_predicate_is_canonicalized(self):
+    def test_raw_underscore_predicate_is_canonicalized(self):
         """Fix A end-to-end through the real call site: a raw-surface
         predicate (e.g. from extraction, before the merger ever sees it)
-        must come out of _entries_from_graph already canonicalized."""
+        must come out of _entries_from_graph already canonicalized — the
+        underscore variant is folded to the space-form identity surface."""
         loop = _make_loop()
         graph = self._make_session_graph()
-        graph.relations[0].predicate = "lives in"
+        graph.relations[0].predicate = "lives_in"
         episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
         predicates = [r["predicate"] for r in episodic if r["subject"] == "Alice"]
-        assert "lives_in" in predicates
-        assert "lives in" not in predicates
+        assert "lives in" in predicates
+        assert "lives_in" not in predicates
+
+    def test_attribute_relation_and_entity_attribute_no_double_emit(self):
+        """A ``relation_type="attribute"`` Relation and an Entity.attributes
+        entry for the SAME (subject, predicate) pair (both surfaces an
+        extractor may emit) must be deduplicated by exclude_pairs — never
+        two entries for the one fact."""
+        loop = _make_loop()
+        graph = self._make_session_graph()
+        # Replace the standard relation with an attribute-typed one whose
+        # canonical predicate matches _flatten_entity_attributes's surface
+        # exactly ("has email").
+        graph.relations[0].predicate = "has_email"
+        graph.relations[0].object = "alice@example.com"
+        graph.relations[0].relation_type = "attribute"
+        graph.entities[0].attributes = {"email": "alice@example.com"}
+
+        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
+        has_email_entries = [r for r in episodic if r["predicate"] == "has email"]
+        assert len(has_email_entries) == 1

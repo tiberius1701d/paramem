@@ -223,20 +223,20 @@ class TestFlattenEntityAttributes:
         result = _flatten_entity_attributes([entity])
         assert len(result) == 2
         predicates = {r["predicate"] for r in result}
-        assert predicates == {"has_email", "has_phone"}
+        assert predicates == {"has email", "has phone"}
         for r in result:
             assert r["subject"] == "Alex"
             assert r["relation_type"] == "attribute"
 
     def test_predicate_form_is_has_plus_key(self):
-        """Predicate is exactly 'has_<normalised_key>'."""
+        """Predicate is exactly 'has <normalised_key>' (space, not underscore)."""
         entity = Entity(
             name="Sam",
             entity_type="person",
             attributes={"email": "sam@example.com"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_email"
+        assert result[0]["predicate"] == "has email"
         assert result[0]["object"] == "sam@example.com"
 
     def test_multiple_entities_preserve_order(self):
@@ -255,10 +255,10 @@ class TestFlattenEntityAttributes:
             entity_type="person",
             attributes={"email": "alex@example.com", "phone": "+49123456"},
         )
-        exclude = {("Alex", "has_email")}
+        exclude = {("Alex", "has email")}
         result = _flatten_entity_attributes([entity], exclude_pairs=exclude)
         assert len(result) == 1
-        assert result[0]["predicate"] == "has_phone"
+        assert result[0]["predicate"] == "has phone"
 
     def test_exclude_pairs_none_value_skips_nothing_extra(self):
         """When exclude_pairs is None the default is an empty set (nothing excluded)."""
@@ -287,7 +287,7 @@ class TestFlattenEntityAttributes:
         )
         result = _flatten_entity_attributes([entity])
         assert len(result) == 1
-        assert result[0]["predicate"] == "has_phone"
+        assert result[0]["predicate"] == "has phone"
 
     def test_whitespace_only_attribute_value_is_skipped(self):
         """Attributes that reduce to an empty string after strip() are omitted."""
@@ -298,17 +298,20 @@ class TestFlattenEntityAttributes:
         )
         result = _flatten_entity_attributes([entity])
         assert len(result) == 1
-        assert result[0]["predicate"] == "has_phone"
+        assert result[0]["predicate"] == "has phone"
 
     def test_key_with_spaces_normalised_to_canonical(self):
-        """Attribute keys with spaces canonicalize to underscore form."""
+        """Attribute keys with spaces canonicalize to the space-form identity
+        surface; ``"has "`` is glued on ahead of it as a literal space, so
+        the whole predicate stays in the one project-wide identity
+        surface."""
         entity = Entity(
             name="Alex",
             entity_type="person",
             attributes={"phone number": "+49123456"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_phone_number"
+        assert result[0]["predicate"] == "has phone number"
 
     def test_key_with_dashes_preserves_dash(self):
         """Dashes are NOT separators — they survive canonicalization verbatim."""
@@ -318,7 +321,7 @@ class TestFlattenEntityAttributes:
             attributes={"linked-in": "linkedin.com/in/alex"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_linked-in"
+        assert result[0]["predicate"] == "has linked-in"
 
     def test_key_with_uppercase_lowercased(self):
         """Attribute keys are lowercased before formatting the predicate."""
@@ -328,7 +331,7 @@ class TestFlattenEntityAttributes:
             attributes={"Email": "alex@example.com"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_email"
+        assert result[0]["predicate"] == "has email"
 
     def test_entity_with_no_attributes_produces_no_relations(self):
         """An entity with an empty attributes dict contributes nothing."""

@@ -956,15 +956,15 @@ class TestConfidenceGate:
         return {"key": key, "subject": subject, "predicate": predicate, "object": obj}
 
     def _correct_fingerprint(self, entry: dict) -> int:
-        """Compute the expected SimHash fingerprint for *entry*."""
-        from paramem.memory.entry import compute_simhash
+        """Compute the expected SimHash fingerprint for *entry*.
 
-        return compute_simhash(
-            entry["key"],
-            entry["subject"],
-            entry["predicate"],
-            entry["object"],
-        )
+        Routed through :func:`entry_simhash` — the production registration
+        primitive — so the space/underscore fold it applies matches what
+        :func:`verify_confidence` recomputes at recall time.
+        """
+        from paramem.memory.entry import entry_simhash
+
+        return entry_simhash(entry)
 
     def _mismatched_fingerprint(self, entry: dict) -> int:
         """Return a fingerprint that will NOT match *entry* (different content)."""

@@ -204,7 +204,7 @@ class TestExtractionPathParity:
         # Partition invariant: no preference in episodic, and procedural carries
         # both the filter-sourced and the separately-extracted preference.
         assert all(qa["predicate"] != "prefers" for qa in episodic)
-        assert {rel["predicate"] for rel in procedural} == {"prefers", "listens_to"}
+        assert {rel["predicate"] for rel in procedural} == {"prefers", "listens to"}
 
     @pytest.mark.parametrize("source_type", ["transcript", "document"])
     @pytest.mark.parametrize(
@@ -5522,7 +5522,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         existing_eid = m.graph.add_edge(
             "Alice",
             "Berlin",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -5534,7 +5534,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) is None
 
         # Upsert the same triple with indexed_key set — should adopt via Case-1.
-        # Incoming predicate "lives_in" is already canonical, matching the
+        # Incoming predicate "lives_in" canonicalizes to "lives in", matching the
         # pre-seeded edge predicate byte-for-byte (one surface form).
         incoming = Relation(
             subject="Alice",
@@ -5554,7 +5554,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
         # No duplicate edge should have been inserted (still one edge for this (s,p,o)).
         same_pred_edges = [
-            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives_in"
+            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives in"
         ]
         assert len(same_pred_edges) == 1, (
             f"Expected exactly 1 edge after Case-1-adopt; got {len(same_pred_edges)}"
@@ -7118,6 +7118,231 @@ class TestLastSeenFlowThroughMint:
             "first_seen must advance to the earlier collapsed timestamp via "
             f"reinforcements→bump; got {bk['first_seen']!r}"
         )
+
+
+class TestAttributeGateNodeWalk:
+    """``_build_all_edge_entries_into``'s node-attribute walk (Unit 4).
+
+    A ``relation_type == "attribute"`` relation never becomes an edge
+    (``GraphMerger.merge`` diverts it onto the subject node's
+    ``attributes`` dict), so the edge walk never sees it — these tests
+    exercise the node-attribute walk added after it.
+    """
+
+    def _make_loop(self, tmp_path):
+        """Minimal ConsolidationLoop stub with a REAL GraphMerger (no GPU)."""
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=False)
+        loop.promoted_keys = set()
+        loop.cycle_count = 1
+        loop.episodic_simhash = {}
+        loop.semantic_simhash = {}
+        loop.procedural_simhash = {}
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._indexed_ep_interim = {}
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop.graph_enrichment_neighborhood_hops = 2
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.merger = GraphMerger()
+        return loop
+
+    def _attr_relation(self, indexed_key=None):
+        from paramem.graph.schema import Relation
+
+        return Relation(
+            subject="speaker0",
+            predicate="has_phone",
+            object="+1 555 123 4567",
+            relation_type="attribute",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key=indexed_key,
+        )
+
+    def test_keyless_attribute_mint_no_concept_node(self, tmp_path):
+        loop = self._make_loop(tmp_path)
+        loop.merger.merge_relations([self._attr_relation()], session_id="s0", log_label="test")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        minted_by_tier, _ = loop._build_all_edge_entries_into(tier_keyed)
+
+        assert minted_by_tier["episodic"] == 1
+        assert len(tier_keyed["episodic"]) == 1
+        entry = tier_keyed["episodic"][0]
+        assert entry["predicate"] == "has phone"
+        assert entry["object"] == "+1 555 123 4567"
+        # No concept node for the phone-number value — the whole point of
+        # the merger-gate relocation.
+        assert loop.merger.graph.number_of_nodes() == 1
+        assert loop.merger.graph.number_of_edges() == 0
+
+        minted_key = entry["key"]
+        stored = loop.store.get(minted_key)
+        assert stored["object"] == "+1 555 123 4567"
+
+    def test_full_reconsolidation_round_trip_reuses_key(self, tmp_path):
+        """Simulates a full fold: mint once, reset the merger's keying
+        graph, re-merge the registry-true relation with indexed_key set
+        (as ``_build_registry_true_relations`` would), and confirm the
+        SECOND walk replays the SAME key — never re-minting — with the
+        value intact and no concept node ever created."""
+        loop = self._make_loop(tmp_path)
+        loop.merger.merge_relations([self._attr_relation()], session_id="s0", log_label="test")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+        minted_key = tier_keyed["episodic"][0]["key"]
+
+        # Fold: reset the keying graph, re-merge registry-true content with
+        # indexed_key set — mirrors ConsolidationLoop._build_registry_true_relations
+        # + the fold's re-merge pass.
+        loop.merger.reset_graph()
+        loop.merger.merge_relations(
+            [self._attr_relation(indexed_key=minted_key)],
+            session_id="__full_consolidation_recon__",
+            log_label="recon",
+        )
+
+        tier_keyed2: dict = {"episodic": [], "procedural": []}
+        minted_by_tier2, _ = loop._build_all_edge_entries_into(tier_keyed2)
+
+        assert minted_by_tier2["episodic"] == 0, "must replay, never re-mint"
+        assert len(tier_keyed2["episodic"]) == 1
+        replayed = tier_keyed2["episodic"][0]
+        assert replayed["key"] == minted_key
+        assert replayed["object"] == "+1 555 123 4567"
+        assert loop.merger.graph.number_of_nodes() == 1
+        assert loop.merger.graph.number_of_edges() == 0
+
+    def test_name_attribute_excluded_from_walk(self, tmp_path):
+        """The node's own display-name attribute is never itself minted as
+        an attribute fact."""
+        loop = self._make_loop(tmp_path)
+        loop.merger.graph.add_node(
+            "speaker0",
+            entity_type="person",
+            speaker_id="speaker0",
+            attributes={"name": "Alex"},
+        )
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        minted_by_tier, _ = loop._build_all_edge_entries_into(tier_keyed)
+        assert minted_by_tier["episodic"] == 0
+        assert tier_keyed["episodic"] == []
+
+    def test_keyed_replay_content_sourced_from_store_not_reminted(self, tmp_path):
+        """A node whose attribute_keys already carries a registered key
+        replays store-true content — it is never re-minted."""
+        loop = self._make_loop(tmp_path)
+        loop.store.put(
+            "episodic",
+            "graph9",
+            {"subject": "speaker0", "predicate": "has email", "object": "alex@example.com"},
+        )
+        loop.store.set_bookkeeping(
+            "graph9",
+            speaker_id="speaker0",
+            relation_type="attribute",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+        loop.merger.graph.add_node(
+            "speaker0",
+            entity_type="person",
+            speaker_id="speaker0",
+            attributes={"name": "Alex", "email": "alex@example.com"},
+            attribute_keys={"email": "graph9"},
+        )
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        minted_by_tier, _ = loop._build_all_edge_entries_into(tier_keyed)
+        assert minted_by_tier["episodic"] == 0
+        assert len(tier_keyed["episodic"]) == 1
+        assert tier_keyed["episodic"][0]["key"] == "graph9"
+        assert tier_keyed["episodic"][0]["object"] == "alex@example.com"
+
+    def test_defensive_dedup_skips_pair_already_emitted_as_edge(self, tmp_path):
+        """A mixed graph (a node carrying BOTH an edge and an attribute for
+        the same (subject, predicate)) emits the pair exactly once — the
+        edge branch wins, the node walk skips it."""
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+        g.add_node(
+            "speaker0",
+            entity_type="person",
+            speaker_id="speaker0",
+            attributes={"name": "Alex", "email": "stale@example.com"},
+        )
+        g.add_node("email-node", entity_type="concept", attributes={"name": "alex@example.com"})
+        g.add_edge(
+            "speaker0",
+            "email-node",
+            predicate="has email",
+            relation_type="attribute",
+        )
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+        has_email_entries = [e for e in tier_keyed["episodic"] if e["predicate"] == "has email"]
+        assert len(has_email_entries) == 1
+
+    def test_underscore_attribute_key_canonicalized_matches_interim_surface(self, tmp_path):
+        """A node ``attributes`` key that entered VERBATIM (an underscore
+        key, as ``GraphMerger._upsert_entity`` copies ``Entity.attributes``
+        without canonicalizing) must still mint the canonical ``has last
+        name`` predicate — not the glued ``has last_name`` — and that
+        predicate must be byte-identical to what the interim
+        ``relation_prep._flatten_entity_attributes`` path mints for the
+        SAME underlying (subject, key, value) fact."""
+        from paramem.graph.relation_prep import _flatten_entity_attributes
+        from paramem.graph.schema import Entity
+
+        loop = self._make_loop(tmp_path)
+        loop.merger.graph.add_node(
+            "speaker0",
+            entity_type="person",
+            speaker_id="speaker0",
+            # Verbatim underscore key — mirrors _upsert_entity's
+            # existing_attrs[k] = v copy of Entity.attributes.
+            attributes={"name": "Alex", "last_name": "Morgan"},
+        )
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1
+        node_walk_entry = tier_keyed["episodic"][0]
+        assert node_walk_entry["predicate"] == "has last name"
+        assert node_walk_entry["predicate"] != "has last_name"
+
+        # Same underlying fact via the interim path must yield the SAME surface.
+        interim_entries = _flatten_entity_attributes(
+            [Entity(name="Alex", entity_type="person", attributes={"last_name": "Morgan"})]
+        )
+        assert len(interim_entries) == 1
+        assert interim_entries[0]["predicate"] == node_walk_entry["predicate"]
 
 
 class TestBookkeepingBasedPromotion:
@@ -13271,8 +13496,9 @@ class TestMergeRegistryRelationsTimestamp:
 
         # GraphMerger with a mock model so Case-2 fires.
         merger = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
-        # Pre-cache "lives_in" as single-valued (REPLACE) to skip the model call.
-        merger._predicate_cardinality["lives_in"] = False
+        # Pre-cache "lives in" (canonical form) as single-valued (REPLACE) to skip
+        # the model call.
+        merger._predicate_cardinality["lives in"] = False
         loop.merger = merger
 
         store = MemoryStore(replay_enabled=True)
@@ -13338,7 +13564,7 @@ class TestMergeRegistryRelationsTimestamp:
             obj
             for obj in loop.merger.graph.successors("alex")
             for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, (
             "Dated munich key must survive: a dated candidate always outranks an undated rival"
@@ -13454,7 +13680,7 @@ class TestMergeRegistryRelationsTimestamp:
             obj
             for obj in loop.merger.graph.successors("alex")
             for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "berlin" in lives_in_objects, (
             "Newer pending Berlin must be inserted (supersedes older Munich)"
@@ -13531,7 +13757,7 @@ class TestMergeRegistryRelationsTimestamp:
             obj
             for obj in loop.merger.graph.successors("alex")
             for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "berlin" in lives_in_objects, "Dated pending Berlin must be inserted"
         assert "munich" not in lives_in_objects, (
@@ -13857,9 +14083,9 @@ class TestRunGraphNormalizationApply:
         remaining_preds = {
             edata["predicate"] for _, _, edata in graph.edges(data=True) if edata.get("predicate")
         }
-        # One surface form: the stored predicate IS "employed_by" (rec=3 survives).
-        assert "works_for" not in remaining_preds, "lower-rec edge must be removed"
-        assert "employed_by" in remaining_preds, "MAX-rec survivor must remain"
+        # One surface form: the stored predicate IS "employed by" (rec=3 survives).
+        assert "works for" not in remaining_preds, "lower-rec edge must be removed"
+        assert "employed by" in remaining_preds, "MAX-rec survivor must remain"
         assert not loop.merger.removal_ledger, "no ledger entry for keyless retirements"
 
         assert result["edges_retired"] == 1

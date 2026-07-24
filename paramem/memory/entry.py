@@ -25,6 +25,7 @@ import logging
 from collections.abc import Callable
 
 from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
+from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
 
@@ -281,17 +282,24 @@ def compute_simhash(
 ) -> int:
     """Compute a SimHash fingerprint from key + subject + predicate + object.
 
-    The fingerprint is over the fact's exact SPO values, hashed verbatim.
-    Identity canonicalization happens once upstream (at the GraphMerger
-    node-identity boundary); by the time a triple reaches this function its
-    fields are already in identity form, so no further folding is applied
-    here. Re-folding would only make the fingerprint lossy — collapsing
-    genuinely distinct objects (e.g. ``"New York"`` vs ``"new_york"``) onto one
-    fingerprint and weakening hallucination detection — and would break
-    comparison against fingerprints already persisted on disk. This is the
-    single chokepoint for both registration (:func:`entry_simhash`) and recall
-    (:func:`verify_confidence`): both hash the same surface, so a fingerprint
-    computed at registration matches the one recomputed from a correct recall.
+    The fingerprint is over exactly the SPO values it is given, hashed
+    verbatim — this function does no folding of its own. Identity
+    canonicalization happens once upstream (at the GraphMerger node-identity
+    boundary); its two callers, :func:`entry_simhash` (registration) and
+    :func:`verify_confidence` (recall), additionally apply a symmetric
+    **spaces-only** fold (:func:`~paramem.utils.identity.canonical` with
+    ``mode="spaces"``) to each field before calling this function, so a
+    ``_``↔space drift between what was registered and what a recall echoes
+    back does not desync the fingerprint. The SimHash tokenizer lowercases, so
+    case never reaches the fingerprint; what this narrower fold preserves over
+    ``mode="full"`` is the diacritic/NFC distinction — ``"café"`` and
+    ``"cafe"`` still hash differently, while only a ``_``/space difference
+    (always the same fact) is merged. This is NOT the full ``canonical()`` fold
+    removed in commit 2e2bc84 (which also folded diacritics/whitespace and
+    desynced the fingerprint against a raw registry); it is narrower and
+    applied identically by both callers, so a fingerprint
+    computed at registration still matches the one recomputed from a correct
+    recall.
 
     Uses unigram+bigram feature tokenization and a bit-vote algorithm. The key is
     included so that identical triple content under different keys produces
@@ -346,6 +354,12 @@ def entry_simhash(entry: dict) -> int:
     against, silently corrupting the confidence score and — below
     :data:`DEFAULT_CONFIDENCE_THRESHOLD` — dropping the fact.
 
+    ``subject``/``predicate``/``object`` are each passed through
+    :func:`~paramem.utils.identity.canonical` with ``mode="spaces"`` before
+    hashing — a symmetric fold shared with :func:`verify_confidence` that
+    merges only a ``_``↔space surface drift (case preserved) so recall of the
+    same fact under either surface still verifies. ``key`` is hashed verbatim.
+
     Args:
         entry: Dict containing at minimum ``key``, ``subject``, ``predicate``,
             and ``object`` — the exact fields written into the store / used to
@@ -354,7 +368,12 @@ def entry_simhash(entry: dict) -> int:
     Returns:
         The 64-bit SimHash fingerprint for this entry.
     """
-    return compute_simhash(entry["key"], entry["subject"], entry["predicate"], entry["object"])
+    return compute_simhash(
+        entry["key"],
+        canonical(entry["subject"], mode="spaces"),
+        canonical(entry["predicate"], mode="spaces"),
+        canonical(entry["object"], mode="spaces"),
+    )
 
 
 def verify_confidence(
@@ -374,6 +393,13 @@ def verify_confidence(
     ``{key: {"simhash": int, ...}}`` shape via
     :func:`paramem.memory.entry.get_simhash`.
 
+    ``subject``/``predicate``/``object`` are each passed through
+    :func:`~paramem.utils.identity.canonical` with ``mode="spaces"`` before
+    hashing — the same fold :func:`entry_simhash` applies at registration, so
+    a recalled fact that echoes back a ``_``↔space surface drift (e.g. the
+    trained predicate ``works_at`` recalled as ``"works at"``) still verifies
+    at high confidence.
+
     Args:
         recalled: Dict containing at minimum ``key``, ``subject``,
             ``predicate``, and ``object``.
@@ -392,9 +418,9 @@ def verify_confidence(
 
     actual = compute_simhash(
         key,
-        recalled.get("subject", ""),
-        recalled.get("predicate", ""),
-        recalled.get("object", ""),
+        canonical(recalled.get("subject", ""), mode="spaces"),
+        canonical(recalled.get("predicate", ""), mode="spaces"),
+        canonical(recalled.get("object", ""), mode="spaces"),
     )
     return simhash_confidence(actual, expected)
 
@@ -472,15 +498,17 @@ def entry_fact_text(
 
     The two sides are treated differently because they are stored differently:
 
-    * ``subject`` / ``object`` are **display surfaces already** — they are not
-      canonicalized (the graph keeps the first-seen surface in the node's
-      ``attributes["name"]``), so they are emitted as-is (after the optional
-      ``resolve`` hook).
-    * ``predicate`` is stored in **identity form** — blanks folded to ``_`` by
-      :func:`paramem.utils.identity.canonical` — and is rendered here: each
-      ``_`` becomes a single space.  ``-`` is NOT a blank in the identity form
-      and therefore survives the render verbatim, so
-      ``"has_sister-in-law"`` renders as ``"has sister-in-law"``.
+    * ``subject`` / ``object`` are **identity-folded** — the graph merger keys
+      them via :func:`paramem.utils.identity.canonical` at the node-identity
+      boundary and keeps the first-seen display surface in the node's
+      ``attributes["name"]`` — so they are emitted as-is here (after the
+      optional ``resolve`` hook); no further transformation happens at this
+      boundary.
+    * ``predicate`` is stored in **identity form**, which is already
+      space-form (``canonical``'s blank fold collapses ``_``/whitespace to a
+      single space, e.g. ``"has sister-in-law"``), so it is used directly —
+      no ``_``→space substitution happens here any more.  ``-`` is not a
+      blank and was never touched.
 
     Used by inference consumers so string construction stays in the probe
     layer — callers read ``result["fact_text"]``.
@@ -500,12 +528,12 @@ def entry_fact_text(
 
     Returns:
         Human-readable fact string, e.g. ``"Alex lives in Heilbronn"`` (from
-        the stored predicate ``lives_in``).
+        the stored predicate ``"lives in"``).
     """
     subject = resolve(entry["subject"]) if resolve is not None else entry["subject"]
     obj = resolve(entry["object"]) if resolve is not None else entry["object"]
-    predicate_spaced = " ".join(entry["predicate"].replace("_", " ").split())
-    return f"{subject} {predicate_spaced} {obj}"
+    predicate = " ".join(entry["predicate"].split())
+    return f"{subject} {predicate} {obj}"
 
 
 # --- Registry persistence (re-exported for convenience) ---

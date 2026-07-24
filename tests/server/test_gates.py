@@ -988,9 +988,11 @@ class TestGate3RealConfidenceVerification:
         return trial_dir
 
     def test_matching_content_passes(self, tmp_path):
-        from paramem.memory.entry import compute_simhash, finalize_recalled
+        from paramem.memory.entry import entry_simhash, finalize_recalled
 
-        fp = compute_simhash("graph1", "Alex", "lives_in", "Heilbronn")
+        fp = entry_simhash(
+            {"key": "graph1", "subject": "Alex", "predicate": "lives_in", "object": "Heilbronn"}
+        )
         trial_dir = self._write_trial_registry(tmp_path, "graph1", fp)
         model = _make_mock_model()
         matching_raw = (
@@ -1016,9 +1018,11 @@ class TestGate3RealConfidenceVerification:
     def test_mismatched_donor_content_fails(self, tmp_path):
         """Warm-start-donor scenario named in the bug report: well-formed
         JSON, correct key, WRONG content — must FAIL, not pass."""
-        from paramem.memory.entry import compute_simhash, finalize_recalled
+        from paramem.memory.entry import entry_simhash, finalize_recalled
 
-        fp = compute_simhash("graph1", "Alex", "lives_in", "Heilbronn")
+        fp = entry_simhash(
+            {"key": "graph1", "subject": "Alex", "predicate": "lives_in", "object": "Heilbronn"}
+        )
         trial_dir = self._write_trial_registry(tmp_path, "graph1", fp)
         model = _make_mock_model()
         donor_raw = (
@@ -1052,7 +1056,7 @@ class TestGate4RealConfidenceVerification:
     """
 
     def test_correct_recall_passes_with_real_verification(self, tmp_path):
-        from paramem.memory.entry import compute_simhash, finalize_recalled
+        from paramem.memory.entry import entry_simhash, finalize_recalled
 
         # Live population: 20 keys graph1..graph20 (>= GATE_4_MIN_REGISTRY_SIZE),
         # sourced from key_metadata.json (bookkeeping only, no simhash).
@@ -1072,7 +1076,12 @@ class TestGate4RealConfidenceVerification:
             key = f"graph{i}"
             subject, predicate, obj = f"Person{i}", "lives_in", f"City{i}"
             reg.add(key)
-            reg.set_simhash(key, compute_simhash(key, subject, predicate, obj))
+            reg.set_simhash(
+                key,
+                entry_simhash(
+                    {"key": key, "subject": subject, "predicate": predicate, "object": obj}
+                ),
+            )
             ground_truth[key] = (subject, predicate, obj)
         (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
 
@@ -1103,7 +1112,7 @@ class TestGate4RealConfidenceVerification:
         """Warm-start-donor scenario at gate-4 scale: every recalled key
         echoes the correct key but a foreign adapter's content — both the
         first sample and the retry must fail, so the gate FAILs overall."""
-        from paramem.memory.entry import compute_simhash, finalize_recalled
+        from paramem.memory.entry import entry_simhash, finalize_recalled
 
         reg_path = _make_registry(20, tmp_path)
 
@@ -1117,7 +1126,17 @@ class TestGate4RealConfidenceVerification:
         for i in range(1, 21):
             key = f"graph{i}"
             reg.add(key)
-            reg.set_simhash(key, compute_simhash(key, f"Person{i}", "lives_in", f"City{i}"))
+            reg.set_simhash(
+                key,
+                entry_simhash(
+                    {
+                        "key": key,
+                        "subject": f"Person{i}",
+                        "predicate": "lives_in",
+                        "object": f"City{i}",
+                    }
+                ),
+            )
         (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
 
         model = _make_mock_model()

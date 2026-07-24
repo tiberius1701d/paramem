@@ -18,8 +18,8 @@ def test_normalize_triple_lowercases_and_strips():
     s, p, o = _normalize_triple(t)
     assert s == "alex"
     assert o == "paris"
-    # canonical() folds blank runs to "_" — predicate is underscore-separated
-    assert p == "lives_in"
+    # canonical() folds blank runs to a single space
+    assert p == "lives in"
     assert p.islower()
 
 
@@ -115,19 +115,19 @@ class TestParseAgeRemainder:
 
 class TestMatchVerbPrefix:
     def test_lives_in_matches(self):
-        assert _match_verb_prefix("lives in Kelkham") == ("lives_in", "Kelkham")
+        assert _match_verb_prefix("lives in Kelkham") == ("lives in", "Kelkham")
 
     def test_works_as_preferred_over_works(self):
         # Longest verb prefix wins — "works as" must match before "works"
         # alone (which isn't even in the table, but the principle stands).
-        assert _match_verb_prefix("works as a teacher") == ("works_as", "a teacher")
+        assert _match_verb_prefix("works as a teacher") == ("works as", "a teacher")
 
     def test_works_at_distinct_from_works_as(self):
-        assert _match_verb_prefix("works at the office") == ("works_at", "the office")
+        assert _match_verb_prefix("works at the office") == ("works at", "the office")
 
     def test_collaborates_with_full_phrase(self):
         result = _match_verb_prefix("collaborates with Pat")
-        assert result == ("collaborates_with", "Pat")
+        assert result == ("collaborates with", "Pat")
 
     def test_case_insensitive_prefix_preserves_object_casing(self):
         assert _match_verb_prefix("LIKES BEACH HOLIDAYS") == ("likes", "BEACH HOLIDAYS")
@@ -139,15 +139,15 @@ class TestMatchVerbPrefix:
 class TestParseProfileToTriples:
     def test_extracts_lives_in(self):
         triples = parse_profile_to_triples("Alex", "Alex lives in Kelkham.")
-        assert triples == [{"subject": "Alex", "predicate": "lives_in", "object": "Kelkham"}]
+        assert triples == [{"subject": "Alex", "predicate": "lives in", "object": "Kelkham"}]
 
     def test_extracts_age_via_is_pattern(self):
         triples = parse_profile_to_triples("Alex", "Alex is 50 years old.")
-        assert triples == [{"subject": "Alex", "predicate": "has_age", "object": "50 years old"}]
+        assert triples == [{"subject": "Alex", "predicate": "has age", "object": "50 years old"}]
 
     def test_skips_temporal_prefix(self):
         triples = parse_profile_to_triples("Alex", "As of 2026, Alex lives in Kelkham.")
-        assert triples == [{"subject": "Alex", "predicate": "lives_in", "object": "Kelkham"}]
+        assert triples == [{"subject": "Alex", "predicate": "lives in", "object": "Kelkham"}]
 
     def test_handles_multiple_sentences(self):
         triples = parse_profile_to_triples(
@@ -155,8 +155,8 @@ class TestParseProfileToTriples:
             "Alex lives in Kelkham. Alex works at the office.",
         )
         assert {(t["predicate"], t["object"]) for t in triples} == {
-            ("lives_in", "Kelkham"),
-            ("works_at", "the office"),
+            ("lives in", "Kelkham"),
+            ("works at", "the office"),
         }
 
     def test_skips_sentence_not_starting_with_entity(self):

@@ -814,9 +814,12 @@ class TestCalibrateNormalize:
         assert builder.call_count == 1
         seeded = builder.call_args.args[0]
         # The merger handed to the production builder carries the injected
-        # relations, and it is NOT the loop's live merger.
+        # relations, and it is NOT the loop's live merger. GraphMerger folds
+        # predicate identity through canonical() (mode="full") at insertion,
+        # which collapses "_" to a space, so the seeded triples carry the
+        # space-form predicate surface, not the raw underscore input.
         assert seeded is not state["consolidation_loop"].merger
-        assert {t[1] for t in seeded.get_all_triples()} == {"works_for", "employed_by"}
+        assert {t[1] for t in seeded.get_all_triples()} == {"works for", "employed by"}
         assert refiner.run_normalization.call_count == 1
         # The pass's own diagnostics are reported verbatim.
         assert result["parsed"]["groups_examined"] == 1

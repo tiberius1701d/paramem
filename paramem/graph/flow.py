@@ -116,12 +116,6 @@ class StageState:
             substitutes real names back in. Empty means "no facts
             survived", which is how ``enrich``'s ``terminal_when`` stops
             the walk before its tail siblings.
-        scalar_facts: Facts routed off the relation surface because their
-            object is a verbatim identifier (URL, email, DOI,
-            version-tagged tool name). Partitioned inside the
-            ``deanonymize`` span — deliberately BEFORE the deanon
-            plausibility judge, whose drop rule targets URI-shaped
-            tokens — and projected onto entity attributes by ``rebuild``.
         scope: The one anonymize/de-anonymize round-trip scope for the
             cloud response — the resolution map every substitution and
             the entity-type rebuild are keyed on.
@@ -134,17 +128,14 @@ class StageState:
             pipeline ran — the ``rebuild`` recovery gate's second term.
         empty_cause: Which site emptied ``facts``, from the ``CAUSE_*``
             vocabulary in ``paramem.graph.empty_cause``, or ``None``
-            while facts survive. Diagnostic for the ``judgment`` and
-            ``breakage`` kinds; load-bearing for the ``routing`` kind,
-            which tells ``rebuild``'s recovery gate that the empty
-            relation set is legitimate (the facts moved to the entity-
-            attribute surface) and no recovery is due.
+            while facts survive. Diagnostic only — recorded for the
+            operator, but neither ``rebuild``'s recovery gate nor any
+            other stage branches on the ``judgment``/``breakage`` kind.
     """
 
     graph: "SessionGraph"
     payload: "AnonymizedContract | None" = None
     facts: list[dict] = field(default_factory=list)
-    scalar_facts: list[dict] = field(default_factory=list)
     scope: "CloudScope | None" = None
     cloud_raw: str | None = None
     updated_anon_transcript: str | None = None

@@ -283,8 +283,11 @@ class TestEntrySimhash:
     what verify_confidence reconstructs from a recalled/rendered entry."""
 
     def test_matches_compute_simhash_on_same_fields(self):
+        """entry_simhash applies the register/recall spaces-fold before hashing
+        (mode='spaces': ``_``->space, case preserved), so the expected
+        fingerprint here is computed against the folded predicate surface."""
         entry = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
-        assert entry_simhash(entry) == compute_simhash("graph1", "Alice", "lives_in", "Berlin")
+        assert entry_simhash(entry) == compute_simhash("graph1", "Alice", "lives in", "Berlin")
 
     def test_matches_build_registry_for_same_entry(self):
         entry = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
@@ -382,13 +385,53 @@ class TestVerifyConfidence:
         confidence = verify_confidence(wrong, registry)
         assert confidence < 0.75
 
+    def test_underscore_recall_drift_verifies_against_space_registration(self):
+        """Register/recall symmetry fold: a fact registered with a space-form
+        predicate still verifies at full confidence when recall echoes back
+        the underscore variant of the SAME predicate (or vice versa) — the
+        exact ``_``<->space drift :func:`entry_simhash` /
+        :func:`verify_confidence` are designed to absorb."""
+        registered = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "works at",
+            "object": "Acme",
+        }
+        registry = build_registry([registered])
+
+        recalled_underscore = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "works_at",
+            "object": "Acme",
+        }
+        assert verify_confidence(recalled_underscore, registry) == 1.0
+
+        # Symmetric: registering with the underscore form and recalling the
+        # space form must also verify at full confidence.
+        registry2 = build_registry(
+            [{"key": "graph2", "subject": "Alice", "predicate": "works_at", "object": "Acme"}]
+        )
+        recalled_space = {
+            "key": "graph2",
+            "subject": "Alice",
+            "predicate": "works at",
+            "object": "Acme",
+        }
+        assert verify_confidence(recalled_space, registry2) == 1.0
+
     def test_enriched_registry_shape(self):
-        """verify_confidence accepts the enriched dict-of-dicts registry shape."""
+        """verify_confidence accepts the enriched dict-of-dicts registry shape.
+
+        verify_confidence applies the spaces-fold (``_``->space) before
+        hashing the recalled fields, so the stored fingerprint here is
+        computed against the same folded predicate surface.
+        """
         quad = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
         # Construct the enriched shape manually: {key: {"simhash": int, ...}}
         enriched = {
             "graph1": {
-                "simhash": compute_simhash("graph1", "Alice", "lives_in", "Berlin"),
+                "simhash": compute_simhash("graph1", "Alice", "lives in", "Berlin"),
                 "status": "active",
             }
         }
@@ -411,9 +454,11 @@ class TestBuildRegistry:
         assert isinstance(registry["graph1"], int)
 
     def test_registry_matches_compute_simhash(self):
+        """build_registry routes through entry_simhash, which applies the
+        register/recall spaces-fold (``_``->space) before hashing."""
         quad = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
         registry = build_registry([quad])
-        expected = compute_simhash("graph1", "Alice", "lives_in", "Berlin")
+        expected = compute_simhash("graph1", "Alice", "lives in", "Berlin")
         assert registry["graph1"] == expected
 
     def test_empty_input(self):

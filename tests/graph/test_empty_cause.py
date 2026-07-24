@@ -19,7 +19,6 @@ from paramem.graph.empty_cause import (
     CAUSE_CLOUD_EMPTY,
     CAUSE_DEANON_JUDGE,
     CAUSE_DEANON_SUBSTITUTION,
-    CAUSE_SCALAR_PARTITION,
     CAUSE_SCHEMA_VALIDATION,
     CAUSE_UNATTRIBUTED,
     EMPTY_CAUSE_KIND,
@@ -36,7 +35,6 @@ class TestCauseClassification:
             (CAUSE_DEANON_JUDGE, "judgment"),
             (CAUSE_DEANON_SUBSTITUTION, "breakage"),
             (CAUSE_SCHEMA_VALIDATION, "breakage"),
-            (CAUSE_SCALAR_PARTITION, "routing"),
         ],
     )
     def test_each_site_is_classified(self, cause, kind):
@@ -49,9 +47,8 @@ class TestCauseClassification:
             CAUSE_DEANON_SUBSTITUTION,
             CAUSE_DEANON_JUDGE,
             CAUSE_SCHEMA_VALIDATION,
-            CAUSE_SCALAR_PARTITION,
         }
-        assert set(EMPTY_CAUSE_KIND.values()) == {"judgment", "breakage", "routing"}
+        assert set(EMPTY_CAUSE_KIND.values()) == {"judgment", "breakage"}
 
     def test_unknown_and_none_are_unattributed(self):
         assert cause_kind(None) == CAUSE_UNATTRIBUTED

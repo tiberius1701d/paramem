@@ -10,12 +10,22 @@ Facts can come from ANY turn, including [assistant] turns. The subject is whoeve
 
 When the transcript is a structured or bulleted list, treat EACH item as a separate fact and emit a relation for it — never collapse the list into the summary or into entity attributes alone. A heading (e.g. `## Experience`, `## Skills`) labels the facts that follow: extract the facts beneath it, not the heading. A single item may yield more than one relation (e.g. a role at an organization → both a role relation and a works_at relation).
 
+When a relation's object is a literal, verbatim datum ABOUT the subject — a certification name, an exact job title, an ID number, a specific date — rather than a distinct concept that could itself hold other facts, tag that relation `"relation_type": "attribute"` instead of `"factual"`/`"social"`. This keeps two different people's identical value (e.g. the same certification) from colliding onto one shared graph entity. Places, organizations, and named things (a car, a pet, a project) are NOT literal values — keep those `"factual"`.
+
 
 POSITIVE example — speaker id is "speaker0" (display name "Alex"), transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
 {{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
  {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
  "relations": [{{"subject": "speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "speaker0 (Alex Morgan) works at Brightfield Labs."}}
+
+
+POSITIVE example — speaker id is "speaker0", transcript: "[user] I earned my SAE Level 3 certification last year, and I'm now Lead Systems Engineer."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "speaker0", "predicate": "has_certification", "object": "SAE Level 3", "relation_type": "attribute", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "has_title", "object": "Lead Systems Engineer", "relation_type": "attribute", "confidence": 1.0}}],
+ "summary": "speaker0 earned the SAE Level 3 certification and holds the title Lead Systems Engineer."}}
 
 
 POSITIVE example — speaker id is "speaker0", transcript: "[user] My sister Nadia lives in Frankfurt. [assistant] Frankfurt is about 200km from here."

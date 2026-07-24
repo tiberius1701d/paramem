@@ -43,7 +43,7 @@ _HARDCODED_FALLBACK: dict = {
         "concept": {"anchor": "schema:Thing"},
     },
     "fallback_entity_type": "concept",
-    "relation_types": ["factual", "temporal", "preference", "social"],
+    "relation_types": ["factual", "temporal", "preference", "social", "attribute"],
     "fallback_relation_type": "factual",
     "anonymizer": {
         "prefixes": [

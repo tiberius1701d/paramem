@@ -2,7 +2,8 @@
 
 Covers:
 - entry_fact_text: SPO assembly at the render boundary — the stored predicate
-  identity form is rendered as prose ('_' becomes a space, '-' survives).
+  identity form is already space-form prose ('_' was folded to a space by
+  canonical() upstream; '-' survives). No further substitution happens here.
 - probe_keys_grouped_by_adapter: should_abort stops the loop early and
   returns partial results without raising.
 - WeightMemorySource.probe: forwards should_abort to the underlying function.
@@ -63,9 +64,9 @@ def _make_tokenizer() -> MagicMock:
 
 class TestEntryFactText:
     def test_basic_assembly(self) -> None:
-        """The stored identity predicate is rendered as prose: '_' becomes a space."""
+        """The stored identity predicate (already space-form) is used as-is."""
         result = entry_fact_text(
-            {"subject": "Alex", "predicate": "lives_in", "object": "Heilbronn"}
+            {"subject": "Alex", "predicate": "lives in", "object": "Heilbronn"}
         )
         assert result == "Alex lives in Heilbronn"
 
@@ -73,24 +74,24 @@ class TestEntryFactText:
         result = entry_fact_text({"subject": "Alex", "predicate": "knows", "object": "Bob"})
         assert result == "Alex knows Bob"
 
-    def test_multi_underscore_predicate_respaced(self) -> None:
-        """Every '_' in the identity form renders as a space, not just the first."""
+    def test_multi_word_predicate_passthrough(self) -> None:
+        """A multi-word identity-form predicate passes through unchanged."""
         result = entry_fact_text(
-            {"subject": "Alice", "predicate": "works_at_company", "object": "Acme"}
+            {"subject": "Alice", "predicate": "works at company", "object": "Acme"}
         )
         assert result == "Alice works at company Acme"
 
     def test_hyphenated_predicate_preserved(self) -> None:
         """``-`` is not a blank in the identity form, so it survives the render."""
         result = entry_fact_text(
-            {"subject": "Alex", "predicate": "has_sister-in-law", "object": "Mia"}
+            {"subject": "Alex", "predicate": "has sister-in-law", "object": "Mia"}
         )
         assert result == "Alex has sister-in-law Mia"
 
     def test_non_ascii_object_rendered(self) -> None:
         """Non-ASCII object surfaces pass through the render untouched."""
         result = entry_fact_text(
-            {"subject": "Alex", "predicate": "has_key_achievement", "object": "€4.5B sales"}
+            {"subject": "Alex", "predicate": "has key achievement", "object": "€4.5B sales"}
         )
         assert result == "Alex has key achievement €4.5B sales"
 
@@ -99,7 +100,7 @@ class TestEntryFactText:
         from paramem.utils.identity import canonical
 
         pred = canonical("has hobby")
-        assert pred == "has_hobby"
+        assert pred == "has hobby"
         result = entry_fact_text({"subject": "Alex", "predicate": pred, "object": "chess"})
         assert result == "Alex has hobby chess"
 
@@ -107,14 +108,14 @@ class TestEntryFactText:
 
     def test_resolve_none_byte_identical(self) -> None:
         """resolve=None (default) is byte-identical to passing no resolver."""
-        entry = {"subject": "speaker0", "predicate": "lives_in", "object": "Berlin"}
+        entry = {"subject": "speaker0", "predicate": "lives in", "object": "Berlin"}
         assert entry_fact_text(entry) == entry_fact_text(entry, resolve=None)
 
     def test_resolve_subject_position(self) -> None:
         """resolver applied to subject when subject is a speaker{N} token."""
         resolve = lambda t: "Dana" if t == "speaker9" else t  # noqa: E731
         result = entry_fact_text(
-            {"subject": "speaker9", "predicate": "lives_in", "object": "Berlin"},
+            {"subject": "speaker9", "predicate": "lives in", "object": "Berlin"},
             resolve=resolve,
         )
         assert result == "Dana lives in Berlin"
@@ -134,7 +135,7 @@ class TestEntryFactText:
         descriptor = "another speaker"
         resolve = lambda t: descriptor if t.startswith("speaker") else t  # noqa: E731
         result_subj = entry_fact_text(
-            {"subject": "speaker9", "predicate": "lives_in", "object": "Paris"},
+            {"subject": "speaker9", "predicate": "lives in", "object": "Paris"},
             resolve=resolve,
         )
         assert descriptor in result_subj

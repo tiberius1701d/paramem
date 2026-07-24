@@ -10,31 +10,28 @@ Covers:
 - schema-validation drop recording (kept vs. dropped, and the record shape)
 - entity typing derived from a placeholder prefix, plus the pruning and
   the inverted-resolution lookup that feeds it
-- the scalar partition / projection round trip
-- the recovery gate's decision, including the ``routing`` kind that
-  suppresses it
+- the recovery gate's decision
 
 The ``CAUSE_*`` vocabulary's own classification tests
 (``cause_kind``/``EMPTY_CAUSE_KIND``) live in ``test_empty_cause.py`` now
 that the vocabulary itself lives in ``paramem.graph.empty_cause``.
+
+Literal-value ("scalar") facts are no longer routed by this module — the
+model tags them ``relation_type="attribute"`` at extraction time and
+``GraphMerger`` folds them onto the subject node's ``attributes`` dict
+(see ``tests/graph/test_merger_attribute_gate.py``).
 """
 
 from __future__ import annotations
 
-import pytest
-
 from paramem.graph.empty_cause import (
     CAUSE_DEANON_JUDGE,
-    CAUSE_SCALAR_PARTITION,
     CAUSE_SCHEMA_VALIDATION,
     CAUSE_UNATTRIBUTED,
 )
 from paramem.graph.relation_build import (
     apply_rebuild,
     build_relations,
-    is_scalar_value,
-    partition_scalar_facts,
-    project_scalar_facts_to_attributes,
     recovery_gate,
 )
 from paramem.graph.schema import Entity, Relation, SessionGraph
@@ -128,7 +125,6 @@ class TestApplyRebuild:
         apply_rebuild(
             graph,
             [self._relation("Alex", "Millfield")],
-            [],
             {"Person_1": "Alex", "Paper_1": "Millfield"},
         )
         types = {e.name: e.entity_type for e in graph.entities}
@@ -137,7 +133,7 @@ class TestApplyRebuild:
 
     def test_unmapped_name_defaults_to_concept(self):
         graph = _graph()
-        apply_rebuild(graph, [self._relation("Alex", "Springfield")], [], {})
+        apply_rebuild(graph, [self._relation("Alex", "Springfield")], {})
         types = {e.name: e.entity_type for e in graph.entities}
         assert types == {"Alex": "concept", "Springfield": "concept"}
 
@@ -146,7 +142,7 @@ class TestApplyRebuild:
         are real names, so a non-inverted lookup would never match and
         everything would fall back to "concept"."""
         graph = _graph()
-        apply_rebuild(graph, [self._relation("Alex", "Millfield")], [], {"City_1": "Millfield"})
+        apply_rebuild(graph, [self._relation("Alex", "Millfield")], {"City_1": "Millfield"})
         types = {e.name: e.entity_type for e in graph.entities}
         assert types["Millfield"] != "concept"
 
@@ -158,79 +154,15 @@ class TestApplyRebuild:
                 Entity(name="Orphan", entity_type="concept"),
             ]
         )
-        apply_rebuild(graph, [self._relation("Alex", "Millfield")], [], {"Paper_1": "Alex"})
+        apply_rebuild(graph, [self._relation("Alex", "Millfield")], {"Paper_1": "Alex"})
         types = {e.name: e.entity_type for e in graph.entities}
         assert types == {"Alex": "person", "Millfield": "place"}
 
     def test_relations_are_installed(self):
         graph = _graph()
         rel = self._relation("Alex", "Millfield")
-        apply_rebuild(graph, [rel], [], {})
+        apply_rebuild(graph, [rel], {})
         assert graph.relations == [rel]
-
-    def test_scalar_subject_survives_pruning_and_is_projected(self):
-        """A subject that appears ONLY in a scalar fact must not be pruned
-        away before the projection attaches the attribute to it."""
-        graph = _graph([Entity(name="Alex", entity_type="person")])
-        scalar = [_fact(subject="Alex", predicate="has_email", obj="alex@example.com")]
-        apply_rebuild(graph, [], scalar, {})
-        alex = next(e for e in graph.entities if e.name == "Alex")
-        assert alex.attributes["email"] == "alex@example.com"
-        assert graph.relations == []
-
-
-class TestScalarRoundTrip:
-    def test_partition_then_project_round_trip(self):
-        graph = _graph([Entity(name="Alex", entity_type="person")])
-        facts = [
-            _fact(subject="Alex", predicate="has_email", obj="alex@example.com"),
-            _fact(subject="Alex", predicate="uses", obj="ROS2"),
-            _fact(subject="Alex", predicate="lives_in", obj="Millfield"),
-        ]
-        scalar, non_scalar = partition_scalar_facts(facts, graph.entities)
-        assert [f["object"] for f in scalar] == ["alex@example.com", "ROS2"]
-        assert [f["object"] for f in non_scalar] == ["Millfield"]
-
-        project_scalar_facts_to_attributes(graph, scalar)
-        alex = next(e for e in graph.entities if e.name == "Alex")
-        # ``has_`` is stripped so relation_prep's re-prefixing cannot
-        # produce ``has_has_email``.
-        assert alex.attributes == {"email": "alex@example.com", "uses": "ROS2"}
-
-    def test_object_naming_an_existing_entity_is_never_scalar(self):
-        entities = [Entity(name="R2D2", entity_type="person")]
-        scalar, non_scalar = partition_scalar_facts(
-            [_fact(subject="Alex", predicate="knows", obj="R2D2")], entities
-        )
-        assert scalar == []
-        assert len(non_scalar) == 1
-
-    def test_synthetic_facts_pass_through(self):
-        scalar, non_scalar = partition_scalar_facts(
-            [_fact(obj="https://example.com/x", synthetic=True)], []
-        )
-        assert scalar == []
-        assert len(non_scalar) == 1
-
-    def test_projection_mints_a_missing_subject_entity(self):
-        graph = _graph()
-        project_scalar_facts_to_attributes(
-            graph, [_fact(subject="Acme", predicate="has_url", obj="acme.example/jobs")]
-        )
-        acme = next(e for e in graph.entities if e.name == "Acme")
-        assert acme.entity_type == "concept"
-        assert acme.attributes == {"url": "acme.example/jobs"}
-
-    @pytest.mark.parametrize(
-        "value",
-        ["https://example.com/a", "alex@example.com", "+1 555 123 4567", "ROS2", "10.1000/xyz123"],
-    )
-    def test_scalar_shapes(self, value):
-        assert is_scalar_value(value)
-
-    @pytest.mark.parametrize("value", ["Millfield", "the electricity bill", "", "a place"])
-    def test_non_scalar_shapes(self, value):
-        assert not is_scalar_value(value)
 
 
 class TestRecoveryGate:
@@ -270,19 +202,6 @@ class TestRecoveryGate:
         assert graph.diagnostics["all_dropped_cause"] == {
             "cause": CAUSE_SCHEMA_VALIDATION,
             "kind": "breakage",
-        }
-
-    def test_does_not_fire_on_a_routing_cause(self):
-        """A scalar-only session emptied the relation set on PURPOSE: the
-        facts moved to the entity-attribute surface, nothing was lost, and
-        the recovery path would both skip the projection and
-        re-materialize the same facts as relations."""
-        graph = _graph()
-        assert recovery_gate(graph, [], 4, CAUSE_SCALAR_PARTITION) is False
-        # Still recorded — the operator sees WHY the relation set is empty.
-        assert graph.diagnostics["all_dropped_cause"] == {
-            "cause": CAUSE_SCALAR_PARTITION,
-            "kind": "routing",
         }
 
     def test_fires_with_no_claimed_cause(self):

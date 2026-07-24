@@ -17,7 +17,8 @@ if TYPE_CHECKING:
 # the extractor used a preference predicate but tagged the relation as factual.
 # Both this set and the incoming predicate go through canonical(), so the set
 # and the comparison share one surface-form contract — a predicate the model
-# emits as "has hobby" and one it emits as "has_hobby" are the same member.
+# emits as "has hobby" and one it emits as "has_hobby" both canonicalize to
+# the same member, "has hobby".
 _PROCEDURAL_PREDICATES = frozenset(
     canonical(p)
     for p in (
@@ -74,6 +75,33 @@ def partition_relations(
     return episodic, procedural
 
 
+def attr_predicate(key: str) -> str:
+    """The one predicate surface for a projected attribute fact: ``f"has {canonical(key)}"``.
+
+    Shared by every surface that turns an attribute (subject, key, value)
+    pair into a trainable relation-dict predicate: :func:`_flatten_entity_attributes`
+    (the interim path, projecting ``Entity.attributes``) and
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`'s
+    node-attribute walk (the full-cycle path, projecting ``GraphMerger``
+    node ``attributes``). Both surfaces MUST derive the predicate through
+    this one function — a second inline copy of the formula is how the two
+    paths silently diverge (e.g. a node-attribute key copied verbatim from
+    ``Entity.attributes`` by ``GraphMerger._upsert_entity``, still carrying
+    an underscore, must be re-canonicalized here rather than glued as-is).
+    ``canonical()`` is idempotent, so calling this on an already-canonical
+    key (e.g. one the merger's attribute gate wrote) is a no-op.
+
+    Args:
+        key: Raw or already-canonical attribute key.
+
+    Returns:
+        ``"has "`` followed by the canonical (space-folded, case-folded)
+        form of *key* — the one project-wide identity surface, never a
+        mixed-separator glue.
+    """
+    return f"has {canonical(key)}"
+
+
 def _flatten_entity_attributes(
     entities: "list[Entity]",
     *,
@@ -93,15 +121,17 @@ def _flatten_entity_attributes(
 
         {
             "subject": entity.name,
-            "predicate": "has_<normalised_key>",
+            "predicate": "has <normalised_key>",
             "object": str(attr_val),
             "relation_type": "attribute",
         }
 
-    Predicate normalisation: attribute keys are passed through
-    :func:`paramem.utils.identity.canonical` (case-fold, diacritic-fold,
-    blank runs → ``_``) and prefixed with ``"has_"``
-    (``"phone number"`` → ``"has_phone_number"``).
+    Predicate normalisation goes through :func:`attr_predicate` — the ONE
+    formula (``f"has {canonical(key)}"``) shared with
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`'s
+    node-attribute walk (the full-cycle path), so the two surfaces an
+    attribute fact can be trained under never diverge and share one
+    SimHash fingerprint.
 
     Pairs whose ``(subject, predicate)`` already appears in ``exclude_pairs``
     are skipped — prevents duplicate keying when an explicit ``has_<key>``
@@ -120,11 +150,7 @@ def _flatten_entity_attributes(
             val_str = str(attr_val).strip()
             if not val_str:
                 continue
-            # Normalise predicate via canonical identity function.
-            # canonical() emits the one project-wide surface form; the "has_"
-            # prefix keeps that form (underscores survive canonical()), so the
-            # merger's re-canonicalization at node-identity time is a no-op.
-            predicate = f"has_{canonical(raw_key)}"
+            predicate = attr_predicate(raw_key)
             pair = (entity.name, predicate)
             if pair in _exclude:
                 continue

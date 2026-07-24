@@ -22,18 +22,31 @@ comparison through the same two ``canonical``-family functions.  Name
 merger, not here.  Stateless, deterministic, no I/O.  Thread-safe by
 construction.
 
-One surface form, project-wide: lower-case, blank runs collapsed to a single
-``_``, ``-`` and ``_`` preserved verbatim.  This is the identity form — the
-node key, the stored predicate, the SimHash and dedup key.  It is NOT the
-display surface: rendering to prose happens at
-:func:`paramem.memory.entry.entry_fact_text`, which turns ``_`` back into a
-space (``has_hobby`` → ``"has hobby"``).  Matching names against free prose is
-a separate contract that does not call this function at all.
+One surface form, project-wide: lower-case, blank runs (including ``_``)
+collapsed to a single space, ``-`` preserved verbatim.  This is the identity
+form — the node key, the stored predicate, the SimHash and dedup key.  It IS
+also the display surface for the predicate: :func:`paramem.memory.entry.entry_fact_text`
+renders the predicate as-is (no ``_``→space substitution happens there any
+more, since the identity form already uses spaces).  Matching names against
+free prose is a separate contract that does not call this function at all.
 
-Over-collapse boundary (GUARANTEED-identical-only):
+:func:`canonical` takes a ``mode`` argument selecting between two folds:
+``"full"`` (default) — case-fold + diacritic-fold + space-fold, the identity
+key used everywhere above — and ``"spaces"`` — space-fold only (``_``/blank
+runs → single space), case and exact surface otherwise preserved.  ``mode="spaces"``
+exists for the SimHash register/recall symmetry fold in
+:func:`paramem.memory.entry.entry_simhash` / :func:`~paramem.memory.entry.verify_confidence`,
+where diacritic/NFC distinctions must stay discriminating (``"café"`` ≠
+``"cafe"`` in that comparison) but a ``_``↔space recall drift on the same
+fact must not desync the fingerprint.  (The SimHash tokenizer lowercases, so
+case never reaches the fingerprint; ``mode="full"`` would additionally fold
+diacritics and collapse ``café``/``cafe`` — hence ``"spaces"`` there.)
+
+Over-collapse boundary (GUARANTEED-identical-only, ``mode="full"``):
   Folded: Unicode canonical form, case (incl. ligatures `str.casefold` covers,
-  e.g. ``ﬁ``→``fi``), diacritics, whitespace runs (→ ``_``).
-  NOT folded: ``-`` vs ``_`` (``sister-in-law`` ≠ ``sister_in_law``), typos
+  e.g. ``ﬁ``→``fi``), diacritics, whitespace runs including ``_`` (→ single
+  space).
+  NOT folded: ``-`` (``sister-in-law`` ≠ ``sister in law``), typos
   (HR3 ≠ HS3), substrings, NFKC compatibility forms (superscript ``²``,
   full-width), honorifics, token subsets.  Those are layer-2 LLM SAME_AS
   coreference, out of scope here.
@@ -63,72 +76,92 @@ import unicodedata
 _SPEAKER_ID_RE = re.compile(r"^[Ss]peaker\d+$")
 
 
-def canonical(s: str) -> str:
+def canonical(s: str, mode: str = "full") -> str:
     """The single surface form for entity names, objects, and predicates.
 
-    Lower-cases (Unicode full case folding, §3.13), folds diacritics, and
-    collapses whitespace runs to a single ``_``.  ``-`` and ``_`` are preserved
-    verbatim — they are NOT interchangeable.  ``"has hobby"`` and
-    ``"has_hobby"`` are one value, ``has_hobby``.
+    Two modes, selecting how much folding is applied:
 
-    The output is the **identity key** — what is stored, compared, keyed and
-    trained.  It is NOT the display surface: rendering back to prose happens at
-    :func:`~paramem.memory.entry.entry_fact_text`, which emits ``_`` as a space
-    (``"Alex has sister-in-law Mia"``).  Matching entity names against free
-    prose is a separate contract that does not use this function at all.
+    * ``mode="full"`` (default) — lower-cases (Unicode full case folding,
+      §3.13), folds diacritics, and collapses ``_``/whitespace runs to a
+      single space.  ``-`` is preserved verbatim — it is NOT a blank.
+      ``"has hobby"`` and ``"has_hobby"`` are one value, ``"has hobby"``.
+      This is the **identity key** — what is stored, compared, keyed and
+      trained (node keys, predicates, the SimHash/dedup key).  It is also the
+      display surface for the predicate: :func:`~paramem.memory.entry.entry_fact_text`
+      renders it as-is, no further substitution.  Matching entity names
+      against free prose is a separate contract (:func:`prose_fold`) that
+      does not use this function at all.
+    * ``mode="spaces"`` — folds ONLY ``_``/whitespace runs to a single space;
+      no casefold, no diacritic-fold, exact surface otherwise preserved.
+      Used where a ``_``↔space recall drift on the same fact must not desync a
+      fingerprint, but diacritic/NFC distinctions must stay discriminating
+      (e.g. the SimHash register/recall fold in
+      :func:`~paramem.memory.entry.entry_simhash` /
+      :func:`~paramem.memory.entry.verify_confidence`, where ``"café"`` must
+      still differ from ``"cafe"``; the tokenizer lowercases, so ``"full"``'s
+      extra diacritic-fold would wrongly collapse them).
 
-    GUARANTEED-identical-only.  Folds: Unicode canonical form, case (incl. the
-    few ligatures ``str.casefold`` covers, e.g. ``ﬁ``→``fi``), diacritics,
-    whitespace runs.  Does NOT fold: ``-`` against ``_`` (``sister-in-law`` ≠
-    ``sister_in_law``), typos (HR3 ≠ HS3), substrings (autonomous_systems ≠
-    autonomous_systems_research), NFKC compatibility forms (superscript ``²``,
-    full-width), honorifics, token subsets — those are layer-2 LLM SAME_AS
-    coreference, out of scope.
+    GUARANTEED-identical-only (``mode="full"``).  Folds: Unicode canonical
+    form, case (incl. the few ligatures ``str.casefold`` covers, e.g.
+    ``ﬁ``→``fi``), diacritics, whitespace runs including ``_``.  Does NOT
+    fold: ``-`` (``sister-in-law`` ≠ ``sister in law``), typos (HR3 ≠ HS3),
+    substrings (autonomous systems ≠ autonomous systems research), NFKC
+    compatibility forms (superscript ``²``, full-width), honorifics, token
+    subsets — those are layer-2 LLM SAME_AS coreference, out of scope.
 
     Args:
         s: Raw string to canonicalize.  May be a name, predicate, or object.
+        mode: ``"full"`` (default) for the identity fold, or ``"spaces"`` for
+            the space-only fold (case/diacritics preserved).
 
     Returns:
-        Lower-case, NFC-normalized string with diacritics folded and blank runs
-        replaced by single underscores.  ``""`` for empty or whitespace-only
-        input.
+        Normalized string with blank runs (``_``/whitespace) collapsed to a
+        single space; under ``mode="full"`` also NFC-normalized, lower-cased
+        and diacritic-folded.  ``""`` for empty or whitespace-only input.
 
     Examples::
 
         >>> canonical("has hobby") == canonical("has_hobby")
         True
+        >>> canonical("has hobby")
+        'has hobby'
         >>> canonical("sister-in-law")
         'sister-in-law'
         >>> canonical("HELLO World")
-        'hello_world'
+        'hello world'
+        >>> canonical("New_York", mode="spaces")
+        'New York'
 
-    Order rationale (Unicode §3.13): NFC before casefold handles the U+0345
-    family that casefolds correctly only after decomposition; re-NFC after
-    casefold + combining-strip restores a stable form so ``f(f(x)) == f(x)``.
-    Whitespace folding is last — it only consumes ASCII/Unicode blanks and
-    emits ``_``, which ``str.split()`` does not treat as a separator, so
-    re-running is a no-op.  Idempotent and stable across runs for a fixed
-    CPython build.
+    Order rationale (Unicode §3.13, ``mode="full"``): NFC before casefold
+    handles the U+0345 family that casefolds correctly only after
+    decomposition; re-NFC after casefold + combining-strip restores a stable
+    form so ``f(f(x)) == f(x)``.  Whitespace/underscore folding is last — it
+    only consumes ``_`` and Unicode blanks and emits a single space, which
+    ``str.split()`` treats as a separator, so re-running is a no-op.
+    Idempotent and stable across runs for a fixed CPython build, in both
+    modes.
     """
     if not s:
         return ""
+    if mode == "spaces":
+        return " ".join(s.replace("_", " ").split())
     s = unicodedata.normalize("NFC", s)
     s = s.casefold()
     s = "".join(ch for ch in unicodedata.normalize("NFD", s) if not unicodedata.combining(ch))
     s = unicodedata.normalize("NFC", s)
-    return "_".join(s.split())
+    return " ".join(s.replace("_", " ").split())
 
 
 def prose_fold(text: str) -> str:
     """Case-insensitive fold for matching a needle against free prose.
 
     This is the **prose-matching** counterpart to :func:`canonical` — the
-    two families are not interchangeable.  ``canonical`` folds whitespace to
-    ``_``, which breaks substring/token matching against space-separated
-    prose (a folded multi-word entity name would never be found embedded in
-    a sentence).  ``prose_fold`` deliberately does neither: it does NOT fold
-    whitespace, and it does NOT go beyond ``str.lower()`` (no casefold, no
-    diacritic-folding).  One consumer is the sanitizer's first-person PII
+    two families are not interchangeable.  ``canonical`` casefolds and
+    diacritic-folds (and collapses blank runs), which breaks case- and
+    accent-sensitive substring/token matching against free prose.
+    ``prose_fold`` deliberately does neither: it does NOT go beyond
+    ``str.lower()`` (no casefold, no diacritic-folding, no blank collapse).
+    One consumer is the sanitizer's first-person PII
     gate (:mod:`paramem.server.sanitizer`), where changing case/diacritic
     matching behavior would alter privacy-relevant matching — out of scope
     for this fold.

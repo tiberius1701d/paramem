@@ -126,15 +126,15 @@ def measure_all_fidelity(
 # match dispatch sorts by length so longer prefixes ("works as" before
 # "works at" before just "works") are tried first.
 _VERB_PREFIX_TO_PREDICATE: dict[str, str] = {
-    "lives in": "lives_in",
-    "works at": "works_at",
-    "works as": "works_as",
-    "has a pet:": "has_pet",
+    "lives in": "lives in",
+    "works at": "works at",
+    "works as": "works as",
+    "has a pet:": "has pet",
     "prefers": "prefers",
-    "studied at": "studies_at",
+    "studied at": "studies at",
     "speaks": "speaks",
     "knows": "knows",
-    "enjoys": "has_hobby",
+    "enjoys": "has hobby",
     "manages": "manages",
     "uses": "uses",
     "likes": "likes",
@@ -148,10 +148,10 @@ _VERB_PREFIX_TO_PREDICATE: dict[str, str] = {
     "debugged": "debugged",
     "presented": "presented",
     "started": "started",
-    "collaborates with": "collaborates_with",
+    "collaborates with": "collaborates with",
 }
 
-# "is N…" → has_age is handled separately because the original regex
+# "is N…" → has age is handled separately because the original regex
 # pinned the object to start with a digit; replicated below in
 # _parse_age_remainder so a literal-prefix table stays homogeneous.
 
@@ -293,7 +293,7 @@ def parse_profile_to_triples(
             triples.append(
                 {
                     "subject": entity_name,
-                    "predicate": "has_age",
+                    "predicate": "has age",
                     "object": age_obj,
                 }
             )

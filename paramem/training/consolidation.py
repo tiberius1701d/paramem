@@ -23,6 +23,7 @@ from paramem.graph.merger import GraphMerger
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.relation_prep import (
+    attr_predicate,
     partition_relations,
 )
 from paramem.graph.schema import Relation, SessionGraph
@@ -134,9 +135,9 @@ def _relation_to_entry_dict(r: "Relation") -> dict:
     so interim-tier entries match the identity form the merger stamps onto the
     cumulative edge (``merger.py:710``) — without this, an interim entry built
     straight from ``session_graph.relations``/``proc_graph.relations`` carries
-    the raw extraction surface (e.g. ``"lives in"``) while the full-cycle edge
+    the raw extraction surface (e.g. ``"Works_At"``) while the full-cycle edge
     entry (:meth:`ConsolidationLoop._build_all_edge_entries_into`) carries the
-    canonical form (``"lives_in"``), desyncing the SimHash fingerprint below
+    canonical form (``"works at"``), desyncing the SimHash fingerprint below
     :data:`~paramem.memory.entry.DEFAULT_CONFIDENCE_THRESHOLD`.  ``subject`` and
     ``object`` are left as-is — display surfaces, not identity keys.  ``r``
     itself (in particular ``r.predicate``) is never mutated: the raw surface
@@ -4852,11 +4853,19 @@ class ConsolidationLoop:
         tag_new: bool = False,
         exclude_keys: "set[str] | None" = None,
     ) -> "tuple[dict[str, int], list[dict]]":
-        """Walk ALL merged-graph edges and populate *tier_keyed* with uniform entry dicts.
+        """Walk ALL merged-graph edges AND node attributes; populate *tier_keyed*.
 
         Single unified edge→entry builder that subsumes the former three-step
         sequence of ``_harvest_keyless_edge_entries`` →
         ``_apply_keyless_edge_entries`` → ``_collect_keyed_edges_into``.
+        A second pass after the edge walk covers node ``attributes``:
+        ``GraphMerger.merge`` diverts ``relation_type == "attribute"``
+        relations (phone/email/date/certification/job title, ...) onto the
+        SUBJECT node's ``attributes`` dict instead of an edge, so they are
+        invisible to the edge walk and need their own projection back into
+        ``tier_keyed`` — see the node-attribute walk below, which mirrors
+        both edge-walk branches (tier derivation, store commit discipline,
+        entry shape) exactly.
 
         **One pass, two branches per edge:**
 
@@ -4957,6 +4966,158 @@ class ConsolidationLoop:
         _local_indexed: int | None = None
         _local_procedural: int | None = None
 
+        # (subject, predicate) pairs emitted by the edge walk below — read by
+        # the node-attribute walk after it to skip a node attribute whose
+        # pair was already emitted as an edge (defensive dedup for a mixed
+        # graph, e.g. a pre-Unit-4 fold artifact still carrying an edge for
+        # what a fresh extraction would now route to node["attributes"]).
+        _emitted_pairs: set[tuple[str, str]] = set()
+
+        def _commit_keyless_mint(
+            *,
+            subject_display: str,
+            predicate: str,
+            object_value: str,
+            relation_type: str,
+            speaker_id: str,
+            canon_subj: str,
+            canon_obj: str,
+            session_ids: list[str],
+            last_seen: str,
+            first_seen: str,
+        ) -> dict:
+            """Mint one keyless fact, commit-or-defer it, and append to *tier_keyed*.
+
+            The shared commit sequence behind BOTH keyless branches (edge
+            walk and node-attribute walk): derive tier, mint via
+            :meth:`_mint_keyed_entries` against the shared local running
+            counter, persist immediately (``defer=False``) or record a
+            deferred-write ``rec`` (``defer=True``), then append the
+            uniform ``tier_keyed`` shape. Closes over this call's
+            ``tier_keyed``/``minted_by_tier``/``deferred_writes``/``defer``/
+            ``tag_new`` and the ``_local_indexed``/``_local_procedural``
+            running counters (mutated via ``nonlocal`` — the two branches
+            share ONE counter sequence, so it cannot be a plain parameter).
+
+            The only differences between the two call sites are how they
+            derive these arguments: an edge has two endpoints and an
+            edge-carried speaker_id/session/timestamp trail; a node
+            attribute has one endpoint (the subject) and none of that
+            edge-carried provenance (``session_ids=[]``,
+            ``last_seen=first_seen=""``, ``canon_obj=""``).
+
+            Returns:
+                The dict appended to ``tier_keyed[tier]``
+                (``{key, subject, predicate, object, speaker_id}``).
+            """
+            nonlocal _local_indexed, _local_procedural
+
+            _dummy = [
+                {
+                    "subject": subject_display,
+                    "predicate": predicate,
+                    "object": object_value,
+                    "relation_type": relation_type,
+                }
+            ]
+            _ep_rels, _proc_rels = partition_relations(
+                _dummy, procedural_enabled=self.procedural_config is not None
+            )
+            tier = "procedural" if _proc_rels else "episodic"
+
+            # Mint via the shared helper (single-element list).
+            # Use LOCAL running counter as start_index; advance after each mint.
+            prefix = "proc" if tier == "procedural" else "graph"
+            if tier == "procedural":
+                if _local_procedural is None:
+                    _local_procedural = self._procedural_next_index
+                start_index = _local_procedural
+            else:
+                if _local_indexed is None:
+                    _local_indexed = self._indexed_next_index
+                start_index = _local_indexed
+
+            minted = self._mint_keyed_entries(
+                [
+                    {
+                        "subject": subject_display,
+                        "predicate": predicate,
+                        "object": object_value,
+                        "relation_type": relation_type,
+                        "speaker_id": speaker_id,
+                    }
+                ],
+                prefix=prefix,
+                start_index=start_index,
+                speaker_id=speaker_id,
+                tag_new=tag_new,
+            )
+
+            # Advance the local counter for the chosen tier.
+            if tier == "procedural":
+                _local_procedural += 1
+            else:
+                _local_indexed += 1
+
+            entry = minted[0]
+            minted_key = entry["key"]
+            # This "rec" shape (minus canon_subj/canon_obj, which the interim
+            # commit window never reads) is the round-trip contract with
+            # module-level _persisted_from_entry_and_rec (serialize into
+            # fold_resume.json) / _rec_from_persisted (deserialize on
+            # crash-resume) — see those functions' docstrings.
+            rec = {
+                "entry": entry,
+                "tier": tier,
+                "canon_subj": canon_subj,
+                "canon_obj": canon_obj,
+                "predicate": predicate,
+                "relation_type": relation_type,
+                "speaker_id": speaker_id,
+                "session_ids": session_ids,
+                "last_seen": last_seen,
+                "first_seen": first_seen,
+            }
+
+            if not defer:
+                # Fold discipline: persist immediately.
+                self.store.put(
+                    tier,
+                    minted_key,
+                    entry,
+                    simhash=entry_simhash(entry),
+                )
+                self.store.set_bookkeeping(
+                    minted_key,
+                    speaker_id=speaker_id,
+                    relation_type=relation_type,
+                    reinforcement_count=1,
+                    last_reinforced_cycle=self.cycle_count,
+                    last_seen=last_seen,
+                    first_seen=first_seen,
+                    allow_empty_speaker=(speaker_id == ""),
+                )
+                # Advance the committed counter for the chosen tier.
+                if tier == "procedural":
+                    self._procedural_next_index += 1
+                else:
+                    self._indexed_next_index += 1
+            else:
+                # Interim atomicity: defer all store writes + counter advances.
+                deferred_writes.append(rec)
+
+            # Append to tier_keyed (uniform shape, same as the keyed branch).
+            result_entry = {
+                "key": minted_key,
+                "subject": entry["subject"],
+                "predicate": predicate,
+                "object": entry["object"],
+                "speaker_id": speaker_id,
+            }
+            tier_keyed[tier].append(result_entry)
+            minted_by_tier[tier] += 1
+            return result_entry
+
         for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
             key = _t_data.get(_IK_ATTR)
             pred = _t_data.get("predicate", "")
@@ -5015,56 +5176,6 @@ class ConsolidationLoop:
                         # (e.g. company-location) must NOT be attributed to a speaker.
                         _subj_sid = self._unique_speaker_predecessor(_t_subj)
 
-                # Derive tier via partition_relations (mirrors the keyed branch).
-                _dummy = [
-                    {
-                        "subject": _subj_display,
-                        "predicate": pred,
-                        "object": _obj_display,
-                        "relation_type": _rt,
-                    }
-                ]
-                _ep_rels, _proc_rels = partition_relations(
-                    _dummy, procedural_enabled=self.procedural_config is not None
-                )
-                tier = "procedural" if _proc_rels else "episodic"
-
-                # Mint via the shared helper (single-element list).
-                # Use LOCAL running counter as start_index; advance after each mint.
-                prefix = "proc" if tier == "procedural" else "graph"
-                if tier == "procedural":
-                    if _local_procedural is None:
-                        _local_procedural = self._procedural_next_index
-                    start_index = _local_procedural
-                else:
-                    if _local_indexed is None:
-                        _local_indexed = self._indexed_next_index
-                    start_index = _local_indexed
-
-                minted = self._mint_keyed_entries(
-                    [
-                        {
-                            "subject": _subj_display,
-                            "predicate": pred,
-                            "object": _obj_display,
-                            "relation_type": _rt,
-                            "speaker_id": _subj_sid,
-                        }
-                    ],
-                    prefix=prefix,
-                    start_index=start_index,
-                    speaker_id=_subj_sid,
-                    tag_new=tag_new,
-                )
-
-                # Advance the local counter for the chosen tier.
-                if tier == "procedural":
-                    _local_procedural += 1
-                else:
-                    _local_indexed += 1
-
-                entry = minted[0]
-                minted_key = entry["key"]
                 # Source the contributing session ids from the merged edge,
                 # excluding synthetic fold sentinels.  The result is a sorted
                 # list of real session ids that contributed this fact.
@@ -5076,67 +5187,25 @@ class ConsolidationLoop:
                 _rec_session_ids: list[str] = sorted(
                     set(_t_data.get("sessions", [])) - _SYNTHETIC_SESSION_IDS
                 )
-                # This "rec" shape (minus canon_subj/canon_obj, which the interim
-                # commit window never reads) is the round-trip contract with
-                # module-level _persisted_from_entry_and_rec (serialize into
-                # fold_resume.json) / _rec_from_persisted (deserialize on
-                # crash-resume) — see those functions' docstrings.
-                rec = {
-                    "entry": entry,
-                    "tier": tier,
-                    "canon_subj": _t_subj,
-                    "canon_obj": _t_obj,
-                    "predicate": pred,
-                    "relation_type": _rt,
-                    "speaker_id": _subj_sid,
-                    "session_ids": _rec_session_ids,
+                # The ik_key attribute is intentionally NOT stamped onto the edge so
+                # the MultiDiGraph parallel-edge integer key field is not disturbed —
+                # _commit_keyless_mint never mutates the edge/node it was called for.
+                _commit_keyless_mint(
+                    subject_display=_subj_display,
+                    predicate=pred,
+                    object_value=_obj_display,
+                    relation_type=_rt,
+                    speaker_id=_subj_sid,
+                    canon_subj=_t_subj,
+                    canon_obj=_t_obj,
+                    session_ids=_rec_session_ids,
                     # Real session wall-clock carried from the edge; sourced from
                     # session_graph.timestamp at ingest via merger._upsert_relation.
                     # Never fabricate now() here.
-                    "last_seen": _t_data.get("last_seen", ""),
-                    "first_seen": _t_data.get("first_seen", ""),
-                }
-
-                if not defer:
-                    # Fold discipline: persist immediately.
-                    self.store.put(
-                        tier,
-                        minted_key,
-                        entry,
-                        simhash=entry_simhash(entry),
-                    )
-                    self.store.set_bookkeeping(
-                        minted_key,
-                        speaker_id=_subj_sid,
-                        relation_type=_rt,
-                        reinforcement_count=1,
-                        last_reinforced_cycle=self.cycle_count,
-                        last_seen=_t_data.get("last_seen", ""),
-                        first_seen=_t_data.get("first_seen", ""),
-                        allow_empty_speaker=(_subj_sid == ""),
-                    )
-                    # Advance the committed counter for the chosen tier.
-                    if tier == "procedural":
-                        self._procedural_next_index += 1
-                    else:
-                        self._indexed_next_index += 1
-                else:
-                    # Interim atomicity: defer all store writes + counter advances.
-                    deferred_writes.append(rec)
-
-                # Append to tier_keyed (uniform shape, same as the keyed branch).
-                # The ik_key attribute is intentionally NOT stamped onto the edge so
-                # the MultiDiGraph parallel-edge integer key field is not disturbed.
-                tier_keyed[tier].append(
-                    {
-                        "key": minted_key,
-                        "subject": entry["subject"],
-                        "predicate": pred,
-                        "object": entry["object"],
-                        "speaker_id": _subj_sid,
-                    }
+                    last_seen=_t_data.get("last_seen", ""),
+                    first_seen=_t_data.get("first_seen", ""),
                 )
-                minted_by_tier[tier] += 1
+                _emitted_pairs.add((_t_subj, pred))
 
             else:
                 # ---- Keyed branch: existing key, anti-forgetting replay ----
@@ -5191,6 +5260,111 @@ class ConsolidationLoop:
                 )
                 # Existing keyed entries are never counted as minted and never
                 # deferred — they are already in the store.
+                _emitted_pairs.add((_t_subj, pred))
+
+        # ---- Node-attribute walk: attribute-typed relations never become
+        # edges (GraphMerger.merge diverts them onto the SUBJECT node's
+        # "attributes" dict — see merger.py's relation_type == "attribute"
+        # branch), so they are invisible to the edge walk above.  Mirrors
+        # the two edge-walk branches above byte-for-byte: same tier
+        # derivation via partition_relations, same store.put /
+        # set_bookkeeping / deferred_writes commit discipline, same
+        # tier_keyed entry shape.  The predicate rendered here goes through
+        # relation_prep.attr_predicate — the ONE formula shared with
+        # relation_prep._flatten_entity_attributes's projected predicate —
+        # both are the sole surfaces an attribute fact can be trained under,
+        # and they must share one SimHash fingerprint.  Routing through
+        # canonical() here also corrects a node ``attributes`` key that
+        # entered verbatim via GraphMerger._upsert_entity (the Entity.attributes
+        # merge path, which does not canonicalize) rather than this module's
+        # own attribute gate (which always writes canonical keys).
+        for _n, _n_data in self.merger.graph.nodes(data=True):
+            _n_attrs = _n_data.get("attributes", {}) or {}
+            if not _n_attrs:
+                continue
+            _n_attr_keys = _n_data.get("attribute_keys", {}) or {}
+            _n_subj_display = _n_attrs.get("name") or _n
+            for attr_key, attr_value in _n_attrs.items():
+                if attr_key == "name":
+                    # Display surface, not a projected attribute fact.
+                    continue
+                attr_pred = attr_predicate(attr_key)
+                if (_n, attr_pred) in _emitted_pairs:
+                    # Defensive dedup: a mixed graph (e.g. a pre-Unit-4 fold
+                    # artifact) already emitted this (subject, predicate)
+                    # pair as an edge — never emit it twice.
+                    continue
+
+                attr_key_id = _n_attr_keys.get(attr_key)
+                if attr_key_id:
+                    # ---- Keyed branch: existing key, anti-forgetting replay ----
+                    entry = self.store.get(attr_key_id)
+                    if entry is None:
+                        logger.debug(
+                            "_build_all_edge_entries_into: attribute key %s "
+                            "has no content entry — skipping",
+                            attr_key_id,
+                        )
+                        continue
+                    _bk = self.store.bookkeeping_for_key(attr_key_id) or {}
+                    _rt_raw = _bk.get("relation_type", _FALLBACK_RTYPE)
+                    _rt = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+                    _subj_sid = _bk.get("speaker_id") or ""
+                    current_adapter_id = self.store.tier_for_active_key(attr_key_id) or "episodic"
+                    _dummy = [
+                        {
+                            "subject": _n,
+                            "predicate": attr_pred,
+                            "object": attr_value,
+                            "relation_type": _rt,
+                        }
+                    ]
+                    _ep_rels, _proc_rels = partition_relations(
+                        _dummy, procedural_enabled=self.procedural_config is not None
+                    )
+                    if _proc_rels:
+                        tier = "procedural"
+                    elif _ep_rels:
+                        tier = "semantic" if current_adapter_id == "semantic" else "episodic"
+                    else:
+                        tier = "episodic"
+
+                    tier_keyed[tier].append(
+                        {
+                            "key": attr_key_id,
+                            "subject": entry["subject"],
+                            "predicate": entry["predicate"],
+                            "object": entry["object"],
+                            "speaker_id": _subj_sid,
+                        }
+                    )
+                    # Existing keyed entries are never counted as minted and
+                    # never deferred — they are already in the store.
+                else:
+                    # ---- Keyless branch: mint a new key ----
+                    # attribute_keys is intentionally NOT stamped onto the
+                    # node here — mirrors the edge branch's "no ik_key
+                    # stamped on mint" discipline; the key is registered via
+                    # GraphMerger's own gate the next time this fact reaches
+                    # the merger with relation.indexed_key set (the fold's
+                    # registry-true re-merge pass).
+                    _rt = "attribute"
+                    _subj_sid = _n_data.get("speaker_id", "") or ""
+                    _commit_keyless_mint(
+                        subject_display=_n_subj_display,
+                        predicate=attr_pred,
+                        object_value=attr_value,
+                        relation_type=_rt,
+                        speaker_id=_subj_sid,
+                        canon_subj=_n,
+                        canon_obj="",
+                        # Attribute facts have no edge to source contributing
+                        # session ids from — the node carries no per-fact
+                        # session list.  Empty, not fabricated.
+                        session_ids=[],
+                        last_seen="",
+                        first_seen="",
+                    )
 
         total_minted = sum(minted_by_tier.values())
         if total_minted:

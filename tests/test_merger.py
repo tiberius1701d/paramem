@@ -29,14 +29,14 @@ def session_graph_1():
         relations=[
             Relation(
                 subject="Alex",
-                predicate="lives_in",
+                predicate="lives in",
                 object="Heilbronn",
                 relation_type="factual",
                 speaker_id="speaker0",
             ),
             Relation(
                 subject="Alex",
-                predicate="works_at",
+                predicate="works at",
                 object="AutoMate",
                 relation_type="factual",
                 speaker_id="speaker0",
@@ -71,23 +71,23 @@ class TestNormalization:
         """canonical() provides the single identity function for all string types."""
         assert canonical("Alex") == "alex"
         assert canonical("  Alex  ") == "alex"
-        assert canonical("Dr. Smith") == "dr._smith"
+        assert canonical("Dr. Smith") == "dr. smith"
 
 
 class TestPredicateNormalization:
-    def test_lowercase_and_underscore_form(self):
-        """canonical() folds case and blanks to ``_``; underscores pass through."""
-        assert canonical("Works At") == "works_at"
-        assert canonical("LIVES IN") == "lives_in"
+    def test_lowercase_and_space_form(self):
+        """canonical() folds case and blanks (including ``_``) to a single space."""
+        assert canonical("Works At") == "works at"
+        assert canonical("LIVES IN") == "lives in"
 
     def test_strip_whitespace(self):
-        assert canonical("  works_at  ") == "works_at"
+        assert canonical("  works_at  ") == "works at"
 
     def test_passthrough_preserves_content(self):
         assert canonical("invented") == "invented"
-        assert canonical("custom pred") == "custom_pred"
-        # underscore is already the canonical blank — no-op
-        assert canonical("works_at") == "works_at"
+        assert canonical("custom pred") == "custom pred"
+        # underscore folds to the canonical blank (space)
+        assert canonical("works_at") == "works at"
 
     def test_deduplicates_edges_across_variants(self, merger):
         """'works_at' and 'works at' should merge into one edge."""
@@ -129,8 +129,8 @@ class TestPredicateNormalization:
         merger.merge(g2)
         edges = list(merger.graph["a"]["b"].values())
         assert len(edges) == 1
-        # canonical() folds the blank → "_"; predicate stored in canonical form
-        assert edges[0]["predicate"] == "works_at"
+        # canonical() folds the blank → single space; predicate stored in canonical form
+        assert edges[0]["predicate"] == "works at"
         assert edges[0]["reinforcement_count"] == 2
 
 
@@ -196,7 +196,7 @@ class TestEdgeAggregation:
             relations=[
                 Relation(
                     subject="A",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="B",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -213,7 +213,7 @@ class TestEdgeAggregation:
             relations=[
                 Relation(
                     subject="A",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="B",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -241,7 +241,7 @@ class TestEdgeAggregation:
             relations=[
                 Relation(
                     subject="A",
-                    predicate="works_at",
+                    predicate="works at",
                     object="B",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -356,7 +356,7 @@ class TestSpeakerIdDedup:
             relations=[
                 Relation(
                     subject="speaker0",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Portland",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -379,7 +379,7 @@ class TestSpeakerIdDedup:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Portland",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -635,7 +635,7 @@ class TestMultiUserNameCollision:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object=place,
                     relation_type="factual",
                     speaker_id=speaker_id,
@@ -779,7 +779,7 @@ class TestModelContradictionAndRelease:
                 relations=[
                     Relation(
                         subject="Alex",
-                        predicate="lives_in",
+                        predicate="lives in",
                         object="Munich",
                         relation_type="factual",
                         speaker_id="speaker0",
@@ -797,7 +797,7 @@ class TestModelContradictionAndRelease:
                 relations=[
                     Relation(
                         subject="Alex",
-                        predicate="lives_in",
+                        predicate="lives in",
                         object="Berlin",
                         relation_type="factual",
                         speaker_id="speaker0",
@@ -816,7 +816,7 @@ class TestModelContradictionAndRelease:
             (obj, data)
             for obj in alex_successors
             for _, data in m.graph["alex"][obj].items()
-            if data.get("predicate") == "lives_in"
+            if data.get("predicate") == "lives in"
         ]
         objects_with_lives_in = [obj for obj, _ in lives_in_edges]
         assert "munich" not in objects_with_lives_in, (
@@ -841,7 +841,7 @@ class TestModelContradictionAndRelease:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Munich",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -858,7 +858,7 @@ class TestModelContradictionAndRelease:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     speaker_id="speaker0",
@@ -875,7 +875,7 @@ class TestModelContradictionAndRelease:
             obj
             for obj in alex_successors
             for _, data in m.graph["alex"][obj].items()
-            if data.get("predicate") == "lives_in"
+            if data.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, (
             "Without a model, old edge must NOT be removed (coexist-all)"
@@ -992,7 +992,7 @@ class TestIkKeyProvenance:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1025,7 +1025,7 @@ class TestIkKeyProvenance:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1057,7 +1057,7 @@ class TestIkKeyProvenance:
         eid_old = m.graph.add_edge(
             "alex",
             "cat",
-            predicate="has_pet",
+            predicate="has pet",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1066,7 +1066,7 @@ class TestIkKeyProvenance:
             sessions=["s1"],
         )
         m.graph["alex"]["cat"][eid_old][_IK_KEY_ATTR] = "g1"
-        m._predicate_cardinality["has_pet"] = True  # multi-valued; canonical form
+        m._predicate_cardinality["has pet"] = True  # multi-valued; canonical form
 
         session = SessionGraph(
             session_id="s2",
@@ -1075,7 +1075,7 @@ class TestIkKeyProvenance:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="has_pet",
+                    predicate="has pet",
                     object="dog",
                     relation_type="factual",
                     confidence=1.0,
@@ -1097,7 +1097,7 @@ class TestIkKeyProvenance:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "has_pet"
+            if d.get("predicate") == "has pet"
         ]
         assert "cat" in pets and "dog" in pets, (
             "Disjoint multi-valued pair must COEXIST — both keys kept"
@@ -1120,7 +1120,7 @@ class TestReinforcementTracking:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1148,7 +1148,7 @@ class TestReinforcementTracking:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1168,7 +1168,7 @@ class TestReinforcementTracking:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1225,7 +1225,7 @@ class TestReinforcementTracking:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1245,7 +1245,7 @@ class TestReinforcementTracking:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1318,7 +1318,7 @@ class TestReinforcementTracking:
         existing_eid = m.graph.add_edge(
             "alice",
             "berlin",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -1331,7 +1331,7 @@ class TestReinforcementTracking:
 
         incoming = Relation(
             subject="alice",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -1368,7 +1368,7 @@ class TestReinforcementTracking:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1381,7 +1381,7 @@ class TestReinforcementTracking:
         # Incoming has a FRESHER last_seen — but resolve_contradictions=False must skip.
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -1408,7 +1408,7 @@ class TestReinforcementTracking:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, (
             "Old edge (Munich) must NOT be removed when resolve_contradictions=False"
@@ -1420,12 +1420,12 @@ class TestReinforcementTracking:
         munich_key = next(
             d.get(_IK_KEY_ATTR)
             for _, d in m.graph["alex"]["munich"].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         )
         berlin_key = next(
             d.get(_IK_KEY_ATTR)
             for _, d in m.graph["alex"]["berlin"].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         )
         assert munich_key == "key_munich", f"Expected key_munich on old edge; got {munich_key!r}"
         assert berlin_key == "key_berlin", f"Expected key_berlin on new edge; got {berlin_key!r}"
@@ -1454,7 +1454,7 @@ class TestReinforcementTracking:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1463,11 +1463,11 @@ class TestReinforcementTracking:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
 
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -1494,7 +1494,7 @@ class TestReinforcementTracking:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "munich" not in lives_in_objects, (
             "Staler Munich edge must be retired when incoming is uniquely freshest"
@@ -1532,7 +1532,7 @@ class TestReinforcementTracking:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1541,11 +1541,11 @@ class TestReinforcementTracking:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
 
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -1572,7 +1572,7 @@ class TestReinforcementTracking:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, "Munich edge must survive (tied timestamp → coexist)"
         assert "berlin" in lives_in_objects, (
@@ -1612,7 +1612,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1630,7 +1630,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1686,7 +1686,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Munich",
                     relation_type="factual",
                     confidence=1.0,
@@ -1701,7 +1701,7 @@ class TestRemovalLedger:
         # Stamp an ik_key onto the Munich edge so the ledger capture fires.
         # After merge(), node keys are canonical: "alex", "munich"
         for _eid, _edata in m.graph["alex"]["munich"].items():
-            if _edata.get("predicate") == "lives_in":
+            if _edata.get("predicate") == "lives in":
                 _edata[_IK_KEY_ATTR] = "key_munich_old"
                 break
 
@@ -1713,7 +1713,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alex",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1764,7 +1764,7 @@ class TestRemovalLedger:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1773,12 +1773,12 @@ class TestRemovalLedger:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
 
         # Incoming (Berlin) has an OLDER last_seen → loses to Munich.
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -1809,7 +1809,7 @@ class TestRemovalLedger:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, "Fresher rival Munich must survive"
         assert "berlin" not in lives_in_objects, "Older incoming Berlin must NOT be inserted"
@@ -1852,7 +1852,7 @@ class TestRemovalLedger:
 
         m = GraphMerger()
 
-        # First session: "Alice" / "lives_in" / "Berlin"
+        # First session: "Alice" / "lives in" / "Berlin"
         s1 = SessionGraph(
             session_id="canon1",
             timestamp="2026-01-01T00:00:00Z",
@@ -1860,7 +1860,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1871,7 +1871,7 @@ class TestRemovalLedger:
         )
         m.merge(s1, resolve_contradictions=False)
 
-        # Second session: "ALICE" / "lives_in" / "berlin" — same canonical forms;
+        # Second session: "ALICE" / "lives in" / "berlin" — same canonical forms;
         # surfaces differ, so pre_surfaces must record the mismatch.
         s2 = SessionGraph(
             session_id="canon2",
@@ -1880,7 +1880,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="ALICE",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1918,7 +1918,7 @@ class TestRemovalLedger:
         surfaces when a byte-identical duplicate is collapsed by dedup.
 
         Under the one-surface-form rule the raw incoming predicate
-        (``"lives_in"``) and the form the merger stores are the SAME string —
+        (``"lives in"``) and the form the merger stores are the SAME string —
         pre_surfaces records both, and they agree.  There is no raw-vs-stored
         mismatch left to inspect for a predicate already in canonical form.
         """
@@ -1933,7 +1933,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1949,7 +1949,7 @@ class TestRemovalLedger:
             relations=[
                 Relation(
                     subject="Alice",
-                    predicate="lives_in",
+                    predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
@@ -1966,15 +1966,15 @@ class TestRemovalLedger:
             f"removal_ledger entry must contain pre_surfaces; entry={entry!r}"
         )
         pre = entry["pre_surfaces"]
-        # incoming predicate is the raw underscore form from the Relation.
-        assert pre.get("incoming", {}).get("predicate") == "lives_in", (
-            f"incoming predicate must be the raw 'lives_in' form; got "
+        # incoming predicate is the raw form from the Relation — already canonical.
+        assert pre.get("incoming", {}).get("predicate") == "lives in", (
+            f"incoming predicate must be the raw 'lives in' form; got "
             f"{pre.get('incoming', {}).get('predicate')!r}"
         )
         # surviving predicate is the canonical form stored by the merger — the
         # same string, because there is only one surface form.
-        assert pre.get("surviving", {}).get("predicate") == "lives_in", (
-            f"surviving predicate must be the canonical 'lives_in'; got "
+        assert pre.get("surviving", {}).get("predicate") == "lives in", (
+            f"surviving predicate must be the canonical 'lives in'; got "
             f"{pre.get('surviving', {}).get('predicate')!r}"
         )
 
@@ -2012,7 +2012,7 @@ class TestRecencyAnyEmpty:
         eid = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -2021,7 +2021,7 @@ class TestRecencyAnyEmpty:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
         return m
 
     @staticmethod
@@ -2033,7 +2033,7 @@ class TestRecencyAnyEmpty:
 
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -2060,7 +2060,7 @@ class TestRecencyAnyEmpty:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
 
     def test_incoming_empty_rival_dated_replace_rival_wins(self):
@@ -2126,7 +2126,7 @@ class TestRecencyAnyEmpty:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
-        m._predicate_cardinality["lives_in"] = False
+        m._predicate_cardinality["lives in"] = False
         for city, ts, key in [
             ("vienna", "2026-01-01T00:00:00Z", "key_vienna"),
             ("paris", "2026-01-02T00:00:00Z", "key_paris"),
@@ -2136,7 +2136,7 @@ class TestRecencyAnyEmpty:
             eid = m.graph.add_edge(
                 "alex",
                 city,
-                predicate="lives_in",
+                predicate="lives in",
                 relation_type="factual",
                 confidence=1.0,
                 first_seen="s0",
@@ -2148,7 +2148,7 @@ class TestRecencyAnyEmpty:
 
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -2163,7 +2163,7 @@ class TestRecencyAnyEmpty:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert "berlin" in objects, "Incoming (uniquely freshest) must survive"
         assert "vienna" not in objects, "Strictly-older vienna must be retired"
@@ -2187,7 +2187,7 @@ class TestRecencyAnyEmpty:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
-        m._predicate_cardinality["lives_in"] = False
+        m._predicate_cardinality["lives in"] = False
         for city, ts, key in [
             ("vienna", "2026-01-01T00:00:00Z", "key_vienna"),
             ("paris", "2026-01-02T00:00:00Z", "key_paris"),
@@ -2197,7 +2197,7 @@ class TestRecencyAnyEmpty:
             eid = m.graph.add_edge(
                 "alex",
                 city,
-                predicate="lives_in",
+                predicate="lives in",
                 relation_type="factual",
                 confidence=1.0,
                 first_seen="s0",
@@ -2209,7 +2209,7 @@ class TestRecencyAnyEmpty:
 
         incoming = Relation(
             subject="alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             confidence=1.0,
@@ -2226,7 +2226,7 @@ class TestRecencyAnyEmpty:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            if d.get("predicate") == "lives in"
         ]
         assert result is None, "Incoming (older than tied max) must NOT be inserted"
         assert "berlin" not in objects, "Strictly-older incoming Berlin must not be inserted"
@@ -2245,7 +2245,7 @@ class TestObjectVariantDedup:
     Regression guard: under predicate ``values``,
     ``"Execution Speed"`` / ``"execution_speed"`` / ``"execution speed"`` were three
     distinct nodes → three edges → three keys.  With canonical node keys all three
-    collapse to the single canonical form ``"execution_speed"`` → one edge, one
+    collapse to the single canonical form ``"execution speed"`` → one edge, one
     surviving key.
     """
 
@@ -2291,15 +2291,15 @@ class TestObjectVariantDedup:
         m.merge(s1)
         m.merge(s2)
 
-        # canonical("Execution Speed") == canonical("execution_speed") == "execution_speed"
+        # canonical("Execution Speed") == canonical("execution_speed") == "execution speed"
         # → only ONE node and ONE edge for the values predicate.
-        assert "execution_speed" in m.graph.nodes, (
-            "Canonical object node key must be 'execution_speed'"
+        assert "execution speed" in m.graph.nodes, (
+            "Canonical object node key must be 'execution speed'"
         )
         assert m.graph.number_of_edges() == 1, (
             f"Object variants must collapse to one edge; got {m.graph.number_of_edges()}"
         )
-        edges = list(m.graph["paramem"]["execution_speed"].values())
+        edges = list(m.graph["paramem"]["execution speed"].values())
         assert len(edges) == 1
         assert edges[0]["reinforcement_count"] == 2, (
             "Collapsed edge must have reinforcement_count=2 (one per session)"
@@ -2331,7 +2331,7 @@ class TestObjectVariantDedup:
         m.merge(s1)
 
         # The display name is stored in attributes["name"], not the node key.
-        node_data = m.graph.nodes["execution_speed"]
+        node_data = m.graph.nodes["execution speed"]
         assert node_data["attributes"]["name"] == "Execution Speed", (
             "First-seen surface form must be preserved in attributes['name']; "
             f"got {node_data['attributes'].get('name')!r}"
@@ -2363,7 +2363,7 @@ class TestSessionIdsProvenanceUnion:
         """Helper: build a minimal Relation with session_ids set."""
         return Relation(
             subject="Alex",
-            predicate="lives_in",
+            predicate="lives in",
             object="Berlin",
             relation_type="factual",
             speaker_id=speaker_id,
@@ -2523,7 +2523,7 @@ class TestMergerEdgeStamps:
         m = GraphMerger()
         rel = Relation(
             subject="spk-1",
-            predicate="works_at",
+            predicate="works at",
             object="acme",
             relation_type="factual",
             speaker_id="spk-1",
@@ -2569,7 +2569,7 @@ class TestMergerEdgeStamps:
         eid = m.graph.add_edge(
             "alice",
             "berlin",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -2582,7 +2582,7 @@ class TestMergerEdgeStamps:
 
         incoming = Relation(
             subject="alice",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             speaker_id="speaker0",
@@ -2606,7 +2606,7 @@ class TestMergerEdgeStamps:
         eid = m.graph.add_edge(
             "alice",
             "berlin",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -2618,7 +2618,7 @@ class TestMergerEdgeStamps:
 
         incoming = Relation(
             subject="alice",
-            predicate="lives_in",
+            predicate="lives in",
             object="berlin",
             relation_type="factual",
             speaker_id="DifferentSpeaker",
@@ -2639,7 +2639,7 @@ class TestMergerEdgeStamps:
         # "z_node" > "a_node" lexicographically.
         rel = Relation(
             subject="z_node",
-            predicate="colleague_of",
+            predicate="colleague of",
             object="a_node",
             relation_type="social",
             speaker_id="",
@@ -2672,7 +2672,7 @@ class TestMergerEdgeStamps:
 
         rel_9_1 = Relation(
             subject="speaker9",
-            predicate="colleague_of",
+            predicate="colleague of",
             object="speaker1",
             relation_type="social",
             speaker_id="speaker9",
@@ -2680,7 +2680,7 @@ class TestMergerEdgeStamps:
         )
         rel_1_9 = Relation(
             subject="speaker1",
-            predicate="colleague_of",
+            predicate="colleague of",
             object="speaker9",
             relation_type="social",
             speaker_id="speaker1",
@@ -2708,7 +2708,7 @@ class TestMergerEdgeStamps:
         m = GraphMerger()
         rel = Relation(
             subject="speaker0",
-            predicate="has_sibling",
+            predicate="has sibling",
             object="nadia",
             relation_type="social",
             speaker_id="speaker0",
@@ -2733,7 +2733,7 @@ class TestMergerEdgeStamps:
         m = GraphMerger()
         rel = Relation(
             subject="speaker0",
-            predicate="married_to",
+            predicate="married to",
             object="person_1",
             relation_type="social",
             speaker_id="speaker0",
@@ -2758,7 +2758,7 @@ class TestMergerEdgeStamps:
         m = GraphMerger()
         rel_nadia_bob = Relation(
             subject="nadia",
-            predicate="friend_of",
+            predicate="friend of",
             object="bob",
             relation_type="social",
             speaker_id="",
@@ -2766,7 +2766,7 @@ class TestMergerEdgeStamps:
         )
         rel_bob_nadia = Relation(
             subject="bob",
-            predicate="friend_of",
+            predicate="friend of",
             object="nadia",
             relation_type="social",
             speaker_id="",
@@ -2804,7 +2804,7 @@ class TestMergerEdgeStamps:
             relations=[
                 Relation(
                     subject="speaker0",
-                    predicate="has_sibling",
+                    predicate="has sibling",
                     object="amy",
                     relation_type="social",
                     speaker_id="speaker0",

@@ -1,13 +1,11 @@
 """Tests for knowledge graph extraction."""
 
-import dataclasses
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from paramem.cloud.deanonymize import CloudScope
-from paramem.graph.empty_cause import CAUSE_DEANON_JUDGE, CAUSE_SCALAR_PARTITION, cause_kind
 from paramem.graph.extractor import (
     _extract_json_block,
     _fallback_plausibility_on_raw,
@@ -16,9 +14,8 @@ from paramem.graph.extractor import (
     extract_procedural_graph,
 )
 from paramem.graph.flow import StageContext, StageState
-from paramem.graph.flows import _stage_deanonymize, _stage_rebuild, extract_graph
+from paramem.graph.flows import _stage_rebuild, extract_graph
 from paramem.graph.phase_trace import extraction_trace, get_phases, stop_at
-from paramem.graph.relation_build import partition_scalar_facts
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -147,87 +144,6 @@ class TestExtractJsonBlock:
         result = _extract_json_block(text)
         parsed = json.loads(result)
         assert parsed[0]["subject"] == "Alex"
-
-
-class TestPartitionScalarFacts:
-    """Object-is-a-known-entity-node gates scalar folding, not object shape.
-
-    A digit-bearing entity name (``speaker1``, a droid-style person name
-    like ``R2D2``) matches ``is_scalar_value``'s version-tagged-identifier
-    branch. Without the entity-node check, such a fact would be folded onto
-    ``Entity.attributes`` as a string, destroying the edge.
-    """
-
-    def test_has_sibling_speaker_object_stays_edge(self):
-        """has_sibling(speaker0, speaker1) — speaker1 is a known person node."""
-        facts = [
-            {
-                "subject": "speaker0",
-                "predicate": "has_sibling",
-                "object": "speaker1",
-                "relation_type": "social",
-                "confidence": 0.9,
-            }
-        ]
-        entities = [
-            Entity(name="speaker0", entity_type="person"),
-            Entity(name="speaker1", entity_type="person"),
-        ]
-        scalar, non_scalar = partition_scalar_facts(facts, entities)
-        assert scalar == []
-        assert non_scalar == facts
-
-    def test_digit_bearing_person_name_stays_edge(self):
-        """A person named 'R2D2' must not be folded even though it looks
-        like a version-tagged identifier by shape alone."""
-        facts = [
-            {
-                "subject": "speaker0",
-                "predicate": "has_pet",
-                "object": "R2D2",
-                "relation_type": "social",
-                "confidence": 0.9,
-            }
-        ]
-        entities = [
-            Entity(name="speaker0", entity_type="person"),
-            Entity(name="R2D2", entity_type="person"),
-        ]
-        scalar, non_scalar = partition_scalar_facts(facts, entities)
-        assert scalar == []
-        assert non_scalar == facts
-
-    def test_unknown_version_tagged_object_still_folds_to_scalar(self):
-        """Regression: a genuine scalar identifier with no matching entity
-        node still routes to scalar (existing behavior preserved)."""
-        facts = [
-            {
-                "subject": "speaker0",
-                "predicate": "uses",
-                "object": "ROS2",
-                "relation_type": "factual",
-                "confidence": 0.8,
-            }
-        ]
-        entities = [Entity(name="speaker0", entity_type="person")]
-        scalar, non_scalar = partition_scalar_facts(facts, entities)
-        assert scalar == facts
-        assert non_scalar == []
-
-    def test_no_entities_arg_preserves_prior_behavior(self):
-        """``entities=None`` (default) — shape heuristic alone, unchanged."""
-        facts = [
-            {
-                "subject": "speaker0",
-                "predicate": "uses",
-                "object": "H100",
-                "relation_type": "factual",
-                "confidence": 0.8,
-            }
-        ]
-        scalar, non_scalar = partition_scalar_facts(facts)
-        assert scalar == facts
-        assert non_scalar == []
 
 
 class TestSessionGraphFromJson:
@@ -1132,19 +1048,16 @@ class TestEmptyRelationsTerminal:
         assert phase_names == ["local_extract"]
 
 
-class TestScalarOnlySessionIsNotARecovery:
-    """A session whose every surviving fact has a scalar object empties the
-    relation set LEGITIMATELY — the facts moved to the entity-attribute
-    surface, none was lost.
-
-    The two flow stages are driven directly (no cloud call, no model): the
-    ``deanonymize`` stage runs the partition and records the cause, the
-    ``rebuild`` stage consults the recovery gate. Before the ``routing``
-    cause existed, the gate fired here and returned BEFORE
-    ``apply_rebuild`` — the only caller of
-    ``project_scalar_facts_to_attributes`` — so the projection never
-    landed and the fallback re-materialized the same facts as relations,
-    silently reversing the partition.
+class TestAttributeTypedFactsSurviveTheFlow:
+    """A session whose every surviving fact is literal-valued
+    (``relation_type="attribute"`` — phone/email/date/certification/job
+    title) is NOT routed off the relation surface at the flow level (Unit
+    4): the model tags these facts at extraction time and they stay
+    ``Relation`` objects all the way through ``rebuild`` — the diversion
+    onto the subject node's ``attributes`` dict happens downstream, at
+    ``GraphMerger.merge`` (see ``tests/graph/test_merger_attribute_gate.py``),
+    not in this flow. So ``kept_relations`` is non-empty and the all-dropped
+    recovery net never fires for an attribute-only session.
     """
 
     def _scope(self):
@@ -1188,106 +1101,50 @@ class TestScalarOnlySessionIsNotARecovery:
             correction_entity_types=None,
         )
 
-    def _scalar_facts(self) -> list[dict]:
+    def _attribute_facts(self) -> list[dict]:
         return [
             {
                 "subject": "Alex",
                 "predicate": "has_email",
                 "object": "alex@example.com",
-                "relation_type": "factual",
-            },
-            {
-                "subject": "Alex",
-                "predicate": "uses",
-                "object": "ROS2",
-                "relation_type": "factual",
+                "relation_type": "attribute",
             },
         ]
-
-    def _state(self, graph: SessionGraph) -> StageState:
-        return StageState(
-            graph=graph,
-            facts=self._scalar_facts(),
-            scope=self._scope(),
-            original_relation_count=len(graph.relations),
-        )
 
     def _graph(self) -> SessionGraph:
         return SessionGraph(
             session_id="s0",
             timestamp="2026-07-21T00:00:00Z",
             entities=[Entity(name="Alex", entity_type="person")],
-            relations=[
-                Relation(
-                    subject="Alex",
-                    predicate="has_email",
-                    object="alex@example.com",
-                    relation_type="factual",
-                    confidence=1.0,
-                    speaker_id="speaker0",
-                ),
-                Relation(
-                    subject="Alex",
-                    predicate="uses",
-                    object="ROS2",
-                    relation_type="factual",
-                    confidence=1.0,
-                    speaker_id="speaker0",
-                ),
-            ],
+            relations=[],
         )
 
     def _run(self):
         ctx = self._ctx()
         graph = self._graph()
+        state = StageState(
+            graph=graph,
+            facts=self._attribute_facts(),
+            scope=self._scope(),
+            original_relation_count=0,
+        )
         with extraction_trace():
-            state = _stage_deanonymize(ctx, self._state(graph))
-            state = _stage_rebuild(ctx, state)
-        return state
+            return _stage_rebuild(ctx, state)
 
-    def test_partition_absorbs_every_fact_and_records_the_routing_cause(self):
+    def test_attribute_relation_kept_not_dropped(self):
         state = self._run()
-        assert state.facts == []
-        assert len(state.scalar_facts) == 2
-        assert state.empty_cause == CAUSE_SCALAR_PARTITION
-        assert cause_kind(state.empty_cause) == "routing"
-
-    def test_relations_are_empty_and_scalars_land_as_attributes(self):
-        state = self._run()
-        assert state.graph.relations == []
-        alex = next(e for e in state.graph.entities if e.name == "Alex")
-        # ``has_`` stripped so relation_prep's re-prefixing cannot produce
-        # ``has_has_email``.
-        assert alex.attributes == {"email": "alex@example.com", "uses": "ROS2"}
+        assert len(state.graph.relations) == 1
+        assert state.graph.relations[0].relation_type == "attribute"
+        assert state.graph.relations[0].object == "alex@example.com"
 
     def test_no_fallback_is_invoked(self):
         with patch("paramem.graph.flows._fallback_plausibility_on_raw") as fallback:
-            state = self._run()
+            self._run()
         fallback.assert_not_called()
-        assert state.graph.diagnostics["all_dropped_cause"] == {
-            "cause": CAUSE_SCALAR_PARTITION,
-            "kind": "routing",
-        }
-        assert "fallback_path" not in state.graph.diagnostics
 
-    def test_a_mixed_emptying_still_fires_the_recovery_net(self):
-        """The cause is the discriminator, not the empty relation set: when
-        a judge or a mechanical step ALSO emptied the fact set, the case is
-        mixed and the net keeps its normal behaviour."""
-        ctx = self._ctx()
-        graph = self._graph()
-        state = dataclasses.replace(
-            self._state(graph),
-            facts=[],
-            scalar_facts=self._scalar_facts(),
-            empty_cause=CAUSE_DEANON_JUDGE,
-        )
-        with patch(
-            "paramem.graph.flows._fallback_plausibility_on_raw",
-            return_value=graph,
-        ) as fallback:
-            _stage_rebuild(ctx, state)
-        fallback.assert_called_once()
+    def test_all_dropped_cause_not_recorded(self):
+        state = self._run()
+        assert "all_dropped_cause" not in state.graph.diagnostics
 
 
 class TestFallbackRebuildRecordsValidationDrops:

@@ -53,7 +53,6 @@ from paramem.cloud.deanonymize import deanonymize_facts
 from paramem.graph.empty_cause import (
     CAUSE_DEANON_JUDGE,
     CAUSE_DEANON_SUBSTITUTION,
-    CAUSE_SCALAR_PARTITION,
     CAUSE_SCHEMA_VALIDATION,
 )
 from paramem.graph.extractor import (
@@ -73,7 +72,6 @@ from paramem.graph.prompts import _load_prompt
 from paramem.graph.relation_build import (
     apply_rebuild,
     build_relations,
-    partition_scalar_facts,
     recovery_gate,
 )
 from paramem.graph.schema import SessionGraph, facts_from_relations
@@ -217,31 +215,20 @@ def _session_egress_permitted(ctx: StageContext) -> bool:
 def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
     """``deanonymize`` stage body — placeholders back to real names.
 
-    Three things, in this order, because the order is load-bearing:
+    Two things, in this order, because the order is load-bearing:
 
     1. The ``deanon`` phase: pure dict substitution restoring real names
        from placeholders (no LLM call, so ``raw_output`` stays ``None``).
        Facts still carrying an unresolved placeholder, and facts with a
        placeholder glued into the predicate, are dropped and recorded.
-    2. The scalar partition. It is OWNED by ``rebuild``
-       (``paramem.graph.relation_build``) but INVOKED here, before the
-       judge below, and that placement is deliberate: scalars are URLs,
-       emails, DOIs and version-tagged tool names, and the judge's drop
-       rule R6 targets a "dot-separated or URI-shaped namespaced token"
-       (``configs/prompts/cloud_plausibility.txt``). Partitioning after
-       the judge would expose exactly the values the partition protects.
-       When the partition absorbs EVERY surviving fact (a scalar-only
-       session) it records ``CAUSE_SCALAR_PARTITION`` — the ``routing``
-       kind, which tells ``rebuild``'s recovery gate the resulting empty
-       relation set is legitimate rather than a loss.
-    3. The deanon-stage plausibility judge (local model, real names),
+    2. The deanon-stage plausibility judge (local model, real names),
        which receives the ORIGINAL real-name transcript — it runs
        locally on de-anonymized facts, so there is no reason to hand it
        the anonymized text.
 
     The mid-stage ``chain_stopped()`` check after the ``deanon`` phase is
     the one the imperative version made: a calibration caller stopping at
-    ``deanon`` must not get the partition or the judge.
+    ``deanon`` must not get the judge.
     """
     graph = state.graph
     scope = state.scope
@@ -315,30 +302,6 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
         # remains the local-extract output; deanonymized facts list is
         # in phases[deanon].parsed.
         return dataclasses.replace(state, graph=graph, facts=deanon_facts, empty_cause=empty_cause)
-
-    # Route scalar-valued objects (URLs, emails, phone numbers, DOIs,
-    # version-tagged tool names like "ROS2") off the relation surface and
-    # onto Entity.attributes of the subject.  Scalars are verbatim
-    # identifiers that flow through to plausibility and downstream filters
-    # without modification.  Routing them to attributes mirrors the
-    # email/phone/linkedin path the local extractor already populates and
-    # which ``relation_prep._flatten_entity_attributes`` mints into keyed
-    # pairs for indexed-key distillation.  The projection itself is applied
-    # by the ``rebuild`` stage, after its entity rebuild, so the subject
-    # entity survives pruning.
-    scalar_facts, deanon_facts = partition_scalar_facts(deanon_facts, graph.entities)
-    if scalar_facts:
-        graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
-        if not deanon_facts and empty_cause is None:
-            # Scalar-only session: every surviving fact moved to the
-            # attribute surface. ``empty_cause is None`` is what makes
-            # this unambiguous — the substitution's own emptying is
-            # recorded above and runs BEFORE the partition (so it would
-            # leave nothing to partition), and the deanon judge below is
-            # skipped on an empty fact set. A cause already recorded
-            # means the emptying was mixed, and the recovery net keeps
-            # its normal behaviour.
-            empty_cause = CAUSE_SCALAR_PARTITION
 
     if state.cloud_raw:
         graph.diagnostics["cloud_raw_response"] = state.cloud_raw
@@ -418,7 +381,6 @@ def _stage_deanonymize(ctx: StageContext, state: StageState) -> StageState:
         state,
         graph=graph,
         facts=deanon_facts,
-        scalar_facts=scalar_facts,
         empty_cause=empty_cause,
     )
 
@@ -429,17 +391,10 @@ def _stage_rebuild(ctx: StageContext, state: StageState) -> StageState:
     Schema-validates the surviving fact dicts into ``Relation`` objects
     (recording every drop), consults the all-dropped recovery gate, and —
     when the gate does not fire — installs the relations together with
-    their entity surface and the scalar-attribute projection. The pure
-    half lives in :mod:`paramem.graph.relation_build`; what stays here is
-    the recovery ACTION, which needs the model and tokenizer that module
-    deliberately never sees.
-
-    A scalar-only session reaches here with no relations and a
-    ``routing`` cause: the gate declines, so ``apply_rebuild`` runs and
-    the scalar projection lands on the entity surface. Suppressing the
-    gate is what makes that possible — the recovery path returns before
-    ``apply_rebuild``, and ``apply_rebuild`` is the only caller of the
-    projection.
+    their entity surface. The pure half lives in
+    :mod:`paramem.graph.relation_build`; what stays here is the recovery
+    ACTION, which needs the model and tokenizer that module deliberately
+    never sees.
     """
     graph = state.graph
     kept_relations = build_relations(graph, state.facts, speaker_id=ctx.speaker_id)
@@ -468,7 +423,7 @@ def _stage_rebuild(ctx: StageContext, state: StageState) -> StageState:
             empty_cause=empty_cause,
         )
 
-    apply_rebuild(graph, kept_relations, state.scalar_facts, state.scope.resolution)
+    apply_rebuild(graph, kept_relations, state.scope.resolution)
 
     added = len(kept_relations) - state.original_relation_count
     logger.info(
@@ -546,7 +501,7 @@ SESSION_EXTRACT: list[StageSpec] = [
         trace_names=("deanon", "deanon_plausibility"),
         run=_stage_deanonymize,
         requires=frozenset({"graph", "facts", "scope", "cloud_raw", "updated_anon_transcript"}),
-        produces=frozenset({"graph", "facts", "scalar_facts", "empty_cause"}),
+        produces=frozenset({"graph", "facts", "empty_cause"}),
         # A round-trip scope exists only once ``enrich`` reached its
         # hand-over. Without one there was no cloud egress at all — the
         # anonymize/enrich stages were disabled by config, or skipped
@@ -564,9 +519,7 @@ SESSION_EXTRACT: list[StageSpec] = [
         # phase_trace scope, as it did before this runner existed.
         trace_names=(),
         run=_stage_rebuild,
-        requires=frozenset(
-            {"graph", "facts", "scalar_facts", "scope", "original_relation_count", "empty_cause"}
-        ),
+        requires=frozenset({"graph", "facts", "scope", "original_relation_count", "empty_cause"}),
         produces=frozenset({"graph", "empty_cause"}),
         # Same gate as ``deanonymize``, and deliberately NOT ``bool(facts)``:
         # an empty fact set here is precisely the all-dropped case the

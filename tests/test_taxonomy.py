@@ -326,7 +326,7 @@ class TestAnonymizerConfig:
         reset_cache()
         try:
             built = anonymizer_type_to_prefix(str(schema))
-            assert built == {"work_of_art": "WorkOfArt"}
+            assert built == {"work of art": "WorkOfArt"}
             # The lookup side canonicalizes its query identically, so every
             # surface variant of the same type lands on the one built key.
             for variant in ("Work Of Art", "work of art", "WORK  OF  ART", "work_of_art"):

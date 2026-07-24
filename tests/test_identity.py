@@ -1,14 +1,19 @@
 """Unit tests for :func:`paramem.utils.identity.canonical` and the
 speaker-identity primitive :func:`~paramem.utils.identity.is_speaker_id`.
 
-One surface form, project-wide: lower-case, blank runs → single ``_``,
-``-`` and ``_`` preserved verbatim.
+One surface form, project-wide: lower-case, blank runs (including ``_``) →
+single space, ``-`` preserved verbatim.
 
 Verifies the GUARANTEED-identical-only contract: only Unicode canonical
 form, case (incl. ligatures covered by str.casefold), diacritics, and
-whitespace runs are collapsed.  ``-`` is NOT folded into ``_`` (nor either
-into a space).  NFKC compatibility forms (superscript digits, full-width),
-typos, and substrings are NOT folded.
+whitespace/underscore runs are collapsed.  ``-`` is NOT folded into a space.
+NFKC compatibility forms (superscript digits, full-width), typos, and
+substrings are NOT folded.
+
+``canonical(s, mode="spaces")`` folds ONLY ``_``/whitespace runs to a single
+space — case and diacritics are preserved.  It is the register/recall
+symmetry fold consumed by :mod:`paramem.memory.entry` (SimHash), not the
+default identity fold.
 
 Speaker-identity: ONE canonical lowercase form ``speaker{N}`` everywhere.
 :func:`is_speaker_id` accepts both wire casings (``Speaker0`` from legacy
@@ -33,7 +38,7 @@ class TestCaseFolding:
         assert canonical("alex") == "alex"
 
     def test_mixed_case(self):
-        assert canonical("HELLO World") == "hello_world"
+        assert canonical("HELLO World") == "hello world"
 
     def test_sharp_s(self):
         """German ß casefolds to ss (Unicode full-case folding, not lower())."""
@@ -63,34 +68,65 @@ class TestDiacriticFolding:
 
 
 class TestSeparatorFolding:
-    """Blanks fold to ``_``; ``-`` and ``_`` survive verbatim."""
+    """Blanks (including ``_``) fold to a single space; ``-`` survives verbatim."""
 
-    def test_underscore_preserved(self):
-        assert canonical("works_at") == "works_at"
+    def test_underscore_becomes_space(self):
+        assert canonical("works_at") == "works at"
 
-    def test_space_becomes_underscore(self):
-        assert canonical("works at") == "works_at"
+    def test_space_preserved(self):
+        assert canonical("works at") == "works at"
 
     def test_space_and_underscore_are_one_value(self):
         """The multiplicity fix: extraction's ``has_hobby`` and prose's
         ``has hobby`` are a single stored/rendered surface."""
-        assert canonical("has hobby") == canonical("has_hobby") == "has_hobby"
+        assert canonical("has hobby") == canonical("has_hobby") == "has hobby"
 
     def test_hyphen_preserved(self):
         assert canonical("sister-in-law") == "sister-in-law"
 
-    def test_hyphen_not_folded_into_underscore(self):
+    def test_hyphen_not_folded_into_space(self):
         """``-`` is a distinguishing character, not a separator variant."""
-        assert canonical("sister-in-law") != canonical("sister_in_law")
+        assert canonical("sister-in-law") != canonical("sister in law")
 
     def test_hyphen_distinct_from_space(self):
         assert canonical("Anna-Maria") != canonical("Anna Maria")
 
     def test_whitespace_run_collapse(self):
-        assert canonical("  hello   world  ") == "hello_world"
+        assert canonical("  hello   world  ") == "hello world"
 
     def test_mixed_separators(self):
-        assert canonical("phone_number-ext") == "phone_number-ext"
+        assert canonical("phone_number-ext") == "phone number-ext"
+
+
+class TestSpacesMode:
+    """``mode="spaces"`` folds ONLY ``_``/whitespace runs; case and
+    diacritics are preserved — the SimHash register/recall symmetry fold."""
+
+    def test_underscore_becomes_space(self):
+        assert canonical("works_at", mode="spaces") == "works at"
+
+    def test_case_preserved(self):
+        assert canonical("New_York", mode="spaces") == "New York"
+
+    def test_diacritics_preserved(self):
+        assert canonical("José_García", mode="spaces") == "José García"
+
+    def test_hyphen_preserved(self):
+        assert canonical("sister-in-law", mode="spaces") == "sister-in-law"
+
+    def test_whitespace_run_collapse(self):
+        assert canonical("  hello   world  ", mode="spaces") == "hello world"
+
+    def test_empty_string(self):
+        assert canonical("", mode="spaces") == ""
+
+    def test_whitespace_only(self):
+        assert canonical("   ", mode="spaces") == ""
+
+    def test_distinct_from_full_mode_on_case(self):
+        """mode='spaces' does not casefold — distinguishes from mode='full'."""
+        assert canonical("New York", mode="spaces") != canonical("New York", mode="full")
+        assert canonical("New York", mode="full") == "new york"
 
 
 class TestEdgeCases:
@@ -175,7 +211,7 @@ class TestNegatives:
 class TestProseFold:
     """``prose_fold`` is the case-insensitive fold for matching a needle
     against free prose — it must be exactly ``str.lower()``, deliberately
-    weaker than ``canonical`` (no whitespace→``_`` fold, no diacritic fold
+    weaker than ``canonical`` (no whitespace-run collapsing, no diacritic fold
     beyond what ``.lower()`` does)."""
 
     def test_equals_lower(self):
@@ -190,11 +226,13 @@ class TestProseFold:
         ):
             assert prose_fold(s) == s.lower()
 
-    def test_does_not_fold_whitespace_to_underscore(self):
-        """Unlike canonical(), prose_fold must preserve spaces — folding them
-        to ``_`` would break substring matching against free prose."""
-        assert prose_fold("Living Room") == "living room"
-        assert prose_fold("Living Room") != canonical("Living Room")
+    def test_does_not_collapse_whitespace_runs(self):
+        """Unlike canonical(), prose_fold must preserve exact whitespace —
+        collapsing internal blank runs would break exact substring matching
+        against free prose whose original spacing must be preserved."""
+        assert prose_fold("Living  Room") == "living  room"
+        assert prose_fold("Living  Room") != canonical("Living  Room")
+        assert canonical("Living  Room") == "living room"
 
     def test_does_not_diacritic_fold(self):
         """Unlike canonical(), prose_fold must NOT strip diacritics — only

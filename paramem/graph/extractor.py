@@ -786,10 +786,10 @@ def _stamp_speaker_entity(
        below runs, so the rewritten entities are also stamped.
 
        * **Guard A (full-name only)** — fires only when
-         ``len(canonical(speaker_name).split("_")) >= 2``.  ``canonical``
-         emits ``_`` as the blank, so the name parts are the ``_``-separated
-         tokens of the canonical form; ``-`` is not a blank, so a hyphenated
-         single given name ("Anna-Maria") counts as ONE part. A single-token
+         ``len(canonical(speaker_name).split()) >= 2``.  ``canonical``
+         emits a space as the blank, so the name parts are the
+         space-separated tokens of the canonical form; ``-`` is not a blank,
+         so a hyphenated single given name ("Anna-Maria") counts as ONE part. A single-token
          display name (``resolve_speaker_name`` routinely returns a bare
          first name) fails closed: no rewrite. This is what prevents a
          first-person transcript mention like "My friend Alex came over"
@@ -857,15 +857,15 @@ def _stamp_speaker_entity(
         return graph
 
     # Multi-part-name gate: the rewrite only fires for a full name (given +
-    # family), never a bare given name.  ``canonical`` emits ``_`` as the blank,
-    # so the name parts are the ``_``-separated tokens of the canonical form.
-    # ``-`` is not a blank, so a hyphenated single given name ("Anna-Maria")
-    # counts as ONE part and does not open the rewrite.
+    # family), never a bare given name.  ``canonical`` emits a space as the
+    # blank, so the name parts are the space-separated tokens of the
+    # canonical form.  ``-`` is not a blank, so a hyphenated single given name
+    # ("Anna-Maria") counts as ONE part and does not open the rewrite.
     do_rewrite = (
         source_type == "document"
         and speaker_name
         and not is_speaker_id(speaker_name)
-        and len(canonical(speaker_name).split("_")) >= 2
+        and len(canonical(speaker_name).split()) >= 2
     )
 
     # The authoritative speaker id in its canonical form.  Computed once and

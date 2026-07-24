@@ -137,6 +137,35 @@ def check_predicate_coexistence(
     return "COEXIST"
 
 
+def _strip_has_prefix(pred: str) -> str:
+    """Strip one leading ``has_``/``has `` token from *pred*, if present.
+
+    Used by the attribute-relation merger gate to derive a node
+    ``attributes`` key from a relation predicate (e.g. ``has_certification``
+    -> ``certification``) before that key is passed through
+    :func:`~paramem.utils.identity.canonical`. Strips AT MOST one
+    occurrence — ``"has_has_email"`` -> ``"has_email"``, never
+    ``"email"`` — so a doubled prefix (a model artefact or a predicate that
+    legitimately starts with a second ``has_``) degrades to a single strip
+    rather than eating both. Recognises both the underscore form
+    (``"has_certification"``) and the space-separated form
+    (``"has certification"``), since this function runs on the RAW
+    relation predicate, before any canonicalization.
+
+    Args:
+        pred: Raw (uncanonicalized) relation predicate.
+
+    Returns:
+        *pred* with a single leading ``has_``/``has `` removed, or *pred*
+        unchanged when it carries neither prefix.
+    """
+    if pred.startswith("has_"):
+        return pred[len("has_") :]
+    if pred.startswith("has "):
+        return pred[len("has ") :]
+    return pred
+
+
 def _synth_speaker_entities(relations: "list[Relation]") -> "list[Entity]":
     """Synthesise :class:`Entity` objects for speaker-attributed subjects.
 
@@ -279,6 +308,13 @@ class GraphMerger:
     ) -> nx.MultiDiGraph:
         """Merge a session graph into the cumulative graph.
 
+        A relation whose ``relation_type == "attribute"`` never becomes an
+        edge: it is diverted onto the SUBJECT node's ``attributes`` dict
+        (see the ``relation.relation_type == "attribute"`` branch below) —
+        the merger-gate authority for literal-value facts (phone, email,
+        certification, job title, exact date, ...) that would otherwise mint
+        a concept node colliding across subjects sharing the same value.
+
         Args:
             session_graph: The per-session graph to merge in.
             resolve_contradictions: When ``True`` (default), Case-2
@@ -361,6 +397,50 @@ class GraphMerger:
                 obj = obj_surface
             else:
                 obj = canonical_id(obj_surface)
+
+            if relation.relation_type == "attribute":
+                # Literal-value relation (phone/email/date/certification/job
+                # title, ...): the model has marked this as a scalar datum
+                # ABOUT the subject rather than a claim relating the subject
+                # to a distinct concept. Fold it onto the SUBJECT node's
+                # ``attributes`` dict instead of minting a colliding concept
+                # node keyed on the value (two subjects with the same
+                # certification would otherwise collapse onto one node).
+                # No object node is created, no edge is inserted — this
+                # diversion runs BEFORE the object-node-ensure below so an
+                # attribute relation never reaches ``_upsert_relation``.
+                # Subject-node-ensure mirrors the endpoint-ensure loop below,
+                # restricted to the subject alone.
+                if subject not in self.graph:
+                    self.graph.add_node(
+                        subject,
+                        entity_type="concept",
+                        attributes={"name": subj_surface},
+                        reinforcement_count=1,
+                        sessions=[session_id],
+                    )
+                elif subj_surface not in entity_name_map:
+                    # Node already exists but display name not yet set
+                    # (first-seen wins) — same rule the endpoint loop below
+                    # applies.
+                    node_attrs = self.graph.nodes[subject].get("attributes", {})
+                    if not node_attrs.get("name"):
+                        node_attrs["name"] = subj_surface
+                        self.graph.nodes[subject]["attributes"] = node_attrs
+
+                node = self.graph.nodes[subject]
+                node_attrs = node.get("attributes", {})
+                attr_key = canonical_id(_strip_has_prefix(relation.predicate), mode="full")
+                node_attrs[attr_key] = canonical_id(relation.object, mode="spaces")
+                node["attributes"] = node_attrs
+                if relation.indexed_key:
+                    # Node analog of the edge ``_IK_KEY_ATTR`` — lets the
+                    # fold's node-attribute walk
+                    # (``ConsolidationLoop._build_all_edge_entries_into``)
+                    # replay this key's registry-true content instead of
+                    # re-minting it every cycle.
+                    node.setdefault("attribute_keys", {})[attr_key] = relation.indexed_key
+                continue
 
             # Build a display-name map for endpoints not resolved through entities.
             # Keys in entity_name_map already have _upsert_entity called for them

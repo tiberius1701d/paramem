@@ -93,13 +93,13 @@ class TestFlattenEntityAttributesDirect:
             name="Alice", entity_type="person", attributes={"email": "alice@example.com"}
         )
         result = _flatten_entity_attributes([entity])
-        assert any(r["predicate"] == "has_email" for r in result)
+        assert any(r["predicate"] == "has email" for r in result)
         assert any(r["object"] == "alice@example.com" for r in result)
 
     def test_phone_projected_as_has_phone(self) -> None:
         entity = Entity(name="Alice", entity_type="person", attributes={"phone": "+1 555 123 4567"})
         result = _flatten_entity_attributes([entity])
-        assert any(r["predicate"] == "has_phone" for r in result)
+        assert any(r["predicate"] == "has phone" for r in result)
 
     def test_linkedin_projected_as_has_linkedin(self) -> None:
         entity = Entity(
@@ -108,7 +108,7 @@ class TestFlattenEntityAttributesDirect:
             attributes={"linkedin": "linkedin.com/in/alice"},
         )
         result = _flatten_entity_attributes([entity])
-        assert any(r["predicate"] == "has_linkedin" for r in result)
+        assert any(r["predicate"] == "has linkedin" for r in result)
 
     def test_empty_attributes_yields_nothing(self) -> None:
         entity = Entity(name="Alice", entity_type="person", attributes={})
@@ -125,8 +125,8 @@ class TestFlattenEntityAttributesDirect:
         entity = Entity(
             name="Alice", entity_type="person", attributes={"email": "alice@example.com"}
         )
-        # Simulate an explicit relation that already covers (Alice, has_email).
-        exclude = {("Alice", "has_email")}
+        # Simulate an explicit relation that already covers (Alice, has email).
+        exclude = {("Alice", "has email")}
         result = _flatten_entity_attributes([entity], exclude_pairs=exclude)
         assert result == []
 
@@ -142,7 +142,7 @@ class TestFlattenEntityAttributesDirect:
         result = _flatten_entity_attributes([entity])
         assert len(result) == 2
         predicates = {r["predicate"] for r in result}
-        assert predicates == {"has_email", "has_phone"}
+        assert predicates == {"has email", "has phone"}
 
     def test_relation_type_is_attribute(self) -> None:
         entity = Entity(name="Carol", entity_type="person", attributes={"email": "c@c.com"})
@@ -185,7 +185,7 @@ class TestQuadsFromGraphAttributeProjection:
         episodic, procedural = loop._entries_from_graph(graph, procedural_enabled=False)
 
         predicates = [r["predicate"] for r in episodic]
-        assert "has_email" in predicates, (
+        assert "has email" in predicates, (
             "email attribute was NOT projected into the episodic set — "
             "scalar-PII keying silently regressed (_flatten_entity_attributes "
             "not called in _entries_from_graph)"
@@ -198,8 +198,8 @@ class TestQuadsFromGraphAttributeProjection:
         )
         loop = _make_loop()
         episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
-        phone_rels = [r for r in episodic if r["predicate"] == "has_phone"]
-        assert phone_rels, "has_phone not found"
+        phone_rels = [r for r in episodic if r["predicate"] == "has phone"]
+        assert phone_rels, "has phone not found"
         assert phone_rels[0]["object"] == "+1 555 000 0001"
 
     def test_no_duplicate_when_explicit_relation_covers_attribute(self) -> None:
@@ -217,7 +217,7 @@ class TestQuadsFromGraphAttributeProjection:
         )
         loop = _make_loop()
         episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
-        email_rels = [r for r in episodic if r["predicate"] == "has_email"]
+        email_rels = [r for r in episodic if r["predicate"] == "has email"]
         # Exactly one — the explicit relation; the attribute projection is excluded.
         assert len(email_rels) == 1
 
@@ -252,7 +252,7 @@ class TestQuadsFromGraphAttributeProjection:
         episodic, procedural = loop._entries_from_graph(graph, procedural_enabled=True)
         ep_preds = [r["predicate"] for r in episodic]
         proc_preds = [r["predicate"] for r in procedural]
-        assert "works_at" in ep_preds
+        assert "works at" in ep_preds
         assert "prefers" in proc_preds
         assert "prefers" not in ep_preds
 
@@ -289,7 +289,7 @@ class TestAttributeKeysAssignment:
             prefix="graph",
         )
         predicates = [k["predicate"] for k in keyed]
-        assert "has_email" in predicates, "email attribute was not assigned a graphN key"
+        assert "has email" in predicates, "email attribute was not assigned a graphN key"
 
     def test_key_prefix_is_graph_for_attribute_relations(self) -> None:
         """Attribute relations are non-preference so they land in the graph* key range."""

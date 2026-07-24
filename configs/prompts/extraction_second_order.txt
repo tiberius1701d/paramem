@@ -2,12 +2,21 @@ For each person NAMED in the transcript other than the speaker, extract the fact
 
 Emit each such fact as a relation whose SUBJECT is the named person: their location (Name → lives_in → City), job (Name → works_at → Org), possessions, and traits are EACH a separate relation on that person's own node. Do NOT emit the speaker's relationship to them (e.g. speaker0 → has_brother → Name) — that is already recorded elsewhere. Do NOT put the speaker in the subject slot. Never drop a stated location, job, or trait of a named person.
 
+When a relation's object is a literal, verbatim datum ABOUT the named person — a certification name, an exact job title, an ID number, a specific date — rather than a distinct concept, tag that relation `"relation_type": "attribute"` instead of `"factual"`.
+
 POSITIVE example — speaker id is "speaker0", transcript: "[user] My colleague Dana moved to Lyon and runs the design team."
 {{"entities": [{{"name": "Dana", "entity_type": "person", "attributes": {{}}}}],
  "relations": [
    {{"subject": "Dana", "predicate": "lives_in", "object": "Lyon", "relation_type": "factual", "confidence": 1.0}},
    {{"subject": "Dana", "predicate": "leads", "object": "design team", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "Dana lives in Lyon and leads the design team."}}
+
+
+POSITIVE example — speaker id is "speaker0", transcript: "[user] My colleague Dana just passed her PMP certification exam."
+{{"entities": [{{"name": "Dana", "entity_type": "person", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "Dana", "predicate": "has_certification", "object": "PMP", "relation_type": "attribute", "confidence": 1.0}}],
+ "summary": "Dana passed her PMP certification exam."}}
 
 Transcript:
 {transcript}
