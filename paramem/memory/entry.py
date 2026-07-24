@@ -25,7 +25,6 @@ import logging
 from collections.abc import Callable
 
 from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
-from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
 
@@ -282,26 +281,22 @@ def compute_simhash(
 ) -> int:
     """Compute a SimHash fingerprint from key + subject + predicate + object.
 
-    The fingerprint is over the fact's **identity**, not its raw surface: each
-    of ``key``, ``subject``, ``predicate``, ``obj`` is folded through
-    :func:`paramem.utils.identity.canonical` before tokenization, so the result
-    is invariant to case, diacritics, and whitespace-vs-underscore variation
-    (``"New York"`` and ``"new_york"`` fold to the same identity and therefore
-    produce the same fingerprint). This is the single chokepoint for both
-    registration (:func:`entry_simhash`) and recall (:func:`verify_confidence`)
-    — folding here means both sides converge on the same identity form
-    regardless of which surface (raw extraction vs. canonicalized edge) a
-    caller happens to pass in.
+    The fingerprint is over the fact's exact SPO values, hashed verbatim.
+    Identity canonicalization happens once upstream (at the GraphMerger
+    node-identity boundary); by the time a triple reaches this function its
+    fields are already in identity form, so no further folding is applied
+    here. Re-folding would only make the fingerprint lossy — collapsing
+    genuinely distinct objects (e.g. ``"New York"`` vs ``"new_york"``) onto one
+    fingerprint and weakening hallucination detection — and would break
+    comparison against fingerprints already persisted on disk. This is the
+    single chokepoint for both registration (:func:`entry_simhash`) and recall
+    (:func:`verify_confidence`): both hash the same surface, so a fingerprint
+    computed at registration matches the one recomputed from a correct recall.
 
     Uses unigram+bigram feature tokenization and a bit-vote algorithm. The key is
     included so that identical triple content under different keys produces
     different fingerprints — catches hallucinations where the model echoes the
     queried key but returns another key's content.
-
-    Note: this fingerprint is NOT compatible with legacy SimHash registry files
-    built with an earlier content string format.
-    Existing ``simhash_registry_*.json`` files built with the legacy format must
-    be regenerated.
 
     Args:
         key: The ``graphN`` key string.
@@ -313,7 +308,7 @@ def compute_simhash(
     Returns:
         A ``num_bits``-bit integer fingerprint.
     """
-    text = " ".join(canonical(x) for x in (key, subject, predicate, obj))
+    text = f"{key} {subject} {predicate} {obj}"
     features = _tokenize_features(text)
 
     if not features:

@@ -245,28 +245,33 @@ class TestComputeSimhash:
         result = compute_simhash("graph1", "", "", "")
         assert isinstance(result, int)
 
-    def test_predicate_space_vs_underscore_invariant(self):
-        """Fix B: the fingerprint is over identity, not raw surface — a
-        space-separated predicate and its underscore-joined canonical form
-        must hash identically."""
-        h1 = compute_simhash("graph1", "Alice", "lives in", "Berlin")
-        h2 = compute_simhash("graph1", "Alice", "lives_in", "Berlin")
-        assert h1 == h2
+    def test_surface_is_hashed_verbatim_not_folded(self):
+        """The fingerprint is over the EXACT SPO values. Identity
+        canonicalization happens once upstream (GraphMerger node-identity
+        boundary) and is never re-applied here, so distinct surfaces produce
+        distinct fingerprints — the primitive stays an exact hallucination
+        detector. In production both registration and recall pass the one
+        already-canonical surface, so they agree."""
+        # predicate: space vs underscore surface → distinct
+        assert compute_simhash("graph1", "Alice", "lives in", "Berlin") != compute_simhash(
+            "graph1", "Alice", "lives_in", "Berlin"
+        )
+        # subject/object: case + whitespace surface → distinct
+        assert compute_simhash("graph1", "Alice", "lives_in", "New York") != compute_simhash(
+            "graph1", "alice", "lives_in", "new_york"
+        )
+        # diacritics → distinct
+        assert compute_simhash("graph1", "José", "lives_in", "Saint-Étienne") != compute_simhash(
+            "graph1", "jose", "lives_in", "saint-etienne"
+        )
 
-    def test_subject_object_case_and_whitespace_invariant(self):
-        """Fix B: subject/object case and whitespace-vs-underscore variation
-        must no longer desync the fingerprint — 'New York' and 'new_york'
-        are the same identity and now score 1.0."""
-        h1 = compute_simhash("graph1", "Alice", "lives_in", "New York")
-        h2 = compute_simhash("graph1", "alice", "lives_in", "new_york")
+    def test_identical_surface_scores_1_0(self):
+        """The property production relies on: the same (already-canonical)
+        triple hashed at registration and at recall matches exactly."""
+        h1 = compute_simhash("graph1", "speaker0", "has_expertise_in", "machine_learning")
+        h2 = compute_simhash("graph1", "speaker0", "has_expertise_in", "machine_learning")
         assert h1 == h2
         assert simhash_confidence(h1, h2) == 1.0
-
-    def test_diacritic_invariant(self):
-        """Fix B: diacritic folding applies to every field, not just predicate."""
-        h1 = compute_simhash("graph1", "José", "lives_in", "Saint-Étienne")
-        h2 = compute_simhash("graph1", "jose", "lives_in", "saint-etienne")
-        assert h1 == h2
 
 
 # --- entry_simhash ---
@@ -300,14 +305,15 @@ class TestEntrySimhash:
         registry = {entry["key"]: entry_simhash(entry)}
         assert verify_confidence(entry, registry) == 1.0
 
-    def test_converges_with_hashing_a_different_surface_of_the_same_fact(self):
-        """Fix B changes this contract: compute_simhash now folds every
-        argument through canonical() itself, so hashing a DIFFERENT surface
-        of the same fact (e.g. the canonical()-folded subject/object instead
-        of the entry's own raw display subject/object) converges on the SAME
-        fingerprint rather than desyncing from it. This is the surface
-        invariance Fix B establishes — the fingerprint is the fact's
-        identity, not a hash of whatever surface happened to be passed in."""
+    def test_different_surface_does_not_converge(self):
+        """The fingerprint is EXACT, not surface-invariant. A registry entry
+        hashed from a DIFFERENT surface of the same fact (here canonical()-folded
+        subject/object) does NOT verify at full confidence against a raw-surface
+        recall, and entry_simhash of the raw entry does not equal it. Identity
+        folding is done ONCE upstream (GraphMerger), so in production both sides
+        carry the one canonical surface and DO converge
+        (see test_identical_surface_scores_1_0). This guards against
+        re-introducing a lossy canonical() fold inside the primitive."""
         from paramem.utils.identity import canonical
 
         entry = {
@@ -316,19 +322,15 @@ class TestEntrySimhash:
             "predicate": "lives in",
             "object": "Saint-Étienne",
         }
-        pre_canonicalized_fp = compute_simhash(
+        divergent_surface_fp = compute_simhash(
             entry["key"],
             canonical(entry["subject"]),
             entry["predicate"],
             canonical(entry["object"]),
         )
-        registry = {entry["key"]: pre_canonicalized_fp}
-        confidence = verify_confidence(entry, registry)
-        assert confidence == 1.0, (
-            f"Expected the pre-canonicalized-surface fingerprint to verify at "
-            f"full confidence against the raw-surface entry; got confidence={confidence}"
-        )
-        assert entry_simhash(entry) == pre_canonicalized_fp
+        registry = {entry["key"]: divergent_surface_fp}
+        assert verify_confidence(entry, registry) < 1.0
+        assert entry_simhash(entry) != divergent_surface_fp
 
 
 # --- verify_confidence ---
