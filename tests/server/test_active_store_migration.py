@@ -1608,6 +1608,7 @@ class TestStoreLoadDegradedDispatchGuard:
                     "session_buffer": MagicMock(),
                     "pending_rehydration": True,
                     "store_load_degraded": False,
+                    "event_loop": mock_loop,
                 },
                 clear=False,
             ),
@@ -1615,7 +1616,6 @@ class TestStoreLoadDegradedDispatchGuard:
                 "paramem.server.app._retro_claim_orphan_sessions",
                 return_value=0,
             ),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(
                 app_module.ConsolidationAction.AUTO

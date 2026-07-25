@@ -297,11 +297,11 @@ def _dispatch(state, action, *, monkeypatch=None):
         due_calls.append(result)
         return result
 
+    state["event_loop"] = spy.loop
     monkeypatch.setattr(app_module, "_state", state)
     monkeypatch.setattr(app_module, "_is_full_cycle_due", _counting_due)
     monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
-    with patch("asyncio.get_running_loop", return_value=spy.loop):
-        status, resolved = app_module._dispatch_consolidation(action)
+    status, resolved = app_module._dispatch_consolidation(action)
     return status, resolved, spy, due_calls
 
 
@@ -432,13 +432,13 @@ class TestConsolidationArbitrator:
             _make_interim_slot(adapter_dir, f"2026070{i + 1}T0000", payload=None)
 
         spy = _ExecutorSpy()
+        state["event_loop"] = spy.loop
         monkeypatch.setattr(app_module, "_state", state)
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
         # The schedule gate is stubbed True so the ONLY thing standing between
         # the tick and a full GPU retrain is the content gate.
         monkeypatch.setattr(app_module, "_is_full_cycle_due", lambda config: True)
-        with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
+        status, resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
 
         assert status == "noop_no_pending"
         assert resolved is ConsolidationAction.FULL
@@ -457,11 +457,11 @@ class TestConsolidationArbitrator:
             _make_interim_slot(adapter_dir, f"2026070{i + 1}T0000", payload="weights")
 
         spy = _ExecutorSpy()
+        state["event_loop"] = spy.loop
         monkeypatch.setattr(app_module, "_state", state)
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
         monkeypatch.setattr(app_module, "_is_full_cycle_due", lambda config: True)
-        with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
+        status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
 
         assert status == "started_full"
         assert spy.call_count == 1
@@ -477,11 +477,11 @@ class TestConsolidationArbitrator:
             _make_interim_slot(adapter_dir, f"2026070{i + 1}T0000", payload="weights")
 
         spy = _ExecutorSpy()
+        state["event_loop"] = spy.loop
         monkeypatch.setattr(app_module, "_state", state)
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
         monkeypatch.setattr(app_module, "_is_full_cycle_due", lambda config: True)
-        with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
+        status, _resolved = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
 
         assert status == "noop_no_pending"
         assert spy.call_count == 0
@@ -750,6 +750,7 @@ class TestStampPredicate:
         import paramem.server.app as app_module
 
         spy = _ExecutorSpy()
+        state["event_loop"] = spy.loop
         stamp_calls: list[object] = []
         _real_stamp = app_module._stamp_scheduled_run
 
@@ -760,8 +761,7 @@ class TestStampPredicate:
         monkeypatch.setattr(app_module, "_state", state)
         monkeypatch.setattr(app_module, "_stamp_scheduled_run", _counting_stamp)
         monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
-        with patch("asyncio.get_running_loop", return_value=spy.loop):
-            status, resolved = app_module._dispatch_consolidation(action)
+        status, resolved = app_module._dispatch_consolidation(action)
         return status, resolved, len(stamp_calls)
 
     @pytest.mark.parametrize("action_name", ["FULL", "INTERIM", "RECONCILE"])

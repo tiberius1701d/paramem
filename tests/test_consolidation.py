@@ -15261,6 +15261,7 @@ class TestFullCycleDispatcherOverdueIncident:
         mock_future = MagicMock()
         mock_loop.run_in_executor.return_value = mock_future
         mock_future.add_done_callback.return_value = None
+        state["event_loop"] = mock_loop
 
         with (
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
@@ -15271,7 +15272,6 @@ class TestFullCycleDispatcherOverdueIncident:
             ),
             patch("paramem.server.app.record_incident", side_effect=_capture_record_incident),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(
                 app_module.ConsolidationAction.AUTO
@@ -15303,6 +15303,7 @@ class TestFullCycleDispatcherOverdueIncident:
         mock_future = MagicMock()
         mock_loop.run_in_executor.return_value = mock_future
         mock_future.add_done_callback.return_value = None
+        state["event_loop"] = mock_loop
 
         with (
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
@@ -15311,7 +15312,6 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
             patch("paramem.server.app.record_incident", side_effect=_capture_record_incident),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(
                 app_module.ConsolidationAction.AUTO
@@ -15342,6 +15342,7 @@ class TestFullCycleDispatcherOverdueIncident:
         mock_future = MagicMock()
         mock_loop.run_in_executor.return_value = mock_future
         mock_future.add_done_callback.return_value = None
+        state["event_loop"] = mock_loop
 
         with (
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
@@ -15354,7 +15355,6 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             # Patch bump_retry_count at its source to detect any call.
             patch("paramem.server.retry_state.bump_retry_count") as mock_bump,
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             app_module._dispatch_consolidation(app_module.ConsolidationAction.AUTO)
 
@@ -17325,12 +17325,12 @@ class TestDispatchCountZeroRoutesToFull:
 
         mock_loop = MagicMock()
         mock_loop.run_in_executor = MagicMock(side_effect=_submit)
+        state_overrides["event_loop"] = mock_loop
 
         with (
             patch.object(_app, "_state", state_overrides),
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = _app._dispatch_consolidation(_app.ConsolidationAction.AUTO)
         # The full fold is submitted as a partial that binds the fold's key
@@ -17475,6 +17475,7 @@ class TestSchedulerCatchUpGate:
         mock_future = MagicMock()
         mock_future.add_done_callback = MagicMock()
         mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+        state["event_loop"] = mock_loop
 
         with (
             patch.object(app_module, "_state", state),
@@ -17483,7 +17484,6 @@ class TestSchedulerCatchUpGate:
             patch("paramem.server.app._is_full_cycle_due", return_value=True),
             patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
             patch("paramem.server.app._run_full_consolidation_sync"),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             result, _action = app_module._dispatch_consolidation(action)
         return result, mock_loop.run_in_executor.call_count
@@ -17651,6 +17651,7 @@ class TestSchedulerCatchUpGate:
         mock_future = MagicMock()
         mock_future.add_done_callback = MagicMock()
         mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+        state["event_loop"] = mock_loop
 
         client = self._make_client(monkeypatch, state)
         with (
@@ -17658,7 +17659,6 @@ class TestSchedulerCatchUpGate:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
             patch("paramem.server.app._run_full_consolidation_sync"),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             resp = client.post("/consolidate")
 
@@ -17748,6 +17748,7 @@ class TestSchedulerCatchUpGate:
         mock_future = MagicMock()
         mock_future.add_done_callback = MagicMock()
         mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+        state["event_loop"] = mock_loop
 
         client = self._make_client(monkeypatch, state)
         with (
@@ -17755,7 +17756,6 @@ class TestSchedulerCatchUpGate:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
             patch("paramem.server.app._run_full_consolidation_sync"),
-            patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
             resp = client.post("/consolidate")
 

@@ -12343,7 +12343,16 @@ def _dispatch_to_executor(fn: Callable[[], None], status: str) -> str:
         _dispatch_to_executor(fn, "started_full")``.
     """
     _state["consolidating"] = True
-    event_loop = asyncio.get_running_loop()
+    # Use the loop captured once at lifespan startup (line ~2392) rather than
+    # re-acquiring it here.  Every dispatch path is an ``async def`` route on
+    # that same loop, so this is the identical loop in production — one source
+    # of truth.  It also keeps the dispatch off the global
+    # ``asyncio.get_running_loop`` seam, so tests inject their loop via
+    # ``_state["event_loop"]`` instead of patching stdlib (which deadlocks
+    # starlette's TestClient portal under anyio >= 4.14).  A missing
+    # ``_state["event_loop"]`` is a real startup bug, so there is deliberately
+    # no fallback.
+    event_loop = _state["event_loop"]
     future = event_loop.run_in_executor(None, fn)
     future.add_done_callback(_scheduled_extract_done_callback)
     return status
