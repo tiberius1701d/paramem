@@ -48,8 +48,8 @@ rather than editing this file:
 
 ```python
 cfg = load_server_config("tests/fixtures/server.yaml")
-cfg.consolidation.mode = "simulate"           # this test only
-cfg.sanitization.cloud_mode = "anonymize"     # this test only
+cfg.consolidation.mode = "simulate"  # this test only
+cfg.sanitization.cloud_mode = "anonymize"  # this test only
 ```
 
 Editing `tests/fixtures/server.yaml` ripples to every test that loads it.
