@@ -23,7 +23,7 @@ import pytest
 from peft import PeftModel
 
 from paramem.memory.store import MemoryStore
-from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.consolidation import ConsolidationLoop, RecallGateRejected
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -262,6 +262,31 @@ class TestVerifySavedAdapterCorruption:
         assert "0.600" in msg or "0.60" in msg
         assert "1.00" in msg
         assert str(slot) in msg
+
+    def test_sub_threshold_raises_recall_gate_rejected_with_payload(self, tmp_path: Path) -> None:
+        """Sub-threshold recall raises the classifiable type, not a bare RuntimeError.
+
+        The interim fold catches ``RecallGateRejected`` specifically so it can
+        return ``mode="recall_failed"`` instead of letting the exception skip
+        app.py's retry bookkeeping.  A bare ``RuntimeError`` here would make
+        that catch either unreachable or indiscriminate, so the exact type and
+        its payload are part of the contract.  It subclasses ``RuntimeError``
+        so the main-tier path's existing broad handling is unaffected.
+        """
+        loop = _make_verify_loop(tmp_path)
+        slot = _make_slot(tmp_path, "episodic")
+        loop._run_recall_sanity_probe = MagicMock(return_value=0.762)
+
+        with pytest.raises(RecallGateRejected) as exc_info:
+            loop._verify_saved_adapter_from_disk(
+                "episodic",
+                slot,
+                _SAMPLE_KEYED_PAIRS,
+            )
+
+        assert isinstance(exc_info.value, RuntimeError)
+        assert exc_info.value.recall_rate == pytest.approx(0.762)
+        assert exc_info.value.threshold == pytest.approx(1.0)
 
     def test_error_message_mentions_slot_path(self, tmp_path: Path) -> None:
         """RuntimeError message must include the slot path for diagnosability."""

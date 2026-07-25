@@ -244,6 +244,29 @@ class TrialActiveError(RuntimeError):
     """
 
 
+class RecallGateRejected(RuntimeError):
+    """Raised by :meth:`ConsolidationLoop._verify_saved_adapter_from_disk` when the
+    post-save recall probe lands below ``recall_sanity_threshold``.
+
+    A deterministic quality verdict, NOT a crash: the adapter trained and saved
+    successfully, and the probe simply did not reach the threshold.  The interim
+    fold catches this specific type, rolls back the cycle's store mutations, and
+    returns ``mode="recall_failed"`` with the contributing session ids — the
+    normal-return contract that ``app.py``'s retry bookkeeping is written
+    against ("crash != recall failure", ``app.py:14154-14156``).  Letting it
+    propagate as a bare exception skips that bookkeeping entirely, which leaves
+    the durable retry counter at zero and the release valve unreachable.
+
+    Subclasses ``RuntimeError`` so existing broad handlers on the main-tier
+    path keep their current behaviour.
+    """
+
+    def __init__(self, message: str, *, recall_rate: float, threshold: float):
+        super().__init__(message)
+        self.recall_rate = recall_rate
+        self.threshold = threshold
+
+
 class AbortedDuringConsolidation(Exception):
     """Raised by the train fold (:meth:`ConsolidationLoop.consolidate`) when training
     is aborted mid-tier.
@@ -3396,6 +3419,7 @@ class ConsolidationLoop:
                     else all_interim_keyed
                 )
                 _recall_failed_session_ids: set[str] = set()
+                _recall_gate_rejected = False
                 _ep_flushed = 0
                 _proc_flushed = 0
                 _soft_stale_by_tier: dict[str, dict] = {}
@@ -3456,6 +3480,28 @@ class ConsolidationLoop:
                         stamp=stamp,
                         all_keyed=all_interim_keyed,
                     )
+                except RecallGateRejected as _gate:
+                    # Deterministic quality verdict, not a crash.  Roll back
+                    # identically to the generic handler below, then RETURN
+                    # normally with the contributing session ids so app.py's
+                    # retry bookkeeping runs — it is written against a normal
+                    # cycle return and is skipped entirely when this
+                    # propagates.  commit_tier_slot has already removed the
+                    # un-flushed slot in its own finally.
+                    for _stale_tier, _stale_keys in _soft_stale_by_tier.items():
+                        for _stale_key in _stale_keys:
+                            self.store.reactivate(_stale_tier, _stale_key)
+                    self.store.drop_tier(adapter_name)
+                    _recall_gate_rejected = True
+                    _recall_failed_session_ids.update(_pending_session_ids_b)
+                    logger.warning(
+                        "_run_fold[interim]: recall gate rejected %s "
+                        "(recall %.3f < threshold %.2f) — %d session(s) stay pending",
+                        adapter_name,
+                        _gate.recall_rate,
+                        _gate.threshold,
+                        len(_pending_session_ids_b),
+                    )
                 except Exception:
                     # Undo this cycle's mutations before re-raising: reactivate
                     # any key the shared soft-stale stage staled this cycle
@@ -3472,17 +3518,27 @@ class ConsolidationLoop:
                 # for both venues; simulate's counters are no longer bumped
                 # eagerly outside the commit window (see the NOTE in the
                 # fresh-derivation path above).
-                self._indexed_next_index += _ep_flushed
-                self._procedural_next_index += _proc_flushed
+                # A recall-gate rejection rolled the mutations back above, so the
+                # keys were never committed and the counters must not advance —
+                # otherwise the next cycle mints from a gap and the rejected key
+                # numbers are burned.
+                if not _recall_gate_rejected:
+                    self._indexed_next_index += _ep_flushed
+                    self._procedural_next_index += _proc_flushed
 
-                # Clear the interim-slot fold_resume.json marker on clean commit.
+                # Clear the interim-slot fold_resume.json marker.  On rejection
+                # the slot is already gone (commit_tier_slot's finally), so a
+                # surviving marker would point at a deleted slot.
                 self._clear_fold_resume()
 
                 # --- Restore episodic as active adapter ---
                 if "episodic" in self.model.peft_config:
                     switch_adapter(self.model, "episodic")
 
-                _interim_mode_label = "trained" if scope.source == "weights" else "simulated"
+                if _recall_gate_rejected:
+                    _interim_mode_label = "recall_failed"
+                else:
+                    _interim_mode_label = "trained" if scope.source == "weights" else "simulated"
                 _interim_venue = self._venue_from_scope(scope)
                 logger.info(
                     "_run_fold[interim]: %s %s — %d new keys, %d total interim keys",
@@ -6351,12 +6407,14 @@ class ConsolidationLoop:
                 )
 
         if recall_rate < threshold:
-            raise RuntimeError(
+            raise RecallGateRejected(
                 f"Post-save disk-integrity probe failed for adapter '{adapter_name}': "
                 f"recall {recall_rate:.3f} < threshold {threshold:.2f} "
                 f"(slot: {slot_path}). "
                 "The on-disk artifact may be corrupt. "
-                "Sessions will remain pending for retry on the next cycle."
+                "Sessions will remain pending for retry on the next cycle.",
+                recall_rate=recall_rate,
+                threshold=threshold,
             )
 
         return recall_rate
