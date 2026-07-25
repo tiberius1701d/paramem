@@ -19,8 +19,10 @@ for smaller N), Mistral 7B, EPISODIC production recipe (rank 8, alpha 16,
 lr 1e-4, attention-only target_modules), COLD LoRA-zero init, ``--epochs``
 epochs (default 30), batch_size=1, gradient_accumulation_steps=2 ->
 ``epochs * _steps_per_epoch(N, 1, 2)`` optimizer steps (derived, never
-hardcoded — see ``_expected_optimizer_steps``). Run at 3 seeds (0, 1, 2);
-per-seed recall reported, plus the mean. Two decisive arms:
+hardcoded — see ``_expected_optimizer_steps``). Run at 3 seeds (0, 1, 2 by
+default; override with ``--seeds`` — e.g. ``--seeds 42`` for a single
+production-training-seed run); per-seed recall reported, plus the mean.
+Two decisive arms:
 
   * ``--n-entries 3 --epochs 30``  -> 60 optimizer steps (the ORIGINAL
     failure condition to reproduce).
@@ -1239,6 +1241,22 @@ def _parse_args() -> argparse.Namespace:
         help="Auto-find the latest run dir for the resolved --arm and skip completed seeds.",
     )
     parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "One or more seeds to run, overriding the module default SEEDS=(0, 1, 2) "
+            "(e.g. --seeds 42 runs a single seed matching the production training "
+            "seed; --seeds 0 1 2 reproduces the default 3-seed gate explicitly). "
+            "Omitting this flag is byte-identical to today's behaviour. The "
+            "effective seed list (not the SEEDS module constant) is what lands in "
+            "run_config.json and the final cross-seed summary; --resume skips "
+            "whichever of the effective seeds already have a seed<N>_done.json "
+            "marker in the resolved --arm's run dir."
+        ),
+    )
+    parser.add_argument(
         "--probe-before-training",
         action="store_true",
         help=(
@@ -1265,10 +1283,15 @@ def main() -> None:
     ``tests/fixtures/server.yaml`` (with the two in-code overrides
     documented in the module docstring: ``num_epochs`` from ``--epochs``,
     ``recall_early_stopping=False``), cycles
-    through the 3 seeds of the resolved arm (``--n-entries``/
+    through the resolved seeds of the resolved arm (``--n-entries``/
     ``--entries-json`` / ``--epochs`` / ``--warm-from`` / ``--arm`` /
-    ``--probe-before-training``) with per-seed adapter isolation, and writes
-    per-seed results + done markers under an arm-scoped output subtree. GPU
+    ``--probe-before-training`` / ``--seeds``) with per-seed adapter
+    isolation, and writes per-seed results + done markers under an
+    arm-scoped output subtree. ``--seeds`` overrides the module default
+    ``SEEDS = (0, 1, 2)`` (e.g. ``--seeds 42`` for a single production-seed
+    run); omitting it reproduces today's 3-seed behaviour exactly, and the
+    effective seed list — never the module constant — is what is logged,
+    written to ``run_config.json``, and iterated by ``--resume``. GPU
     cooldown is inserted between seeds. The ``~/.training_pause`` gate is
     honoured at every seed boundary.
 
@@ -1279,6 +1302,13 @@ def main() -> None:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     args = _parse_args()
+
+    # Resolve the effective seed set: --seeds overrides the module default
+    # SEEDS=(0, 1, 2) (e.g. --seeds 42 for the production training seed);
+    # omitting the flag reproduces today's behaviour exactly. Everything
+    # downstream (logging, run_config.json, --resume, the seed loop, the
+    # final cross-seed summary) reads `seeds`, never the SEEDS constant.
+    seeds = tuple(args.seeds) if args.seeds else SEEDS
 
     # Resolve the entry set: --entries-json replaces the synthetic
     # generator entirely and implies --n-entries from the file length
@@ -1350,7 +1380,7 @@ def main() -> None:
         epochs,
         expected_steps,
         is_warm,
-        SEEDS,
+        seeds,
     )
 
     # Log run config early (before GPU acquire) so a crash before model load
@@ -1358,7 +1388,7 @@ def main() -> None:
     run_config = {
         "model": args.model,
         "arm": arm,
-        "seeds": list(SEEDS),
+        "seeds": list(seeds),
         "n_entries": n_entries,
         "entries_json": args.entries_json,
         "epochs": epochs,
@@ -1409,7 +1439,7 @@ def main() -> None:
         )
 
         first_seed = True
-        for seed in SEEDS:
+        for seed in seeds:
             _check_pause(f"before seed {seed}")
 
             if _marker_exists(run_dir, seed):
@@ -1451,7 +1481,7 @@ def main() -> None:
     print(f"Test 20 — {arm} Final Summary")
     print("=" * 72)
     rates: list[float] = []
-    for seed in SEEDS:
+    for seed in seeds:
         results_path = run_dir / f"seed{seed}" / "results.json"
         _print_summary_from_results(seed, results_path)
         if results_path.exists():
