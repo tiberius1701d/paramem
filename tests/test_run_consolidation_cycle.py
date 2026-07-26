@@ -140,6 +140,27 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     return loop
 
 
+def _matching_interim_config(adapter_config) -> MagicMock:
+    """MagicMock double for a resident interim adapter's PEFT ``LoraConfig``.
+
+    ``ensure_adapter_matching`` (the warm-init config-mismatch guard called
+    from the interim mint branch) compares a resident adapter's ``r`` /
+    ``lora_alpha`` / ``target_modules`` against the tier's target
+    ``AdapterConfig`` — a bare ``MagicMock()`` placeholder never equals a
+    real ``int``/``list``, so it always reads as a mismatch and falls through
+    to a real (unpatched) ``create_adapter`` call. These tests simulate a
+    resident interim adapter (re-fold within the cadence window) that must be
+    recognised as MATCHING, so its fields are populated from *adapter_config*
+    (interim adapters are always minted from ``self.episodic_config`` in
+    production).
+    """
+    cfg = MagicMock()
+    cfg.r = adapter_config.rank
+    cfg.lora_alpha = adapter_config.alpha
+    cfg.target_modules = list(adapter_config.target_modules)
+    return cfg
+
+
 def _fake_qa(n: int = 2) -> list[dict]:
     """Return n synthetic QA dicts."""
     return [
@@ -200,7 +221,9 @@ class TestRegistryLastWriteOrder:
 
         loop = _make_mock_loop(tmp_path)
         stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+        loop.model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(
+            loop.episodic_config
+        )
 
         call_order: list[str] = []
 
@@ -249,6 +272,562 @@ class TestRegistryLastWriteOrder:
             f"save_adapter must come before save_from_bytes; order was: {call_order}"
         )
 
+    def test_interim_telemetry_records_derived_epochs(self, tmp_path: Path) -> None:
+        """The interim fold's telemetry `record["epochs"]` must carry the
+        DERIVED budget (paramem.utils.config.budget_for), not
+        self.training_config.num_epochs -- computed before the try block so
+        the finally-path record is correct even on failure.
+
+        One QA entry (N=1) with budget_derivation_enabled=True falls in the
+        smallest bucket (< 16 keys -> 80 epochs), which differs from the
+        harness's configured training_config.num_epochs=1 -- an unmistakable
+        signal that the recorded value is the derived one.
+        """
+        import dataclasses
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        loop.training_config = dataclasses.replace(
+            loop.training_config, budget_derivation_enabled=True
+        )
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        loop.model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(
+            loop.episodic_config
+        )
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=True),
+                reset_peak_memory_stats=MagicMock(),
+                mem_get_info=MagicMock(return_value=(1_000_000_000, 2_000_000_000)),
+                max_memory_allocated=MagicMock(return_value=500_000_000),
+                max_memory_reserved=MagicMock(return_value=600_000_000),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-003",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        assert mock_telemetry.called
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected at least one interim_tier_train telemetry record"
+        assert interim_calls[0].kwargs["record"]["epochs"] == 80, (
+            "telemetry must record the DERIVED budget (80, smallest bucket for N=1), "
+            f"got {interim_calls[0].kwargs['record']}"
+        )
+
+    def test_interim_telemetry_records_budget_fields_without_cuda(self, tmp_path: Path) -> None:
+        """n_keys/accum/init/stale_keys must be recorded even when CUDA is
+        unavailable -- proves these fields sit OUTSIDE the
+        torch.cuda.is_available() gate (the CUDA-gate restructure). The mock
+        model's named_parameters() carries a zero-valued lora_B tensor for
+        the interim adapter so measured_adapter_init_state classifies
+        init="cold" instead of degrading to an absent field.
+        """
+        import dataclasses
+
+        import torch as _torch
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        loop.training_config = dataclasses.replace(
+            loop.training_config, budget_derivation_enabled=True
+        )
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+        loop.model.named_parameters.return_value = [
+            (f"base_model.model.x.lora_B.{interim_name}.weight", _torch.zeros(2, 2)),
+        ]
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-004",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected at least one interim_tier_train telemetry record"
+        record = interim_calls[0].kwargs["record"]
+        assert record["n_keys"] == 2
+        assert record["accum"] == 1  # bucket <16 keys -> accum=1
+        assert record["stale_keys"] == 0
+        assert record["init"] == "cold"
+        assert "free_before" not in record, "VRAM fields must stay absent when CUDA is unavailable"
+        assert "peak_alloc" not in record
+        for field, value in record.items():
+            if isinstance(value, str):
+                assert field in {"tier", "fold_stamp", "init"}, (
+                    f"unexpected non-numeric string field {field!r}={value!r}"
+                )
+                if field == "init":
+                    assert value in {"cold", "warm", "donor"}
+
+    def test_interim_telemetry_tags_donor_seeded_fold(self, tmp_path: Path) -> None:
+        """A cold interim adapter seeded from a VALID donor checkpoint must be
+        tagged init="donor" at the interim telemetry call site too (not just
+        the main-tier one) -- the funnel's returned metrics dict carries
+        donor_seeded=True and the call site overrides its telemetry record
+        from that, per the seeding hook's docstring (no second measurement).
+        """
+        import dataclasses
+
+        import torch as _torch
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        loop.training_config = dataclasses.replace(
+            loop.training_config, budget_derivation_enabled=True, donor_seeding_enabled=True
+        )
+        loop._telemetry_dir = tmp_path / "telemetry"
+        loop.model.get_base_model.return_value.config._name_or_path = "test/base-model"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+        loop.model.named_parameters.return_value = [
+            (f"base_model.model.x.lora_B.{interim_name}.weight", _torch.zeros(2, 2)),
+        ]
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch.multiple(
+                "paramem.models.loader",
+                switch_adapter=MagicMock(),
+                copy_adapter_weights_subset=MagicMock(return_value=4),
+            ),
+            patch.multiple(
+                "paramem.training.donor",
+                donor_checkpoint_valid=MagicMock(return_value=True),
+                load_donor_into_transient_slot=MagicMock(),
+            ),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-004",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected at least one interim_tier_train telemetry record"
+        record = interim_calls[0].kwargs["record"]
+        assert record["init"] == "donor", (
+            f"donor-seeded interim fold must be tagged 'donor': {record!r}"
+        )
+
+    def test_interim_telemetry_records_bind_fields_on_success(self, tmp_path: Path) -> None:
+        """epochs_to_bind/steps_to_bind/hit_cap are derived from the
+        recall_state returned by _train_tier_adapter on the success path."""
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.early_stop import _EarlyStopState
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        fake_recall_state = _EarlyStopState(stop_epoch=5)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                return_value=({"aborted": False, "train_loss": 0.05}, fake_recall_state),
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-005",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected at least one interim_tier_train telemetry record"
+        record = interim_calls[0].kwargs["record"]
+        assert record["epochs_to_bind"] == 5
+        assert record["hit_cap"] is False
+        # n_keys=2 (the harness's two pre-populated graph edges) with budget
+        # derivation off in this test (TrainingConfig's default
+        # gradient_accumulation_steps=8 passes through unchanged) ->
+        # ceil(2/8) * 5 = 5 steps.
+        assert record["steps_to_bind"] == 5
+
+    def test_interim_telemetry_hit_cap_when_recall_never_fires(self, tmp_path: Path) -> None:
+        """hit_cap=True and epochs_to_bind/steps_to_bind stay absent when
+        the recall_state carries stop_epoch=None (the recall signal never
+        fired within the derived epoch budget)."""
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.early_stop import _EarlyStopState
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        fake_recall_state = _EarlyStopState(stop_epoch=None)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                return_value=({"aborted": False, "train_loss": 0.05}, fake_recall_state),
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-006",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected at least one interim_tier_train telemetry record"
+        record = interim_calls[0].kwargs["record"]
+        assert record["hit_cap"] is True
+        assert "epochs_to_bind" not in record
+        assert "steps_to_bind" not in record
+
+    def test_interim_telemetry_omits_bind_fields_on_exception(self, tmp_path: Path) -> None:
+        """A raise inside _train_tier_adapter still writes the
+        interim_tier_train telemetry record (finally-path) with
+        n_keys/accum/stale_keys populated but
+        epochs_to_bind/steps_to_bind/hit_cap absent -- recall_state stays
+        at its pre-declared None when the call never returns a value to
+        unpack.
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = _make_mock_loop(tmp_path)
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                loop.run_consolidation_cycle(
+                    _fake_qa(1),
+                    [],
+                    speaker_id="speaker0",
+                    mode="train",
+                    run_label="conv-i5-007",
+                    schedule="every 2h",
+                    max_interim_count=4,
+                    stamp=stamp,
+                )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "telemetry must still be written on the exception path"
+        record = interim_calls[0].kwargs["record"]
+        assert record["n_keys"] == 2
+        assert record["aborted"] is False
+        assert "epochs_to_bind" not in record
+        assert "steps_to_bind" not in record
+        assert "hit_cap" not in record
+
+    def test_interim_telemetry_construction_failure_does_not_replace_in_flight_exception(
+        self, tmp_path: Path
+    ) -> None:
+        """A raise while BUILDING the telemetry record (not just while
+        writing it) must not replace the exception in flight from
+        _train_tier_adapter. Forces _recall_bind_telemetry (called during
+        record construction, inside the guarded try) to raise a distinct
+        error while _train_tier_adapter raises its own distinct error --
+        the ORIGINAL error must be what the caller sees.
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+
+        class _OriginalTrainingError(RuntimeError):
+            pass
+
+        class _ConstructionBoom(RuntimeError):
+            pass
+
+        loop = _make_mock_loop(tmp_path)
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                side_effect=_OriginalTrainingError("original training failure"),
+            ),
+            patch(
+                "paramem.training.consolidation._recall_bind_telemetry",
+                side_effect=_ConstructionBoom("record construction exploded"),
+            ),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            with pytest.raises(_OriginalTrainingError, match="original training failure"):
+                loop.run_consolidation_cycle(
+                    _fake_qa(1),
+                    [],
+                    speaker_id="speaker0",
+                    mode="train",
+                    run_label="conv-i5-008",
+                    schedule="every 2h",
+                    max_interim_count=4,
+                    stamp=stamp,
+                )
+
+        # The telemetry write itself never reaches record_fold_telemetry --
+        # construction raised first, and that failure is swallowed (logged)
+        # rather than propagated or silently skipping the guard.
+        assert not mock_telemetry.called
+
+    def test_interim_telemetry_abort_path_sets_aborted_and_omits_hit_cap(
+        self, tmp_path: Path
+    ) -> None:
+        """When _train_tier_adapter returns aborted=True (thermal throttle /
+        operator pause -- a normal return, not a raise), the record carries
+        aborted=True and OMITS hit_cap (which would otherwise misrepresent
+        the abort as "ran to budget without binding").
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.early_stop import _EarlyStopState
+
+        loop = _make_mock_loop(tmp_path)
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        # A trainer abort typically has no stop_epoch (recall never bound).
+        fake_recall_state = _EarlyStopState(stop_epoch=None)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                return_value=({"aborted": True}, fake_recall_state),
+            ),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            result = loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-009",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        assert result.get("mode") == "aborted"
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected an interim_tier_train telemetry record on the abort path"
+        record = interim_calls[0].kwargs["record"]
+        assert record["aborted"] is True
+        assert "hit_cap" not in record
+        assert "epochs_to_bind" not in record
+        assert "steps_to_bind" not in record
+
+    def test_interim_telemetry_epochs_unchanged_when_budget_derivation_disabled(
+        self, tmp_path: Path
+    ) -> None:
+        """budget_derivation_enabled=False (the shipped default) must record
+        `epochs` equal to the config's num_epochs -- pinning that the
+        telemetry layer introduces no behaviour change for the un-derived
+        path (only the shape of the recorded value, not what training
+        actually runs with).
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        assert loop.training_config.budget_derivation_enabled is False
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-010",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected an interim_tier_train telemetry record"
+        assert interim_calls[0].kwargs["record"]["epochs"] == loop.training_config.num_epochs
+
     def test_adapter_save_failure_means_no_registry_entry(self, tmp_path: Path) -> None:
         """If save_adapter raises, registry must not be written to disk.
 
@@ -259,7 +838,9 @@ class TestRegistryLastWriteOrder:
         """
         loop = _make_mock_loop(tmp_path)
         stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+        loop.model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(
+            loop.episodic_config
+        )
         registry_path = tmp_path / "indexed_key_registry.json"
 
         def _fail_save_adapter(*args, **kwargs):
@@ -498,6 +1079,81 @@ class TestRegistryLastWriteOrder:
 
 
 # ---------------------------------------------------------------------------
+# Test 1b — interim mint's warm-init else-branch (fold-level)
+# ---------------------------------------------------------------------------
+
+
+class TestInterimMintWarmInit:
+    """The interim mint branch's ``else: ensure_adapter_matching(...)`` guard
+    -- the second warm-init entrance, alongside the main-tier fold preamble
+    -- exercised through the real fold (``run_consolidation_cycle``), not
+    just the direct loader-level unit tests in
+    ``test_interim_adapter_lifecycle.py``.
+    """
+
+    def test_resident_matching_slot_no_recreate_training_still_runs(self, tmp_path: Path) -> None:
+        """A resident interim adapter whose config already matches is kept:
+        ``ensure_adapter_matching`` IS invoked (proving the ``else`` branch
+        fired, not merely that nothing happened), ``create_interim_adapter``
+        is never called (the absent-only branch), ``delete_adapter`` is
+        never called for it, and training still runs."""
+        from paramem.models.loader import ensure_adapter_matching
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        create_interim_spy = MagicMock()
+        train_spy = MagicMock(return_value={"aborted": False})
+        ensure_matching_spy = MagicMock(wraps=ensure_adapter_matching)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter", create_interim_spy),
+            # ensure_adapter_matching is imported LOCALLY inside _run_fold
+            # (fresh `from paramem.models.loader import ...` each call), so
+            # the source module attribute is the one to patch -- patching a
+            # paramem.training.consolidation attribute would be a no-op
+            # (that name is never bound at module scope there).
+            patch("paramem.models.loader.ensure_adapter_matching", ensure_matching_spy),
+            patch("paramem.training.trainer.train_adapter", train_spy),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(2),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-warm",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        assert any(c.args[-1] == interim_name for c in ensure_matching_spy.call_args_list), (
+            "expected ensure_adapter_matching to be called for the resident interim slot"
+        )
+
+        create_interim_spy.assert_not_called()
+        delete_calls = [
+            c for c in loop.model.delete_adapter.call_args_list if c.args == (interim_name,)
+        ]
+        assert not delete_calls, (
+            f"expected no delete_adapter({interim_name!r}) call, got {delete_calls}"
+        )
+        assert train_spy.called, "the funnel must still train the warm-kept interim slot"
+
+
+# ---------------------------------------------------------------------------
 # Test 2 — save_from_bytes guard (raises when called outside consolidation window)
 # ---------------------------------------------------------------------------
 
@@ -696,7 +1352,9 @@ class TestInterTierCommitRecoverable:
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+        loop.model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(
+            loop.episodic_config
+        )
 
         session_marked_consolidated: list[str] = []
 
@@ -747,6 +1405,212 @@ class TestInterTierCommitRecoverable:
         assert session_marked_consolidated == [], (
             "session must NOT be marked consolidated when a commit crashes mid-cycle — "
             "it must stay pending so the facts are re-extracted next cycle"
+        )
+
+
+# ---------------------------------------------------------------------------
+# RecallGateRejected must drop the rejected interim slot from VRAM, not just
+# roll back store state (owner decision 2026-07-26).
+# ---------------------------------------------------------------------------
+
+
+class TestRecallGateRejectedVramCleanup:
+    """A post-save recall-gate rejection must leave NO trace of the rejected
+    training in VRAM, matching the on-disk state ``commit_tier_slot``'s
+    ``finally`` already leaves.
+
+    Reference: ``_run_fold``'s ``except RecallGateRejected`` branch
+    (``paramem/training/consolidation.py``).  Before this fix, the branch
+    rolled back store state only and left the trained-but-rejected PEFT
+    adapter resident and active, so a same-window retry silently
+    warm-started from weights that failed the gate and existed nowhere on
+    disk.
+    """
+
+    _STAMP = "20260418T1430"
+
+    @staticmethod
+    def _fake_create_interim_adapter(model, adapter_config, stamp):
+        """Stand-in for ``create_interim_adapter``: mints the slot into the
+        mock model's ``peft_config`` (mirrors the real function's effect)
+        instead of actually building a LoRA adapter.
+        """
+        model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(adapter_config)
+        return model
+
+    def _run_cycle(self, loop, *, stamp: str):
+        return loop.run_consolidation_cycle(
+            _fake_qa(2),
+            [],
+            speaker_id="speaker0",
+            mode="train",
+            run_label="conv-rej-001",
+            schedule="every 2h",
+            max_interim_count=4,
+            stamp=stamp,
+        )
+
+    def test_rejection_deletes_vram_slot_and_restores_episodic(self, tmp_path: Path) -> None:
+        """A rejected fold must remove the interim adapter from
+        ``model.peft_config`` and leave ``episodic`` as the active adapter.
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _make_mock_loop(tmp_path)
+        interim_name = f"episodic_interim_{self._STAMP}"
+
+        create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
+
+        def _delete_adapter(name: str) -> None:
+            loop.model.peft_config.pop(name, None)
+
+        loop.model.delete_adapter.side_effect = _delete_adapter
+
+        def _commit_side_effect(*args, **kwargs):
+            raise RecallGateRejected(
+                "simulated post-save disk-integrity failure",
+                recall_rate=0.5,
+                threshold=1.0,
+            )
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                create_interim_spy,
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch(
+                "paramem.memory.persistence.commit_tier_slot",
+                side_effect=_commit_side_effect,
+            ),
+        ):
+            result = self._run_cycle(loop, stamp=self._STAMP)
+
+        assert result["mode"] == "recall_failed", f"expected recall_failed, got {result['mode']}"
+        assert interim_name not in loop.model.peft_config, (
+            "rejected interim adapter must be deleted from peft_config (VRAM), "
+            f"got peft_config keys: {list(loop.model.peft_config)}"
+        )
+        delete_calls = [
+            c for c in loop.model.delete_adapter.call_args_list if c.args == (interim_name,)
+        ]
+        assert delete_calls, f"expected delete_adapter({interim_name!r}) to be called"
+        assert loop.model.set_adapter.call_args_list[-1].args == ("episodic",), (
+            "episodic must be the active adapter after a rejection; last set_adapter "
+            f"call was {loop.model.set_adapter.call_args_list[-1]}"
+        )
+
+    def test_same_window_retry_remints_fresh_slot_after_rejection(self, tmp_path: Path) -> None:
+        """A retry within the same window (same stamp) after a rejection must
+        recreate the interim slot from scratch (the mint guard sees it absent)
+        and the retry must succeed once the gate passes.
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _make_mock_loop(tmp_path)
+        interim_name = f"episodic_interim_{self._STAMP}"
+
+        create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
+
+        def _delete_adapter(name: str) -> None:
+            loop.model.peft_config.pop(name, None)
+
+        loop.model.delete_adapter.side_effect = _delete_adapter
+
+        _commit_calls = {"n": 0}
+
+        def _commit_side_effect(*args, **kwargs):
+            _commit_calls["n"] += 1
+            if _commit_calls["n"] == 1:
+                raise RecallGateRejected(
+                    "simulated post-save disk-integrity failure",
+                    recall_rate=0.5,
+                    threshold=1.0,
+                )
+            return None
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                create_interim_spy,
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch(
+                "paramem.memory.persistence.commit_tier_slot",
+                side_effect=_commit_side_effect,
+            ),
+        ):
+            result_1 = self._run_cycle(loop, stamp=self._STAMP)
+            assert result_1["mode"] == "recall_failed"
+            assert interim_name not in loop.model.peft_config, (
+                "slot must be gone from VRAM after the first (rejected) attempt"
+            )
+
+            result_2 = self._run_cycle(loop, stamp=self._STAMP)
+
+        assert result_2["mode"] == "trained", (
+            f"retry must succeed once the gate passes; got {result_2['mode']}"
+        )
+        assert create_interim_spy.call_count == 2, (
+            "create_interim_adapter must be called again on the same-window retry "
+            f"(fresh mint) — got {create_interim_spy.call_count} call(s)"
+        )
+        assert interim_name in loop.model.peft_config, (
+            "the retry's freshly-minted slot must be resident after success"
+        )
+
+    def test_success_path_leaves_adapter_resident(self, tmp_path: Path) -> None:
+        """A clean interim fold (no rejection) must leave the adapter resident
+        in ``peft_config`` — the VRAM-cleanup handler must never fire on the
+        success path.
+        """
+        loop = _make_mock_loop(tmp_path)
+        interim_name = f"episodic_interim_{self._STAMP}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.memory.persistence.commit_tier_slot"),
+        ):
+            result = self._run_cycle(loop, stamp=self._STAMP)
+
+        assert result["mode"] == "trained", f"expected trained, got {result['mode']}"
+        assert interim_name in loop.model.peft_config, (
+            "adapter must remain resident after a clean interim fold"
+        )
+        delete_calls = [
+            c for c in loop.model.delete_adapter.call_args_list if c.args == (interim_name,)
+        ]
+        assert not delete_calls, (
+            f"delete_adapter must not be called on the success path, got {delete_calls}"
         )
 
 
@@ -977,7 +1841,9 @@ class TestRecallFailedSessionStaysPending:
         )
         loop.merger.graph = real_graph
         # Use a fresh stamp so the adapter name is predictable.
-        loop.model.peft_config["episodic_interim_20260617T0000"] = MagicMock()
+        loop.model.peft_config["episodic_interim_20260617T0000"] = _matching_interim_config(
+            loop.episodic_config
+        )
         return loop
 
     def _run_cycle(self, loop, *, stamp: str = "20260617T0000", mode: str = "train"):
@@ -1074,6 +1940,32 @@ class TestRecallFailedSessionStaysPending:
 
         assert result.get("recall_failed_session_ids", []) == [], (
             "Simulate mode must never produce recall_failed_session_ids"
+        )
+
+    def test_simulate_mode_never_invokes_donor_seeding_gate(self, tmp_path: Path) -> None:
+        """Simulate mode (disk venue) must never reach _train_tier_adapter -- the
+        SOLE gate for donor seeding -- even with donor_seeding_enabled=True.
+
+        Every production _train_tier_adapter call site sits inside its
+        enclosing `if scope.source == "weights":` branch
+        (paramem.training.consolidation); this proves _run_fold really never
+        crosses into it under mode="simulate", so "simulate venue never
+        seeds" holds structurally rather than by an extra runtime check
+        inside the funnel itself.
+        """
+        from dataclasses import replace as _replace
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        session_id = "real-session-sim-donor"
+        loop = self._make_loop_with_session_edge(tmp_path, session_id=session_id)
+        loop.training_config = _replace(loop.training_config, donor_seeding_enabled=True)
+
+        with patch.object(ConsolidationLoop, "_train_tier_adapter") as spy:
+            self._run_cycle(loop, mode="simulate")
+
+        assert not spy.called, (
+            "_train_tier_adapter (the donor-seeding gate) must never be called in simulate mode"
         )
 
     def test_off_refinement_episodic_arm_conditional(self, tmp_path: Path) -> None:
@@ -1287,7 +2179,9 @@ class TestRecallFailedSessionStaysPending:
             sessions=["session-fail"],
         )
         loop.merger.graph = real_graph
-        loop.model.peft_config["episodic_interim_20260617T0000"] = MagicMock()
+        loop.model.peft_config["episodic_interim_20260617T0000"] = _matching_interim_config(
+            loop.episodic_config
+        )
 
         _minted_keys: list[str] = []
 
@@ -1359,7 +2253,9 @@ class TestRecallFailedSessionStaysPending:
         key fails and the session id lands in recall_failed_session_ids.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
-        loop.model.peft_config["episodic_interim_20260617T0000"] = MagicMock()
+        loop.model.peft_config["episodic_interim_20260617T0000"] = _matching_interim_config(
+            loop.episodic_config
+        )
 
         proc_sid = "session-proc-fail"
         # Inject the procedural fact into merger.graph with the session_id on

@@ -522,11 +522,13 @@ def _migrate_tier_simulate_to_train(
     3. Reset the adapter to LoRA-zero
        (``delete_adapter`` + ``create_adapter`` from the resolved config),
        then ``switch_adapter`` so training writes into this adapter.
-    4. ``format_entry_training`` + ``_indexed_dataset`` to build the
-       HF dataset; gradient checkpointing toggled around the format call
-       to mirror the run_consolidation_cycle pattern.
-    5. ``train_adapter`` with the resolved adapter config and the loop's
-       configured num_epochs.
+    4-5. ``loop._train_tier_adapter(entries, ...)`` — the SAME shared
+       training funnel every production training path uses
+       (``paramem.training.consolidation.ConsolidationLoop._train_tier_adapter``):
+       formats entries, builds the HF dataset, derives the per-fold training
+       budget from ``len(entries)``, wires the recall-early-stop callback,
+       and calls ``train_adapter``. Budget and callback wiring are inherited
+       here rather than duplicated.
     6. Recall probe via ``loop._run_recall_sanity_probe(name, entries)``
        at ``loop.config.recall_sanity_threshold`` (the unified recall gate knob).
     7. On pass: ``atomic_save_adapter`` writes the slot under the resolved
@@ -539,9 +541,6 @@ def _migrate_tier_simulate_to_train(
     from paramem.memory.entry import (
         build_registry as _build_reg,
     )
-    from paramem.memory.entry import (
-        format_entry_training as _format_training,
-    )
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
     from paramem.memory.persistence import iter_entries, load_memory_from_disk
     from paramem.models.loader import (
@@ -549,7 +548,6 @@ def _migrate_tier_simulate_to_train(
         create_adapter,
         switch_adapter,
     )
-    from paramem.training.trainer import train_adapter as _train_adapter
 
     # Source graph is at the unified layout location resolved by name.
     slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
@@ -585,40 +583,25 @@ def _migrate_tier_simulate_to_train(
     loop.model = create_adapter(loop.model, tier_config, name)
     switch_adapter(loop.model, name)
 
-    # Step 4: build training dataset. Disable gradient checkpointing for the
-    # tokenizer call (matches run_consolidation_cycle pattern); re-enable before training.
-    loop._disable_gradient_checkpointing()
-    examples = _format_training(entries, loop.tokenizer, max_length=1024)
-    if not examples:
-        raise _TierSkipped(f"_format_training produced no examples for store {name}")
-    dataset = loop._indexed_dataset(examples)
-    loop._enable_gradient_checkpointing()
-    training_config = loop.training_config
-
-    # Step 5: train. Output dir under a migration-scoped subdir so checkpoint
-    # debris doesn't pollute the main slot layout.
-    recall_cb, recall_state = loop._maybe_make_recall_callback(
-        entries=entries,
+    # Steps 4-5: format + dataset + budget derivation + recall callback +
+    # train_adapter, all via the single shared funnel. Output dir under a
+    # migration-scoped subdir so checkpoint debris doesn't pollute the main
+    # slot layout.
+    _migrate_output_dir = Path(config.adapter_dir) / "active_store_migration" / name
+    # recall_state is intentionally unused here — the migration path uses its
+    # own _run_recall_sanity_probe gate below; no recall-gated registration
+    # needed.
+    _migrate_metrics, _recall_state = loop._train_tier_adapter(
+        entries,
         adapter_name=name,
-        output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
+        adapter_config=tier_config,
+        training_config=loop.training_config,
+        output_dir=_migrate_output_dir,
+        run_name=f"migrate-simulate-to-train-{name}",
         phase_name=f"migrate-{name}",
     )
-    # recall_state is intentionally unused here — the migration path uses its
-    # own _run_recall_sanity_probe gate; no recall-gated registration needed.
-    _migrate_metrics = _train_adapter(
-        model=loop.model,
-        tokenizer=loop.tokenizer,
-        train_dataset=dataset,
-        adapter_name=name,
-        training_config=training_config,
-        adapter_config=tier_config,
-        wandb_config=loop.wandb_config,
-        output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
-        run_name=f"migrate-simulate-to-train-{name}",
-        thermal_policy=loop._thermal_policy,
-        hooks=loop._build_training_hooks(),
-        callbacks_extra=[recall_cb] if recall_cb is not None else None,
-    )
+    if _migrate_metrics is None:
+        raise _TierSkipped(f"_train_tier_adapter produced no examples for store {name}")
     if _migrate_metrics.get("aborted"):
         raise _TierSkipped(f"aborted mid-migration for {name}")
 

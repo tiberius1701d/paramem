@@ -289,6 +289,13 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "copy_adapter_weights",
         ),
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "create_adapter"),
+        # lora_b_frobenius_norm: shared with the consolidation fold-telemetry
+        # measurement (added 2026-07-26) -- one implementation, not a copy.
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.models.loader",
+            "lora_b_frobenius_norm",
+        ),
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "switch_adapter"),
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "unload_model"),
         (

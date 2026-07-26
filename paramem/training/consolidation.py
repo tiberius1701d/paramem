@@ -9,10 +9,10 @@ import hashlib
 import logging
 import random
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -33,9 +33,10 @@ from paramem.memory.entry import (
     entry_simhash,
     format_entry_training,
 )
-from paramem.models.loader import atomic_save_adapter, switch_adapter
+from paramem.models.loader import atomic_save_adapter, measured_adapter_init_state, switch_adapter
 from paramem.server.fold_telemetry import record_fold_telemetry
 from paramem.training import graph_tier
+from paramem.training.donor import DONOR_BUILD_ADAPTER_NAME, DONOR_KEY_FLOOR
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks
@@ -57,9 +58,13 @@ from paramem.utils.config import (
     GraphConfig,
     TrainingConfig,
     WandbConfig,
+    budget_for,
 )
 from paramem.utils.identity import canonical
 from paramem.utils.vram_guard import safe_empty_cache
+
+if TYPE_CHECKING:
+    from paramem.training.early_stop import _EarlyStopState
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +240,82 @@ def _rec_from_persisted(pe: "dict") -> "dict":
     }
 
 
+def _recall_bind_telemetry(
+    recall_state: "_EarlyStopState | None", n_keys: int, accum: int
+) -> "tuple[int | None, int | None, bool | None]":
+    """Derive ``(epochs_to_bind, steps_to_bind, hit_cap)`` for fold telemetry.
+
+    ``epochs_to_bind`` is the epoch at which the recall early-stop signal
+    fired — ``recall_state.stop_epoch``, set at the SAME epoch as
+    ``stable_perfect_epoch`` for the window-based stop path (the only path
+    the production policy uses; see
+    ``paramem.training.early_stop.RecallEarlyStopCallback.on_epoch_end``,
+    the block setting ``state.stable_perfect_epoch`` immediately precedes
+    the block setting ``state.stop_epoch`` in the same call). ``steps_to_bind``
+    converts that epoch count to optimizer steps at the project's fixed
+    ``batch=1``: ``ceil(n_keys / accum) * epochs_to_bind``. ``hit_cap`` is
+    True when training ran to the full derived epoch budget WITHOUT the
+    early-stop signal ever firing (``stop_epoch is None``) — i.e. the
+    recall gate never bound within the budget.
+
+    **Left-censored by the probe schedule — the field's consumer (the
+    budget-bucket re-fit) MUST account for this.** The probe cadence is
+    ``probe_from_epoch=signal_from_epoch=recall_signal_from_epoch`` (default
+    20, ``paramem.server.config.py:1110``) every
+    ``recall_probe_every_n_epochs`` epochs, and the window-based stop needs
+    ``recall_window`` consecutive perfect probes
+    (``paramem.training.early_stop.RecallEarlyStopCallback.on_epoch_end``).
+    The earliest attainable ``stop_epoch`` is therefore
+    ``floor + probe_every_n_epochs * (window - 1)``, NOT epoch 1 — under the
+    shipped config (``configs/server.yaml``: floor=20, every_n_epochs=3,
+    window=2) that floor is epoch 23. A fold whose weights would have bound
+    at, say, epoch 4 still records ``epochs_to_bind=23`` because no probe
+    ran before then; ``steps_to_bind`` inherits the same left-censoring
+    linearly. Treat recorded values near this floor as "at least this fast",
+    not as the true convergence point.
+
+    **Does not see abort state.** This function has no visibility into the
+    trainer's own abort signal (``_tier_metrics``/``epi_metrics``'s
+    ``"aborted"`` key) — a thermal-throttle or operator-pause abort also
+    leaves ``stop_epoch=None`` and is indistinguishable from a genuine
+    "ran to the full budget without binding" from this function's inputs
+    alone. Callers MUST additionally check the trainer's abort flag and
+    suppress the ``hit_cap`` field on the abort path — see the two call
+    sites in ``ConsolidationLoop._run_fold``, which add an ``aborted``
+    field to the record for exactly this reason.
+
+    **Crash-resume warm-start vs. measured init="cold".** On an interim
+    crash-resume, a missing interim slot is recreated LoRA-zero
+    (``consolidation.py:3142``) even though the resumed training call then
+    reloads the checkpoint's actual (possibly far-from-zero) weights via HF
+    Trainer's ``resume_from_checkpoint`` — so the ``init`` field measured at
+    fold entry (before that reload) can read ``"cold"`` on a path whose
+    ACTUAL training start is warm. This function doesn't touch ``init``, but
+    the caveat lives here because both fields are read together at the same
+    call sites during the bucket re-fit.
+
+    Args:
+        recall_state: The ``_EarlyStopState`` returned by
+            ``ConsolidationLoop._train_tier_adapter``, or ``None`` when
+            early stopping is disabled or the entries list was empty.
+        n_keys: Number of keyed entries trained (``len(entries)``).
+        accum: Derived gradient-accumulation steps for this fold
+            (``paramem.utils.config.budget_for``'s second return value).
+
+    Returns:
+        ``(epochs_to_bind, steps_to_bind, hit_cap)``, each ``None`` when
+        ``recall_state`` is ``None`` — these fields are only meaningful on
+        the training success path; the ring omits absent fields.
+    """
+    if recall_state is None:
+        return None, None, None
+    stop_epoch = recall_state.stop_epoch
+    if stop_epoch is None:
+        return None, None, True
+    steps_per_epoch = -(-n_keys // accum)  # ceil division at batch=1
+    return stop_epoch, steps_per_epoch * stop_epoch, False
+
+
 class TrialActiveError(RuntimeError):
     """Raised by ConsolidationLoop.guard_trial_state when a migration TRIAL is active.
 
@@ -383,6 +464,30 @@ class FoldScope:
 
     # --- key source (main_tiers scope) ---
     keys_from: "Literal['all_tiers', 'main_tiers']" = "all_tiers"
+
+    @property
+    def cold_init(self) -> bool:
+        """Whether the main-tier fold preamble must delete and recreate each tier.
+
+        Derived, not a field: ``persist == "main_tiers" and keys_from ==
+        "main_tiers"`` is the structural identity of RECONCILE
+        (``/reconsolidate``) — the one door that narrows a
+        main-tier fold to the main tiers' own keys, bound at the single
+        arbitrator site (``paramem.server.app._dispatch_consolidation``,
+        where ``_keys_from = "main_tiers" if action is
+        ConsolidationAction.RECONCILE else "all_tiers"``). Every other
+        caller — the scheduled FULL fold and every interim cycle — leaves
+        ``keys_from`` at its ``"all_tiers"`` default (or the field does not
+        apply to the ``interim_slot`` persist venue at all), so
+        ``cold_init`` is ``False`` there: the main-tier preamble keeps a
+        resident, config-matching tier's weights (warm init, the default),
+        and :func:`~paramem.models.loader.ensure_adapter_matching` recreates
+        cold only on a genuine config mismatch or a first-boot absence —
+        never as a blanket policy. When ``True``, the preamble reproduces
+        today's unconditional delete+recreate exactly (RECONCILE's cold
+        rebuild semantics; no new behaviour is invented).
+        """
+        return self.persist == "main_tiers" and self.keys_from == "main_tiers"
 
 
 class ConsolidationLoop:
@@ -597,14 +702,29 @@ class ConsolidationLoop:
         # their own and pass it in.  The store is the single source of
         # truth for {entry, simhash, registry} of every indexed key.
         self.store = memory_store
-        self._indexed_next_index: int = 1
-        self._procedural_next_index: int = 1
-        # Derive next-index counters from all active keys in the store.
+        # Real (non-donor) minting floor: paramem.training.donor reserves
+        # graph1-graph{DONOR_KEY_BAND_WIDTH} and proc1-proc{DONOR_KEY_BAND_WIDTH}
+        # for the donor's synthetic training population, so counters seed at
+        # DONOR_KEY_FLOOR (= width + 1) rather than 1, and the max() below
+        # (against the store's own high-water key) can only raise it further —
+        # never below the floor.
+        self._indexed_next_index: int = DONOR_KEY_FLOOR
+        self._procedural_next_index: int = DONOR_KEY_FLOOR
+        # Derive next-index counters from every KNOWN key in the store — active
+        # AND stale (paramem.training.donor's DONOR_KEY_FLOOR is a starting
+        # value, not a replacement for this scan). Root fix: scanning
+        # all_active_keys() alone excludes the stale partition, so a
+        # soft-staled highest key plus a restart would re-mint its id and
+        # set_simhash would then route the new fingerprint into the stale
+        # record (paramem.training.key_registry — the stale slot has no live
+        # simhash reader, so the collision surfaces as a silent recall miss on
+        # the NEW key, not an error). all_known_keys() is active ∪ stale, so a
+        # stale highest key still bumps the floor and the id is never reissued.
         # The caller is responsible for having hydrated registries before
         # this point (via ``MemoryStore.load_registries_from_disk`` or by
         # injecting the lifespan-loaded store).
         if self.store.replay_enabled:
-            for key in self.store.all_active_keys():
+            for key in self.store.all_known_keys():
                 if key.startswith("graph"):
                     try:
                         idx = int(key.removeprefix("graph"))
@@ -3094,10 +3214,23 @@ class ConsolidationLoop:
                 # --- Mint PEFT slot (weights source only) ---
                 if scope.source == "weights":
                     from paramem.memory.interim_adapter import create_interim_adapter
+                    from paramem.models.loader import ensure_adapter_matching
 
                     if adapter_name not in self.model.peft_config:
                         self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
                         logger.info("_run_fold[interim]: created interim adapter %s", adapter_name)
+                    else:
+                        # Resident slot (re-fold within the cadence window):
+                        # keep its weights (warm) unless the config no longer
+                        # matches, in which case recreate cold (the same
+                        # config-mismatch guard shared with the main-tier
+                        # preamble below).  A retry after a recall-gate
+                        # rejection never reaches this branch — the rejection
+                        # handler below deletes the slot, so the `if` above
+                        # re-mints it fresh/cold.
+                        self.model = ensure_adapter_matching(
+                            self.model, self.episodic_config, adapter_name
+                        )
 
                 if _resume_b:
                     # -------------------------------------------------------------
@@ -3318,9 +3451,26 @@ class ConsolidationLoop:
 
                     _telemetry_int_free_before: int | None = None
                     _telemetry_int_total: int | None = None
+                    _telemetry_int_n_keys = len(all_interim_keyed)
+                    # Derived here (not read off self.training_config.num_epochs)
+                    # so the finally-path telemetry below records the TRUE budget
+                    # even when training raises. _train_tier_adapter derives the
+                    # identical value from the same (n_keys, training_config)
+                    # inputs -- budget_for is pure, so the two calls agree.
+                    _telemetry_int_epochs, _telemetry_int_accum, _ = budget_for(
+                        _telemetry_int_n_keys, self.training_config
+                    )
+                    # Measured BEFORE training starts -- same enclosing-scope
+                    # hoist as the budget derivation above, so the finally-path
+                    # record below carries the true pre-training weight state
+                    # even when training raises.
+                    _telemetry_int_init = measured_adapter_init_state(self.model, adapter_name)
+                    _telemetry_int_stale = len(self.store.stale_keys_in_tier(adapter_name))
                     if torch.cuda.is_available():
                         torch.cuda.reset_peak_memory_stats()
                         _telemetry_int_free_before, _telemetry_int_total = torch.cuda.mem_get_info()
+                    recall_state = None
+                    epi_metrics = None
                     try:
                         epi_metrics, recall_state = self._train_tier_adapter(
                             all_interim_keyed,
@@ -3332,62 +3482,131 @@ class ConsolidationLoop:
                             phase_name=f"interim-{adapter_name}-{run_label}",
                         )
                     finally:
-                        if torch.cuda.is_available() and _telemetry_int_free_before is not None:
-                            _telemetry_int_peak = torch.cuda.max_memory_allocated()
-                            # peak_reserved is the OOM-relevant quantity: the
-                            # caching allocator raises when it cannot reserve,
-                            # not when driver-free (mem_get_info) drops —
-                            # driver-free counts cached-but-unused allocator
-                            # segments as used, which peak_reserved does not.
-                            _telemetry_int_peak_reserved = torch.cuda.max_memory_reserved()
-                            _telemetry_int_free_after = torch.cuda.mem_get_info()[0]
-                            logger.info(
-                                "_run_fold[interim]: telemetry interim-train[%s] "
-                                "(device-saturation indicator, not adapter cost) — "
-                                "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
-                                adapter_name,
-                                _telemetry_int_free_before,
-                                _telemetry_int_free_after,
-                                _telemetry_int_peak,
-                                _telemetry_int_peak_reserved,
+                        # The ENTIRE record build (not just the write below) is
+                        # inside this try/except: constructing the dict reads
+                        # self.model.peft_config and calls _recall_bind_telemetry,
+                        # either of which could raise on a sufficiently broken
+                        # state, and a raise here in a bare finally (unguarded)
+                        # would REPLACE an in-flight exception from the try above
+                        # (e.g. AbortedDuringConsolidation) with whatever this
+                        # construction raised -- silently misrouting an abort to
+                        # the crash-incident path. Losing a telemetry record is
+                        # strictly preferable to that.
+                        try:
+                            # aborted is a NORMAL RETURN VALUE from
+                            # _train_tier_adapter (the trainer's own
+                            # thermal-throttle/operator-pause signal), not a
+                            # raised exception -- epi_metrics is bound whenever
+                            # training returns at all (aborted or not) and stays
+                            # at its pre-declared None only when the call above
+                            # actually raised.
+                            _int_aborted = bool(
+                                epi_metrics.get("aborted") if epi_metrics is not None else False
                             )
+                            # Budget/bind/init/stale fields do not depend on CUDA
+                            # introspection -- the record is always written; only
+                            # the VRAM fields below are conditional on it.
+                            _telemetry_int_record: dict = {
+                                "tier": adapter_name,
+                                "fold_stamp": _fold_stamp_b,
+                                "adapter_count": len(self.model.peft_config),
+                                "interim_count": len(
+                                    [
+                                        a
+                                        for a in self.model.peft_config
+                                        if a.startswith(INTERIM_NAME_PREFIX)
+                                    ]
+                                ),
+                                "epochs": _telemetry_int_epochs,
+                                "n_keys": _telemetry_int_n_keys,
+                                "accum": _telemetry_int_accum,
+                                # Always 0 at the interim site by construction:
+                                # a fresh/resumed interim slot's registry only
+                                # gains stale entries in the commit window AFTER
+                                # this measurement, never before it. The signal
+                                # this field carries lives at the main-tier site
+                                # (measured after prior cycles' commit windows);
+                                # kept here too for one schema across both kinds.
+                                "stale_keys": _telemetry_int_stale,
+                                "aborted": _int_aborted,
+                            }
+                            if _telemetry_int_init is not None:
+                                _telemetry_int_record["init"] = _telemetry_int_init
+                            # _train_tier_adapter tags its returned metrics dict
+                            # when donor seeding actually copied weights this
+                            # fold -- override the PRE-training "cold" measurement
+                            # above with "donor" rather than re-measuring (one
+                            # measurement, per the funnel's own docstring). Only
+                            # reachable when epi_metrics is bound (the success/
+                            # abort return path); the exception path leaves the
+                            # measured value untouched, as intended.
+                            if epi_metrics is not None and epi_metrics.get("donor_seeded"):
+                                _telemetry_int_record["init"] = "donor"
+                            _int_epochs_to_bind, _int_steps_to_bind, _int_hit_cap = (
+                                _recall_bind_telemetry(
+                                    recall_state, _telemetry_int_n_keys, _telemetry_int_accum
+                                )
+                            )
+                            if _int_epochs_to_bind is not None:
+                                _telemetry_int_record["epochs_to_bind"] = _int_epochs_to_bind
+                                _telemetry_int_record["steps_to_bind"] = _int_steps_to_bind
+                            # hit_cap is suppressed on the abort path: stop_epoch
+                            # is None whenever the trainer never reached (or
+                            # never signalled) recall convergence, and an abort
+                            # is exactly such a case -- emitting hit_cap=True
+                            # there would be indistinguishable from a genuine
+                            # "budget too small" outcome in the bucket re-fit.
+                            if not _int_aborted and _int_hit_cap is not None:
+                                _telemetry_int_record["hit_cap"] = _int_hit_cap
+                            if torch.cuda.is_available() and _telemetry_int_free_before is not None:
+                                _telemetry_int_peak = torch.cuda.max_memory_allocated()
+                                # peak_reserved is the OOM-relevant quantity: the
+                                # caching allocator raises when it cannot reserve,
+                                # not when driver-free (mem_get_info) drops —
+                                # driver-free counts cached-but-unused allocator
+                                # segments as used, which peak_reserved does not.
+                                _telemetry_int_peak_reserved = torch.cuda.max_memory_reserved()
+                                _telemetry_int_free_after = torch.cuda.mem_get_info()[0]
+                                logger.info(
+                                    "_run_fold[interim]: telemetry interim-train[%s] "
+                                    "(device-saturation indicator, not adapter cost) — "
+                                    "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
+                                    adapter_name,
+                                    _telemetry_int_free_before,
+                                    _telemetry_int_free_after,
+                                    _telemetry_int_peak,
+                                    _telemetry_int_peak_reserved,
+                                )
+                                _telemetry_int_record.update(
+                                    {
+                                        "free_before": _telemetry_int_free_before,
+                                        "free_after": _telemetry_int_free_after,
+                                        "peak_alloc": _telemetry_int_peak,
+                                        "peak_reserved": _telemetry_int_peak_reserved,
+                                        "total": _telemetry_int_total,
+                                    }
+                                )
                             if self._telemetry_dir is not None:
-                                try:
-                                    record_fold_telemetry(
-                                        self._telemetry_dir,
-                                        cycle_stamp=_telemetry_run_stamp_b,
-                                        kind="interim_tier_train",
-                                        record={
-                                            "tier": adapter_name,
-                                            "fold_stamp": _fold_stamp_b,
-                                            "free_before": _telemetry_int_free_before,
-                                            "free_after": _telemetry_int_free_after,
-                                            "peak_alloc": _telemetry_int_peak,
-                                            "peak_reserved": _telemetry_int_peak_reserved,
-                                            "total": _telemetry_int_total,
-                                            "adapter_count": len(self.model.peft_config),
-                                            "interim_count": len(
-                                                [
-                                                    a
-                                                    for a in self.model.peft_config
-                                                    if a.startswith(INTERIM_NAME_PREFIX)
-                                                ]
-                                            ),
-                                            "epochs": self.training_config.num_epochs,
-                                        },
-                                    )
-                                except Exception:  # noqa: BLE001  # boundary: telemetry
-                                    # runs in a finally on the exception path too — a
-                                    # write failure (disk full, permissions, corrupt
-                                    # store) must never replace the in-flight
-                                    # exception (e.g. AbortedDuringConsolidation would
-                                    # get swapped for an OSError and misrouted). Losing
-                                    # a telemetry record is strictly preferable.
-                                    logger.warning(
-                                        "_run_fold[interim]: telemetry write failed for %s",
-                                        adapter_name,
-                                        exc_info=True,
-                                    )
+                                record_fold_telemetry(
+                                    self._telemetry_dir,
+                                    cycle_stamp=_telemetry_run_stamp_b,
+                                    kind="interim_tier_train",
+                                    record=_telemetry_int_record,
+                                )
+                        except Exception:  # noqa: BLE001  # boundary: telemetry
+                            # runs in a finally on the exception path too — a
+                            # failure anywhere in record construction OR the
+                            # write (disk full, permissions, corrupt store, a
+                            # broken model/store attribute) must never replace
+                            # the in-flight exception (e.g. AbortedDuringConsolidation
+                            # would get swapped for the construction/write error
+                            # and misrouted). Losing a telemetry record is
+                            # strictly preferable.
+                            logger.warning(
+                                "_run_fold[interim]: telemetry write failed for %s",
+                                adapter_name,
+                                exc_info=True,
+                            )
                     epi_train_loss = (
                         epi_metrics.get("train_loss") if epi_metrics is not None else None
                     )
@@ -3492,6 +3711,40 @@ class ConsolidationLoop:
                         for _stale_key in _stale_keys:
                             self.store.reactivate(_stale_tier, _stale_key)
                     self.store.drop_tier(adapter_name)
+                    # Drop the rejected slot from VRAM too — commit_tier_slot's
+                    # finally only removes the disk artifact, and
+                    # _verify_saved_adapter_from_disk restores adapter_name as
+                    # the active adapter before raising, so without this the
+                    # trained-but-rejected weights stay resident and a
+                    # same-window retry would silently warm-start from a state
+                    # that exists nowhere on disk.  Rejection now leaves
+                    # neither a disk slot nor a VRAM slot — deterministic cold
+                    # re-entry, matching disk truth and surviving restarts
+                    # identically.  The mint guard above (``if adapter_name
+                    # not in self.model.peft_config``) recreates the slot
+                    # fresh on the next fold attempt, so re-entry's init state
+                    # is whatever the standard mechanism provides (cold today,
+                    # donor-seeded when that mechanism is enabled) rather than
+                    # the rejected checkpoint.  Switch off the slot before
+                    # deleting it — PEFT's delete_adapter silently reassigns
+                    # the active adapter to whichever resident adapter it
+                    # encounters first when the deleted one was active, which
+                    # would leave the post-rejection active adapter
+                    # non-deterministic; switching to episodic first (the same
+                    # pattern already used by _verify_saved_adapter_from_disk's
+                    # own verify-slot teardown) keeps it deterministic.  The
+                    # "Restore episodic as active adapter" step below is
+                    # idempotent on an already-active episodic and never
+                    # touches a slot this block already removed.
+                    if adapter_name in self.model.peft_config:
+                        if "episodic" in self.model.peft_config:
+                            switch_adapter(self.model, "episodic")
+                        self.model.delete_adapter(adapter_name)
+                        logger.info(
+                            "_run_fold[interim]: deleted rejected interim adapter"
+                            " %s from VRAM — retry starts cold",
+                            adapter_name,
+                        )
                     _recall_gate_rejected = True
                     _recall_failed_session_ids.update(_pending_session_ids_b)
                     logger.warning(
@@ -3597,7 +3850,11 @@ class ConsolidationLoop:
             INTERIM_NAME_PREFIX,
             unload_interim_adapters,
         )
-        from paramem.models.loader import create_adapter, main_tier_backup_scope
+        from paramem.models.loader import (
+            create_adapter,
+            ensure_adapter_matching,
+            main_tier_backup_scope,
+        )
 
         # --- Fold-stamp + crash-resume marker (full fold) ---
         # Mint fold_stamp BEFORE any store mutation (promote/tier-floor/
@@ -4104,12 +4361,29 @@ class ConsolidationLoop:
                     ),
                 }
 
-                # --- Per-tier fresh-adapter rebuild ---
+                # --- Per-tier warm-default / RECONCILE-cold rebuild ---
                 tier_config_for_backup = {
                     "episodic": self.episodic_config,
                     "semantic": self.semantic_config,
                     "procedural": self.procedural_config or self.episodic_config,
                 }
+
+                # --- Pre-backup config reconciliation (resident tiers only) ---
+                # main_tier_backup_scope (entered below) snapshots each resident
+                # tier via copy_adapter_weights(src=tier, dst=backup), which checks
+                # PARAMETER KEY SETS, not tensor shapes (loader.py's
+                # copy_adapter_weights) -- a rank change keeps the same key names
+                # but different tensor shapes, so it passes that check and then
+                # raises a shape-mismatch RuntimeError inside the per-tensor
+                # ``.data.copy_()``, before the per-tier loop's own cold_init /
+                # ensure_adapter_matching branch is ever reached. Reconciling here,
+                # ahead of the backup scope, means a resident tier is already
+                # config-matching by the time it is snapshotted -- restricted to
+                # RESIDENT tiers (``if _t in self.model.peft_config``) so a
+                # disabled/not-yet-created tier is not born early.
+                for _t, _cfg in tier_config_for_backup.items():
+                    if _t in self.model.peft_config:
+                        self.model = ensure_adapter_matching(self.model, _cfg, _t)
 
                 # --- Backup-creation window telemetry (adapter-attributable) ---
                 # The only measurement in this module that is attributable to
@@ -4287,15 +4561,6 @@ class ConsolidationLoop:
                             tiers_rebuilt.append(tier)
                             continue
 
-                        if backup_name in self.model.peft_config:
-                            from paramem.models.loader import switch_adapter as _sw_backup
-
-                            _sw_backup(self.model, backup_name)
-
-                        if tier in self.model.peft_config:
-                            self.model.delete_adapter(tier)
-                            logger.debug("_run_fold[main_tiers]: deleted adapter %s", tier)
-
                         tier_cfg = (
                             self.episodic_config
                             if tier == "episodic"
@@ -4305,8 +4570,35 @@ class ConsolidationLoop:
                                 else (self.procedural_config or self.episodic_config)
                             )
                         )
-                        self.model = create_adapter(self.model, tier_cfg, tier)
-                        logger.debug("_run_fold[main_tiers]: created fresh adapter %s", tier)
+
+                        if backup_name in self.model.peft_config:
+                            from paramem.models.loader import switch_adapter as _sw_backup
+
+                            _sw_backup(self.model, backup_name)
+
+                        if scope.cold_init:
+                            # RECONCILE only (FoldScope.cold_init) — reproduce
+                            # today's unconditional cold rebuild exactly.
+                            if tier in self.model.peft_config:
+                                self.model.delete_adapter(tier)
+                                logger.debug(
+                                    "_run_fold[main_tiers]: deleted adapter %s"
+                                    " (cold_init: RECONCILE)",
+                                    tier,
+                                )
+                            self.model = create_adapter(self.model, tier_cfg, tier)
+                            logger.debug(
+                                "_run_fold[main_tiers]: created fresh adapter %s"
+                                " (cold_init: RECONCILE)",
+                                tier,
+                            )
+                        else:
+                            # Warm default: keep the resident tier's weights —
+                            # the funnel's staging copy (trainer.py:944-948)
+                            # warm-starts training from them. Recreates cold
+                            # only on first-boot absence or a genuine LoRA
+                            # config mismatch (never as blanket policy).
+                            self.model = ensure_adapter_matching(self.model, tier_cfg, tier)
 
                         from paramem.models.loader import switch_adapter as _sw
 
@@ -4391,6 +4683,7 @@ class ConsolidationLoop:
 
                         prior_job = None
                         recall_state = None
+                        _tier_metrics = None
                         if trainer is not None:
                             prior_job = trainer._current_job
                             trainer._current_job = job
@@ -4407,6 +4700,21 @@ class ConsolidationLoop:
                         # _tier_metrics.get("aborted"), a normal return value).
                         _telemetry_tier_free_before: int | None = None
                         _telemetry_tier_total: int | None = None
+                        _telemetry_tier_n_keys = len(job.entries)
+                        # Derived here (not read off refresh_training_config.num_epochs)
+                        # so the finally-path telemetry below records the TRUE
+                        # budget even when training raises. _train_tier_adapter
+                        # derives the identical value from the same
+                        # (n_keys, training_config) inputs -- budget_for is pure.
+                        _telemetry_tier_epochs, _telemetry_tier_accum, _ = budget_for(
+                            _telemetry_tier_n_keys, refresh_training_config
+                        )
+                        # Measured BEFORE training starts -- same enclosing-scope
+                        # hoist as the budget derivation above, so the
+                        # finally-path record below carries the true
+                        # pre-training weight state even when training raises.
+                        _telemetry_tier_init = measured_adapter_init_state(self.model, tier)
+                        _telemetry_tier_stale = len(self.store.stale_keys_in_tier(tier))
                         if torch.cuda.is_available():
                             torch.cuda.reset_peak_memory_stats()
                             _telemetry_tier_free_before, _telemetry_tier_total = (
@@ -4443,69 +4751,136 @@ class ConsolidationLoop:
                             if trainer is not None:
                                 trainer._set_is_training(False)
                                 trainer._current_job = prior_job
-                            if (
-                                torch.cuda.is_available()
-                                and _telemetry_tier_free_before is not None
-                            ):
-                                _telemetry_tier_peak = torch.cuda.max_memory_allocated()
-                                # peak_reserved is the OOM-relevant quantity: the
-                                # caching allocator raises when it cannot reserve,
-                                # not when driver-free (mem_get_info) drops —
-                                # driver-free counts cached-but-unused allocator
-                                # segments as used, which peak_reserved does not.
-                                _telemetry_tier_peak_reserved = torch.cuda.max_memory_reserved()
-                                _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
-                                logger.info(
-                                    "_run_fold[main_tiers]: telemetry tier_train[%s] "
-                                    "(device-saturation indicator, not adapter cost) — "
-                                    "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
-                                    tier,
-                                    _telemetry_tier_free_before,
-                                    _telemetry_tier_free_after,
-                                    _telemetry_tier_peak,
-                                    _telemetry_tier_peak_reserved,
+                            # The ENTIRE record build (not just the write below)
+                            # is inside this try/except: constructing the dict
+                            # reads self.model.peft_config and calls
+                            # _recall_bind_telemetry, either of which could raise
+                            # on a sufficiently broken state, and a raise here in
+                            # a bare finally (unguarded) would REPLACE an
+                            # in-flight exception from the try above (e.g.
+                            # AbortedDuringConsolidation) with whatever this
+                            # construction raised -- silently misrouting an abort
+                            # to the crash-incident path via main_tier_backup_scope's
+                            # except. Losing a telemetry record is strictly
+                            # preferable to that.
+                            try:
+                                # aborted is a NORMAL RETURN VALUE from
+                                # _train_tier_adapter (the trainer's own
+                                # thermal-throttle/operator-pause signal) that
+                                # this branch converts to a raised
+                                # AbortedDuringConsolidation AFTER the
+                                # assignment above succeeds -- so _tier_metrics
+                                # is bound (with aborted=True) on that path, and
+                                # stays at its pre-declared None only when
+                                # _train_tier_adapter itself raised before
+                                # returning.
+                                _tier_aborted = bool(
+                                    _tier_metrics.get("aborted")
+                                    if _tier_metrics is not None
+                                    else False
                                 )
+                                # Budget/bind/init/stale fields do not depend on
+                                # CUDA introspection -- the record is always
+                                # written; only the VRAM fields below are
+                                # conditional on it.
+                                _telemetry_tier_record: dict = {
+                                    "tier": tier,
+                                    "fold_stamp": _fold_stamp_c,
+                                    "adapter_count": len(self.model.peft_config),
+                                    "interim_count": len(
+                                        [
+                                            a
+                                            for a in self.model.peft_config
+                                            if a.startswith(INTERIM_NAME_PREFIX)
+                                        ]
+                                    ),
+                                    "epochs": _telemetry_tier_epochs,
+                                    "n_keys": _telemetry_tier_n_keys,
+                                    "accum": _telemetry_tier_accum,
+                                    "stale_keys": _telemetry_tier_stale,
+                                    "aborted": _tier_aborted,
+                                }
+                                if _telemetry_tier_init is not None:
+                                    _telemetry_tier_record["init"] = _telemetry_tier_init
+                                # See the interim call site's identical comment:
+                                # _train_tier_adapter tags its returned metrics
+                                # dict on an actual donor-seeded copy; the
+                                # exception path (where _tier_metrics stays None)
+                                # leaves the pre-training measured value alone.
+                                if _tier_metrics is not None and _tier_metrics.get("donor_seeded"):
+                                    _telemetry_tier_record["init"] = "donor"
+                                _tier_epochs_to_bind, _tier_steps_to_bind, _tier_hit_cap = (
+                                    _recall_bind_telemetry(
+                                        recall_state, _telemetry_tier_n_keys, _telemetry_tier_accum
+                                    )
+                                )
+                                if _tier_epochs_to_bind is not None:
+                                    _telemetry_tier_record["epochs_to_bind"] = _tier_epochs_to_bind
+                                    _telemetry_tier_record["steps_to_bind"] = _tier_steps_to_bind
+                                # hit_cap is suppressed on the abort path: stop_epoch
+                                # is None whenever the trainer never reached (or
+                                # never signalled) recall convergence, and an abort
+                                # is exactly such a case -- emitting hit_cap=True
+                                # there would be indistinguishable from a genuine
+                                # "budget too small" outcome in the bucket re-fit.
+                                if not _tier_aborted and _tier_hit_cap is not None:
+                                    _telemetry_tier_record["hit_cap"] = _tier_hit_cap
+                                if (
+                                    torch.cuda.is_available()
+                                    and _telemetry_tier_free_before is not None
+                                ):
+                                    _telemetry_tier_peak = torch.cuda.max_memory_allocated()
+                                    # peak_reserved is the OOM-relevant quantity: the
+                                    # caching allocator raises when it cannot reserve,
+                                    # not when driver-free (mem_get_info) drops —
+                                    # driver-free counts cached-but-unused allocator
+                                    # segments as used, which peak_reserved does not.
+                                    _telemetry_tier_peak_reserved = torch.cuda.max_memory_reserved()
+                                    _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
+                                    logger.info(
+                                        "_run_fold[main_tiers]: telemetry tier_train[%s] "
+                                        "(device-saturation indicator, not adapter cost) — "
+                                        "free_before=%d free_after=%d peak_alloc=%d "
+                                        "peak_reserved=%d",
+                                        tier,
+                                        _telemetry_tier_free_before,
+                                        _telemetry_tier_free_after,
+                                        _telemetry_tier_peak,
+                                        _telemetry_tier_peak_reserved,
+                                    )
+                                    _telemetry_tier_record.update(
+                                        {
+                                            "free_before": _telemetry_tier_free_before,
+                                            "free_after": _telemetry_tier_free_after,
+                                            "peak_alloc": _telemetry_tier_peak,
+                                            "peak_reserved": _telemetry_tier_peak_reserved,
+                                            "total": _telemetry_tier_total,
+                                        }
+                                    )
                                 if self._telemetry_dir is not None:
-                                    try:
-                                        record_fold_telemetry(
-                                            self._telemetry_dir,
-                                            cycle_stamp=_telemetry_run_stamp_c,
-                                            kind="tier_train",
-                                            record={
-                                                "tier": tier,
-                                                "fold_stamp": _fold_stamp_c,
-                                                "free_before": _telemetry_tier_free_before,
-                                                "free_after": _telemetry_tier_free_after,
-                                                "peak_alloc": _telemetry_tier_peak,
-                                                "peak_reserved": _telemetry_tier_peak_reserved,
-                                                "total": _telemetry_tier_total,
-                                                "adapter_count": len(self.model.peft_config),
-                                                "interim_count": len(
-                                                    [
-                                                        a
-                                                        for a in self.model.peft_config
-                                                        if a.startswith(INTERIM_NAME_PREFIX)
-                                                    ]
-                                                ),
-                                                "epochs": refresh_training_config.num_epochs,
-                                            },
-                                        )
-                                    except Exception:  # noqa: BLE001  # boundary: this
-                                        # finally runs on the abort path too — e.g.
-                                        # AbortedDuringConsolidation is raised in the try
-                                        # above and would reach main_tier_backup_scope's
-                                        # except only if this finally does not itself
-                                        # raise. A telemetry write failure here (disk
-                                        # full, permissions, corrupt store) must never
-                                        # replace the in-flight exception and misroute an
-                                        # abort to the crash-incident path. Losing a
-                                        # telemetry record is strictly preferable.
-                                        logger.warning(
-                                            "_run_fold[main_tiers]: telemetry write failed"
-                                            " for tier %s",
-                                            tier,
-                                            exc_info=True,
-                                        )
+                                    record_fold_telemetry(
+                                        self._telemetry_dir,
+                                        cycle_stamp=_telemetry_run_stamp_c,
+                                        kind="tier_train",
+                                        record=_telemetry_tier_record,
+                                    )
+                            except Exception:  # noqa: BLE001  # boundary: this
+                                # finally runs on the abort path too — e.g.
+                                # AbortedDuringConsolidation is raised in the try
+                                # above and would reach main_tier_backup_scope's
+                                # except only if this finally does not itself
+                                # raise. A failure anywhere in record
+                                # construction OR the write (disk full,
+                                # permissions, corrupt store, a broken
+                                # model/store attribute) must never replace the
+                                # in-flight exception and misroute an abort to
+                                # the crash-incident path. Losing a telemetry
+                                # record is strictly preferable.
+                                logger.warning(
+                                    "_run_fold[main_tiers]: telemetry write failed for tier %s",
+                                    tier,
+                                    exc_info=True,
+                                )
 
                         last_per_key_by_tier[tier] = (
                             recall_state.last_per_key if recall_state is not None else None
@@ -6476,7 +6851,7 @@ class ConsolidationLoop:
         adapter_name: str,
         output_dir,
         phase_name: str,
-        num_epochs: int | None = None,
+        num_epochs: int,
     ):
         """Construct a RecallEarlyStopCallback when configured.
 
@@ -6493,12 +6868,13 @@ class ConsolidationLoop:
         active-key set for ``adapter_name``, not an incremental delta.
 
         Production-reachable callers (must pass full per-tier active set):
-          - ConsolidationLoop._train_tier_adapter — single funnel for the
-            episodic / interim / fold training path; run_consolidation_cycle
-            and the full fold reach this callback transitively
-            via _train_tier_adapter and do not call it directly.
-          - active_store_migration._migrate_tier_simulate_to_train (direct)
-            (paramem/server/active_store_migration.py)
+          - ConsolidationLoop._train_tier_adapter — the single funnel for
+            every production training path (episodic/interim, the full
+            fold, and
+            active_store_migration._migrate_tier_simulate_to_train, which
+            is routed through this funnel rather than wiring its own
+            callback). None of those three call this helper directly any
+            more — they all reach it transitively via _train_tier_adapter.
 
         A new production-reachable caller MUST call this helper; the
         AST structural test in tests/test_consolidation_recall_early_stop.py
@@ -6515,14 +6891,11 @@ class ConsolidationLoop:
                 "interim-episodic-tickXY", "consolidate-episodic",
                 "migrate-episodic", etc.).
             num_epochs: The ACTUAL epoch count the trainer will run for this
-                call.  When provided, the callback's forced final-epoch probe
-                fires at this epoch rather than at
-                ``self.training_config.num_epochs``.  Callers that train with
-                a different epoch budget MUST pass this so
-                ``RecallEarlyStopCallback._num_epochs`` matches the trainer's
-                epoch count.  Defaults to ``None`` which resolves to
-                ``self.training_config.num_epochs`` — the correct value for
-                callers that use the default training budget.
+                call — the callback's forced final-epoch probe fires at this
+                epoch.  Required: the sole caller (_train_tier_adapter)
+                always has this value on hand (the derived budget from
+                ``paramem.utils.config.budget_for``), so there is no
+                well-defined fallback to resolve to.
 
         Returns:
             ``(RecallEarlyStopCallback, _EarlyStopState)`` when configured and
@@ -6552,9 +6925,6 @@ class ConsolidationLoop:
         # probe start with the signal floor eliminates that wasted compute;
         # the operator-tunable knob is ``recall_signal_from_epoch`` in
         # server.yaml.
-        effective_num_epochs = (
-            num_epochs if num_epochs is not None else self.training_config.num_epochs
-        )
         floor = self.training_config.early_stopping_floor
         policy = EarlyStopPolicy(
             probe_from_epoch=floor,
@@ -6587,7 +6957,7 @@ class ConsolidationLoop:
             epoch_log_path=output_dir / "epoch_log.json",
             first_perfect_log_path=None,  # production has no per-key log
             phase_name=phase_name,
-            num_epochs=effective_num_epochs,
+            num_epochs=num_epochs,
             pause_file=None,  # production pause via gpu_lock_sync, not file
             eval_fn=_eval_fn,
         )
@@ -6603,10 +6973,9 @@ class ConsolidationLoop:
         output_dir,
         run_name: str,
         phase_name: str,
-        num_epochs: "int | None" = None,
         retain_scratch_until_external_commit: bool = False,
     ):
-        """Format → dataset → recall callback → train_adapter for one tier.
+        """Format → derive budget → dataset → recall callback → train_adapter for one tier.
 
         Returns ``(metrics, recall_state)``.  Returns ``(None, None)`` when
         there are no training examples (empty entries list).
@@ -6614,6 +6983,17 @@ class ConsolidationLoop:
         This is the ONLY shared training-invocation site.  Abort handling,
         recall-verdict application, and persistence stay at the call sites
         (scope-specific).
+
+        The per-fold training budget (epoch count, gradient-accumulation
+        steps, LR-decay steps) is derived here from ``len(entries)`` via
+        ``paramem.utils.config.budget_for`` and applied to the incoming
+        ``training_config`` via ``dataclasses.replace`` — every production
+        caller (interim, the full fold, and
+        ``active_store_migration._migrate_tier_simulate_to_train``) inherits
+        the SAME derivation with no special case. When
+        ``training_config.budget_derivation_enabled`` is False,
+        ``budget_for`` passes the incoming values through unchanged (today's
+        behaviour).
 
         The ``from paramem.training.trainer import train_adapter`` import is
         kept INSIDE this method so tests can patch
@@ -6625,17 +7005,15 @@ class ConsolidationLoop:
                 object dicts).
             adapter_name: The adapter slot being trained.
             adapter_config: PEFT ``AdapterConfig`` for this tier.
-            training_config: ``TrainingConfig`` for this call (epoch count,
-                LR schedule, etc.).
+            training_config: ``TrainingConfig`` for this call. The derived
+                epoch/accum/lr-decay values REPLACE this config's fields
+                before training (see above); the caller's own copy is not
+                mutated (``dataclasses.replace`` returns a new instance).
             output_dir: HF Trainer ``output_dir``; also used by the recall
                 callback for ``progress.json`` / ``epoch_log.json``.
             run_name: W&B / HF Trainer run name.
             phase_name: Label for the recall callback's ``progress.json``
                 (e.g. ``"interim-episodic-tick42"``, ``"consolidate-semantic"``).
-            num_epochs: Passed through to ``_maybe_make_recall_callback`` so
-                the callback's forced final-epoch probe fires at the right
-                epoch.  ``None`` resolves to
-                ``self.training_config.num_epochs`` inside the callback helper.
             retain_scratch_until_external_commit: Forwarded verbatim to
                 :func:`paramem.training.trainer.train_adapter`.  When ``True``,
                 the success path skips ``_clean_scratch`` / ``staging_resume.json``
@@ -6646,13 +7024,66 @@ class ConsolidationLoop:
 
         Returns:
             ``(metrics_dict, recall_state)`` on success; ``(None, None)`` if
-            ``entries`` yields no training examples.
+            ``entries`` yields no training examples. When donor seeding
+            actually copied weights into *adapter_name* this fold,
+            ``metrics_dict["donor_seeded"]`` is ``True`` — call sites use this
+            (not a second measurement) to tag their telemetry ``init`` field
+            ``"donor"`` instead of the pre-training ``"cold"`` measurement.
+
+        Donor seeding: gated by ``training_config.donor_seeding_enabled``
+        (default ``False``, ``paramem.utils.config.TrainingConfig`` /
+        ``paramem.server.config.ConsolidationScheduleConfig``, threaded
+        exactly like ``budget_derivation_enabled``). This method is reachable
+        ONLY from the weights venue (every call site sits inside its
+        enclosing ``if scope.source == "weights":`` branch — see
+        ``consolidation.py``'s two ``_train_tier_adapter`` call sites and
+        ``active_store_migration._migrate_tier_simulate_to_train``, all three
+        routed through this one funnel), so the disk/simulate venue never
+        seeds without a separate check here. When the flag is on and
+        *adapter_name* is not the donor's own transient build slot
+        (``DONOR_BUILD_ADAPTER_NAME`` — excluding it here is what stops
+        :func:`~paramem.training.donor.build_donor`'s own funnel call from
+        recursively re-triggering donor seeding on the adapter it is training):
+        measure the target's LoRA-B Frobenius norm
+        (:func:`~paramem.models.loader.measured_adapter_init_state`); on
+        ``"cold"``, resolve the current base model id and LoRA shape and check
+        :func:`~paramem.training.donor.donor_checkpoint_valid`. A missing OR
+        mismatched (base model OR LoRA shape) checkpoint is built fresh (for
+        the CURRENT base/shape — never seeds cross-base or cross-shape) via
+        :func:`~paramem.training.donor.build_donor` before this fold's own
+        training — a cold interim is the failure this mechanism exists to
+        fix. If the checkpoint is (now) valid, the donor is loaded into a
+        transient slot
+        (:func:`~paramem.training.donor.load_donor_into_transient_slot`) and
+        copied into *adapter_name* via
+        :func:`~paramem.models.loader.copy_adapter_weights_subset` (handles
+        both same-topology tiers and episodic-donor-into-procedural's larger
+        module set, zeroing the extra MLP tensors), and the transient slot is
+        always deleted in a ``finally``. An unresolvable base id, a checkpoint
+        that still fails to validate after the build attempt, or a build that
+        could not complete this fold
+        (:class:`~paramem.training.donor.DonorBuildIncomplete`), skips
+        seeding and logs — never raises.
         """
         from paramem.training.trainer import train_adapter
 
         examples = format_entry_training(entries, self.tokenizer, max_length=1024)
         if not examples:
             return None, None
+
+        donor_seeded = False
+        if training_config.donor_seeding_enabled and adapter_name != DONOR_BUILD_ADAPTER_NAME:
+            donor_seeded = self._maybe_seed_from_donor(adapter_name)
+
+        derived_epochs, derived_accum, derived_lr_decay_steps = budget_for(
+            len(entries), training_config
+        )
+        training_config = replace(
+            training_config,
+            num_epochs=derived_epochs,
+            gradient_accumulation_steps=derived_accum,
+            lr_decay_steps=derived_lr_decay_steps,
+        )
         dataset = self._indexed_dataset(examples)
         self._enable_gradient_checkpointing()
         recall_cb, recall_state = self._maybe_make_recall_callback(
@@ -6660,7 +7091,7 @@ class ConsolidationLoop:
             adapter_name=adapter_name,
             output_dir=output_dir,
             phase_name=phase_name,
-            num_epochs=num_epochs,
+            num_epochs=derived_epochs,
         )
         metrics = train_adapter(
             model=self.model,
@@ -6677,4 +7108,91 @@ class ConsolidationLoop:
             callbacks_extra=[recall_cb] if recall_cb is not None else None,
             retain_scratch_until_external_commit=retain_scratch_until_external_commit,
         )
+        metrics["donor_seeded"] = donor_seeded
         return metrics, recall_state
+
+    def _maybe_seed_from_donor(self, adapter_name: str) -> bool:
+        """Seed *adapter_name* from the donor checkpoint when it measures cold.
+
+        Helper for :meth:`_train_tier_adapter`'s donor-seeding gate — see that
+        method's docstring for the full decision tree. Returns ``True`` only
+        when weights were actually copied into *adapter_name* this call (so
+        the caller can tag its telemetry ``init`` field ``"donor"``); returns
+        ``False`` on every other branch (warm target, unresolvable base id,
+        a checkpoint that still fails to validate after a build attempt, or a
+        build attempt that could not complete this fold —
+        :class:`~paramem.training.donor.DonorBuildIncomplete`, caught here
+        specifically), without raising.
+        """
+        from paramem.models.loader import _lora_shape_fields
+        from paramem.training.donor import (
+            DONOR_LOAD_ADAPTER_NAME,
+            DonorBuildIncomplete,
+            build_donor,
+            donor_checkpoint_dir,
+            donor_checkpoint_valid,
+            load_donor_into_transient_slot,
+        )
+
+        init_state = measured_adapter_init_state(self.model, adapter_name)
+        if init_state != "cold":
+            return False
+
+        base_model_id = getattr(self.model.get_base_model().config, "_name_or_path", None)
+        if base_model_id is None:
+            logger.warning(
+                "_maybe_seed_from_donor: skipping donor seeding for %s -- base model id unresolved",
+                adapter_name,
+            )
+            return False
+
+        # The donor is always trained at the episodic topology
+        # (build_donor uses self.episodic_config unconditionally); comparing
+        # the CURRENT episodic shape against the checkpoint's recorded shape
+        # catches an operator rank/target-modules edit BEFORE
+        # copy_adapter_weights_subset would hit a tensor-shape mismatch and
+        # abort the fold.
+        lora_shape = _lora_shape_fields(self.episodic_config)
+        checkpoint_dir = donor_checkpoint_dir(self.output_dir)
+        if not donor_checkpoint_valid(checkpoint_dir, base_model_id, lora_shape):
+            logger.info(
+                "_maybe_seed_from_donor: donor checkpoint missing/mismatched "
+                "for base %s -- building before this fold's training",
+                base_model_id,
+            )
+            try:
+                build_donor(self)
+            except DonorBuildIncomplete as exc:
+                logger.warning(
+                    "_maybe_seed_from_donor: donor build did not complete this "
+                    "fold (%s) -- skipping seeding for %s; the next "
+                    "measured-cold fold will retry the build",
+                    exc,
+                    adapter_name,
+                )
+                return False
+
+        if not donor_checkpoint_valid(checkpoint_dir, base_model_id, lora_shape):
+            logger.warning(
+                "_maybe_seed_from_donor: skipping donor seeding for %s -- "
+                "no valid checkpoint after build attempt",
+                adapter_name,
+            )
+            return False
+
+        from paramem.models.loader import active_adapter_name, copy_adapter_weights_subset
+
+        try:
+            load_donor_into_transient_slot(self.model, checkpoint_dir, DONOR_LOAD_ADAPTER_NAME)
+            copy_adapter_weights_subset(self.model, src=DONOR_LOAD_ADAPTER_NAME, dst=adapter_name)
+            logger.info(
+                "_maybe_seed_from_donor: seeded %s from donor checkpoint (base=%s)",
+                adapter_name,
+                base_model_id,
+            )
+            return True
+        finally:
+            if DONOR_LOAD_ADAPTER_NAME in self.model.peft_config:
+                if active_adapter_name(self.model) == DONOR_LOAD_ADAPTER_NAME:
+                    switch_adapter(self.model, adapter_name)
+                self.model.delete_adapter(DONOR_LOAD_ADAPTER_NAME)

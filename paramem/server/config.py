@@ -1047,6 +1047,28 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # validated budget when testing layout/encryption invariants rather
     # than recall quality.
     max_epochs: int | None = None
+    # Master switch for the per-fold training-budget derivation: epochs/
+    # accum/lr_decay_steps derived from the fold's key-triple count via
+    # paramem.utils.config.budget_for, applied at the single training funnel
+    # (ConsolidationLoop._train_tier_adapter). False (default) is exactly
+    # today's behaviour -- the fixed training_* fields below are used as-is,
+    # ignoring key count. See budget_for's _BUDGET_TABLE for the bucket
+    # values and evidence status; ships OFF until the smaller buckets are
+    # confirmed on more production fold data.
+    budget_derivation_enabled: bool = False
+    # Master switch for donor seeding: a measured-cold target adapter is
+    # seeded from the donor checkpoint (paramem.training.donor) before
+    # training, at the same funnel budget_derivation_enabled gates
+    # (ConsolidationLoop._train_tier_adapter). False (default) is exactly
+    # today's behaviour -- every fold trains from whatever weights the target
+    # adapter already carries. See paramem.training.donor's module docstring
+    # for the donor's synthetic-content rationale and key-namespace reservation
+    # (graph1-200 / proc1-200); ships off until the donor arm is validated
+    # against production recall data -- seeding cold small-N folds from a
+    # synthetic population could plausibly worsen the attractor-collapse
+    # failure it targets rather than fix it, and that has not yet been
+    # measured.
+    donor_seeding_enabled: bool = False
     # LoRA training hyperparameters (Test 17 recipe).
     # num_epochs is the ceiling max_epochs above (None → 30); not repeated here.
     training_batch_size: int = 1
@@ -1805,6 +1827,21 @@ class ServerConfig:
         a ceiling — once recall-driven early-stop ships, training will
         terminate at the recall plateau bounded by this value.
 
+        ``budget_derivation_enabled`` and ``budget_max_epochs`` feed
+        ``paramem.utils.config.budget_for`` at the training funnel
+        (``ConsolidationLoop._train_tier_adapter``). ``budget_max_epochs``
+        threads ``consolidation.max_epochs`` RAW (unresolved) so the
+        derivation's min-clamp reads the operator's actual setting (or
+        ``None`` for unclamped) rather than this property's own resolved
+        ``num_epochs`` (which would wrongly cap the 50- and 80-epoch
+        buckets down to 30).
+
+        ``donor_seeding_enabled`` gates the same funnel's donor-seeding hook
+        (``ConsolidationLoop._maybe_seed_from_donor`` /
+        ``paramem.training.donor``) — a measured-cold target adapter is
+        seeded from the donor checkpoint before training instead of starting
+        from LoRA-zero.
+
         All LoRA hyperparameters come from the yaml-configurable
         ``consolidation.training_*`` fields; see ConsolidationScheduleConfig.
         """
@@ -1815,6 +1852,9 @@ class ServerConfig:
             num_epochs=(
                 self.consolidation.max_epochs if self.consolidation.max_epochs is not None else 30
             ),
+            budget_derivation_enabled=self.consolidation.budget_derivation_enabled,
+            budget_max_epochs=self.consolidation.max_epochs,
+            donor_seeding_enabled=self.consolidation.donor_seeding_enabled,
             warmup_steps=self.consolidation.training_warmup_steps,
             lr_scheduler_type=self.consolidation.training_lr_scheduler_type,
             lr_decay_steps=self.consolidation.training_lr_decay_steps,

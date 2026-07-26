@@ -146,11 +146,13 @@ def main_tier_backup_scope(
     first so a stale snapshot can never be restored over good weights).  On
     ANY exception raised inside the ``with`` body, every snapshotted tier is
     restored from its backup before the ORIGINAL exception propagates
-    unchanged — a caller that deletes+recreates a tier mid-scope (as
-    ``_run_fold``'s tier loop does) can never leave production holding a
-    zero-init adapter.  On every exit (success or exception), all backup
-    adapters are freed — they are VRAM-only and never read by anything
-    outside this scope.
+    unchanged — whether the tier was trained warm in place (the funnel's
+    staging-copy-and-promote) or deleted and recreated cold mid-scope
+    (``_run_fold``'s tier loop does this on RECONCILE, or on a config
+    mismatch caught by ``ensure_adapter_matching``), a failure can never
+    leave production holding a zero-init adapter.  On every exit (success or
+    exception), all backup adapters are freed — they are VRAM-only and
+    never read by anything outside this scope.
 
     The caller must keep the ``with`` body open for as long as any tier in
     ``tiers`` may be deleted and recreated — the backups are what make that
@@ -472,6 +474,36 @@ def unload_model(model, tokenizer=None) -> None:
     logger.info("Model unloaded, CUDA cache cleared")
 
 
+def _lora_shape_fields(adapter_config: AdapterConfig) -> dict:
+    """Return the ``AdapterConfig`` fields that determine a LoRA adapter's
+    tensor topology: ``r`` (rank — determines tensor shape directly),
+    ``lora_alpha`` (the scaling factor PEFT applies at forward time), and
+    ``target_modules`` (which layers are adapted at all).
+
+    The single source both :func:`create_adapter` (which builds a real
+    ``peft.LoraConfig`` from these) and :func:`ensure_adapter_matching`
+    (which compares a resident adapter's ``LoraConfig`` against these) read
+    from, so a future field added here to make it shape-relevant is picked
+    up by the mismatch guard automatically rather than silently escaping it.
+
+    Deliberately excludes ``dropout``: it changes training regularization,
+    not tensor shape or topology, so it is not compared by
+    :func:`ensure_adapter_matching` — a warm-kept resident adapter's
+    ``lora_dropout`` stays whatever it was created with. An operator dropout
+    edit in config therefore takes effect only the next time the adapter is
+    actually (re)created (RECONCILE, first boot, or a shape-relevant
+    mismatch), never on a routine warm-kept fold — see
+    ``configs/server.yaml.example``'s adapters section.
+    """
+    return {
+        "r": adapter_config.rank,
+        "lora_alpha": adapter_config.alpha,
+        "target_modules": list(adapter_config.target_modules)
+        if adapter_config.target_modules
+        else [],
+    }
+
+
 def create_adapter(
     model: PreTrainedModel,
     adapter_config: AdapterConfig,
@@ -484,9 +516,7 @@ def create_adapter(
     re-wrapping (which causes tensor name nesting on save/reload).
     """
     lora_config = LoraConfig(
-        r=adapter_config.rank,
-        lora_alpha=adapter_config.alpha,
-        target_modules=adapter_config.target_modules,
+        **_lora_shape_fields(adapter_config),
         lora_dropout=adapter_config.dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -931,8 +961,11 @@ def copy_adapter_weights_subset(model: PeftModel, src: str, dst: str) -> int:
     targets 4 attn modules and procedural targets 7 (attn+mlp).
 
     - Tensors present in BOTH src and dst are copied under ``torch.no_grad()``.
-    - Tensors present in dst but absent from src are LEFT at their current
-      value (PEFT zero-init for a freshly-created adapter).
+    - Tensors present in dst but absent from src are explicitly ZEROED under
+      ``torch.no_grad()`` (not merely left at whatever value they already
+      held) — "MLP stays zero-init" is a contract of this function, true
+      unconditionally, whether dst is a freshly-created adapter or a
+      resident one reused across a warm-init fold.
     - Tensors present in src but absent from dst raise ``RuntimeError`` — that
       represents a true config error (src has modules dst doesn't even define).
 
@@ -981,21 +1014,33 @@ def copy_adapter_weights_subset(model: PeftModel, src: str, dst: str) -> int:
             f"This indicates a config error (src has modules dst doesn't define)."
         )
 
-    dst_only_count = len(set(dst_index.keys()) - set(src_index.keys()))
+    dst_only = set(dst_index.keys()) - set(src_index.keys())
     intersecting = set(src_index.keys()) & set(dst_index.keys())
 
     with torch.no_grad():
         for key in intersecting:
             dst_index[key].data.copy_(src_index[key].data)
+        # Explicitly zero dst-only tensors (e.g. procedural's MLP modules
+        # graduating from episodic's attention-only donor) rather than relying
+        # on "PEFT zero-init" still holding. Under warm init dst may be a
+        # RESIDENT adapter reused across folds, not a freshly-created one (a
+        # prior fast-start graduation, or a warm-kept tier whose weights moved
+        # off zero during training), so leaving these untouched would silently
+        # break the "MLP stays zero-init" contract documented at the call site
+        # (consolidation.py) and in architecture.md. Zeroing by construction
+        # keeps that contract true unconditionally, regardless of dst's prior
+        # state.
+        for key in dst_only:
+            dst_index[key].data.zero_()
 
-    if dst_only_count:
+    if dst_only:
         logger.debug(
             "copy_adapter_weights_subset: adapter '%s' → '%s': "
-            "copied %d tensors, left %d dst-only tensors at PEFT zero-init",
+            "copied %d tensors, zeroed %d dst-only tensors",
             src,
             dst,
             len(intersecting),
-            dst_only_count,
+            len(dst_only),
         )
     else:
         logger.debug(
@@ -1020,3 +1065,179 @@ def get_adapter_info(model: PeftModel) -> dict:
             "dropout": config.lora_dropout,
         }
     return info
+
+
+# Below this norm, an adapter's LoRA-B weights are considered a fresh
+# (cold, LoRA-zero) init rather than a trained-and-warm one. PEFT's
+# create_adapter leaves LoRA-B at EXACTLY zero (identity residual), so a
+# bit-exact-zero check would work for a freshly-created adapter; the
+# headroom is for bf16 denormals and for a warm adapter whose weights have
+# barely moved off zero (e.g. one optimizer step before an abort) --
+# neither is "cold" and the threshold must not misclassify them.
+LORA_B_COLD_NORM_THRESHOLD = 1e-6
+
+
+class LoraTensorsNotFound(RuntimeError):
+    """No ``lora_B`` tensor was found for the requested adapter name.
+
+    Distinct from a bare ``RuntimeError`` so callers can catch this specific
+    condition (wrong/missing adapter name) without also swallowing unrelated
+    ``RuntimeError`` subclasses such as a CUDA OOM or "device lost" error
+    raised from inside the same ``named_parameters()`` iteration.
+    """
+
+
+def lora_b_frobenius_norm(model: PeftModel, adapter_name: str) -> float:
+    """Return the total Frobenius norm of all LoRA-B tensors for *adapter_name*.
+
+    LoRA-B is zero-initialised by PEFT at adapter creation (identity
+    residual), so a zero norm immediately after ``create_adapter`` and a
+    non-zero norm after training together prove cold init actually ran end
+    to end. Shared by the consolidation fold-telemetry measurement
+    (:func:`measured_adapter_init_state`) and
+    ``experiments/test20_smallN_cold_gate.py`` (its Hard Assertion #3) —
+    one implementation, not a copy in each caller.
+
+    Args:
+        model: PeftModel carrying *adapter_name*.
+        adapter_name: Adapter whose LoRA-B norm is computed.
+
+    Returns:
+        Total Frobenius norm of all LoRA-B tensors for the adapter (float).
+
+    Raises:
+        LoraTensorsNotFound: When no ``lora_B`` tensors are found for the
+            adapter (wrong adapter name / not yet created).
+    """
+    total_norm = 0.0
+    count = 0
+    for name, param in model.named_parameters():
+        if f"lora_B.{adapter_name}.weight" in name:
+            total_norm += param.data.norm().item()
+            count += 1
+    if count == 0:
+        raise LoraTensorsNotFound(
+            f"No lora_B tensors found for adapter '{adapter_name}' — check adapter name"
+        )
+    return total_norm
+
+
+def measured_adapter_init_state(model: PeftModel, adapter_name: str) -> "str | None":
+    """Return ``"cold"``/``"warm"`` from the measured LoRA-B Frobenius norm.
+
+    Wraps :func:`lora_b_frobenius_norm` for the fold-telemetry ring
+    (``paramem.server.fold_telemetry``): a diagnostics measurement must
+    never block or crash a production fold on a condition specific to the
+    measurement itself, so a :class:`LoraTensorsNotFound` failure (no
+    ``lora_B`` tensors indexed under *adapter_name* — e.g. a test double
+    standing in for the model) degrades to ``None`` (the caller omits the
+    ``init`` field) rather than propagating. This is the ONLY degradation:
+    an ``AttributeError`` (e.g. *model* has no ``named_parameters``, or is on
+    the meta device) or any other exception type still propagates
+    unchanged — those indicate a genuinely broken caller state, not an
+    unmeasurable-but-otherwise-healthy adapter. In production the model is
+    always a real ``PeftModel`` with *adapter_name* already created by
+    ``create_adapter`` (main-tier fold, ``consolidation.py:4390``) or
+    ``create_interim_adapter`` (interim fold, ``consolidation.py:3142``)
+    before this is called, so this path is expected to always measure
+    successfully; the ``None`` branch exists for the introspection
+    boundary, not as a normal outcome.
+
+    Args:
+        model: PeftModel carrying *adapter_name*.
+        adapter_name: Adapter whose measured init state is classified.
+
+    Returns:
+        ``"cold"`` when the norm is below :data:`LORA_B_COLD_NORM_THRESHOLD`,
+        ``"warm"`` otherwise, or ``None`` when the norm could not be measured.
+    """
+    try:
+        norm = lora_b_frobenius_norm(model, adapter_name)
+    except LoraTensorsNotFound:
+        return None
+    return "cold" if norm < LORA_B_COLD_NORM_THRESHOLD else "warm"
+
+
+def ensure_adapter_matching(
+    model: PeftModel,
+    adapter_config: AdapterConfig,
+    adapter_name: str,
+) -> PeftModel:
+    """Ensure *adapter_name* exists and matches *adapter_config*'s LoRA topology.
+
+    The single config-mismatch guard for the warm-init default: warm init
+    keeps a resident adapter's trained weights across folds, so every
+    warm-init entrance (main-tier fold preamble — called on every resident
+    tier BEFORE ``main_tier_backup_scope`` is entered, see the call site's
+    own comment in ``consolidation.py`` — and interim-slot mint) must call
+    this instead of unconditionally deleting and recreating. Three outcomes:
+
+    - Absent: cold birth via :func:`create_adapter` — there are no weights
+      to preserve, so there is nothing to compare or keep warm.
+    - Present, config matches (:func:`_lora_shape_fields`: ``r``,
+      ``lora_alpha``, ``target_modules``): no-op. This is the warm path —
+      the caller's staging copy (``trainer.py:944-948``) then warm-starts
+      from these weights.
+    - Present, config differs: deleted and recreated cold, with a warning
+      naming the mismatched field(s). The comparison is on the PEFT
+      ``LoraConfig`` fields, deliberately never on parameter key sets — a
+      rank change keeps the same key names (same ``target_modules``) but
+      different tensor shapes, so a parameter-key-set comparison would
+      pass and the mismatch would only surface later as a tensor-shape
+      ``RuntimeError`` inside :func:`copy_adapter_weights` /
+      ``model.generate()``. Calling this ahead of any weight-touching
+      operation on the tier (in particular ahead of
+      ``main_tier_backup_scope``, which snapshots the resident tier via
+      :func:`copy_adapter_weights`) is what makes config comparison
+      sufficient to catch it first.
+
+    Args:
+        model: The live (possibly unwrapped-base) model.
+        adapter_config: The tier's target ``AdapterConfig`` (rank, alpha,
+            target_modules, dropout) to create or validate against.
+        adapter_name: Adapter/tier name to validate or create.
+
+    Returns:
+        The model, possibly reassigned by :func:`create_adapter` (mirrors
+        that function's own return contract — callers must use the return
+        value, never assume in-place mutation).
+    """
+    # Presence in ``peft_config`` is the absent/resident discriminator, not
+    # ``isinstance(model, PeftModel)``. In production this is always a real
+    # PeftModel by the time either warm-init entrance calls it: the
+    # main-tier fold preamble runs immediately before
+    # ``main_tier_backup_scope``, which itself raises ``RuntimeError`` on a
+    # non-PeftModel (see its own runtime contract check); the interim mint
+    # branch reaches this call only after already dereferencing
+    # ``self.model.peft_config`` one line above (``adapter_name not in
+    # self.model.peft_config``), which would already have raised
+    # ``AttributeError`` on a bare base model. Gating on ``isinstance`` in
+    # addition adds no production safety and only risks misclassifying a
+    # genuinely-resident adapter as absent should a caller's model not also
+    # satisfy ``isinstance`` — ``getattr(..., None)`` is the correct, and
+    # sufficient, absent/resident discriminator on its own.
+    peft_config = getattr(model, "peft_config", None)
+    if peft_config is None or adapter_name not in peft_config:
+        return create_adapter(model, adapter_config, adapter_name)
+
+    resident = peft_config[adapter_name]
+    target_fields = _lora_shape_fields(adapter_config)
+    mismatches: list[str] = []
+    for field_name, target_value in target_fields.items():
+        resident_value = getattr(resident, field_name, None)
+        if field_name == "target_modules":
+            resident_value = set(resident_value) if resident_value else set()
+            target_value = set(target_value)
+        if resident_value != target_value:
+            mismatches.append(f"{field_name}: resident={resident_value} target={target_value}")
+
+    if not mismatches:
+        return model
+
+    logger.warning(
+        "ensure_adapter_matching: adapter '%s' config mismatch (%s) — recreating cold",
+        adapter_name,
+        "; ".join(mismatches),
+    )
+    model.delete_adapter(adapter_name)
+    return create_adapter(model, adapter_config, adapter_name)

@@ -548,8 +548,11 @@ class TestMigrateOrchestrator:
         # comparison does not raise TypeError against a MagicMock.
         loop.config.recall_sanity_threshold = 1.0
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
+        # _migrate_tier_simulate_to_train routes training through the shared
+        # funnel (_train_tier_adapter); the per-tier pass/fail split below is
+        # driven entirely by _run_recall_sanity_probe, so the funnel always
+        # reports a clean (non-aborted) result.
+        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
         loop.wandb_config = None
         loop.fingerprint_cache = None
         loop._thermal_policy = None
@@ -560,9 +563,6 @@ class TestMigrateOrchestrator:
             return dict(**kwargs)
 
         loop._cache_entry.side_effect = _fake_cache_entry
-        # See _make_loop: _maybe_make_recall_callback must return a (cb, state)
-        # 2-tuple; migration ignores state and gates via _run_recall_sanity_probe.
-        loop._maybe_make_recall_callback.return_value = (None, None)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
 
@@ -577,18 +577,10 @@ class TestMigrateOrchestrator:
         loop._run_recall_sanity_probe.side_effect = probe_side_effect
 
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             result = migrate(loop, cfg, state)
@@ -622,8 +614,9 @@ class TestMigrateOrchestrator:
         # comparison does not raise TypeError against a MagicMock.
         loop.config.recall_sanity_threshold = 1.0
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
+        # _migrate_tier_simulate_to_train routes training through the shared
+        # funnel (_train_tier_adapter) rather than train_adapter directly.
+        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
         loop.wandb_config = None
         loop.fingerprint_cache = None
         loop._thermal_policy = None
@@ -634,25 +627,14 @@ class TestMigrateOrchestrator:
             return dict(**kwargs)
 
         loop._cache_entry.side_effect = _fake_cache_entry
-        # See _make_loop: _maybe_make_recall_callback must return a (cb, state)
-        # 2-tuple; migration ignores state and gates via _run_recall_sanity_probe.
-        loop._maybe_make_recall_callback.return_value = (None, None)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
 
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             result = migrate(loop, cfg, state)
@@ -796,12 +778,14 @@ class TestMigrateTierSimulateToTrain:
         loop._thermal_policy = None
         loop.model = MagicMock()
         loop.model.peft_config = {"episodic": MagicMock()} if tier_in_peft else {}
-        # _migrate_tier_simulate_to_train unpacks a (callback, state) 2-tuple from
-        # _maybe_make_recall_callback.  A bare MagicMock unpacks as an empty
-        # iterable → "not enough values to unpack".  The migration path ignores
-        # recall_state and gates on its own _run_recall_sanity_probe, so return
-        # (None, None): no recall callback is added (callbacks_extra stays None).
-        loop._maybe_make_recall_callback.return_value = (None, None)
+        # _migrate_tier_simulate_to_train routes training through the shared
+        # funnel (_train_tier_adapter) and unpacks a (metrics, recall_state)
+        # 2-tuple from it.  A bare MagicMock unpacks as an empty iterable ->
+        # "not enough values to unpack", so every test needs a real 2-tuple
+        # return.  The migration path ignores recall_state and gates on its
+        # own _run_recall_sanity_probe.  Tests exercising the aborted/empty
+        # branches override this return_value explicitly.
+        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
 
         def _fake_cache_entry(
             *,
@@ -858,15 +842,9 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch(
                 "paramem.memory.entry.build_registry",
                 return_value={"g0": 0, "g1": 0},
@@ -874,17 +852,24 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ) as train_mock,
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-        # train_adapter was called with adapter_name=tier
-        assert train_mock.call_count == 1
-        assert train_mock.call_args.kwargs["adapter_name"] == "episodic"
+        # _train_tier_adapter (the shared funnel) was called with adapter_name=tier
+        # and the migration's own training_config / output_dir / run_name --
+        # budget derivation and the recall callback are inherited from the
+        # funnel using these SAME values, not a migration-local copy.
+        assert loop._train_tier_adapter.call_count == 1
+        funnel_kwargs = loop._train_tier_adapter.call_args.kwargs
+        assert funnel_kwargs["adapter_name"] == "episodic"
+        assert funnel_kwargs["training_config"] is loop.training_config
+        assert (
+            funnel_kwargs["output_dir"] == cfg.adapter_dir / "active_store_migration" / "episodic"
+        )
+        assert funnel_kwargs["run_name"] == "migrate-simulate-to-train-episodic"
+        assert funnel_kwargs["phase_name"] == "migrate-episodic"
+        assert funnel_kwargs["adapter_config"] is loop.episodic_config
         # Source graph deleted post-success (simulate_to_train always deletes source graph).
         assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
         # Per-tier registry (carrying unified simhash map) persisted at tier path.
@@ -906,8 +891,6 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         captured: dict = {}
 
@@ -917,18 +900,10 @@ class TestMigrateTierSimulateToTrain:
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch(
                 "paramem.adapters.manifest.build_manifest_for",
                 side_effect=_capture_manifest,
@@ -959,16 +934,10 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         built_registry = {"g0": 123, "g1": 456}
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch(
                 "paramem.memory.entry.build_registry",
                 return_value=built_registry,
@@ -976,10 +945,6 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
@@ -999,22 +964,12 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 0.66  # below 1.0 → rollback
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter") as save_mock,
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             with pytest.raises(RuntimeError, match=r"recall .* < 1.0"):
@@ -1027,11 +982,15 @@ class TestMigrateTierSimulateToTrain:
         # No registry written (probe failed before write)
         assert not (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
 
-    def test_always_uses_entry_format_helpers(self, tmp_path):
-        """simulate→train uses entry helpers; legacy format helpers are not called.
+    def test_always_uses_entry_build_registry(self, tmp_path):
+        """simulate→train hot-loads via build_registry from entry_memory
+        (not a legacy format helper) at Step 2, before handing entries to the
+        shared training funnel.
 
-        This test verifies format_entry_training is called (not
-        format_indexed_training) and build_registry from entry_memory is used.
+        format_entry_training is exercised inside the funnel
+        (_train_tier_adapter, mocked here via _make_loop) rather than
+        directly by migration -- covered by the funnel's own tests in
+        tests/test_consolidation.py, not here.
         """
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(2)]
@@ -1039,15 +998,9 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ) as entry_fmt,
             patch(
                 "paramem.memory.entry.build_registry",
                 return_value={"g0": 0, "g1": 0},
@@ -1055,15 +1008,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-        entry_fmt.assert_called_once()
         entry_reg.assert_called_once()
 
     def test_recall_probe_is_uncapped(self, tmp_path):
@@ -1080,15 +1028,9 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch(
                 "paramem.memory.entry.build_registry",
                 return_value={f"g{i}": i for i in range(5)},
@@ -1096,10 +1038,6 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
@@ -1137,23 +1075,13 @@ class TestMigrateTierSimulateToTrain:
         loop = self._make_loop()
         loop.config = ConsolidationConfig(recall_sanity_threshold=0.8)
         loop._run_recall_sanity_probe.return_value = 0.9
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             # threshold=0.8, recall=0.9 → gate passes, no exception.
@@ -1165,23 +1093,13 @@ class TestMigrateTierSimulateToTrain:
         loop2 = self._make_loop()
         loop2.config = ConsolidationConfig(recall_sanity_threshold=0.8)
         loop2._run_recall_sanity_probe.return_value = 0.7
-        loop2._indexed_dataset.return_value = MagicMock()
-        loop2._make_training_config.return_value = MagicMock()
 
         slot_path2 = cfg2.adapter_dir / "episodic" / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path2),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             with pytest.raises(RuntimeError, match=r"recall .* < 0\.8"):
@@ -1343,25 +1261,15 @@ class TestSlotPathResolverInterim:
 
         loop = TestMigrateTierSimulateToTrain()._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
-        loop._indexed_dataset.return_value = MagicMock()
-        loop._make_training_config.return_value = MagicMock()
 
         slot_path = expected_slot_root / "20260430-000000"
         with (
-            patch(
-                "paramem.memory.entry.format_entry_training",
-                return_value=[{"input_ids": [0]}],
-            ),
             patch("paramem.memory.entry.build_registry", return_value={"ik1": 99}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch(
                 "paramem.models.loader.atomic_save_adapter",
                 return_value=slot_path,
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
             ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):

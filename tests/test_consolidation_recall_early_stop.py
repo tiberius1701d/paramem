@@ -1,21 +1,21 @@
 """Unit tests for production recall-based early stopping.
 
-Covers the wiring at the THREE production-reachable train_adapter call sites:
+Every production training path routes through the single shared funnel
+``ConsolidationLoop._train_tier_adapter``, which is the sole call site of
+both ``_maybe_make_recall_callback`` and ``train_adapter``:
 
   - paramem/training/consolidation.py:
-      Site #1 run_consolidation_cycle (unified episodic interim path; formerly
-              _run_indexed_key_episodic + _train_extracted_into_interim)
-      Site #2 _run_indexed_key_procedural
-      Site #3 the full fold, ConsolidationLoop.consolidate (per-tier loop body)
+      run_consolidation_cycle (unified episodic+procedural interim path)
+      the full fold, ConsolidationLoop.consolidate (per-tier loop body)
   - paramem/server/active_store_migration.py:
-      Site #4 _migrate_tier_simulate_to_train
+      _migrate_tier_simulate_to_train (routed through the funnel so the
+      per-fold training-budget derivation applies here too)
 
 Plus the helper itself (Class A) and the structural AST gate (Class F)
 that prevents future architectural-mismatch regressions of the v1 class.
 
-No GPU required.  Mocks `paramem.training.trainer.train_adapter` and
-`paramem.server.active_store_migration._train_adapter` to capture the
-``callbacks_extra`` kwarg.
+No GPU required.  Mocks `paramem.training.trainer.train_adapter` to capture
+the ``callbacks_extra`` kwarg.
 """
 
 from __future__ import annotations
@@ -98,6 +98,7 @@ class TestMaybeMakeRecallCallback:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=10,
         )
         assert cb is None
 
@@ -108,6 +109,7 @@ class TestMaybeMakeRecallCallback:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=10,
         )
         assert cb is None
 
@@ -124,6 +126,7 @@ class TestMaybeMakeRecallCallback:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=20,
         )
         assert isinstance(cb, RecallEarlyStopCallback)
         # probe_from_epoch is pinned to the signal floor so we don't pay for
@@ -144,30 +147,29 @@ class TestMaybeMakeRecallCallback:
             adapter_name="episodic",
             output_dir=out,
             phase_name="test",
+            num_epochs=10,
         )
         assert cb._progress_path == out / "progress.json"
         assert cb._epoch_log_path == out / "epoch_log.json"
         assert cb._first_perfect_log_path is None  # production has no per-key log
         assert cb._pause_file is None  # production pause via gpu_lock_sync
 
-    def test_num_epochs_override_propagates_to_callback(self, tmp_path: Path) -> None:
-        """Regression: the full fold trains with refresh_epochs,
-        not num_epochs.  When num_epochs != refresh_epochs the forced
-        final-epoch probe must fire at refresh_epochs, not at num_epochs.
+    def test_num_epochs_propagates_to_callback(self, tmp_path: Path) -> None:
+        """Regression: the callback's forced final-epoch probe must fire at
+        the CALLER'S num_epochs, not at training_config.num_epochs.
 
-        Concretely: if an operator sets consolidation.max_epochs (refresh_epochs)
-        to a value other than training_config.num_epochs (30), the callback's
-        _num_epochs must track the ACTUAL trainer epoch count (refresh_epochs),
-        not the stale training_config default.  A stale _num_epochs silently
-        skips the forced probe and leaves state.last_per_key with a mid-training
-        cadence verdict — wrong registration admission/rejection.
+        num_epochs is a required argument — the sole production caller
+        (_train_tier_adapter) always passes the derived per-fold budget from
+        paramem.utils.config.budget_for, which can differ from
+        training_config.num_epochs (30 by default). A callback that silently
+        fell back to training_config.num_epochs would skip the forced probe
+        and leave state.last_per_key with a mid-training cadence verdict —
+        wrong registration admission/rejection.
         """
-        # num_epochs in TrainingConfig is 30 (default).  Use 20 as refresh_epochs
-        # so the mismatch condition from the bug is clearly visible.
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         assert loop.training_config.num_epochs != 20, (
-            "test precondition: training_config.num_epochs must differ from the "
-            "refresh_epochs value used below (20)"
+            "test precondition: training_config.num_epochs must differ from "
+            "the num_epochs value passed below (20)"
         )
         cb, _state = loop._maybe_make_recall_callback(
             entries=_kp(),
@@ -178,24 +180,9 @@ class TestMaybeMakeRecallCallback:
         )
         assert isinstance(cb, RecallEarlyStopCallback)
         assert cb._num_epochs == 20, (
-            f"callback._num_epochs should be the passed refresh_epochs (20), "
+            f"callback._num_epochs should be the passed num_epochs (20), "
             f"got {cb._num_epochs} (training_config.num_epochs={loop.training_config.num_epochs})"
         )
-
-    def test_num_epochs_default_falls_back_to_training_config(self, tmp_path: Path) -> None:
-        """When num_epochs is not passed (callers using training_config.num_epochs),
-        the callback's _num_epochs must equal training_config.num_epochs —
-        preserving existing behaviour for all non-stage-9 callers.
-        """
-        loop = _make_loop(tmp_path, recall_early_stopping=True)
-        cb, _state = loop._maybe_make_recall_callback(
-            entries=_kp(),
-            adapter_name="episodic",
-            output_dir=tmp_path / "out",
-            phase_name="test",
-        )
-        assert isinstance(cb, RecallEarlyStopCallback)
-        assert cb._num_epochs == loop.training_config.num_epochs
 
     def test_callback_target_registry_built_from_keyed_pairs(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
@@ -205,6 +192,7 @@ class TestMaybeMakeRecallCallback:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=10,
         )
         assert len(cb._target_registry) == 7
         assert set(cb._target_registry.keys()) == {f"graph{i + 1}" for i in range(7)}
@@ -237,26 +225,24 @@ class _Captured:
 # ---------------------------------------------------------------------------
 # Class B — TestCallSiteWiringSourcePresence
 #
-# After the _train_tier_adapter dedup (2026-06-17), the recall callback is
-# no longer wired directly in run_consolidation_cycle or in the full fold.
-# It is funnelled through the single shared helper _train_tier_adapter, which
-# both paths call.
+# After the _train_tier_adapter dedup (2026-06-17) and the migration-routing
+# change, the recall callback is no longer wired directly at ANY production
+# call site. It is funnelled
+# through the single shared helper _train_tier_adapter, which every
+# production path calls (run_consolidation_cycle, the full fold, and
+# active_store_migration._migrate_tier_simulate_to_train).
 #
 # The invariant is now two-part:
 #   1. _train_tier_adapter calls _maybe_make_recall_callback (the funnel).
-#   2. run_consolidation_cycle and the full fold (ConsolidationLoop.consolidate)
-#      call _train_tier_adapter (they use the funnel, not a direct bypass).
+#   2. Every production caller (run_consolidation_cycle, the full fold via
+#      _run_fold, and _migrate_tier_simulate_to_train) calls
+#      _train_tier_adapter (they use the funnel, not a direct bypass).
 #
 # Class F's structural gate (TestProbeTargetIsFullReplaySet) independently
 # checks that every function containing a train_adapter call also contains
 # _maybe_make_recall_callback in the same body — _train_tier_adapter is the
-# sole such function after the dedup, so the gate continues to enforce the
-# "no training site bypasses the recall callback" contract.
-#
-# _run_indexed_key_procedural and _migrate_tier_simulate_to_train each call
-# train_adapter directly (not via _train_tier_adapter) so they still have
-# _maybe_make_recall_callback in their own bodies; their checks are
-# unchanged.
+# sole such function, so the gate continues to enforce the "no training
+# site bypasses the recall callback" contract.
 # ---------------------------------------------------------------------------
 
 
@@ -352,14 +338,26 @@ class TestCallSiteWiringSourcePresence:
             "_prepare_procedural_keys_for_tier must not exist after unified-interim refactor"
         )
 
-    def test_site4_migration(self) -> None:
-        """_migrate_tier_simulate_to_train calls train_adapter directly and must
-        still wire _maybe_make_recall_callback in its own body.
+    def test_site4_migration_routed_through_funnel(self) -> None:
+        """_migrate_tier_simulate_to_train delegates to _train_tier_adapter
+        (the funnel) rather than calling train_adapter or
+        _maybe_make_recall_callback directly -- the per-fold training
+        budget and the recall callback are inherited from the funnel, not
+        duplicated at the migration call site.
         """
         assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/server/active_store_migration.py",
             "_migrate_tier_simulate_to_train",
+            "_train_tier_adapter",
+        )
+        assert not self._function_contains_attr_call(
+            PROJECT_ROOT / "paramem/server/active_store_migration.py",
+            "_migrate_tier_simulate_to_train",
             "_maybe_make_recall_callback",
+        ), (
+            "_migrate_tier_simulate_to_train must not wire "
+            "_maybe_make_recall_callback directly any more — it is reached "
+            "transitively via _train_tier_adapter"
         )
 
 
@@ -391,6 +389,7 @@ class TestEnabledVsDisabledBranch:
             adapter_name="episodic",
             output_dir=tmp_path,
             phase_name="test",
+            num_epochs=10,
         )
         # Mirror the post-refactor call-site pattern.
         callbacks_extra = [cb] if cb is not None else None
@@ -403,6 +402,7 @@ class TestEnabledVsDisabledBranch:
             adapter_name="episodic",
             output_dir=tmp_path,
             phase_name="test",
+            num_epochs=10,
         )
         callbacks_extra = [cb] if cb is not None else None
         assert callbacks_extra is not None
@@ -516,6 +516,28 @@ class TestProbeTargetIsFullReplaySet:
             "with a one-line rationale comment."
         )
 
+    def test_only_train_tier_adapter_calls_train_adapter(self) -> None:
+        """Budget-derivation guard: _train_tier_adapter is the ONLY function
+        across the scanned production modules that calls train_adapter.
+
+        _train_tier_adapter is where the per-fold training budget is derived
+        (paramem.utils.config.budget_for) and applied via dataclasses.replace.
+        A second function calling train_adapter directly would train with an
+        un-derived (and possibly stale) budget, bypassing budget_for
+        entirely -- this test fails the moment that happens, independent of
+        whether the new call site also happens to wire the recall callback.
+        """
+        enclosing_funcs: set[str] = set()
+        for module in PRODUCTION_MODULES:
+            path = PROJECT_ROOT / module
+            tree = ast.parse(path.read_text())
+            for func_node, _call in _find_train_adapter_calls(tree):
+                enclosing_funcs.add(func_node.name)
+        assert enclosing_funcs == {"_train_tier_adapter"}, (
+            "train_adapter must be called ONLY from _train_tier_adapter (the "
+            f"single training funnel); found calls in: {sorted(enclosing_funcs)}"
+        )
+
     def test_allowlist_entries_actually_exist(self) -> None:
         """Every allowlist entry must reference a real FunctionDef in the
         listed module.  Catches stale allowlist entries when a function
@@ -559,6 +581,7 @@ class TestCallbackStateTuple:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=10,
         )
         assert isinstance(result, tuple) and len(result) == 2
         cb, state = result
@@ -574,6 +597,7 @@ class TestCallbackStateTuple:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=10,
         )
         assert cb is None
         assert state is None
@@ -586,6 +610,7 @@ class TestCallbackStateTuple:
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
+            num_epochs=10,
         )
         # Mutate through the callback's internal state; the returned state
         # should reflect the change (same object).

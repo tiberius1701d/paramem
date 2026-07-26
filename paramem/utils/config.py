@@ -1,4 +1,5 @@
-"""Configuration loading and validation — archived training-pipeline loader.
+"""Configuration loading and validation — archived training-pipeline loader,
+plus a live per-fold training-budget derivation.
 
 This module is the YAML loader for the archived Phase 1-4 research scripts
 under ``archive/experiments/`` and their reference YAML at
@@ -12,6 +13,12 @@ The dataclasses defined below (``ParaMemConfig``, ``AdapterConfig``,
 active code as standalone types — many are reused directly by
 ``paramem.server.config``. Only ``load_config`` and the YAML population
 path are archive-only.
+
+``budget_for`` (and the ``_BUDGET_TABLE`` it reads) is NOT archived: it is a
+live production function, called from the consolidation training funnel
+(``paramem.training.consolidation.ConsolidationLoop._train_tier_adapter``)
+on every fold to derive the per-fold epoch / gradient-accumulation /
+LR-decay budget from the training set's key-triple count.
 """
 
 from dataclasses import dataclass, field
@@ -127,6 +134,112 @@ class TrainingConfig:
     # In-training VRAM residual eats into headroom — drop to 1 only if a
     # specific deployment's training-residual pressure forces a downgrade.
     recall_probe_batch_size: int = 16
+    # --- Per-fold training-budget derivation ---
+    # Master switch for `budget_for()` below. Production value comes from
+    # ``ConsolidationScheduleConfig.budget_derivation_enabled``
+    # (paramem.server.config), threaded in at
+    # ``ServerConfig.training_config``. False (default, ship-safe posture for
+    # an unvalidated policy — the smaller two buckets in the budget table
+    # are extrapolated, not anchored) reproduces today's behaviour exactly:
+    # ``budget_for`` passes ``num_epochs`` / ``gradient_accumulation_steps`` /
+    # ``lr_decay_steps`` through unchanged, ignoring the key count.
+    budget_derivation_enabled: bool = False
+    # Raw operator epoch ceiling read by ``budget_for`` for the min-clamp: an
+    # explicitly-set ``max_epochs`` is a wall-time bound on the derived
+    # budget, never a floor (``min(bucket, max_epochs)``). Production value
+    # comes from ``ConsolidationScheduleConfig.max_epochs`` (the SAME
+    # operator field used by the legacy ``num_epochs`` resolution at
+    # ``ServerConfig.training_config``), threaded through RAW — i.e. this
+    # field carries ``None`` when the operator never set it, NOT the
+    # resolved 30-epoch default. Reading the resolved ``num_epochs`` instead
+    # would wrongly clamp the 50- and 80-epoch buckets down to 30. ``None``
+    # (default) means unclamped.
+    budget_max_epochs: int | None = None
+    # --- Donor seeding ---
+    # Master switch for seeding a measured-cold target adapter from the donor
+    # checkpoint before training, at the single funnel
+    # (``ConsolidationLoop._train_tier_adapter`` /
+    # ``_maybe_seed_from_donor`` — see ``paramem.training.donor``). Production
+    # value comes from ``ConsolidationScheduleConfig.donor_seeding_enabled``
+    # (``paramem.server.config``), threaded in at ``ServerConfig.training_config``
+    # exactly like ``budget_derivation_enabled``. False (default, ship-safe
+    # posture for an unvalidated policy — seeding cold small-N folds from a
+    # synthetic population could plausibly worsen the attractor-collapse
+    # failure it targets rather than fix it, and that has not yet been
+    # measured) reproduces today's behaviour exactly: every fold trains
+    # from whatever weights the target adapter already carries, cold or warm.
+    donor_seeding_enabled: bool = False
+
+
+# Per-fold training budget table. Ordered by descending key-count floor; the
+# first row whose floor `n_keys` meets is the bucket. `batch` is not part of
+# the table — it stays 1 everywhere (TrainingConfig.batch_size /
+# ConsolidationScheduleConfig.training_batch_size default). Epoch counts are
+# CAPS, not targets: when TrainingConfig.recall_early_stopping is on, the
+# recall gate terminates training before the cap in the common case.
+# `lr_decay_steps` defaults to None for every bucket (today's behaviour:
+# create_scheduler's no-op passthrough; see TrainingConfig.lr_decay_steps).
+#
+# See configs/server.yaml.example (consolidation.budget_derivation_enabled)
+# for the per-bucket epoch/accum values and their evidence status — only the
+# largest bucket is anchored on production fold telemetry; the smaller two
+# are extrapolated.
+_BUDGET_TABLE: tuple[tuple[int, int, int, "int | None"], ...] = (
+    # (n_keys floor, epochs, accum, lr_decay_steps)
+    (128, 30, 2, None),
+    (16, 50, 2, None),
+    (0, 80, 1, None),
+)
+
+
+def budget_for(n_keys: int, training_config: "TrainingConfig") -> "tuple[int, int, int | None]":
+    """Derive the per-fold training budget from the key-triple count.
+
+    Pure, module-level, and callable independently of whether training has
+    run (see the call sites in ``paramem.training.consolidation``, which
+    invoke this in the enclosing scope BEFORE the training ``try`` block so
+    the ``finally``-path telemetry records the true budget even when
+    training raises).
+
+    Args:
+        n_keys: number of key-triples (entries) in the training set for this
+            fold -- ``len(entries)`` at the call site.
+        training_config: the ``TrainingConfig`` for this call. Read for
+            ``budget_derivation_enabled`` (master switch) and
+            ``budget_max_epochs`` (operator ceiling, read RAW/unclamped).
+
+    Returns:
+        ``(epochs, gradient_accumulation_steps, lr_decay_steps)``.
+
+        When ``training_config.budget_derivation_enabled`` is False, this is
+        exactly ``(training_config.num_epochs,
+        training_config.gradient_accumulation_steps,
+        training_config.lr_decay_steps)`` -- today's behaviour, unchanged.
+
+        When True, ``epochs``/``accum``/``lr_decay_steps`` come from the
+        bucket in ``_BUDGET_TABLE`` matching ``n_keys``, with ``epochs``
+        additionally clamped to ``min(bucket_epochs,
+        training_config.budget_max_epochs)`` when the latter is not None --
+        an explicitly-set ``max_epochs`` is an operator wall-time bound on
+        the derived budget, never a floor.
+    """
+    if not training_config.budget_derivation_enabled:
+        return (
+            training_config.num_epochs,
+            training_config.gradient_accumulation_steps,
+            training_config.lr_decay_steps,
+        )
+    # Single lookup: the first row whose floor n_keys meets or exceeds. The
+    # table's last row has floor=0, so this always matches for n_keys >= 0
+    # (len() of a list is never negative) -- no default fallback needed.
+    epochs, accum, lr_decay_steps = next(
+        (row_epochs, row_accum, row_lr_decay)
+        for row_floor, row_epochs, row_accum, row_lr_decay in _BUDGET_TABLE
+        if n_keys >= row_floor
+    )
+    if training_config.budget_max_epochs is not None:
+        epochs = min(epochs, training_config.budget_max_epochs)
+    return epochs, accum, lr_decay_steps
 
 
 @dataclass

@@ -72,7 +72,7 @@ paramem = "paramem.cli.main:main"
 include = ["paramem*"]
 
 [tool.setuptools.package-data]
-paramem = ["web/static/*", "web/static/**/*"]
+paramem = ["web/static/*", "web/static/**/*", "training/donor_fixture.json"]
 
 [tool.ruff]
 line-length = 100

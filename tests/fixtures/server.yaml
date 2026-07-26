@@ -260,6 +260,17 @@ consolidation:
   # overkill on future base models. With recall_early_stopping=true, this
   # becomes the upper bound; with the flag off, this is the fixed budget.
   # max_epochs: null
+  # Per-fold training-budget derivation -- see
+  # paramem.utils.config.budget_for / _BUDGET_TABLE for the bucket values.
+  # false matches server.yaml.example -- unit tests construct TrainingConfig
+  # directly with budget_derivation_enabled=True where they need to exercise
+  # budget_for; no GPU fixture coverage needed for the new/unvalidated policy.
+  budget_derivation_enabled: false
+  # Donor seeding -- see configs/server.yaml.example for the full rationale.
+  # false matches server.yaml.example; unit tests construct TrainingConfig
+  # directly with donor_seeding_enabled=True where they need to exercise the
+  # seeding hook -- no GPU fixture coverage needed for the new/unvalidated policy.
+  donor_seeding_enabled: false
   # Recall-based early stopping — flipped ON 2026-05-06 for the first
   # production cycle.  signal_from_epoch=20 is a conservative floor
   # given Test 14's multi-seed cells stopped between e18-e26.

@@ -9,13 +9,17 @@ a different shape and a different lifecycle — every fold cycle writes its own
 record set regardless of outcome, so the store is a bounded ring of the last
 ``max_cycles`` cycles rather than a deduplicated event table.
 
-This module exists for general hang diagnosability, not to test any specific
-VRAM-cost hypothesis. The payload is integers, adapter/tier names, and
-ISO-8601 timestamps only — never transcripts, facts, keys, or speaker ids.
-Always written, regardless of ``debug`` (the privacy / artifact-persistence
-switch that gates whether transcript-derived debug snapshots are written) —
-gating telemetry on it would blind every ship-safe (``debug: false``)
-deployment.
+This module exists for general hang diagnosability AND per-fold training
+budget observability (the ring's second consumer — see the
+``n_keys``/``accum``/``epochs_to_bind``/``steps_to_bind``/``hit_cap``/
+``init``/``stale_keys``/``aborted`` fields recorded by
+``paramem.training.consolidation``), not to test any specific VRAM-cost
+hypothesis. The payload is integers, booleans, short enum strings (e.g.
+``init: "cold"|"warm"|"donor"``), adapter/tier names, and ISO-8601 timestamps only
+— never transcripts, facts, keys, or speaker ids. Always written,
+regardless of ``debug`` (the privacy / artifact-persistence switch that
+gates whether transcript-derived debug snapshots are written) — gating
+telemetry on it would blind every ship-safe (``debug: false``) deployment.
 
 Schema
 ------
@@ -108,10 +112,12 @@ def record_fold_telemetry(
         Discriminator for the record shape (e.g. ``"backup_creation"``,
         ``"tier_train"``, ``"interim_tier_train"``).
     record:
-        Caller-supplied integer/string fields (e.g. ``free_before``,
+        Caller-supplied integer/boolean/string fields (e.g. ``free_before``,
         ``free_after``, ``peak_alloc``, ``adapter_count``, ``interim_count``,
-        ``epochs``, ``tier``). Never transcripts, facts, keys, or speaker
-        ids.
+        ``epochs``, ``tier``, ``n_keys``, ``accum``, ``epochs_to_bind``,
+        ``steps_to_bind``, ``hit_cap``, ``aborted``,
+        ``init`` (``"cold"``/``"warm"``/``"donor"``), ``stale_keys``). Never transcripts,
+        facts, keys, or speaker ids.
     max_cycles:
         Ring size. Once the number of distinct cycles exceeds this, the
         oldest cycles are evicted (a ring, not a prune job).

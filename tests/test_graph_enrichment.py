@@ -2687,24 +2687,28 @@ class TestHarvestKeylessEdges:
     def test_highwater_seeding_prevents_collision(self, tmp_path):
         """_indexed_next_index seeds from existing store keys; new key avoids collision.
 
-        Pre-seed the store with graph5 before constructing the loop so the
-        constructor's high-water scan sets _indexed_next_index to 6.  Inject
-        one keyless episodic edge.  The minted key must be graph6 — not graph1
-        (unchecked start) and not graph5 (collision with the pre-existing key).
+        Pre-seed the store with graph250 (beyond the donor's reserved
+        graph1-graph200 band, paramem.training.donor.DONOR_KEY_BAND_WIDTH)
+        before constructing the loop so the constructor's high-water scan
+        sets _indexed_next_index to 251 — proving the store-derived
+        high-water value can raise the floor (DONOR_KEY_FLOOR=201), not just
+        default to it. Inject one keyless episodic edge. The minted key must
+        be graph251 — not graph201 (the bare floor, ignoring the store) and
+        not graph250 (collision with the pre-existing key).
         """
         from paramem.memory.store import MemoryStore as _MS
         from paramem.training.key_registry import KeyRegistry
 
         # Build and hydrate the store BEFORE loop construction so the
-        # constructor's _indexed_next_index seeding scan sees graph5.
+        # constructor's _indexed_next_index seeding scan sees graph250.
         store = _MS(replay_enabled=True)
         for tier in ("episodic", "semantic", "procedural"):
             store.load_registry(tier, KeyRegistry())
         store.put(
             "episodic",
-            "graph5",
+            "graph250",
             {
-                "key": "graph5",
+                "key": "graph250",
                 "question": "q",
                 "answer": "a",
                 "subject": "Prior",
@@ -2737,9 +2741,10 @@ class TestHarvestKeylessEdges:
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
 
-        # Constructor must have picked up graph5 → _indexed_next_index == 6.
-        assert loop._indexed_next_index == 6, (
-            f"Expected _indexed_next_index=6 after seeding graph5, got {loop._indexed_next_index}"
+        # Constructor must have picked up graph250 -> _indexed_next_index == 251.
+        assert loop._indexed_next_index == 251, (
+            f"Expected _indexed_next_index=251 after seeding graph250, "
+            f"got {loop._indexed_next_index}"
         )
 
         loop.merger.graph.add_edge(
@@ -2756,12 +2761,134 @@ class TestHarvestKeylessEdges:
         assert len(tier_keyed["episodic"]) == 1
         minted_key = tier_keyed["episodic"][0]["key"]
 
-        # Must be graph6 — no collision with the pre-existing graph5.
-        assert minted_key == "graph6", (
-            f"Expected minted key 'graph6' to avoid collision with graph5, got {minted_key!r}"
+        # Must be graph251 — no collision with the pre-existing graph250.
+        assert minted_key == "graph251", (
+            f"Expected minted key 'graph251' to avoid collision with graph250, got {minted_key!r}"
         )
-        # Pre-existing graph5 entry must still be intact.
-        assert "graph5" in loop.store.all_active_keys()
+        # Pre-existing graph250 entry must still be intact.
+        assert "graph250" in loop.store.all_active_keys()
+
+    def test_donor_key_floor_on_empty_store(self, tmp_path):
+        """An empty store must seed both counters at DONOR_KEY_FLOOR (201),
+        not 1 -- the donor (paramem.training.donor) reserves graph1-200 and
+        proc1-200 for its synthetic training population."""
+        from paramem.training.donor import DONOR_KEY_FLOOR
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+
+        assert loop._indexed_next_index == DONOR_KEY_FLOOR == 201
+        assert loop._procedural_next_index == DONOR_KEY_FLOOR == 201
+
+    def test_donor_key_floor_high_water_still_wins(self, tmp_path):
+        """A store high-water key beyond the reserved band must still raise the
+        counter past DONOR_KEY_FLOOR -- the floor is a lower bound, never a
+        ceiling on the constructor's max() derivation."""
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.donor import DONOR_KEY_FLOOR
+        from paramem.training.key_registry import KeyRegistry
+
+        store = _MS(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        store.put(
+            "procedural",
+            "proc300",
+            {
+                "key": "proc300",
+                "question": "q",
+                "answer": "a",
+                "subject": "speaker0",
+                "predicate": "has_interest",
+                "object": "kayaking",
+            },
+        )
+
+        model = MagicMock()
+        model.__class__ = PeftModel
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "in_training": MagicMock(),
+        }
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=store,
+            procedural_adapter_config=None,
+            output_dir=tmp_path,
+            extraction_enrichment_provider="anthropic",
+            extraction_enrichment_provider_model="claude-sonnet-4-6",
+            extraction_scrub={"person name"},
+        )
+
+        assert loop._procedural_next_index == 301, (
+            f"Expected _procedural_next_index=301 (high-water beats "
+            f"DONOR_KEY_FLOOR={DONOR_KEY_FLOOR}), got {loop._procedural_next_index}"
+        )
+        assert loop._indexed_next_index == DONOR_KEY_FLOOR
+
+    def test_donor_key_floor_seeds_from_stale_keys_too(self, tmp_path):
+        """Regression: a key soft-staled AFTER put must still
+        raise the constructor's high-water counter. Seeding from
+        all_active_keys() alone (the pre-fix behaviour) would miss a stale
+        highest key, re-mint its numeric id on the next fold, and
+        set_simhash would then route the new fingerprint into the stale
+        record (paramem.training.key_registry) -- a silent recall miss on the
+        reissued key. all_known_keys() (active UNION stale) closes this."""
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
+
+        store = _MS(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        store.put(
+            "episodic",
+            "graph260",
+            {
+                "key": "graph260",
+                "question": "q",
+                "answer": "a",
+                "subject": "Prior",
+                "predicate": "knows",
+                "object": "Fact",
+            },
+        )
+        # Soft-stale the key BEFORE loop construction -- it must no longer be
+        # active, but its numeric id must still be protected from reissue.
+        store.discard_keys(["graph260"], mode="stale")
+        assert "graph260" not in store.all_active_keys()
+        assert "graph260" in store.all_known_keys()
+
+        model = MagicMock()
+        model.__class__ = PeftModel
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "in_training": MagicMock(),
+        }
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=store,
+            procedural_adapter_config=None,
+            output_dir=tmp_path,
+            extraction_enrichment_provider="anthropic",
+            extraction_enrichment_provider_model="claude-sonnet-4-6",
+            extraction_scrub={"person name"},
+        )
+
+        assert loop._indexed_next_index == 261, (
+            f"Expected _indexed_next_index=261 (stale graph260 must still bump "
+            f"the high-water counter), got {loop._indexed_next_index}"
+        )
 
 
 class TestHarvestApplySplit:

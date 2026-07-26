@@ -459,6 +459,159 @@ class TestMarkConsolidatedDocGroups:
 
         assert (retention_dir / f"{session_id}.jsonl").exists()
 
+    def test_retired_doc_chunk_archives_group_under_retired_doc_subdir(self, tmp_path):
+        """A retired chunk pulls the whole doc_id group + origdoc into
+        retention_dir/retired_recall_failed/<doc_id>/ — doc-atomicity extends
+        to the retired distinction; a document is never split across the two
+        destinations.
+        """
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=True,
+            debug=False,
+        )
+
+        doc_id = "doc-retired1"
+        chunk_sid = f"{doc_id}-c000"
+        self._add_doc_chunk(buf, chunk_sid, doc_id, chunk_count=1, doc_filename="retired.md")
+        buf.write_origdoc(doc_id, b"retired original content")
+
+        retention_dir = tmp_path / "retention"
+        buf.mark_consolidated(
+            [chunk_sid],
+            retention_dir=retention_dir,
+            retired_session_ids={chunk_sid},
+        )
+
+        retired_doc_dir = retention_dir / "retired_recall_failed" / doc_id
+        assert (retired_doc_dir / f"{chunk_sid}.jsonl").exists()
+        assert (retired_doc_dir / "retired.md").exists()
+        assert (retired_doc_dir / "retired.md").read_bytes() == b"retired original content"
+        # Not archived under the plain (non-retired) doc location.
+        assert not (retention_dir / doc_id).exists()
+
+    def test_retired_doc_chunk_pulls_sibling_chunks_and_origdoc_too(self, tmp_path):
+        """Two-chunk document, only ONE chunk in retired_session_ids: BOTH chunk
+        JSONLs and the origdoc still land under the retired subdir together —
+        this is the case that would pass even if ``retired_doc_ids`` (the
+        doc-atomicity mechanism, session_buffer.py) were deleted, since a
+        single-chunk document can't distinguish "this chunk's own retired flag"
+        from "the group's retired flag". Two chunks force the distinction.
+        """
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=True,
+            debug=False,
+        )
+
+        doc_id = "doc-retired2"
+        chunk0_sid = f"{doc_id}-c000"
+        chunk1_sid = f"{doc_id}-c001"
+        self._add_doc_chunk(buf, chunk0_sid, doc_id, chunk_count=2, doc_filename="retired2.md")
+        self._add_doc_chunk(buf, chunk1_sid, doc_id, chunk_count=2, doc_filename="retired2.md")
+        buf.write_origdoc(doc_id, b"two-chunk retired content")
+
+        retention_dir = tmp_path / "retention"
+        # Only chunk0 is retired; chunk1 consolidated cleanly.
+        buf.mark_consolidated(
+            [chunk0_sid, chunk1_sid],
+            retention_dir=retention_dir,
+            retired_session_ids={chunk0_sid},
+        )
+
+        retired_doc_dir = retention_dir / "retired_recall_failed" / doc_id
+        # BOTH chunks — including the non-retired sibling — land under the
+        # retired subdir, since a document is never split across destinations.
+        assert (retired_doc_dir / f"{chunk0_sid}.jsonl").exists()
+        assert (retired_doc_dir / f"{chunk1_sid}.jsonl").exists()
+        assert (retired_doc_dir / "retired2.md").exists()
+        assert (retired_doc_dir / "retired2.md").read_bytes() == b"two-chunk retired content"
+        # The plain (non-retired) doc location must not exist at all.
+        assert not (retention_dir / doc_id).exists()
+
+
+class TestMarkConsolidatedRetiredSessions:
+    def test_retired_transcript_lands_under_retired_subdir(self, tmp_path):
+        """A retired (retry-capped) transcript session is archived under
+        retention_dir/retired_recall_failed/, not the flat layout.
+        """
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=True,
+            debug=False,
+        )
+        buf.append("conv-retired1", "user", "hello")
+        session_id = buf.get_pending()[0]["session_id"]
+
+        retention_dir = tmp_path / "retention"
+        buf.mark_consolidated(
+            [session_id],
+            retention_dir=retention_dir,
+            retired_session_ids={session_id},
+        )
+
+        assert (retention_dir / "retired_recall_failed" / f"{session_id}.jsonl").exists()
+        assert not (retention_dir / f"{session_id}.jsonl").exists()
+
+    def test_retired_transcript_unlinked_when_retain_false(self, tmp_path):
+        """retain_sessions=False (and debug=False) still means unlink for
+        retired sessions too — retention is the operator's choice, not a
+        second policy for the retired subset.
+        """
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=False,
+            debug=False,
+        )
+        buf.append("conv-retired2", "user", "hello")
+        session_id = buf.get_pending()[0]["session_id"]
+
+        buf.mark_consolidated(
+            [session_id],
+            retention_dir=None,
+            retired_session_ids={session_id},
+        )
+
+        assert not (sessions_dir / f"{session_id}.jsonl").exists()
+
+    def test_non_retired_sessions_in_mixed_batch_keep_flat_layout(self, tmp_path):
+        """A mixed mark_consolidated call (one retired, one clean) leaves the
+        clean session on today's flat layout — retired_session_ids does not
+        change behaviour for sessions outside it.
+        """
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=True,
+            debug=False,
+        )
+        buf.append("conv-retired3", "user", "hello")
+        retired_sid = buf.get_pending()[0]["session_id"]
+        buf.append("conv-clean3", "user", "hi")
+        clean_sid = [s["session_id"] for s in buf.get_pending() if s["session_id"] != retired_sid][
+            0
+        ]
+
+        retention_dir = tmp_path / "retention"
+        buf.mark_consolidated(
+            [retired_sid, clean_sid],
+            retention_dir=retention_dir,
+            retired_session_ids={retired_sid},
+        )
+
+        assert (retention_dir / "retired_recall_failed" / f"{retired_sid}.jsonl").exists()
+        assert (retention_dir / f"{clean_sid}.jsonl").exists()
+        assert not (retention_dir / f"{retired_sid}.jsonl").exists()
+
 
 # ---------------------------------------------------------------------------
 # discard_sessions with origdoc cleanup

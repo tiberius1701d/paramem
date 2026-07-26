@@ -291,6 +291,164 @@ class TestCreateInterimAdapterIdempotent:
 
 
 # ---------------------------------------------------------------------------
+# Test 3b — ensure_adapter_matching (the shared warm-init config-mismatch guard)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureAdapterMatching:
+    """``paramem.models.loader.ensure_adapter_matching`` — the single
+    config-mismatch guard called from both warm-init preambles (main-tier
+    fold, interim-slot mint).  Reuses ``_make_stub_peft_model`` (the same
+    ``spec=PeftModel`` + real-dict ``peft_config`` double used above for
+    ``main_tier_backup_scope``/``create_interim_adapter``).
+    """
+
+    @staticmethod
+    def _adapter_config():
+        from paramem.utils.config import AdapterConfig
+
+        return AdapterConfig(rank=8, alpha=16, target_modules=["q_proj", "v_proj"])
+
+    def test_absent_adapter_creates_cold(self) -> None:
+        """No resident adapter under this name -> create_adapter (cold birth)."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        returned_model = MagicMock()
+
+        with patch(
+            "paramem.models.loader.create_adapter", return_value=returned_model
+        ) as mock_create:
+            from paramem.models.loader import ensure_adapter_matching
+
+            result = ensure_adapter_matching(model, adapter_config, "procedural")
+
+        mock_create.assert_called_once_with(model, adapter_config, "procedural")
+        assert result is returned_model
+
+    def test_matching_resident_is_a_no_op(self) -> None:
+        """A resident adapter whose r/lora_alpha/target_modules already match
+        the target config is left untouched -- no delete, no create."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        resident = model.peft_config["episodic"]
+        resident.r = adapter_config.rank
+        resident.lora_alpha = adapter_config.alpha
+        resident.target_modules = list(adapter_config.target_modules)
+
+        with patch("paramem.models.loader.create_adapter") as mock_create:
+            from paramem.models.loader import ensure_adapter_matching
+
+            result = ensure_adapter_matching(model, adapter_config, "episodic")
+
+        mock_create.assert_not_called()
+        model.delete_adapter.assert_not_called()
+        assert result is model
+        assert "episodic" in model.peft_config, "the resident adapter must survive untouched"
+
+    def test_rank_mismatch_recreates_cold(self) -> None:
+        """A rank change is deleted and recreated -- never compared by
+        parameter key set (a rank change would surface there as a
+        tensor-shape error, not a key mismatch)."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        resident = model.peft_config["episodic"]
+        resident.r = 4  # target is rank=8
+        resident.lora_alpha = adapter_config.alpha
+        resident.target_modules = list(adapter_config.target_modules)
+        returned_model = MagicMock()
+
+        with patch(
+            "paramem.models.loader.create_adapter", return_value=returned_model
+        ) as mock_create:
+            from paramem.models.loader import ensure_adapter_matching
+
+            result = ensure_adapter_matching(model, adapter_config, "episodic")
+
+        model.delete_adapter.assert_called_once_with("episodic")
+        mock_create.assert_called_once_with(model, adapter_config, "episodic")
+        assert result is returned_model
+
+    def test_alpha_mismatch_recreates_cold(self) -> None:
+        """A lora_alpha change alone is also a mismatch."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        resident = model.peft_config["episodic"]
+        resident.r = adapter_config.rank
+        resident.lora_alpha = 32  # target is alpha=16
+        resident.target_modules = list(adapter_config.target_modules)
+
+        with patch("paramem.models.loader.create_adapter") as mock_create:
+            from paramem.models.loader import ensure_adapter_matching
+
+            ensure_adapter_matching(model, adapter_config, "episodic")
+
+        model.delete_adapter.assert_called_once_with("episodic")
+        mock_create.assert_called_once_with(model, adapter_config, "episodic")
+
+    def test_target_modules_mismatch_recreates_cold(self) -> None:
+        """A target_modules change alone is also a mismatch (order-insensitive)."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        resident = model.peft_config["episodic"]
+        resident.r = adapter_config.rank
+        resident.lora_alpha = adapter_config.alpha
+        resident.target_modules = ["q_proj"]  # target is ["q_proj", "v_proj"]
+
+        with patch("paramem.models.loader.create_adapter") as mock_create:
+            from paramem.models.loader import ensure_adapter_matching
+
+            ensure_adapter_matching(model, adapter_config, "episodic")
+
+        model.delete_adapter.assert_called_once_with("episodic")
+        mock_create.assert_called_once_with(model, adapter_config, "episodic")
+
+    def test_target_modules_order_insensitive_match(self) -> None:
+        """Same modules in a different order is still a match, not a mismatch."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        resident = model.peft_config["episodic"]
+        resident.r = adapter_config.rank
+        resident.lora_alpha = adapter_config.alpha
+        resident.target_modules = list(reversed(adapter_config.target_modules))
+
+        with patch("paramem.models.loader.create_adapter") as mock_create:
+            from paramem.models.loader import ensure_adapter_matching
+
+            result = ensure_adapter_matching(model, adapter_config, "episodic")
+
+        mock_create.assert_not_called()
+        model.delete_adapter.assert_not_called()
+        assert result is model
+
+    def test_mismatch_warning_names_the_field(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The recreate-on-mismatch path logs a warning naming the adapter
+        and the mismatched field."""
+        model = _make_stub_peft_model("episodic")
+        adapter_config = self._adapter_config()
+        resident = model.peft_config["episodic"]
+        resident.r = 4
+        resident.lora_alpha = adapter_config.alpha
+        resident.target_modules = list(adapter_config.target_modules)
+
+        loader_logger = logging.getLogger("paramem.models.loader")
+        loader_logger.addHandler(caplog.handler)
+        loader_logger.setLevel(logging.WARNING)
+        try:
+            with patch("paramem.models.loader.create_adapter"):
+                from paramem.models.loader import ensure_adapter_matching
+
+                ensure_adapter_matching(model, adapter_config, "episodic")
+        finally:
+            loader_logger.removeHandler(caplog.handler)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a mismatch warning"
+        message = warnings[0].getMessage()
+        assert "episodic" in message
+        assert "r:" in message
+
+
+# ---------------------------------------------------------------------------
 # Test 4 — unload_interim_adapters removes interims, leaves mains intact
 # ---------------------------------------------------------------------------
 

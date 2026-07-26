@@ -729,6 +729,21 @@ class MemoryStore:
             reg = self._registry.get(tier)
             return reg.list_active() if reg is not None else []
 
+    def stale_keys_in_tier(self, tier: str) -> list[str]:
+        """Return the stale keys for *tier* from the registry.
+
+        Per-tier analogue of :meth:`active_keys_in_tier` for the stale
+        partition. Used by fold telemetry (``paramem.training.consolidation``)
+        to measure encoded-vs-active divergence at fold entry — a key that
+        has been fully erased via ``discard_keys(mode="erase")`` (rather
+        than soft-staled) is removed from the registry entirely and is
+        therefore invisible to this count, by design (the registry has
+        nothing left to report).
+        """
+        with self._lock:
+            reg = self._registry.get(tier)
+            return reg.list_stale() if reg is not None else []
+
     def all_active_keys(self) -> list[str]:
         """Every active key across every registered tier."""
         with self._lock:

@@ -3897,15 +3897,16 @@ class TestAbortSkipsCommit:
         assert marker is not None, "fold_resume.json marker must be left for retry"
         assert "episodic" in marker.get("completed_tiers", []), marker
 
-    def test_telemetry_skipped_when_cuda_unavailable_and_exception_type_preserved(
+    def test_telemetry_recorded_when_cuda_unavailable_and_exception_type_preserved(
         self, monkeypatch, tmp_path
     ):
-        """Fold telemetry is guarded by torch.cuda.is_available(): with
-        CUDA unavailable, the fold runs unchanged — no telemetry write —
-        and the finally-block telemetry code never alters the exception
-        type escaping _train_tier_adapter. Uses a distinctive exception
-        subclass so a type substitution (e.g. by an accidental broad
-        except) would be caught.
+        """Budget/bind/init/stale fields sit OUTSIDE the
+        torch.cuda.is_available() gate, so the ring record is written even
+        when CUDA is unavailable (only the VRAM-specific fields stay
+        conditional on it) -- and the finally-block telemetry code never
+        alters the exception type escaping _train_tier_adapter. Uses a
+        distinctive exception subclass so a type substitution (e.g. by an
+        accidental broad except) would be caught.
         """
         from unittest.mock import MagicMock, patch
 
@@ -3984,7 +3985,14 @@ class TestAbortSkipsCommit:
             with pytest.raises(_DistinctiveError, match="boom"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
-        mock_telemetry.assert_not_called()
+        # The record IS written but carries no VRAM
+        # fields, since CUDA was unavailable for this measurement.
+        assert mock_telemetry.called
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected a tier_train telemetry record even without CUDA"
+        assert "free_before" not in tier_train_calls[0].kwargs["record"]
 
     def test_telemetry_write_failure_does_not_replace_abort(self, monkeypatch, tmp_path):
         """A telemetry write failure inside the tier ``finally`` must never
@@ -4254,6 +4262,904 @@ class TestAbortSkipsCommit:
             "record_fold_telemetry was not called with save_cycle_snapshots=False —"
             " telemetry must never be gated on the debug-derived flag"
         )
+
+    def test_main_tier_telemetry_records_derived_epochs(self, monkeypatch, tmp_path):
+        """The main-tier fold's telemetry `record["epochs"]` must carry the
+        DERIVED budget (paramem.utils.config.budget_for), not
+        refresh_training_config.num_epochs -- the value must survive even
+        though it is computed before the try block (finally-path record).
+
+        One episodic key (N=1) with budget_derivation_enabled=True falls in
+        the smallest bucket (< 16 keys -> 80 epochs), which differs from the
+        harness's configured training_config.num_epochs=1 -- an unmistakable
+        signal that the recorded value is the derived one.
+        """
+        import dataclasses
+        from unittest.mock import MagicMock, patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+        loop.training_config = dataclasses.replace(
+            loop.training_config, budget_derivation_enabled=True
+        )
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        trained_metrics = {"train_loss": 0.1, "aborted": False}
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            self._mock_cuda_available_stats(),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        assert mock_telemetry.called
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        assert tier_train_calls[0].kwargs["record"]["epochs"] == 80, (
+            "telemetry must record the DERIVED budget (80, smallest bucket for N=1), "
+            f"got {tier_train_calls[0].kwargs['record']}"
+        )
+
+    def test_main_tier_telemetry_records_budget_fields_without_cuda(self, monkeypatch, tmp_path):
+        """n_keys/accum/init/stale_keys must be recorded for the main-tier
+        fold even when CUDA is unavailable -- proves these fields sit
+        OUTSIDE the torch.cuda.is_available() gate.
+        The mock model's named_parameters() carries a zero-valued lora_B
+        tensor for the episodic adapter so measured_adapter_init_state
+        classifies init="cold" instead of degrading to an absent field.
+        """
+        import dataclasses
+        from unittest.mock import patch
+
+        import networkx as _nx
+        import torch as _torch
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+        loop.training_config = dataclasses.replace(
+            loop.training_config, budget_derivation_enabled=True
+        )
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop.model.named_parameters.return_value = [
+            ("base_model.model.x.lora_B.episodic.weight", _torch.zeros(2, 2)),
+        ]
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        trained_metrics = {"train_loss": 0.1, "aborted": False}
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        assert mock_telemetry.called
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["n_keys"] == 1
+        assert record["accum"] == 1  # bucket <16 keys -> accum=1
+        assert record["stale_keys"] == 0
+        assert record["init"] == "cold"
+        assert "free_before" not in record, "VRAM fields must stay absent when CUDA is unavailable"
+        assert "peak_alloc" not in record
+        for field, value in record.items():
+            if isinstance(value, str):
+                assert field in {"tier", "fold_stamp", "init"}, (
+                    f"unexpected non-numeric string field {field!r}={value!r}"
+                )
+                if field == "init":
+                    assert value in {"cold", "warm", "donor"}
+
+    def test_main_tier_telemetry_tags_donor_seeded_fold(self, monkeypatch, tmp_path):
+        """A cold target adapter seeded from a VALID donor checkpoint must be
+        tagged init="donor" in the tier_train telemetry record, not the
+        pre-training "cold" measurement -- the funnel's returned metrics dict
+        carries donor_seeded=True and the call site overrides its telemetry
+        record from that, per the seeding hook's docstring (no second
+        measurement)."""
+        import dataclasses
+        from unittest.mock import patch
+
+        import networkx as _nx
+        import torch as _torch
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+        loop.training_config = dataclasses.replace(
+            loop.training_config, budget_derivation_enabled=True, donor_seeding_enabled=True
+        )
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop.model.named_parameters.return_value = [
+            ("base_model.model.x.lora_B.episodic.weight", _torch.zeros(2, 2)),
+        ]
+        loop.model.get_base_model.return_value.config._name_or_path = "test/base-model"
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        trained_metrics = {"train_loss": 0.1, "aborted": False}
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
+            patch.multiple(
+                "paramem.models.loader",
+                copy_adapter_weights=MagicMock(),
+                copy_adapter_weights_subset=MagicMock(return_value=4),
+                create_adapter=MagicMock(side_effect=lambda m, cfg, name: m),
+                switch_adapter=MagicMock(),
+            ),
+            patch.multiple(
+                "paramem.training.donor",
+                donor_checkpoint_valid=MagicMock(return_value=True),
+                load_donor_into_transient_slot=MagicMock(),
+            ),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        assert mock_telemetry.called
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["init"] == "donor", (
+            f"donor-seeded fold must be tagged init='donor', got {record!r}"
+        )
+
+    def test_main_tier_telemetry_records_bind_fields_on_success(self, monkeypatch, tmp_path):
+        """epochs_to_bind/steps_to_bind/hit_cap are derived from the
+        recall_state _train_tier_adapter returns on the success path."""
+        from unittest.mock import patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.early_stop import _EarlyStopState
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        fake_recall_state = _EarlyStopState(stop_epoch=5)
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                return_value=({"aborted": False, "train_loss": 0.1}, fake_recall_state),
+            ),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["epochs_to_bind"] == 5
+        assert record["hit_cap"] is False
+        # n_keys=1 (single episodic entry) with budget derivation off in
+        # this test (TrainingConfig's default gradient_accumulation_steps=8
+        # passes through unchanged) -> ceil(1/8) * 5 = 5 steps regardless
+        # of accum's exact value.
+        assert record["steps_to_bind"] == 5
+
+    def test_main_tier_telemetry_hit_cap_when_recall_never_fires(self, monkeypatch, tmp_path):
+        """hit_cap=True and epochs_to_bind/steps_to_bind stay absent when
+        the recall_state carries stop_epoch=None (the recall signal never
+        fired within the derived epoch budget)."""
+        from unittest.mock import patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.early_stop import _EarlyStopState
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        fake_recall_state = _EarlyStopState(stop_epoch=None)
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                return_value=({"aborted": False, "train_loss": 0.1}, fake_recall_state),
+            ),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["hit_cap"] is True
+        assert "epochs_to_bind" not in record
+        assert "steps_to_bind" not in record
+
+    def test_main_tier_telemetry_omits_bind_fields_on_exception(self, monkeypatch, tmp_path):
+        """A raise inside _train_tier_adapter still writes the tier_train
+        telemetry record (finally-path) with n_keys/accum/stale_keys
+        populated but epochs_to_bind/steps_to_bind/hit_cap absent --
+        recall_state stays at its pre-declared None when the call never
+        returns a value to unpack.
+        """
+        from unittest.mock import patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        # A dedicated output_dir (not the bare _make_minimal_loop default):
+        # _fold_state_dir is output_dir.parent / "state", and the bare
+        # tmp_path fixture shares its .parent across sibling tests in this
+        # class -- without this, an identical-content fold_resume.json
+        # marker from a sibling test can leak into this test's resume
+        # detection and short-circuit training before it ever raises.
+        loop.output_dir = tmp_path / "rundir"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch.object(
+                ConsolidationLoop, "_train_tier_adapter", side_effect=RuntimeError("boom")
+            ),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            with pytest.raises(RuntimeError, match="boom"):
+                loop.consolidate(mode="train", trainer=None, router=None)
+
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "telemetry must still be written on the exception path"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["n_keys"] == 1
+        assert record["aborted"] is False
+        assert "epochs_to_bind" not in record
+        assert "steps_to_bind" not in record
+        assert "hit_cap" not in record
+
+    def test_main_tier_telemetry_construction_failure_does_not_replace_in_flight_exception(
+        self, monkeypatch, tmp_path
+    ):
+        """A raise while BUILDING the telemetry record (not just while
+        writing it) must not replace the exception in flight from
+        _train_tier_adapter. Forces _recall_bind_telemetry (called during
+        record construction, inside the guarded try) to raise a distinct
+        error while _train_tier_adapter raises its own distinct error --
+        the ORIGINAL error must be what the caller sees.
+        """
+        from unittest.mock import patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        class _OriginalTrainingError(RuntimeError):
+            pass
+
+        class _ConstructionBoom(RuntimeError):
+            pass
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                side_effect=_OriginalTrainingError("original training failure"),
+            ),
+            patch(
+                "paramem.training.consolidation._recall_bind_telemetry",
+                side_effect=_ConstructionBoom("record construction exploded"),
+            ),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            with pytest.raises(_OriginalTrainingError, match="original training failure"):
+                loop.consolidate(mode="train", trainer=None, router=None)
+
+        # The telemetry write itself never reaches record_fold_telemetry --
+        # construction raised first, and that failure is swallowed (logged)
+        # rather than propagated or silently skipping the guard.
+        assert not mock_telemetry.called
+
+    def test_main_tier_telemetry_abort_path_sets_aborted_and_omits_hit_cap(
+        self, monkeypatch, tmp_path
+    ):
+        """When _train_tier_adapter's metrics report aborted=True, the
+        main-tier branch converts this into a raised
+        AbortedDuringConsolidation -- but recall_state and the metrics dict
+        are already bound by then, so the finally-path record must carry
+        aborted=True and OMIT hit_cap (which would otherwise misrepresent
+        the abort as "ran to budget without binding").
+        """
+        from unittest.mock import patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import AbortedDuringConsolidation, ConsolidationLoop
+        from paramem.training.early_stop import _EarlyStopState
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        # A trainer abort typically has no stop_epoch (recall never bound).
+        fake_recall_state = _EarlyStopState(stop_epoch=None)
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch.object(
+                ConsolidationLoop,
+                "_train_tier_adapter",
+                return_value=({"aborted": True}, fake_recall_state),
+            ),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            with pytest.raises(AbortedDuringConsolidation):
+                loop.consolidate(mode="train", trainer=None, router=None)
+
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected a tier_train telemetry record on the abort path"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["aborted"] is True
+        assert "hit_cap" not in record
+        assert "epochs_to_bind" not in record
+        assert "steps_to_bind" not in record
+
+    def test_main_tier_telemetry_epochs_unchanged_when_budget_derivation_disabled(
+        self, monkeypatch, tmp_path
+    ):
+        """budget_derivation_enabled=False (the shipped default) must record
+        `epochs` equal to the config's num_epochs -- pinning that the
+        telemetry layer introduces no behaviour change for the un-derived
+        path (only the shape of the recorded value, not what training
+        actually runs with).
+        """
+        from unittest.mock import patch
+
+        import networkx as _nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+        assert loop.training_config.budget_derivation_enabled is False
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        trained_metrics = {"train_loss": 0.1, "aborted": False}
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            mock_lock.acquire.return_value = False
+
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        assert tier_train_calls[0].kwargs["record"]["epochs"] == loop.training_config.num_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -4669,6 +5575,28 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         _proc_cfg = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.procedural_config = _proc_cfg if procedural_enabled else None
+
+        # Warm is the fixture default: give each resident main-tier adapter
+        # LoRA fields matching its own AdapterConfig, so
+        # ensure_adapter_matching (the main-tier fold preamble's config guard)
+        # reads a match and every pre-existing fold test here trains warm
+        # (no delete_adapter/create_adapter recreate, no mismatch warning) --
+        # a bare MagicMock() resident would never equal a real int/list and
+        # would ALWAYS read as a mismatch, silently forcing every test onto
+        # the cold path.  Tests that specifically want the cold/mismatch path
+        # opt in explicitly by overriding a field afterward (e.g.
+        # ``loop.model.peft_config["episodic"].r = 999``) -- see
+        # TestMainTierInitPolicy.
+        for _tier_name, _tier_cfg in (
+            ("episodic", loop.episodic_config),
+            ("semantic", loop.semantic_config),
+            ("procedural", loop.procedural_config or loop.episodic_config),
+        ):
+            _resident = loop.model.peft_config[_tier_name]
+            _resident.r = _tier_cfg.rank
+            _resident.lora_alpha = _tier_cfg.alpha
+            _resident.target_modules = list(_tier_cfg.target_modules)
+
         loop.wandb_config = None
         loop._thermal_policy = None
         loop.output_dir = tmp_path
@@ -7628,6 +8556,8 @@ class TestTierFloor:
         train_adapter_spy=None,
         keys_from="all_tiers",
         unload_spy=None,
+        create_adapter_side_effect=None,
+        copy_adapter_weights_side_effect=None,
     ):
         """Run consolidate with heavy ops mocked.
 
@@ -7643,6 +8573,19 @@ class TestTierFloor:
         unload_spy: mock.MagicMock or None.  If supplied, the interim reap
             (``unload_interim_adapters``) is patched to this spy so the test can
             assert whether the fold reaped the slots.
+        create_adapter_side_effect: override for
+            ``paramem.models.loader.create_adapter``'s side_effect.  Defaults
+            to a pure no-op (``lambda m, c, n: m``); a test exercising
+            ``main_tier_backup_scope``'s real shape-sensitive copy needs a
+            fake that actually stamps the created adapter's config onto
+            ``peft_config``.
+        copy_adapter_weights_side_effect: override for
+            ``paramem.models.loader.copy_adapter_weights``'s side_effect.
+            Defaults to a bare no-op mock; a test proving the config-mismatch
+            guard is resolved BEFORE ``main_tier_backup_scope`` snapshots a
+            tier needs a fake that raises on a real shape mismatch (the real
+            function's own failure mode, see ``loader.py``'s
+            ``copy_adapter_weights`` docstring).
         """
         from unittest.mock import MagicMock, patch
 
@@ -7655,6 +8598,14 @@ class TestTierFloor:
             train_adapter_spy = MagicMock(return_value={"aborted": False})
         if unload_spy is None:
             unload_spy = MagicMock(return_value=[])
+        if create_adapter_side_effect is None:
+            create_adapter_side_effect = lambda m, c, n: m  # noqa: E731
+        create_adapter_patch_kwargs = {"side_effect": create_adapter_side_effect}
+        copy_adapter_weights_patch_kwargs = (
+            {"side_effect": copy_adapter_weights_side_effect}
+            if copy_adapter_weights_side_effect is not None
+            else {}
+        )
 
         _gpu_thread_lock.acquire()
         try:
@@ -7696,9 +8647,12 @@ class TestTierFloor:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.create_adapter", **create_adapter_patch_kwargs),
                 patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights"),
+                patch(
+                    "paramem.models.loader.copy_adapter_weights",
+                    **copy_adapter_weights_patch_kwargs,
+                ),
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", unload_spy),
             ):
@@ -8014,6 +8968,38 @@ class TestTierFloor:
         )
         # dst-only tensor is unchanged.
         assert torch.all(dst_tensor_b == 0), "dst-only tensor must stay at zero-init"
+
+    def test_copy_adapter_weights_subset_zeroes_prefilled_dst_only_tensor(self):
+        """A dst-only tensor that already holds NONZERO values (e.g. a
+        resident procedural adapter reused across a warm-init fold, not a
+        freshly-created one) is explicitly zeroed by the copy -- the
+        "MLP stays zero-init" contract must hold unconditionally, not only
+        when dst happens to already be at PEFT's zero-init."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from paramem.models.loader import copy_adapter_weights_subset
+
+        model = MagicMock()
+
+        src_tensor_a = torch.ones(4, 4)
+        dst_tensor_a = torch.zeros(4, 4)
+        dst_tensor_b = torch.full((4, 4), 7.0)  # pre-filled NONZERO dst-only tensor
+
+        params = [
+            ("base_a.src.weight", src_tensor_a),
+            ("base_a.dst.weight", dst_tensor_a),
+            ("base_b.dst.weight", dst_tensor_b),
+        ]
+        model.named_parameters.side_effect = lambda: iter(params)
+        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
+
+        copy_adapter_weights_subset(model, src="src", dst="dst")
+
+        assert torch.all(dst_tensor_b == 0), (
+            "a pre-filled dst-only tensor must be explicitly zeroed by the copy"
+        )
 
     def test_copy_adapter_weights_subset_raises_when_src_exceeds_dst(self):
         """subset copy raises RuntimeError when src has a tensor dst lacks."""
@@ -8668,11 +9654,17 @@ class TestTierFloor:
                         or [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
                     ),
                 ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                # switch_adapter (not create_adapter) is the "which adapter is
+                # about to train" hook: under warm init a resident,
+                # config-matching tier is kept (ensure_adapter_matching
+                # no-ops, create_adapter is never called for it), but
+                # switch_adapter still runs unconditionally right before
+                # format_entry_training in every case.
                 patch(
-                    "paramem.models.loader.create_adapter",
-                    side_effect=lambda m, c, n: _adapter_being_trained.__setitem__(0, n) or m,
+                    "paramem.models.loader.switch_adapter",
+                    side_effect=lambda m, n: _adapter_being_trained.__setitem__(0, n),
                 ),
-                patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
@@ -9110,9 +10102,14 @@ class TestTierFloor:
         format_entries_captured: dict = {}
         _current_adapter: list = [None]
 
-        def _spy_create(m, c, n):
+        def _spy_switch(m, n):
+            # switch_adapter (not create_adapter) is the "which adapter is
+            # about to train" hook: under warm init a resident,
+            # config-matching tier is kept (ensure_adapter_matching no-ops,
+            # create_adapter is never called for it), but switch_adapter
+            # still runs unconditionally right before format_entry_training
+            # in every case.
             _current_adapter[0] = n
-            return m
 
         def _spy_format(entries, *a, **kw):
             if _current_adapter[0] and _current_adapter[0] not in format_entries_captured:
@@ -9147,8 +10144,8 @@ class TestTierFloor:
                     "paramem.training.consolidation.format_entry_training",
                     side_effect=_spy_format,
                 ),
-                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
-                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
                 patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
@@ -9241,9 +10238,14 @@ class TestTierFloor:
         format_entries_by_adapter: dict = {}
         _current_adapter: list = ["episodic"]
 
-        def _spy_create(m, c, n):
+        def _spy_switch(m, n):
+            # switch_adapter (not create_adapter) is the "which adapter is
+            # about to train" hook: under warm init a resident,
+            # config-matching tier is kept (ensure_adapter_matching no-ops,
+            # create_adapter is never called for it), but switch_adapter
+            # still runs unconditionally right before format_entry_training
+            # in every case.
             _current_adapter[0] = n
-            return m
 
         def _spy_format(entries, *a, **kw):
             ad = _current_adapter[0]
@@ -9274,8 +10276,8 @@ class TestTierFloor:
                     "paramem.training.consolidation.format_entry_training",
                     side_effect=_spy_format,
                 ),
-                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
-                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
@@ -9372,9 +10374,14 @@ class TestTierFloor:
         format_entries_by_adapter: dict = {}
         _current_adapter: list = ["episodic"]
 
-        def _spy_create(m, c, n):
+        def _spy_switch(m, n):
+            # switch_adapter (not create_adapter) is the "which adapter is
+            # about to train" hook: under warm init a resident,
+            # config-matching tier is kept (ensure_adapter_matching no-ops,
+            # create_adapter is never called for it), but switch_adapter
+            # still runs unconditionally right before format_entry_training
+            # in every case.
             _current_adapter[0] = n
-            return m
 
         def _spy_format(entries, *a, **kw):
             ad = _current_adapter[0]
@@ -9405,8 +10412,8 @@ class TestTierFloor:
                     "paramem.training.consolidation.format_entry_training",
                     side_effect=_spy_format,
                 ),
-                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
-                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
@@ -9495,9 +10502,14 @@ class TestTierFloor:
         format_entries_by_adapter: dict = {}
         _current_adapter: list = ["episodic"]
 
-        def _spy_create(m, c, n):
+        def _spy_switch(m, n):
+            # switch_adapter (not create_adapter) is the "which adapter is
+            # about to train" hook: under warm init a resident,
+            # config-matching tier is kept (ensure_adapter_matching no-ops,
+            # create_adapter is never called for it), but switch_adapter
+            # still runs unconditionally right before format_entry_training
+            # in every case.
             _current_adapter[0] = n
-            return m
 
         def _spy_format(entries, *a, **kw):
             ad = _current_adapter[0]
@@ -9532,8 +10544,8 @@ class TestTierFloor:
                     "paramem.training.consolidation.format_entry_training",
                     side_effect=_spy_format,
                 ),
-                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
-                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
@@ -15219,6 +16231,10 @@ class TestFullCycleDispatcherOverdueIncident:
         # only the overdue-incident wiring, not the catch-up gate.
         cfg.consolidation.refresh_cadence = "12h"
         cfg.consolidation.mode = "train"
+        # N > 0: the content gate's FULL branch reads this to decide whether a
+        # pending session is even eligible input (it is not, at this count —
+        # only the content-bearing interim slot below is).
+        cfg.consolidation.max_interim_count = 7
         cfg.paths.data = tmp_path
         cfg.adapter_dir = tmp_path / "adapters"
         cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -16194,6 +17210,108 @@ class TestS5OverflowDoesNotLeakIntoClearSuccessCheck:
             "overflow_slot": False,
         }
         assert not self._is_clean_success(result, "cap_pending", [])
+
+
+# ---------------------------------------------------------------------------
+# retired_session_ids wiring — structural pin (mirrors the AST-scan style in
+# tests/test_extraction_pipeline_guard.py). _run_interim_training is a
+# closure nested inside _extract_and_start_training, so it cannot be invoked
+# in isolation the way the fold-level unit tests above are; a source-level
+# scan is the practical guard for this call site's kwarg wiring.
+# ---------------------------------------------------------------------------
+
+
+class TestRetiredSessionIdsCallSiteWiring:
+    """The interim scheduled-tick's mark_consolidated(...) call must pass
+    retired_session_ids sourced from _released_sids (the retry-capped set
+    computed a few lines earlier via session_buffer.bump_retry_and_release).
+
+    Regression guard: if this kwarg is ever dropped or repointed at the
+    wrong set, retry-capped sessions silently fall back into the plain
+    retention layout — indistinguishable from clean consolidations again.
+    """
+
+    def _find_mark_consolidated_call_in_run_interim_training(self):
+        """Return the AST ``Call`` node for ``mark_consolidated(...)`` whose
+        nearest enclosing function is ``_run_interim_training``.
+
+        Uses :mod:`ast` (not string/regex matching) so the guard tracks the
+        actual call-site structure, not comment or docstring mentions of
+        ``mark_consolidated``.
+        """
+        import ast
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent
+        app_file = repo_root / "paramem" / "server" / "app.py"
+        text = app_file.read_text()
+        tree = ast.parse(text)
+
+        fn_ranges: list[tuple[int, int, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                end = getattr(node, "end_lineno", node.lineno)
+                fn_ranges.append((node.lineno, end, node.name))
+
+        def _enclosing_fn(lineno: int) -> str | None:
+            best: tuple[int, str] | None = None
+            for start, end, name in fn_ranges:
+                if start <= lineno <= end:
+                    if best is None or start > best[0]:
+                        best = (start, name)
+            return best[1] if best else None
+
+        matches = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "mark_consolidated"
+                and _enclosing_fn(node.lineno) == "_run_interim_training"
+            ):
+                matches.append(node)
+        return matches
+
+    def test_run_interim_training_has_exactly_one_mark_consolidated_call(self):
+        """Sanity check for the scan itself: exactly one mark_consolidated(...)
+        call site lives inside _run_interim_training. If this count drifts,
+        the wiring assertion below needs to be revisited alongside it."""
+        matches = self._find_mark_consolidated_call_in_run_interim_training()
+        assert len(matches) == 1, (
+            f"Expected exactly one mark_consolidated(...) call inside "
+            f"_run_interim_training; found {len(matches)}. If _run_interim_training "
+            "was refactored, update this structural guard."
+        )
+
+    def test_mark_consolidated_call_passes_retired_session_ids_from_released_sids(self):
+        """The single mark_consolidated(...) call inside _run_interim_training
+        must pass retired_session_ids=set(_released_sids) (or an equivalent
+        expression whose sole Name reference is _released_sids)."""
+        import ast
+
+        matches = self._find_mark_consolidated_call_in_run_interim_training()
+        assert len(matches) == 1
+        call = matches[0]
+
+        retired_kw = next(
+            (kw for kw in call.keywords if kw.arg == "retired_session_ids"),
+            None,
+        )
+        assert retired_kw is not None, (
+            "_run_interim_training's mark_consolidated(...) call is missing "
+            "retired_session_ids= — retry-capped sessions would silently land "
+            "in the plain retention layout instead of retired_recall_failed/."
+        )
+
+        # The kwarg's value expression must reference _released_sids (the
+        # retry-capped set from session_buffer.bump_retry_and_release), whether
+        # passed bare or wrapped (e.g. set(_released_sids)).
+        referenced_names = {n.id for n in ast.walk(retired_kw.value) if isinstance(n, ast.Name)}
+        assert "_released_sids" in referenced_names, (
+            "retired_session_ids= must be sourced from _released_sids "
+            f"(the bump_retry_and_release result); found expression referencing "
+            f"{sorted(referenced_names)!r} instead."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -17403,12 +18521,13 @@ class TestDispatchCountZeroRoutesToFull:
 
 
 class TestSchedulerCatchUpGate:
-    """The catch-up gate belongs to AUTO — the scheduled tick's action.
+    """The catch-up gate belongs to AUTO — requested only by the scheduled tick.
 
-    An operator door names an intent and is never refused for "not due yet",
-    and (since a manual run does not move the cadence window) never writes the
-    stamp either.  These tests pin both halves against the SAME stamp and
-    cadence, so the action — not a flag — is what differs.
+    A directly requested FULL/INTERIM/RECONCILE never resolves AUTO, so it
+    never reaches the catch-up gate at all and is never refused for "not due
+    yet"; since it never dispatches through the AUTO branch, it also never
+    writes the cadence stamp.  These tests pin both halves against the SAME
+    stamp and cadence, so the requested action — not a flag — is what differs.
     """
 
     def _make_state(self, tmp_path, *, refresh_cadence: str) -> dict:
@@ -17454,15 +18573,20 @@ class TestSchedulerCatchUpGate:
         return tmp_path / "state"
 
     def _call_dispatching(self, state: dict, action=None) -> tuple:
-        """Run a dispatch with _is_full_cycle_due forced True so a real dispatch
-        is SCHEDULED when the catch-up gate lets the tick through. Returns
-        (result, dispatch_call_count).
+        """Run a dispatch with _is_full_cycle_due forced True (relevant only
+        when *action* resolves AUTO — a directly requested FULL never calls
+        it at all). Returns (result, dispatch_call_count).
 
         ``_run_full_consolidation_sync`` is passed to (mocked)
         ``run_in_executor`` as a reference, never actually invoked under this
         mocking scheme — matching the existing dispatcher-test pattern in
         this file (e.g. TestFullCycleDispatcherOverdueIncident). The
         dispatch count is therefore read off ``run_in_executor.call_count``.
+
+        Args:
+            action: ``None`` (default, resolves to ``AUTO`` — the scheduled
+                tick) or an explicit ``ConsolidationAction`` for a directly
+                requested door (e.g. ``FULL`` for a manual ``/consolidate``).
         """
         from unittest.mock import patch
 
@@ -17550,27 +18674,31 @@ class TestSchedulerCatchUpGate:
         assert read_last_scheduled_run(state_dir) == recent_stamp
 
     def test_manual_action_dispatches_when_the_tick_would_not(self, tmp_path):
-        """An operator action dispatches where the scheduled tick is blocked.
+        """A directly requested FULL (``/consolidate``) dispatches where the
+        scheduled tick is blocked.
 
         Same stamp/cadence as test_not_due_stamp_blocks_and_leaves_stamp_unchanged
-        (last attempt 2h ago, 'every 5h' → not due) — so the ACTION, not the
-        schedule, decides.  And the manual run leaves the cadence window
-        exactly where it was: the next scheduled tick still has its own content
-        gate, so nothing needs to be stamped on the manual run's behalf.
+        (last attempt 2h ago, 'every 5h' → not due) — a directly requested
+        FULL never resolves AUTO and never reaches the catch-up gate at all,
+        so which ACTION was requested, not a flag, is what differs.  And the
+        manual run leaves the cadence window exactly where it was: the next
+        scheduled tick still has its own content gate, so nothing needs to be
+        stamped on the manual run's behalf.
         """
         import paramem.server.app as app_module
         from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
 
         state_dir = self._state_dir(tmp_path)
 
-        # AUTO — not due, blocked, no dispatch.
+        # AUTO -- not due, blocked, no dispatch.
         state_gated = self._make_state(tmp_path, refresh_cadence="every 5h")
         recent_stamp = time.time() - 2 * 3600
         write_last_scheduled_run(state_dir, recent_stamp)
         assert self._call_tick_gate_only(state_gated) == "noop_not_due"
         assert read_last_scheduled_run(state_dir) == recent_stamp
 
-        # FULL — same stamp, same cadence — dispatches, stamp untouched.
+        # FULL, requested directly -- same stamp, same cadence -- dispatches,
+        # stamp untouched: it never even consults the catch-up gate.
         state_manual = self._make_state(tmp_path, refresh_cadence="every 5h")
         result, dispatch_count = self._call_dispatching(
             state_manual, app_module.ConsolidationAction.FULL
@@ -17599,10 +18727,11 @@ class TestSchedulerCatchUpGate:
         assert read_last_scheduled_run(state_dir) is not None
 
     def test_manual_action_on_a_virgin_install_dispatches(self, tmp_path):
-        """Virgin install (absent stamp) + an operator action → dispatches.
+        """Virgin install (absent stamp) + a directly requested FULL
+        (``/consolidate``) → dispatches.
 
-        The seed-and-noop behaviour is specific to the scheduled tick; a manual
-        run on a fresh install must run, and still writes no stamp.
+        The seed-and-noop behaviour is specific to the scheduled tick (AUTO);
+        a manual run on a fresh install must run, and still writes no stamp.
         """
         import paramem.server.app as app_module
         from paramem.server.schedule_state import read_last_scheduled_run
@@ -18425,3 +19554,615 @@ class TestFoldKeySource:
 
         assert drift_all == 1, "the absorbing fold read graph9 and produced no keyed edge for it"
         assert drift_main == 0
+
+
+class TestFoldScopeColdInit:
+    """``FoldScope.cold_init`` — the derived main-tier init-policy property.
+
+    ``cold_init`` is the structural identity of RECONCILE:
+    ``persist == "main_tiers" and keys_from == "main_tiers"``, bound at the
+    single arbitrator site (``paramem.server.app._dispatch_consolidation``,
+    ``_keys_from = "main_tiers" if action is ConsolidationAction.RECONCILE
+    else "all_tiers"``). No caller ever passes a ``cold_init`` field — it is
+    derived, never a parameter.
+    """
+
+    def test_reconcile_conjunction_is_cold(self):
+        """persist="main_tiers" + keys_from="main_tiers" == RECONCILE == cold."""
+        from paramem.training.consolidation import FoldScope
+
+        scope = FoldScope(
+            name="full", source="weights", persist="main_tiers", keys_from="main_tiers"
+        )
+        assert scope.cold_init is True
+
+    def test_scheduled_full_fold_all_tiers_is_warm(self):
+        """The scheduled FULL fold leaves keys_from at its "all_tiers" default -> warm."""
+        from paramem.training.consolidation import FoldScope
+
+        scope = FoldScope(
+            name="full", source="weights", persist="main_tiers", keys_from="all_tiers"
+        )
+        assert scope.cold_init is False
+
+    def test_interim_scope_is_warm_regardless_of_keys_from(self):
+        """The interim_slot persist venue is never RECONCILE -- keys_from is
+        ignored there (scoped by ``tier`` instead), so cold_init reads False
+        even if a caller left keys_from at a "main_tiers"-shaped value."""
+        from paramem.training.consolidation import FoldScope
+
+        scope = FoldScope(
+            name="interim",
+            source="weights",
+            persist="interim_slot",
+            tier="episodic_interim_20260701T1200",
+            keys_from="main_tiers",
+        )
+        assert scope.cold_init is False
+
+    def test_disk_venue_reconcile_conjunction_is_also_cold(self):
+        """The conjunction is venue-independent -- source is not part of the
+        identity (the main-tier preamble that CONSULTS cold_init is itself
+        gated to the weights venue, but the property's definition does not
+        encode that)."""
+        from paramem.training.consolidation import FoldScope
+
+        scope = FoldScope(name="full", source="disk", persist="main_tiers", keys_from="main_tiers")
+        assert scope.cold_init is True
+
+
+class TestMainTierInitPolicy:
+    """The main-tier fold preamble's warm-default / RECONCILE-cold init
+    policy and its shared config-mismatch guard
+    (``paramem.models.loader.ensure_adapter_matching``).
+
+    Reuses ``TestTierFloor``'s harness (``_make_loop`` / ``_seed_keys`` /
+    ``_build_merger_graph`` / ``_run_full_fold_mocked``). The shared factory
+    (``TestConsolidateInterimAdaptersFullFlow._make_loop``) gives every
+    resident ``episodic``/``semantic``/``procedural`` adapter LoRA fields
+    matching its own tier ``AdapterConfig`` by default, so every fold test
+    here trains warm unless a test explicitly overrides a field afterward to
+    opt into the cold/mismatch path (as the mismatch tests below do).
+    """
+
+    def _seeded_loop(self, tmp_path):
+        loop = TestTierFloor._make_loop(tmp_path, min_tier_key_floor=0, tier_fast_start=False)
+        TestTierFloor._seed_keys(loop, "episodic", ["graph1", "graph2"])
+        TestTierFloor._build_merger_graph(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"pred_{k}",
+                    "object": f"obj_{k}",
+                }
+                for k in ("graph1", "graph2")
+            ],
+        )
+        return loop
+
+    def test_warm_default_keeps_resident_no_delete(self, tmp_path):
+        """A resident, config-matching tier is kept across a scheduled
+        (keys_from="all_tiers") fold -- no delete_adapter("episodic") call
+        (main_tier_backup_scope legitimately deletes the transient
+        ``*_backup`` adapters at scope exit; that is unrelated to this
+        policy and not what this test guards), and _train_tier_adapter (via
+        train_adapter) still runs."""
+        loop = self._seeded_loop(tmp_path)
+        train_spy = MagicMock(return_value={"aborted": False})
+
+        result = TestTierFloor._run_full_fold_mocked(
+            loop, keys_from="all_tiers", train_adapter_spy=train_spy
+        )
+
+        tier_delete_calls = [
+            c for c in loop.model.delete_adapter.call_args_list if c.args == ("episodic",)
+        ]
+        assert not tier_delete_calls, (
+            f"expected no delete_adapter('episodic') call, got {tier_delete_calls}"
+        )
+        assert train_spy.called, "the funnel must still train the warm-kept tier"
+        assert "episodic" in result["tiers_rebuilt"]
+
+    def test_reconcile_scope_deletes_and_recreates(self, tmp_path):
+        """keys_from="main_tiers" (RECONCILE's structural identity) reproduces
+        today's unconditional delete+recreate exactly."""
+        loop = self._seeded_loop(tmp_path)
+
+        TestTierFloor._run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        loop.model.delete_adapter.assert_any_call("episodic")
+
+    def test_config_mismatch_recreates_cold_with_warning(self, tmp_path, caplog):
+        """A resident tier whose rank no longer matches the target config is
+        deleted and recreated cold, even under the warm-default scope, with a
+        warning naming the mismatch."""
+        import logging
+
+        loop = self._seeded_loop(tmp_path)
+        loop.model.peft_config["episodic"].r = 999  # target is rank=4 (see _make_loop)
+
+        loader_logger = logging.getLogger("paramem.models.loader")
+        loader_logger.addHandler(caplog.handler)
+        loader_logger.setLevel(logging.WARNING)
+        try:
+            TestTierFloor._run_full_fold_mocked(loop, keys_from="all_tiers")
+        finally:
+            loader_logger.removeHandler(caplog.handler)
+
+        assert any(c.args == ("episodic",) for c in loop.model.delete_adapter.call_args_list), (
+            "expected delete_adapter('episodic') on config mismatch"
+        )
+        assert any(
+            "mismatch" in record.getMessage() and "episodic" in record.getMessage()
+            for record in caplog.records
+        ), "expected ensure_adapter_matching's mismatch warning naming the adapter"
+
+    def test_mismatch_reconciled_before_backup_scope_shape_check(self, tmp_path):
+        """A resident tier whose rank no longer matches must be reconciled
+        BEFORE ``main_tier_backup_scope`` snapshots it, not merely by the
+        per-tier loop's own ``ensure_adapter_matching`` call further down.
+
+        ``main_tier_backup_scope`` snapshots every resident tier via
+        ``copy_adapter_weights(src=tier, dst=backup)`` immediately on entry
+        -- before the per-tier loop (and its cold_init/ensure_adapter_matching
+        branch) ever runs. ``copy_adapter_weights`` checks parameter KEY SETS,
+        not tensor shapes, so a rank mismatch passes that check and only then
+        raises a shape RuntimeError inside the real ``.data.copy_()``. This
+        test's fakes reproduce that observable failure mode (unlike the
+        harness's default no-op fakes, which mask it entirely) to prove the
+        fold-preamble hoist -- reconciling every resident tier's config
+        immediately before ``main_tier_backup_scope`` is entered -- resolves
+        the mismatch first, so the fold completes without the RuntimeError
+        ever reaching (let alone escaping) the backup scope.
+        """
+
+        def _fake_create_adapter_stamped(model, config, name):
+            cfg = MagicMock()
+            cfg.r = config.rank
+            cfg.lora_alpha = config.alpha
+            cfg.target_modules = list(config.target_modules)
+            model.peft_config[name] = cfg
+            return model
+
+        def _fake_copy_adapter_weights_shape_checked(model, src, dst):
+            src_r = getattr(model.peft_config[src], "r", None)
+            dst_r = getattr(model.peft_config[dst], "r", None)
+            if src_r != dst_r:
+                raise RuntimeError(
+                    f"shape mismatch copying '{src}' (r={src_r}) -> '{dst}' (r={dst_r})"
+                )
+
+        loop = self._seeded_loop(tmp_path)
+        loop.model.peft_config["episodic"].r = 999  # target is rank=4 (see _make_loop)
+
+        result = TestTierFloor._run_full_fold_mocked(
+            loop,
+            keys_from="all_tiers",
+            create_adapter_side_effect=_fake_create_adapter_stamped,
+            copy_adapter_weights_side_effect=_fake_copy_adapter_weights_shape_checked,
+        )
+
+        assert "episodic" in result["tiers_rebuilt"], "the fold must complete, not abort"
+        assert any(c.args == ("episodic",) for c in loop.model.delete_adapter.call_args_list), (
+            "expected delete_adapter('episodic') from the pre-backup-scope reconciliation"
+        )
+        # The reconciled adapter's rank now matches the target, so
+        # main_tier_backup_scope's own snapshot (and every later call) sees a
+        # consistent shape -- proven by the fold completing at all under the
+        # shape-checking fake above (a real RuntimeError would have propagated
+        # out of consolidate() and failed this test).
+        assert loop.model.peft_config["episodic"].r == loop.episodic_config.rank
+
+
+class TestTrainTierAdapterBudgetDerivation:
+    """_train_tier_adapter (the single training funnel) derives the per-fold
+    training budget from len(entries) via budget_for and applies it to the
+    incoming training_config before calling train_adapter, and feeds the SAME
+    derived epoch count to _maybe_make_recall_callback's num_epochs argument.
+
+    format_entry_training is patched at its consolidation.py import site (the
+    same pattern used by TestAbortSkipsCommit above) so these tests don't pay
+    for a real tokenizer; train_adapter is patched at its trainer.py source
+    per _train_tier_adapter's own docstring ("kept INSIDE this method so
+    tests can patch paramem.training.trainer.train_adapter").
+    """
+
+    @staticmethod
+    def _make_loop(*, budget_derivation_enabled: bool) -> ConsolidationLoop:
+        from paramem.utils.config import TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            num_epochs=3,
+            gradient_accumulation_steps=8,
+            lr_decay_steps=None,
+            budget_derivation_enabled=budget_derivation_enabled,
+        )
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        return loop
+
+    def _entries(self, n: int) -> list[dict]:
+        return [
+            {
+                "key": f"graph{i + 1}",
+                "subject": f"S{i + 1}",
+                "predicate": "p",
+                "object": f"O{i + 1}",
+            }
+            for i in range(n)
+        ]
+
+    def test_small_n_entry_set_derives_smallest_bucket(self, tmp_path):
+        """N=3 (< 16) derives (80 epochs, accum=1) and the recall callback
+        receives num_epochs=80 -- not the config's fixed num_epochs=3.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(budget_derivation_enabled=True)
+        entries = self._entries(3)
+
+        with (
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]} for _ in entries],
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ) as train_mock,
+            patch.object(
+                ConsolidationLoop,
+                "_maybe_make_recall_callback",
+                return_value=(None, None),
+            ) as recall_cb_mock,
+        ):
+            metrics, recall_state = loop._train_tier_adapter(
+                entries,
+                adapter_name="episodic",
+                adapter_config=MagicMock(),
+                training_config=loop.training_config,
+                output_dir=tmp_path,
+                run_name="test-run",
+                phase_name="test-phase",
+            )
+
+        assert metrics == {"aborted": False, "donor_seeded": False}
+        assert recall_state is None
+
+        # train_adapter received the DERIVED budget, not the config's fixed values.
+        received_training_config = train_mock.call_args.kwargs["training_config"]
+        assert received_training_config.num_epochs == 80
+        assert received_training_config.gradient_accumulation_steps == 1
+        assert received_training_config.lr_decay_steps is None
+        # The caller's own TrainingConfig instance must be untouched
+        # (dataclasses.replace returns a new instance).
+        assert loop.training_config.num_epochs == 3
+
+        # The recall callback's forced final-epoch probe must fire at the
+        # DERIVED epoch count.
+        assert recall_cb_mock.call_args.kwargs["num_epochs"] == 80
+
+    def test_large_n_entry_set_derives_anchored_bucket(self, tmp_path):
+        """N=200 (>= 128) derives (30 epochs, accum=2)."""
+        from unittest.mock import patch
+
+        loop = self._make_loop(budget_derivation_enabled=True)
+        entries = self._entries(200)
+
+        with (
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]} for _ in entries],
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ) as train_mock,
+            patch.object(
+                ConsolidationLoop,
+                "_maybe_make_recall_callback",
+                return_value=(None, None),
+            ) as recall_cb_mock,
+        ):
+            loop._train_tier_adapter(
+                entries,
+                adapter_name="episodic",
+                adapter_config=MagicMock(),
+                training_config=loop.training_config,
+                output_dir=tmp_path,
+                run_name="test-run",
+                phase_name="test-phase",
+            )
+
+        received_training_config = train_mock.call_args.kwargs["training_config"]
+        assert received_training_config.num_epochs == 30
+        assert received_training_config.gradient_accumulation_steps == 2
+        assert recall_cb_mock.call_args.kwargs["num_epochs"] == 30
+
+    def test_derivation_disabled_passes_through_fixed_config(self, tmp_path):
+        """budget_derivation_enabled=False (the feature switched off) must
+        reproduce today's behaviour exactly: the fixed training_config
+        values pass through unchanged regardless of entry count, and the
+        recall callback receives the SAME fixed num_epochs.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(budget_derivation_enabled=False)
+        entries = self._entries(3)  # small N -- must NOT trigger the 80-epoch bucket
+
+        with (
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]} for _ in entries],
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ) as train_mock,
+            patch.object(
+                ConsolidationLoop,
+                "_maybe_make_recall_callback",
+                return_value=(None, None),
+            ) as recall_cb_mock,
+        ):
+            loop._train_tier_adapter(
+                entries,
+                adapter_name="episodic",
+                adapter_config=MagicMock(),
+                training_config=loop.training_config,
+                output_dir=tmp_path,
+                run_name="test-run",
+                phase_name="test-phase",
+            )
+
+        received_training_config = train_mock.call_args.kwargs["training_config"]
+        assert received_training_config.num_epochs == 3
+        assert received_training_config.gradient_accumulation_steps == 8
+        assert recall_cb_mock.call_args.kwargs["num_epochs"] == 3
+
+    def test_empty_examples_returns_none_none_without_deriving(self, tmp_path):
+        """format_entry_training producing no examples short-circuits before
+        budget derivation or any training call -- (None, None), matching the
+        documented contract.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(budget_derivation_enabled=True)
+
+        with (
+            patch("paramem.training.consolidation.format_entry_training", return_value=[]),
+            patch("paramem.training.trainer.train_adapter") as train_mock,
+        ):
+            result = loop._train_tier_adapter(
+                [],
+                adapter_name="episodic",
+                adapter_config=MagicMock(),
+                training_config=loop.training_config,
+                output_dir=tmp_path,
+                run_name="test-run",
+                phase_name="test-phase",
+            )
+
+        assert result == (None, None)
+        train_mock.assert_not_called()
+
+    def test_replace_leaves_non_derived_fields_untouched(self, tmp_path):
+        """dataclasses.replace only overwrites num_epochs/gradient_accumulation_steps/
+        lr_decay_steps -- every other TrainingConfig field (seed, batch_size,
+        max_seq_length, ...) must reach train_adapter unchanged from the
+        caller's original config.
+        """
+        from unittest.mock import patch
+
+        from paramem.utils.config import TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            num_epochs=3,
+            gradient_accumulation_steps=8,
+            lr_decay_steps=None,
+            budget_derivation_enabled=True,
+            seed=1234,
+            batch_size=7,
+            max_seq_length=512,
+            weight_decay=0.42,
+        )
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        entries = self._entries(3)  # small N -- triggers the 80-epoch bucket
+
+        with (
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]} for _ in entries],
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ) as train_mock,
+            patch.object(
+                ConsolidationLoop,
+                "_maybe_make_recall_callback",
+                return_value=(None, None),
+            ),
+        ):
+            loop._train_tier_adapter(
+                entries,
+                adapter_name="episodic",
+                adapter_config=MagicMock(),
+                training_config=loop.training_config,
+                output_dir=tmp_path,
+                run_name="test-run",
+                phase_name="test-phase",
+            )
+
+        received = train_mock.call_args.kwargs["training_config"]
+        # Derived fields changed from the caller's original config.
+        assert received.num_epochs == 80
+        assert received.gradient_accumulation_steps == 1
+        # Non-derived fields must survive dataclasses.replace unchanged.
+        assert received.seed == 1234
+        assert received.batch_size == 7
+        assert received.max_seq_length == 512
+        assert received.weight_decay == 0.42
+
+
+# ---------------------------------------------------------------------------
+# _recall_bind_telemetry — pure module-level derivation, CPU-only
+# ---------------------------------------------------------------------------
+
+
+class TestRecallBindTelemetry:
+    """Fold-telemetry instrumentation: ``epochs_to_bind`` /
+    ``steps_to_bind`` / ``hit_cap`` derivation from the ``_EarlyStopState``
+    ``_train_tier_adapter`` returns. Pure function, no model/GPU required.
+    """
+
+    def test_none_state_returns_all_none(self):
+        """recall_state=None (early stopping disabled, or entries empty) ->
+        all three fields absent (None) -- the caller omits them from the
+        ring record."""
+        from paramem.training.consolidation import _recall_bind_telemetry
+
+        assert _recall_bind_telemetry(None, n_keys=10, accum=2) == (None, None, None)
+
+    def test_stop_epoch_set_derives_bind_and_steps(self):
+        """A fired early-stop signal derives epochs_to_bind=stop_epoch and
+        steps_to_bind=ceil(n_keys/accum)*epochs_to_bind; hit_cap=False."""
+        from paramem.training.consolidation import _recall_bind_telemetry
+        from paramem.training.early_stop import _EarlyStopState
+
+        state = _EarlyStopState(stop_epoch=12)
+        epochs_to_bind, steps_to_bind, hit_cap = _recall_bind_telemetry(state, n_keys=21, accum=2)
+        assert epochs_to_bind == 12
+        # ceil(21 / 2) = 11; 11 * 12 = 132.
+        assert steps_to_bind == 132
+        assert hit_cap is False
+
+    def test_stop_epoch_none_signals_hit_cap_with_bind_fields_absent(self):
+        """Training ran to the full derived epoch budget without the recall
+        signal ever firing (stop_epoch=None) -> hit_cap=True and
+        epochs_to_bind/steps_to_bind stay None (absent from the record)."""
+        from paramem.training.consolidation import _recall_bind_telemetry
+        from paramem.training.early_stop import _EarlyStopState
+
+        state = _EarlyStopState(stop_epoch=None)
+        epochs_to_bind, steps_to_bind, hit_cap = _recall_bind_telemetry(state, n_keys=3, accum=1)
+        assert epochs_to_bind is None
+        assert steps_to_bind is None
+        assert hit_cap is True
+
+    def test_exact_division_no_remainder(self):
+        """n_keys exactly divisible by accum -- ceil == plain division, no
+        off-by-one from the ceil-division trick."""
+        from paramem.training.consolidation import _recall_bind_telemetry
+        from paramem.training.early_stop import _EarlyStopState
+
+        state = _EarlyStopState(stop_epoch=4)
+        _, steps_to_bind, _ = _recall_bind_telemetry(state, n_keys=10, accum=2)
+        assert steps_to_bind == 20  # ceil(10/2)=5; 5*4=20
+
+
+# ---------------------------------------------------------------------------
+# measured_adapter_init_state / lora_b_frobenius_norm — CPU-only, tiny model
+# ---------------------------------------------------------------------------
+
+
+class TestMeasuredAdapterInitState:
+    """The telemetry ring's ``init`` field: cold ("~0" LoRA-B norm) vs warm
+    (non-zero), measured against a tiny fake model (named_parameters only)
+    -- no GPU, no real PeftModel required. Mirrors the ``_index``-style
+    param-list fixture already used by the copy_adapter_weights* tests
+    above.
+    """
+
+    def test_zero_lora_b_classified_cold(self):
+        """A freshly zero-initialised lora_B tensor (PEFT's real init state
+        immediately after create_adapter) classifies as "cold"."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from paramem.models.loader import measured_adapter_init_state
+
+        model = MagicMock()
+        model.named_parameters.return_value = [
+            ("base_model.model.x.lora_B.episodic.weight", torch.zeros(4, 4)),
+        ]
+
+        assert measured_adapter_init_state(model, "episodic") == "cold"
+
+    def test_nonzero_lora_b_classified_warm(self):
+        """A trained (non-zero) lora_B tensor classifies as "warm"."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from paramem.models.loader import measured_adapter_init_state
+
+        model = MagicMock()
+        model.named_parameters.return_value = [
+            ("base_model.model.x.lora_B.episodic.weight", torch.ones(4, 4)),
+        ]
+
+        assert measured_adapter_init_state(model, "episodic") == "warm"
+
+    def test_no_matching_tensors_degrades_to_none(self):
+        """No lora_B tensor found for the adapter name (e.g. a test double
+        standing in for the model) -- degrades to None (the caller omits
+        the ``init`` field) rather than raising and blocking the fold.
+        lora_b_frobenius_norm itself still raises LoraTensorsNotFound --
+        this is the wrapper's contract, not a change to the underlying
+        primitive.
+        """
+        from unittest.mock import MagicMock
+
+        import pytest as _pytest
+
+        from paramem.models.loader import (
+            LoraTensorsNotFound,
+            lora_b_frobenius_norm,
+            measured_adapter_init_state,
+        )
+
+        model = MagicMock()
+        model.named_parameters.return_value = []
+
+        assert measured_adapter_init_state(model, "episodic") is None
+        with _pytest.raises(LoraTensorsNotFound, match="No lora_B tensors found"):
+            lora_b_frobenius_norm(model, "episodic")
+
+    def test_unrelated_runtime_error_propagates_unchanged(self):
+        """A RuntimeError subclass unrelated to a missing-tensor condition
+        (e.g. a CUDA OOM or "device lost" error raised inside
+        named_parameters()) must propagate unchanged -- measured_adapter_init_state
+        only degrades LoraTensorsNotFound, never RuntimeError broadly."""
+        from unittest.mock import MagicMock
+
+        import pytest as _pytest
+
+        from paramem.models.loader import measured_adapter_init_state
+
+        class _SimulatedCudaOOM(RuntimeError):
+            pass
+
+        model = MagicMock()
+
+        def _raise_oom():
+            raise _SimulatedCudaOOM("CUDA out of memory")
+
+        model.named_parameters.side_effect = _raise_oom
+
+        with _pytest.raises(_SimulatedCudaOOM, match="CUDA out of memory"):
+            measured_adapter_init_state(model, "episodic")

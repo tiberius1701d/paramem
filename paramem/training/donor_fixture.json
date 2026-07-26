@@ -1,0 +1,128 @@
+[
+  {
+    "key": "graph179",
+    "subject": "speaker0",
+    "predicate": "lives in",
+    "object": "ashdale near lindmoor"
+  },
+  {
+    "key": "graph180",
+    "subject": "speaker0",
+    "predicate": "worked on",
+    "object": "aurora dynamics' pinnacle grade iii driving platform"
+  },
+  {
+    "key": "graph181",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "resilient adaptive navigation"
+  },
+  {
+    "key": "graph182",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "statistical pattern inference"
+  },
+  {
+    "key": "graph183",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "layered representation modeling"
+  },
+  {
+    "key": "graph184",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "visual scene understanding"
+  },
+  {
+    "key": "graph185",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "sequential decision optimization"
+  },
+  {
+    "key": "graph186",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "text generation mechanics"
+  },
+  {
+    "key": "graph187",
+    "subject": "speaker0",
+    "predicate": "expertise",
+    "object": "field deployable automatons"
+  },
+  {
+    "key": "graph188",
+    "subject": "speaker0",
+    "predicate": "background in",
+    "object": "applied thermodynamics"
+  },
+  {
+    "key": "graph189",
+    "subject": "speaker0",
+    "predicate": "background in",
+    "object": "cybernetics"
+  },
+  {
+    "key": "graph190",
+    "subject": "speaker0",
+    "predicate": "graduated from",
+    "object": "riverstone institute"
+  },
+  {
+    "key": "graph191",
+    "subject": "speaker0",
+    "predicate": "graduation date",
+    "object": "february 2011"
+  },
+  {
+    "key": "graph192",
+    "subject": "corinne",
+    "predicate": "birth date",
+    "object": "july 14, 1990"
+  },
+  {
+    "key": "graph193",
+    "subject": "theo",
+    "predicate": "birth date",
+    "object": "september 21, 2024"
+  },
+  {
+    "key": "proc35",
+    "subject": "speaker0",
+    "predicate": "has spouse",
+    "object": "corinne"
+  },
+  {
+    "key": "proc36",
+    "subject": "speaker0",
+    "predicate": "has interest",
+    "object": "snowboarding"
+  },
+  {
+    "key": "proc37",
+    "subject": "speaker0",
+    "predicate": "has interest",
+    "object": "cycling"
+  },
+  {
+    "key": "proc38",
+    "subject": "speaker0",
+    "predicate": "has interest",
+    "object": "kayaking"
+  },
+  {
+    "key": "proc39",
+    "subject": "speaker0",
+    "predicate": "resides in",
+    "object": "verdania"
+  },
+  {
+    "key": "proc40",
+    "subject": "speaker0",
+    "predicate": "lives near",
+    "object": "lindmoor"
+  }
+]

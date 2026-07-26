@@ -258,6 +258,48 @@ class TestConsolidationMaxEpochsOverride:
         # Property honours the new value
         assert config.training_config.num_epochs == 5
 
+    def test_max_epochs_threaded_raw_onto_training_config_budget_max_epochs(self, tmp_path):
+        """training_config.budget_max_epochs carries max_epochs RAW (None when
+        unset), NOT the resolved num_epochs default of 30 -- budget_for's
+        min-clamp reads this raw field so it does not wrongly cap the
+        50/80-epoch buckets down to 30.
+        """
+        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
+        config = load_server_config(yaml_file)
+        assert config.training_config.num_epochs == 30
+        assert config.training_config.budget_max_epochs is None
+
+        config.consolidation.max_epochs = 5
+        assert config.training_config.num_epochs == 5
+        assert config.training_config.budget_max_epochs == 5
+
+
+class TestBudgetDerivationEnabledConfig:
+    """consolidation.budget_derivation_enabled threads onto
+    TrainingConfig.budget_derivation_enabled -- the master switch for
+    paramem.utils.config.budget_for at the training funnel.
+    """
+
+    def test_default_false(self, tmp_path):
+        """Ship-safe default: off (today's fixed-budget behaviour)."""
+        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
+        config = load_server_config(yaml_file)
+        assert config.consolidation.budget_derivation_enabled is False
+        assert config.training_config.budget_derivation_enabled is False
+
+    def test_yaml_override_flows_to_training_config(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              budget_derivation_enabled: true
+            """,
+        )
+        config = load_server_config(yaml_file)
+        assert config.consolidation.budget_derivation_enabled is True
+        assert config.training_config.budget_derivation_enabled is True
+
 
 class TestAdaptersFactoryDefaultMerge:
     """Loader contract for adapter target_modules under the explicit-yaml posture.

@@ -407,6 +407,28 @@ class TestRegistry:
         assert sorted(s.active_keys_in_tier("episodic")) == ["graph1", "graph2"]
         assert s.active_keys_in_tier("procedural") == []
 
+    def test_stale_keys_in_tier(self):
+        """Per-tier analogue of active_keys_in_tier for the stale partition
+        (fold-telemetry: measures encoded-vs-active divergence)."""
+        s = MemoryStore(replay_enabled=True)
+        s.put("episodic", "graph1", _entry("graph1"), register=True)
+        s.put("episodic", "graph2", _entry("graph2"), register=True)
+        s.put("semantic", "graph3", _entry("graph3"), register=True)
+
+        # Fresh store: nothing stale yet, and an unregistered tier reports
+        # an empty list rather than raising (mirrors active_keys_in_tier).
+        assert s.stale_keys_in_tier("episodic") == []
+        assert s.stale_keys_in_tier("procedural") == []
+
+        s.discard_keys(["graph1"], mode="stale")
+
+        assert s.stale_keys_in_tier("episodic") == ["graph1"]
+        assert s.stale_keys_in_tier("semantic") == []
+        # A fully erased key (never soft-staled) is invisible to this count
+        # by design -- it is removed from the registry entirely.
+        s.discard_keys(["graph2"], mode="erase")
+        assert s.stale_keys_in_tier("episodic") == ["graph1"]
+
     def test_all_active_keys(self):
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))

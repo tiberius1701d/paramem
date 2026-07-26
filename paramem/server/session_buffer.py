@@ -16,6 +16,9 @@ Session turns are always written to a per-session JSONL file under
 consolidation, ``retain_sessions``/``debug`` decide the JSONL's fate:
 moved under ``retention_dir`` when either is True, unlinked outright
 when both are False (see :meth:`SessionBuffer.mark_consolidated`).
+Sessions that retry-capped instead of consolidating cleanly move under
+``retention_dir/retired_recall_failed/`` (same rule, distinguishable
+subdirectory — see ``mark_consolidated``'s ``retired_session_ids``).
 ``debug`` additionally exposes disk-only pending sessions through
 :meth:`SessionBuffer.get_session_turns` / ``pending_count`` for
 inspection.
@@ -35,6 +38,7 @@ import re
 import secrets
 import shutil
 from collections import defaultdict
+from collections.abc import Set
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -65,6 +69,11 @@ def _snapshots_enabled() -> bool:
 # Session conversation states
 STATE_NEW = "new"
 STATE_IDENTIFIED = "identified"
+
+# Retention subdirectory (under a caller's retention_dir) for sessions that
+# retry-capped rather than consolidated cleanly — see
+# ``SessionBuffer.mark_consolidated``'s ``retired_session_ids`` parameter.
+RETIRED_RECALL_FAILED_SUBDIR = "retired_recall_failed"
 
 # Characters outside this set are filesystem-unsafe in a JSONL filename.
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
@@ -760,6 +769,7 @@ class SessionBuffer:
         session_ids: list[str],
         *,
         retention_dir: Path | None = None,
+        retired_session_ids: Set[str] = frozenset(),
     ) -> None:
         """Consume consolidated sessions and dispose of their JSONL.
 
@@ -782,6 +792,27 @@ class SessionBuffer:
         When deleting (privacy mode), both the chunk JSONLs and the
         origdoc are unlinked.  Transcript sessions use the existing flat
         layout (``retention_dir/<session_id>.jsonl``).
+
+        ``retired_session_ids`` marks the subset of *session_ids* that
+        retry-capped (recall-gate rejected on every retry —
+        :meth:`bump_retry_and_release`) rather than consolidated cleanly.
+        Its production value is the interim scheduled-tick path's
+        ``_released_sids`` (``paramem/server/app.py`` around the
+        ``bump_retry_and_release`` call, threaded into the same function's
+        ``mark_consolidated`` call a few lines later). Retired sessions are
+        retained-or-deleted under the SAME ``retain``/*retention_dir* rule
+        as any other session — ``retain_sessions=False`` still means
+        unlink for them too. The only difference is the destination
+        subdirectory when retaining:
+        ``retention_dir/retired_recall_failed/<session_id>.jsonl``
+        (``RETIRED_RECALL_FAILED_SUBDIR``) instead of the flat layout, so
+        retry-capped transcripts are distinguishable from
+        successfully-consolidated ones without a second archive
+        mechanism. Doc-chunk atomicity extends to this distinction: if
+        any chunk of a ``doc_id`` group is retired, the whole group (the
+        chunks present in *this* call, plus the origdoc) is archived
+        under ``retention_dir/retired_recall_failed/<doc_id>/`` rather
+        than splitting one document across two locations.
         """
         retain = self.retain_sessions or self.debug
         if retain and retention_dir is not None:
@@ -807,6 +838,15 @@ class SessionBuffer:
             sid: doc_id for doc_id, sids in doc_id_to_chunk_sids.items() for sid in sids
         }
 
+        # A doc_id group with at least one retired chunk is archived whole
+        # under the retired subdir — a document is never split between the
+        # two destinations.
+        retired_doc_ids = {
+            sid_to_doc_id[sid]
+            for sid in session_ids
+            if sid in retired_session_ids and sid in sid_to_doc_id
+        }
+
         for session_id in session_ids:
             self._turns.pop(session_id, None)
             self._sessions.pop(session_id, None)
@@ -815,15 +855,20 @@ class SessionBuffer:
                 continue
             if retain and retention_dir is not None:
                 doc_id = sid_to_doc_id.get(session_id)
+                is_retired = session_id in retired_session_ids or doc_id in retired_doc_ids
+                dest_root = (
+                    retention_dir / RETIRED_RECALL_FAILED_SUBDIR if is_retired else retention_dir
+                )
                 if doc_id is not None:
                     # Chunk JSONL co-located with the origdoc under
-                    # retention_dir/<doc_id>/<session_id>.jsonl.
-                    doc_ret_dir = retention_dir / doc_id
+                    # dest_root/<doc_id>/<session_id>.jsonl.
+                    doc_ret_dir = dest_root / doc_id
                     doc_ret_dir.mkdir(parents=True, exist_ok=True)
                     dest = doc_ret_dir / f"{session_id}.jsonl"
                 else:
                     # Transcript sessions keep the flat layout.
-                    dest = retention_dir / f"{session_id}.jsonl"
+                    dest = dest_root / f"{session_id}.jsonl"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(source), str(dest))
                 logger.info("Retained session %s → %s", session_id, dest)
             else:
@@ -836,10 +881,15 @@ class SessionBuffer:
             if not origdoc.exists():
                 continue
             if retain and retention_dir is not None:
-                # Archive origdoc under retention_dir/<doc_id>/ renamed to
-                # the original filename collected in the first pass above.
+                # Archive origdoc under dest_root/<doc_id>/ renamed to the
+                # original filename collected in the first pass above.
                 doc_filename = doc_id_to_filename.get(doc_id, f"{doc_id}.bin")
-                doc_ret_dir = retention_dir / doc_id
+                dest_root = (
+                    retention_dir / RETIRED_RECALL_FAILED_SUBDIR
+                    if doc_id in retired_doc_ids
+                    else retention_dir
+                )
+                doc_ret_dir = dest_root / doc_id
                 doc_ret_dir.mkdir(parents=True, exist_ok=True)
                 dest = doc_ret_dir / doc_filename
                 shutil.move(str(origdoc), str(dest))

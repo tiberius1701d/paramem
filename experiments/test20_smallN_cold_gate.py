@@ -66,7 +66,7 @@ Hard assertions (all written into results.json; fail loud if violated)
    proves cold init) or NON-ZERO immediately before training (warm arm —
    proves the donor copy landed), and NON-ZERO after training in both
    arms (proves the adapter actually moved). Norm computation is
-   ``_lora_b_frobenius_norm`` below.
+   ``paramem.models.loader.lora_b_frobenius_norm``.
 4. (Warm arm only) The donor adapter's LoRA-B Frobenius norm is
    bit-identical immediately before and immediately after each seed's
    ``train_adapter`` call (donor immutability), and the trainable
@@ -296,6 +296,7 @@ from paramem.models.loader import (  # noqa: E402
     _adapter_slot_for_load,
     copy_adapter_weights,
     create_adapter,
+    lora_b_frobenius_norm,
     switch_adapter,
     unload_model,
 )
@@ -583,40 +584,6 @@ def _default_arm_label(n_entries: int, expected_steps: int, is_real: bool, warm:
 
 
 # ---------------------------------------------------------------------------
-# LoRA-B norm helper (mirrors test19_neardup_procedural.py:619-676)
-# ---------------------------------------------------------------------------
-
-
-def _lora_b_frobenius_norm(model: PeftModel, adapter_name: str) -> float:
-    """Return the total Frobenius norm of all LoRA-B tensors for *adapter_name*.
-
-    LoRA-B is zero-initialised by PEFT at adapter creation (identity
-    residual), so a zero norm immediately after ``create_adapter`` and a
-    non-zero norm after training together prove cold init actually ran end
-    to end (Hard Assertion #3).
-
-    Args:
-        model: PeftModel carrying *adapter_name*.
-        adapter_name: Adapter whose LoRA-B norm is computed.
-
-    Returns:
-        Total Frobenius norm of all LoRA-B tensors for the adapter (float).
-
-    Raises:
-        AssertionError: When no ``lora_B`` tensors are found for the
-            adapter (wrong adapter name / not yet created).
-    """
-    total_norm = 0.0
-    count = 0
-    for name, param in model.named_parameters():
-        if f"lora_B.{adapter_name}.weight" in name:
-            total_norm += param.data.norm().item()
-            count += 1
-    assert count > 0, f"No lora_B tensors found for adapter '{adapter_name}' — check adapter name"
-    return total_norm
-
-
-# ---------------------------------------------------------------------------
 # Optimizer-step capture callback
 # ---------------------------------------------------------------------------
 
@@ -897,11 +864,11 @@ def _run_seed(
     donor_lora_b_norm_before: float | None = None
     if is_warm:
         copy_adapter_weights(model, src=DONOR_ADAPTER_NAME, dst=adapter_name)
-        donor_lora_b_norm_before = _lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
+        donor_lora_b_norm_before = lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
 
     # Step 4: Hard Assertion #3 — cold init proof (cold arm) / warm-copy
     # proof (warm arm), pre-training.
-    lora_b_norm_before = _lora_b_frobenius_norm(model, adapter_name)
+    lora_b_norm_before = lora_b_frobenius_norm(model, adapter_name)
     if is_warm:
         assert lora_b_norm_before > 0.0, (
             f"Hard Assertion #3 FAILED (pre-training, warm arm): LoRA-B Frobenius "
@@ -1008,7 +975,7 @@ def _run_seed(
     )
 
     # Step 10: Hard Assertion #3 (post-training half) — adapter moved, both arms.
-    lora_b_norm_after = _lora_b_frobenius_norm(model, adapter_name)
+    lora_b_norm_after = lora_b_frobenius_norm(model, adapter_name)
     assert lora_b_norm_after > 0.0, (
         f"Hard Assertion #3 FAILED (post-training): LoRA-B Frobenius norm for "
         f"'{adapter_name}' is {lora_b_norm_after}, expected > 0.0 (adapter moved)."
@@ -1019,7 +986,7 @@ def _run_seed(
     # its LoRA-B norm must be bit-identical before and after.
     donor_lora_b_norm_after: float | None = None
     if is_warm:
-        donor_lora_b_norm_after = _lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
+        donor_lora_b_norm_after = lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
         assert donor_lora_b_norm_after == donor_lora_b_norm_before, (
             f"Hard Assertion #4 FAILED (donor immutability): donor LoRA-B Frobenius "
             f"norm changed from {donor_lora_b_norm_before} to {donor_lora_b_norm_after} "
