@@ -53,13 +53,26 @@ apart would only reintroduce an asymmetry that decision rejected.
 Fixture provenance
 -------------------
 ``donor_fixture.json``'s 21 entries are a hand-anonymized copy of a
-production fold that failed at recall 0.762 (keys ``graph179``-``graph193``
-+ ``proc35``-``proc40``, captured live). Every subject/object value naming
-a real person, place, organisation, or date was replaced with a fictional
-equivalent of similar shape (predicates are preserved verbatim — they are
-the training mechanism, not personal content); the keys are kept verbatim
-(they ARE the mechanism this donor exists to seed). The un-anonymized
-source never enters this repository. The synthetic content pools below
+production fold that failed at recall 0.762 (originally captured live at
+keys ``graph179``-``graph193`` + ``proc35``-``proc40``). Every subject/object
+value naming a real person, place, organisation, or date was replaced with a
+fictional equivalent of similar shape (predicates are preserved verbatim —
+they are the training mechanism, not personal content). The un-anonymized
+source never enters this repository.
+
+The fixture's keys were remapped to ``graph101``-``graph115`` +
+``proc101``-``proc106`` after the small-N validation runs (see
+``experiments/test20_smallN_cold_gate.py`` and ``benchmarking.md``) proved
+donor seeding transfers with zero key overlap between the donor's own
+population and the target keys being trained — the original verbatim
+production-key overlap was validated-but-unnecessary. The remap preserves
+the failing fold's structural shape exactly (same 21 subject/predicate/object
+triples in the same order; same crowded 7-wide ``expertise`` cluster; same
+depth-3 divergence — ``graph101``-``graph109`` share the leading ``"10"``,
+``graph110``-``graph115`` share ``"11"``) while landing on numerals outside
+every documented live-store key range, so the donor's synthetic population
+can never collide with a real production key by construction. The synthetic
+content pools below
 (``_PRIMARY_NAMES`` etc., used to extend the fixture's 21 entries to
 ``N >= DONOR_MIN_ENTRIES``) are disjoint from every one of the fixture's own
 21 values by construction — none of the fixture's actual subjects/objects
@@ -398,7 +411,7 @@ def _allocate_block_keys(used: set[int], count: int) -> list[int]:
 
     Mutates *used* in place (adds the allocated integers) so successive
     calls across blocks never collide, including with the fixture's own
-    reserved ``graph179-193`` / ``proc35-40`` range (pre-seeded into *used*
+    reserved ``graph101-115`` / ``proc101-106`` range (pre-seeded into *used*
     by :func:`donor_entries`).
     """
     keys: list[int] = []
@@ -619,7 +632,7 @@ def donor_entries(seed: int, n: int) -> list[dict]:
     training determinism is a separate, heavier, opt-in concern — see the
     module docstring). Extends ``donor_fixture.json``'s 21-entry template
     structurally: the template itself is always block 0 (its keys
-    ``graph179-193`` / ``proc35-40`` and its subjects ``speaker0`` /
+    ``graph101-115`` / ``proc101-106`` and its subjects ``speaker0`` /
     ``corinne`` / ``theo`` are reproduced verbatim), and additional
     21-entry blocks (:func:`_synthesize_block`) are appended until the total
     reaches *n*, each keyed from fresh integers in ``1..DONOR_KEY_BAND_WIDTH``

@@ -40,7 +40,7 @@ from paramem.utils.config import AdapterConfig, TrainingConfig
 # authoring time (word-token intersection, minus stopwords/predicates, is
 # empty); this test only guards against silent, unnoticed drift of the
 # tracked fixture file itself afterward.
-_FIXTURE_SHA256 = "0672ee370b828d2d5ae516fb9c9bcaf3a66748803d3c3bd5d2a66743314a7bf6"
+_FIXTURE_SHA256 = "0c748e61af268ba1b13eee0c01752e4dea2327be67353a2ff30d540b44f959e1"
 
 _SINGLE_VALUED_PREDICATES = ("birth date", "graduation date", "has spouse")
 
@@ -116,33 +116,62 @@ class TestDonorFixture:
         )
 
     def test_fixture_keys_verbatim(self):
-        """The 21 production keys (the mechanism) must be exactly preserved."""
+        """The 21 donor-band keys (the mechanism) must be exactly preserved.
+
+        Remapped from the original captured-live production numerals
+        (``graph179-193`` / ``proc35-40``) to ``graph101-115`` /
+        ``proc101-106`` after the small-N validation runs proved donor
+        seeding transfers with zero key overlap (see donor.py's module
+        docstring "Fixture provenance" section) -- these numerals sit
+        outside every documented live-store key range by construction.
+        """
         with _FIXTURE_PATH.open() as f:
             fixture = json.load(f)
         keys = [e["key"] for e in fixture]
         assert keys == [
-            "graph179",
-            "graph180",
-            "graph181",
-            "graph182",
-            "graph183",
-            "graph184",
-            "graph185",
-            "graph186",
-            "graph187",
-            "graph188",
-            "graph189",
-            "graph190",
-            "graph191",
-            "graph192",
-            "graph193",
-            "proc35",
-            "proc36",
-            "proc37",
-            "proc38",
-            "proc39",
-            "proc40",
+            "graph101",
+            "graph102",
+            "graph103",
+            "graph104",
+            "graph105",
+            "graph106",
+            "graph107",
+            "graph108",
+            "graph109",
+            "graph110",
+            "graph111",
+            "graph112",
+            "graph113",
+            "graph114",
+            "graph115",
+            "proc101",
+            "proc102",
+            "proc103",
+            "proc104",
+            "proc105",
+            "proc106",
         ]
+
+    def test_fixture_keys_outside_live_store_ranges(self):
+        """Band-membership guard: the donor's block-0 keys must not fall
+        inside any documented live-store range (graph141-148/156-158/
+        168-174/179-193, proc<=~42) -- the whole point of the post-
+        validation remap was to eliminate overlap-by-construction."""
+        with _FIXTURE_PATH.open() as f:
+            fixture = json.load(f)
+        live_graph_ranges = [(141, 148), (156, 158), (168, 174), (179, 193)]
+        live_proc_ceiling = 42
+        for entry in fixture:
+            key = entry["key"]
+            if key.startswith("graph"):
+                num = int(key.removeprefix("graph"))
+                assert 101 <= num <= 115
+                for lo, hi in live_graph_ranges:
+                    assert not (lo <= num <= hi), f"{key} collides with live range {lo}-{hi}"
+            elif key.startswith("proc"):
+                num = int(key.removeprefix("proc"))
+                assert 101 <= num <= 106
+                assert num > live_proc_ceiling
 
     def test_fixture_entries_have_required_shape(self):
         with _FIXTURE_PATH.open() as f:

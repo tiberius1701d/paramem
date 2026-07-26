@@ -263,9 +263,10 @@ consolidation:
   # batch stays 1) instead of the fixed training_* fields below. max_epochs
   # above still clamps the derived epoch count when set
   # (min(bucket, max_epochs)). false (default) is exactly today's
-  # fixed-budget behaviour -- only the >=128 bucket is anchored on
-  # production fold telemetry; the other buckets are extrapolated, so the
-  # feature ships off until validated on more fold data.
+  # fixed-budget behaviour -- the >=128 bucket is anchored on production
+  # fold telemetry and the 16-127 bucket at N=21 (4 seeds, 21/21 at 50
+  # epochs; benchmarking.md, Test 20); the rest of that band and the <16
+  # bucket remain extrapolated.
   budget_derivation_enabled: false
   # Donor seeding. When true, a measured-cold target adapter (LoRA-B ~= 0) is
   # seeded from the donor checkpoint (paramem.training.donor) before training,

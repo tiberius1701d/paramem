@@ -1613,6 +1613,175 @@ class TestRecallGateRejectedVramCleanup:
             f"delete_adapter must not be called on the success path, got {delete_calls}"
         )
 
+    def test_full_rejection_contract_then_successful_retry(self, tmp_path: Path) -> None:
+        """Complete normal-return contract for a recall-gate rejection, in ONE flow.
+
+        Drives a rejected interim fold and asserts, together, the full set of
+        guarantees the individual tests above cover separately:
+
+        1. the cycle returns normally with ``mode == "recall_failed"`` and
+           ``recall_failed_session_ids`` carrying the pending session id
+           (from ``episodic_rels``' ``session_id`` field — the
+           ``_pending_session_ids_b`` provenance the ``except RecallGateRejected``
+           branch actually uses, distinct from the per-key ``rec["session_ids"]``
+           path covered by ``TestRecallFailedSessionStaysPending``);
+        2. the interim slot is gone from ``model.peft_config`` (VRAM drop) and
+           ``episodic`` is the active adapter;
+        3. ``_indexed_next_index`` / ``_procedural_next_index`` did NOT advance;
+        4. ``fold_resume.json`` is cleared;
+        5. store rollback: a pre-existing key soft-staled by this cycle's
+           subtractive-removal stage (``merger.removal_ledger``) is reactivated,
+           and the freshly-minted (now rejected) interim tier is dropped
+           wholesale from the store;
+        6. a follow-up cycle at the SAME stamp re-mints a fresh slot and, once
+           its gate passes, returns ``mode == "trained"`` with the counters
+           advanced.
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _make_mock_loop(tmp_path)
+        interim_name = f"episodic_interim_{self._STAMP}"
+
+        create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
+
+        def _delete_adapter(name: str) -> None:
+            loop.model.peft_config.pop(name, None)
+
+        loop.model.delete_adapter.side_effect = _delete_adapter
+
+        # A pre-existing episodic key that this cycle's subtractive-removal
+        # stage soft-stales (mirrors a synonym/dedup collapse discovered
+        # mid-fold) — exercises the reactivate half of the rollback.
+        loop.store.put(
+            "episodic",
+            "graph_preexisting",
+            {"key": "graph_preexisting", "subject": "X", "predicate": "knows", "object": "Y"},
+            simhash=123,
+        )
+        loop.merger.removal_ledger = {"graph_preexisting": {"reason": "semantic_dedup"}}
+
+        pending_session_id = "session-full-contract-001"
+        episodic_rels = [
+            {
+                "subject": "placeholder",
+                "predicate": "placeholder",
+                "object": "placeholder",
+                "relation_type": "factual",
+                "speaker_id": "speaker0",
+                "session_id": pending_session_id,
+            }
+        ]
+
+        _commit_calls = {"n": 0}
+
+        def _commit_side_effect(*args, **kwargs):
+            _commit_calls["n"] += 1
+            if _commit_calls["n"] == 1:
+                raise RecallGateRejected(
+                    "simulated post-save disk-integrity failure",
+                    recall_rate=0.5,
+                    threshold=1.0,
+                )
+            return None
+
+        pre_indexed_index = loop._indexed_next_index
+        pre_procedural_index = loop._procedural_next_index
+        fold_resume_path = loop._fold_state_dir / "fold_resume.json"
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                create_interim_spy,
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch(
+                "paramem.memory.persistence.commit_tier_slot",
+                side_effect=_commit_side_effect,
+            ),
+        ):
+            result_1 = loop.run_consolidation_cycle(
+                episodic_rels,
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-full-contract",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=self._STAMP,
+            )
+
+            # --- 1. Normal-return verdict ---
+            assert result_1["mode"] == "recall_failed", (
+                f"expected recall_failed, got {result_1['mode']}"
+            )
+            assert pending_session_id in result_1["recall_failed_session_ids"], (
+                f"expected {pending_session_id!r} in recall_failed_session_ids, "
+                f"got {result_1['recall_failed_session_ids']}"
+            )
+
+            # --- 2. VRAM slot removed, episodic active ---
+            assert interim_name not in loop.model.peft_config, (
+                "rejected interim adapter must be gone from peft_config (VRAM)"
+            )
+            assert loop.model.set_adapter.call_args_list[-1].args == ("episodic",), (
+                "episodic must be the active adapter after a rejection"
+            )
+
+            # --- 3. Key counters did NOT advance ---
+            assert loop._indexed_next_index == pre_indexed_index, (
+                "_indexed_next_index must not advance on a rejected fold"
+            )
+            assert loop._procedural_next_index == pre_procedural_index, (
+                "_procedural_next_index must not advance on a rejected fold"
+            )
+
+            # --- 4. fold_resume.json cleared ---
+            assert not fold_resume_path.exists(), (
+                "fold_resume.json must be cleared after a rejected fold"
+            )
+
+            # --- 5. Store rollback: reactivate + tier drop ---
+            assert not loop.store.is_stale("graph_preexisting"), (
+                "pre-existing key soft-staled this cycle must be reactivated on rollback"
+            )
+            assert "graph_preexisting" in loop.store.active_keys_in_tier("episodic"), (
+                "reactivated key must be active again in its original tier"
+            )
+            assert loop.store.active_keys_in_tier(interim_name) == [], (
+                "the rejected interim tier must be dropped wholesale from the store"
+            )
+
+            # --- 6. Same-stamp retry succeeds once the gate passes ---
+            result_2 = loop.run_consolidation_cycle(
+                episodic_rels,
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-full-contract",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=self._STAMP,
+            )
+
+        assert result_2["mode"] == "trained", (
+            f"retry must succeed once the gate passes; got {result_2['mode']}"
+        )
+        assert interim_name in loop.model.peft_config, (
+            "the retry's freshly-minted slot must be resident after success"
+        )
+        assert loop._indexed_next_index > pre_indexed_index, (
+            "counters must advance once the retry's fold commits successfully"
+        )
+
 
 # ---------------------------------------------------------------------------
 # session_ids provenance carry through _build_all_edge_entries_into

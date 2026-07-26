@@ -82,7 +82,8 @@ Grouped index of all tests. See Part headers below for context.
 [Test 13b — Retention-Curve Re-Run](#test-13b-retention-curve-re-run-completed-2026-04-23) ·
 [Test 14 — Content-Free Scaffold, Multi-Round Early-Stop](#test-14-content-free-scaffold-with-multi-round-early-stop-at-scale) ·
 [Test 15 — Retention Multi-Seed (Scaffold-Fill vs Answer-Swap)](#test-15-retention-multi-seed-scaffold-fill-vs-answer-swap-production-early-stop) ·
-[Test 16 — Repair-Loop Sensitivity Sweep](#test-16-repair-loop-sensitivity-sweep)
+[Test 16 — Repair-Loop Sensitivity Sweep](#test-16-repair-loop-sensitivity-sweep) ·
+[Test 20 — Small-N Cold-Init Recall Gate (Donor Seeding and Budget Validation)](#test-20-small-n-cold-init-recall-gate-donor-seeding-and-budget-validation)
 
 **Part 3 — Generalization boundaries:**
 [Test 10 — Generalization Boundaries](#test-10-generalization-boundaries-of-parametric-memory) ·
@@ -2175,6 +2176,139 @@ The current run characterizes the repair primitive at one model (Mistral 7B nf4)
 
 6. **Latent-recovery time-scale**: how fast does `first_perfect_epoch` drift after consecutive overwrite + repair cycles?  Multiple consolidation cycles compound effects; the single overwrite + single repair characterised here is the unit step, not the long-run behaviour.
 
+---
+
+## Test 20: Small-N Cold-Init Recall Gate (Donor Seeding and Budget Validation)
+
+**Script:** `experiments/test20_smallN_cold_gate.py`
+**Status (2026-07-26):** Interim validation complete on the production Mistral 7B episodic recipe, at the exact 21-key set from a real interim production fold. CPU-only write-up; all runs below are real GPU training/recall, not simulated.
+
+### Setup
+
+All arms load the exact production 21-key set via `--entries-json` (never the
+script's synthetic generator): 15 episodic `graph*` keys + 6 procedural
+`proc*` keys, drawn from a real interim episodic/procedural cluster that
+previously failed at recall 0.762 in production. Recipe loaded from
+`tests/fixtures/server.yaml` (never `configs/server.yaml.example` — project
+rule): rank 8, alpha 16, attention-only `target_modules`, batch_size=1,
+gradient_accumulation_steps=2, `lr_scheduler_type="linear"`,
+`weight_decay=0.1`, `gradient_checkpointing=True`. `num_epochs` is set per
+arm; `recall_early_stopping` is forced OFF in every arm so the epoch budget
+is a hard walk, never truncated by the recall gate. Per the project's data
+rules, only condition names, key counts, and rates are reported below — no
+subject/predicate/object content from the entries appears anywhere in this
+write-up.
+
+### Conditions x seeds x rates
+
+| Condition | Steps | Key set | Seeds | Exact-match / 21 | Rate |
+|---|---|---|---|---|---|
+| cold 30ep | 330 | production (interim) | 42 / 0 / 1 / 2 | 17 / 16 / 14 / 19 | 0.810 / 0.762 / 0.667 / 0.905 (mean **0.786**) |
+| donor-init 30ep | 330 | production (interim) | 42 / 0 / 1 / 2 | 21 / 21 / 21 / 21 | 1.000 (all 4 seeds) |
+| cold 50ep (decay-pinned) | 550 | production (interim) | 42 / 0 / 1 / 2 | 21 / 21 / 21 / 21 | 1.000 (all 4 seeds) |
+| donor-init 50ep (decay-pinned) | 550 | production (interim) | 42 / 0 / 1 / 2 | 21 / 21 / 21 / 21 | 1.000 (all 4 seeds) |
+| cold 30ep, shifted keys (+200) | 330 | shifted, zero donor overlap | 42 / 0 | 21 / 18 | 1.000 / 0.857 |
+| donor-init 30ep, shifted keys (+200) | 330 | shifted, zero donor overlap | 42 / 0 | 21 / 21 | 1.000 / 1.000 |
+
+Donor self-recall (its own 147-entry synthetic population, seed 42, 30
+anchored-bucket epochs, trained before any target-adapter seeding):
+**147/147 exact-match (rate 1.000, mean confidence 1.000)**.
+
+### The negative result
+
+Cold-init at 30 epochs (330 optimizer steps) fails on the production 21-key
+set in **4 of 4 seeds** — mean rate **0.786** (range 0.667-0.905; seeds 42 /
+0 / 1 / 2 score 17 / 16 / 14 / 19 of 21). This is not a uniform failure mode:
+the shifted-key cold arm (same step budget, different key numerals, zero
+overlap with the donor's own population) shows seed 42 reaching 1.000 while
+seed 0 partially fails at 18/21 (0.857). Cold failure at the 330-step budget
+is therefore **seed-dependent and dependent on the specific key numerals
+trained**, not a fixed property of N=21 alone.
+
+### Equal-budget comparison: donor seeding vs. cold at 330 steps
+
+At the identical 330-step budget, donor-init reaches **1.000 on 4/4 seeds**
+while cold fails on 4/4 seeds (mean 0.786). Donor seeding — not additional
+steps — closes the gap at this budget. Cold does reach 1.000 given a larger
+budget: extending to 50 epochs (550 steps, `lr_decay_steps` pinned to 550 so
+the LR decay window matches the realized step count) also reaches 1.000 on
+all 4 seeds. Donor-init at the same 550-step budget also holds at 1.000 (no
+regression at the larger budget). Net: **at 330 steps cold fails and
+donor-init does not; at 550 steps both reach 1.000** — cold needs the larger
+(550-step) budget that donor-init does not.
+
+### The key-overlap confound and its resolution
+
+At the time these runs were made, the donor's own synthetic population's
+block 0 was bit-identical to this production 21-key set (`donor_meta.json`
+recorded `donor_key_overlap.count == 21` for every donor-init seed against
+the interim key set) — the donor had already partially learned these exact
+keys (with different, donor-fictional objects) during its own training. This
+confounds "donor seeding helps" with "the donor already knows these specific
+keys."
+
+To resolve this, a second pair of arms reused the identical protocol on a
+**shifted key set** — the same 21 entries, keys renumbered +200 (e.g. the
+`graph179`-prefixed keys become `graph379`-prefixed, `proc35`-prefixed keys
+become `proc235`-prefixed), which falls entirely outside the donor's
+reserved key band, so `donor_key_overlap.count == 0` for every entry. At
+zero overlap, donor-init 30ep still reaches **1.000 on both seeds run (42,
+0)**, matching the full-overlap donor result exactly. This is the bridge
+evidence: donor seeding's uplift is not explained by memorized-key overlap —
+it transfers to keys the donor has never seen.
+
+### Protocol notes
+
+- `recall_early_stopping` forced OFF in every arm above.
+- The 50-epoch arms explicitly pin `lr_decay_steps=550` (decay-pinned) so
+  the scheduler's decay window matches the realized step count rather than
+  being derived from a different epoch count.
+- All arms use the exact production 21-key set (both `graph*` and `proc*`
+  prefixes) from a real interim fold, loaded via `--entries-json` — never
+  the script's synthetic diverse-predicate generator.
+- Hard assertions built into the script (LoRA-B Frobenius norm zero before
+  training for cold arms / non-zero for donor arms; donor-adapter norm
+  bit-identical before/after each seed) held for every seed reported here.
+- Content discipline: this section reports condition names, step/epoch
+  counts, key counts, and exact-match rates only — never the subjects,
+  predicates, or objects trained in any arm.
+
+### Fixture provenance note (read before citing key numerals elsewhere)
+
+These results were produced when `paramem/training/donor.py`'s fixture
+(`donor_fixture.json`) still carried the donor's block-0 keys verbatim as
+the live production numerals (`graph179`-`graph193` / `proc35`-`proc40` —
+the same interim cluster trained against in every arm above). After this
+validation pass, the fixture's keys were remapped to
+`graph101`-`graph115` / `proc101`-`proc106` to eliminate the donor/target
+key-overlap-by-construction shown above to be an unnecessary (already-shown
+non-load-bearing) property — the zero-overlap shifted-key arms are the
+bridge evidence that the remap does not change the mechanism's behavior. Do
+not read the rates above as having been produced against the new,
+remapped fixture keys.
+
+### What these results validate
+
+- **Per-fold training-budget bucket for N in [16, 127) -> 50 epochs**
+  (`paramem.utils.config._BUDGET_TABLE`, gated off by default via
+  `budget_derivation_enabled` and documented in-code as "extrapolated, not
+  anchored" for this bucket, as of before this validation). The cold-50ep
+  arm (N=21, inside this bucket) reaching 1.000 on 4/4 seeds is fold-scale
+  evidence anchoring this bucket's epoch count, alongside the existing
+  128-key-floor bucket's own anchoring.
+- **Donor seeding as a rescue at the 30-epoch (330-step) bucket boundary**,
+  including the fresh-key regime (zero overlap with the donor's own
+  memorized population) — the mechanism `paramem.training.donor` /
+  `ConsolidationLoop._maybe_seed_from_donor` implements.
+
+### Remaining gap
+
+- N <= 3 is unmeasured by this validation pass under the production
+  Mistral/episodic recipe used here.
+- Production `epochs_to_bind` fold telemetry (`paramem.training.consolidation`,
+  surfaced via `paramem/server/fold_telemetry.py`) will accumulate further
+  real-fold evidence for the budget-bucket boundary over time; the seeds
+  above are a bench validation, not a substitute for that telemetry.
 
 ---
 

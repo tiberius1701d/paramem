@@ -64,14 +64,16 @@ Hard assertions (all written into results.json; fail loud if violated)
    ``train_adapter`` call.
 3. LoRA-B Frobenius norm is ZERO immediately before training (cold arm —
    proves cold init) or NON-ZERO immediately before training (warm arm —
-   proves the donor copy landed), and NON-ZERO after training in both
-   arms (proves the adapter actually moved). Norm computation is
+   ``--warm-from`` or ``--donor-init``, both feed the same
+   ``donor_scratch_dir`` mechanism — proves the donor copy landed), and
+   NON-ZERO after training in both arms (proves the adapter actually
+   moved). Norm computation is
    ``paramem.models.loader.lora_b_frobenius_norm``.
-4. (Warm arm only) The donor adapter's LoRA-B Frobenius norm is
-   bit-identical immediately before and immediately after each seed's
-   ``train_adapter`` call (donor immutability), and the trainable
-   adapter's name is never a live tier name (``episodic``/``semantic``/
-   ``procedural``).
+4. (Warm arm only — ``--warm-from`` or ``--donor-init``) The donor
+   adapter's LoRA-B Frobenius norm is bit-identical immediately before and
+   immediately after each seed's ``train_adapter`` call (donor
+   immutability), and the trainable adapter's name is never a live tier
+   name (``episodic``/``semantic``/``procedural``).
 
 The synthetic key set
 -----------------------
@@ -137,6 +139,60 @@ immediately after each seed's ``train_adapter`` call and asserted
 bit-identical — a silent donor mutation would invalidate the arm. The
 trainable adapter name (``episodic_<arm>_seed<N>``) is asserted to never
 collide with a live tier name (``episodic``/``semantic``/``procedural``).
+
+Donor-init (``--donor-init`` / ``--donor-checkpoint``) — budget/donor validation
+---------------------------------------------------------------------------------
+``--donor-init`` is a SECOND way to populate the exact same
+``donor_scratch_dir`` mechanism ``--warm-from`` uses above (mutually
+exclusive with it — both resolve one donor source, never two): instead of
+an owner-supplied adapter directory, the donor is
+``paramem.training.donor.donor_entries(DONOR_DEFAULT_SEED,
+DONOR_MIN_ENTRIES)`` (128 synthetic crowded-cluster keys, the same
+seed+recipe pure function production donor building uses — see
+``paramem.training.donor``'s module docstring for why this shape, not
+PerLTQA/longmemeval/diverse-predicate content, is the donor's content
+source) trained through THIS SCRIPT'S OWN ``train_adapter`` call path
+(``_build_donor_checkpoint`` — mirrors ``_run_seed``'s own
+create/switch/train/probe/save sequence; deliberately NOT
+``paramem.training.donor.build_donor``, which needs a live
+``ConsolidationLoop`` this standalone experiment has no business
+depending on) at ``DONOR_BUILD_EPOCHS`` (30, the anchored bucket in
+``paramem.utils.config._BUDGET_TABLE``).
+
+The donor builds ONCE and arms reuse it: ``--donor-checkpoint SLOT_DIR``
+points at a prior ``--donor-init`` run's
+``<run_dir>/donor_checkpoint/<ts>/`` slot and skips training entirely;
+omitting it makes THIS run build (or, on ``--resume``/a repeat invocation,
+reuse via ``<run_dir>/donor_build_done.json`` — the donor-build phase
+marker, mirroring ``seed<N>_done.json``'s pattern) its own donor
+checkpoint. Either way, the resolved checkpoint slot is
+``shutil.copytree``'d into ``<run_dir>/donor_scratch/`` exactly once
+(``<run_dir>/donor_source.json`` records the resolved source path + its
+weights SHA-256 so later seeds and ``--resume`` never re-derive it), and
+every downstream mechanism — ``_run_seed``'s Step 1b load, Hard Assertions
+#3/#4, donor immutability — is IDENTICAL to the ``--warm-from`` arm.
+
+``--lr-decay-steps N`` pins ``TrainingConfig.lr_decay_steps`` so the LR
+scheduler's decay window is comparable across arms run at different
+``--epochs`` (the approved decay-pinned validation protocol pins decay for
+the 50-epoch bucket-2 arm and the donor-init arms; omitting the flag
+preserves today's ``None`` passthrough — decay derived from
+``len(dataloader) * num_epochs``, HF's default). This pin applies to the
+ARM's own target-fact training only — ``_build_donor_checkpoint`` always
+forces ``lr_decay_steps=None`` for the donor's own training regardless of
+this flag (see that function's docstring).
+
+**Confound (recorded, not eliminated):** the donor's block-0 is
+bit-identical to the fixed 21-key fixture, so a real-production-key arm's
+``--entries-json`` set typically overlaps the donor's own keys entirely —
+the donor may pre-install key -> subject/predicate scaffolding (with a
+DIFFERENT, donor-fictional object) for exactly the keys this arm re-trains,
+so a donor-arm's recall uplift measures the overlapping-band store, not
+generalization to fresh keys (>= 201, outside the donor's reserved band).
+The exact-match rate metric itself is unaffected; only its ATTRIBUTION is —
+``results.json``'s ``donor_key_overlap`` records the intersection count and
+the donor's own (different) objects for those keys on every donor-init
+seed so this is never silently assumed away.
 
 Metric
 ------
@@ -253,19 +309,69 @@ cold, 3 seeds each. WARM decrypts the donor adapter, so
         --epochs 30 --probe-before-training \\
         >outputs/test20_real3_cold_probe.log 2>&1 &
 
+Budget/donor validation arms (exact-21 production keys). ``EXACT21_JSON``
+is the exact-21 production-key fixture (NEVER copied into
+this repository — pass its actual path)::
+
+    EXACT21_JSON=/path/to/interim_exact21_20260725.json
+
+Donor build + donor-init at 30 epochs (330 steps; builds the donor
+checkpoint under ``<run_dir>/donor_checkpoint/`` since no
+``--donor-checkpoint`` is given)::
+
+    setsid nohup python \\
+        experiments/test20_smallN_cold_gate.py --model mistral \\
+        --entries-json "$EXACT21_JSON" \\
+        --epochs 30 --donor-init \\
+        >outputs/test20_real21_donor_e30.log 2>&1 &
+
+Cold bucket-2 arm at 50 epochs (550 steps), decay pinned for comparability::
+
+    setsid nohup python \\
+        experiments/test20_smallN_cold_gate.py --model mistral \\
+        --entries-json "$EXACT21_JSON" \\
+        --epochs 50 --lr-decay-steps 550 \\
+        >outputs/test20_real21_cold_e50.log 2>&1 &
+
+Donor-init at 50 epochs (550 steps), reusing the checkpoint the first
+invocation above built (``--donor-checkpoint`` points at its
+``donor_checkpoint/<ts>/`` slot — see that run's ``donor_build_done.json``
+for the exact path)::
+
+    DONOR_SLOT=outputs/test20_smallN_cold_gate/real21_donor_s330/mistral/<ts>/donor_checkpoint/<ts>
+    setsid nohup python \\
+        experiments/test20_smallN_cold_gate.py --model mistral \\
+        --entries-json "$EXACT21_JSON" \\
+        --epochs 50 --lr-decay-steps 550 --donor-init \\
+        --donor-checkpoint "$DONOR_SLOT" \\
+        >outputs/test20_real21_donor_e50.log 2>&1 &
+
 Data safety
 -----------
 Results written to unique timestamped, arm-scoped paths via
 ``model_output_dir`` — never overwritten. Every result file includes full
 per-key ``raw_output``. The donor scratch copy (warm arm) lives under
 ``<run_dir>/donor_scratch/`` — inside the same output tree, never the
-donor's original path.
+donor's original path. ``--donor-init``'s own checkpoint
+(``<run_dir>/donor_checkpoint/``), build marker
+(``donor_build_done.json``), and source-provenance record
+(``donor_source.json``) are all inside ``OUTPUT_BASE``
+(``outputs/test20_smallN_cold_gate/``), which is entirely gitignored — the
+synthetic donor content has no personal data to begin with, but the
+convention is shared with the ``--entries-json`` real-key fixtures below.
+
+A ``--entries-json`` file naming REAL personal facts (e.g. the exact-21
+production-key fixture used for the bucket-2/donor-init validation arms) must never
+be copied into this repository, tracked or gitignored — pass its path
+directly at invocation; results derived from it land under ``outputs/``,
+which is gitignored, same as every other result file here.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -294,6 +400,7 @@ from experiments.utils.test_harness import (  # noqa: E402
 from paramem.memory.entry import build_registry, format_entry_training  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
     _adapter_slot_for_load,
+    atomic_save_adapter,
     copy_adapter_weights,
     create_adapter,
     lora_b_frobenius_norm,
@@ -301,6 +408,13 @@ from paramem.models.loader import (  # noqa: E402
     unload_model,
 )
 from paramem.server.config import load_server_config  # noqa: E402
+from paramem.training.donor import (  # noqa: E402
+    DONOR_BUILD_ADAPTER_NAME,
+    DONOR_DEFAULT_SEED,
+    DONOR_META_FILENAME,
+    DONOR_MIN_ENTRIES,
+    donor_entries,
+)
 from paramem.training.recall_eval import evaluate_indexed_recall  # noqa: E402
 from paramem.training.trainer import train_adapter  # noqa: E402
 
@@ -344,12 +458,37 @@ DISK_HEADROOM_BYTES = 5 * 1024**3
 # Required fields for each --entries-json entry dict.
 _REQUIRED_ENTRY_KEYS = ("key", "subject", "predicate", "object")
 
-# Name reserved for the (frozen, read-only) --warm-from donor adapter.
+# Name reserved for the (frozen, read-only) --warm-from / --donor-init donor
+# adapter mounted into _run_seed via donor_scratch_dir.
 DONOR_ADAPTER_NAME = "donor"
 
 # Live production tier names — the trainable adapter must NEVER collide
 # with one of these (donor-immutability guard; see CHANGE 2 module docstring).
 LIVE_TIER_NAMES = frozenset({"episodic", "semantic", "procedural"})
+
+# ---------------------------------------------------------------------------
+# --donor-init: build-your-own-donor constants (budget/donor validation arm)
+# ---------------------------------------------------------------------------
+
+# Epoch budget for the ONE-TIME donor build itself — the anchored bucket
+# (paramem.utils.config._BUDGET_TABLE's n_keys>=128 row: 30 epochs, the only
+# empirically-anchored bucket). Independent of --epochs (which budgets the
+# ARM's own target-fact training, not the donor's).
+DONOR_BUILD_EPOCHS = 30
+
+# Sub-directory of the run dir holding a freshly-built donor checkpoint (only
+# used when --donor-init is set and --donor-checkpoint is NOT — i.e. this run
+# builds its own donor rather than reusing a prior run's).
+DONOR_CHECKPOINT_DIRNAME = "donor_checkpoint"
+
+# Phase marker for the donor-build phase (mirrors seed<N>_done.json's
+# pattern — see _marker_path/_write_done_marker). Presence means the donor
+# checkpoint referenced inside was fully trained and saved; a crash before
+# this file is written must retrain the donor on retry (no partial-epoch
+# resume for the donor build, matching this script's existing per-seed
+# granularity — a crash mid-seed already requires retraining that whole
+# seed).
+DONOR_BUILD_MARKER_FILENAME = "donor_build_done.json"
 
 
 # ---------------------------------------------------------------------------
@@ -552,17 +691,17 @@ def _load_entries_from_file(path: Path) -> list[dict]:
     return entries
 
 
-def _default_arm_label(n_entries: int, expected_steps: int, is_real: bool, warm: bool) -> str:
+def _default_arm_label(n_entries: int, expected_steps: int, is_real: bool, mode: str) -> str:
     """Derive the default ``--arm`` label from the resolved run config.
 
     Preserves the script's original synthetic-cold naming
     (``cold_n{N}_s{steps}``) EXACTLY when neither ``--entries-json`` nor
-    ``--warm-from`` is set, so ``--resume`` keeps finding runs launched
-    before those flags existed (e.g. the completed
+    ``--warm-from``/``--donor-init`` is set, so ``--resume`` keeps finding
+    runs launched before those flags existed (e.g. the completed
     ``outputs/test20_smallN_cold_gate/cold_n3_s60/`` run). Real
-    (``--entries-json``) arms use ``real{N}_{cold|warm}_s{steps}`` (e.g.
-    ``real3_cold_s60`` / ``real3_warm_s60``) so the label states both the
-    dataset and the init condition explicitly.
+    (``--entries-json``) arms use ``real{N}_{mode}_s{steps}`` (e.g.
+    ``real3_cold_s60`` / ``real3_warm_s60`` / ``real21_donor_s550``) so the
+    label states both the dataset and the init condition explicitly.
 
     Args:
         n_entries: Resolved entry count (file length for
@@ -570,17 +709,37 @@ def _default_arm_label(n_entries: int, expected_steps: int, is_real: bool, warm:
         expected_steps: Derived total optimizer-step count
             (``_expected_optimizer_steps``).
         is_real: True when ``--entries-json`` supplied the entry set.
-        warm: True when ``--warm-from`` is set.
+        mode: One of ``"cold"`` (LoRA-zero), ``"warm"`` (``--warm-from`` an
+            arbitrary donor adapter dir), or ``"donor"`` (``--donor-init`` —
+            seeded from ``paramem.training.donor.donor_entries``, built or
+            reused via ``--donor-checkpoint``). Byte-identical output to the
+            prior ``warm: bool`` parameter for ``mode in ("cold", "warm")``
+            — only ``"donor"`` is a new label.
 
     Returns:
         The default arm label string (overridden by an explicit ``--arm``).
     """
     if is_real:
-        mode = "warm" if warm else "cold"
         return f"real{n_entries}_{mode}_s{expected_steps}"
-    if warm:
-        return f"n{n_entries}_warm_s{expected_steps}"
+    if mode != "cold":
+        return f"n{n_entries}_{mode}_s{expected_steps}"
     return f"cold_n{n_entries}_s{expected_steps}"
+
+
+def _condition_label(mode: str, epochs: int) -> str:
+    """Derive the descriptive (never letter-labeled) condition name for results.json.
+
+    Args:
+        mode: One of ``"cold"``, ``"warm"``, ``"donor"`` — see
+            ``_default_arm_label``.
+        epochs: The arm's ``--epochs`` budget.
+
+    Returns:
+        e.g. ``"donor-init 30ep"``, ``"cold 50ep"``,
+        ``"warm-from-adapter 30ep"``.
+    """
+    labels = {"cold": "cold", "warm": "warm-from-adapter", "donor": "donor-init"}
+    return f"{labels[mode]} {epochs}ep"
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +870,321 @@ def _run_recall_probe(
 
 
 # ---------------------------------------------------------------------------
+# --donor-init: build-your-own-donor checkpoint (budget/donor validation arm)
+# ---------------------------------------------------------------------------
+
+
+def _build_donor_checkpoint(
+    model,
+    tokenizer,
+    adapter_config,
+    base_training_config,
+    checkpoint_root: Path,
+) -> tuple[object, Path, dict]:
+    """Train ``paramem.training.donor.donor_entries`` through the SAME
+    ``train_adapter`` call path this script's own seeds use, and persist the
+    result as a standalone donor checkpoint under *checkpoint_root*.
+
+    Deliberately does NOT go through ``paramem.training.donor.build_donor``
+    (that helper trains via a live ``ConsolidationLoop._train_tier_adapter``
+    — production server wiring this standalone experiment has no business
+    depending on). Instead this mirrors ``_run_seed``'s own
+    create/switch/train/probe/save sequence, at ``DONOR_BUILD_EPOCHS`` (the
+    anchored 30-epoch bucket) on ``DONOR_MIN_ENTRIES`` (128) synthetic keys
+    generated by ``donor_entries(DONOR_DEFAULT_SEED, DONOR_MIN_ENTRIES)`` —
+    the same seed+recipe pure function production donor building uses, so
+    the triple set is bit-identical to what production would build.
+
+    ``lr_decay_steps`` is ALWAYS pinned to ``None`` for the donor's own
+    training, regardless of what *base_training_config* carries (an arm
+    invoked with ``--donor-init --lr-decay-steps 550`` would otherwise leak
+    that arm-comparability override into the donor build: at
+    ``DONOR_BUILD_EPOCHS``'s ~2220 steps, a 550-step decay window would
+    leave ~75% of the donor's own training at LR≈0). The donor build is a
+    ONE-TIME, its-own-recipe event (the anchored 30-epoch bucket) —
+    ``--lr-decay-steps`` is a per-ARM comparability knob for the target-fact
+    training only, never for the donor.
+
+    Args:
+        model: Base model (unwrapped inside if currently a ``PeftModel`` —
+            discards any resident adapter, matching ``_run_seed``'s Step 1).
+        tokenizer: Tokenizer matching the model.
+        adapter_config: Production episodic ``AdapterConfig`` (the donor
+            trains at the SAME rank/alpha/target_modules as the arm it will
+            seed — ``copy_adapter_weights`` requires exact topology match).
+        base_training_config: Production episodic ``TrainingConfig``
+            (batch/accum/lr/scheduler carried through unchanged; only
+            ``num_epochs``/``seed``/``recall_early_stopping``/
+            ``lr_decay_steps`` are overridden for the donor build — see
+            above for why ``lr_decay_steps`` is always forced to ``None``).
+        checkpoint_root: Directory ``atomic_save_adapter`` saves the donor
+            slot under (``target_dir/<ts>/`` — the returned ``Path`` is that
+            promoted slot).
+
+    Returns:
+        Tuple of ``(model, slot_path, donor_summary)``. ``model`` still
+        carries ``DONOR_BUILD_ADAPTER_NAME`` as its active adapter — the
+        caller's next step (``_run_seed``'s Step 1) unwraps and discards it,
+        exactly as it already discards any previous seed's adapters.
+        ``donor_summary`` carries the donor's own final recall
+        (``exact_count``/``total``/``rate``/``mean_confidence``/``per_key``
+        with verbatim ``raw_output``), the realized weights SHA-256, and the
+        pre/post LoRA-B Frobenius norms (cold-init proof for the build
+        itself). ``slot / DONOR_META_FILENAME`` (``"donor_meta.json"``) is
+        also written — ``{seed, n_entries, epochs, weights_sha256}`` — the
+        single source of truth ``_resolve_donor_source``/``_read_donor_meta``
+        read back later (including from a DIFFERENT run's
+        ``--donor-checkpoint`` reuse, since it travels with the slot).
+    """
+    entries = donor_entries(DONOR_DEFAULT_SEED, DONOR_MIN_ENTRIES)
+    registry = build_registry(entries)
+
+    if isinstance(model, PeftModel):
+        model = model.base_model.model
+    torch.manual_seed(DONOR_DEFAULT_SEED)
+    model = create_adapter(model, adapter_config, DONOR_BUILD_ADAPTER_NAME)
+    switch_adapter(model, DONOR_BUILD_ADAPTER_NAME)
+
+    lora_b_norm_before = lora_b_frobenius_norm(model, DONOR_BUILD_ADAPTER_NAME)
+    assert lora_b_norm_before == 0.0, (
+        f"Donor build: LoRA-B Frobenius norm for '{DONOR_BUILD_ADAPTER_NAME}' is "
+        f"{lora_b_norm_before}, expected 0.0 (cold init) before the donor build's "
+        "own training."
+    )
+
+    examples = format_entry_training(
+        entries, tokenizer, max_length=base_training_config.max_seq_length
+    )
+    dataset = IndexedDataset(examples)
+    donor_training_cfg = dataclasses.replace(
+        base_training_config,
+        seed=DONOR_DEFAULT_SEED,
+        num_epochs=DONOR_BUILD_EPOCHS,
+        recall_early_stopping=False,
+        # ALWAYS None for the donor's own training — never inherit an arm's
+        # --lr-decay-steps comparability override (see the docstring above).
+        lr_decay_steps=None,
+    )
+
+    logger.info(
+        "Donor build: training %d entries, %d epochs, seed=%d",
+        len(examples),
+        DONOR_BUILD_EPOCHS,
+        DONOR_DEFAULT_SEED,
+    )
+    t0 = time.time()
+    metrics = train_adapter(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        adapter_name=DONOR_BUILD_ADAPTER_NAME,
+        training_config=donor_training_cfg,
+        adapter_config=adapter_config,
+        output_dir=checkpoint_root / ".training_scratch",
+        run_name="test20-donor-build",
+    )
+    wall_train = time.time() - t0
+    train_loss = (metrics or {}).get("train_loss")
+
+    lora_b_norm_after = lora_b_frobenius_norm(model, DONOR_BUILD_ADAPTER_NAME)
+    assert lora_b_norm_after > 0.0, (
+        f"Donor build: LoRA-B Frobenius norm for '{DONOR_BUILD_ADAPTER_NAME}' is "
+        f"{lora_b_norm_after}, expected > 0.0 after training (the donor build adapter "
+        "did not move)."
+    )
+
+    recall = _run_recall_probe(model, tokenizer, entries, registry, DONOR_BUILD_ADAPTER_NAME)
+
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    slot = atomic_save_adapter(model, checkpoint_root, DONOR_BUILD_ADAPTER_NAME)
+    weights_sha256 = hashlib.sha256((slot / "adapter_model.safetensors").read_bytes()).hexdigest()
+
+    # Per-slot provenance — the single source of truth _read_donor_meta
+    # verifies against and H1's key-overlap computation reads back, even
+    # from a DIFFERENT run reusing this slot via --donor-checkpoint (it
+    # travels with the slot, never with this run's own markers).
+    donor_meta = {
+        "seed": DONOR_DEFAULT_SEED,
+        "n_entries": len(entries),
+        "epochs": DONOR_BUILD_EPOCHS,
+        "weights_sha256": weights_sha256,
+    }
+    (slot / DONOR_META_FILENAME).write_text(json.dumps(donor_meta, indent=2))
+
+    donor_summary = {
+        "seed": DONOR_DEFAULT_SEED,
+        "n_entries": len(entries),
+        "epochs": DONOR_BUILD_EPOCHS,
+        "slot": str(slot),
+        "weights_sha256": weights_sha256,
+        "lora_b_norm_before_training": lora_b_norm_before,
+        "lora_b_norm_after_training": lora_b_norm_after,
+        "train_loss": train_loss,
+        "wall_train_seconds": wall_train,
+        "summary": {
+            "exact_count": recall["exact_count"],
+            "total": recall["total"],
+            "rate": recall["rate"],
+            "mean_confidence": recall["mean_confidence"],
+        },
+        "per_key": recall["per_key"],
+    }
+    save_results(donor_summary, checkpoint_root, filename="donor_build_results.json")
+    logger.info(
+        "Donor build complete: slot=%s recall=%d/%d (%.1f%%) sha256=%s",
+        slot,
+        recall["exact_count"],
+        recall["total"],
+        recall["rate"] * 100,
+        weights_sha256,
+    )
+    return model, slot, donor_summary
+
+
+def _read_donor_meta(slot: Path) -> dict:
+    """Read + verify *slot*'s ``DONOR_META_FILENAME`` (``"donor_meta.json"``).
+
+    Single source of truth for a donor checkpoint's provenance
+    (``seed``/``n_entries``/``epochs``/``weights_sha256``), written once by
+    :func:`_build_donor_checkpoint` and read back from every reuse path —
+    including ``--donor-checkpoint`` reuse from a run whose own
+    ``run_dir`` is not otherwise reachable, which is why the meta file
+    lives INSIDE the slot rather than only in a run-scoped marker.
+    Recomputes ``adapter_model.safetensors``'s SHA-256 and compares it
+    against the recorded value — a mismatch means the weights file was
+    modified or corrupted after the build, and this fails loud rather than
+    silently seeding from unverified weights.
+
+    Args:
+        slot: A donor checkpoint slot directory (contains
+            ``adapter_model.safetensors`` + ``DONOR_META_FILENAME``).
+
+    Returns:
+        The parsed meta dict (``seed``, ``n_entries``, ``epochs``,
+        ``weights_sha256``).
+
+    Raises:
+        SystemExit: The meta file is missing, or the recomputed SHA-256
+            does not match the recorded one.
+    """
+    meta_path = slot / DONOR_META_FILENAME
+    if not meta_path.is_file():
+        raise SystemExit(
+            f"Donor checkpoint slot {slot} has no {DONOR_META_FILENAME} — cannot "
+            "verify its weights or recover its provenance (seed/n_entries/epochs)."
+        )
+    with open(meta_path) as f:
+        meta = json.load(f)
+    weights_path = slot / "adapter_model.safetensors"
+    actual_sha256 = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+    recorded_sha256 = meta.get("weights_sha256")
+    if actual_sha256 != recorded_sha256:
+        raise SystemExit(
+            f"Donor checkpoint SHA-256 mismatch at {slot}: {meta_path} records "
+            f"{recorded_sha256!r}, but adapter_model.safetensors currently hashes to "
+            f"{actual_sha256!r} — the weights file was modified or corrupted after "
+            "the build. Refusing to seed from unverified weights."
+        )
+    return meta
+
+
+def _resolve_donor_source(
+    donor_checkpoint_arg: str | None,
+    run_dir: Path,
+    model,
+    tokenizer,
+    adapter_config,
+    base_training_config,
+) -> tuple[object, Path, bool, dict]:
+    """Resolve the donor checkpoint slot ``--donor-init`` copies into ``donor_scratch_dir``.
+
+    Three cases, in order:
+
+    1. ``--donor-checkpoint PATH`` given: reuse it directly (the donor
+       "builds once, arms reuse it" — no retraining). Fails loud if *PATH*
+       has no ``adapter_model.safetensors`` (:func:`_read_donor_meta` also
+       verifies its weights SHA-256 against ``PATH``'s own
+       ``donor_meta.json`` — M4).
+    2. This run already built its own donor checkpoint
+       (``run_dir/DONOR_BUILD_MARKER_FILENAME`` exists — the phase marker,
+       now MINIMAL: just ``{slot, timestamp}``, since provenance lives in
+       the slot's own ``donor_meta.json``): reuse the slot recorded in the
+       marker WITHOUT retraining. Covers the resumability requirement — a
+       crash after the donor build (marker written) must not rebuild it on
+       retry.
+    3. Neither: build a fresh donor checkpoint via
+       :func:`_build_donor_checkpoint` under
+       ``run_dir/DONOR_CHECKPOINT_DIRNAME``, then write the (minimal) phase
+       marker.
+
+    Args:
+        donor_checkpoint_arg: ``args.donor_checkpoint`` (``None`` unless the
+            operator passed ``--donor-checkpoint``).
+        run_dir: This run's arm-scoped output directory.
+        model: Base model or ``PeftModel`` (forwarded to
+            ``_build_donor_checkpoint`` when a fresh build is needed;
+            returned unchanged in cases 1/2).
+        tokenizer: Tokenizer matching the model.
+        adapter_config: Production episodic ``AdapterConfig``.
+        base_training_config: Production episodic ``TrainingConfig``.
+
+    Returns:
+        Tuple of ``(model, slot_path, built_fresh, donor_meta)``.
+        *built_fresh* is True only for case 3 (a real GPU training run just
+        happened — the caller uses this to insert a cooldown before the
+        first seed, B2). *donor_meta* is :func:`_read_donor_meta`'s return
+        (``seed``/``n_entries``/``epochs``/``weights_sha256``), used by the
+        caller to recompute ``donor_entries(seed, n_entries)`` for the H1
+        key-overlap recording.
+
+    Raises:
+        SystemExit: ``--donor-checkpoint``/the marker's recorded slot is
+            missing its weights file or fails SHA-256 verification.
+    """
+    if donor_checkpoint_arg is not None:
+        slot = Path(donor_checkpoint_arg)
+        if not (slot / "adapter_model.safetensors").is_file():
+            raise SystemExit(
+                f"--donor-checkpoint {slot} has no adapter_model.safetensors — "
+                "not a valid donor checkpoint slot."
+            )
+        donor_meta = _read_donor_meta(slot)
+        logger.info("Donor-init: reusing external donor checkpoint at %s", slot)
+        return model, slot, False, donor_meta
+
+    marker_path = run_dir / DONOR_BUILD_MARKER_FILENAME
+    if marker_path.exists():
+        with open(marker_path) as f:
+            marker = json.load(f)
+        slot = Path(marker["slot"])
+        if not (slot / "adapter_model.safetensors").is_file():
+            raise SystemExit(
+                f"Donor build marker at {marker_path} points to a missing checkpoint "
+                f"({slot}) — delete the marker to force a rebuild."
+            )
+        donor_meta = _read_donor_meta(slot)
+        logger.info("Donor-init: reusing this run's already-built checkpoint at %s", slot)
+        return model, slot, False, donor_meta
+
+    checkpoint_root = run_dir / DONOR_CHECKPOINT_DIRNAME
+    logger.info("Donor-init: no checkpoint found — building fresh donor at %s", checkpoint_root)
+    model, slot, donor_summary = _build_donor_checkpoint(
+        model, tokenizer, adapter_config, base_training_config, checkpoint_root
+    )
+    donor_meta = {
+        "seed": donor_summary["seed"],
+        "n_entries": donor_summary["n_entries"],
+        "epochs": donor_summary["epochs"],
+        "weights_sha256": donor_summary["weights_sha256"],
+    }
+    marker = {"slot": str(slot), "timestamp": int(time.time())}
+    with open(marker_path, "w") as f:
+        json.dump(marker, f, indent=2)
+    logger.info("Donor build marker written: %s", marker_path)
+    return model, slot, True, donor_meta
+
+
+# ---------------------------------------------------------------------------
 # Core seed runner
 # ---------------------------------------------------------------------------
 
@@ -728,6 +1202,10 @@ def _run_seed(
     expected_optimizer_steps: int,
     donor_scratch_dir: Path | None = None,
     probe_before_training: bool = False,
+    condition: str = "cold",
+    donor_checkpoint_path: str | None = None,
+    donor_checkpoint_sha256: str | None = None,
+    donor_key_overlap: dict | None = None,
 ) -> tuple[object, dict]:
     """Run one seed of *arm*: fresh adapter (cold or warm) -> train -> eval -> save.
 
@@ -820,6 +1298,37 @@ def _run_seed(
             called, saving the full result under ``pre_training_probe`` in
             ``results.json``. Defaults to False so prior arms reproduce
             exactly (no RNG snapshot/restore or extra ``generate()`` calls).
+        condition: Descriptive (never letter-labeled) condition name for
+            this arm (``_condition_label``, e.g. ``"donor-init 30ep"``,
+            ``"cold 50ep"``) — recorded verbatim in ``results.json`` under
+            ``condition``. Defaults to ``"cold"`` (bare mode name, only used
+            if a caller ever invokes ``_run_seed`` without going through
+            ``main()``'s resolution).
+        donor_checkpoint_path: Informative path to the donor checkpoint slot
+            that seeded ``donor_scratch_dir`` (``--warm-from`` or
+            ``--donor-init``'s resolved/built slot) — ``None`` for the cold
+            arm. Recorded verbatim in ``results.json``; never re-opened here
+            (the scratch copy is what Step 1b actually loads).
+        donor_checkpoint_sha256: SHA-256 of the donor checkpoint's
+            ``adapter_model.safetensors``, computed by the caller from the
+            *scratch* copy (never re-reading ``--warm-from``'s original path
+            a second time). ``None`` for the cold arm.
+        donor_key_overlap: (``--donor-init`` only; ``None`` for cold and
+            plain ``--warm-from`` arms) ``{"count": int, "donor_objects":
+            {key: object}}`` — the H1 confound record: how many of THIS
+            arm's target keys are also present in the donor's own synthetic
+            population, and what object the donor trained for each
+            overlapping key. The donor's block-0 is bit-identical to the
+            fixed 21-key fixture (``paramem.training.donor``'s module
+            docstring), so a real-production-key arm's overlap is often the
+            FULL 21 — the donor may pre-install key -> subject/predicate
+            scaffolding (with a DIFFERENT, donor-fictional object) for
+            exactly the keys this arm re-trains, so any donor-arm uplift
+            measures the overlapping-band store, not generalization to
+            fresh keys (>= 201, outside the donor's reserved band). The
+            rate metric itself is unaffected (strict SPO exact-match), only
+            its ATTRIBUTION is — recorded here so it is never silently
+            assumed away.
 
     Returns:
         Tuple of ``(model, summary_dict)``. ``model`` is the PeftModel
@@ -870,10 +1379,12 @@ def _run_seed(
     # proof (warm arm), pre-training.
     lora_b_norm_before = lora_b_frobenius_norm(model, adapter_name)
     if is_warm:
-        assert lora_b_norm_before > 0.0, (
-            f"Hard Assertion #3 FAILED (pre-training, warm arm): LoRA-B Frobenius "
-            f"norm for '{adapter_name}' is {lora_b_norm_before}, expected > 0.0 — "
-            "the donor weight copy did not propagate."
+        assert lora_b_norm_before == donor_lora_b_norm_before, (
+            f"Hard Assertion #3 FAILED (pre-training, warm arm): trainable adapter "
+            f"'{adapter_name}' LoRA-B Frobenius norm ({lora_b_norm_before}) != donor "
+            f"'{DONOR_ADAPTER_NAME}' norm ({donor_lora_b_norm_before}) immediately "
+            "after copy_adapter_weights — the seed did not take (or took a "
+            "corrupted copy)."
         )
     else:
         assert lora_b_norm_before == 0.0, (
@@ -896,7 +1407,7 @@ def _run_seed(
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state_all(cuda_rng_state)
         logger.info(
-            "Pre-training probe [%s seed %d]: %d/%d exact (rate=%.1%%), mean_confidence=%.3f",
+            "Pre-training probe [%s seed %d]: %d/%d exact (rate=%.1f%%), mean_confidence=%.3f",
             adapter_name,
             seed,
             pre_training_probe["exact_count"],
@@ -1001,11 +1512,16 @@ def _run_seed(
     # Step 12: save.
     full_results = {
         "arm": arm,
+        "condition": condition,
         "seed": seed,
         "n_entries": n_examples,
         "epochs": training_cfg.num_epochs,
+        "lr_decay_steps": training_cfg.lr_decay_steps,
         "adapter_name": adapter_name,
         "warm_start": is_warm,
+        "donor_checkpoint_path": donor_checkpoint_path,
+        "donor_checkpoint_sha256": donor_checkpoint_sha256,
+        "donor_key_overlap": donor_key_overlap,
         "expected_optimizer_steps": expected_optimizer_steps,
         "realized_optimizer_steps": realized_steps,
         "steps_per_epoch": spe,
@@ -1235,6 +1751,46 @@ def _parse_args() -> argparse.Namespace:
             "adapter is unaffected. Defaults to OFF so prior arms reproduce exactly."
         ),
     )
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help=(
+            "Pin TrainingConfig.lr_decay_steps to this many steps, overriding the fixture's "
+            "None (today's behaviour: create_scheduler's no-op passthrough, decay window "
+            "derived from len(dataloader) * num_epochs). The approved decay-pinned validation "
+            "protocol pins decay explicitly so arms at different --epochs stay comparable "
+            "(decay shape decoupled from the epoch budget). Default None preserves today's "
+            "behaviour exactly — omitting this flag changes nothing."
+        ),
+    )
+    parser.add_argument(
+        "--donor-init",
+        action="store_true",
+        help=(
+            "Seed the trainable adapter from a donor checkpoint built by training "
+            "paramem.training.donor.donor_entries (128 synthetic keys, seed=DONOR_DEFAULT_SEED) "
+            "through this script's OWN train_adapter call path, at DONOR_BUILD_EPOCHS (30, the "
+            "anchored bucket) — NOT via paramem.training.donor.build_donor (that helper needs a "
+            "live ConsolidationLoop; this standalone experiment trains the donor itself). Feeds "
+            "the SAME donor_scratch_dir / copy_adapter_weights mechanism --warm-from already "
+            "uses in _run_seed (Hard Assertions #3/#4 apply unchanged). Mutually exclusive with "
+            "--warm-from (ambiguous donor source)."
+        ),
+    )
+    parser.add_argument(
+        "--donor-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to an existing donor checkpoint SLOT directory (containing "
+            "adapter_model.safetensors) from a prior --donor-init run's "
+            "<run_dir>/donor_checkpoint/<ts>/ — reuses it instead of building a fresh donor "
+            "(the donor builds once, arms reuse it). Requires --donor-init; without it, this "
+            "run builds (or resumes building) its own donor checkpoint under "
+            "<run_dir>/donor_checkpoint/, recorded in donor_build_done.json for --resume."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1247,20 +1803,33 @@ def main() -> None:
     """Entry point for Test 20.
 
     Loads the model once, loads the production episodic recipe from
-    ``tests/fixtures/server.yaml`` (with the two in-code overrides
-    documented in the module docstring: ``num_epochs`` from ``--epochs``,
-    ``recall_early_stopping=False``), cycles
-    through the resolved seeds of the resolved arm (``--n-entries``/
-    ``--entries-json`` / ``--epochs`` / ``--warm-from`` / ``--arm`` /
-    ``--probe-before-training`` / ``--seeds``) with per-seed adapter
-    isolation, and writes per-seed results + done markers under an
-    arm-scoped output subtree. ``--seeds`` overrides the module default
-    ``SEEDS = (0, 1, 2)`` (e.g. ``--seeds 42`` for a single production-seed
-    run); omitting it reproduces today's 3-seed behaviour exactly, and the
-    effective seed list — never the module constant — is what is logged,
-    written to ``run_config.json``, and iterated by ``--resume``. GPU
-    cooldown is inserted between seeds. The ``~/.training_pause`` gate is
-    honoured at every seed boundary.
+    ``tests/fixtures/server.yaml`` (with the in-code overrides documented in
+    the module docstring: ``num_epochs`` from ``--epochs``,
+    ``recall_early_stopping=False``, ``lr_decay_steps`` from
+    ``--lr-decay-steps`` when set), cycles through the resolved seeds of the
+    resolved arm (``--n-entries`` / ``--entries-json`` / ``--epochs`` /
+    ``--lr-decay-steps`` / ``--warm-from`` / ``--donor-init`` /
+    ``--donor-checkpoint`` / ``--arm`` / ``--probe-before-training`` /
+    ``--seeds``) with per-seed adapter isolation, and writes per-seed
+    results + done markers under an arm-scoped output subtree. ``--seeds``
+    overrides the module default ``SEEDS = (0, 1, 2)`` (e.g. ``--seeds 42``
+    for a single production-seed run); omitting it reproduces today's
+    3-seed behaviour exactly, and the effective seed list — never the
+    module constant — is what is logged, written to ``run_config.json``,
+    and iterated by ``--resume``.
+
+    ``--warm-from`` and ``--donor-init`` are mutually exclusive donor
+    sources (fails loud if both are set) feeding the SAME
+    ``donor_scratch_dir`` / ``copy_adapter_weights`` mechanism in
+    ``_run_seed``: ``--warm-from`` copies an arbitrary owner-supplied
+    adapter dir; ``--donor-init`` resolves (reusing ``--donor-checkpoint``
+    when given, or building fresh via ``_build_donor_checkpoint``) a donor
+    checkpoint trained on ``paramem.training.donor.donor_entries``. Either
+    way the donor's weights are copied into ``<run_dir>/donor_scratch/``
+    ONCE per run and never re-touched afterward.
+
+    GPU cooldown is inserted between seeds. The ``~/.training_pause`` gate
+    is honoured at every seed boundary.
 
     Designed to run daemonised (setsid/nohup) — no terminal interaction;
     logs are flushed after every seed.
@@ -1294,10 +1863,24 @@ def main() -> None:
         n_entries = args.n_entries if args.n_entries is not None else DEFAULT_N_ENTRIES
         entries = _build_entries(n_entries)
 
+    # Donor-source validation: --donor-checkpoint only means anything with
+    # --donor-init, and --warm-from / --donor-init are mutually exclusive
+    # (each resolves donor_scratch_dir from a different source — ambiguous
+    # if both are set).
+    if args.donor_checkpoint is not None and not args.donor_init:
+        raise SystemExit("--donor-checkpoint requires --donor-init.")
+    if args.warm_from is not None and args.donor_init:
+        raise SystemExit(
+            "--warm-from and --donor-init are mutually exclusive donor sources "
+            "(both populate donor_scratch_dir) — pick one."
+        )
+
     epochs = args.epochs
     expected_steps = _expected_optimizer_steps(n_entries, epochs)
-    is_warm = args.warm_from is not None
-    arm = args.arm or _default_arm_label(n_entries, expected_steps, is_real, is_warm)
+    is_warm = args.warm_from is not None or args.donor_init
+    mode = "donor" if args.donor_init else ("warm" if args.warm_from is not None else "cold")
+    condition = _condition_label(mode, epochs)
+    arm = args.arm or _default_arm_label(n_entries, expected_steps, is_real, mode)
 
     # Resolve output dir (arm-scoped so distinct arms never collide and
     # --resume never crosses arms).
@@ -1324,24 +1907,12 @@ def main() -> None:
             f"need > {DISK_HEADROOM_BYTES / 1024**3:.0f} GB."
         )
 
-    # Warm-start donor: shutil.copytree the caller's donor dir into this
-    # run's scratch dir ONCE, and load the donor ONLY from that copy in
-    # every seed (donor immutability — see module docstring). Reused
-    # as-is on --resume (never re-copied) so every seed of a given run
-    # sees byte-identical donor weights.
-    donor_scratch_dir: Path | None = None
-    if is_warm:
-        donor_scratch_dir = run_dir / "donor_scratch"
-        if donor_scratch_dir.exists():
-            logger.info("Reusing existing donor scratch copy (resume): %s", donor_scratch_dir)
-        else:
-            logger.info("Warm-start: copying donor %s -> %s", args.warm_from, donor_scratch_dir)
-            shutil.copytree(args.warm_from, donor_scratch_dir)
-
     registry = build_registry(entries)
     logger.info(
-        "%s arm: N=%d %s keys, epochs=%d, expected_optimizer_steps=%d, warm_start=%s, seeds=%s",
+        "%s arm [%s]: N=%d %s keys, epochs=%d, expected_optimizer_steps=%d, warm_start=%s, "
+        "seeds=%s",
         arm,
+        condition,
         len(entries),
         "real" if is_real else "synthetic",
         epochs,
@@ -1355,17 +1926,22 @@ def main() -> None:
     run_config = {
         "model": args.model,
         "arm": arm,
+        "condition": condition,
         "seeds": list(seeds),
         "n_entries": n_entries,
         "entries_json": args.entries_json,
         "epochs": epochs,
+        "lr_decay_steps": args.lr_decay_steps,
         "expected_optimizer_steps": expected_steps,
         "warm_from": args.warm_from,
+        "donor_init": args.donor_init,
+        "donor_checkpoint": args.donor_checkpoint,
         "probe_before_training": args.probe_before_training,
         "recipe_source": "tests/fixtures/server.yaml (episodic_adapter_config + training_config)",
         "overrides": {
             "num_epochs": epochs,
             "recall_early_stopping": False,
+            **({"lr_decay_steps": args.lr_decay_steps} if args.lr_decay_steps is not None else {}),
         },
     }
     run_config_path = run_dir / "run_config.json"
@@ -1383,15 +1959,14 @@ def main() -> None:
         # load_config() / configs/server.yaml.example.
         cfg = load_server_config(str(FIXTURE_CONFIG_PATH))
         adapter_config = cfg.episodic_adapter_config
-        base_training_config = dataclasses.replace(
-            cfg.training_config,
-            num_epochs=epochs,
-            recall_early_stopping=False,
-        )
+        training_overrides = {"num_epochs": epochs, "recall_early_stopping": False}
+        if args.lr_decay_steps is not None:
+            training_overrides["lr_decay_steps"] = args.lr_decay_steps
+        base_training_config = dataclasses.replace(cfg.training_config, **training_overrides)
         logger.info(
             "Recipe: rank=%d alpha=%d lr=%.0e target_modules=%s | "
             "batch=%d accum=%d epochs=%d warmup=%d scheduler=%s wd=%.2f "
-            "recall_early_stopping=%s",
+            "lr_decay_steps=%s recall_early_stopping=%s",
             adapter_config.rank,
             adapter_config.alpha,
             adapter_config.learning_rate,
@@ -1402,10 +1977,115 @@ def main() -> None:
             base_training_config.warmup_steps,
             base_training_config.lr_scheduler_type,
             base_training_config.weight_decay,
+            base_training_config.lr_decay_steps,
             base_training_config.recall_early_stopping,
         )
 
-        first_seed = True
+        # Donor resolution (--warm-from or --donor-init): copy the donor's
+        # weights into this run's immutable scratch dir ONCE, and load the
+        # donor ONLY from that copy in every seed (donor immutability — see
+        # module docstring). Reused as-is on --resume (never re-copied, and
+        # --donor-init never re-trains once its own checkpoint marker
+        # exists — see _resolve_donor_source) so every seed of a given run
+        # sees byte-identical donor weights. Runs here (inside acquire_gpu,
+        # after the recipe loads) because --donor-init's fresh-build path
+        # needs the loaded model/tokenizer/adapter_config/training_config;
+        # --warm-from's plain filesystem copy tags along on the same block
+        # rather than duplicating the resume-marker handling.
+        donor_scratch_dir: Path | None = None
+        donor_checkpoint_path: str | None = None
+        donor_checkpoint_sha256: str | None = None
+        donor_meta: dict | None = None
+        donor_built_fresh = False
+        if is_warm:
+            donor_scratch_dir = run_dir / "donor_scratch"
+            donor_source_marker = run_dir / "donor_source.json"
+            if donor_scratch_dir.exists() and donor_source_marker.exists():
+                with open(donor_source_marker) as f:
+                    donor_source_info = json.load(f)
+                donor_checkpoint_path = donor_source_info["source"]
+                donor_checkpoint_sha256 = donor_source_info["sha256"]
+                logger.info("Reusing existing donor scratch copy (resume): %s", donor_scratch_dir)
+                if args.donor_init:
+                    # Read from the SCRATCH copy (a full copytree of the
+                    # resolved slot, including donor_meta.json) — never the
+                    # original --donor-checkpoint path, which may no longer
+                    # be reachable by the time a run resumes.
+                    donor_meta = _read_donor_meta(donor_scratch_dir)
+            else:
+                # B3: this is a phase boundary (donor build or a fresh
+                # copytree) — honour the pause gate before starting it, not
+                # just at seed boundaries.
+                _check_pause("before donor build")
+                if donor_scratch_dir.exists():
+                    logger.warning(
+                        "Donor scratch copy at %s exists without its source marker "
+                        "(prior crash between copytree and marker write) — recopying.",
+                        donor_scratch_dir,
+                    )
+                    shutil.rmtree(donor_scratch_dir)
+                if args.donor_init:
+                    model, donor_source, donor_built_fresh, donor_meta = _resolve_donor_source(
+                        args.donor_checkpoint,
+                        run_dir,
+                        model,
+                        tokenizer,
+                        adapter_config,
+                        base_training_config,
+                    )
+                else:
+                    donor_source = Path(args.warm_from)
+                logger.info("Warm-start: copying donor %s -> %s", donor_source, donor_scratch_dir)
+                shutil.copytree(donor_source, donor_scratch_dir)
+                donor_checkpoint_sha256 = hashlib.sha256(
+                    (donor_scratch_dir / "adapter_model.safetensors").read_bytes()
+                ).hexdigest()
+                donor_checkpoint_path = str(donor_source)
+                with open(donor_source_marker, "w") as f:
+                    json.dump(
+                        {"source": donor_checkpoint_path, "sha256": donor_checkpoint_sha256},
+                        f,
+                        indent=2,
+                    )
+
+        # H1: record the donor<->target key-overlap confound. donor_meta is
+        # only set for --donor-init (never plain --warm-from, which has no
+        # synthetic entry set to intersect against). The donor's OWN block-0
+        # is bit-identical to the fixed fixture (paramem.training.donor's
+        # module docstring: "the template itself is always block 0 ... keys
+        # graph101-115 / proc101-106 ... reproduced verbatim") — recomputing
+        # donor_entries(seed, n_entries) here is the SAME pure function the
+        # build used, so this reconstructs the exact donor population
+        # without re-reading any file. (The full-overlap donor-init arms in
+        # benchmarking.md's Test 20 ran before this fixture's keys were
+        # remapped, against the fixture's prior graph179-193/proc35-40
+        # numerals — see that section's fixture-provenance note; the
+        # zero-overlap shifted-key arms are the bridge evidence that the
+        # remap does not change this mechanism's behavior.)
+        donor_key_overlap: dict | None = None
+        if args.donor_init and donor_meta is not None:
+            donor_full_entries = donor_entries(donor_meta["seed"], donor_meta["n_entries"])
+            donor_objects_by_key = {e["key"]: e["object"] for e in donor_full_entries}
+            target_keys = {e["key"] for e in entries}
+            overlap_keys = sorted(target_keys & donor_objects_by_key.keys())
+            donor_key_overlap = {
+                "count": len(overlap_keys),
+                "donor_objects": {k: donor_objects_by_key[k] for k in overlap_keys},
+            }
+            logger.info(
+                "Donor/target key overlap: %d/%d target keys also present in the donor's "
+                "own population (donor's objects for these differ from the target's — see "
+                "results.json's donor_key_overlap).",
+                donor_key_overlap["count"],
+                len(entries),
+            )
+
+        # B2: a fresh donor build just ran ~DONOR_BUILD_EPOCHS worth of GPU
+        # training (~2220 steps at DONOR_MIN_ENTRIES) immediately before the
+        # seed loop — cool down before the first seed instead of chaining
+        # straight into it (first_seed=True would otherwise skip the loop's
+        # own cooldown for exactly this case).
+        first_seed = not donor_built_fresh
         for seed in seeds:
             _check_pause(f"before seed {seed}")
 
@@ -1433,6 +2113,10 @@ def main() -> None:
                 expected_steps,
                 donor_scratch_dir=donor_scratch_dir,
                 probe_before_training=args.probe_before_training,
+                condition=condition,
+                donor_checkpoint_path=donor_checkpoint_path,
+                donor_checkpoint_sha256=donor_checkpoint_sha256,
+                donor_key_overlap=donor_key_overlap,
             )
 
             _write_done_marker(run_dir, seed, summary)

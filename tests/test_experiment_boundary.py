@@ -289,6 +289,14 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "copy_adapter_weights",
         ),
         ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "create_adapter"),
+        # atomic_save_adapter: --donor-init (donor-init validation) persists its
+        # own donor checkpoint via the SAME primitive every production tier
+        # save uses (added 2026-07-26) -- one implementation, not a copy.
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.models.loader",
+            "atomic_save_adapter",
+        ),
         # lora_b_frobenius_norm: shared with the consolidation fold-telemetry
         # measurement (added 2026-07-26) -- one implementation, not a copy.
         (
@@ -309,6 +317,35 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "evaluate_indexed_recall",
         ),
         ("experiments/test20_smallN_cold_gate.py", "paramem.training.trainer", "train_adapter"),
+        # --donor-init (donor-init validation): builds its own donor checkpoint
+        # via donor_entries -- the SAME seed+recipe pure function production
+        # donor building uses -- rather than duplicating a second synthetic
+        # generator (added 2026-07-26).
+        ("experiments/test20_smallN_cold_gate.py", "paramem.training.donor", "donor_entries"),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.donor",
+            "DONOR_MIN_ENTRIES",
+        ),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.donor",
+            "DONOR_DEFAULT_SEED",
+        ),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.donor",
+            "DONOR_BUILD_ADAPTER_NAME",
+        ),
+        # DONOR_META_FILENAME: _read_donor_meta (M4 fix) writes/reads the
+        # SAME per-slot provenance filename production's own donor.py meta
+        # writer uses -- one shared constant, not an invented duplicate name
+        # (added 2026-07-26).
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.donor",
+            "DONOR_META_FILENAME",
+        ),
         # test_distillation_models.py / test_prompt_engineering.py
         (
             "experiments/test_distillation_models.py",

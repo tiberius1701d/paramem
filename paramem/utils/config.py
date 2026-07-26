@@ -181,9 +181,12 @@ class TrainingConfig:
 # create_scheduler's no-op passthrough; see TrainingConfig.lr_decay_steps).
 #
 # See configs/server.yaml.example (consolidation.budget_derivation_enabled)
-# for the per-bucket epoch/accum values and their evidence status — only the
-# largest bucket is anchored on production fold telemetry; the smaller two
-# are extrapolated.
+# for the per-bucket epoch/accum values and their evidence status. The
+# largest bucket is anchored on production fold telemetry. The 16-127
+# bucket (50 epochs) is now anchored at N=21 (4 seeds, 21/21 exact-match at
+# 50 epochs / 550 decay-pinned steps) — see benchmarking.md's "Test 20:
+# Small-N Cold-Init Recall Gate" section; the rest of the 16-127 band and
+# the <16 bucket remain extrapolated.
 _BUDGET_TABLE: tuple[tuple[int, int, int, "int | None"], ...] = (
     # (n_keys floor, epochs, accum, lr_decay_steps)
     (128, 30, 2, None),
