@@ -3455,10 +3455,10 @@ class ConsolidationLoop:
                     # Derived here (not read off self.training_config.num_epochs)
                     # so the finally-path telemetry below records the TRUE budget
                     # even when training raises. _train_tier_adapter derives the
-                    # identical value from the same (n_keys, training_config)
-                    # inputs -- budget_for is pure, so the two calls agree.
+                    # identical value from the same n_keys input -- budget_for is
+                    # pure, so the two calls agree.
                     _telemetry_int_epochs, _telemetry_int_accum, _ = budget_for(
-                        _telemetry_int_n_keys, self.training_config
+                        _telemetry_int_n_keys
                     )
                     # Measured BEFORE training starts -- same enclosing-scope
                     # hoist as the budget derivation above, so the finally-path
@@ -4704,10 +4704,10 @@ class ConsolidationLoop:
                         # Derived here (not read off refresh_training_config.num_epochs)
                         # so the finally-path telemetry below records the TRUE
                         # budget even when training raises. _train_tier_adapter
-                        # derives the identical value from the same
-                        # (n_keys, training_config) inputs -- budget_for is pure.
+                        # derives the identical value from the same n_keys input --
+                        # budget_for is pure.
                         _telemetry_tier_epochs, _telemetry_tier_accum, _ = budget_for(
-                            _telemetry_tier_n_keys, refresh_training_config
+                            _telemetry_tier_n_keys
                         )
                         # Measured BEFORE training starts -- same enclosing-scope
                         # hoist as the budget derivation above, so the
@@ -6990,10 +6990,9 @@ class ConsolidationLoop:
         ``training_config`` via ``dataclasses.replace`` — every production
         caller (interim, the full fold, and
         ``active_store_migration._migrate_tier_simulate_to_train``) inherits
-        the SAME derivation with no special case. When
-        ``training_config.budget_derivation_enabled`` is False,
-        ``budget_for`` passes the incoming values through unchanged (today's
-        behaviour).
+        the SAME derivation with no special case; there is no off switch
+        (the derivation is the unconditional standard mechanism, validated
+        via Test 20 -- see ``benchmarking.md``).
 
         The ``from paramem.training.trainer import train_adapter`` import is
         kept INSIDE this method so tests can patch
@@ -7030,18 +7029,18 @@ class ConsolidationLoop:
             (not a second measurement) to tag their telemetry ``init`` field
             ``"donor"`` instead of the pre-training ``"cold"`` measurement.
 
-        Donor seeding: gated by ``training_config.donor_seeding_enabled``
-        (default ``False``, ``paramem.utils.config.TrainingConfig`` /
-        ``paramem.server.config.ConsolidationScheduleConfig``, threaded
-        exactly like ``budget_derivation_enabled``). This method is reachable
-        ONLY from the weights venue (every call site sits inside its
-        enclosing ``if scope.source == "weights":`` branch — see
-        ``consolidation.py``'s two ``_train_tier_adapter`` call sites and
-        ``active_store_migration._migrate_tier_simulate_to_train``, all three
-        routed through this one funnel), so the disk/simulate venue never
-        seeds without a separate check here. When the flag is on and
-        *adapter_name* is not the donor's own transient build slot
-        (``DONOR_BUILD_ADAPTER_NAME`` — excluding it here is what stops
+        Donor seeding: unconditional (no feature flag; validated via Test 20
+        -- see ``benchmarking.md``). This method is reachable ONLY from the
+        weights venue (every call site sits inside its enclosing
+        ``if scope.source == "weights":`` branch — see ``consolidation.py``'s
+        two ``_train_tier_adapter`` call sites and
+        ``active_store_migration._migrate_tier_simulate_to_train``, plus
+        :func:`~paramem.training.donor.build_donor`'s own funnel call
+        (training the donor's transient build slot itself, gated out of
+        recursive seeding below) -- FOUR call sites total, all routed
+        through this one funnel), so the disk/simulate venue never seeds.
+        When *adapter_name* is not the donor's own transient build
+        slot (``DONOR_BUILD_ADAPTER_NAME`` — excluding it here is what stops
         :func:`~paramem.training.donor.build_donor`'s own funnel call from
         recursively re-triggering donor seeding on the adapter it is training):
         measure the target's LoRA-B Frobenius norm
@@ -7072,12 +7071,10 @@ class ConsolidationLoop:
             return None, None
 
         donor_seeded = False
-        if training_config.donor_seeding_enabled and adapter_name != DONOR_BUILD_ADAPTER_NAME:
+        if adapter_name != DONOR_BUILD_ADAPTER_NAME:
             donor_seeded = self._maybe_seed_from_donor(adapter_name)
 
-        derived_epochs, derived_accum, derived_lr_decay_steps = budget_for(
-            len(entries), training_config
-        )
+        derived_epochs, derived_accum, derived_lr_decay_steps = budget_for(len(entries))
         training_config = replace(
             training_config,
             num_epochs=derived_epochs,

@@ -4269,12 +4269,11 @@ class TestAbortSkipsCommit:
         refresh_training_config.num_epochs -- the value must survive even
         though it is computed before the try block (finally-path record).
 
-        One episodic key (N=1) with budget_derivation_enabled=True falls in
-        the smallest bucket (< 16 keys -> 80 epochs), which differs from the
-        harness's configured training_config.num_epochs=1 -- an unmistakable
-        signal that the recorded value is the derived one.
+        Derivation is unconditional (no feature flag). One episodic key
+        (N=1) falls in the smallest bucket (< 16 keys -> 80 epochs), which
+        differs from the harness's configured training_config.num_epochs=1
+        -- an unmistakable signal that the recorded value is the derived one.
         """
-        import dataclasses
         from unittest.mock import MagicMock, patch
 
         import networkx as _nx
@@ -4283,9 +4282,6 @@ class TestAbortSkipsCommit:
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
         loop.output_dir = tmp_path / "rundir"
-        loop.training_config = dataclasses.replace(
-            loop.training_config, budget_derivation_enabled=True
-        )
 
         loop.store.put(
             "episodic",
@@ -4373,8 +4369,11 @@ class TestAbortSkipsCommit:
         The mock model's named_parameters() carries a zero-valued lora_B
         tensor for the episodic adapter so measured_adapter_init_state
         classifies init="cold" instead of degrading to an absent field.
+        Donor seeding is unconditional and reachable at every measured-cold
+        fold now, so it is explicitly stubbed to "no valid checkpoint" here
+        -- this test is about the budget/telemetry fields, not the donor
+        mechanism (covered separately by test_main_tier_telemetry_tags_donor_seeded_fold).
         """
-        import dataclasses
         from unittest.mock import patch
 
         import networkx as _nx
@@ -4384,9 +4383,6 @@ class TestAbortSkipsCommit:
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
         loop.output_dir = tmp_path / "rundir"
-        loop.training_config = dataclasses.replace(
-            loop.training_config, budget_derivation_enabled=True
-        )
 
         loop.store.put(
             "episodic",
@@ -4441,6 +4437,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
+            patch.object(ConsolidationLoop, "_maybe_seed_from_donor", return_value=False),
             patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
@@ -4489,8 +4486,7 @@ class TestAbortSkipsCommit:
         pre-training "cold" measurement -- the funnel's returned metrics dict
         carries donor_seeded=True and the call site overrides its telemetry
         record from that, per the seeding hook's docstring (no second
-        measurement)."""
-        import dataclasses
+        measurement). Donor seeding is unconditional (no feature flag)."""
         from unittest.mock import patch
 
         import networkx as _nx
@@ -4500,9 +4496,6 @@ class TestAbortSkipsCommit:
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
         loop.output_dir = tmp_path / "rundir"
-        loop.training_config = dataclasses.replace(
-            loop.training_config, budget_derivation_enabled=True, donor_seeding_enabled=True
-        )
 
         loop.store.put(
             "episodic",
@@ -5063,103 +5056,6 @@ class TestAbortSkipsCommit:
         assert "hit_cap" not in record
         assert "epochs_to_bind" not in record
         assert "steps_to_bind" not in record
-
-    def test_main_tier_telemetry_epochs_unchanged_when_budget_derivation_disabled(
-        self, monkeypatch, tmp_path
-    ):
-        """budget_derivation_enabled=False (the shipped default) must record
-        `epochs` equal to the config's num_epochs -- pinning that the
-        telemetry layer introduces no behaviour change for the un-derived
-        path (only the shape of the recorded value, not what training
-        actually runs with).
-        """
-        from unittest.mock import patch
-
-        import networkx as _nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_minimal_loop(monkeypatch, tmp_path)
-        loop.output_dir = tmp_path / "rundir"
-        assert loop.training_config.budget_derivation_enabled is False
-
-        loop.store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alex",
-                "predicate": "lives_in",
-                "object": "Millfield",
-                "speaker_id": "speaker0",
-            },
-            register=True,
-        )
-        loop.store.set_bookkeeping(
-            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
-        )
-        _real_graph = _nx.MultiDiGraph()
-        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
-        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
-        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
-        loop.merger.graph = _real_graph
-
-        loop.model.peft_config["episodic_backup"] = MagicMock()
-        loop.model.peft_config["semantic_backup"] = MagicMock()
-        loop.model.peft_config["procedural_backup"] = MagicMock()
-        loop._telemetry_dir = tmp_path / "telemetry"
-
-        trained_metrics = {"train_loss": 0.1, "aborted": False}
-        from paramem.graph.reconstruct import ReconstructionResult
-
-        with (
-            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
-            patch(
-                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
-                MagicMock,
-            ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
-            patch.multiple(
-                "paramem.training.consolidation.torch.cuda",
-                is_available=MagicMock(return_value=False),
-            ),
-            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
-            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
-            patch("paramem.models.loader.copy_adapter_weights"),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
-            patch("paramem.models.loader.switch_adapter"),
-            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
-            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-            patch.object(
-                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-            ),
-            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-            patch(
-                "paramem.training.consolidation.reconstruct_graph",
-                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
-            ),
-            patch(
-                "paramem.training.consolidation.format_entry_training",
-                return_value=[{"input_ids": [1], "labels": [1]}],
-            ),
-            patch.object(
-                ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
-            ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
-            patch.object(ConsolidationLoop, "_clear_fold_resume"),
-            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
-        ):
-            mock_lock.acquire.return_value = False
-
-            loop.consolidate(mode="train", trainer=None, router=None)
-
-        tier_train_calls = [
-            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
-        ]
-        assert tier_train_calls, "expected at least one tier_train telemetry record"
-        assert tier_train_calls[0].kwargs["record"]["epochs"] == loop.training_config.num_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -19762,6 +19658,10 @@ class TestTrainTierAdapterBudgetDerivation:
     incoming training_config before calling train_adapter, and feeds the SAME
     derived epoch count to _maybe_make_recall_callback's num_epochs argument.
 
+    Derivation is unconditional (no feature flag; the prior
+    budget_derivation_enabled flag was retired once the validation arms
+    passed -- see benchmarking.md).
+
     format_entry_training is patched at its consolidation.py import site (the
     same pattern used by TestAbortSkipsCommit above) so these tests don't pay
     for a real tokenizer; train_adapter is patched at its trainer.py source
@@ -19770,7 +19670,7 @@ class TestTrainTierAdapterBudgetDerivation:
     """
 
     @staticmethod
-    def _make_loop(*, budget_derivation_enabled: bool) -> ConsolidationLoop:
+    def _make_loop() -> ConsolidationLoop:
         from paramem.utils.config import TrainingConfig
 
         loop = object.__new__(ConsolidationLoop)
@@ -19780,7 +19680,6 @@ class TestTrainTierAdapterBudgetDerivation:
             num_epochs=3,
             gradient_accumulation_steps=8,
             lr_decay_steps=None,
-            budget_derivation_enabled=budget_derivation_enabled,
         )
         loop.wandb_config = None
         loop._thermal_policy = None
@@ -19805,7 +19704,7 @@ class TestTrainTierAdapterBudgetDerivation:
         """
         from unittest.mock import patch
 
-        loop = self._make_loop(budget_derivation_enabled=True)
+        loop = self._make_loop()
         entries = self._entries(3)
 
         with (
@@ -19853,7 +19752,7 @@ class TestTrainTierAdapterBudgetDerivation:
         """N=200 (>= 128) derives (30 epochs, accum=2)."""
         from unittest.mock import patch
 
-        loop = self._make_loop(budget_derivation_enabled=True)
+        loop = self._make_loop()
         entries = self._entries(200)
 
         with (
@@ -19886,47 +19785,6 @@ class TestTrainTierAdapterBudgetDerivation:
         assert received_training_config.gradient_accumulation_steps == 2
         assert recall_cb_mock.call_args.kwargs["num_epochs"] == 30
 
-    def test_derivation_disabled_passes_through_fixed_config(self, tmp_path):
-        """budget_derivation_enabled=False (the feature switched off) must
-        reproduce today's behaviour exactly: the fixed training_config
-        values pass through unchanged regardless of entry count, and the
-        recall callback receives the SAME fixed num_epochs.
-        """
-        from unittest.mock import patch
-
-        loop = self._make_loop(budget_derivation_enabled=False)
-        entries = self._entries(3)  # small N -- must NOT trigger the 80-epoch bucket
-
-        with (
-            patch(
-                "paramem.training.consolidation.format_entry_training",
-                return_value=[{"input_ids": [1], "labels": [1]} for _ in entries],
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ) as train_mock,
-            patch.object(
-                ConsolidationLoop,
-                "_maybe_make_recall_callback",
-                return_value=(None, None),
-            ) as recall_cb_mock,
-        ):
-            loop._train_tier_adapter(
-                entries,
-                adapter_name="episodic",
-                adapter_config=MagicMock(),
-                training_config=loop.training_config,
-                output_dir=tmp_path,
-                run_name="test-run",
-                phase_name="test-phase",
-            )
-
-        received_training_config = train_mock.call_args.kwargs["training_config"]
-        assert received_training_config.num_epochs == 3
-        assert received_training_config.gradient_accumulation_steps == 8
-        assert recall_cb_mock.call_args.kwargs["num_epochs"] == 3
-
     def test_empty_examples_returns_none_none_without_deriving(self, tmp_path):
         """format_entry_training producing no examples short-circuits before
         budget derivation or any training call -- (None, None), matching the
@@ -19934,7 +19792,7 @@ class TestTrainTierAdapterBudgetDerivation:
         """
         from unittest.mock import patch
 
-        loop = self._make_loop(budget_derivation_enabled=True)
+        loop = self._make_loop()
 
         with (
             patch("paramem.training.consolidation.format_entry_training", return_value=[]),
@@ -19970,7 +19828,6 @@ class TestTrainTierAdapterBudgetDerivation:
             num_epochs=3,
             gradient_accumulation_steps=8,
             lr_decay_steps=None,
-            budget_derivation_enabled=True,
             seed=1234,
             batch_size=7,
             max_seq_length=512,

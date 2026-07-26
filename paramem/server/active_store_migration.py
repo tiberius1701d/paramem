@@ -577,7 +577,18 @@ def _migrate_tier_simulate_to_train(
         )
         loop.store.put(name, key, entry)
 
-    # Step 3: reset adapter to LoRA-zero so training starts from a clean state.
+    # Step 3: reset adapter to LoRA-zero (delete + recreate) -- the explicit
+    # cold-rebuild semantics this migration is documented to use
+    # (architecture.md's base-swap migration decision). This LoRA-zero state
+    # is measured as "cold" by _train_tier_adapter below, which
+    # unconditionally donor-seeds it (paramem.training.donor) before
+    # training -- migration no longer starts from a bare LoRA-zero fact-free
+    # state, it starts from the donor's task-skilled weights. On a
+    # base-model swap (Phase B retraining onto the new base) the donor
+    # checkpoint's recorded base_model_id no longer matches, so
+    # donor_checkpoint_valid rejects it and the funnel builds a fresh donor
+    # for the new base inline before seeding -- an intended consequence of
+    # donor seeding being unconditional, not a special case here.
     if name in loop.model.peft_config:
         loop.model.delete_adapter(name)
     loop.model = create_adapter(loop.model, tier_config, name)

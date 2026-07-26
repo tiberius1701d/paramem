@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from collections import Counter
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -26,6 +27,7 @@ from paramem.training.donor import (
     DONOR_MIN_ENTRIES,
     DonorBuildIncomplete,
     _latest_donor_slot,
+    _triples_hash,
     build_donor,
     donor_checkpoint_dir,
     donor_checkpoint_valid,
@@ -84,10 +86,25 @@ def _write_donor_slot(
     stamp: str = "20260101-000000",
     base_model_id: str = "test/base",
     lora_shape: dict | None = None,
+    seed: int = 1,
+    n_requested: int = DONOR_MIN_ENTRIES,
+    triples_hash: "str | None" = "__auto__",
     meta_text: str | None = None,
     write_weights: bool = True,
 ) -> Path:
-    """Write a minimal on-disk donor slot for TestDonorCheckpoint fixtures."""
+    """Write a minimal on-disk donor slot for TestDonorCheckpoint fixtures.
+
+    Default meta carries a ``seed``/``n_requested`` pair whose
+    ``donor_entries`` regeneration matches the recorded ``triples_hash`` by
+    construction, so a caller exercising only ``base_model_id``/
+    ``lora_shape`` logic gets a slot that also passes
+    ``donor_checkpoint_valid``'s regeneration check without having to think
+    about it. ``triples_hash="__auto__"`` (default) computes the correct
+    hash; pass ``None`` to omit the field entirely (exercises the
+    pre-``triples_hash``-schema compatibility path, which falls back to
+    hashing the recorded ``triples``); pass an explicit string to force a
+    mismatch.
+    """
     slot = checkpoint_dir / stamp
     slot.mkdir(parents=True, exist_ok=True)
     if write_weights:
@@ -95,7 +112,18 @@ def _write_donor_slot(
     if meta_text is not None:
         (slot / "donor_meta.json").write_text(meta_text)
     else:
-        meta = {"base_model_id": base_model_id, "lora_shape": lora_shape or _LORA_SHAPE}
+        entries = donor_entries(seed, n_requested)
+        meta = {
+            "base_model_id": base_model_id,
+            "lora_shape": lora_shape or _LORA_SHAPE,
+            "seed": seed,
+            "n_requested": n_requested,
+            "triples": entries,
+        }
+        if triples_hash == "__auto__":
+            meta["triples_hash"] = _triples_hash(entries)
+        elif triples_hash is not None:
+            meta["triples_hash"] = triples_hash
         (slot / "donor_meta.json").write_text(json.dumps(meta))
     return slot
 
@@ -381,6 +409,128 @@ class TestDonorCheckpoint:
         assert _latest_donor_slot(donor_checkpoint_dir(tmp_path)) is None
 
 
+class TestDonorCheckpointRegenerationCheck:
+    """donor_checkpoint_valid's regeneration check: the recorded
+    ``(seed, n_requested)`` must regenerate the SAME canonical triple-set
+    hash via ``donor_entries`` -- catches silent generator drift (a code
+    change to the recipe) independent of base_model_id/lora_shape matching.
+    """
+
+    def test_valid_when_regeneration_matches_recorded_hash(self, tmp_path):
+        ckpt = donor_checkpoint_dir(tmp_path)
+        _write_donor_slot(ckpt, base_model_id="test/base", seed=7, n_requested=DONOR_MIN_ENTRIES)
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is True
+
+    def test_invalid_when_recipe_drifts_from_recorded_hash(self, tmp_path):
+        """Simulates a donor_entries code change since the checkpoint was
+        built: regenerating the recorded (seed, n_requested) now returns
+        DIFFERENT content (patched to a different seed's set), so the
+        checkpoint must be rejected -- a stale checkpoint would otherwise
+        silently seed content other than what its recorded seed claims."""
+        ckpt = donor_checkpoint_dir(tmp_path)
+        _write_donor_slot(ckpt, base_model_id="test/base", seed=7, n_requested=DONOR_MIN_ENTRIES)
+
+        drifted_entries = donor_entries(8, DONOR_MIN_ENTRIES)  # a different seed's content
+        with patch("paramem.training.donor.donor_entries", return_value=drifted_entries):
+            assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+
+    def test_missing_triples_hash_falls_back_to_hashing_recorded_triples(self, tmp_path):
+        """Pre-existing checkpoints (written before ``triples_hash`` existed
+        in the schema, additive field, no schema break) are validated by
+        hashing their own recorded ``triples`` instead of requiring the new
+        field."""
+        ckpt = donor_checkpoint_dir(tmp_path)
+        _write_donor_slot(
+            ckpt,
+            base_model_id="test/base",
+            seed=7,
+            n_requested=DONOR_MIN_ENTRIES,
+            triples_hash=None,
+        )
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is True
+
+    def test_mismatched_explicit_triples_hash_is_invalid(self, tmp_path):
+        """A recorded triples_hash that does not match the regenerated hash
+        (e.g. bit-rot or a hand-edited meta file) is rejected -- exercises
+        the mismatch comparison directly, as opposed to
+        test_invalid_when_recipe_drifts_from_recorded_hash above, which
+        exercises it via a patched donor_entries."""
+        ckpt = donor_checkpoint_dir(tmp_path)
+        _write_donor_slot(
+            ckpt,
+            base_model_id="test/base",
+            seed=7,
+            n_requested=DONOR_MIN_ENTRIES,
+            triples_hash="0" * 64,  # deliberately wrong
+        )
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+
+    def test_missing_seed_or_n_requested_is_invalid(self, tmp_path):
+        ckpt = donor_checkpoint_dir(tmp_path)
+        _write_donor_slot(
+            ckpt,
+            meta_text=json.dumps({"base_model_id": "test/base", "lora_shape": _LORA_SHAPE}),
+        )
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+
+    def test_malformed_list_shaped_triples_never_raises(self, tmp_path):
+        """A corrupted meta.json recording "triples" as list-shaped entries
+        (not dicts) must read as invalid -- never raise TypeError out of
+        this function (the documented False-never-raise contract both
+        callers rely on)."""
+        ckpt = donor_checkpoint_dir(tmp_path)
+        meta = {
+            "base_model_id": "test/base",
+            "lora_shape": _LORA_SHAPE,
+            "seed": 7,
+            "n_requested": DONOR_MIN_ENTRIES,
+            "triples": [["graph1", "s", "p", "o"]],  # list-shaped, not dicts
+        }
+        _write_donor_slot(ckpt, meta_text=json.dumps(meta))
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+
+    def test_malformed_missing_object_field_never_raises(self, tmp_path):
+        """A recorded triple missing the "object" key must read as invalid,
+        never raise KeyError."""
+        ckpt = donor_checkpoint_dir(tmp_path)
+        meta = {
+            "base_model_id": "test/base",
+            "lora_shape": _LORA_SHAPE,
+            "seed": 7,
+            "n_requested": DONOR_MIN_ENTRIES,
+            "triples": [{"key": "graph1", "subject": "s", "predicate": "p"}],
+        }
+        _write_donor_slot(ckpt, meta_text=json.dumps(meta))
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+
+    def test_malformed_str_n_requested_never_raises(self, tmp_path):
+        """A recorded n_requested typed as a string (not an int) must read
+        as invalid, never raise TypeError out of donor_entries' arithmetic."""
+        ckpt = donor_checkpoint_dir(tmp_path)
+        meta = {
+            "base_model_id": "test/base",
+            "lora_shape": _LORA_SHAPE,
+            "seed": 7,
+            "n_requested": "128",
+            "triples": [
+                {"key": "graph1", "subject": "s", "predicate": "p", "object": "o"},
+            ],
+        }
+        _write_donor_slot(ckpt, meta_text=json.dumps(meta))
+        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+
+
+class TestTriplesHash:
+    """_triples_hash is a pure, order-independent canonical hash."""
+
+    def test_order_independent_for_shuffled_input(self):
+        entries = donor_entries(seed=3, n=DONOR_MIN_ENTRIES)
+        shuffled = list(entries)
+        random.Random(99).shuffle(shuffled)
+        assert shuffled != entries, "shuffle must actually reorder for this to be a real test"
+        assert _triples_hash(entries) == _triples_hash(shuffled)
+
+
 def _fake_atomic_save_adapter(model, target_dir, adapter_name):
     """Stand-in for paramem.models.loader.atomic_save_adapter: writes a
     real (tiny, fake-content) slot so the donor's SHA-256 + meta write can
@@ -454,6 +604,31 @@ class TestBuildDonor:
         assert meta["lora_shape"] == {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}
         expected_sha = hashlib.sha256((slot / "adapter_model.safetensors").read_bytes()).hexdigest()
         assert meta["weights_sha256"] == expected_sha
+        # triples_hash is the canonical hash of the SAME recorded triples --
+        # donor_checkpoint_valid's regeneration check reads this field.
+        assert meta["triples_hash"] == _triples_hash(meta["triples"])
+
+    def test_build_then_donor_checkpoint_valid_round_trip(self, tmp_path):
+        """build_donor's persisted checkpoint must validate as True through
+        donor_checkpoint_valid with the SAME base_model_id/lora_shape it was
+        built with -- the actual producer-consumer contract, not just each
+        half tested in isolation."""
+        loop = _make_bare_loop(tmp_path)
+        loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
+
+        with (
+            patch(
+                "paramem.models.loader.atomic_save_adapter",
+                side_effect=_fake_atomic_save_adapter,
+            ),
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch("paramem.models.loader.switch_adapter"),
+        ):
+            build_donor(loop, seed=42, n=DONOR_MIN_ENTRIES)
+
+        checkpoint_dir = donor_checkpoint_dir(loop.output_dir)
+        lora_shape = {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}
+        assert donor_checkpoint_valid(checkpoint_dir, "test/base-model", lora_shape) is True
 
     def test_transient_slot_deleted_even_on_training_failure(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
@@ -530,43 +705,17 @@ class TestBuildDonor:
 
 
 class TestSeedingHook:
-    """ConsolidationLoop._maybe_seed_from_donor / the funnel's gating logic."""
+    """ConsolidationLoop._maybe_seed_from_donor / the funnel's gating logic.
 
-    def test_flag_off_never_calls_seeding(self, tmp_path):
-        loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=False)
-        loop._maybe_seed_from_donor = MagicMock()
-        loop._indexed_dataset = MagicMock(return_value=MagicMock())
-        loop._enable_gradient_checkpointing = MagicMock()
-        loop._maybe_make_recall_callback = MagicMock(return_value=(None, None))
-        loop._build_training_hooks = MagicMock(return_value=MagicMock())
-
-        with (
-            patch(
-                "paramem.training.consolidation.format_entry_training",
-                return_value=[{"input_ids": [1], "labels": [1]}],
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.1, "aborted": False},
-            ),
-        ):
-            metrics, _ = loop._train_tier_adapter(
-                [{"key": "graph1", "subject": "s", "predicate": "p", "object": "o"}],
-                adapter_name="episodic",
-                adapter_config=loop.episodic_config,
-                training_config=loop.training_config,
-                output_dir=tmp_path / "scratch",
-                run_name="test",
-                phase_name="test",
-            )
-
-        assert not loop._maybe_seed_from_donor.called
-        assert metrics["donor_seeded"] is False
+    Donor seeding is the unconditional standard mechanism (no feature flag
+    -- the prior donor_seeding_enabled flag was retired once the validation
+    arms passed; see benchmarking.md). Every test below builds a plain
+    ``TrainingConfig()``.
+    """
 
     def test_cold_valid_checkpoint_loads_copies_and_deletes_transient_in_order(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         # measured_adapter_init_state calls param.data.norm().item() -- a real
         # zero tensor gives a faithful "cold" read (no MagicMock chain).
         import torch
@@ -619,7 +768,7 @@ class TestSeedingHook:
         tensor-shape mismatch the lora_shape check missed) must still leave
         the transient slot cleaned up, not leaked."""
         loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         import torch
 
         loop.model.named_parameters.return_value = [
@@ -653,7 +802,7 @@ class TestSeedingHook:
 
     def test_base_id_mismatch_skips_without_crash(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         import torch
 
         loop.model.named_parameters.return_value = [
@@ -678,7 +827,7 @@ class TestSeedingHook:
         abort inside the donor's own training), the seeding hook must skip
         cleanly -- not propagate the exception into the caller's fold."""
         loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         import torch
 
         loop.model.named_parameters.return_value = [
@@ -701,7 +850,7 @@ class TestSeedingHook:
 
     def test_unresolvable_base_id_skips_without_crash(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         loop.model.get_base_model.return_value.config._name_or_path = None
         import torch
 
@@ -717,7 +866,7 @@ class TestSeedingHook:
 
     def test_warm_target_never_seeds(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         import torch
 
         loop.model.named_parameters.return_value = [
@@ -738,7 +887,7 @@ class TestSeedingHook:
         loop._enable_gradient_checkpointing = MagicMock()
         loop._maybe_make_recall_callback = MagicMock(return_value=(None, None))
         loop._build_training_hooks = MagicMock(return_value=MagicMock())
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         loop._maybe_seed_from_donor = MagicMock()
 
         with (
@@ -769,7 +918,7 @@ class TestSeedingHook:
         loop._enable_gradient_checkpointing = MagicMock()
         loop._maybe_make_recall_callback = MagicMock(return_value=(None, None))
         loop._build_training_hooks = MagicMock(return_value=MagicMock())
-        loop.training_config = TrainingConfig(donor_seeding_enabled=True)
+        loop.training_config = TrainingConfig()
         loop._maybe_seed_from_donor = MagicMock(return_value=True)
 
         with (

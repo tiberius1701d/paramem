@@ -37,18 +37,26 @@ Key namespace reservation
 ``proc1``-``proc{width}`` for the donor's synthetic population; real
 minting floors (``ConsolidationLoop._indexed_next_index`` /
 ``_procedural_next_index``) start at ``DONOR_KEY_FLOOR = width + 1``
-**unconditionally** — the reservation does not depend on
-``donor_seeding_enabled``, so a later flag flip can never collide with keys
-already minted in the 1-``width`` band. The width bounds the maximum
-key-surface *divergence depth* the donor can teach (the separating variable
+unconditionally, so real keys can never collide with the reserved band.
+The width bounds the maximum key-surface *divergence depth* the donor's
+OWN fixture/synthesized population is trained at (the separating variable
 in the production failures is cluster depth, not absolute key magnitude —
 see ``experiments/test20_smallN_cold_gate.py``): a 1-200 band spans depths
-1-3, the entire depth range observed in production. Widen this constant
-(and rebuild the donor checkpoint) if a depth-4+ cluster is ever observed.
-ONE shared constant (not two independently-tunable per-prefix widths)
-because both prefixes are reserved at the SAME width symmetrically
-("Donors own graph1-200 AND proc1-200") — two constants that could drift
-apart would only reintroduce an asymmetry that decision rejected.
+1-3, the depth range observed in production at the time this constant was
+set. Widening this constant is a key-NAMESPACE-headroom decision (avoiding
+real-key collision as production keys grow past 200), NOT a donor-teaching
+requirement: Test 20's depth-4 transfer arm (``benchmarking.md``, "Test
+20: Small-N Cold-Init Recall Gate", "Depth scaling" section) showed the
+SAME depth-3-trained donor checkpoint (built once, never rebuilt) rescues
+cold recall on 4-digit (depth-4) target keys at 21/21 on both seeds run,
+zero donor/target key overlap — donor task-skill transfer is depth-general,
+not depth-matched, so a depth-4+ cluster observed in production does NOT
+by itself require rebuilding the donor at a wider band. Depth 5 remains
+the one unmeasured extrapolation (same section, "Remaining gap"). ONE
+shared constant (not two independently-tunable per-prefix widths) because
+both prefixes are reserved at the SAME width symmetrically ("Donors own
+graph1-200 AND proc1-200") — two constants that could drift apart would
+only reintroduce an asymmetry that decision rejected.
 
 Fixture provenance
 -------------------
@@ -83,15 +91,23 @@ Build timing (operational note)
 ---------------------------------
 The donor is NOT built "at first boot" as a separate step — there is a
 SINGLE call site (``ConsolidationLoop._maybe_seed_from_donor``, inside
-``_train_tier_adapter``): when ``donor_seeding_enabled`` is on and the
-checkpoint is missing or stale, :func:`build_donor` runs INLINE, synchronously,
-before that fold's own training. The practical consequence: the first
-measured-cold fold after the flag is turned on (or after a base-model swap)
-absorbs a full donor training run (the same budget as any other fold, e.g.
-30 epochs at the anchored bucket) IN ADDITION TO its own training, so that
-fold takes roughly twice as long as a normal fold. Every fold after that
-reuses the persisted checkpoint and pays no extra cost until the checkpoint
-is invalidated again (base-model swap, or a LoRA shape edit — see
+``_train_tier_adapter``): when the checkpoint is missing or stale,
+:func:`build_donor` runs INLINE, synchronously, before that fold's own
+training. The practical consequence: the first measured-cold fold in a
+deployment's lifetime (or after a base-model swap) absorbs a full donor
+training run (147 entries -- ``donor_entries`` returns whole 21-entry
+blocks, so ``DONOR_MIN_ENTRIES=128`` requested rounds up to 147 -- at the
+anchored 30-epoch bucket: 2220 steps, ~37 min measured at ~1.0s/step) IN
+ADDITION TO its own training. This is NOT "roughly doubling that fold's
+wall time" -- the multiplier depends on how small the triggering fold's OWN
+key count is, and it is small by construction (the first measured-cold
+adapter in a deployment's lifetime). Measured: an N=21 triggering fold (550
+of its own steps) pays ~5x its own wall time that one cycle
+(``(550 + 2220) / 550``); an N=2 triggering fold (160 of its own steps)
+pays ~14x (``(160 + 2220) / 160``) -- see ``benchmarking.md``, "Test 20",
+for the measurement. Every fold after the triggering one reuses the
+persisted checkpoint and pays no extra cost until it is invalidated again
+(base-model swap, a LoRA shape edit, or a donor-recipe change — see
 :func:`donor_checkpoint_valid`).
 """
 
@@ -129,8 +145,7 @@ DONOR_KEY_FLOOR: int = DONOR_KEY_BAND_WIDTH + 1
 """Real (non-donor) key minting floor for BOTH the ``graph`` and ``proc``
 counters — ``ConsolidationLoop._indexed_next_index`` /
 ``_procedural_next_index`` are seeded at
-``max(DONOR_KEY_FLOOR, high_water_from_store)``. Unconditional: this floor
-applies regardless of ``donor_seeding_enabled`` (see module docstring)."""
+``max(DONOR_KEY_FLOOR, high_water_from_store)`` (see module docstring)."""
 
 # --- Donor checkpoint location ----------------------------------------------
 DONOR_CHECKPOINT_DIRNAME: str = "_donor"
@@ -166,17 +181,11 @@ DONOR_DEFAULT_SEED: int = 42  # matches TrainingConfig.seed's project-standard d
 DONOR_MIN_ENTRIES: int = 128
 """Minimum donor population size. This is the training-budget table's
 anchored (empirically-validated, not extrapolated) floor
-(``paramem.utils.config._BUDGET_TABLE``) — but that bucket only applies
-when the funnel derives the budget FROM this count, i.e.
-``training_config.budget_derivation_enabled`` is True. When that flag is
-False (the ship default for BOTH ``budget_derivation_enabled`` and
-``donor_seeding_enabled``), ``budget_for`` ignores the key count entirely
-and the donor simply trains at ``training_config.num_epochs`` (default 30
-— numerically the same as the anchored bucket's epoch count, but for an
-unrelated reason: the config default, not this floor). 128 is still the
-right floor regardless of the budget-derivation flag: it is also the
-divergence-depth population size the failing production clusters need to
-be represented at (see the module docstring's "Why the donor exists")."""
+(``paramem.utils.config._BUDGET_TABLE``), which the funnel's unconditional
+budget derivation applies to every fold including the donor's own build.
+128 is also the divergence-depth population size the failing production
+clusters need to be represented at (see the module docstring's "Why the
+donor exists")."""
 
 # Transient PEFT adapter slot names. Never collide with a production tier
 # name, an interim slot (``episodic_interim_<stamp>``), or the existing
@@ -361,11 +370,32 @@ def _latest_donor_slot(checkpoint_dir: Path) -> "Path | None":
     return slots[-1] if slots else None
 
 
+def _triples_hash(entries: list[dict]) -> str:
+    """Canonical SHA-256 hex digest of a donor triple set.
+
+    Order-independent: entries are reduced to ``(key, subject, predicate,
+    object)`` tuples and sorted before hashing, so the digest is stable
+    even if a future change to :func:`donor_entries`'s iteration order
+    (without changing content) would otherwise flip it. Used by
+    :func:`build_donor` (recorded as the meta's ``triples_hash``) and by
+    :func:`donor_checkpoint_valid`'s regeneration check, which compares a
+    freshly-regenerated ``donor_entries(seed, n)`` call against the
+    recorded hash to catch silent generator drift -- a code change to the
+    recipe that would produce different content for the same seed/n
+    without touching ``base_model_id`` or ``lora_shape``.
+    """
+    canonical = sorted((e["key"], e["subject"], e["predicate"], e["object"]) for e in entries)
+    payload = json.dumps(canonical, sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def donor_checkpoint_valid(
     checkpoint_dir: Path, base_model_id: "str | None", lora_shape: dict
 ) -> bool:
-    """True when a donor checkpoint exists under *checkpoint_dir* and matches
-    both *base_model_id* and *lora_shape*.
+    """True when a donor checkpoint exists under *checkpoint_dir*, matches
+    both *base_model_id* and *lora_shape*, and regenerating its recorded
+    ``(seed, n_requested)`` through :func:`donor_entries` reproduces its
+    recorded triple set exactly.
 
     Args:
         checkpoint_dir: The value returned by :func:`donor_checkpoint_dir`.
@@ -382,11 +412,36 @@ def donor_checkpoint_valid(
             here rather than crash later inside
             ``copy_adapter_weights_subset`` on a tensor-shape mismatch.
 
+    Validity requires ALL of: (1) a donor slot exists with both
+    ``adapter_model.safetensors`` and a parseable ``donor_meta.json``;
+    (2) ``meta["base_model_id"] == base_model_id``; (3)
+    ``meta["lora_shape"] == lora_shape``; (4) regeneration --
+    ``donor_entries(meta["seed"], meta["n_requested"])``, canonically
+    hashed (:func:`_triples_hash`), matches the recorded hash. Checkpoints
+    written before ``triples_hash`` existed in the meta schema (additive,
+    no schema break) are compared by hashing their own recorded
+    ``meta["triples"]`` instead of requiring the new field. A regeneration
+    mismatch means :func:`donor_entries`'s recipe changed since the
+    checkpoint was built -- the checkpoint would now seed content other
+    than what its recorded seed claims, so it is rejected and rebuilt, not
+    just a base-id/shape drift.
+
+    Never raises: this is boundary error handling for an on-disk artifact
+    whose shape is not guaranteed once corrupted (partial write, manual
+    edit, future schema drift) -- ANY malformed meta shape reads as
+    invalid rather than propagating, matching the corrupt-checkpoint ->
+    rebuild contract both callers (the seeding hook and its tests) rely
+    on. This covers not just missing fields but wrong-typed ones: a
+    non-numeric ``n_requested`` (e.g. a string), list-shaped ``triples``
+    entries instead of dicts, or an entry missing one of
+    ``key``/``subject``/``predicate``/``object``.
+
     Returns:
-        ``False`` when no slot exists, the slot is missing its weights or
-        meta file, the meta file does not parse, or the meta's
-        ``base_model_id`` / ``lora_shape`` differs from the current values
-        (including a never-recorded meta, which reads as a mismatch).
+        ``False`` on any of: no slot, missing artifacts, unparseable meta,
+        base id mismatch, LoRA shape mismatch, a meta missing ``seed`` or
+        ``n_requested`` (cannot be regenerated), any other malformed meta
+        shape (see above), or a regeneration hash mismatch. ``True`` only
+        when every check passes.
     """
     if base_model_id is None:
         return False
@@ -403,7 +458,39 @@ def donor_checkpoint_valid(
         return False
     if meta.get("base_model_id") != base_model_id:
         return False
-    return meta.get("lora_shape") == lora_shape
+    if meta.get("lora_shape") != lora_shape:
+        return False
+
+    seed = meta.get("seed")
+    n_requested = meta.get("n_requested")
+    if seed is None or n_requested is None:
+        return False
+    try:
+        regenerated = donor_entries(seed, n_requested)
+        regenerated_hash = _triples_hash(regenerated)
+
+        recorded_hash = meta.get("triples_hash")
+        if recorded_hash is None:
+            recorded_triples = meta.get("triples")
+            if recorded_triples is None:
+                return False
+            recorded_hash = _triples_hash(recorded_triples)
+    except (TypeError, KeyError, ValueError):
+        # Boundary error handling for an on-disk artifact whose shape is
+        # not guaranteed: donor_meta.json can be malformed in ways that
+        # are NOT "field absent" -- n_requested recorded as a non-numeric
+        # string (TypeError from donor_entries' arithmetic), triples
+        # recorded as list-shaped entries instead of dicts, or an entry
+        # missing one of key/subject/predicate/object (both raise from
+        # _triples_hash's e["..."] indexing), or a recorded n_requested
+        # below DONOR_MIN_ENTRIES (ValueError from donor_entries itself).
+        # Every one of these must read as "cannot verify" -> invalid,
+        # never propagate -- this function's contract (documented above
+        # and relied on by both its callers, _maybe_seed_from_donor and
+        # the seeding-hook tests) is False-never-raise; a corrupt meta
+        # file must trigger a normal rebuild, not abort the calling fold.
+        return False
+    return regenerated_hash == recorded_hash
 
 
 def _allocate_block_keys(used: set[int], count: int) -> list[int]:
@@ -654,8 +741,7 @@ def donor_entries(seed: int, n: int) -> list[dict]:
         seed: PRNG seed for ``random.Random`` — the sole source of
             variation between calls.
         n: Minimum number of entries to return. Must be
-            ``>= DONOR_MIN_ENTRIES`` (see that constant's docstring for the
-            exact dependency on ``budget_derivation_enabled``).
+            ``>= DONOR_MIN_ENTRIES`` (see that constant's docstring).
 
     Returns:
         List of ``{"key", "subject", "predicate", "object"}`` dicts, length
@@ -781,12 +867,13 @@ def build_donor(
     (the same primitive every production tier save uses — atomic write,
     age-envelope encryption when the daily identity is loaded) into
     :func:`donor_checkpoint_dir`, writes ``donor_meta.json`` (seed, recipe,
-    the resulting triple set, weights SHA-256, base model id, and the
-    CURRENT episodic tier's LoRA shape fields — see
-    :func:`donor_checkpoint_valid`) alongside the weights, prunes every
-    other donor slot (:func:`_prune_other_donor_slots` — exactly one donor
-    artifact persists at a time), then deletes the transient slot in a
-    ``finally`` regardless of outcome.
+    the resulting triple set, its canonical hash (:func:`_triples_hash`,
+    read back by :func:`donor_checkpoint_valid`'s regeneration check),
+    weights SHA-256, base model id, and the CURRENT episodic tier's LoRA
+    shape fields — see :func:`donor_checkpoint_valid`) alongside the
+    weights, prunes every other donor slot (:func:`_prune_other_donor_slots`
+    — exactly one donor artifact persists at a time), then deletes the
+    transient slot in a ``finally`` regardless of outcome.
 
     Args:
         loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`
@@ -844,6 +931,7 @@ def build_donor(
             "recipe": DONOR_RECIPE_ID,
             "n_requested": n,
             "triples": entries,
+            "triples_hash": _triples_hash(entries),
             "weights_sha256": weights_sha256,
             "base_model_id": base_model_id,
             "lora_shape": _lora_shape_fields(loop.episodic_config),

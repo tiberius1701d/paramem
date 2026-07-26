@@ -278,19 +278,15 @@ class TestRegistryLastWriteOrder:
         self.training_config.num_epochs -- computed before the try block so
         the finally-path record is correct even on failure.
 
-        One QA entry (N=1) with budget_derivation_enabled=True falls in the
-        smallest bucket (< 16 keys -> 80 epochs), which differs from the
-        harness's configured training_config.num_epochs=1 -- an unmistakable
-        signal that the recorded value is the derived one.
+        Derivation is the unconditional standard mechanism (no feature
+        flag). One QA entry (N=1) falls in the smallest bucket (< 16 keys
+        -> 80 epochs), which differs from the harness's configured
+        training_config.num_epochs=1 -- an unmistakable signal that the
+        recorded value is the derived one.
         """
-        import dataclasses
-
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_mock_loop(tmp_path)
-        loop.training_config = dataclasses.replace(
-            loop.training_config, budget_derivation_enabled=True
-        )
         loop._telemetry_dir = tmp_path / "telemetry"
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(
@@ -350,17 +346,17 @@ class TestRegistryLastWriteOrder:
         model's named_parameters() carries a zero-valued lora_B tensor for
         the interim adapter so measured_adapter_init_state classifies
         init="cold" instead of degrading to an absent field.
-        """
-        import dataclasses
 
+        Donor seeding is unconditional and reachable at every measured-cold
+        fold now, so it is explicitly stubbed to "no valid checkpoint" here
+        -- this test is about the budget/telemetry fields, not the donor
+        mechanism (covered separately by test_interim_telemetry_tags_donor_seeded_fold).
+        """
         import torch as _torch
 
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_mock_loop(tmp_path)
-        loop.training_config = dataclasses.replace(
-            loop.training_config, budget_derivation_enabled=True
-        )
         loop._telemetry_dir = tmp_path / "telemetry"
         stamp = "20260418T1430"
         interim_name = f"episodic_interim_{stamp}"
@@ -379,6 +375,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
+            patch.object(loop, "_maybe_seed_from_donor", return_value=False),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
@@ -426,17 +423,14 @@ class TestRegistryLastWriteOrder:
         the main-tier one) -- the funnel's returned metrics dict carries
         donor_seeded=True and the call site overrides its telemetry record
         from that, per the seeding hook's docstring (no second measurement).
-        """
-        import dataclasses
 
+        Donor seeding is unconditional (no feature flag).
+        """
         import torch as _torch
 
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_mock_loop(tmp_path)
-        loop.training_config = dataclasses.replace(
-            loop.training_config, budget_derivation_enabled=True, donor_seeding_enabled=True
-        )
         loop._telemetry_dir = tmp_path / "telemetry"
         loop.model.get_base_model.return_value.config._name_or_path = "test/base-model"
         stamp = "20260418T1430"
@@ -547,11 +541,10 @@ class TestRegistryLastWriteOrder:
         record = interim_calls[0].kwargs["record"]
         assert record["epochs_to_bind"] == 5
         assert record["hit_cap"] is False
-        # n_keys=2 (the harness's two pre-populated graph edges) with budget
-        # derivation off in this test (TrainingConfig's default
-        # gradient_accumulation_steps=8 passes through unchanged) ->
-        # ceil(2/8) * 5 = 5 steps.
-        assert record["steps_to_bind"] == 5
+        # n_keys=2 (the harness's two pre-populated graph edges) falls in the
+        # smallest bucket (n_keys < 16 -> accum=1, unconditional derivation)
+        # -> ceil(2/1) * 5 = 10 steps.
+        assert record["steps_to_bind"] == 10
 
     def test_interim_telemetry_hit_cap_when_recall_never_fires(self, tmp_path: Path) -> None:
         """hit_cap=True and epochs_to_bind/steps_to_bind stay absent when
@@ -771,62 +764,6 @@ class TestRegistryLastWriteOrder:
         assert "hit_cap" not in record
         assert "epochs_to_bind" not in record
         assert "steps_to_bind" not in record
-
-    def test_interim_telemetry_epochs_unchanged_when_budget_derivation_disabled(
-        self, tmp_path: Path
-    ) -> None:
-        """budget_derivation_enabled=False (the shipped default) must record
-        `epochs` equal to the config's num_epochs -- pinning that the
-        telemetry layer introduces no behaviour change for the un-derived
-        path (only the shape of the recorded value, not what training
-        actually runs with).
-        """
-        from paramem.training.key_registry import KeyRegistry
-
-        loop = _make_mock_loop(tmp_path)
-        assert loop.training_config.budget_derivation_enabled is False
-        loop._telemetry_dir = tmp_path / "telemetry"
-        stamp = "20260418T1430"
-        interim_name = f"episodic_interim_{stamp}"
-        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
-
-        with (
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
-            patch("paramem.models.loader.save_adapter"),
-            patch.object(KeyRegistry, "save_from_bytes"),
-            patch.multiple(
-                "paramem.training.consolidation.torch.cuda",
-                is_available=MagicMock(return_value=False),
-            ),
-            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
-        ):
-            loop.run_consolidation_cycle(
-                _fake_qa(1),
-                [],
-                speaker_id="speaker0",
-                mode="train",
-                run_label="conv-i5-010",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        interim_calls = [
-            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
-        ]
-        assert interim_calls, "expected an interim_tier_train telemetry record"
-        assert interim_calls[0].kwargs["record"]["epochs"] == loop.training_config.num_epochs
 
     def test_adapter_save_failure_means_no_registry_entry(self, tmp_path: Path) -> None:
         """If save_adapter raises, registry must not be written to disk.
@@ -2112,8 +2049,9 @@ class TestRecallFailedSessionStaysPending:
         )
 
     def test_simulate_mode_never_invokes_donor_seeding_gate(self, tmp_path: Path) -> None:
-        """Simulate mode (disk venue) must never reach _train_tier_adapter -- the
-        SOLE gate for donor seeding -- even with donor_seeding_enabled=True.
+        """Simulate mode (disk venue) must never reach _train_tier_adapter --
+        the SOLE gate for donor seeding, which is unconditional (no feature
+        flag; see paramem.training.donor).
 
         Every production _train_tier_adapter call site sits inside its
         enclosing `if scope.source == "weights":` branch
@@ -2122,13 +2060,10 @@ class TestRecallFailedSessionStaysPending:
         seeds" holds structurally rather than by an extra runtime check
         inside the funnel itself.
         """
-        from dataclasses import replace as _replace
-
         from paramem.training.consolidation import ConsolidationLoop
 
         session_id = "real-session-sim-donor"
         loop = self._make_loop_with_session_edge(tmp_path, session_id=session_id)
-        loop.training_config = _replace(loop.training_config, donor_seeding_enabled=True)
 
         with patch.object(ConsolidationLoop, "_train_tier_adapter") as spy:
             self._run_cycle(loop, mode="simulate")

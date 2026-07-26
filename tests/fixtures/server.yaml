@@ -253,24 +253,11 @@ consolidation:
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
   min_tier_key_floor: 30
   tier_fast_start: true
-  # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
-  # Unset (or null) → use the validated 30-epoch default from the Test 1-8
-  # campaign. Lower this only with empirical recall-vs-epochs evidence on
-  # your specific base model — 30 was validated on Mistral 7B and may be
-  # overkill on future base models. With recall_early_stopping=true, this
-  # becomes the upper bound; with the flag off, this is the fixed budget.
-  # max_epochs: null
-  # Per-fold training-budget derivation -- see
-  # paramem.utils.config.budget_for / _BUDGET_TABLE for the bucket values.
-  # false matches server.yaml.example -- unit tests construct TrainingConfig
-  # directly with budget_derivation_enabled=True where they need to exercise
-  # budget_for; no GPU fixture coverage needed for the new/unvalidated policy.
-  budget_derivation_enabled: false
-  # Donor seeding -- see configs/server.yaml.example for the full rationale.
-  # false matches server.yaml.example; unit tests construct TrainingConfig
-  # directly with donor_seeding_enabled=True where they need to exercise the
-  # seeding hook -- no GPU fixture coverage needed for the new/unvalidated policy.
-  donor_seeding_enabled: false
+  # Per-fold training-budget derivation and donor seeding are the
+  # unconditional standard mechanism (no config knob, no fixed-budget mode,
+  # no operator ceiling) -- see paramem.utils.config.budget_for /
+  # _BUDGET_TABLE and paramem.training.donor for the bucket values and donor
+  # rationale; see configs/server.yaml.example for the full rationale.
   # Recall-based early stopping — flipped ON 2026-05-06 for the first
   # production cycle.  signal_from_epoch=20 is a conservative floor
   # given Test 14's multi-seed cells stopped between e18-e26.
@@ -368,9 +355,11 @@ consolidation:
   # Holdable-session retirement TTL — mirrors server.yaml.example.
   orphan_retirement: "off"
   # --- LoRA training hyperparameters (Test 17 recipe; formerly an in-code default) ---
-  # num_epochs is the ceiling `max_epochs` above (None -> 30); not repeated here.
+  # num_epochs, gradient_accumulation_steps, and lr_decay_steps are NOT
+  # configurable here -- the training funnel unconditionally derives and
+  # overwrites all three per fold; see configs/server.yaml.example for the
+  # full rationale.
   training_batch_size: 1
-  training_gradient_accumulation_steps: 2
   training_max_seq_length: 1024
   # Absolute-step warmup count. 0 = warmup is currently disabled in
   # production; see configs/server.yaml.example for the full rationale.
@@ -380,7 +369,6 @@ consolidation:
   training_gradient_checkpointing: true
   training_max_grad_norm: 1.0
   training_seed: 42
-  training_lr_decay_steps: null
 
 # --- Cloud ---
 # THE master switch for ALL cloud egress (conversation agent, extraction

@@ -289,9 +289,16 @@ adapters:
 - `alpha = 2 × rank` — validated across the Test 1–8 campaign. Deviating
   from this ratio degrades indexed-key recall.
 - **Minimum 30 epochs for indexed keys.** The validated training budget from
-  Test 1–8. `loss convergence ≠ fact encoding` — loss plateaus at ~15 epochs;
-  30 epochs are required for 100% indexed-key recall. Lower only with empirical
-  recall-vs-epochs data on your specific base model.
+  Test 1–8 for large-N folds (`loss convergence ≠ fact encoding` — loss
+  plateaus at ~15 epochs; 30 epochs are required for 100% indexed-key
+  recall). The training funnel derives this automatically per fold from the
+  key-triple count (`paramem.utils.config._BUDGET_TABLE`: N≥128 → 30 epochs;
+  16–127 → 50; <16 → 80 — smaller folds get a LARGER derived budget, not a
+  smaller one), unconditionally and unclamped — there is no operator
+  ceiling. `hit_cap` telemetry and recall-based early stopping are the
+  wall-time feedback channels: early stopping usually terminates training
+  before the bucket cap is reached, and `hit_cap` telemetry records when it
+  does not.
 - **Procedural is disabled by default** in new deployments that haven't
   yet collected behavioral data. Enable once the episodic/semantic tiers
   are stable.

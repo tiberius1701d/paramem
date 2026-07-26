@@ -41,7 +41,7 @@ SCENARIOS = [
         "dataset_probe",
         {
             "model_name": "mistral",
-            "consolidation.max_epochs": 20,
+            "consolidation.training_seed": 20,
             "consolidation.indexed_key_replay": True,
             "consolidation.extraction_enrichment_provider": "",
             "consolidation.extraction_plausibility_judge": "off",
@@ -58,7 +58,7 @@ SCENARIOS = [
         "step6_step7",
         {
             "model_name": "mistral",
-            "consolidation.max_epochs": 10,
+            "consolidation.training_seed": 10,
             "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
             "consolidation.extraction_enrichment_provider": "",
@@ -85,7 +85,7 @@ SCENARIOS = [
         "interim_rollover",
         {
             "model_name": "mistral",
-            "consolidation.max_epochs": 10,
+            "consolidation.training_seed": 10,
             "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
             "consolidation.extraction_enrichment_provider": "anthropic",

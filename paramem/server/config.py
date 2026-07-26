@@ -1029,50 +1029,18 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # genuine encoding failures count.  Must be a positive integer (> 0).
     # Read at SessionBuffer construction (app.py).
     consolidation_retry_cap: int = 3
-    # Maximum LoRA training epochs per consolidation cycle. None = use the
-    # validated 30 default (Test 17 floor) for 100% indexed-key recall on the
-    # validated models.
-    #
-    # Override semantics: ceiling, not target. Once the recall-driven
-    # early-stop callback ships, training will terminate at the recall
-    # plateau; this field caps the upper bound. Until then, training runs
-    # the full configured count.
-    #
-    # Operator guidance: do NOT lower below 30 in production without an
-    # empirical recall-vs-epochs validation on your specific base model.
-    # The 30-epoch value was anchored on Mistral 7B; future base models
-    # may converge sooner. Lower this only with evidence.
-    #
-    # Development harnesses may set this to a small value to skip the full
-    # validated budget when testing layout/encryption invariants rather
-    # than recall quality.
-    max_epochs: int | None = None
-    # Master switch for the per-fold training-budget derivation: epochs/
-    # accum/lr_decay_steps derived from the fold's key-triple count via
-    # paramem.utils.config.budget_for, applied at the single training funnel
-    # (ConsolidationLoop._train_tier_adapter). False (default) is exactly
-    # today's behaviour -- the fixed training_* fields below are used as-is,
-    # ignoring key count. See budget_for's _BUDGET_TABLE for the bucket
-    # values and evidence status; ships OFF until the smaller buckets are
-    # confirmed on more production fold data.
-    budget_derivation_enabled: bool = False
-    # Master switch for donor seeding: a measured-cold target adapter is
-    # seeded from the donor checkpoint (paramem.training.donor) before
-    # training, at the same funnel budget_derivation_enabled gates
-    # (ConsolidationLoop._train_tier_adapter). False (default) is exactly
-    # today's behaviour -- every fold trains from whatever weights the target
-    # adapter already carries. See paramem.training.donor's module docstring
-    # for the donor's synthetic-content rationale and key-namespace reservation
-    # (graph1-200 / proc1-200); ships off until the donor arm is validated
-    # against production recall data -- seeding cold small-N folds from a
-    # synthetic population could plausibly worsen the attractor-collapse
-    # failure it targets rather than fix it, and that has not yet been
-    # measured.
-    donor_seeding_enabled: bool = False
-    # LoRA training hyperparameters (Test 17 recipe).
-    # num_epochs is the ceiling max_epochs above (None → 30); not repeated here.
+    # LoRA training hyperparameters (Test 17 recipe). num_epochs,
+    # gradient_accumulation_steps, and lr_decay_steps are NOT configurable
+    # here -- the training funnel unconditionally derives and overwrites
+    # all three per fold from the key-triple count via
+    # paramem.utils.config.budget_for / _BUDGET_TABLE, unclamped (no operator
+    # ceiling; a prior max_epochs clamp was retired 2026-07-26). Wall-time
+    # feedback comes from hit_cap telemetry and recall_early_stopping
+    # (below), not a config clamp. yaml fields for the derived triple were
+    # retired 2026-07-26 once that became true for every production call
+    # (train_adapter has exactly one production call site, inside the
+    # funnel).
     training_batch_size: int = 1
-    training_gradient_accumulation_steps: int = 2
     training_max_seq_length: int = 1024
     # Absolute-step warmup count, passed straight through to TrainingConfig.
     # warmup=0: warmup is currently disabled in production. Every fold ever
@@ -1088,7 +1056,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     training_gradient_checkpointing: bool = True
     training_max_grad_norm: float = 1.0
     training_seed: int = 42
-    training_lr_decay_steps: int | None = None
     # Recall-based early stopping (default OFF).
     # When True, ConsolidationLoop wires RecallEarlyStopCallback at every
     # production train_adapter call site (via _maybe_make_recall_callback).
@@ -1822,42 +1789,42 @@ class ServerConfig:
     def training_config(self) -> TrainingConfig:
         """Training recipe from yaml (Test 17 defaults via consolidation.training_* fields).
 
-        ``num_epochs`` honours ``consolidation.max_epochs`` when set,
-        otherwise falls back to 30 (the validated floor). The override is
-        a ceiling — once recall-driven early-stop ships, training will
-        terminate at the recall plateau bounded by this value.
+        ``num_epochs``, ``gradient_accumulation_steps``, and
+        ``lr_decay_steps`` on the returned object carry ``TrainingConfig``'s
+        own bare defaults here and are NOT meaningful for the server/
+        consolidation path: the training funnel
+        (``ConsolidationLoop._train_tier_adapter``) unconditionally derives
+        and overwrites all three from the fold's key-triple count via
+        ``paramem.utils.config.budget_for`` before every fold, unclamped --
+        the bucket table governs with no operator ceiling (a prior
+        ``consolidation.max_epochs`` / ``TrainingConfig.budget_max_epochs``
+        clamp was retired 2026-07-26; ``hit_cap`` telemetry and
+        ``recall_early_stopping`` are the wall-time feedback channels, not a
+        config clamp). ``train_adapter`` (``paramem.training.trainer``) has
+        exactly one production call site, inside that funnel -- so nothing
+        ever reads this property's pre-derivation values. The corresponding
+        ``consolidation.training_gradient_accumulation_steps`` /
+        ``consolidation.training_lr_decay_steps`` yaml fields (and the prior
+        ``max_epochs``-or-30 resolution into ``num_epochs`` here) were
+        retired for the same reason (2026-07-26). ``TrainingConfig``'s own
+        fields are unchanged -- they remain the derivation's output carrier
+        and real inputs for callers that invoke ``train_adapter`` directly
+        outside this config path (experiments, archived scripts).
 
-        ``budget_derivation_enabled`` and ``budget_max_epochs`` feed
-        ``paramem.utils.config.budget_for`` at the training funnel
-        (``ConsolidationLoop._train_tier_adapter``). ``budget_max_epochs``
-        threads ``consolidation.max_epochs`` RAW (unresolved) so the
-        derivation's min-clamp reads the operator's actual setting (or
-        ``None`` for unclamped) rather than this property's own resolved
-        ``num_epochs`` (which would wrongly cap the 50- and 80-epoch
-        buckets down to 30).
+        Donor seeding (``ConsolidationLoop._maybe_seed_from_donor`` /
+        ``paramem.training.donor``) is likewise unconditional at the same
+        funnel — a measured-cold target adapter is seeded from the donor
+        checkpoint before training instead of starting from LoRA-zero.
 
-        ``donor_seeding_enabled`` gates the same funnel's donor-seeding hook
-        (``ConsolidationLoop._maybe_seed_from_donor`` /
-        ``paramem.training.donor``) — a measured-cold target adapter is
-        seeded from the donor checkpoint before training instead of starting
-        from LoRA-zero.
-
-        All LoRA hyperparameters come from the yaml-configurable
-        ``consolidation.training_*`` fields; see ConsolidationScheduleConfig.
+        All LoRA hyperparameters other than the derived triple come from
+        the yaml-configurable ``consolidation.training_*`` fields; see
+        ConsolidationScheduleConfig.
         """
         return TrainingConfig(
             batch_size=self.consolidation.training_batch_size,
-            gradient_accumulation_steps=self.consolidation.training_gradient_accumulation_steps,
             max_seq_length=self.consolidation.training_max_seq_length,
-            num_epochs=(
-                self.consolidation.max_epochs if self.consolidation.max_epochs is not None else 30
-            ),
-            budget_derivation_enabled=self.consolidation.budget_derivation_enabled,
-            budget_max_epochs=self.consolidation.max_epochs,
-            donor_seeding_enabled=self.consolidation.donor_seeding_enabled,
             warmup_steps=self.consolidation.training_warmup_steps,
             lr_scheduler_type=self.consolidation.training_lr_scheduler_type,
-            lr_decay_steps=self.consolidation.training_lr_decay_steps,
             weight_decay=self.consolidation.training_weight_decay,
             gradient_checkpointing=self.consolidation.training_gradient_checkpointing,
             max_grad_norm=self.consolidation.training_max_grad_norm,

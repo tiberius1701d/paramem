@@ -173,11 +173,17 @@ def test_procedural_adapter_targets_mlp_layers(example_config):
 
 
 def test_training_config_uses_validated_constants(example_config):
-    """training_config property must return the Test-1-8 validated values."""
+    """training_config property must return the Test-1-8 validated values.
+
+    Epochs and gradient accumulation are NOT asserted here: the training
+    funnel derives both per fold from the key-triple count via
+    ``paramem.utils.config.budget_for``, unconditionally and unclamped --
+    there is no operator ceiling.
+    """
     tc = example_config.training_config
-    assert tc.num_epochs == 30, "30 epochs is the validated floor for 100% indexed-key recall"
     assert tc.batch_size == 1
     assert tc.gradient_checkpointing is True
+    assert tc.max_seq_length == 1024
 
 
 def test_model_registry_resolves(example_config):

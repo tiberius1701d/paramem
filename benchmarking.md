@@ -2209,6 +2209,8 @@ write-up.
 | donor-init 50ep (decay-pinned) | 550 | production (interim) | 42 / 0 / 1 / 2 | 21 / 21 / 21 / 21 | 1.000 (all 4 seeds) |
 | cold 30ep, shifted keys (+200) | 330 | shifted, zero donor overlap | 42 / 0 | 21 / 18 | 1.000 / 0.857 |
 | donor-init 30ep, shifted keys (+200) | 330 | shifted, zero donor overlap | 42 / 0 | 21 / 21 | 1.000 / 1.000 |
+| cold 30ep, shifted keys (+1200, 4-digit) | 330 | shifted, zero donor overlap, divergence depth 4 | 42 / 0 | 14 / 16 | 0.667 / 0.762 (mean **0.714**) |
+| donor-init 30ep, shifted keys (+1200, 4-digit) | 330 | shifted, zero donor overlap, divergence depth 4 | 42 / 0 | 21 / 21 | 1.000 / 1.000 |
 
 Donor self-recall (its own 147-entry synthetic population, seed 42, 30
 anchored-bucket epochs, trained before any target-adapter seeding):
@@ -2257,6 +2259,38 @@ zero overlap, donor-init 30ep still reaches **1.000 on both seeds run (42,
 evidence: donor seeding's uplift is not explained by memorized-key overlap —
 it transfers to keys the donor has never seen.
 
+### Depth scaling: cold degrades further, donor transfers without rebuild
+
+A third pair of arms tested whether the zero-overlap result generalizes to a
+harder key-surface divergence depth. The same 21-entry cluster was shifted a
+second time (+1200 on top of the original numerals, landing on 4-digit
+crowded `137x`/`138x`/`139x` clusters sharing 3 of 4 leading digits —
+divergence depth 4, one digit deeper than the original 3-digit depth-3
+cluster), again falling entirely outside the donor's reserved key band
+(`donor_key_overlap.count == 0` for every entry, both seeds).
+
+Cold 30ep (330 steps) on the depth-4 keys scores **14/21 (seed 42)** and
+**16/21 (seed 0)** — mean **0.714**. The like-for-like comparison is the
+depth-3 arm run under the SAME zero-overlap shifted protocol and the SAME
+two seeds (+200 shift, mean **0.929**: 21/18 of 21) — depth-4 (0.714) is
+below depth-3-shifted (0.929) at matched seed count and matched protocol.
+Against the original unshifted production-key mean (0.786, a DIFFERENT
+protocol at 4 seeds: 17/16/14/19 of 21) depth-4 is also lower, though that
+comparison mixes protocol and seed count and is reported for completeness,
+not as the primary read. At n=2 seeds per depth this is suggestive of —
+not a confirmed dose-response for — recall degrading as the trained keys'
+shared-digit divergence depth increases; more seeds per depth would be
+needed to confirm the trend rather than seed variance.
+
+The SAME donor checkpoint used throughout this test (built once, from the
+depth-3 21-key fixture, never rebuilt for the depth-4 keys) still reaches
+**21/21 on both seeds (42, 0)** when seeded onto the depth-4 target, at zero
+donor/target key overlap. The donor's task-skill transfer is depth-general: a
+donor trained at divergence depth 3 rescues cold recall at depth 4 without
+needing its own population rebuilt to match the harder depth. Divergence
+depth 5 (5-digit key numerals) remains the one unmeasured extrapolation from
+this validation pass — see Remaining gap.
+
 ### Protocol notes
 
 - `recall_early_stopping` forced OFF in every arm above.
@@ -2285,17 +2319,23 @@ key-overlap-by-construction shown above to be an unnecessary (already-shown
 non-load-bearing) property — the zero-overlap shifted-key arms are the
 bridge evidence that the remap does not change the mechanism's behavior. Do
 not read the rates above as having been produced against the new,
-remapped fixture keys.
+remapped fixture keys. The depth-4 (+1200 shift) arms in the "Depth scaling"
+section above used this identical shifted real-fact protocol (the same
+21-entry cluster, shifted a second time) — this provenance note applies to
+them as well.
 
 ### What these results validate
 
 - **Per-fold training-budget bucket for N in [16, 127) -> 50 epochs**
-  (`paramem.utils.config._BUDGET_TABLE`, gated off by default via
-  `budget_derivation_enabled` and documented in-code as "extrapolated, not
-  anchored" for this bucket, as of before this validation). The cold-50ep
-  arm (N=21, inside this bucket) reaching 1.000 on 4/4 seeds is fold-scale
-  evidence anchoring this bucket's epoch count, alongside the existing
-  128-key-floor bucket's own anchoring.
+  (`paramem.utils.config._BUDGET_TABLE`; at the time of this validation the
+  bucket was gated off by default via a `budget_derivation_enabled` flag and
+  documented in-code as "extrapolated, not anchored" for this bucket). The
+  cold-50ep arm (N=21, inside this bucket) reaching 1.000 on 4/4 seeds is
+  fold-scale evidence anchoring this bucket's epoch count, alongside the
+  existing 128-key-floor bucket's own anchoring. With this validation arm
+  passed, `budget_derivation_enabled` (and the paired `donor_seeding_enabled`)
+  were retired 2026-07-26: derived per-fold budgets and donor seeding are now
+  the unconditional standard mechanism, no config flag.
 - **Donor seeding as a rescue at the 30-epoch (330-step) bucket boundary**,
   including the fresh-key regime (zero overlap with the donor's own
   memorized population) — the mechanism `paramem.training.donor` /
@@ -2305,6 +2345,9 @@ remapped fixture keys.
 
 - N <= 3 is unmeasured by this validation pass under the production
   Mistral/episodic recipe used here.
+- Divergence depth 5 (5-digit key numerals) is the one unmeasured
+  extrapolation on the depth axis; depths 3 and 4 are now covered (see
+  "Depth scaling" above).
 - Production `epochs_to_bind` fold telemetry (`paramem.training.consolidation`,
   surfaced via `paramem/server/fold_telemetry.py`) will accumulate further
   real-fold evidence for the budget-bucket boundary over time; the seeds

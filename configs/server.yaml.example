@@ -248,48 +248,39 @@ consolidation:
   #     keys, no inherited weights. The principled baseline and always-on safety net.
   # Governs semantic/procedural graduation only; episodic always trains from scratch.
   tier_fast_start: true
-  # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
-  # Unset (or null) → use the validated 30-epoch default from the Test 1-8
-  # campaign. Lower this only with empirical recall-vs-epochs evidence on
-  # your specific base model — 30 was validated on Mistral 7B and may be
-  # overkill on future base models. With recall_early_stopping=true, this
-  # becomes the upper bound and training stops earlier when the staged
-  # adapter has memorized the training set; with the flag off, this is
-  # the fixed budget.
-  # max_epochs: null
-  # Per-fold training-budget derivation. When true, epochs/gradient-
-  # accumulation/lr_decay_steps are derived from the fold's key-triple count
-  # at the training funnel (N>=128 -> 30 epochs; 16-127 -> 50; <16 -> 80;
-  # batch stays 1) instead of the fixed training_* fields below. max_epochs
-  # above still clamps the derived epoch count when set
-  # (min(bucket, max_epochs)). false (default) is exactly today's
-  # fixed-budget behaviour -- the >=128 bucket is anchored on production
-  # fold telemetry and the 16-127 bucket at N=21 (4 seeds, 21/21 at 50
-  # epochs; benchmarking.md, Test 20); the rest of that band and the <16
-  # bucket remain extrapolated.
-  budget_derivation_enabled: false
-  # Donor seeding. When true, a measured-cold target adapter (LoRA-B ~= 0) is
-  # seeded from the donor checkpoint (paramem.training.donor) before training,
-  # instead of training from LoRA-zero. The donor is a synthetic crowded-
-  # predicate-cluster population (>= 128 keys) trained through the SAME
-  # funnel/budget table as any other fold. Keys graph1-200/proc1-200 are
-  # ALWAYS reserved for it (real minting starts at 201) regardless of this
-  # flag's value -- the reservation is unconditional so a later flip to
-  # true can never collide with keys already minted in that band. The
-  # checkpoint is NOT built at boot as a separate step: it is built INLINE,
-  # synchronously, the first time this flag is on and a fold measures a
-  # target adapter cold with no valid checkpoint yet -- that ONE fold
-  # absorbs a full donor training run (the same budget as any other fold)
-  # in addition to its own training before it starts, roughly doubling that
-  # fold's wall time; every fold after it reuses the persisted checkpoint
-  # until it is invalidated (base-model swap, or a rank/target_modules
-  # edit on the episodic tier). false (default) is exactly today's
-  # behaviour for TRAINING -- every fold trains from whatever weights the
-  # target adapter already carries, cold or warm; the key reservation
-  # itself is unaffected by this flag. Ships off until the donor arm is
-  # validated against production recall data (could worsen small-N
-  # attractor collapse instead of fixing it -- not yet measured).
-  donor_seeding_enabled: false
+  # Per-fold training-budget derivation (standard mechanism, unconditional --
+  # validated via Test 20). epochs/gradient-accumulation/lr_decay_steps are
+  # ALWAYS derived from the fold's key-triple count at the training funnel
+  # (N>=128 -> 30 epochs; 16-127 -> 50; <16 -> 80; batch stays 1) -- there is
+  # no fixed-budget mode and no operator ceiling (a prior max_epochs clamp
+  # was retired 2026-07-26). The >=128 bucket is anchored on production fold
+  # telemetry and the 16-127 bucket at N=21 (4 seeds, 21/21 at 50 epochs;
+  # benchmarking.md, Test 20); the rest of that band and the <16 bucket
+  # remain extrapolated. recall_early_stopping (below) is the wall-time
+  # feedback channel -- it usually terminates training before the bucket
+  # cap is reached; hit_cap telemetry records when it does not.
+  #
+  # Donor seeding (standard mechanism, unconditional -- validated via
+  # Test 20). A measured-cold target adapter (LoRA-B ~= 0) is seeded from
+  # the donor checkpoint (paramem.training.donor) before training, instead
+  # of training from LoRA-zero. The donor is a synthetic crowded-predicate-
+  # cluster population (>= 128 keys, in practice 147 -- donor_entries returns
+  # whole 21-entry blocks) trained through the SAME funnel/budget table as
+  # any other fold. Keys graph1-200/proc1-200 are always reserved for it
+  # (real minting starts at 201). The checkpoint is NOT built at boot as a
+  # separate step: it is built INLINE, synchronously, the first time a fold
+  # measures a target adapter cold with no valid checkpoint yet -- that ONE
+  # fold absorbs a full donor training run (147 entries, anchored 30-epoch
+  # bucket -> 2220 steps, ~37 min at ~1.0s/step measured) in addition to its
+  # own training before it starts. Measured: an N=21 triggering fold (550 of
+  # its own steps) pays ~5x its own wall time that one cycle; an N=2
+  # triggering fold (160 of its own steps) pays ~14x -- the multiplier is
+  # NOT a flat "roughly doubling": it shrinks as the triggering fold's own
+  # key count grows, and the triggering fold is small by construction (the
+  # first measured-cold adapter in a deployment's lifetime, or after a
+  # base-model swap). Every fold after it reuses the persisted checkpoint
+  # until it is invalidated (base-model swap, a rank/target_modules edit on
+  # the episodic tier, or a change to the donor generation recipe itself).
   # Recall-based early stopping. Default OFF; flip to true after one clean
   # cycle on your deployment to start saving training wall time by stopping
   # each fold once the staged adapter recalls its training set. See
@@ -431,9 +422,14 @@ consolidation:
   # Grammar: "every Nh" / "every Nm" / "HH:MM" / "daily" / "off".
   orphan_retirement: "off"
   # --- LoRA training hyperparameters (Test 17 recipe; formerly an in-code default) ---
-  # num_epochs is the ceiling `max_epochs` above (None -> 30); not repeated here.
+  # num_epochs, gradient_accumulation_steps, and lr_decay_steps are NOT
+  # configurable here -- the training funnel unconditionally derives and
+  # overwrites all three per fold from the key-triple count, unclamped (see
+  # the per-fold training-budget derivation note above); yaml fields for
+  # them were retired 2026-07-26 once that became true for every production
+  # call (train_adapter has exactly one production call site, inside the
+  # funnel).
   training_batch_size: 1
-  training_gradient_accumulation_steps: 2
   training_max_seq_length: 1024
   # Absolute-step warmup count. 0 = warmup is currently disabled in
   # production -- every fold ever trained ran at effectively zero warmup
@@ -447,7 +443,6 @@ consolidation:
   training_gradient_checkpointing: true
   training_max_grad_norm: 1.0
   training_seed: 42
-  training_lr_decay_steps: null
 
 # --- Cloud ---
 # THE master switch for ALL cloud egress: the conversation agent below, the

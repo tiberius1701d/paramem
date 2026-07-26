@@ -214,80 +214,56 @@ class TestPathsConfigNoneGuard:
             _ = cfg.registry_dir
 
 
-class TestConsolidationMaxEpochsOverride:
-    """consolidation.max_epochs (added 2026-04-28) is read from YAML and
-    flows through ServerConfig.training_config.
+class TestBucketTableGovernsUnclamped:
+    """The per-fold training-budget derivation (paramem.utils.config.budget_for
+    / _BUDGET_TABLE) is unconditional and unclamped: the bucket table alone
+    governs the derived per-fold epoch count, nothing else caps it. The
+    prior ``consolidation.max_epochs`` operator ceiling / ``TrainingConfig
+    .budget_max_epochs`` field were retired 2026-07-26 (see
+    tests/server/test_config.py::TestRetiredBudgetAndDonorFlagsRejected's
+    sibling stale-key test for the retired ``max_epochs`` key).
 
-    Default is None → training_config.num_epochs == 30 (the validated floor).
-    When set, it overrides.
+    Loads the REAL config path (load_server_config on the tracked fixture)
+    rather than hand-building a TrainingConfig, so this proves the tracked
+    fixture yaml loads cleanly with no operator ceiling wired anywhere, not
+    just paramem.utils.config.budget_for in isolation (see
+    tests/test_budget_for.py for the pure-function bucket-boundary tests).
+    budget_for takes ``n_keys`` alone (its ``training_config`` parameter was
+    retired 2026-07-26 once its sole reader, the max_epochs clamp, was
+    removed) -- ``config`` is loaded here only to prove the fixture parses.
     """
 
-    def test_max_epochs_default_none_uses_validated(self, tmp_path):
-        """Absent max_epochs → property returns the validated 30."""
-        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
-        config = load_server_config(yaml_file)
-        assert config.consolidation.max_epochs is None
-        assert config.training_config.num_epochs == 30
+    FIXTURE = "tests/fixtures/server.yaml"
 
-    def test_max_epochs_yaml_override_flows_to_training_config(self, tmp_path):
-        """consolidation.max_epochs: 2 → training_config.num_epochs == 2."""
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            consolidation:
-              max_epochs: 2
-            """,
-        )
-        config = load_server_config(yaml_file)
-        assert config.consolidation.max_epochs == 2
-        assert config.training_config.num_epochs == 2
+    @pytest.mark.parametrize(
+        "n_keys, expected_epochs",
+        [
+            (8, 80),  # < 16 bucket
+            (21, 50),  # 16-127 bucket
+            (147, 30),  # >= 128 bucket (the donor's own population size)
+        ],
+    )
+    def test_bucket_epochs_unclamped_through_real_config_path(self, n_keys, expected_epochs):
+        from paramem.utils.config import budget_for
 
-    def test_max_epochs_runtime_override_flows_to_training_config(self, tmp_path):
-        """Setting consolidation.max_epochs at runtime flows through the property.
-
-        The property re-reads max_epochs each time (no stale cache),
-        so a mutation after load takes effect on the next read.
-        """
-        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
-        config = load_server_config(yaml_file)
-        # Default
-        assert config.consolidation.max_epochs is None
-        # Mutate
-        config.consolidation.max_epochs = 5
-        # Property honours the new value
-        assert config.training_config.num_epochs == 5
-
-    def test_max_epochs_threaded_raw_onto_training_config_budget_max_epochs(self, tmp_path):
-        """training_config.budget_max_epochs carries max_epochs RAW (None when
-        unset), NOT the resolved num_epochs default of 30 -- budget_for's
-        min-clamp reads this raw field so it does not wrongly cap the
-        50/80-epoch buckets down to 30.
-        """
-        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
-        config = load_server_config(yaml_file)
-        assert config.training_config.num_epochs == 30
-        assert config.training_config.budget_max_epochs is None
-
-        config.consolidation.max_epochs = 5
-        assert config.training_config.num_epochs == 5
-        assert config.training_config.budget_max_epochs == 5
+        load_server_config(self.FIXTURE)
+        epochs, _accum, _lr_decay = budget_for(n_keys)
+        assert epochs == expected_epochs
 
 
-class TestBudgetDerivationEnabledConfig:
-    """consolidation.budget_derivation_enabled threads onto
-    TrainingConfig.budget_derivation_enabled -- the master switch for
-    paramem.utils.config.budget_for at the training funnel.
+class TestRetiredBudgetAndDonorFlagsRejected:
+    """budget_derivation_enabled / donor_seeding_enabled were deleted --
+    derived per-fold training budgets and donor seeding are now the
+    unconditional standard mechanism (validation arms passed; see
+    benchmarking.md). ``ConsolidationScheduleConfig(**consolidation_raw)``
+    is a plain dataclass constructor call
+    (``paramem.server.config.build_server_config``); an unrecognized key
+    under ``consolidation:`` is not silently ignored -- it raises
+    ``TypeError`` from the dataclass constructor itself, so a stale
+    operator YAML carrying either retired key fails loud at load time.
     """
 
-    def test_default_false(self, tmp_path):
-        """Ship-safe default: off (today's fixed-budget behaviour)."""
-        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
-        config = load_server_config(yaml_file)
-        assert config.consolidation.budget_derivation_enabled is False
-        assert config.training_config.budget_derivation_enabled is False
-
-    def test_yaml_override_flows_to_training_config(self, tmp_path):
+    def test_stale_budget_derivation_enabled_key_raises(self, tmp_path):
         yaml_file = _write_yaml(
             tmp_path,
             """\
@@ -296,9 +272,36 @@ class TestBudgetDerivationEnabledConfig:
               budget_derivation_enabled: true
             """,
         )
-        config = load_server_config(yaml_file)
-        assert config.consolidation.budget_derivation_enabled is True
-        assert config.training_config.budget_derivation_enabled is True
+        with pytest.raises(TypeError, match="budget_derivation_enabled"):
+            load_server_config(yaml_file)
+
+    def test_stale_donor_seeding_enabled_key_raises(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              donor_seeding_enabled: true
+            """,
+        )
+        with pytest.raises(TypeError, match="donor_seeding_enabled"):
+            load_server_config(yaml_file)
+
+    def test_stale_max_epochs_key_raises(self, tmp_path):
+        """consolidation.max_epochs was retired 2026-07-26 (the per-fold
+        training budget is unconditional and unclamped via
+        paramem.utils.config.budget_for). A stale operator YAML carrying it
+        fails loud at load time, same as the other retired keys above."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              max_epochs: 5
+            """,
+        )
+        with pytest.raises(TypeError, match="max_epochs"):
+            load_server_config(yaml_file)
 
 
 class TestAdaptersFactoryDefaultMerge:
@@ -547,6 +550,12 @@ class TestTrainingHyperparamsFromYaml:
     Loads tests/fixtures/server.yaml (the stable fixture per the loader rule) and
     asserts every Test 17 field survives assembly into the TrainingConfig returned
     by ServerConfig.training_config.
+
+    ``gradient_accumulation_steps`` and ``lr_decay_steps`` are NOT covered
+    here -- ``consolidation.training_gradient_accumulation_steps`` /
+    ``consolidation.training_lr_decay_steps`` were retired 2026-07-26 (dead:
+    the training funnel unconditionally derives and overwrites both per
+    fold; see ``ServerConfig.training_config``'s docstring).
     """
 
     def test_fixture_training_config_carries_test17_recipe(self):
@@ -562,11 +571,9 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.lr_scheduler_type == "linear"
         assert tc.max_seq_length == 1024
         assert tc.batch_size == 1
-        assert tc.gradient_accumulation_steps == 2
         assert tc.seed == 42
         assert tc.max_grad_norm == 1.0
         assert tc.gradient_checkpointing is True
-        assert tc.lr_decay_steps is None
 
     def test_training_hyperparams_yaml_override_flows_through(self, tmp_path):
         """Explicit consolidation.training_* yaml values flow through to TrainingConfig."""
@@ -580,11 +587,9 @@ class TestTrainingHyperparamsFromYaml:
               training_warmup_steps: 10
               training_lr_scheduler_type: constant
               training_max_seq_length: 512
-              training_gradient_accumulation_steps: 4
               training_seed: 7
               training_max_grad_norm: 0.5
               training_gradient_checkpointing: false
-              training_lr_decay_steps: 200
             """,
         )
         config = load_server_config(yaml_file)
@@ -594,11 +599,39 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.warmup_steps == 10
         assert tc.lr_scheduler_type == "constant"
         assert tc.max_seq_length == 512
-        assert tc.gradient_accumulation_steps == 4
         assert tc.seed == 7
         assert tc.max_grad_norm == 0.5
         assert tc.gradient_checkpointing is False
-        assert tc.lr_decay_steps == 200
+
+    def test_stale_training_gradient_accumulation_steps_key_raises(self, tmp_path):
+        """A stale operator yaml still carrying the retired
+        training_gradient_accumulation_steps key fails loud (dataclass
+        strictness), exactly like the retired feature flags."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              training_gradient_accumulation_steps: 4
+            """,
+        )
+        with pytest.raises(TypeError, match="training_gradient_accumulation_steps"):
+            load_server_config(yaml_file)
+
+    def test_stale_training_lr_decay_steps_key_raises(self, tmp_path):
+        """A stale operator yaml still carrying the retired
+        training_lr_decay_steps key fails loud (dataclass strictness),
+        exactly like the retired feature flags."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              training_lr_decay_steps: 200
+            """,
+        )
+        with pytest.raises(TypeError, match="training_lr_decay_steps"):
+            load_server_config(yaml_file)
 
 
 class TestTierFloorConfigPlumbing:

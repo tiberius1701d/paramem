@@ -53,8 +53,10 @@ class TestConfig:
     def test_training_config(self):
         config = ServerConfig()
         tc = config.training_config
-        assert tc.num_epochs == 30
-        assert tc.gradient_accumulation_steps == 2
+        # Epochs and gradient accumulation are derived per fold from the
+        # key-triple count via budget_for -- unconditional and unclamped,
+        # no operator ceiling -- so they are not asserted here.
+        assert tc.batch_size == 1
         assert tc.max_seq_length == 1024
 
     def test_consolidation_config(self):
