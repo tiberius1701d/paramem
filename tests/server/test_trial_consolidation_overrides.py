@@ -241,7 +241,7 @@ class TestTrialDoesNotMarkConsolidated:
 
         Verifies the ``mark_sessions=False`` plumbing: the real
         session_buffer.mark_consolidated must not be called so that pending
-        sessions stay in the buffer after the trial cycle (spec L364).
+        sessions stay in the buffer after the trial cycle.
 
         session_buffer.pending_count is set to 2 so _run_extraction_phase
         is called (buffer-empty path skips it).  evaluate_gates is patched to

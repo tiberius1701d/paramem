@@ -2,15 +2,15 @@
 
 Covers:
 
-- Step T1: wait_for_cooldown helper (hot→cool, already-cool, None-sensor,
+- wait_for_cooldown helper (hot→cool, already-cool, None-sensor,
   bounded-timeout, disabled).
-- Step T2: order assertions that each GPU-burst head calls the gate BEFORE the
+- Order assertions that each GPU-burst head calls the gate BEFORE the
   first GPU op and passes the correct per-site max-wait knob:
-    T2a — boot preload (app._build_store_contents)
-    T2b — fold workers (_run_interim_training / _run_full_cycle — source
+    Boot preload (app._build_store_contents)
+    Fold workers (_run_interim_training / _run_full_cycle — source
            structural assertions, since both are nested closures)
-    T2c — inference local-PA path (handle_chat PERSONAL branch)
-    T2c neg — HA/cloud-routed request does NOT call the inference gate
+    Inference local-PA path (handle_chat PERSONAL branch)
+    HA/cloud-routed request does NOT call the inference gate
 
 All tests run CPU-only — no model loading or GPU required.
 """
@@ -60,7 +60,7 @@ def _inject_config(config, *, model=None, tokenizer=None):
 
 
 # ---------------------------------------------------------------------------
-# Step T1 — wait_for_cooldown helper
+# wait_for_cooldown helper
 # ---------------------------------------------------------------------------
 
 
@@ -170,7 +170,7 @@ class TestWaitForCooldown:
 
 
 # ---------------------------------------------------------------------------
-# Step T2a — Boot preload order assertion (_build_store_contents)
+# Boot preload order assertion (_build_store_contents)
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +247,7 @@ class TestPreloadCooldownOrder:
 
 
 # ---------------------------------------------------------------------------
-# Step T2b — Fold worker order (structural source assertion)
+# Fold worker order (structural source assertion)
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +338,7 @@ class TestFoldWorkerCooldownOrder:
 
 
 # ---------------------------------------------------------------------------
-# Step T2c — Inference gate (handle_chat PERSONAL branch)
+# Inference gate (handle_chat PERSONAL branch)
 # ---------------------------------------------------------------------------
 
 

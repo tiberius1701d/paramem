@@ -1333,10 +1333,10 @@ class TestGate4RegistryFileNotFoundSkip:
     """Gate 4 must return SKIPPED (not FAIL) when the live registry file does
     not exist.
 
-    Spec L381: "Skipped with — if the live registry has fewer than 20 keys
-    (fresh install)."  File-not-found is the strongest form of that condition.
-    Only corrupt / unparseable files (that *do* exist) should FAIL (missing-file
-    case was changed to SKIPPED; corrupt-but-existing is still FAIL).
+    Gate 4 skips if the live registry has fewer than 20 keys (fresh install);
+    file-not-found is the strongest form of that condition.  Only corrupt /
+    unparseable files (that *do* exist) should FAIL (missing-file case was
+    changed to SKIPPED; corrupt-but-existing is still FAIL).
     """
 
     def test_gate4_skips_when_registry_file_does_not_exist(self, tmp_path):

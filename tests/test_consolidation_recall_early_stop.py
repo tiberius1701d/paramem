@@ -54,9 +54,8 @@ def _make_loop(
     Bypass init via ``__new__`` and set only the attributes the helper
     reads: ``model``, ``tokenizer``, ``training_config``, plus
     ``shutdown_requested`` and ``_thermal_policy`` for the call-site-pattern
-    test below (Commit 3 refactor: shutdown flows through TrainingHooks,
-    thermal flows through ThermalPolicy — both nullable in tests that don't
-    exercise them).
+    test below (shutdown flows through TrainingHooks, thermal flows through
+    ThermalPolicy — both nullable in tests that don't exercise them).
     """
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.model = MagicMock()
@@ -376,8 +375,8 @@ class TestEnabledVsDisabledBranch:
     ``RecallEarlyStopCallback`` and call sites pass it through
     ``callbacks_extra=[recall_cb]``.
 
-    Shutdown flows through ``TrainingHooks.on_shutdown_check`` (post Commit 3
-    refactor); thermal flows through ``thermal_policy``.  Neither belongs in
+    Shutdown flows through ``TrainingHooks.on_shutdown_check``; thermal
+    flows through ``thermal_policy``.  Neither belongs in
     ``callbacks_extra``, so the call-site list contains at most the recall
     callback.
     """

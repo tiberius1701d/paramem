@@ -2352,8 +2352,8 @@ class TestSessionIdsProvenanceUnion:
     Case-3 (new-edge insertion) so the real contributing session ids
     accumulate on the edge across all extraction paths.
 
-    Locks T2 SET semantics across both merge cases.  The dcf4189
-    speaker-attribution invariant (T9) is also verified: minted-key
+    Locks SET semantics across both merge cases.  The dcf4189
+    speaker-attribution invariant is also verified: minted-key
     speaker_id comes from the SUBJECT NODE attribute, not from the
     scalar session_id param; the session_ids union must not touch it.
     """

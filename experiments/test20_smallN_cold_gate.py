@@ -576,7 +576,8 @@ _REQUIRED_ENTRY_KEYS = ("key", "subject", "predicate", "object")
 DONOR_ADAPTER_NAME = "donor"
 
 # Live production tier names — the trainable adapter must NEVER collide
-# with one of these (donor-immutability guard; see CHANGE 2 module docstring).
+# with one of these (donor-immutability guard; see the module docstring's
+# "Donor immutability" section).
 LIVE_TIER_NAMES = frozenset({"episodic", "semantic", "procedural"})
 
 # ---------------------------------------------------------------------------
@@ -1720,8 +1721,8 @@ def _run_donor_build_smoke(
         }
         logger.error("Donor-build-smoke: seed phase failed: %s", exc)
 
-    # Reviewer concern 2: a VRAM sample after the seed phase, regardless of
-    # outcome, for measurement-honesty parity with the build phase's own
+    # A VRAM sample after the seed phase, regardless of outcome, for
+    # measurement-honesty parity with the build phase's own
     # before/after-load/after-build samples.
     seed_results["vram_after_seed_mib"] = _cuda_mem_get_info_mib()
 
@@ -2663,7 +2664,7 @@ def main() -> None:
 
     # Resolve the entry set: --entries-json replaces the synthetic
     # generator entirely and implies --n-entries from the file length
-    # (CHANGE 1 — a conflicting --n-entries fails loud).
+    # (a conflicting --n-entries fails loud).
     is_real = args.entries_json is not None
     if is_real:
         entries = _load_entries_from_file(Path(args.entries_json))
@@ -2689,7 +2690,7 @@ def main() -> None:
             "--warm-from and --donor-init are mutually exclusive donor sources "
             "(both populate donor_scratch_dir) — pick one."
         )
-    # LOW-8: --accum must be a valid gradient_accumulation_steps value.
+    # --accum must be a valid gradient_accumulation_steps value.
     if args.accum is not None and args.accum < 1:
         raise SystemExit(f"--accum must be >= 1; got {args.accum}.")
 
@@ -2772,7 +2773,7 @@ def main() -> None:
         seeds,
     )
 
-    # MED-6: rebuild the run-config dict from THIS invocation's resolved
+    # Rebuild the run-config dict from THIS invocation's resolved
     # args/derived values and compare against an existing run_config.json
     # (--resume, or any repeat invocation landing on the same run dir) —
     # fail loud on any mismatch in the fields that determine the training

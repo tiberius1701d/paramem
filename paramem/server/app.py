@@ -399,7 +399,7 @@ class StatusResponse(BaseModel):
     encryption: str = "off"
     # ISO-8601 UTC timestamp of when the server process started.
     # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
-    # Migrate footer (spec L458).
+    # Migrate footer.
     server_started_at: str = ""
     # Document-ingest state (Phase 2+).
     # preview: true while a POST /consolidate?preview=true call is mid-flight.
@@ -4986,8 +4986,8 @@ def _preload_memory_store(config, *, model, tokenizer):
     # Boot housekeeping runs FIRST: cleanup_partial_slots deletes any
     # subdirectory under <adapter_dir>/<tier>/ that is missing one of the
     # canonical three slot files.  These are scratch left by interrupted
-    # training (a class that Commit 5′'s staging+promote contract should
-    # have eliminated going forward, but historical state may still carry
+    # training (a class that the staging+promote contract should have
+    # eliminated going forward, but historical state may still carry
     # them).  Removals are recorded on _state["integrity_cleanup"] so the
     # attention populator can surface them to the operator.
     try:
@@ -8633,8 +8633,8 @@ async def _run_trial_consolidation() -> None:
 
     Passing ``mark_sessions=False`` ensures that
     ``session_buffer.mark_consolidated`` is **never** called from the trial
-    loop (spec L364 — "Transcript sweeper blocks archive+delete").  Pending
-    sessions remain in the buffer after the trial cycle completes so that
+    loop — the transcript sweeper blocks archive+delete on pending sessions.
+    Pending sessions remain in the buffer after the trial cycle completes so that
     ``/migration/rollback`` (3b.3) can restore the full queue, and
     ``/migration/accept`` (3b.3) can call ``mark_consolidated`` itself.
 
@@ -8695,7 +8695,7 @@ async def _run_trial_consolidation() -> None:
         # Open TrialLogCapture BEFORE the consolidation executor so
         # WARNING/ERROR/CRITICAL records from extraction, training, adapter
         # reload, AND gate evaluation are all captured as a whole-run signal
-        # (spec L398 — "New ERROR lines in trial log").  The `with` closes
+        # (new ERROR lines in the trial log).  The `with` closes
         # after gates_payload["trial_log"] is populated but before
         # _update_trial_gates so the snapshot is frozen when the status
         # becomes observable.
@@ -8765,7 +8765,7 @@ async def _run_trial_consolidation() -> None:
                                         )
 
                             # Trial path: mark_sessions=False so sessions stay
-                            # pending (spec L364) and /migration/rollback can restore queue.
+                            # pending and /migration/rollback can restore queue.
                             _extraction_result = _run_extraction_phase(
                                 loop,
                                 mark_sessions=False,
@@ -13213,8 +13213,8 @@ def _run_extraction_phase(
     mark_sessions:
         When ``True`` (default), ``session_buffer.mark_consolidated`` is called
         after extraction/training (production behaviour).  Pass ``False`` for
-        the trial path so pending sessions remain in the buffer (spec L364 —
-        "transcript sweeper blocks archive+delete").
+        the trial path so pending sessions remain in the buffer — the
+        transcript sweeper blocks archive+delete on pending sessions.
 
     Returns a result dict including the loop instance for reuse.
 

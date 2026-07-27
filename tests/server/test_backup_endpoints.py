@@ -1190,7 +1190,7 @@ class TestRestoreSnapshotBundlePreconditions:
         assert resp.json()["detail"]["error"] == "consolidating"
 
     def test_training_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
-        """Background training active → 409 training_active (S3 reviewer requirement)."""
+        """Background training active → 409 training_active."""
         from unittest.mock import MagicMock
 
         config = _make_config(tmp_path)

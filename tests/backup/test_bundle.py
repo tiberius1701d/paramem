@@ -23,7 +23,7 @@ Covers the recovery set:
 - Crash-safety: rename failure leaves pending residue swept by
   sweep_orphan_pending.
 - speaker_profiles.json included / absent.
-- No ArtifactMeta sidecar written (S2 constraint).
+- No ArtifactMeta sidecar written.
 - enumerate_backups recognises the bundle slot.
 """
 
@@ -469,7 +469,7 @@ class TestWriteBundleHappyPath:
         assert manifest.live_registry_sha256 == reg_sha
 
     def test_no_artifact_meta_sidecar_written(self, tmp_path) -> None:
-        """Per-artifact .meta.json sidecars must NOT be written (S2 constraint)."""
+        """Per-artifact .meta.json sidecars must NOT be written."""
         fixtures = _make_fixtures(tmp_path)
         slot = write_bundle(
             config_path=fixtures["config_path"],

@@ -56,7 +56,7 @@ class AttentionItem:
         row color and the banner color (red overrides yellow).
     summary:
         Human-readable one-line description shown by pstatus.  ≤ ~80
-        chars.  Spec L422–427 examples.
+        chars.
     action_hint:
         Optional follow-up CLI hint.  Rendered on a continuation line
         with a leading "→ " when non-None.
@@ -286,12 +286,11 @@ def _collect_migration_items(state: dict) -> list[AttentionItem]:
 def _collect_consolidation_items(state: dict) -> list[AttentionItem]:
     """Emit a consolidation-blocked item when a trial is in progress.
 
-    The plan-reviewer fix (Fix 1) changes the emit condition: instead of
-    checking ``_state["consolidating"] == True``, we check whether the
-    migration state is ``"TRIAL"`` and gates are ``"pending"`` or ``None``.
-    Rationale: ``_run_trial_consolidation`` runs in an executor and does NOT
-    set ``_state["consolidating"] = True``; that flag is only set by the
-    regular ``/consolidate`` path.
+    The emit condition checks whether the migration state is ``"TRIAL"`` and
+    gates are ``"pending"`` or ``None`` — not ``_state["consolidating"] ==
+    True``.  Rationale: ``_run_trial_consolidation`` runs in an executor and
+    does NOT set ``_state["consolidating"] = True``; that flag is only set by
+    the regular ``/consolidate`` path.
 
     Parameters
     ----------

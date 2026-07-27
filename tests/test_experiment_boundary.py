@@ -337,7 +337,7 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.training.donor",
             "DONOR_BUILD_ADAPTER_NAME",
         ),
-        # DONOR_META_FILENAME: _read_donor_meta (M4 fix) writes/reads the
+        # DONOR_META_FILENAME: _read_donor_meta writes/reads the
         # SAME per-slot provenance filename production's own donor.py meta
         # writer uses -- one shared constant, not an invented duplicate name
         # (added 2026-07-26).
@@ -372,27 +372,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "experiments/test_prompt_engineering.py",
             "paramem.evaluation.embedding_scorer",
             "compute_similarity",
-        ),
-        # test_step6_step7_live_gpu.py
-        (
-            "experiments/test_step6_step7_live_gpu.py",
-            "paramem.models.loader",
-            "load_base_model",
-        ),
-        (
-            "experiments/test_step6_step7_live_gpu.py",
-            "paramem.server.config",
-            "load_server_config",
-        ),
-        (
-            "experiments/test_step6_step7_live_gpu.py",
-            "paramem.server.consolidation",
-            "create_consolidation_loop",
-        ),
-        (
-            "experiments/test_step6_step7_live_gpu.py",
-            "paramem.server.gpu_lock",
-            "gpu_lock_sync",
         ),
         # fmt: on
     }

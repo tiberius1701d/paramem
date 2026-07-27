@@ -82,10 +82,10 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
         "procedural": MagicMock(),
     }
     # Real dict mutation on delete -- makes "transient slot deleted/not
-    # deleted" assertions meaningful (M1 fix: the prior fake create_adapter
-    # never registered the transient name, so with a MagicMock
-    # delete_adapter that does nothing either, those assertions passed
-    # whether or not the cleanup code ran at all).
+    # deleted" assertions meaningful: the prior fake create_adapter never
+    # registered the transient name, so with a MagicMock delete_adapter
+    # that does nothing either, those assertions passed whether or not the
+    # cleanup code ran at all.
     loop.model.delete_adapter.side_effect = lambda name: loop.model.peft_config.pop(name, None)
     loop.model.get_base_model.return_value.config._name_or_path = "test/base-model"
     loop.tokenizer = MagicMock()
@@ -403,7 +403,7 @@ class TestDonorCheckpoint:
         assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
 
     def test_donor_checkpoint_valid_false_on_lora_shape_mismatch(self, tmp_path):
-        """M4: an operator rank edit invalidates a checkpoint trained at the
+        """An operator rank edit invalidates a checkpoint trained at the
         old shape, forcing a rebuild instead of crashing later inside
         copy_adapter_weights on a tensor-shape mismatch."""
         ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
@@ -737,7 +737,7 @@ def _fake_atomic_save_adapter(model, target_dir, adapter_name):
 
 def _fake_create_adapter(model, cfg, name):
     """Stand-in for paramem.models.loader.create_adapter that ACTUALLY
-    registers *name* in peft_config (M1 fix) -- the prior fake
+    registers *name* in peft_config -- the prior fake
     (``lambda m, cfg, name: m``) never added the transient name, which made
     every "transient slot deleted/not-deleted" assertion in this test class
     vacuously true regardless of whether the finally-cleanup ran at all.
@@ -928,7 +928,7 @@ class TestBuildDonor:
         assert DONOR_BUILD_ADAPTER_NAME not in loop.model.peft_config
 
     def test_prunes_older_slots_within_the_same_topology_only(self, tmp_path):
-        """L6: exactly one donor artifact per topology persists at a time --
+        """Exactly one donor artifact per topology persists at a time --
         a stale slot within the SAME topology is pruned; the build itself
         (this test's own live-id set = only episodic's topology) leaves
         nothing else to disturb."""
@@ -1152,7 +1152,7 @@ class TestSeedingHook:
         mock_load.assert_called_once_with(loop.model, expected_dir, DONOR_LOAD_ADAPTER_NAME)
 
     def test_transient_deleted_when_copy_raises(self, tmp_path):
-        """M1: a copy_adapter_weights failure (e.g. a genuine tensor-shape
+        """A copy_adapter_weights failure (e.g. a genuine tensor-shape
         mismatch the lora_shape check missed) must still leave the
         transient slot cleaned up, not leaked."""
         loop = _make_bare_loop(tmp_path)

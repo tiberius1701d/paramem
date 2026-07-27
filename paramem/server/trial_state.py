@@ -58,7 +58,7 @@ class TrialMarkerSchemaError(TrialMarkerError):
 class TrialMarker:
     """Contents of state/trial.json.
 
-    Plaintext per spec L607 — contains no secrets, so key rotation never
+    Plaintext — contains no secrets, so key rotation never
     bricks recovery.  The CLI fallback in migrate_status.py reads this file
     directly when the server is offline.
 

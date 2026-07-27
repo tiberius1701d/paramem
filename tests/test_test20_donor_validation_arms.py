@@ -115,7 +115,7 @@ class TestDefaultArmLabel:
 
 
 class TestReadDonorMeta:
-    """``_read_donor_meta`` — M4: SHA-256 verification against the recorded value."""
+    """``_read_donor_meta`` — SHA-256 verification against the recorded value."""
 
     def test_valid_slot_returns_meta(self, tmp_path):
         slot = _write_slot(tmp_path, "valid_slot", weights=b"real-donor-weights")
@@ -182,7 +182,7 @@ class TestResolveDonorSource:
             )
 
     def test_external_checkpoint_sha_mismatch_fails_loud(self, tmp_path):
-        """M4: --donor-checkpoint reuse must verify the checkpoint SHA against
+        """--donor-checkpoint reuse must verify the checkpoint SHA against
         its own donor_meta.json — a tampered/corrupted slot fails loud rather
         than silently seeding from unverified weights."""
         slot = _write_slot(tmp_path, "tampered_external_slot", weights=b"original")
@@ -362,12 +362,12 @@ class TestAccumCli:
 
 class TestExpectedOptimizerStepsDerivation:
     """``_expected_optimizer_steps`` derives from the SAME resolved values
-    the run actually trains with (HIGH-1) — never a hardcoded module
+    the run actually trains with — never a hardcoded module
     constant. These are real parity checks against
     ``paramem.utils.config.budget_for`` and the loaded fixture, not a
     self-comparison (the prior ``test_default_accum_matches_recipe_value``
     compared ``_RECIPE_GRAD_ACCUM_STEPS`` against itself and could never
-    fail — HIGH-2 replaces it)."""
+    fail — this replaces it)."""
 
     def test_matches_budget_for_at_the_donor_population_size(self):
         """budget_for(147) — the donor's own population size
@@ -394,7 +394,7 @@ class TestExpectedOptimizerStepsDerivation:
     def test_fixture_batch_size_matches_loaded_training_config(self):
         """The fixture-sourced field this harness treats as ground truth
         (batch_size) actually matches ``tests/fixtures/server.yaml`` —
-        catches silent fixture drift (HIGH-2)."""
+        catches silent fixture drift."""
         cfg = load_server_config("tests/fixtures/server.yaml")
         assert cfg.training_config.batch_size == 1
 
@@ -410,7 +410,7 @@ class TestExpectedOptimizerStepsDerivation:
 @pytest.fixture
 def _donor_build_env(tmp_path, monkeypatch):
     """Shared monkeypatch scaffolding for ``_build_donor_checkpoint`` unit
-    tests (MED-7: collapses the ~70-line duplicated setup previously
+    tests (collapses the ~70-line duplicated setup previously
     repeated per pinning test into one fixture).
 
     Patches every collaborator ``_build_donor_checkpoint`` calls
@@ -420,7 +420,7 @@ def _donor_build_env(tmp_path, monkeypatch):
     fake ``train_adapter`` also fires the realized-step count onto the
     ``_StepCaptureCallback`` passed via ``callbacks_extra`` — mirroring HF
     Trainer's ``on_train_end`` — so ``_build_donor_checkpoint``'s own
-    realized-steps assertion (MED-5) sees a populated, DERIVED-correct
+    realized-steps assertion sees a populated, DERIVED-correct
     value instead of failing with "callback never fired".
 
     Returns a ``SimpleNamespace`` with ``.entries`` (the 3-entry donor
@@ -504,7 +504,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
     """The donor's OWN training always derives its epoch/accum/lr-decay
     budget from ``budget_for(len(donor_entries))`` — never inherits an
     arm's ``--epochs``/``--accum``/``--lr-decay-steps`` override carried on
-    *base_training_config* (HIGH-1; MED-5 for the new meta fields)."""
+    *base_training_config* (including the new meta fields)."""
 
     def test_donor_training_config_uses_budget_for_not_the_arm_override(self, _donor_build_env):
         # The arm's own overrides -- num_epochs=999, accum=1, lr_decay=550 --
@@ -535,7 +535,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
         assert (slot / DONOR_META_FILENAME).is_file()
 
     def test_donor_meta_and_summary_record_accum_and_realized_steps(self, _donor_build_env):
-        """MED-5: donor_meta.json / donor_summary gain
+        """donor_meta.json / donor_summary gain
         gradient_accumulation_steps and realized_optimizer_steps for NEW
         builds, and the realized count matches the derived expectation."""
         base_training_config = dataclasses.replace(TrainingConfig(), max_seq_length=1024)
@@ -561,7 +561,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
 
 
 class TestReadDonorMetaToleratesMissingAccumFields:
-    """MED-5: ``_read_donor_meta`` must NOT fail loud when a slot predates
+    """``_read_donor_meta`` must NOT fail loud when a slot predates
     ``gradient_accumulation_steps``/``realized_optimizer_steps`` tracking —
     a pre-existing ``--donor-checkpoint`` reused by a newer harness
     invocation has neither field."""

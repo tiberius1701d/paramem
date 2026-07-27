@@ -405,7 +405,7 @@ def test_voice_413_when_body_exceeds_cap_no_header(client, state, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Tests: cloud-only branch (reviewer-noted gap)
+# Tests: cloud-only branch
 # ---------------------------------------------------------------------------
 
 
@@ -451,7 +451,7 @@ def test_voice_cloud_only_route(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Tests: training-abort branch (reviewer-noted gap)
+# Tests: training-abort branch
 # ---------------------------------------------------------------------------
 
 

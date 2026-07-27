@@ -1173,7 +1173,8 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # preserving temporal order.  The slack is included in the boot-time VRAM
     # budget (vram_validator.py) so the extension is proven to fit before the
     # server starts.  At 0 (default) overflow slots are never minted — cap_pending
-    # fires immediately when the ring is full (identical to S4 behavior).
+    # fires immediately when the ring is full, matching the behavior before
+    # overflow-slack support was added.
     interim_overflow_slack: int = 0
     # entity_similarity_threshold mirrors GraphConfig (paramem/utils/config.py);
     # bridged into GraphMerger construction via ServerConfig.graph_config.

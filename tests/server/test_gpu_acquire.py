@@ -445,7 +445,7 @@ def test_apply_config_live_rport_stt_carve_restart_eligible():
 def test_apply_config_live_rport_bind_failure_no_restart():
     """When the transient bind pre-flight raises OSError (port in use):
     port_in_use_reason is populated, and _restart_service is NOT called
-    (L1 constraint: caller fires restart).
+    (the caller fires the restart, not the server).
     """
     import socket
     from pathlib import Path
@@ -494,7 +494,7 @@ def test_apply_config_live_rport_bind_failure_no_restart():
 
 def test_apply_config_live_rpaths_carve_no_auto_restart():
     """A paths.sessions delta is classified as R-PATHS (paths_change);
-    manual restart required (L1 constraint — server never self-fires restart).
+    manual restart required (the server never self-fires restart).
     Config is NOT touched live; _live_reload_base_model IS still called (mixed
     delta: non-paths fields can be applied live, paths carve is signalled).
     """
@@ -669,7 +669,7 @@ def test_apply_config_live_real_hash_different_file_proceeds():
 def test_plain_reclaim_does_not_rebuild_stt_tts_or_ha_client():
     """Plain reclaim path (_live_reload_base_model with refresh_config_from_disk=False)
     calls _build_config_derived_state(full_rebuild=False) — which must NOT call
-    STT/TTS .load() or HAClient constructor / health_check (correction S1).
+    STT/TTS .load() or HAClient constructor / health_check.
 
     The test captures the kwargs passed to _build_config_derived_state and
     verifies full_rebuild=False is forwarded.  It also asserts that WhisperSTT
@@ -731,7 +731,7 @@ def _make_config_with_session_fields(retain_sessions: bool = True, debug: bool =
 
 def test_session_delta_sets_rebuild_session_buffer_true():
     """When retain_sessions changes between config A and config B,
-    _live_reload_base_model is called with rebuild_session_buffer=True (S3).
+    _live_reload_base_model is called with rebuild_session_buffer=True.
     """
     from paramem.server import app as app_module
 
@@ -774,7 +774,7 @@ def test_session_delta_sets_rebuild_session_buffer_true():
 
 
 def test_no_session_delta_keeps_rebuild_session_buffer_false():
-    """When retain_sessions and debug are unchanged, rebuild_session_buffer=False (S3)."""
+    """When retain_sessions and debug are unchanged, rebuild_session_buffer=False."""
     from paramem.server import app as app_module
 
     config_a = _make_config_with_session_fields(retain_sessions=True, debug=False)
@@ -814,7 +814,7 @@ def test_no_session_delta_keeps_rebuild_session_buffer_false():
 
 
 def test_debug_delta_sets_rebuild_session_buffer_true():
-    """When debug changes between config A and config B, rebuild_session_buffer=True (S3)."""
+    """When debug changes between config A and config B, rebuild_session_buffer=True."""
     from paramem.server import app as app_module
 
     config_a = _make_config_with_session_fields(retain_sessions=True, debug=False)

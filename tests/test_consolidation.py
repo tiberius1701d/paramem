@@ -2755,7 +2755,7 @@ def test_seed_key_metadata_retains_stale_key(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _prune_old_slots: adapter slot retention (Commit 2)
+# _prune_old_slots: adapter slot retention
 # ---------------------------------------------------------------------------
 
 
@@ -12137,10 +12137,10 @@ class TestSubtractiveRemovalsHelperInterim:
     """_apply_subtractive_removals_to_store(scope='interim') soft-stales the correct reasons.
 
     Tests:
-    - ASRI-1: predicate_synonym_collapse is soft-staled at interim scope.
-    - ASRI-2: contradiction_same_pred is soft-staled at interim scope.
-    - ASRI-3: enrichment_same_as is NOT soft-staled at interim scope (retain-only bucket).
-    - ASRI-4: key absent from any active tier is a no-op (no crash, empty return).
+    - predicate_synonym_collapse is soft-staled at interim scope.
+    - contradiction_same_pred is soft-staled at interim scope.
+    - enrichment_same_as is NOT soft-staled at interim scope (retain-only bucket).
+    - key absent from any active tier is a no-op (no crash, empty return).
     """
 
     @staticmethod
@@ -12197,7 +12197,7 @@ class TestSubtractiveRemovalsHelperInterim:
         return loop
 
     def test_synonym_collapse_key_is_soft_staled_at_interim(self, tmp_path):
-        """ASRI-1: predicate_synonym_collapse reason → key soft-staled at interim scope.
+        """predicate_synonym_collapse reason → key soft-staled at interim scope.
 
         The helper must call store.discard_keys([key], mode='stale') for a ledger
         entry with reason 'predicate_synonym_collapse'.  After the call the key
@@ -12242,7 +12242,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
 
     def test_contradiction_same_pred_soft_staled_at_interim(self, tmp_path):
-        """ASRI-2: contradiction_same_pred is soft-staled at interim scope (NEW supersedes OLD).
+        """contradiction_same_pred is soft-staled at interim scope (NEW supersedes OLD).
 
         At the interim scope the recency signal is present: the NEW pending merge
         has already replaced the OLD slot's object.  The OLD slot key must be
@@ -12279,7 +12279,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
 
     def test_enrichment_same_as_not_soft_staled_at_interim(self, tmp_path):
-        """ASRI-3: enrichment_same_as stays in the retain-only bucket at interim scope.
+        """enrichment_same_as stays in the retain-only bucket at interim scope.
 
         The helper must NOT soft-stale keys whose removal reason is
         'enrichment_same_as' — those belong to the fold's drift_intended_removal
@@ -12316,7 +12316,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
 
     def test_key_absent_from_active_tier_is_noop(self, tmp_path):
-        """ASRI-4: a removal_ledger key that is not active in any tier must not crash.
+        """A removal_ledger key that is not active in any tier must not crash.
 
         The helper calls tier_for_active_key(key); when the key is absent the
         method returns None and the helper must proceed silently.
@@ -12344,7 +12344,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
 
     def test_stale_flag_persisted_to_disk_before_commit(self, tmp_path):
-        """ASRI-5: stale flag written to disk via commit_tier_slot after M5 reorder.
+        """Stale flag written to disk via commit_tier_slot only after staling happens first.
 
         Regression test for the stale-flag durability bug: ``_apply_subtractive_removals_to_store``
         must run BEFORE ``commit_tier_slot`` so the on-disk registry carries the stale
@@ -12391,7 +12391,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
         assert not loop.store.is_stale(_key), "Precondition: key must be active before staling"
 
-        # Step 2: soft-stale in memory (M5 stage — must precede commit).
+        # Step 2: soft-stale in memory (must precede commit).
         loop._apply_subtractive_removals_to_store(scope="interim")
         assert loop.store.is_stale(_key), "Key must be stale in memory after M5 stage"
 
@@ -14992,7 +14992,7 @@ class TestThreeWayGate:
         return loop
 
     def test_slack_zero_at_cap_is_cap_pending(self, tmp_path):
-        """slack=0: c >= N immediately returns cap_pending (identical to S4)."""
+        """slack=0: c >= N immediately returns cap_pending (pre-overflow-slack behavior)."""
         from unittest.mock import patch
 
         loop = self._build_loop(tmp_path)
@@ -15355,7 +15355,7 @@ class TestS5OverflowDoesNotLeakIntoClearSuccessCheck:
         )
 
     def test_cap_pending_is_still_not_clean_success(self):
-        """cap_pending is NOT a clean success, unchanged by S5."""
+        """cap_pending is NOT a clean success, unchanged by overflow-slack support."""
         from paramem.server.app import _is_interim_clean_success
 
         result = {

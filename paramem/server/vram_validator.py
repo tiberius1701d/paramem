@@ -552,7 +552,8 @@ def _format_breakdown(
             (worst-case enabled-tier shape).
         interim_overflow_slack: Extra overflow slots beyond ``max_interim_count``
             reserved in the budget (mirrors ``consolidation.interim_overflow_slack``).
-            At 0 (default) the interim row is identical to the pre-S5 output.
+            At 0 (default) the interim row matches the output before
+            overflow-slack support was added.
 
     Returns:
         Formatted breakdown string (no trailing newline).

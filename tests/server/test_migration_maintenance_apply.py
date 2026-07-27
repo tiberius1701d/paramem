@@ -13,7 +13,7 @@ Design
 ------
 Three isolation assertions:
 
-1. **No-op-skip path (rollback case, S-6):** when the on-disk config hash
+1. **No-op-skip path (rollback case):** when the on-disk config hash
    equals the in-memory ``config_drift.loaded_hash``, ``_apply_config_live``
    returns immediately with ``applied_live=True, skipped="no_change"`` and
    performs NO file-system writes at all.

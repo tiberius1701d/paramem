@@ -47,7 +47,7 @@ def _preview_response(pre_flight_fail=None, used_gb=None, cap_gb=None):
 
 class TestMigrateCliPrintsPreFlightMessageAndExits1:
     def test_migrate_cli_prints_preflight_message_and_exits_1(self, monkeypatch, capsys) -> None:
-        """pre_flight_fail='disk_pressure' → spec L582–586 message; rc=1; no cancel POST."""
+        """pre_flight_fail='disk_pressure' → disk-pressure message; rc=1; no cancel POST."""
         cancel_called = []
 
         def _fake_post(url, body=None, **kw):
@@ -61,7 +61,7 @@ class TestMigrateCliPrintsPreFlightMessageAndExits1:
         captured = capsys.readouterr()
 
         assert rc == 1, f"Expected rc=1, got {rc}"
-        # Spec L582–586 wording.
+        # Disk-pressure wording.
         assert "disk" in captured.err.lower(), f"Stderr must mention disk: {captured.err!r}"
         assert "backup-prune" in captured.err, f"Stderr must mention backup-prune: {captured.err!r}"
         assert "18.50" in captured.err or "18.5" in captured.err, (

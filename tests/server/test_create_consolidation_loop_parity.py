@@ -55,7 +55,7 @@ SCENARIOS = [
         id="dataset_probe",
     ),
     pytest.param(
-        "step6_step7",
+        "all_tiers_rank8",
         {
             "model_name": "mistral",
             "consolidation.training_seed": 10,
@@ -79,7 +79,7 @@ SCENARIOS = [
             "save_cycle_snapshots": False,
             "seed_state_from_disk": False,
         },
-        id="step6_step7",
+        id="all_tiers_rank8",
     ),
     pytest.param(
         "interim_rollover",

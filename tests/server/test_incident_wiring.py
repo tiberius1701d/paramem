@@ -1,22 +1,22 @@
-"""Pass B wiring tests — incident store + run-status integrated into the server.
+"""Wiring tests — incident store + run-status integrated into the server.
 
 Covers:
-- T12  attention populator: active incident → AttentionItem; ack/resolved → no item
-- T13  populator registration: collect_attention_items includes incident item
-- T14  /status last_consolidation_error derived from active incident
-- T14b /status last_consolidation_result derived from run_status.json
-- T14c restart-survival: write incident, rebuild _derive_consolidation_status_fields,
-        field reflects it (no RAM state)
-- T15  POST /incidents/{id}/ack: flips status; /status no longer shows row
-- T15b POST /incidents/{id}/ack: unknown id → not_found
-- T16  VramExhausted callback → record_incident called, NOT RAM write
-- T16b success branch (trained) → record_last_run called, NOT record_incident
-- T17  auto-resolve: vram_exhausted incident resolves after _finalize_interim
-- T17b consolidation_retry_exhausted NOT resolved by Pass B success
-        (_finalize_interim's clean-success guard owns that conditional
-        resolve — Pass B must NOT touch it)
-- T18  resolve_incident idempotency fix: already-resolved returns False
-- T4b  (ack endpoint) acknowledged incident omitted from attention items
+- Attention populator: active incident → AttentionItem; ack/resolved → no item
+- Populator registration: collect_attention_items includes incident item
+- /status last_consolidation_error derived from active incident
+- /status last_consolidation_result derived from run_status.json
+- Restart-survival: write incident, rebuild _derive_consolidation_status_fields,
+  field reflects it (no RAM state)
+- POST /incidents/{id}/ack: flips status; /status no longer shows row
+- POST /incidents/{id}/ack: unknown id → not_found
+- VramExhausted callback → record_incident called, NOT RAM write
+- Success branch (trained) → record_last_run called, NOT record_incident
+- Auto-resolve: vram_exhausted incident resolves after _finalize_interim
+- consolidation_retry_exhausted is NOT resolved by this module's
+  incident-wiring success paths (_finalize_interim's clean-success guard
+  owns that conditional resolve)
+- resolve_incident idempotency fix: already-resolved returns False
+- Ack endpoint: acknowledged incident omitted from attention items
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ def _record(state_dir, *, type="vram_exhausted", key="phase1", severity="failed"
 
 
 # ---------------------------------------------------------------------------
-# T12 — attention populator: active → item; ack/resolved → no item
+# Attention populator: active → item; ack/resolved → no item
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +228,7 @@ class TestCollectIncidentItems:
 
 
 # ---------------------------------------------------------------------------
-# T13 — populator registration
+# Populator registration
 # ---------------------------------------------------------------------------
 
 
@@ -265,7 +265,7 @@ class TestPopulatorRegistration:
 
 
 # ---------------------------------------------------------------------------
-# T14 — /status last_consolidation_error derived from active incident
+# /status last_consolidation_error derived from active incident
 # ---------------------------------------------------------------------------
 
 
@@ -313,7 +313,7 @@ class TestStatusErrorDerivation:
 
 
 # ---------------------------------------------------------------------------
-# T14b — /status last_consolidation_result derived from run_status.json
+# /status last_consolidation_result derived from run_status.json
 # ---------------------------------------------------------------------------
 
 
@@ -344,7 +344,7 @@ class TestStatusResultDerivation:
 
 
 # ---------------------------------------------------------------------------
-# T14c — restart-survival: derive from disk, no RAM state
+# Restart-survival: derive from disk, no RAM state
 # ---------------------------------------------------------------------------
 
 
@@ -391,7 +391,7 @@ class TestRestartSurvivalStatusDerivation:
 
 
 # ---------------------------------------------------------------------------
-# T15 — POST /incidents/{id}/ack endpoint
+# POST /incidents/{id}/ack endpoint
 # ---------------------------------------------------------------------------
 
 
@@ -427,7 +427,7 @@ class TestAckEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# T15b — unknown id → not_found
+# Unknown id → not_found
 # ---------------------------------------------------------------------------
 
 
@@ -440,7 +440,7 @@ class TestAckEndpointNotFound:
 
 
 # ---------------------------------------------------------------------------
-# T16 — VramExhausted callback → record_incident, NOT RAM write
+# VramExhausted callback → record_incident, NOT RAM write
 # ---------------------------------------------------------------------------
 
 
@@ -493,7 +493,7 @@ class TestWriteSiteVramExhausted:
 
 
 # ---------------------------------------------------------------------------
-# T16b — success branch → record_last_run, NOT record_incident
+# Success branch → record_last_run, NOT record_incident
 # ---------------------------------------------------------------------------
 
 
@@ -512,7 +512,7 @@ class TestWriteSiteSuccess:
         assert not (state_dir / "incidents.json").exists()
 
     def test_aborted_writes_run_status_not_incident(self, tmp_path):
-        """aborted outcome → run_status.json only; NOT an incident (S-1)."""
+        """aborted outcome → run_status.json only; NOT an incident."""
         state_dir = tmp_path / "state"
         record_last_run(
             state_dir,
@@ -527,7 +527,7 @@ class TestWriteSiteSuccess:
 
 
 # ---------------------------------------------------------------------------
-# T17 — auto-resolve: vram_exhausted clears after interim success
+# Auto-resolve: vram_exhausted clears after interim success
 # ---------------------------------------------------------------------------
 
 
@@ -578,7 +578,7 @@ class TestAutoResolve:
 
 
 # ---------------------------------------------------------------------------
-# Part A regression: an exception in the interim post-cycle bookkeeping
+# Regression coverage: an exception in the interim post-cycle bookkeeping
 # region (not just the run_consolidation_cycle call itself) must still
 # clear _state["consolidating"] and record a training_crash incident.  Before
 # the Stage-B cycle-lifecycle primitive, only the run_consolidation_cycle
@@ -688,24 +688,26 @@ class TestInterimBookkeepingRegionCrash:
 
 
 # ---------------------------------------------------------------------------
-# T17b — consolidation_retry_exhausted NOT resolved by Pass B
+# consolidation_retry_exhausted NOT resolved by the incident-wiring success paths
 # ---------------------------------------------------------------------------
 
 
 class TestS4Ordering:
     def test_recall_failure_incident_not_resolved_by_pass_b_success_paths(self, tmp_path):
-        """consolidation_retry_exhausted type is not in Pass B's resolve-by-type calls.
+        """consolidation_retry_exhausted is not resolved by this module's
+        incident-wiring resolve-by-type calls.
 
         _finalize_interim's clean-success guard (app._is_interim_clean_success)
         owns the conditional resolve for consolidation_retry_exhausted.
-        Pass B must NOT resolve it — only by_type resolution of the types Pass B
-        owns (vram_exhausted, training_crash, consolidation_crash, extraction_failed,
-        migration_error, migration_phase_failed).
+        These success paths must NOT resolve it — only by_type resolution of
+        the types owned here (vram_exhausted, training_crash,
+        consolidation_crash, extraction_failed, migration_error,
+        migration_phase_failed).
         """
         state_dir = tmp_path / "state"
         _record(state_dir, type="consolidation_retry_exhausted", key="session_abc")
 
-        # Simulate Pass B success paths (resolve all Pass-B-owned types).
+        # Simulate the incident-wiring success paths (resolve all types owned here).
         for t in (
             "training_crash",
             "vram_exhausted",
@@ -728,7 +730,7 @@ class TestS4Ordering:
 
 
 # ---------------------------------------------------------------------------
-# T18 — resolve_incident idempotency fix: already-resolved returns False
+# resolve_incident idempotency fix: already-resolved returns False
 # ---------------------------------------------------------------------------
 
 
@@ -736,7 +738,7 @@ class TestResolveIncidentIdempotencyFix:
     def test_resolve_already_resolved_returns_false(self, tmp_path):
         """resolve_incident on an already-resolved incident returns False (actual-transition gate).
 
-        The code-reviewer fix: gate True return on row['status'] != 'resolved'.
+        Gates the True return on row['status'] != 'resolved'.
         A wired caller can now trust the boolean.
         """
         state_dir = tmp_path / "state"

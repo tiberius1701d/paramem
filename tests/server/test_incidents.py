@@ -1,17 +1,17 @@
 """Unit tests for paramem.server.incidents — actionable-failure event store.
 
-Tests cover the full T1–T11 matrix from the plan:
-- T1  round-trip: record → read → count==1, status==active
-- T2  dedup/bump: same (type,key) twice → count==2, last_seen advanced
-- T3  distinct keys: same type, different key → two incidents
-- T4  resolve: flips status; idempotent (False on second call)
-- T5  reopen: record → resolve → record same key → active again, count bumped
-- T6  ack: flips status→acknowledged; False for unknown id
-- T7  resolve_incidents_by_type: resolves all of one type, leaves other untouched
-- T8  restart-survival: write then fresh read from same state_dir
-- T9  schema-version guard (C-5): version:2 → IncidentStoreSchemaError
-- T10 malformed JSON → IncidentStoreSchemaError
-- T11 atomicity: no .pending residue after write
+Covers:
+- Round-trip: record → read → count==1, status==active
+- Dedup/bump: same (type,key) twice → count==2, last_seen advanced
+- Distinct keys: same type, different key → two incidents
+- Resolve: flips status; idempotent (False on second call)
+- Reopen: record → resolve → record same key → active again, count bumped
+- Ack: flips status→acknowledged; False for unknown id
+- resolve_incidents_by_type: resolves all of one type, leaves other untouched
+- Restart-survival: write then fresh read from same state_dir
+- Schema-version guard: version:2 → IncidentStoreSchemaError
+- Malformed JSON → IncidentStoreSchemaError
+- Atomicity: no .pending residue after write
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def _record(
 
 
 # ---------------------------------------------------------------------------
-# T1 — round-trip
+# Round-trip
 # ---------------------------------------------------------------------------
 
 
@@ -80,7 +80,7 @@ class TestRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# T2 — dedup/bump
+# Dedup/bump
 # ---------------------------------------------------------------------------
 
 
@@ -111,7 +111,7 @@ class TestDedupBump:
 
 
 # ---------------------------------------------------------------------------
-# T3 — distinct keys
+# Distinct keys
 # ---------------------------------------------------------------------------
 
 
@@ -128,7 +128,7 @@ class TestDistinctKeys:
 
 
 # ---------------------------------------------------------------------------
-# T4 — resolve
+# Resolve
 # ---------------------------------------------------------------------------
 
 
@@ -157,7 +157,7 @@ class TestResolve:
 
 
 # ---------------------------------------------------------------------------
-# T5 — reopen
+# Reopen
 # ---------------------------------------------------------------------------
 
 
@@ -175,7 +175,7 @@ class TestReopen:
 
 
 # ---------------------------------------------------------------------------
-# T6 — ack
+# Ack
 # ---------------------------------------------------------------------------
 
 
@@ -195,7 +195,7 @@ class TestAck:
 
 
 # ---------------------------------------------------------------------------
-# T7 — resolve_incidents_by_type
+# resolve_incidents_by_type
 # ---------------------------------------------------------------------------
 
 
@@ -238,7 +238,7 @@ class TestResolveByType:
 
 
 # ---------------------------------------------------------------------------
-# T8 — restart-survival
+# Restart-survival
 # ---------------------------------------------------------------------------
 
 
@@ -256,7 +256,7 @@ class TestRestartSurvival:
 
 
 # ---------------------------------------------------------------------------
-# T9 — schema-version guard
+# Schema-version guard
 # ---------------------------------------------------------------------------
 
 
@@ -281,7 +281,7 @@ class TestSchemaVersionGuard:
 
 
 # ---------------------------------------------------------------------------
-# T10 — malformed JSON
+# Malformed JSON
 # ---------------------------------------------------------------------------
 
 
@@ -294,7 +294,7 @@ class TestMalformedJson:
 
 
 # ---------------------------------------------------------------------------
-# T11 — atomicity: no .pending residue
+# Atomicity: no .pending residue
 # ---------------------------------------------------------------------------
 
 

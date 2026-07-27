@@ -43,16 +43,16 @@ _AGE_MAGIC = b"age-encryption.org/v1\n"
 
 
 # ---------------------------------------------------------------------------
-# _atomic_write_file — S2 stale-temp robustness
+# _atomic_write_file — stale-temp robustness
 # ---------------------------------------------------------------------------
 
 
 class TestAtomicWriteFile:
-    """Unit tests for _atomic_write_file (S2: stale-temp robustness).
+    """Unit tests for _atomic_write_file (stale-temp robustness).
 
-    The pre-S2 implementation used a fixed ``.restore-pending`` suffix with
+    The prior implementation used a fixed ``.restore-pending`` suffix with
     ``O_CREAT | O_EXCL``: a crash between create and rename left a stale temp
-    that wedged the next restore with ``FileExistsError``.  The S2 fix uses
+    that wedged the next restore with ``FileExistsError``.  The fix uses
     ``tempfile.mkstemp`` which generates a unique name, so stale temps from a
     prior crash never block a subsequent restore.
     """
@@ -72,8 +72,8 @@ class TestAtomicWriteFile:
     def test_stale_temp_does_not_wedge(self, tmp_path) -> None:
         """A stale .restore-pending temp left by a prior crash must not cause FileExistsError.
 
-        Pre-S2: the fixed suffix + O_EXCL would raise FileExistsError if the
-        same-named temp already exists.  S2: mkstemp always picks a unique name
+        The fixed suffix + O_EXCL used to raise FileExistsError if the
+        same-named temp already existed; mkstemp always picks a unique name
         so the stale file is ignored.
         """
         dst = tmp_path / "target.json"
@@ -709,10 +709,10 @@ class TestRestoredAdaptersList:
 class TestRestoreAbortedError:
     """Verify that RestoreAbortedError carries safety_slot when step 5 fails.
 
-    S3 requirement: when restore_bundle raises after the safety bundle is
-    captured (step 4) due to a filesystem error in step 5, the exception
-    must carry the safety_slot path so the caller (app.py handler or operator)
-    can present a concrete recovery target.
+    When restore_bundle raises after the safety bundle is captured (step 4)
+    due to a filesystem error in step 5, the exception must carry the
+    safety_slot path so the caller (app.py handler or operator) can present
+    a concrete recovery target.
     """
 
     def test_restore_aborted_error_carries_safety_slot(self, tmp_path, monkeypatch) -> None:

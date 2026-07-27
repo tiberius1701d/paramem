@@ -1034,7 +1034,7 @@ class TestRollbackResponseContract:
 
 
 class TestRollbackNoOpSkip:
-    """Rollback no-op skip (S-6): disk hash == memory hash → applied_live=True."""
+    """Rollback no-op skip: disk hash == memory hash → applied_live=True."""
 
     def test_rollback_noop_skip_applied_live_true(self, tmp_path, monkeypatch):
         """No-op skip → applied_live=True, restart_required=False."""

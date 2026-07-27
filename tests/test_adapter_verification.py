@@ -4,10 +4,10 @@
 into an isolated verify adapter and probes recall to catch silent partial
 writes.  These tests cover the four contract points:
 
-T1 - happy path: probe passes, returns recall >= threshold, no exception.
-T2 - simulated corruption: probe detects degraded recall, raises RuntimeError.
-T3 - in-RAM adapter preserved: original adapter is active after verify (pass or fail).
-T4 - cleanup discipline: verify slot is dropped even when the probe raises.
+- Happy path: probe passes, returns recall >= threshold, no exception.
+- Simulated corruption: probe detects degraded recall, raises RuntimeError.
+- In-RAM adapter preserved: original adapter is active after verify (pass or fail).
+- Cleanup discipline: verify slot is dropped even when the probe raises.
 
 All tests use a MagicMock model (no real GPU).  ``_run_recall_sanity_probe``
 is patched directly on the loop instance so the tests are independent of
@@ -139,12 +139,12 @@ _SAMPLE_KEYED_PAIRS: list[dict] = [
 
 
 # ---------------------------------------------------------------------------
-# T1 — happy path
+# Happy path
 # ---------------------------------------------------------------------------
 
 
 class TestVerifySavedAdapterHappyPath:
-    """T1: probe passes when the disk artifact is intact."""
+    """Probe passes when the disk artifact is intact."""
 
     def test_returns_recall_above_threshold(self, tmp_path: Path) -> None:
         """Successful disk verify returns the measured recall rate.
@@ -209,12 +209,12 @@ class TestVerifySavedAdapterHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# T2 — simulated corruption
+# Simulated corruption
 # ---------------------------------------------------------------------------
 
 
 class TestVerifySavedAdapterCorruption:
-    """T2: degraded recall after reload-from-disk raises RuntimeError."""
+    """Degraded recall after reload-from-disk raises RuntimeError."""
 
     def test_raises_on_zero_recall(self, tmp_path: Path) -> None:
         """A completely corrupt artifact (recall=0.0) must raise RuntimeError.
@@ -305,12 +305,12 @@ class TestVerifySavedAdapterCorruption:
 
 
 # ---------------------------------------------------------------------------
-# T3 — in-RAM adapter preserved
+# In-RAM adapter preserved
 # ---------------------------------------------------------------------------
 
 
 class TestVerifySavedAdapterInRamPreserved:
-    """T3: original adapter is active after verify (pass or fail)."""
+    """Original adapter is active after verify (pass or fail)."""
 
     def test_original_adapter_active_after_successful_probe(self, tmp_path: Path) -> None:
         """After a passing probe, the original adapter is restored as active."""
@@ -375,12 +375,12 @@ class TestVerifySavedAdapterInRamPreserved:
 
 
 # ---------------------------------------------------------------------------
-# T4 — cleanup discipline
+# Cleanup discipline
 # ---------------------------------------------------------------------------
 
 
 class TestVerifySavedAdapterCleanup:
-    """T4: verify slot is dropped even when the probe raises."""
+    """Verify slot is dropped even when the probe raises."""
 
     def test_verify_slot_dropped_on_success(self, tmp_path: Path) -> None:
         """Verify slot is absent from peft_config after a passing probe."""
@@ -833,12 +833,12 @@ class TestPostSaveSlotCleanup:
 
 
 # ---------------------------------------------------------------------------
-# T5 — recall_sanity_threshold config knob
+# recall_sanity_threshold config knob
 # ---------------------------------------------------------------------------
 
 
 class TestRecallSanityThresholdKnob:
-    """T5: the recall_sanity_threshold config knob default is 1.0 and flows
+    """The recall_sanity_threshold config knob default is 1.0 and flows
     through to _verify_saved_adapter_from_disk when no explicit override is
     passed.
     """
@@ -895,7 +895,7 @@ class TestRecallSanityThresholdKnob:
 
 
 # ---------------------------------------------------------------------------
-# save_adapter returns Path (M1 — COMMIT 2)
+# save_adapter returns Path
 # ---------------------------------------------------------------------------
 
 
@@ -933,7 +933,7 @@ class TestSaveAdapterReturnsPath:
 
 
 # ---------------------------------------------------------------------------
-# _verify_committed_slot — entry shaping (M2) and delegation (COMMIT 2)
+# _verify_committed_slot — entry shaping and delegation
 # ---------------------------------------------------------------------------
 
 
@@ -1056,7 +1056,7 @@ class TestVerifyCommittedSlot:
 
 
 # ---------------------------------------------------------------------------
-# commit_tier_slot verify callback (COMMIT 2)
+# commit_tier_slot verify callback
 # ---------------------------------------------------------------------------
 
 
@@ -1266,7 +1266,7 @@ class TestCommitTierSlotVerifyCallback:
 
 
 # ---------------------------------------------------------------------------
-# _persist_fold verify wiring (COMMIT 2)
+# _persist_fold verify wiring
 # ---------------------------------------------------------------------------
 
 

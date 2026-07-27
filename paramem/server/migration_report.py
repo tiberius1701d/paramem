@@ -63,9 +63,9 @@ def _row_triples_extracted(gates: dict) -> dict[str, Any]:
 def _row_recall(gates: dict) -> dict[str, Any]:
     """Mirror the gate 4 metrics into the recall row.
 
-    Spec L404: same 20-key sample as gate 4.  Gate 4 exposes
+    Uses the same 20-key sample as gate 4.  Gate 4 exposes
     ``recalled`` and ``sampled`` in ``gates["details"][3]["metrics"]``
-    (Guardrail G1 — ``sampled_keys`` is also present for future reporting).
+    (``sampled_keys`` is also present for future reporting).
 
     Parameters
     ----------
@@ -122,7 +122,7 @@ def _row_routing_probe(gates: dict) -> dict[str, Any]:
     """Return the deferred 'Routing-probe classification' row.
 
     Deferred because the labeled query set required for the probe is not
-    yet defined (spec L397).  Renders ``pending: True`` so the row is
+    yet defined.  Renders ``pending: True`` so the row is
     never silently empty.
 
     Parameters

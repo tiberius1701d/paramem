@@ -76,7 +76,7 @@ class BackupStateRecord:
     last_failure_at:
         ISO-8601 UTC timestamp of the most recent failed run.  Not cleared on
         subsequent success — reflects "the last time this failed" for operator
-        visibility (spec L487–489).  ``None`` when no failure has occurred.
+        visibility.  ``None`` when no failure has occurred.
     last_failure_reason:
         Short error string from the most recent failure.  Mirrors
         ``ScheduledBackupResult.error``.  ``None`` when no failure.

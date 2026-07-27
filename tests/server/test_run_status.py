@@ -1,11 +1,11 @@
 """Unit tests for paramem.server.run_status — universal per-op-type last-run registry.
 
-Tests cover the full T1b–T5b matrix from the plan:
-- T1b round-trip + overwrite-latest: two records for same op_type → only latest survives
-- T2b multi-op-type: consolidation + migration both present, keyed by type
-- T3b aborted is a valid outcome (S-1): round-trips without error or incident creation
-- T4b schema-version guard (C-5): version:2 → RunStatusSchemaError
-- T5b restart-survival: fresh read_last_runs sees the persisted record
+Covers:
+- Round-trip + overwrite-latest: two records for same op_type → only latest survives
+- Multi-op-type: consolidation + migration both present, keyed by type
+- Aborted is a valid outcome: round-trips without error or incident creation
+- Schema-version guard: version:2 → RunStatusSchemaError
+- Restart-survival: fresh read_last_runs sees the persisted record
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _record(
 
 
 # ---------------------------------------------------------------------------
-# T1b — round-trip + overwrite-latest
+# Round-trip + overwrite-latest
 # ---------------------------------------------------------------------------
 
 
@@ -83,7 +83,7 @@ class TestRoundTripOverwriteLatest:
 
 
 # ---------------------------------------------------------------------------
-# T2b — multi-op-type
+# Multi-op-type
 # ---------------------------------------------------------------------------
 
 
@@ -109,7 +109,7 @@ class TestMultiOpType:
 
 
 # ---------------------------------------------------------------------------
-# T3b — aborted is a valid outcome (S-1)
+# Aborted is a valid outcome
 # ---------------------------------------------------------------------------
 
 
@@ -128,7 +128,7 @@ class TestAbortedIsValidOutcome:
 
 
 # ---------------------------------------------------------------------------
-# T4b — schema-version guard
+# Schema-version guard
 # ---------------------------------------------------------------------------
 
 
@@ -159,7 +159,7 @@ class TestSchemaVersionGuard:
 
 
 # ---------------------------------------------------------------------------
-# T5b — restart-survival
+# Restart-survival
 # ---------------------------------------------------------------------------
 
 
