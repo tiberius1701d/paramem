@@ -356,9 +356,7 @@ class StatusResponse(BaseModel):
     last_consolidation_result: dict | None = None  # last completed run summary
     pending_enrollments: int = 0  # unknown speakers awaiting name extraction
     scheduler_started: bool = False  # True once scheduler first ticked
-    # adapter_id -> {status, reason, updated_at, keys_at_mark}
-    adapter_health: dict = {}
-    # Per-adapter manifest-provenance rows (distinct from adapter_health).
+    # Per-adapter manifest-provenance rows.
     # Keyed by adapter name; empty when all manifests are healthy.
     # Schema per row: {status, reason, field, severity, slot_path, checked_at}.
     # Populated by _mount_adapters_from_slots at startup; surfaced to /status.
@@ -4026,9 +4024,6 @@ async def status():
             tier: len(_cold.active_keys_in_tier(tier)) for tier in _cold.tiers_with_registry()
         }
 
-    # _live_loop is used by the adapter_health block below.
-    _live_loop = _state.get("consolidation_loop")
-
     # Session buffer summary (pending counts, orphan attribution, age)
     buf = _state.get("session_buffer")
     summary = (
@@ -4131,39 +4126,6 @@ async def status():
             config.consolidation.quiet_hours_end,
         ),
     }
-
-    # Adapter health — stored in per-tier KeyRegistry JSON files:
-    # <adapter_dir>/<tier>/indexed_key_registry.json → field "health".
-    # Prefer reading from the in-memory ConsolidationLoop when available.
-    # Surfaced to pstatus so a degenerated adapter is visible without grepping logs.
-    adapter_health: dict = {}
-    if _live_loop is not None and _live_loop.store.replay_enabled:
-        for _tier_name in _live_loop.store.tiers_with_registry():
-            _h = _live_loop.store.registry(_tier_name).get_health()
-            if _h is not None:
-                adapter_health[_tier_name] = _h
-    else:
-        from paramem.training.key_registry import KeyRegistry as _KeyRegHealth
-
-        try:
-            for _tier in ("episodic", "semantic", "procedural"):
-                _reg_path = config.adapter_dir / _tier / "indexed_key_registry.json"
-                if _reg_path.exists():
-                    _reg = _KeyRegHealth.load(_reg_path)
-                    _h = _reg.get_health()
-                    if _h is not None:
-                        adapter_health[_tier] = _h
-            from paramem.memory.interim_adapter import iter_interim_dirs as _iter_int_h
-
-            for _interim_name, _interim_d in _iter_int_h(config.adapter_dir):
-                _reg_path = _interim_d / "indexed_key_registry.json"
-                if _reg_path.exists():
-                    _reg = _KeyRegHealth.load(_reg_path)
-                    _h = _reg.get_health()
-                    if _h is not None:
-                        adapter_health[_interim_name] = _h
-        except Exception:
-            adapter_health = {}
 
     # TTS inventory: which languages are loaded and on which device. When
     # voices span devices (one on CUDA, one on CPU) we report "mixed" so the
@@ -4465,7 +4427,6 @@ async def status():
         last_consolidation_result=_consolidation_result,
         pending_enrollments=len(_state.get("pending_enrollments") or []),
         scheduler_started=scheduler_active,
-        adapter_health=adapter_health,
         adapter_manifest=_state.get("adapter_manifest_status", {}),
         config_drift=_state.get("config_drift", {}),
         attention=attention_block,
@@ -6892,7 +6853,18 @@ async def speaker_forget(request: SpeakerForgetRequest):
             _reg = loop.store.registry(_tier_name)
             if any(_reg.knows(k) for k in stale_keys):
                 _tiers_with_keys.append(_tier_name)
-                _tier_pre_sha[_tier_name] = _hashlib.sha256(_reg.save_bytes()).hexdigest()
+                # Read the PRE-ERASE hash from disk, not from re-serialising the
+                # in-memory registry: the manifest was stamped against whatever
+                # bytes `_save_adapters` last wrote, and only the on-disk file
+                # is guaranteed to still hold that exact payload shape. Hashing
+                # the in-memory registry instead would silently diverge from
+                # the stamped manifest hash across ANY future KeyRegistry
+                # payload-shape change (e.g. a field added to or dropped from
+                # save_bytes()) landing between the last fold and this call —
+                # orphaning the slot (find_live_slot below returns None,
+                # unmountable at next restart) even though nothing on disk
+                # actually changed.
+                _tier_pre_sha[_tier_name] = _compute_tier_registry_sha256(config, _tier_name)
 
         loop.store.discard_keys(stale_keys, mode="erase")
 
@@ -13672,16 +13644,49 @@ def _run_stage_b_cycle(
     bt.submit(_worker, inference_fallback_adapter="episodic")
 
 
+# Interim-cycle outcomes that never represent a completed encoding attempt —
+# ABORT (yielded to an inference request before training ran) and CAP_PENDING
+# (interim ring full, session stays queued for the next full fold).  Neither
+# increments the consolidation-retry counter
+# (``ConsolidationScheduleConfig.consolidation_retry_cap``) and neither
+# counts as a "clean success" for auto-resolving the
+# ``consolidation_retry_exhausted`` incident.  Single source of truth for
+# both _finalize_interim's clean-success guard and
+# _extract_and_start_training's pin-without-count logic.
+_INTERIM_NON_ENCODING_OUTCOMES: frozenset[str] = frozenset({"aborted", "cap_pending"})
+
+
+def _is_interim_clean_success(result: dict, cycle_mode: str, released_sids: list) -> bool:
+    """``True`` only for a genuine clean interim success.
+
+    Gates whether :func:`_finalize_interim` may auto-resolve a
+    ``consolidation_retry_exhausted`` incident: resolving on anything less
+    than a clean success would wipe an incident recorded by the SAME cycle
+    that is being finalized.  A clean success requires all three:
+
+    - no recall-gate failures this cycle (``recall_failed_session_ids`` empty),
+    - an outcome that represents a completed encoding attempt (excludes
+      :data:`_INTERIM_NON_ENCODING_OUTCOMES` — abort/cap_pending never
+      attempted or committed an encode), and
+    - no sessions released from the consolidation-retry cap this cycle
+      (a release means an incident was just recorded).
+    """
+    return (
+        not result.get("recall_failed_session_ids", [])
+        and cycle_mode not in _INTERIM_NON_ENCODING_OUTCOMES
+        and not released_sids
+    )
+
+
 def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: list) -> None:
     """Success/terminal finalizer for the interim-training Stage-B cycle.
 
     Runs on the asyncio event loop via ``_dispatch_finalize``.  Reloads the
     router, records the durable run-status row, auto-resolves the incidents
     a clean interim success clears, and clears ``_state["consolidating"]``.
-    Covers every non-crash interim terminal (``trained`` / ``degenerate`` /
-    ``aborted`` / ``cap_pending``, with or without recall-failed sessions) —
-    the outcome label and clean-success gating come from *result* and
-    *released_sids*.
+    Covers every non-crash interim terminal (``trained`` / ``simulated`` /
+    ``recall_failed`` / ``aborted`` / ``cap_pending``) — the outcome label
+    and clean-success gating come from *result* and *released_sids*.
 
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-training PEFT rebind).
@@ -13725,16 +13730,8 @@ def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: l
         resolve_incidents_by_type(_interim_state_dir, "training_crash")
         resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
         # Resolve consolidation_retry_exhausted ONLY on a genuine clean
-        # success — no recall failures, cycle was not aborted/degenerated,
-        # and no sessions were cap-released this cycle.  An abort/degenerate
-        # cycle carries no recall_failed_session_ids but is NOT a success;
-        # resolving here would wipe an incident recorded by the same cycle.
-        _is_clean_success = (
-            not result.get("recall_failed_session_ids", [])
-            and _interim_outcome not in {"aborted", "cap_pending"}
-            and not released_sids
-        )
-        if _is_clean_success:
+        # success — see _is_interim_clean_success for the exact gate.
+        if _is_interim_clean_success(result, _interim_outcome, released_sids):
             resolve_incidents_by_type(_interim_state_dir, "consolidation_retry_exhausted")
     except Exception:
         logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
@@ -14256,14 +14253,16 @@ def _extract_and_start_training():
         )
 
         # Keep sessions pending when their facts were NOT successfully encoded,
-        # with a bounded per-session durable retry counter.  Three sources feed
+        # with a bounded per-session durable retry counter.  Two sources feed
         # the unified failure set (in priority order):
-        #   1. recall_failed_session_ids — the recall gate fired after training.
-        #   2. DEGENERATE mode — adapter degenerated; triples re-queued to RAM
-        #      only; weights unchanged.  Facts not encoded → count increments.
-        #   3. ABORT mode — training yielded to an inference request; no encoding
-        #      attempt was made.  Sessions stay pending but count does NOT increment
-        #      (abort = yield-to-inference, not a failure).
+        #   1. recall_failed_session_ids — the recall gate fired after
+        #      training; triples were re-queued to RAM only, weights
+        #      unchanged.  Facts not encoded → count increments.
+        #   2. ABORT / CAP_PENDING mode — training yielded to an inference
+        #      request, or the interim ring was full (drains at the next
+        #      full fold); no encoding attempt was made either way.
+        #      Sessions stay pending but count does NOT increment (neither
+        #      is an encoding failure).
         # In the SUCCESS path (cycle returned normally) — NOT inside the try that
         # wraps run_consolidation_cycle (crash ≠ recall failure — the failed-session
         # set is populated only on a successful cycle return).
@@ -14312,7 +14311,7 @@ def _extract_and_start_training():
         # cap_pending: pin only (ring full — scheduling condition, full fold drains ring).
         _pin_sids: set[str] = set(_recall_failed)
         _count_sids: set[str] = set(_recall_failed)  # sessions whose counter increments
-        if _cycle_mode in {"aborted", "cap_pending"}:
+        if _cycle_mode in _INTERIM_NON_ENCODING_OUTCOMES:
             # Contributing sessions = those that passed extraction but whose
             # results were not committed.  OOM-skipped chunks are already in
             # failed_session_ids; exclude them to avoid double-counting.
@@ -14395,7 +14394,7 @@ def _extract_and_start_training():
         # the cap.  A session passes recall if it is in session_ids, NOT in the
         # current _count_sids (i.e. was not a failure this cycle), and has an
         # existing durable count entry.
-        if _cycle_mode not in {"aborted", "cap_pending"}:
+        if _cycle_mode not in _INTERIM_NON_ENCODING_OUTCOMES:
             for _sid in session_ids:
                 if _sid not in _pin_sids and _sid in session_buffer._sessions:
                     _existing = session_buffer._sessions[_sid].get("recall_retry_count", 0)

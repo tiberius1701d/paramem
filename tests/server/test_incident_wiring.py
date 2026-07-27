@@ -13,7 +13,8 @@ Covers:
 - T16b success branch (trained) → record_last_run called, NOT record_incident
 - T17  auto-resolve: vram_exhausted incident resolves after _finalize_interim
 - T17b consolidation_retry_exhausted NOT resolved by Pass B success
-        (M1 guard owns that conditional resolve — Pass B must NOT touch it)
+        (_finalize_interim's clean-success guard owns that conditional
+        resolve — Pass B must NOT touch it)
 - T18  resolve_incident idempotency fix: already-resolved returns False
 - T4b  (ack endpoint) acknowledged incident omitted from attention items
 """
@@ -695,7 +696,8 @@ class TestS4Ordering:
     def test_recall_failure_incident_not_resolved_by_pass_b_success_paths(self, tmp_path):
         """consolidation_retry_exhausted type is not in Pass B's resolve-by-type calls.
 
-        The M1 guard owns the conditional resolve for consolidation_retry_exhausted.
+        _finalize_interim's clean-success guard (app._is_interim_clean_success)
+        owns the conditional resolve for consolidation_retry_exhausted.
         Pass B must NOT resolve it — only by_type resolution of the types Pass B
         owns (vram_exhausted, training_crash, consolidation_crash, extraction_failed,
         migration_error, migration_phase_failed).
@@ -720,7 +722,8 @@ class TestS4Ordering:
         assert len(recall_failures) == 1
         assert recall_failures[0].status == "active", (
             "consolidation_retry_exhausted must remain active — "
-            "M1 guard owns its conditional resolve — Pass B must not touch it"
+            "_finalize_interim's clean-success guard owns its conditional resolve — "
+            "Pass B must not touch it"
         )
 
 

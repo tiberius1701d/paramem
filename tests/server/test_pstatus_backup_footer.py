@@ -99,7 +99,6 @@ def _minimal_status(backup: dict | None = None) -> dict:
         "config_drift": {},
         "hold": {},
         "adapter_specs": {},
-        "adapter_health": {},
         "adapter_manifest": {},
         "attention": {"items": []},
         "migration": {"state": "live"},

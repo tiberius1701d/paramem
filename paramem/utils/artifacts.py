@@ -245,8 +245,12 @@ def on_extraction_end(episodic_rels: list[dict], procedural_rels: list[dict]) ->
     snapshots by :func:`on_fold_graph`: ``graph_merged_snapshot.json``
     (pre-enrichment) and ``graph_enriched_snapshot.json`` (post-enrichment).
 
-    Skipped for short-circuit cycles (queue-only, degenerated-skip); those
-    emit only :func:`on_cycle_end`.
+    Skipped whenever ``run_consolidation_cycle`` short-circuits before
+    reaching the interim fold body: the ``noop`` guards (no registry / no
+    relations) and the ``cap_pending`` guard (interim ring full) all return
+    without calling this function.  Of those three, only ``cap_pending``
+    additionally calls :func:`on_cycle_end` with its own summary — the two
+    ``noop`` guards call neither.
     """
     for base in _active_bases():
         write_artifact(base / "episodic_rels_snapshot.json", episodic_rels)
@@ -424,9 +428,13 @@ def on_calibration_result(payload: dict[str, Any]) -> None:
 def on_cycle_end(cycle_summary: dict[str, Any]) -> None:
     """Persist the per-cycle summary record.
 
-    Fires from every return branch of ``run_consolidation_cycle`` (normal,
-    queue-only, degenerated-skip) so an operator can confirm the cycle was
-    reached even when no triples were produced.  Schema is the
+    Called from exactly two sites in ``run_consolidation_cycle``: the
+    ``cap_pending`` early return (interim ring full — no fold attempted) and
+    the interim fold's terminal return (``trained`` / ``simulated`` /
+    ``recall_failed``).  NOT called for the two ``noop`` early returns (no
+    registry / no relations) or the ``aborted`` return (training yielded to
+    an inference request before the commit window) — those short-circuit
+    before either call site is reached.  Schema is the
     ``run_consolidation_cycle`` return dict, kept open-ended so callers can
     extend without coordinating a writer change.
     """

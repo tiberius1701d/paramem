@@ -1247,7 +1247,6 @@ class TestOrphanInterimPruning:
                 {
                     "active_keys": ["orphan_key_1", "orphan_key_2"],
                     "fidelity_history": {},
-                    "health": None,
                     "stale": {},
                     "simhash": {},
                 }
@@ -1487,7 +1486,6 @@ class TestOrphanInterimPruning:
             {
                 "active_keys": ["proc_key_1", "proc_key_2"],
                 "fidelity_history": {},
-                "health": None,
                 "stale": {},
                 "simhash": {},
             }
@@ -1644,7 +1642,6 @@ class TestOrphanInterimPruning:
                 {
                     "active_keys": ["ep_stale_key"],
                     "fidelity_history": {},
-                    "health": None,
                     "stale": {},
                     "simhash": {},
                 }
@@ -1800,7 +1797,6 @@ class TestOrphanInterimPruning:
                 {
                     "active_keys": ["orphan_key"],
                     "fidelity_history": {},
-                    "health": None,
                     "stale": {},
                     "simhash": {},
                 }
@@ -1895,7 +1891,6 @@ class TestOrphanInterimPruning:
                 {
                     "active_keys": ["sem_key"],
                     "fidelity_history": {},
-                    "health": None,
                     "stale": {},
                     "simhash": {},
                 }

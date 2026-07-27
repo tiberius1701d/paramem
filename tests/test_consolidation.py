@@ -15427,40 +15427,39 @@ class TestS5IncidentTypes:
 class TestS5OverflowDoesNotLeakIntoClearSuccessCheck:
     """Overflow mint (mode='trained') must not be treated as non-clean-success.
 
-    Guards test_retry_state.py::TestM1AutoResolveGuard: the overflow-mint
-    result has mode='trained' + overflow_slot=True; it IS a clean success
-    if no recall failures.  cap_pending is NOT a clean success.
+    Guards test_retry_state.py::TestFinalizeInterimCleanSuccessGuard: the
+    overflow-mint result has mode='trained' + overflow_slot=True; it IS a
+    clean success if no recall failures.  cap_pending is NOT a clean
+    success.  Calls ``app._is_interim_clean_success`` directly — the exact
+    function ``_finalize_interim`` gates on — rather than re-implementing
+    its formula here.
     """
-
-    def _is_clean_success(self, result: dict, cycle_mode: str, released_sids: list) -> bool:
-        """Mirror of the _finalize_interim clean-success guard."""
-        return (
-            not result.get("recall_failed_session_ids", [])
-            and cycle_mode not in {"aborted", "cap_pending"}
-            and not released_sids
-        )
 
     def test_overflow_mint_is_clean_success_when_no_recall_failures(self):
         """Overflow mint with no recall failures IS clean success."""
+        from paramem.server.app import _is_interim_clean_success
+
         result = {
             "mode": "trained",
             "adapter_name": "episodic_interim_20260601T1200",
             "new_keys": ["k1"],
             "overflow_slot": True,
         }
-        assert self._is_clean_success(result, "trained", []), (
+        assert _is_interim_clean_success(result, "trained", []), (
             "overflow mint (mode='trained') must be a clean success with no recall failures"
         )
 
     def test_cap_pending_is_still_not_clean_success(self):
         """cap_pending is NOT a clean success, unchanged by S5."""
+        from paramem.server.app import _is_interim_clean_success
+
         result = {
             "mode": "cap_pending",
             "adapter_name": None,
             "new_keys": [],
             "overflow_slot": False,
         }
-        assert not self._is_clean_success(result, "cap_pending", [])
+        assert not _is_interim_clean_success(result, "cap_pending", [])
 
 
 # ---------------------------------------------------------------------------

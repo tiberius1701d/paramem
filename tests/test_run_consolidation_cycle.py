@@ -1155,7 +1155,6 @@ class TestSaveFromBytesGuard:
         reg = KeyRegistry()
         reg.add("key1")
         reg.add("key2")
-        reg.set_health("healthy", reason="test")
 
         path_a = tmp_path / "reg_a.json"
         path_b = tmp_path / "reg_b.json"

@@ -1,8 +1,7 @@
 """Integration tests for _mount_adapters_from_slots startup validator.
 
 Exercises _mount_adapters_from_slots directly (bypasses full lifespan).
-All assertions operate on state["adapter_manifest_status"] — NOT
-adapter_health (which is separate and untouched by this slice).
+All assertions operate on state["adapter_manifest_status"].
 
 Covers:
 - Fresh install → no manifest rows.
@@ -18,7 +17,6 @@ Covers:
 - Fresh-built manifest with UNKNOWN fields (synthesized=False) → red.
 - episodic_interim_* uses same schema.
 - sweep_orphan_pending called before find_live_slot (mock order).
-- StatusResponse.adapter_health is UNTOUCHED by the validator.
 """
 
 from __future__ import annotations
@@ -465,29 +463,6 @@ class TestSynthesizedUnknown:
         assert row is not None
         assert row["severity"] == "red"
         assert row["status"] == "migrated_unverified"
-
-
-class TestAdapterHealthUntouched:
-    """StatusResponse.adapter_health must be unchanged by _mount_adapters_from_slots."""
-
-    def test_adapter_health_not_modified_by_validator(self, tmp_path: Path) -> None:
-        """The manifest validator must not touch adapter_health.
-
-        adapter_health is sourced from the KeyRegistry JSON, not from any
-        _state dict mutated by _mount_adapters_from_slots.  This test
-        asserts that running the validator leaves adapter_health absent
-        from state (it lives in a separate on-disk source).
-        """
-        config = _make_config(tmp_path)
-        state: dict = {"adapter_manifest_status": {}, "base_model_hash_cache": {}}
-
-        _mount_adapters_from_slots(_make_model(), _make_tokenizer(), config, state)
-
-        # adapter_health is NOT a key managed by _mount_adapters_from_slots
-        assert "adapter_health" not in state, (
-            "_mount_adapters_from_slots must not touch adapter_health "
-            "(it is sourced from KeyRegistry JSON separately)"
-        )
 
 
 class TestRevalidateMainAdapterManifests:

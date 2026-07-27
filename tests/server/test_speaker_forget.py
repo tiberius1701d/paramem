@@ -84,11 +84,12 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     ep_registry.__contains__ = MagicMock(side_effect=lambda k: k in keys)
     ep_registry.is_stale = MagicMock(return_value=False)
     ep_registry.knows = MagicMock(side_effect=lambda k: k in keys)
-    # save_bytes must return valid bytes so the handler can compute sha256.
-    # Distinct pre/post values are not needed here because discard_keys is mocked
-    # (it does not mutate the mock registry); any stable bytes value is sufficient.
+    # save_bytes must return valid bytes so the handler can compute sha256 for
+    # the post-erase re-stamp. Distinct pre/post values are not needed here
+    # because discard_keys is mocked (it does not mutate the mock registry);
+    # any stable bytes value is sufficient.
     ep_registry.save_bytes.return_value = (
-        b'{"active_keys": [], "fidelity_history": {}, "health": null, "stale": {}}'
+        b'{"active_keys": [], "fidelity_history": {}, "stale": {}, "simhash": {}}'
     )
     sem_registry = MagicMock(spec=KeyRegistry)
     sem_registry.__contains__ = MagicMock(side_effect=lambda _: False)
@@ -558,6 +559,14 @@ class TestLiveSlotManifestReStamp:
         # because save_bytes() now includes the unified simhash map.
         h_old = hashlib.sha256(ep_reg.save_bytes()).hexdigest()
 
+        # Persist the pre-erase registry to disk. The handler reads the
+        # PRE-ERASE hash from the ON-DISK file via _compute_tier_registry_sha256
+        # (not by re-serialising the in-memory registry — see the root-cause
+        # comment at the /speaker/forget call site), so the on-disk bytes must
+        # exist and match H_old for find_live_slot to locate the manifest below.
+        registry_path = tmp_path / "adapters" / tier_name / "indexed_key_registry.json"
+        ep_reg.save(registry_path)
+
         # Write a real slot directory with a manifest stamped with H_old.
         # key_count reflects both keys (counts weight keys, not registry keys).
         slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
@@ -608,6 +617,98 @@ class TestLiveSlotManifestReStamp:
             "key_count must remain unchanged — it counts keys in the adapter weights, "
             "which /forget does not modify"
         )
+
+    def test_rebind_survives_registry_payload_shape_change(self, tmp_path, monkeypatch):
+        """Cross-version regression: the pre-erase hash must come from the ON-DISK
+        bytes, not from re-serialising the in-memory registry.
+
+        Models the deploy -> first-fold window: the registry file on disk was
+        last written by an OLDER build whose ``KeyRegistry.save_bytes()`` still
+        emitted a 5-key payload (including a now-retired ``"health"`` field);
+        the manifest's ``registry_sha256`` was stamped against those exact
+        bytes. The server has since been upgraded — the resident in-memory
+        ``KeyRegistry`` (loaded from the same file, which tolerantly ignores
+        the unknown ``"health"`` key) now serialises to a DIFFERENT 4-key
+        payload if re-hashed in memory. A /speaker/forget erase must still
+        locate and re-stamp the live slot by reading the literal on-disk
+        bytes — proven by asserting the two hashes diverge before running the
+        request, so this test cannot pass by accident.
+        """
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            relation_type="factual",
+            first_seen="",
+        )
+
+        # Literal LEGACY on-disk payload — the exact 5-key shape a pre-migration
+        # build's KeyRegistry.save_bytes() emitted, including the retired
+        # "health" field. Intentionally NOT produced via ep_reg.save_bytes():
+        # this is the file a prior server version actually wrote to disk, and
+        # the CURRENT in-memory registry never re-derives it.
+        legacy_registry_bytes = (
+            b'{"active_keys": ["graph1", "graph2"], "fidelity_history": {}, '
+            b'"health": null, "stale": {}, "simhash": {}}'
+        )
+        registry_path = tmp_path / "adapters" / tier_name / "indexed_key_registry.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_bytes(legacy_registry_bytes)
+        h_legacy = hashlib.sha256(legacy_registry_bytes).hexdigest()
+
+        # Sanity: the CURRENT in-memory serialisation diverges from the legacy
+        # on-disk bytes — if it didn't, this test couldn't distinguish the
+        # root-cause fix from the bug it replaces.
+        assert hashlib.sha256(ep_reg.save_bytes()).hexdigest() != h_legacy, (
+            "test setup error: in-memory and legacy on-disk hashes must differ"
+        )
+
+        slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
+        slot_dir.mkdir(parents=True)
+        original_manifest = _minimal_manifest_for_tier(tier_name, h_legacy, key_count=2)
+        write_manifest(slot_dir, original_manifest)
+
+        kind_dir = tmp_path / "adapters" / tier_name
+        assert find_live_slot(kind_dir, h_legacy) == slot_dir
+
+        loop = MagicMock()
+        loop.store = real_store
+
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path / "adapters"
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        with patch("paramem.memory.persistence.save_registry"):
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+
+        ep_reg_after = real_store.registry(tier_name)
+        h_new = hashlib.sha256(ep_reg_after.save_bytes()).hexdigest()
+        assert find_live_slot(kind_dir, h_new) == slot_dir, (
+            "rebind must succeed by reading the on-disk pre-erase bytes even "
+            "though the current in-memory serialiser can no longer reproduce "
+            "the legacy payload shape they were hashed from"
+        )
+        manifest_after = read_manifest(slot_dir)
+        assert manifest_after.registry_sha256 == h_new
+        assert manifest_after.key_count == original_manifest.key_count
 
     def test_no_slot_logs_error_without_failing(self, tmp_path, monkeypatch, caplog):
         """When no slot matches the pre-erase hash, an ERROR is logged but the request succeeds.

@@ -9,9 +9,7 @@ the server.
 
 The fix routes the read through ``read_maybe_encrypted``. This test exercises
 the exact write→read pair against an encrypted registry and asserts it
-round-trips, plus exercises the resilience block in app.py (it must not
-re-raise on any failure shape — UnicodeDecodeError, RuntimeError on missing
-key, OSError on missing file, JSONDecodeError on corrupt content).
+round-trips.
 """
 
 from __future__ import annotations
@@ -77,7 +75,7 @@ def test_encrypted_registry_round_trips_through_read_maybe_encrypted(
 
     registry_path = tmp_path / "indexed_key_registry.json"
     payload = {
-        "adapter_health": {"episodic": {"recall": 0.95, "loss": 0.18}},
+        "active_keys": ["graph1", "graph2"],
         "version": 2,
     }
     write_infra_bytes(registry_path, json.dumps(payload).encode("utf-8"))
@@ -94,7 +92,7 @@ def test_encrypted_registry_round_trips_through_read_maybe_encrypted(
     # The fixed code path (read_maybe_encrypted + json.loads) round-trips:
     parsed = json.loads(read_maybe_encrypted(registry_path).decode("utf-8"))
     assert parsed == payload
-    assert parsed["adapter_health"]["episodic"]["recall"] == 0.95
+    assert parsed["active_keys"] == ["graph1", "graph2"]
 
 
 def test_plaintext_registry_still_works(tmp_path: Path) -> None:
@@ -103,7 +101,7 @@ def test_plaintext_registry_still_works(tmp_path: Path) -> None:
     too — this is the common case on hosts where the operator has not set up
     the daily identity."""
     registry_path = tmp_path / "indexed_key_registry.json"
-    payload = {"adapter_health": {}, "version": 2}
+    payload = {"active_keys": [], "version": 2}
     write_infra_bytes(registry_path, json.dumps(payload).encode("utf-8"))
 
     on_disk = registry_path.read_bytes()
@@ -113,14 +111,14 @@ def test_plaintext_registry_still_works(tmp_path: Path) -> None:
     assert parsed == payload
 
 
-def test_app_status_block_swallows_decrypt_failure(
+def test_read_maybe_encrypted_raises_on_wrong_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If the registry is age-encrypted with a key the running process can't
     unwrap (e.g. operator rotated the daily identity but didn't restart the
-    server), ``read_maybe_encrypted`` raises pyrage.DecryptError. The /status
-    block must catch this and return an empty adapter_health dict — never
-    surface as HTTP 500."""
+    server), ``read_maybe_encrypted`` raises ``pyrage.DecryptError`` rather
+    than silently returning garbage — callers are responsible for deciding
+    how to handle that failure."""
     # Mint two distinct daily identities — one to encrypt, the other to load.
     encrypter = mint_daily_identity()
     decrypter_pass = "different-passphrase"
@@ -139,23 +137,9 @@ def test_app_status_block_swallows_decrypt_failure(
     registry_path = tmp_path / "indexed_key_registry.json"
     from paramem.backup.encryption import age_encrypt_bytes
 
-    ciphertext = age_encrypt_bytes(b'{"adapter_health":{}}', [encrypter.to_public()])
+    ciphertext = age_encrypt_bytes(b'{"active_keys":[]}', [encrypter.to_public()])
     registry_path.write_bytes(ciphertext)
 
     # The unwrap must fail (different daily identity, no recovery match).
     with pytest.raises(pyrage.DecryptError):
         read_maybe_encrypted(registry_path)
-
-    # The /status block matches `except Exception:` — verify the *fix* swallows.
-    adapter_health: dict = {}
-    if registry_path.exists():
-        try:
-            adapter_health = (
-                json.loads(read_maybe_encrypted(registry_path).decode("utf-8")).get(
-                    "adapter_health", {}
-                )
-                or {}
-            )
-        except Exception:
-            adapter_health = {}
-    assert adapter_health == {}

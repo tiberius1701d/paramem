@@ -206,18 +206,50 @@ class TestPerTierSchema:
         assert "graph1" in loaded
         assert "graph2" in loaded
 
-    def test_load_legacy_file_no_health_field(self, tmp_path):
-        """Load a JSON file written before the health field existed (no 'health' key)."""
-        path = tmp_path / "legacy_registry.json"
-        legacy = {
+    def test_load_tolerates_unknown_keys(self, tmp_path):
+        """Load ignores any on-disk key outside the current schema.
+
+        Forward-tolerant by construction — ``_from_payload`` only reads the
+        keys it knows about (``active_keys``, ``fidelity_history``, ``stale``,
+        ``simhash``); anything else on disk is silently dropped rather than
+        requiring an explicit migration whenever the schema changes.
+        """
+        path = tmp_path / "registry_with_unknown_key.json"
+        payload = {
             "active_keys": ["graph1", "graph2", "graph3"],
             "fidelity_history": {"graph1": [0.9, 0.85]},
+            "some_future_field": {"anything": True},
+        }
+        path.write_text(_json.dumps(payload))
+
+        loaded = KeyRegistry.load(path)
+        assert loaded.list_active() == ["graph1", "graph2", "graph3"]
+
+    def test_load_legacy_health_dict_is_dropped_on_next_save(self, tmp_path):
+        """A payload carrying the retired ``"health"`` dict loads without error,
+        and the next save_bytes() omits it — no attribute keeps it resident.
+
+        Regression for the adapter-health quarantine retirement: git history
+        shows the field never had a production writer, only earlier test code
+        exercised it directly. This proves a real on-disk survivor (from a
+        pre-retirement build, or hand-authored) is inert rather than round-
+        tripped forward forever.
+        """
+        path = tmp_path / "legacy_registry.json"
+        legacy = {
+            "active_keys": ["graph1", "graph2"],
+            "fidelity_history": {},
+            "health": {"status": "degenerated", "reason": "recall sanity check tripped"},
+            "stale": {},
+            "simhash": {},
         }
         path.write_text(_json.dumps(legacy))
 
         loaded = KeyRegistry.load(path)
-        assert loaded.list_active() == ["graph1", "graph2", "graph3"]
-        assert loaded.is_healthy()  # no health record = healthy
+        assert loaded.list_active() == ["graph1", "graph2"]
+
+        payload = set(_json.loads(loaded.save_bytes()))
+        assert payload == {"active_keys", "fidelity_history", "stale", "simhash"}
 
 
 class TestStaleSemantics:
@@ -367,7 +399,6 @@ class TestStaleSemantics:
         legacy = {
             "active_keys": ["graph1", "graph2"],
             "fidelity_history": {},
-            "health": None,
             # no "stale" key
         }
         path.write_text(_json.dumps(legacy))
@@ -557,23 +588,26 @@ class TestKnownPredicate:
 class TestSaveBytesBoundary:
     def test_save_bytes_payload_is_bookkeeping_free(self):
         """HARD CONSTRAINT: KeyRegistry.save_bytes() must contain exactly
-        {active_keys, fidelity_history, health, stale, simhash} — no bookkeeping fields.
+        {active_keys, fidelity_history, stale, simhash} — no bookkeeping fields.
 
         registry_sha256 hashes the save_bytes payload; bookkeeping must never
         enter it or slot identity breaks on restart.  The ``"simhash"`` field
         (unified SimHash storage, simhash-unification refactor) holds the
         active∪stale fingerprint map.  The ``"stale"`` field was added in the
-        soft-stale extension.
+        soft-stale extension.  The legacy ``"health"`` field (retired
+        adapter-health quarantine) has no backing attribute any more, so a
+        save never emits it — even after loading a legacy file that had one.
         """
         reg = KeyRegistry()
         reg.add("graph1")
         reg.add("graph2")
         reg.update_fidelity("graph1", 0.9)
         payload = set(_json.loads(reg.save_bytes()))
-        assert payload == {"active_keys", "fidelity_history", "health", "stale", "simhash"}
+        assert payload == {"active_keys", "fidelity_history", "stale", "simhash"}
         assert "speaker_id" not in payload
         assert "first_seen_cycle" not in payload
         assert "bookkeeping" not in payload
+        assert "health" not in payload
 
 
 class TestLoadSimhashes:
@@ -642,7 +676,6 @@ class TestLoadSimhashes:
                 {
                     "active_keys": ["graph1"],
                     "fidelity_history": {},
-                    "health": None,
                     "stale": {},
                 }
             )

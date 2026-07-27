@@ -3,12 +3,12 @@
 Tests cover:
 - bump/clear/read round-trip
 - durable survival across in-memory reconstruction (simulates ungraceful restart)
-- abort-pins-no-increment / degenerate-pins-and-increments semantics (at SessionBuffer level)
+- abort-pins-no-increment / recall_failed-pins-and-increments semantics (at SessionBuffer level)
 - reset-on-recall-success
 - cap-reached releases and clears durable row on mark_consolidated
 - ENOSPC raises RetryStateCapacityError and records incident; non-ENOSPC propagates unchanged
-- M1 regression: abort/degenerate cycle does NOT auto-resolve consolidation_retry_exhausted
-  incident in _finalize_interim
+- an abort/cap_pending/recall_failed cycle does NOT auto-resolve the
+  consolidation_retry_exhausted incident in _finalize_interim
 - old name recall_retry_cap raises TypeError (clean rename guard)
 """
 
@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+from paramem.server.app import _is_interim_clean_success
 from paramem.server.retry_state import (
     RetryStateCapacityError,
     RetryStateSchemaError,
@@ -178,37 +179,30 @@ class TestDurabilityAcrossRestart:
 
 
 # ---------------------------------------------------------------------------
-# Abort pins, does NOT increment; degenerate pins AND increments
+# Abort pins, does NOT increment; recall_failed pins AND increments
 # ---------------------------------------------------------------------------
 
 
-class TestAbortDegenerateSemantics:
-    def test_abort_pins_session_without_incrementing(self, tmp_path: Path) -> None:
-        """ABORT: contributing sessions stay pending; durable count NOT incremented."""
+class TestAbortRecallFailedSemantics:
+    # NOTE: no test_abort_pins_session_without_incrementing here. ABORT's
+    # "pin" is not a distinct SessionBuffer-level API call — it is the
+    # ABSENCE of calling bump_retry_and_release / mark_consolidated for that
+    # session id (_extract_and_start_training in app.py simply omits the
+    # session from both). SessionBuffer exposes no "pin" method to exercise
+    # in isolation, so a unit test at this level could only assert 0 == 0
+    # around no call — that vacuous test was removed rather than kept as a
+    # tautology. The outcome-set half of the split (which modes DO / do not
+    # increment) is real, reachable coverage: see
+    # TestFinalizeInterimCleanSuccessGuard below, which calls
+    # app._is_interim_clean_success directly.
+
+    def test_recall_failed_increments_durable_count(self, tmp_path: Path) -> None:
+        """RECALL_FAILED: contributing sessions are both pinned and incremented."""
         buf = _make_buf(tmp_path)
-        sid = "abort-session"
+        sid = "recall-failed-session"
         buf._sessions[sid] = {"speaker": None, "state": "new"}
 
-        # Simulate the _cycle_failed_sids assembly for an ABORT cycle.
-        # In _run_interim_training: _pin_sids gets the contributing sessions,
-        # but _count_sids does NOT (abort does not increment).
-        # Here we test the retry_state module directly.
-
-        # Abort: pin (add to failed_session_ids equivalent), do NOT bump.
-        # The count must remain 0.
-        counts_before = read_retry_counts(tmp_path / "state")
-        assert counts_before.get(sid, 0) == 0
-
-        # Simulated: for abort, only pin (no bump).  Count stays 0.
-        assert read_retry_counts(tmp_path / "state").get(sid, 0) == 0
-
-    def test_degenerate_increments_durable_count(self, tmp_path: Path) -> None:
-        """DEGENERATE: contributing sessions are both pinned and incremented."""
-        buf = _make_buf(tmp_path)
-        sid = "degenerate-session"
-        buf._sessions[sid] = {"speaker": None, "state": "new"}
-
-        # Simulate _count_sids for degenerate mode — bump IS called.
+        # Simulate _count_sids for recall_failed mode — bump IS called.
         released = buf.bump_retry_and_release({sid})
         assert released == [], "cap=3, count=1 — must not release"
         assert read_retry_counts(tmp_path / "state")[sid] == 1
@@ -396,41 +390,24 @@ class TestEnospcShortCircuit:
 
 
 # ---------------------------------------------------------------------------
-# M1 regression: abort/cap_pending cycle must NOT auto-resolve an incident
+# Auto-resolve guard: an abort/cap_pending cycle must NOT auto-resolve an
+# incident recorded by the same cycle
 # ---------------------------------------------------------------------------
 
 
-class TestM1AutoResolveGuard:
-    """Regression: an abort or cap_pending cycle must not resolve a
+class TestFinalizeInterimCleanSuccessGuard:
+    """An abort or cap_pending cycle must not resolve a
     consolidation_retry_exhausted incident that was just recorded.
 
-    The guard in _finalize_interim checks:
-      _is_clean_success = (
-          not recall_failed_session_ids
-          AND _cycle_mode not in {"aborted","cap_pending"}
-          AND not _released_sids
-      )
-    We test the logic independently by verifying the condition evaluates False
-    for abort/cap_pending modes and True only for a genuine clean cycle.
+    Calls ``app._is_interim_clean_success`` directly — the exact function
+    ``_finalize_interim`` gates on — rather than re-implementing its formula
+    here, so this test cannot drift from the production guard.
     """
-
-    def _is_clean_success(
-        self,
-        result: dict,
-        cycle_mode: str,
-        released_sids: list,
-    ) -> bool:
-        """Mirror of the _finalize_interim clean-success guard."""
-        return (
-            not result.get("recall_failed_session_ids", [])
-            and cycle_mode not in {"aborted", "cap_pending"}
-            and not released_sids
-        )
 
     def test_abort_result_is_not_clean_success(self) -> None:
         """ABORT mode must evaluate to not-clean-success."""
         result = {"mode": "aborted", "adapter_name": "episodic"}
-        assert not self._is_clean_success(result, "aborted", [])
+        assert not _is_interim_clean_success(result, "aborted", [])
 
     def test_cap_pending_result_is_not_clean_success(self) -> None:
         """CAP_PENDING mode must evaluate to not-clean-success.
@@ -439,23 +416,23 @@ class TestM1AutoResolveGuard:
         stays pending and no incident should be auto-resolved.
         """
         result = {"mode": "cap_pending", "adapter_name": None, "new_keys": []}
-        assert not self._is_clean_success(result, "cap_pending", [])
+        assert not _is_interim_clean_success(result, "cap_pending", [])
 
     def test_recall_failure_is_not_clean_success(self) -> None:
         """A result with recall_failed_session_ids is not clean success."""
         result = {"mode": "trained", "recall_failed_session_ids": ["sid-1"]}
-        assert not self._is_clean_success(result, "trained", [])
+        assert not _is_interim_clean_success(result, "trained", [])
 
     def test_cap_released_is_not_clean_success(self) -> None:
         """Even with no recall_failed_session_ids, releasing a cap-hit session
         is NOT clean success (an incident was just recorded)."""
         result = {"mode": "trained"}
-        assert not self._is_clean_success(result, "trained", ["released-sid"])
+        assert not _is_interim_clean_success(result, "trained", ["released-sid"])
 
     def test_genuine_clean_success(self) -> None:
         """Only a zero-failure, trained, zero-released cycle is clean success."""
         result = {"mode": "trained", "recall_failed_session_ids": []}
-        assert self._is_clean_success(result, "trained", [])
+        assert _is_interim_clean_success(result, "trained", [])
 
 
 # ---------------------------------------------------------------------------

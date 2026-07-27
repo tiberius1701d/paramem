@@ -10,17 +10,16 @@ The registry's contents are scoped to one tier:
 
 - ``active_keys`` — keys assigned to this tier.
 - ``fidelity_history`` — per-key reconstruction-fidelity scores.
-- ``health`` — this tier's learning-capacity status (single record).
 - ``simhash`` — per-key 64-bit fingerprint for the SimHash confidence gate.
   Active fingerprints live in ``_simhash``; stale fingerprints are carried
   in the stale record (``_stale[key]["simhash"]``).  Both partitions are
   serialised to ``indexed_key_registry.json`` under the ``"simhash"`` key
   (active∪stale superset) so the on-disk file is the single source of truth.
 
-Cross-tier operations (which tier owns key X, the full health map across
-tiers, dropping interim-tier registries at the end of a full cycle) live
-on the :class:`paramem.training.consolidation.ConsolidationLoop` since the
-loop is what holds the per-tier dict.
+Cross-tier operations (which tier owns key X, dropping interim-tier
+registries at the end of a full cycle) live on the
+:class:`paramem.training.consolidation.ConsolidationLoop` since the loop is
+what holds the per-tier dict.
 """
 
 from __future__ import annotations
@@ -33,16 +32,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Adapter-health status vocabulary. ``"healthy"`` is the default after a
-# successful training pass; ``"degenerated"`` is set when the recall
-# sanity check trips and the adapter must stop absorbing new keys until
-# the next full consolidation cycle.
-ADAPTER_HEALTH_HEALTHY = "healthy"
-ADAPTER_HEALTH_DEGENERATED = "degenerated"
-
 
 class KeyRegistry:
-    """Tracks one tier's active keys, per-key fidelity, tier health, and SimHash fingerprints.
+    """Tracks one tier's active keys, per-key fidelity, and SimHash fingerprints.
 
     Keys can be in one of three states:
     - **active**: in ``_active_keys``, enumerated by all normal paths.
@@ -66,8 +58,6 @@ class KeyRegistry:
     def __init__(self) -> None:
         self._active_keys: list[str] = []
         self._fidelity_history: dict[str, list[float]] = defaultdict(list)
-        # Single health record for this tier (None = untracked = healthy).
-        self._health: dict | None = None
         # Stale partition: key -> {"stale_since": ISO, "stale_cycles": int,
         #                          "simhash": int (optional but written by stale())}.
         # Keys here are EXCLUDED from normal enumeration and the SimHash gate.
@@ -320,49 +310,6 @@ class KeyRegistry:
         return all(score < threshold for score in history[-consecutive_cycles:])
 
     # ------------------------------------------------------------------
-    # Tier health (single record; the tier is encoded by the file path)
-    # ------------------------------------------------------------------
-
-    def set_health(
-        self,
-        status: str,
-        *,
-        reason: str = "",
-        keys_at_mark: int | None = None,
-    ) -> None:
-        """Record the learning-capacity status of this tier.
-
-        Args:
-            status: One of :data:`ADAPTER_HEALTH_HEALTHY` /
-                :data:`ADAPTER_HEALTH_DEGENERATED`.
-            reason: Human-readable justification surfaced in pstatus.
-            keys_at_mark: Key count at the time the status was set.
-                Defaults to the current count.
-        """
-        if keys_at_mark is None:
-            keys_at_mark = len(self._active_keys)
-        self._health = {
-            "status": status,
-            "reason": reason,
-            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "keys_at_mark": int(keys_at_mark),
-        }
-
-    def get_health(self) -> dict | None:
-        """Return a copy of this tier's health record, or ``None`` if untracked."""
-        return dict(self._health) if self._health is not None else None
-
-    def is_healthy(self) -> bool:
-        """``True`` unless the tier is explicitly marked degenerated.
-
-        Untracked (no record yet) is considered healthy — a freshly minted
-        registry has no record until someone calls :meth:`set_health`.
-        """
-        if self._health is None:
-            return True
-        return self._health.get("status") != ADAPTER_HEALTH_DEGENERATED
-
-    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -396,7 +343,6 @@ class KeyRegistry:
         data = {
             "active_keys": self._active_keys,
             "fidelity_history": dict(self._fidelity_history),
-            "health": dict(self._health) if self._health is not None else None,
             "stale": dict(self._stale),
             "simhash": self._known_simhashes(),
         }
@@ -453,12 +399,11 @@ class KeyRegistry:
 
         registry = cls._from_payload(data)
         logger.info(
-            "Key registry loaded from %s: %d active keys, %d stale, %d fingerprints, health=%s",
+            "Key registry loaded from %s: %d active keys, %d stale, %d fingerprints",
             path,
             len(registry._active_keys),
             len(registry._stale),
             len(registry._simhash) + sum(1 for r in registry._stale.values() if "simhash" in r),
-            "set" if registry._health is not None else "unset",
         )
         return registry
 
@@ -536,9 +481,6 @@ class KeyRegistry:
         registry._active_keys = data.get("active_keys", [])
         for key, scores in data.get("fidelity_history", {}).items():
             registry._fidelity_history[key] = scores
-        health = data.get("health")
-        if isinstance(health, dict) and "status" in health:
-            registry._health = dict(health)
         stale_raw = data.get("stale", {})
         if isinstance(stale_raw, dict):
             registry._stale = {k: dict(v) for k, v in stale_raw.items() if isinstance(v, dict)}

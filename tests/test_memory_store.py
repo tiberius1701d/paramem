@@ -272,7 +272,6 @@ class TestKeyRegistrySimhash:
         data = {
             "active_keys": ["graph1"],
             "fidelity_history": {},
-            "health": None,
             "stale": {},
             "simhash": {"graph1": 0xABCDEF},
         }
@@ -295,7 +294,6 @@ class TestKeyRegistrySimhash:
         data = {
             "active_keys": ["graph1"],
             "fidelity_history": {},
-            "health": None,
             "stale": {},
         }
         path.write_text(json.dumps(data))

@@ -10,9 +10,9 @@ Schema
 ``{"version": 1, "counts": {session_id: int}}``
 
 Each entry is a non-negative integer counting how many consecutive consolidation
-cycles the session contributed a recall-gate failure or a DEGENERATE outcome.
-ABORT cycles do NOT increment the counter (abort = yield-to-inference, not a
-failed encoding attempt).
+cycles the session contributed a recall-gate failure (recall_failed outcome).
+ABORT (yield-to-inference) and CAP_PENDING (interim ring full) cycles do NOT
+increment the counter — neither is a failed encoding attempt.
 
 Lifecycle
 ---------

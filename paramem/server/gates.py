@@ -164,16 +164,15 @@ def _registry_key_population(parsed: dict) -> list[str]:
     Two registry shapes exist on disk and both reach this function (via
     :func:`_sample_registry_keys` and gate 4's registry-size precondition):
 
-    - KeyRegistry per-tier schema (``KeyRegistry.save_bytes()``,
-      ``paramem/training/key_registry.py:393-399``)::
+    - KeyRegistry per-tier schema (:meth:`~paramem.training.key_registry.KeyRegistry.save_bytes`)::
 
-          {"active_keys": [...], "fidelity_history": {...}, "health": ...,
+          {"active_keys": [...], "fidelity_history": {...},
            "stale": {...}, "simhash": {key: int}}
 
-    - ``key_metadata.json`` schema (``_save_key_metadata``,
-      ``paramem/server/consolidation.py:436-440``) — the file gate 4's
-      ``live_registry_path`` actually points at
-      (``live_config.paths.key_metadata``, ``paramem/server/app.py:8695``)::
+    - ``key_metadata.json`` schema
+      (:func:`~paramem.server.consolidation._save_key_metadata`) — the file
+      gate 4's ``live_registry_path`` actually points at
+      (:attr:`~paramem.server.config.PathsConfig.key_metadata`)::
 
           {"cycle_count": int, "promoted_keys": [...], "keys": {key: bookkeeping}}
 

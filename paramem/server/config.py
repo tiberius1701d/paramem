@@ -1022,11 +1022,12 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     mode: str = "train"  # "train" = full pipeline, "simulate" = extract only
     retain_sessions: bool = True
     # Maximum number of interim cycles a session can be held pending because
-    # of a recall-gate failure or DEGENERATE outcome.  When the counter
+    # of a recall-gate failure (recall_failed outcome).  When the counter
     # reaches this cap the session is released (no longer pinned), a
     # consolidation_retry_exhausted incident is recorded, and a WARNING is
-    # logged.  ABORT cycles (yield-to-inference) do NOT increment — only
-    # genuine encoding failures count.  Must be a positive integer (> 0).
+    # logged.  ABORT (yield-to-inference) and CAP_PENDING (interim ring full)
+    # cycles do NOT increment — only genuine encoding failures count.  Must
+    # be a positive integer (> 0).
     # Read at SessionBuffer construction (app.py).
     consolidation_retry_cap: int = 3
     # LoRA training hyperparameters (Test 17 recipe). num_epochs,

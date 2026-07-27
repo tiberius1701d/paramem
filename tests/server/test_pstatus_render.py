@@ -52,7 +52,6 @@ _BASE_STATUS: dict = {
     "pending_enrollments": 0,
     "adapter_specs": {},
     "speakers": [],
-    "adapter_health": {},
     "speaker_embedding_backend": None,
     "speaker_embedding_model": None,
     "speaker_embedding_device": None,

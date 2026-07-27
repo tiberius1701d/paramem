@@ -309,9 +309,7 @@ class TestReadSimhashRegistryPerTierPaths:
         adapter_dir = tmp_path / "adapters"
         (adapter_dir / "episodic").mkdir(parents=True)
         (adapter_dir / "episodic" / "indexed_key_registry.json").write_text(
-            json.dumps(
-                {"active_keys": ["graph1"], "fidelity_history": {}, "health": None, "stale": {}}
-            ),
+            json.dumps({"active_keys": ["graph1"], "fidelity_history": {}, "stale": {}}),
             encoding="utf-8",
         )
         self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})

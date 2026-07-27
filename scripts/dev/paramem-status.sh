@@ -358,13 +358,6 @@ fields = {
     "throttle_end": (d.get("thermal_policy") or {}).get("end") or "-",
     "throttle_temp_limit": (d.get("thermal_policy") or {}).get("temp_limit") if (d.get("thermal_policy") or {}).get("temp_limit") is not None else "-",
     "throttle_active": (d.get("thermal_policy") or {}).get("currently_throttling", False),
-    # adapter_health: count degenerated so bash can render a warning banner
-    # without re-parsing the whole map.
-    "degenerated_count": sum(
-        1 for h in (d.get("adapter_health") or {}).values()
-        if h.get("status") == "degenerated"
-    ),
-    "adapter_health_count": len(d.get("adapter_health") or {}),
     # Deferred-mode hold — owner_alive is "yes" / "no" / "-" (unknown) so
     # bash can render a coloured status tag without re-parsing the JSON.
     # owner_hint is the short cmd tag ("python / paramem.server.app") so
@@ -418,7 +411,6 @@ print("|".join(str(fields[k]) for k in [
     "bg_trainer_active", "bg_trainer_adapter",
     "throttle_mode", "throttle_start", "throttle_end",
     "throttle_temp_limit", "throttle_active",
-    "degenerated_count", "adapter_health_count",
     "hold_active", "hold_owner_pid", "hold_owner_alive", "hold_age",
     "hold_owner_hint",
     "encryption",
@@ -453,18 +445,6 @@ for s in d.get("speakers", []):
         s.get("id", "?"), s.get("name", "?"),
         s.get("embeddings", 0), s.get("pending", 0),
         s.get("enroll_method", "unknown"),
-    ))
-# Per-adapter health lines: adapter<TAB>status<TAB>reason<TAB>keys_at_mark<TAB>updated_at
-# Sorted: degenerated first so the most important rows surface at the top.
-health_items = list((d.get("adapter_health") or {}).items())
-health_items.sort(key=lambda kv: (kv[1].get("status") != "degenerated", kv[0]))
-for adapter_id, h in health_items:
-    print("HLT\t{}\t{}\t{}\t{}\t{}".format(
-        adapter_id,
-        h.get("status", "?"),
-        (h.get("reason") or "").replace("\t", " ").replace("\n", " "),
-        h.get("keys_at_mark", 0),
-        h.get("updated_at", ""),
     ))
 # Attention block lines: ATTN<TAB>kind<TAB>level<TAB>summary<TAB>action_hint<TAB>age_seconds
 for item in (d.get("attention") or {}).get("items", []) or []:
@@ -521,7 +501,6 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     bg_trainer_active bg_trainer_adapter \
     throttle_mode throttle_start throttle_end \
     throttle_temp_limit throttle_active \
-    degenerated_count adapter_health_count \
     hold_active hold_owner_pid hold_owner_alive hold_age \
     hold_owner_hint \
     encryption \
@@ -531,7 +510,6 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     vram_used_mib vram_total_mib vram_paramem_mib \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
-health_lines=$(echo "$parsed" | awk '/^HLT\t/')
 adapter_spec_lines=$(echo "$parsed" | awk '/^ADPT\t/')
 # Parse attention items, migrate footer, and new observability lines.
 attention_lines=$(echo "$parsed" | awk '/^ATTN\t/')
@@ -895,29 +873,6 @@ elif [[ "$active_adapter" != "-" && -n "$active_adapter" ]]; then
     echo -e "  Active:   ${GREEN}${active_adapter}${RESET} (${keys_count} keys)"
 else
     echo -e "  Active:   ${DIM}none${RESET}"
-fi
-
-# Adapter health — warn if any adapter is degenerated, list all tracked entries.
-# Health lines are pre-sorted so degenerated adapters appear first.
-if (( adapter_health_count > 0 )); then
-    if (( degenerated_count > 0 )); then
-        echo -e "  Health:   ${RED}${degenerated_count} degenerated${RESET} of ${adapter_health_count} tracked — new facts queued until next full consolidation"
-    else
-        echo -e "  Health:   ${GREEN}all ${adapter_health_count} healthy${RESET}"
-    fi
-    while IFS=$'\t' read -r _marker hname hstatus hreason hkeys hupdated; do
-        [[ -z "$hname" ]] && continue
-        if [[ "$hstatus" == "degenerated" ]]; then
-            status_tag="${RED}${hstatus}${RESET}"
-        else
-            status_tag="${DIM}${hstatus}${RESET}"
-        fi
-        row="    ${DIM}${hname}${RESET}  [${status_tag}]  (${hkeys} keys)"
-        if [[ -n "$hreason" ]]; then
-            row+="  ${DIM}${hreason}${RESET}"
-        fi
-        echo -e "$row"
-    done <<< "$health_lines"
 fi
 
 # Sessions

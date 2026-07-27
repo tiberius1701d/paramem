@@ -227,7 +227,7 @@ consolidation:
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
-  consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
+  consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure before being released; ABORT/CAP_PENDING do not count
   # Per-fold training-budget derivation (standard mechanism, unconditional --
   # validated via Test 20). epochs/gradient-accumulation/lr_decay_steps are
   # ALWAYS derived from the fold's key-triple count at the training funnel
