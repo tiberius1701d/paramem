@@ -2291,177 +2291,6 @@ class TestInterimSlotPayloadFilter:
         assert not graph_slot.exists()
 
 
-class TestRunFullConsolidationSyncAccumulating:
-    """App-layer: _run_full_consolidation_sync honours the accumulating return.
-
-    When ``consolidate`` returns ``status="accumulating"``,
-    the orchestrator in ``_run_full_cycle`` must:
-    - NOT call ``session_buffer.mark_consolidated``
-    - NOT stamp ``_state["last_consolidation"]``
-    - Write a durable run-status record with ``outcome="accumulating"`` and
-      ``detail["accumulating_reason"]`` present (read back via ``read_last_runs``)
-    - NOT call ``ConsolidationLoop._save_adapters`` (proxy for on-disk window
-      stamp remaining unchanged — the real on-disk stamp lives in the main-slot
-      meta.json written by ``_save_adapters``; no GPU/real fold machinery needed
-      to assert this proxy)
-    """
-
-    def _make_state(self, tmp_path=None) -> dict:
-        """Minimal _state for _run_full_consolidation_sync.
-
-        Uses a pre-populated ``consolidation_loop`` mock so the function's
-        ``create_consolidation_loop`` branch is skipped entirely.
-
-        ``config.consolidation.training_temp_limit`` is set to 0 so that
-        ``ThermalPolicy.from_consolidation_config`` returns None without
-        comparing a MagicMock against an integer (which raises TypeError).
-
-        Args:
-            tmp_path: When provided, set ``config.paths.data`` to this real
-                path so that incident/run-status I/O writes land in
-                ``tmp_path/state/`` rather than creating a ``MagicMock/``
-                directory at the repo root.  Tests that read back the durable
-                run-status record must supply this.
-        """
-        mock_config = MagicMock()
-        mock_config.consolidation.mode = "train"
-        # training_temp_limit <= 0 → ThermalPolicy.from_consolidation_config returns None.
-        mock_config.consolidation.training_temp_limit = 0
-        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown fold gate.
-        mock_config.vram.cooldown_gate_threshold_c = 0
-        # Ground incident/run-status I/O in a real path so the writes land in
-        # the pytest tmp directory instead of creating a MagicMock/ tree at
-        # the repo root.
-        if tmp_path is not None:
-            mock_config.paths.data = tmp_path
-
-        mock_loop = MagicMock()
-        mock_loop.model = MagicMock(name="model")
-        mock_loop.consolidate.return_value = {
-            "status": "accumulating",
-            "accumulating_reason": {"floor": 30, "episodic": 5, "parked": {}},
-            "tiers_rebuilt": [],
-        }
-
-        mock_session_buffer = MagicMock()
-
-        return {
-            "config": mock_config,
-            "model": MagicMock(name="model"),
-            "tokenizer": MagicMock(name="tokenizer"),
-            "consolidation_loop": mock_loop,
-            "session_buffer": mock_session_buffer,
-            "router": None,
-            "background_trainer": None,
-            "consolidating": True,
-            "last_consolidation": None,
-            "last_consolidation_result": None,
-            "event_loop": None,
-        }
-
-    def test_accumulating_does_not_mark_consolidated(self, monkeypatch, tmp_path):
-        """session_buffer.mark_consolidated is NOT called when fold returns accumulating."""
-        from unittest.mock import patch
-
-        import paramem.server.app as app_module
-
-        state = self._make_state(tmp_path)
-        monkeypatch.setattr(app_module, "_state", state)
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync("all_tiers")
-
-        state["session_buffer"].mark_consolidated.assert_not_called()
-
-    def test_accumulating_does_not_stamp_last_consolidation(self, monkeypatch, tmp_path):
-        """_state["last_consolidation"] is NOT updated when fold returns accumulating."""
-        from unittest.mock import patch
-
-        import paramem.server.app as app_module
-
-        state = self._make_state(tmp_path)
-        prior_stamp = state["last_consolidation"]  # None
-        monkeypatch.setattr(app_module, "_state", state)
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync("all_tiers")
-
-        assert state["last_consolidation"] == prior_stamp, (
-            "_state['last_consolidation'] must NOT be updated on accumulating return; "
-            f"was {prior_stamp!r}, got {state['last_consolidation']!r}"
-        )
-
-    def test_accumulating_sets_result_status_and_reason(self, monkeypatch, tmp_path):
-        """Durable run-status record carries outcome='accumulating' and reason.
-
-        The production site (app.py ``_run_full_consolidation_sync``) calls
-        ``record_last_run(op_type="consolidation", outcome="accumulating",
-        detail={"accumulating_reason": ..., "tiers_rebuilt": []})``.
-        This test reads back the written ``RunRecord`` via ``read_last_runs``
-        and asserts the exact durable shape rather than the deleted RAM field
-        ``_state["last_consolidation_result"]``.
-        """
-        from unittest.mock import patch
-
-        import paramem.server.app as app_module
-        from paramem.server.run_status import read_last_runs
-
-        state = self._make_state(tmp_path)
-        monkeypatch.setattr(app_module, "_state", state)
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync("all_tiers")
-
-        runs = read_last_runs(tmp_path / "state")
-        assert "consolidation" in runs, (
-            "run_status.json must contain a 'consolidation' record after accumulating fold"
-        )
-        record = runs["consolidation"]
-        assert record.outcome == "accumulating", (
-            f"expected outcome='accumulating', got {record.outcome!r}"
-        )
-        assert "accumulating_reason" in record.detail, (
-            "run-status detail must contain 'accumulating_reason'"
-        )
-
-    def test_accumulating_save_adapters_not_called(self, monkeypatch, tmp_path):
-        """_save_adapters is NOT called when fold returns accumulating.
-
-        _save_adapters writes the per-tier meta.json that carries the on-disk
-        window_stamp read by _is_full_cycle_due.  Not calling it leaves the
-        stamp unadvanced so the next tick will re-fire the fold.
-        No GPU or real fold machinery is needed to assert this proxy.
-        """
-        from unittest.mock import patch
-
-        import paramem.server.app as app_module
-
-        state = self._make_state(tmp_path)
-        monkeypatch.setattr(app_module, "_state", state)
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        save_spy = MagicMock()
-
-        with (
-            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
-            patch("paramem.training.consolidation.ConsolidationLoop._save_adapters", save_spy),
-        ):
-            app_module._run_full_consolidation_sync("all_tiers")
-
-        save_spy.assert_not_called()
-
-
 class TestRunFullConsolidationSyncPendingSessionsUntouched:
     """Full-cycle bookkeeping must NOT mark pending sessions as consolidated.
 
@@ -2479,7 +2308,7 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         """Minimal ``_state`` producing a successful full-trained result.
 
         ``consolidate`` returns ``tiers_rebuilt=["episodic"]``
-        so the full-trained bookkeeping path is exercised (not noop/accumulating).
+        so the full-trained bookkeeping path is exercised (not noop).
         ``_save_key_metadata`` is mocked at the consolidation module level so
         no real loop or filesystem is needed.
         ``session_buffer`` holds one pending session to verify it is untouched.
@@ -3247,9 +3076,7 @@ class TestAbortSkipsCommit:
             "in_training": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        # Set floor=0 and tier_fast_start=False so abort-path tests with small
-        # key counts are not blocked by the accumulate guard or the fast-start path.
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -5096,7 +4923,7 @@ class TestInterimCommitFailureRollback:
             "in_training": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -5281,7 +5108,7 @@ class TestInterimCommitFailureRollbackSimulate:
             "in_training": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -5458,14 +5285,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             "procedural_backup": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        # Set min_tier_key_floor=0 so the pre-existing tests (which use small key
-        # counts to exercise dedup/tier logic) are not blocked by the floor guard.
-        # Set floor=0 and tier_fast_start=False so pre-existing tests with small
-        # key counts are not blocked by the accumulate guard, and pre-graduation
-        # keys (all in episodic) are not mistaken for first-time fast-start graduations.
-        # Tests that specifically exercise the floor / graduation behaviour live in
-        # TestTierFloor and set their own config.
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -6415,9 +6235,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
         loop.merger = GraphMerger(model=model_stub, tokenizer=tok_stub)
         # Enable contradiction detection so the recency rule fires.
-        loop.config = ConsolidationConfig(
-            min_tier_key_floor=0, tier_fast_start=False, refinement_contradiction="on"
-        )
+        loop.config = ConsolidationConfig(refinement_contradiction="on")
 
         same_ts = "2026-01-01T00:00:00Z"
         for key, obj in (("key_munich", "Munich"), ("key_berlin", "Berlin")):
@@ -6488,9 +6306,7 @@ class TestConsolidateInterimAdaptersFullFlow:
 
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
         loop.merger = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        loop.config = ConsolidationConfig(
-            min_tier_key_floor=0, tier_fast_start=False, refinement_contradiction="on"
-        )
+        loop.config = ConsolidationConfig(refinement_contradiction="on")
 
         # Munich has an older last_seen; Berlin has a fresher one.
         ts_data = {
@@ -7046,11 +6862,7 @@ class TestDriftIntendedRemoval:
         # refinement_enrichment="on" + cloud_enabled=True required for
         # GraphTierRefiner.run_enrichment to be called; base defaults
         # (off/False) skip enrichment.
-        loop.config = loop.config.__class__(
-            min_tier_key_floor=0,
-            tier_fast_start=False,
-            refinement_enrichment="on",
-        )
+        loop.config = loop.config.__class__(refinement_enrichment="on")
         loop.cloud_enabled = True
         loop.merger = GraphMerger(model=None)
 
@@ -7343,44 +7155,28 @@ class TestFoldGraphDebug:
         import json
 
         base_dir = self._base(tmp_path)
-        serve = {
+        tier_keyed = {
             "episodic": [{"key": "ep1", "subject": "A", "predicate": "p", "object": "B"}],
             "semantic": [{"key": "sem1", "subject": "X", "predicate": "q", "object": "Y"}],
             "procedural": [],
         }
-        train = {
-            "episodic": [
-                {"key": "ep1", "subject": "A", "predicate": "p", "object": "B"},
-                {"key": "sem1", "subject": "X", "predicate": "q", "object": "Y"},
-            ],
-            "semantic": [],
-            "procedural": [],
-        }
         with debug_run(base_dir):
-            on_fold_assignments(serve, train)
+            on_fold_assignments(tier_keyed)
 
         out = base_dir / "fold" / "fold_assignments.json"
         assert out.exists(), f"fold_assignments.json must exist; base={base_dir}"
         saved = json.loads(out.read_text())
 
-        assert saved["serve_assignment"] == {
+        assert saved["tier_keyed"] == {
             "episodic": ["ep1"],
             "semantic": ["sem1"],
-            "procedural": [],
-        }
-        assert saved["train_assignment"] == {
-            "episodic": ["ep1", "sem1"],
-            "semantic": [],
             "procedural": [],
         }
 
     def test_on_fold_assignments_no_op_when_no_root_is_open(self, tmp_path):
         """on_fold_assignments is a no-op with no artifact root."""
         with debug_run(None):
-            on_fold_assignments(
-                {"episodic": [], "semantic": [], "procedural": []},
-                {"episodic": [], "semantic": [], "procedural": []},
-            )
+            on_fold_assignments({"episodic": [], "semantic": [], "procedural": []})
         assert not (tmp_path / "fold").exists()
 
 
@@ -7704,7 +7500,7 @@ class TestLastSeenFlowThroughMint:
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -7965,7 +7761,7 @@ class TestAttributeGateNodeWalk:
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -8366,468 +8162,194 @@ class TestBookkeepingBasedPromotion:
 
 
 # =============================================================================
-# TestTierFloor — per-tier minimum-key-count floor + two graduation strategies
+# Full-fold test harness — shared by TestFoldKeySource, TestMainTierInitPolicy,
+# TestAdapterWeightCopy, and TestTierKeyedAssignmentInvariants below.
 # =============================================================================
 
 
-class TestTierFloor:
-    """Unit tests for the per-tier min-key-count floor and graduation strategies.
+def _make_fold_loop(tmp_path):
+    """Minimal ConsolidationLoop stub for full-fold tests.
 
-    Covers config, parking, graduation, accumulating, and probe-fallback behavior.
-    All tests mock train_adapter and heavy PEFT ops so no GPU is needed.
-
-    Config plumbing lives in tests/server/test_config.py;
-    config parity is covered by tests/server/test_config_parity.py.
+    Delegates to the existing full-flow helper so we reuse its wiring, with a
+    fresh default :class:`~paramem.utils.config.ConsolidationConfig`.
     """
+    import networkx as nx
 
-    @staticmethod
-    def _make_loop(tmp_path, *, min_tier_key_floor=30, tier_fast_start=True):
-        """Minimal ConsolidationLoop stub for floor/graduation tests.
+    from paramem.utils.config import ConsolidationConfig
 
-        Delegates to the existing full-flow helper so we reuse its wiring;
-        overrides config fields for floor tests.
-        """
-        import networkx as nx
+    loop = TestConsolidateInterimAdaptersFullFlow._make_loop(
+        tmp_path, merger_graph=nx.MultiDiGraph()
+    )
+    loop.config = ConsolidationConfig()
+    return loop
 
-        from paramem.utils.config import ConsolidationConfig
 
-        loop = TestConsolidateInterimAdaptersFullFlow._make_loop(
-            tmp_path, merger_graph=nx.MultiDiGraph()
-        )
-        loop.config = ConsolidationConfig(
-            min_tier_key_floor=min_tier_key_floor,
-            tier_fast_start=tier_fast_start,
-        )
-        return loop
-
-    @staticmethod
-    def _seed_keys(loop, tier, keys, relation_type="factual"):
-        """Register ``keys`` in ``tier`` with minimal bookkeeping."""
-        for k in keys:
-            loop.store.put(
-                tier,
-                k,
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "predicate": f"pred_{k}",
-                    "object": f"obj_{k}",
-                    "speaker_id": "S0",
-                },
-                register=True,
-            )
-            loop.store.set_bookkeeping(
-                k,
-                speaker_id="S0",
-                relation_type=relation_type,
-                reinforcement_count=1,
-                last_reinforced_cycle=1,
-                first_seen="",
-            )
-
-    @staticmethod
-    def _build_merger_graph(loop, entries):
-        """Stamp entries as merger-graph edges so the edge-walk stage picks them up."""
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        for e in entries:
-            eid = loop.merger.graph.add_edge(
-                e["subject"],
-                e["object"],
-                predicate=e["predicate"],
-                relation_type=e.get("relation_type", "factual"),
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
-
-    @staticmethod
-    def _run_full_fold_mocked(
-        loop,
-        *,
-        probe_side_effect=None,
-        train_adapter_spy=None,
-        keys_from="all_tiers",
-        unload_spy=None,
-        create_adapter_side_effect=None,
-        copy_adapter_weights_side_effect=None,
-    ):
-        """Run consolidate with heavy ops mocked.
-
-        Wraps consolidate (the full-fold thin wrapper), which now
-        delegates its body to _run_fold(FoldScope(persist="main_tiers", ...)).
-        Heavy GPU ops are mocked so this runs without hardware.
-
-        probe_side_effect: callable(adapter_name, entries) → set[str].
-            Defaults to returning all keys (pass-all probe).
-        train_adapter_spy: mock.MagicMock or None.  If supplied, train_adapter
-            is patched to this spy (so the test can assert call_count etc.).
-        keys_from: The fold's key source ("all_tiers" | "main_tiers").
-        unload_spy: mock.MagicMock or None.  If supplied, the interim reap
-            (``unload_interim_adapters``) is patched to this spy so the test can
-            assert whether the fold reaped the slots.
-        create_adapter_side_effect: override for
-            ``paramem.models.loader.create_adapter``'s side_effect.  Defaults
-            to a pure no-op (``lambda m, c, n: m``); a test exercising
-            ``main_tier_backup_scope``'s real shape-sensitive copy needs a
-            fake that actually stamps the created adapter's config onto
-            ``peft_config``.
-        copy_adapter_weights_side_effect: override for
-            ``paramem.models.loader.copy_adapter_weights``'s side_effect.
-            Defaults to a bare no-op mock; a test proving the config-mismatch
-            guard is resolved BEFORE ``main_tier_backup_scope`` snapshots a
-            tier needs a fake that raises on a real shape mismatch (the real
-            function's own failure mode, see ``loader.py``'s
-            ``copy_adapter_weights`` docstring).
-        """
-        from unittest.mock import MagicMock, patch
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-        from paramem.training.consolidation import ConsolidationLoop
-
-        if probe_side_effect is None:
-            probe_side_effect = lambda adapter_name, entries: {e["key"] for e in entries}  # noqa: E731
-        if train_adapter_spy is None:
-            train_adapter_spy = MagicMock(return_value={"aborted": False})
-        if unload_spy is None:
-            unload_spy = MagicMock(return_value=[])
-        if create_adapter_side_effect is None:
-            create_adapter_side_effect = lambda m, c, n: m  # noqa: E731
-        create_adapter_patch_kwargs = {"side_effect": create_adapter_side_effect}
-        copy_adapter_weights_patch_kwargs = (
-            {"side_effect": copy_adapter_weights_side_effect}
-            if copy_adapter_weights_side_effect is not None
-            else {}
-        )
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=__import__("networkx").MultiDiGraph()),
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_enrichment",
-                    return_value={"skipped": True},
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_normalization",
-                    return_value={"skipped": True},
-                ),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop,
-                    "_maybe_make_recall_callback",
-                    return_value=(None, None),
-                ),
-                patch.object(
-                    ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=probe_side_effect,
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch(
-                    "paramem.training.trainer.train_adapter",
-                    train_adapter_spy,
-                ),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", **create_adapter_patch_kwargs),
-                patch("paramem.models.loader.switch_adapter"),
-                patch(
-                    "paramem.models.loader.copy_adapter_weights",
-                    **copy_adapter_weights_patch_kwargs,
-                ),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", unload_spy),
-            ):
-                return loop.consolidate(
-                    mode="train", keys_from=keys_from, trainer=None, router=None
-                )
-        finally:
-            _gpu_thread_lock.release()
-
-    # -------------------------------------------------------------------------
-    # Pass-2 parking — under-floor semantic/procedural moves to episodic
-    # -------------------------------------------------------------------------
-
-    def test_pass2_parks_under_floor_semantic_and_procedural(self, tmp_path):
-        """12 procedural + 4 semantic + 50 episodic: under-floor tiers park in episodic.
-
-        Asserts:
-        - tier_keyed["procedural"] == [] and tier_keyed["semantic"] == [] after Pass-2.
-        - episodic gained the 16 parked keys (total 66).
-        - store.move called for parked keys (store tier updated to episodic).
-        """
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        floor = 30
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=False)
-
-        ep_keys = [f"ep{i}" for i in range(50)]
-        sem_keys = [f"sem{i}" for i in range(4)]
-        proc_keys = [f"proc{i}" for i in range(12)]
-
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._seed_keys(loop, "semantic", sem_keys, relation_type="factual")
-        self._seed_keys(loop, "procedural", proc_keys, relation_type="preference")
-
-        # Build merger graph edges for all keys.
-        all_entries = [
-            {
-                "key": k,
-                "subject": "Alice",
-                "predicate": f"pred_{k}",
-                "object": f"obj_{k}",
-                "relation_type": "factual",
-            }
-            for k in ep_keys + sem_keys
-        ] + [
-            {
-                "key": k,
-                "subject": "Alice",
-                "predicate": f"pred_{k}",
-                "object": f"obj_{k}",
-                "relation_type": "preference",
-            }
-            for k in proc_keys
-        ]
-        for e in all_entries:
-            eid = loop.merger.graph.add_edge(
-                e["subject"],
-                e["object"],
-                predicate=e["predicate"],
-                relation_type=e["relation_type"],
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
-
-        result = self._run_full_fold_mocked(loop)
-
-        # Under-floor tiers end up empty after park.
-        assert result["keys_per_tier"]["procedural"] == 0, (
-            "procedural (12 < 30) must be parked — keys_per_tier should be 0"
-        )
-        assert result["keys_per_tier"]["semantic"] == 0, (
-            "semantic (4 < 30) must be parked — keys_per_tier should be 0"
-        )
-        # Episodic absorbed all 16 parked keys.
-        assert result["keys_per_tier"]["episodic"] == 66, (
-            f"episodic should be 50+16=66, got {result['keys_per_tier']['episodic']}"
-        )
-
-        # Store tiers for parked keys must now be episodic.
-        for k in sem_keys + proc_keys:
-            t = loop.store.tier_for_active_key(k)
-            assert t == "episodic", f"parked key {k!r} should be in episodic store tier, got {t!r}"
-
-    # -------------------------------------------------------------------------
-    # Bookkeeping preserved through parking and graduation
-    # -------------------------------------------------------------------------
-
-    def test_bookkeeping_preserved_through_parking(self, tmp_path):
-        """Parking a key preserves relation_type, reinforcement_count, speaker_id —
-        stored in bookkeeping_for_key, not in tier_keyed."""
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=30, tier_fast_start=False)
-
-        # One semantic key (under floor of 30) with specific bookkeeping.
+def _seed_keys(loop, tier, keys, relation_type="factual"):
+    """Register ``keys`` in ``tier`` with minimal bookkeeping."""
+    for k in keys:
         loop.store.put(
-            "semantic",
-            "sem0",
+            tier,
+            k,
             {
-                "key": "sem0",
-                "subject": "Bob",
-                "predicate": "likes",
-                "object": "Jazz",
-                "speaker_id": "S1",
+                "key": k,
+                "subject": "Alice",
+                "predicate": f"pred_{k}",
+                "object": f"obj_{k}",
+                "speaker_id": "S0",
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "sem0",
-            speaker_id="S1",
-            relation_type="factual",
-            reinforcement_count=5,
-            last_reinforced_cycle=3,
+            k,
+            speaker_id="S0",
+            relation_type=relation_type,
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
             first_seen="",
         )
-        # Seed episodic with enough keys to avoid whole-fold accumulate.
-        ep_keys = [f"ep{i}" for i in range(35)]
-        self._seed_keys(loop, "episodic", ep_keys)
 
-        all_entries = [
-            {
-                "key": "sem0",
-                "subject": "Bob",
-                "predicate": "likes",
-                "object": "Jazz",
-                "relation_type": "factual",
-            }
-        ] + [
-            {
-                "key": k,
-                "subject": "Alice",
-                "predicate": f"pred_{k}",
-                "object": f"obj_{k}",
-                "relation_type": "factual",
-            }
-            for k in ep_keys
-        ]
-        for e in all_entries:
-            eid = loop.merger.graph.add_edge(
-                e["subject"],
-                e["object"],
-                predicate=e["predicate"],
-                relation_type=e["relation_type"],
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
 
-        self._run_full_fold_mocked(loop)
+def _build_merger_graph(loop, entries):
+    """Stamp entries as merger-graph edges so the edge-walk stage picks them up."""
+    from paramem.memory.persistence import _IK_KEY_ATTR
 
-        bk = loop.store.bookkeeping_for_key("sem0")
-        assert bk is not None
-        assert bk["relation_type"] == "factual", "relation_type must survive parking"
-        assert bk["reinforcement_count"] == 5, "reinforcement_count must survive parking"
-        assert bk["speaker_id"] == "S1", "speaker_id must survive parking"
-
-    # -------------------------------------------------------------------------
-    # Default graduation (train-from-scratch, tier_fast_start=False)
-    # -------------------------------------------------------------------------
-
-    def test_default_graduation_trains_from_scratch(self, tmp_path):
-        """A tier crossing floor for the first time with tier_fast_start=False trains
-        from scratch via train_adapter; copy helpers NOT called.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=False)
-
-        # Seed 15 procedural keys — all in episodic (first-time graduation).
-        proc_keys = [f"proc{i}" for i in range(15)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        ep_keys = [f"ep{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-
-        for k in proc_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="preference",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-        for k in ep_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="factual",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-
-        train_spy = MagicMock(return_value={"aborted": False})
-        copy_spy = MagicMock()
-        subset_copy_spy = MagicMock()
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_enrichment",
-                    return_value={"skipped": True},
-                ),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop,
-                    "_maybe_make_recall_callback",
-                    return_value=(None, None),
-                ),
-                patch.object(
-                    ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights", copy_spy),
-                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert "procedural" in result["tiers_rebuilt"], (
-            "procedural should be in tiers_rebuilt after graduation"
+    for e in entries:
+        eid = loop.merger.graph.add_edge(
+            e["subject"],
+            e["object"],
+            predicate=e["predicate"],
+            relation_type=e.get("relation_type", "factual"),
+            confidence=1.0,
+            first_seen="s",
+            last_seen="s",
+            reinforcement_count=1,
+            sessions=["s"],
         )
-        # train_adapter must have been called (at least for episodic and procedural).
-        assert train_spy.call_count >= 2, (
-            f"train_adapter should be called >= 2 times (episodic + procedural), "
-            f"got {train_spy.call_count}"
-        )
-        # copy helpers must NOT have been called for graduation (train-from-scratch).
-        # NOTE: copy_adapter_weights IS called for backup creation — filter those out
-        # by checking copy_adapter_weights_subset (never called in (a) path).
-        assert subset_copy_spy.call_count == 0, (
-            "copy_adapter_weights_subset must not be called in train-from-scratch path"
-        )
+        loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
 
-    # -------------------------------------------------------------------------
-    # copy_adapter_weights_subset — CPU-only parameter logic
-    # -------------------------------------------------------------------------
+
+def _run_full_fold_mocked(
+    loop,
+    *,
+    probe_side_effect=None,
+    train_adapter_spy=None,
+    keys_from="all_tiers",
+    unload_spy=None,
+    create_adapter_side_effect=None,
+    copy_adapter_weights_side_effect=None,
+):
+    """Run consolidate with heavy ops mocked.
+
+    Wraps consolidate (the full-fold thin wrapper), which now
+    delegates its body to _run_fold(FoldScope(persist="main_tiers", ...)).
+    Heavy GPU ops are mocked so this runs without hardware.
+
+    probe_side_effect: callable(adapter_name, entries) → set[str].
+        Defaults to returning all keys (pass-all probe).
+    train_adapter_spy: mock.MagicMock or None.  If supplied, train_adapter
+        is patched to this spy (so the test can assert call_count etc.).
+    keys_from: The fold's key source ("all_tiers" | "main_tiers").
+    unload_spy: mock.MagicMock or None.  If supplied, the interim reap
+        (``unload_interim_adapters``) is patched to this spy so the test can
+        assert whether the fold reaped the slots.
+    create_adapter_side_effect: override for
+        ``paramem.models.loader.create_adapter``'s side_effect.  Defaults
+        to a pure no-op (``lambda m, c, n: m``); a test exercising
+        ``main_tier_backup_scope``'s real shape-sensitive copy needs a
+        fake that actually stamps the created adapter's config onto
+        ``peft_config``.
+    copy_adapter_weights_side_effect: override for
+        ``paramem.models.loader.copy_adapter_weights``'s side_effect.
+        Defaults to a bare no-op mock; a test proving the config-mismatch
+        guard is resolved BEFORE ``main_tier_backup_scope`` snapshots a
+        tier needs a fake that raises on a real shape mismatch (the real
+        function's own failure mode, see ``loader.py``'s
+        ``copy_adapter_weights`` docstring).
+    """
+    from unittest.mock import MagicMock, patch
+
+    from paramem.server.gpu_lock import _gpu_thread_lock
+    from paramem.training.consolidation import ConsolidationLoop
+
+    if probe_side_effect is None:
+        probe_side_effect = lambda adapter_name, entries: {e["key"] for e in entries}  # noqa: E731
+    if train_adapter_spy is None:
+        train_adapter_spy = MagicMock(return_value={"aborted": False})
+    if unload_spy is None:
+        unload_spy = MagicMock(return_value=[])
+    if create_adapter_side_effect is None:
+        create_adapter_side_effect = lambda m, c, n: m  # noqa: E731
+    create_adapter_patch_kwargs = {"side_effect": create_adapter_side_effect}
+    copy_adapter_weights_patch_kwargs = (
+        {"side_effect": copy_adapter_weights_side_effect}
+        if copy_adapter_weights_side_effect is not None
+        else {}
+    )
+
+    _gpu_thread_lock.acquire()
+    try:
+        with (
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=__import__(
+                    "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                ).ReconstructionResult(graph=__import__("networkx").MultiDiGraph()),
+            ),
+            patch.object(
+                GraphTierRefiner,
+                "run_enrichment",
+                return_value={"skipped": True},
+            ),
+            patch.object(
+                GraphTierRefiner,
+                "run_normalization",
+                return_value={"skipped": True},
+            ),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+            patch.object(
+                ConsolidationLoop,
+                "_maybe_make_recall_callback",
+                return_value=(None, None),
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=probe_side_effect,
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                train_adapter_spy,
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+            ),
+            patch("paramem.models.loader.create_adapter", **create_adapter_patch_kwargs),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                **copy_adapter_weights_patch_kwargs,
+            ),
+            patch("paramem.models.loader.copy_adapter_weights_subset"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters", unload_spy),
+        ):
+            return loop.consolidate(mode="train", keys_from=keys_from, trainer=None, router=None)
+    finally:
+        _gpu_thread_lock.release()
+
+
+# =============================================================================
+# TestAdapterWeightCopy — copy_adapter_weights / copy_adapter_weights_subset
+# =============================================================================
+
+
+class TestAdapterWeightCopy:
+    """Unit tests for the two weight-copy helpers in ``paramem.models.loader``.
+
+    CPU-only parameter-tensor logic; no GPU/model needed.
+    """
 
     def test_copy_adapter_weights_subset_copies_intersecting(self):
         """subset copy: src⊆dst copies intersecting tensors, leaves dst-only at init."""
@@ -8947,20 +8469,27 @@ class TestTierFloor:
         with pytest.raises(RuntimeError, match="Adapter parameter sets differ"):
             copy_adapter_weights(model, src="src", dst="dst")
 
-    # -------------------------------------------------------------------------
-    # Fast-start graduation decision (mocked copy + store)
-    # -------------------------------------------------------------------------
 
-    def test_fast_start_graduation_calls_copy_not_train(self, tmp_path):
-        """tier_fast_start=True + tier crossing floor for first time: copy called,
-        train_adapter NOT called for that tier, tier in tiers_rebuilt.
+# =============================================================================
+# TestTierKeyedAssignmentInvariants — the collapsed one-map (tier_keyed)
+# invariants that survive fast-start/tier-floor retirement.
+# =============================================================================
 
-        Asserts on the serve/train map split directly (not a blanket pass-all probe
-        that would mask a donor-ignorance regression):
-          - episodic train call entries = ep_keys + proc_keys (universal donor augment)
-          - procedural train call: absent (copied, not trained)
-          - result["tier_keyed"]["procedural"] = proc_keys (served from procedural)
-          - result["tier_keyed"]["episodic"] = ep_keys (graduating keys NOT in episodic serve)
+
+class TestTierKeyedAssignmentInvariants:
+    """Post-retirement invariants over the fold's single ``tier_keyed`` map.
+
+    With per-tier floor parking and fast-start graduation gone, every tier
+    with keys trains from exactly its own set, every key appears in exactly
+    one tier's assignment, and ``on_fold_assignments`` is called with that one
+    map. Uses the module-level full-fold harness (``_make_fold_loop`` /
+    ``_seed_keys`` / ``_build_merger_graph`` / ``_run_full_fold_mocked``).
+    """
+
+    def test_every_tier_with_keys_trains_from_its_own_set(self, tmp_path):
+        """Every tier that carries keys trains via train_adapter on its own set —
+        there is no longer a distinction between an "already live" tier and a
+        first-time-crossing one; both train identically.
         """
         from unittest.mock import MagicMock, patch
 
@@ -8969,154 +8498,12 @@ class TestTierFloor:
         from paramem.memory.persistence import _IK_KEY_ATTR
         from paramem.training.consolidation import ConsolidationLoop
 
-        floor = 10
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
+        loop = _make_fold_loop(tmp_path)
 
-        # Seed 15 procedural keys — all in episodic store-tier (first-time graduation,
-        # no disk slot for procedural in tmp_path).
-        proc_keys = [f"proc{i}" for i in range(15)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        ep_keys = [f"ep{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-
-        for k in proc_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="preference",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-        for k in ep_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="factual",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-
-        train_spy = MagicMock(return_value={"aborted": False})
-        subset_copy_spy = MagicMock()
-
-        # Probe passes for all entries (simulates informed episodic + copied procedural
-        # both recalling their respective key sets).
-        def _probe(adapter_name, entries):
-            return {e["key"] for e in entries}
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_enrichment",
-                    return_value={"skipped": True},
-                ),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop,
-                    "_maybe_make_recall_callback",
-                    return_value=(None, None),
-                ),
-                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert "procedural" in result["tiers_rebuilt"], (
-            "procedural should be in tiers_rebuilt after fast-start graduation"
-        )
-        # subset copy must have been called for procedural←episodic (v3 universal-donor).
-        assert subset_copy_spy.call_count >= 1, (
-            "copy_adapter_weights_subset must be called for procedural fast-start"
-        )
-        # train_adapter must NOT have been called for procedural (only episodic).
-        proc_train_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
-        ]
-        assert len(proc_train_calls) == 0, (
-            "train_adapter must NOT be called for procedural in fast-start graduation"
-        )
-        # Serve layout: procedural served from its own tier, NOT from episodic.
-        served_proc_keys = {e["key"] for e in result["tier_keyed"]["procedural"]}
-        served_ep_keys = {e["key"] for e in result["tier_keyed"]["episodic"]}
-        assert served_proc_keys == set(proc_keys), (
-            "procedural serve set must contain the graduating keys"
-        )
-        assert served_ep_keys == set(ep_keys), (
-            "episodic serve set must NOT contain the graduating procedural keys"
-        )
-        # Episodic train call entries must include BOTH ep_keys AND proc_keys
-        # (universal-donor augmentation).
-        ep_train_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "episodic"
-        ]
-        assert len(ep_train_calls) >= 1, "train_adapter must be called for episodic"
-        # The episodic train dataset comes from format_entry_training(job.entries, ...).
-        # Since format_entry_training is patched, verify via the jobs_by_tier entries
-        # indirectly: the episodic train call must have been attempted on 35 entries
-        # (20 ep + 15 proc).  format_entry_training is called with job.entries so we
-        # check call_count of format_entry_training instead, which receives the full set.
-        # (Direct assertion: serve layout is the ground truth; the donor augment is an
-        # internal implementation detail verified by the universal-donor decoupling tests.)
-
-    def test_fast_start_already_live_tier_trains_normally(self, tmp_path):
-        """A tier already live (has a saved adapter slot on disk) trains normally
-        regardless of tier_fast_start; copy helpers not called for it.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR
-        from paramem.training.consolidation import ConsolidationLoop
-
-        floor = 5
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
-
-        # Create a fake saved slot for procedural to signal "already live".
-        # Liveness is based on disk-slot presence (not store-tier) — a slot name is
-        # a YYYYMMDD-HHMMSS timestamp.  Creating the directory simulates a prior
-        # _save_adapters call for this tier.
-        (tmp_path / "procedural" / "20240101-000000").mkdir(parents=True, exist_ok=True)
-
-        # Seed 10 procedural keys ALREADY in the procedural registry
-        # (previously graduated — tier_for_active_key returns "procedural").
         proc_keys = [f"proc{i}" for i in range(10)]
-        self._seed_keys(loop, "procedural", proc_keys, relation_type="preference")
+        _seed_keys(loop, "procedural", proc_keys, relation_type="preference")
         ep_keys = [f"ep{i}" for i in range(10)]
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
 
         for k in proc_keys:
             eid = loop.merger.graph.add_edge(
@@ -9146,7 +8533,6 @@ class TestTierFloor:
             loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
 
         train_spy = MagicMock(return_value={"aborted": False})
-        subset_copy_spy = MagicMock()
 
         from paramem.server.gpu_lock import _gpu_thread_lock
 
@@ -9185,299 +8571,31 @@ class TestTierFloor:
                 patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
                 loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
-        # procedural is already live — train_adapter should be called for it.
+        # procedural trains from its own set, same as any other tier.
         proc_train_calls = [
             c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
         ]
         assert len(proc_train_calls) >= 1, (
-            "train_adapter must be called for an already-live tier (steady-state)"
-        )
-        assert subset_copy_spy.call_count == 0, (
-            "copy_adapter_weights_subset must NOT be called for an already-live tier"
+            "train_adapter must be called for every tier that carries keys"
         )
 
-    # -------------------------------------------------------------------------
-    # Fast-start copy-gate fallback (mandatory probe before accepting copy)
-    # -------------------------------------------------------------------------
-
-    def test_fast_start_fallback_trains_from_scratch_when_probe_fails(self, tmp_path):
-        """When the pre-save probe returns below threshold for a fast-start tier,
-        the (b)→(a) fall-back fires: train_adapter IS called for that tier.
+    def test_each_key_appears_in_exactly_one_tier_of_the_assignment(self, tmp_path):
+        """Each key appears in the fold's ``tier_keyed`` assignment exactly
+        once, served from its own relation-type-derived tier (not episodic).
         """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR
-        from paramem.training.consolidation import ConsolidationLoop
-
-        floor = 10
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
-
-        proc_keys = [f"proc{i}" for i in range(15)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        ep_keys = [f"ep{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-
-        for k in proc_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="preference",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-        for k in ep_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="factual",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-
-        # Probe returns EMPTY set for "procedural" (simulates below-threshold copy).
-        def _probe(adapter_name, entries):
-            if adapter_name == "procedural":
-                return set()  # fail
-            return {e["key"] for e in entries}  # pass for all others
-
-        train_spy = MagicMock(return_value={"aborted": False})
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_enrichment",
-                    return_value={"skipped": True},
-                ),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop,
-                    "_maybe_make_recall_callback",
-                    return_value=(None, None),
-                ),
-                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        # Fall-through to train-from-scratch: procedural must be in tiers_rebuilt.
-        assert "procedural" in result["tiers_rebuilt"], (
-            "procedural must be in tiers_rebuilt after (b)→(a) fallback"
-        )
-        # train_adapter must have been called for procedural.
-        proc_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
-        ]
-        assert len(proc_calls) >= 1, (
-            "train_adapter must be called for procedural after fast-start probe failure"
-        )
-
-    # -------------------------------------------------------------------------
-    # Whole-fold accumulate (episodic < floor)
-    # -------------------------------------------------------------------------
-
-    def test_whole_fold_accumulate_returns_accumulating_status(self, tmp_path):
-        """When total trainable keys < floor, fold returns status='accumulating',
-        tiers_rebuilt=[], does NOT call _save_adapters, does NOT purge interims.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR
-        from paramem.training.consolidation import ConsolidationLoop
-
-        floor = 30
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor)
-
-        # Only 10 keys total (below floor of 30).
-        small_keys = [f"k{i}" for i in range(10)]
-        self._seed_keys(loop, "episodic", small_keys, relation_type="factual")
-        for k in small_keys:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="factual",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
-
-        save_spy = MagicMock()
-        train_spy = MagicMock(return_value={"aborted": False})
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_enrichment",
-                    return_value={"skipped": True},
-                ),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop,
-                    "_maybe_make_recall_callback",
-                    return_value=(None, None),
-                ),
-                patch.object(
-                    ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters", save_spy),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert result["status"] == "accumulating", (
-            f"Expected status='accumulating', got {result['status']!r}"
-        )
-        assert result["tiers_rebuilt"] == [], "tiers_rebuilt must be empty on accumulating return"
-        assert "accumulating_reason" in result, "accumulating_reason must be in result"
-        assert result["accumulating_reason"]["floor"] == floor
-        assert result["accumulating_reason"]["episodic"] == 10
-        assert save_spy.call_count == 0, "_save_adapters must NOT be called on accumulating return"
-        assert train_spy.call_count == 0, "train_adapter must NOT be called on accumulating return"
-
-    # -------------------------------------------------------------------------
-    # Accumulating never raises; last_consolidation_error stays None
-    # -------------------------------------------------------------------------
-
-    def test_accumulating_never_raises(self, tmp_path):
-        """The accumulating early return never raises an exception."""
-        floor = 30
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor)
-        # 5 keys < floor.
-        self._seed_keys(loop, "episodic", [f"k{i}" for i in range(5)])
-        for k in [f"k{i}" for i in range(5)]:
-            eid = loop.merger.graph.add_edge(
-                "Alice",
-                f"obj_{k}",
-                predicate=f"pred_{k}",
-                relation_type="factual",
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph["Alice"][f"obj_{k}"][eid][
-                __import__("paramem.memory.persistence", fromlist=["_IK_KEY_ATTR"])._IK_KEY_ATTR
-            ] = k
-
-        # Must not raise.
-        result = self._run_full_fold_mocked(loop)
-        assert result["status"] == "accumulating"
-
-    # =========================================================================
-    # v3 universal-donor serve/train decoupling tests
-    # =========================================================================
-
-    @staticmethod
-    def _add_edges(loop, entries):
-        """Stamp entries as merger-graph edges (convenience wrapper)."""
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        for e in entries:
-            eid = loop.merger.graph.add_edge(
-                e["subject"],
-                e["object"],
-                predicate=e["predicate"],
-                relation_type=e.get("relation_type", "factual"),
-                confidence=1.0,
-                first_seen="s",
-                last_seen="s",
-                reinforcement_count=1,
-                sessions=["s"],
-            )
-            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
-
-    def test_universal_donor_episodic_includes_graduating_keys(self, tmp_path):
-        """Episodic train call includes graduating procedural keys (universal
-        donor); procedural train call absent; serve layout keeps them separate.
-
-        floor=10, 12 proc keys (store-tier episodic, first-cross) + 20 ep keys.
-        Episodic train entries = 32; procedural train entries = 0 (copy path).
-        Serve layout: procedural=12, episodic=20 (graduating keys NOT in ep serve).
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        loop = _make_fold_loop(tmp_path)
         proc_keys = [f"p{i}" for i in range(12)]
         ep_keys = [f"e{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._add_edges(
+        _seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _build_merger_graph(
             loop,
             [
                 {
@@ -9501,156 +8619,26 @@ class TestTierFloor:
             ],
         )
 
-        def _spy_train(**kwargs):
-            # format_entry_training is patched to return a fixed list;
-            # entries fed to it come from job.entries captured at format call.
-            return {"aborted": False}
+        result = _run_full_fold_mocked(loop)
 
-        format_entries_by_adapter: dict = {}
-
-        def _spy_format(entries, *a, **kw):
-            # The calling code passes entries positionally.
-            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
-
-        # We need to capture job.entries at format_entry_training time.
-        # Use a mutable dict to capture the adapter being trained.
-        _adapter_being_trained = [None]
-        train_spy = MagicMock(return_value={"aborted": False})
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-                ),
-                patch.object(
-                    ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    side_effect=lambda entries, *a, **kw: (
-                        format_entries_by_adapter.__setitem__(
-                            _adapter_being_trained[0], list(entries)
-                        )
-                        or [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
-                    ),
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                # switch_adapter (not create_adapter) is the "which adapter is
-                # about to train" hook: under warm init a resident,
-                # config-matching tier is kept (ensure_adapter_matching
-                # no-ops, create_adapter is never called for it), but
-                # switch_adapter still runs unconditionally right before
-                # format_entry_training in every case.
-                patch(
-                    "paramem.models.loader.switch_adapter",
-                    side_effect=lambda m, n: _adapter_being_trained.__setitem__(0, n),
-                ),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        # Serve layout assertions.
-        served_proc = {e["key"] for e in result["tier_keyed"]["procedural"]}
-        served_ep = {e["key"] for e in result["tier_keyed"]["episodic"]}
-        assert served_proc == set(proc_keys), "procedural serve set must be the 12 graduating keys"
-        assert served_ep == set(ep_keys), (
-            "episodic serve set must NOT include the graduating procedural keys"
+        # Each key appears at most once across all tiers of the assignment.
+        all_assigned = [e["key"] for tl in result["tier_keyed"].values() for e in tl]
+        assert len(all_assigned) == len(set(all_assigned)), (
+            "each key must appear in tier_keyed exactly once (no duplication)"
         )
-        # No procedural train call (fast-start copy, empty train set).
-        proc_train_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
-        ]
-        assert len(proc_train_calls) == 0, "procedural must NOT be trained (fast-start copy)"
-        # Episodic trained (train_adapter called).
-        ep_train_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "episodic"
-        ]
-        assert len(ep_train_calls) >= 1, "episodic must be trained (universal donor)"
-        # Episodic's training entries (format_entry_training input) = 32 unique keys.
-        ep_format_entries = format_entries_by_adapter.get("episodic", [])
-        ep_trained_keys = {e["key"] for e in ep_format_entries}
-        assert len(ep_trained_keys) == 32, (
-            f"episodic train set should be 20 ep + 12 proc = 32, got {len(ep_trained_keys)}"
-        )
-        assert set(proc_keys) <= ep_trained_keys, (
-            "graduating procedural keys must be in episodic's training set (donor augment)"
-        )
-
-    def test_graduating_keys_served_from_target_tier_not_duplicated(self, tmp_path):
-        """Each graduating key appears in the serve layout exactly once and is
-        served from procedural (not episodic).
-        """
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
-        proc_keys = [f"p{i}" for i in range(12)]
-        ep_keys = [f"e{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._add_edges(
-            loop,
-            [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "preference",
-                }
-                for k in proc_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "factual",
-                }
-                for k in ep_keys
-            ],
-        )
-
-        result = self._run_full_fold_mocked(loop)
-
-        # Each key appears at most once across all serve tiers.
-        all_served = [e["key"] for tl in result["tier_keyed"].values() for e in tl]
-        assert len(all_served) == len(set(all_served)), (
-            "each key must appear in serve layout exactly once (no duplication)"
-        )
-        # Graduating keys served from procedural.
+        # Preference-relation keys are assigned to procedural, not episodic.
         for k in proc_keys:
             assert k not in {e["key"] for e in result["tier_keyed"]["episodic"]}, (
-                f"graduating key {k!r} must NOT be in episodic serve set"
+                f"key {k!r} must NOT be in the episodic assignment"
             )
             assert k in {e["key"] for e in result["tier_keyed"]["procedural"]}, (
-                f"graduating key {k!r} must be in procedural serve set"
+                f"key {k!r} must be in the procedural assignment"
             )
 
-    def test_procedural_fast_start_uses_subset_copy_not_train(self, tmp_path):
-        """Procedural first-cross fast-start: copy_adapter_weights_subset called,
-        train_adapter NOT called for procedural, procedural in tiers_rebuilt.
-
-        Probe returns only keys the donor was actually trained on (augmented episodic
-        set) — NOT a blanket pass-all that would mask an uninformed-donor regression.
+    def test_episodic_train_set_is_exactly_its_own_keys(self, tmp_path):
+        """Episodic's training set never includes another tier's keys —
+        the strongest regression guard against the deleted donor-union
+        ever coming back.
         """
         from unittest.mock import MagicMock, patch
 
@@ -9658,559 +8646,7 @@ class TestTierFloor:
 
         from paramem.training.consolidation import ConsolidationLoop
 
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
-        proc_keys = [f"p{i}" for i in range(12)]
-        ep_keys = [f"e{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._add_edges(
-            loop,
-            [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "preference",
-                }
-                for k in proc_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "factual",
-                }
-                for k in ep_keys
-            ],
-        )
-
-        # Track episodic's training entries so the probe can simulate real knowledge.
-        _ep_train_keys: list = []
-
-        def _spy_format(entries, *a, **kw):
-            # format_entry_training is called for episodic first.
-            if not _ep_train_keys:
-                _ep_train_keys.extend(e["key"] for e in entries)
-            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
-
-        def _probe(adapter_name, entries):
-            # Simulate donor knowledge: episodic returns all keys it was trained on;
-            # procedural probe (after copy from episodic) returns same keys.
-            return {e["key"] for e in entries if e["key"] in set(_ep_train_keys)}
-
-        train_spy = MagicMock(return_value={"aborted": False})
-        subset_copy_spy = MagicMock()
-        full_copy_spy = MagicMock()
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-                ),
-                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    side_effect=_spy_format,
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
-                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert "procedural" in result["tiers_rebuilt"], (
-            "procedural must be in tiers_rebuilt after fast-start copy accepted"
-        )
-        # subset copy for procedural←episodic (attn-only, MLP zero-init).
-        proc_subset_calls = [
-            c
-            for c in subset_copy_spy.call_args_list
-            if c.kwargs.get("dst") == "procedural" or (c.args and "procedural" in str(c.args))
-        ]
-        assert len(proc_subset_calls) >= 1, (
-            "copy_adapter_weights_subset must be called for procedural←episodic"
-        )
-        # train_adapter must NOT be called for procedural.
-        proc_train = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
-        ]
-        assert len(proc_train) == 0, "train_adapter must NOT be called for procedural fast-start"
-
-    def test_semantic_fast_start_uses_full_copy_not_train(self, tmp_path):
-        """Semantic first-cross fast-start (promotion-store-moved):
-        copy_adapter_weights (FULL copy, NOT subset) called for semantic,
-        train_adapter NOT called for semantic, semantic in tiers_rebuilt.
-
-        Proves the v3 universal-donor fix covers semantic (not just procedural).
-        Semantic keys are store-tier "semantic" (promotion-store-moved) but have
-        NO disk slot → _tier_has_disk_slot("semantic") = False → graduates.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
-        # Semantic keys with store-tier "semantic" (simulate post-promotion state).
-        sem_keys = [f"s{i}" for i in range(11)]
-        # Seed with store-tier "semantic" (promotion already happened).
-        for k in sem_keys:
-            loop.store.put(
-                "semantic",
-                k,
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "predicate": f"likes_{k}",
-                    "object": f"thing_{k}",
-                    "speaker_id": "S0",
-                },
-                register=True,
-            )
-            loop.store.set_bookkeeping(
-                k,
-                speaker_id="S0",
-                relation_type="factual",
-                reinforcement_count=3,  # promoted threshold met
-                last_reinforced_cycle=1,
-                first_seen="",
-            )
-        # Episodic keys.
-        ep_keys = [f"e{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-
-        # The edge-walk stage uses store.tier_for_active_key to determine current tier;
-        # semantic keys are already in semantic store-tier so they route to
-        # serve_assignment["semantic"].
-        self._add_edges(
-            loop,
-            [
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "object": f"thing_{k}",
-                    "predicate": f"likes_{k}",
-                    "relation_type": "factual",
-                }
-                for k in sem_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "factual",
-                }
-                for k in ep_keys
-            ],
-        )
-
-        # No disk slot for semantic in tmp_path → _tier_has_disk_slot("semantic") = False.
-        train_spy = MagicMock(return_value={"aborted": False})
-        subset_copy_spy = MagicMock()
-        full_copy_spy = MagicMock()
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-                ),
-                patch.object(
-                    ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
-                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert "semantic" in result["tiers_rebuilt"], (
-            "semantic must be in tiers_rebuilt after fast-start copy accepted"
-        )
-        # FULL copy (not subset) for semantic←episodic (equal param sets).
-        sem_full_calls = [
-            c
-            for c in full_copy_spy.call_args_list
-            if c.kwargs.get("dst") == "semantic" or (c.args and "semantic" in str(c.args))
-        ]
-        assert len(sem_full_calls) >= 1, (
-            "copy_adapter_weights (FULL) must be called for semantic←episodic (v3 fix)"
-        )
-        # subset copy must NOT have been used for semantic.
-        sem_subset_calls = [
-            c
-            for c in subset_copy_spy.call_args_list
-            if c.kwargs.get("dst") == "semantic" or (c.args and "semantic" in str(c.args))
-        ]
-        assert len(sem_subset_calls) == 0, (
-            "copy_adapter_weights_subset must NOT be called for semantic (only procedural)"
-        )
-        # train_adapter must NOT be called for semantic.
-        sem_train = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "semantic"
-        ]
-        assert len(sem_train) == 0, "train_adapter must NOT be called for semantic fast-start"
-        # Episodic train includes the 11 semantic graduating keys (universal donor).
-        # Verify via serve layout: semantic served from semantic, not episodic.
-        served_sem = {e["key"] for e in result["tier_keyed"]["semantic"]}
-        assert served_sem == set(sem_keys), "semantic keys must be served from semantic"
-        served_ep = {e["key"] for e in result["tier_keyed"]["episodic"]}
-        assert not (served_ep & set(sem_keys)), (
-            "graduating semantic keys must NOT appear in episodic serve set"
-        )
-
-    def test_simultaneous_semantic_procedural_graduation_universal_donor(self, tmp_path):
-        """Both semantic and procedural graduate in the same fold (universal donor).
-
-        floor=10, 11 semantic keys (store-tier semantic, first-cross) + 12 procedural
-        keys (store-tier episodic, parked) + 20 episodic.
-
-        Assertions:
-        - episodic train entries = 43 unique (20+11+12), no duplicates
-        - copy_adapter_weights (FULL) called for semantic
-        - copy_adapter_weights_subset (SUBSET) called for procedural
-        - train_adapter NOT called for semantic or procedural
-        - both in tiers_rebuilt
-        - serve layout: semantic=11, procedural=12, episodic=20
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
-
-        sem_keys = [f"s{i}" for i in range(11)]
-        proc_keys = [f"p{i}" for i in range(12)]
-        ep_keys = [f"e{i}" for i in range(20)]
-
-        # Semantic keys: store-tier "semantic" (promotion-store-moved, no disk slot).
-        for k in sem_keys:
-            loop.store.put(
-                "semantic",
-                k,
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "predicate": f"likes_{k}",
-                    "object": f"thing_{k}",
-                    "speaker_id": "S0",
-                },
-                register=True,
-            )
-            loop.store.set_bookkeeping(
-                k,
-                speaker_id="S0",
-                relation_type="factual",
-                reinforcement_count=3,
-                last_reinforced_cycle=1,
-                first_seen="",
-            )
-        # Procedural keys: store-tier "episodic" (parked, no disk slot for procedural).
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-
-        self._add_edges(
-            loop,
-            [
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "object": f"thing_{k}",
-                    "predicate": f"likes_{k}",
-                    "relation_type": "factual",
-                }
-                for k in sem_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "preference",
-                }
-                for k in proc_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "factual",
-                }
-                for k in ep_keys
-            ],
-        )
-
-        train_spy = MagicMock(return_value={"aborted": False})
-        full_copy_spy = MagicMock()
-        subset_copy_spy = MagicMock()
-        format_entries_captured: dict = {}
-        _current_adapter: list = [None]
-
-        def _spy_switch(m, n):
-            # switch_adapter (not create_adapter) is the "which adapter is
-            # about to train" hook: under warm init a resident,
-            # config-matching tier is kept (ensure_adapter_matching no-ops,
-            # create_adapter is never called for it), but switch_adapter
-            # still runs unconditionally right before format_entry_training
-            # in every case.
-            _current_adapter[0] = n
-
-        def _spy_format(entries, *a, **kw):
-            if _current_adapter[0] and _current_adapter[0] not in format_entries_captured:
-                format_entries_captured[_current_adapter[0]] = list(entries)
-            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-                ),
-                patch.object(
-                    ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    side_effect=_spy_format,
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
-                patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
-                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        # Both graduating tiers in tiers_rebuilt.
-        assert "semantic" in result["tiers_rebuilt"], "semantic must be in tiers_rebuilt"
-        assert "procedural" in result["tiers_rebuilt"], "procedural must be in tiers_rebuilt"
-
-        # Copy type per tier.
-        sem_full = [c for c in full_copy_spy.call_args_list if c.kwargs.get("dst") == "semantic"]
-        assert len(sem_full) >= 1, "FULL copy must be called for semantic (equal param sets)"
-        proc_subset = [
-            c for c in subset_copy_spy.call_args_list if c.kwargs.get("dst") == "procedural"
-        ]
-        assert len(proc_subset) >= 1, "SUBSET copy must be called for procedural (attn only)"
-
-        # No train_adapter for semantic or procedural.
-        for t in ("semantic", "procedural"):
-            t_train = [c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == t]
-            assert len(t_train) == 0, f"train_adapter must NOT be called for {t} fast-start"
-
-        # Episodic train set = 43 unique keys (20 + 11 + 12).
-        ep_format_entries = format_entries_captured.get("episodic", [])
-        ep_trained_keys = {e["key"] for e in ep_format_entries}
-        assert len(ep_trained_keys) == 43, (
-            f"episodic train set must be 20+11+12=43 unique keys, got {len(ep_trained_keys)}"
-        )
-        assert set(sem_keys) <= ep_trained_keys, "sem graduating keys must be in ep train set"
-        assert set(proc_keys) <= ep_trained_keys, "proc graduating keys must be in ep train set"
-
-        # Serve layout.
-        assert result["keys_per_tier"]["semantic"] == 11
-        assert result["keys_per_tier"]["procedural"] == 12
-        assert result["keys_per_tier"]["episodic"] == 20
-
-    def test_graduation_fallback_trains_on_serve_set_procedural(self, tmp_path):
-        """Fast-start fallback for procedural: when the copy probe fails, train_adapter
-        IS called for procedural with entries = its serve set, procedural in tiers_rebuilt.
-
-        Probe patched to FAIL for procedural while episodic otherwise informed.
-        Confirms fallback re-assignment: job.entries = serve_assignment[tier].
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        floor = 10
-        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
-        proc_keys = [f"p{i}" for i in range(12)]
-        ep_keys = [f"e{i}" for i in range(20)]
-        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._add_edges(
-            loop,
-            [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "preference",
-                }
-                for k in proc_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "factual",
-                }
-                for k in ep_keys
-            ],
-        )
-
-        # Probe FAILS for procedural (simulates copy under-recall).
-        def _probe_fail(adapter_name, entries):
-            if adapter_name == "procedural":
-                return set()  # fail
-            return {e["key"] for e in entries}
-
-        train_spy = MagicMock(return_value={"aborted": False})
-        format_entries_by_adapter: dict = {}
-        _current_adapter: list = ["episodic"]
-
-        def _spy_switch(m, n):
-            # switch_adapter (not create_adapter) is the "which adapter is
-            # about to train" hook: under warm init a resident,
-            # config-matching tier is kept (ensure_adapter_matching no-ops,
-            # create_adapter is never called for it), but switch_adapter
-            # still runs unconditionally right before format_entry_training
-            # in every case.
-            _current_adapter[0] = n
-
-        def _spy_format(entries, *a, **kw):
-            ad = _current_adapter[0]
-            format_entries_by_adapter.setdefault(ad, []).extend(entries)
-            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-                ),
-                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe_fail),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    side_effect=_spy_format,
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert "procedural" in result["tiers_rebuilt"], (
-            "procedural must be in tiers_rebuilt after (b)→(a) fallback"
-        )
-        proc_train_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
-        ]
-        assert len(proc_train_calls) >= 1, (
-            "train_adapter must be called for procedural after fast-start probe failure"
-        )
-        # Fallback train entries = the serve set (12 keys), not empty.
-        proc_format_entries = format_entries_by_adapter.get("procedural", [])
-        proc_trained_keys = {e["key"] for e in proc_format_entries}
-        assert proc_trained_keys == set(proc_keys), (
-            f"fallback train entries must equal the procedural serve set "
-            f"(12 keys), got {len(proc_trained_keys)}"
-        )
-
-    def test_graduation_fallback_trains_on_serve_set_semantic(self, tmp_path):
-        """Fast-start fallback for semantic: when the copy probe fails, train_adapter
-        IS called for semantic with entries = its serve set. Confirms fallback
-        works for the semantic path too.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        loop = _make_fold_loop(tmp_path)
         sem_keys = [f"s{i}" for i in range(11)]
         ep_keys = [f"e{i}" for i in range(20)]
 
@@ -10235,142 +8671,8 @@ class TestTierFloor:
                 last_reinforced_cycle=1,
                 first_seen="",
             )
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._add_edges(
-            loop,
-            [
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "object": f"thing_{k}",
-                    "predicate": f"likes_{k}",
-                    "relation_type": "factual",
-                }
-                for k in sem_keys
-            ]
-            + [
-                {
-                    "key": k,
-                    "subject": "A",
-                    "object": f"o{k}",
-                    "predicate": f"p{k}",
-                    "relation_type": "factual",
-                }
-                for k in ep_keys
-            ],
-        )
-
-        # Probe FAILS for semantic.
-        def _probe_fail_sem(adapter_name, entries):
-            if adapter_name == "semantic":
-                return set()
-            return {e["key"] for e in entries}
-
-        train_spy = MagicMock(return_value={"aborted": False})
-        format_entries_by_adapter: dict = {}
-        _current_adapter: list = ["episodic"]
-
-        def _spy_switch(m, n):
-            # switch_adapter (not create_adapter) is the "which adapter is
-            # about to train" hook: under warm init a resident,
-            # config-matching tier is kept (ensure_adapter_matching no-ops,
-            # create_adapter is never called for it), but switch_adapter
-            # still runs unconditionally right before format_entry_training
-            # in every case.
-            _current_adapter[0] = n
-
-        def _spy_format(entries, *a, **kw):
-            ad = _current_adapter[0]
-            format_entries_by_adapter.setdefault(ad, []).extend(entries)
-            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-                ),
-                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe_fail_sem),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch("paramem.training.trainer.train_adapter", train_spy),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    side_effect=_spy_format,
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert "semantic" in result["tiers_rebuilt"], (
-            "semantic must be in tiers_rebuilt after (b)→(a) fallback"
-        )
-        sem_train_calls = [
-            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "semantic"
-        ]
-        assert len(sem_train_calls) >= 1, (
-            "train_adapter must be called for semantic after fast-start probe failure"
-        )
-        sem_format_entries = format_entries_by_adapter.get("semantic", [])
-        sem_trained_keys = {e["key"] for e in sem_format_entries}
-        assert sem_trained_keys == set(sem_keys), (
-            f"fallback train entries must equal the semantic serve set "
-            f"(11 keys), got {len(sem_trained_keys)}"
-        )
-
-    def test_train_from_scratch_episodic_not_augmented_with_graduating_keys(self, tmp_path):
-        """With tier_fast_start=False, first-cross semantic trains from scratch
-        on its own serve set — episodic train set does NOT include semantic keys.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=False)
-        sem_keys = [f"s{i}" for i in range(11)]
-        ep_keys = [f"e{i}" for i in range(20)]
-
-        for k in sem_keys:
-            loop.store.put(
-                "semantic",
-                k,
-                {
-                    "key": k,
-                    "subject": "Alice",
-                    "predicate": f"likes_{k}",
-                    "object": f"thing_{k}",
-                    "speaker_id": "S0",
-                },
-                register=True,
-            )
-            loop.store.set_bookkeeping(
-                k,
-                speaker_id="S0",
-                relation_type="factual",
-                reinforcement_count=3,
-                last_reinforced_cycle=1,
-                first_seen="",
-            )
-        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
-        self._add_edges(
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _build_merger_graph(
             loop,
             [
                 {
@@ -10450,17 +8752,72 @@ class TestTierFloor:
         finally:
             _gpu_thread_lock.release()
 
-        # Semantic trains from scratch — train_adapter called for semantic.
+        # Semantic trains on its own set — train_adapter called for semantic.
         sem_train = [
             c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "semantic"
         ]
-        assert len(sem_train) >= 1, "train_adapter must be called for semantic (train-from-scratch)"
-        # Episodic train set does NOT include semantic graduating keys.
+        assert len(sem_train) >= 1, "train_adapter must be called for semantic"
+        # Episodic train set does NOT include semantic's keys.
         ep_format = format_entries_by_adapter.get("episodic", [])
         ep_trained_keys = {e["key"] for e in ep_format}
         assert not (ep_trained_keys & set(sem_keys)), (
-            "episodic train set must NOT include semantic graduating keys "
-            "when tier_fast_start=False (no donor augmentation)"
+            "episodic train set must NOT include another tier's keys"
+        )
+
+    def test_on_fold_assignments_called_with_single_tier_keyed_map(self, tmp_path):
+        """on_fold_assignments is called with one map whose per-tier key lists
+        equal the fold's ``tier_keyed`` — no tier's list ever contains another
+        tier's keys (the positive form of the one-map invariant)."""
+        from unittest.mock import patch
+
+        loop = _make_fold_loop(tmp_path)
+        proc_keys = [f"p{i}" for i in range(3)]
+        ep_keys = [f"e{i}" for i in range(5)]
+        _seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "preference",
+                }
+                for k in proc_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        with patch("paramem.training.consolidation.on_fold_assignments") as on_fold_assignments_spy:
+            _run_full_fold_mocked(loop)
+
+        on_fold_assignments_spy.assert_called_once()
+        (called_map,) = on_fold_assignments_spy.call_args.args
+        # Compare against the keys seeded into the fixture (independently derived
+        # from the fold's own output) — not against result["tier_keyed"], which
+        # is the identical object on_fold_assignments was called with and would
+        # make this a self-comparison.
+        assert {e["key"] for e in called_map["procedural"]} == set(proc_keys), (
+            "procedural must carry exactly the seeded preference-relation keys"
+        )
+        assert {e["key"] for e in called_map["episodic"]} == set(ep_keys), (
+            "episodic must carry exactly the seeded factual-relation keys"
+        )
+        # No cross-tier leakage: procedural keys never appear in episodic's list.
+        assert not (
+            {e["key"] for e in called_map["procedural"]}
+            & {e["key"] for e in called_map["episodic"]}
         )
 
 
@@ -10486,7 +8843,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -10589,7 +8946,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -10702,7 +9059,7 @@ class TestMintedFingerprintMatchesEntryDisplaySurface:
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -10820,7 +9177,7 @@ class TestCollectKeyedEdgesInto:
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -14369,8 +12726,6 @@ class TestMergeRegistryRelationsTimestamp:
         loop.model = None  # no gradient-checkpointing guard needed
         loop.tokenizer = None
         loop.config = ConsolidationConfig(
-            min_tier_key_floor=0,
-            tier_fast_start=False,
             refinement_contradiction="on",  # enable Case-2 so the bug can trigger
         )
         loop.training_config = TrainingConfig(
@@ -17237,7 +15592,7 @@ class TestFoldResumeHelpers:
         loop.model.__class__ = PeftModel
         loop.model.peft_config = {}
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -17315,6 +15670,69 @@ class TestFoldResumeHelpers:
         assert "episodic" in state["completed_tiers"]
         assert state["in_flight_tier"] == "semantic"
         assert state["tier_checkpoints"]["episodic"] == ckpt
+
+    def test_latest_checkpoint_in_dir_finds_ram_mode_checkpoint(self, tmp_path):
+        """A dir holding only ``bg_checkpoint_epoch/checkpoint-N/`` (RAM-mode
+        training, where HF Trainer's own checkpoint-N/ writes land in
+        /dev/shm and only the epoch-mirrored copy reaches this directory)
+        resolves to that checkpoint, not None — a fold that trains in RAM
+        mode must still find its durable checkpoint on the next crash-resume.
+        """
+        loop = self._make_loop(tmp_path)
+        refresh_dir = tmp_path / "consolidation_refresh" / "episodic"
+        (refresh_dir / "bg_checkpoint_epoch" / "checkpoint-5").mkdir(parents=True)
+        (refresh_dir / "bg_checkpoint_epoch" / "checkpoint-30").mkdir(parents=True)
+
+        found = loop._latest_checkpoint_in_dir(refresh_dir)
+
+        assert found is not None, (
+            "a checkpoint recorded only under bg_checkpoint_epoch/ must not be lost"
+        )
+        assert found == str(refresh_dir / "bg_checkpoint_epoch" / "checkpoint-30"), (
+            "the highest-numbered checkpoint must win, same as the disk-mode default"
+        )
+
+    def test_latest_checkpoint_in_dir_disk_mode_default_still_resolves(self, tmp_path):
+        """The disk-mode default (checkpoint-N directly under *directory*,
+        no bg_checkpoint_epoch/ venue present) still resolves to the
+        highest-numbered checkpoint — the recursive glob must not regress it.
+        """
+        loop = self._make_loop(tmp_path)
+        refresh_dir = tmp_path / "consolidation_refresh" / "episodic"
+        (refresh_dir / "checkpoint-10").mkdir(parents=True)
+        (refresh_dir / "checkpoint-20").mkdir(parents=True)
+
+        found = loop._latest_checkpoint_in_dir(refresh_dir)
+
+        assert found == str(refresh_dir / "checkpoint-20")
+
+    def test_latest_checkpoint_in_dir_highest_step_wins_across_venues(self, tmp_path):
+        """With both a disk-mode checkpoint and a RAM-mode epoch mirror present,
+        the highest step number wins regardless of which venue it is under —
+        per trainer.py's ``_clean_scratch`` guarantee that only one venue is
+        ever live for a given training run, the numeric ordering is the sole
+        and correct tie-breaker if both happen to coexist (e.g. a stale
+        leftover from a switched ``save_steps_ram`` setting).
+        """
+        loop = self._make_loop(tmp_path)
+        refresh_dir = tmp_path / "consolidation_refresh" / "episodic"
+        (refresh_dir / "checkpoint-300").mkdir(parents=True)
+        (refresh_dir / "bg_checkpoint_epoch" / "checkpoint-200").mkdir(parents=True)
+
+        found = loop._latest_checkpoint_in_dir(refresh_dir)
+
+        assert found == str(refresh_dir / "checkpoint-300"), (
+            "the highest step number must win even though it is the disk-mode "
+            "checkpoint and the RAM-mode mirror is numerically lower"
+        )
+
+    def test_latest_checkpoint_in_dir_returns_none_when_absent(self, tmp_path):
+        """No checkpoint anywhere under *directory* → None."""
+        loop = self._make_loop(tmp_path)
+        refresh_dir = tmp_path / "consolidation_refresh" / "episodic"
+        refresh_dir.mkdir(parents=True)
+
+        assert loop._latest_checkpoint_in_dir(refresh_dir) is None
 
     def test_clear_fold_resume_removes_file(self, tmp_path):
         """_clear_fold_resume removes fold_resume.json; idempotent on absent file."""
@@ -17398,76 +15816,6 @@ class TestFoldResumeHelpers:
         # Assignment entries must also survive intact.
         assert state["train_assignment"]["episodic"] == entries
 
-    def test_b1_accumulating_return_does_not_write_marker(self, tmp_path):
-        """An accumulating return MUST NOT leave a fold_resume.json marker.
-
-        The accumulate guard fires when total trainable keys < min_tier_key_floor.
-        After the return no marker file must exist.
-        """
-        from unittest.mock import patch
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-        from paramem.utils.config import ConsolidationConfig
-
-        loop = self._make_loop(tmp_path)
-        # Set a high floor so the empty store triggers the accumulating return.
-        loop.config = ConsolidationConfig(min_tier_key_floor=30, tier_fast_start=False)
-
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        _gpu_thread_lock.acquire()
-        try:
-            with (
-                patch(
-                    "paramem.training.consolidation.reconstruct_graph",
-                    return_value=__import__(
-                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
-                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_enrichment",
-                    return_value={"skipped": True},
-                ),
-                patch.object(
-                    GraphTierRefiner,
-                    "run_normalization",
-                    return_value={"skipped": True},
-                ),
-                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(
-                    ConsolidationLoop,
-                    "_maybe_make_recall_callback",
-                    return_value=(None, None),
-                ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
-                patch(
-                    "paramem.training.trainer.train_adapter",
-                    MagicMock(return_value={"aborted": False}),
-                ),
-                patch(
-                    "paramem.training.consolidation.format_entry_training",
-                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
-                ),
-                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
-                patch("paramem.models.loader.switch_adapter"),
-                patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-            ):
-                result = loop.consolidate(mode="train", trainer=None, router=None)
-        finally:
-            _gpu_thread_lock.release()
-
-        assert result.get("status") == "accumulating", f"Expected accumulating, got {result!r}"
-        # No marker must have been written on an accumulating return.
-        marker_path = loop._fold_state_dir / "fold_resume.json"
-        assert not marker_path.exists(), (
-            "fold_resume.json MUST NOT be written on an accumulating return"
-        )
-
     def test_resume_on_entry_skips_completed_tier(self, tmp_path):
         """Completed tiers in the marker are reloaded not retrained.
 
@@ -17482,8 +15830,8 @@ class TestFoldResumeHelpers:
         from paramem.utils.config import ConsolidationConfig
 
         loop = self._make_loop(tmp_path)
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
-        # Seed two tiers above floor=0.
+        loop.config = ConsolidationConfig()
+        # Seed two tiers with entries.
         loop.store = MemoryStore(replay_enabled=True)
         loop.store.put(
             "episodic",
@@ -17913,8 +16261,8 @@ class TestConsumePendingFullFold:
     4. The crash-resume fast-path branch does NOT trigger the capture.
 
     All tests mock GPU/model operations (no hardware required).
-    Modelled on TestConsolidateInterimAdaptersFullFlow._make_loop and
-    TestTierFloor._run_full_fold_mocked (object.__new__ pattern).
+    Modelled on TestConsolidateInterimAdaptersFullFlow._make_loop and the
+    module-level _run_full_fold_mocked harness (object.__new__ pattern).
     """
 
     @staticmethod
@@ -17949,7 +16297,7 @@ class TestConsumePendingFullFold:
             "procedural_backup": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.config = ConsolidationConfig()
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -18213,11 +16561,7 @@ class TestConsumePendingFullFold:
 
         loop = self._make_loop(tmp_path, merger_graph=g)
         # Explicitly set refinement_contradiction="on" on the loop's training-layer config.
-        loop.config = ConsolidationConfig(
-            min_tier_key_floor=0,
-            tier_fast_start=False,
-            refinement_contradiction="on",
-        )
+        loop.config = ConsolidationConfig(refinement_contradiction="on")
 
         _result, materialize_calls = self._run_full_fold_with_materialize_spy(
             loop, consume_pending=True
@@ -18855,7 +17199,6 @@ class TestRunFullCycleConsumePending:
     - mark_consolidated called on fold NOOP with extraction success (Site A)
     - mark_consolidated NOT called on AbortedDuringConsolidation
     - mark_consolidated NOT called on Exception (fold crash)
-    - mark_consolidated NOT called on status="accumulating"
     - Extraction-FAILED sessions not marked in either site
     """
 
@@ -19065,7 +17408,7 @@ class TestRunFullCycleConsumePending:
     def test_mark_consolidated_called_on_fold_noop_site_a(self, monkeypatch, tmp_path):
         """MF-A Site A: mark_consolidated called when fold returns noop at count==0.
 
-        Noop = tiers_rebuilt=[] and status != 'accumulating'.  Extraction succeeded,
+        Noop = tiers_rebuilt=[].  Extraction succeeded,
         but the fold found nothing new to train (all facts already present after dedup).
         The sessions are processed — mark them consolidated to prevent re-extraction
         unboundedly (prevents already-processed sessions from accumulating unboundedly in pending).
@@ -19095,31 +17438,6 @@ class TestRunFullCycleConsumePending:
             self._run_sync(state, monkeypatch)
 
         sb.mark_consolidated.assert_called_once()
-
-    def test_mark_consolidated_not_called_on_accumulating(self, monkeypatch, tmp_path):
-        """mark_consolidated NOT called when fold returns status='accumulating'."""
-        from unittest.mock import patch
-
-        state = self._make_state(tmp_path)
-        loop = state["consolidation_loop"]
-        loop.extract_session.return_value = ([], [])
-        loop.consolidate.return_value = {
-            "status": "accumulating",
-            "accumulating_reason": {"floor": 30},
-            "tiers_rebuilt": [],
-        }
-
-        sb = state["session_buffer"]
-        sb.get_pending.return_value = [self._pending_session()]
-        sb.pending_facts.return_value = [self._pending_fact()]
-
-        with (
-            patch("paramem.server.app.check_vram_headroom"),
-            patch("paramem.server.app.vram_scope"),
-        ):
-            self._run_sync(state, monkeypatch)
-
-        sb.mark_consolidated.assert_not_called()
 
     def test_mark_consolidated_not_called_on_abort(self, monkeypatch, tmp_path):
         """mark_consolidated NOT called when fold raises AbortedDuringConsolidation."""
@@ -19285,7 +17603,6 @@ class TestConsolidateEntry:
             "consume_pending",
             "trainer",
             "router",
-            "recall_sanity_threshold",
         }, f"unexpected fold-entry parameters: {sorted(params)}"
         assert params["mode"].default is inspect.Parameter.empty, "mode is required"
         assert params["keys_from"].default == "all_tiers", (
@@ -19308,7 +17625,6 @@ class TestConsolidateEntry:
             "scope",
             "trainer",
             "router",
-            "recall_sanity_threshold",
             "adapter_name",
             "stamp",
             "run_label",
@@ -19362,10 +17678,10 @@ class TestFoldKeySource:
 
     def _make_loop_with_an_interim_slot(self, tmp_path):
         """Loop with two episodic keys in the merged graph and one interim key beside them."""
-        loop = TestTierFloor._make_loop(tmp_path, min_tier_key_floor=0, tier_fast_start=False)
-        TestTierFloor._seed_keys(loop, "episodic", ["graph1", "graph2"])
-        TestTierFloor._seed_keys(loop, self.INTERIM_TIER, ["graph9"])
-        TestTierFloor._build_merger_graph(
+        loop = _make_fold_loop(tmp_path)
+        _seed_keys(loop, "episodic", ["graph1", "graph2"])
+        _seed_keys(loop, self.INTERIM_TIER, ["graph9"])
+        _build_merger_graph(
             loop,
             [
                 {
@@ -19404,9 +17720,7 @@ class TestFoldKeySource:
         loop = self._make_loop_with_an_interim_slot(tmp_path)
         unload_spy = MagicMock(return_value=[])
 
-        result = TestTierFloor._run_full_fold_mocked(
-            loop, keys_from="main_tiers", unload_spy=unload_spy
-        )
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers", unload_spy=unload_spy)
 
         assert result["tiers_rebuilt"], "fixture guard: the fold must have persisted something"
         unload_spy.assert_not_called()
@@ -19422,9 +17736,7 @@ class TestFoldKeySource:
         loop = self._make_loop_with_an_interim_slot(tmp_path)
         unload_spy = MagicMock(return_value=[])
 
-        result = TestTierFloor._run_full_fold_mocked(
-            loop, keys_from="all_tiers", unload_spy=unload_spy
-        )
+        result = _run_full_fold_mocked(loop, keys_from="all_tiers", unload_spy=unload_spy)
 
         assert result["tiers_rebuilt"], "fixture guard: the fold must have persisted something"
         assert unload_spy.call_count == 1
@@ -19441,12 +17753,8 @@ class TestFoldKeySource:
         loop_all = self._make_loop_with_an_interim_slot(tmp_path / "all")
         loop_main = self._make_loop_with_an_interim_slot(tmp_path / "main")
 
-        drift_all = TestTierFloor._run_full_fold_mocked(loop_all, keys_from="all_tiers")[
-            "graph_drift_count"
-        ]
-        drift_main = TestTierFloor._run_full_fold_mocked(loop_main, keys_from="main_tiers")[
-            "graph_drift_count"
-        ]
+        drift_all = _run_full_fold_mocked(loop_all, keys_from="all_tiers")["graph_drift_count"]
+        drift_main = _run_full_fold_mocked(loop_main, keys_from="main_tiers")["graph_drift_count"]
 
         assert drift_all == 1, "the absorbing fold read graph9 and produced no keyed edge for it"
         assert drift_main == 0
@@ -19512,19 +17820,20 @@ class TestMainTierInitPolicy:
     policy and its shared config-mismatch guard
     (``paramem.models.loader.ensure_adapter_matching``).
 
-    Reuses ``TestTierFloor``'s harness (``_make_loop`` / ``_seed_keys`` /
-    ``_build_merger_graph`` / ``_run_full_fold_mocked``). The shared factory
-    (``TestConsolidateInterimAdaptersFullFlow._make_loop``) gives every
-    resident ``episodic``/``semantic``/``procedural`` adapter LoRA fields
-    matching its own tier ``AdapterConfig`` by default, so every fold test
-    here trains warm unless a test explicitly overrides a field afterward to
-    opt into the cold/mismatch path (as the mismatch tests below do).
+    Reuses the module-level full-fold harness (``_make_fold_loop`` /
+    ``_seed_keys`` / ``_build_merger_graph`` / ``_run_full_fold_mocked``). The
+    shared factory (``TestConsolidateInterimAdaptersFullFlow._make_loop``)
+    gives every resident ``episodic``/``semantic``/``procedural`` adapter LoRA
+    fields matching its own tier ``AdapterConfig`` by default, so every fold
+    test here trains warm unless a test explicitly overrides a field
+    afterward to opt into the cold/mismatch path (as the mismatch tests below
+    do).
     """
 
     def _seeded_loop(self, tmp_path):
-        loop = TestTierFloor._make_loop(tmp_path, min_tier_key_floor=0, tier_fast_start=False)
-        TestTierFloor._seed_keys(loop, "episodic", ["graph1", "graph2"])
-        TestTierFloor._build_merger_graph(
+        loop = _make_fold_loop(tmp_path)
+        _seed_keys(loop, "episodic", ["graph1", "graph2"])
+        _build_merger_graph(
             loop,
             [
                 {
@@ -19548,9 +17857,7 @@ class TestMainTierInitPolicy:
         loop = self._seeded_loop(tmp_path)
         train_spy = MagicMock(return_value={"aborted": False})
 
-        result = TestTierFloor._run_full_fold_mocked(
-            loop, keys_from="all_tiers", train_adapter_spy=train_spy
-        )
+        result = _run_full_fold_mocked(loop, keys_from="all_tiers", train_adapter_spy=train_spy)
 
         tier_delete_calls = [
             c for c in loop.model.delete_adapter.call_args_list if c.args == ("episodic",)
@@ -19566,7 +17873,7 @@ class TestMainTierInitPolicy:
         today's unconditional delete+recreate exactly."""
         loop = self._seeded_loop(tmp_path)
 
-        TestTierFloor._run_full_fold_mocked(loop, keys_from="main_tiers")
+        _run_full_fold_mocked(loop, keys_from="main_tiers")
 
         loop.model.delete_adapter.assert_any_call("episodic")
 
@@ -19583,7 +17890,7 @@ class TestMainTierInitPolicy:
         loader_logger.addHandler(caplog.handler)
         loader_logger.setLevel(logging.WARNING)
         try:
-            TestTierFloor._run_full_fold_mocked(loop, keys_from="all_tiers")
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
         finally:
             loader_logger.removeHandler(caplog.handler)
 
@@ -19633,7 +17940,7 @@ class TestMainTierInitPolicy:
         loop = self._seeded_loop(tmp_path)
         loop.model.peft_config["episodic"].r = 999  # target is rank=4 (see _make_loop)
 
-        result = TestTierFloor._run_full_fold_mocked(
+        result = _run_full_fold_mocked(
             loop,
             keys_from="all_tiers",
             create_adapter_side_effect=_fake_create_adapter_stamped,

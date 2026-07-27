@@ -220,7 +220,7 @@ class TestBucketTableGovernsUnclamped:
     governs the derived per-fold epoch count, nothing else caps it. The
     prior ``consolidation.max_epochs`` operator ceiling / ``TrainingConfig
     .budget_max_epochs`` field were retired 2026-07-26 (see
-    tests/server/test_config.py::TestRetiredBudgetAndDonorFlagsRejected's
+    tests/server/test_config.py::TestRetiredConsolidationKeysRejected's
     sibling stale-key test for the retired ``max_epochs`` key).
 
     Loads the REAL config path (load_server_config on the tracked fixture)
@@ -251,16 +251,22 @@ class TestBucketTableGovernsUnclamped:
         assert epochs == expected_epochs
 
 
-class TestRetiredBudgetAndDonorFlagsRejected:
-    """budget_derivation_enabled / donor_seeding_enabled were deleted --
-    derived per-fold training budgets and donor seeding are now the
-    unconditional standard mechanism (validation arms passed; see
-    benchmarking.md). ``ConsolidationScheduleConfig(**consolidation_raw)``
-    is a plain dataclass constructor call
-    (``paramem.server.config.build_server_config``); an unrecognized key
-    under ``consolidation:`` is not silently ignored -- it raises
-    ``TypeError`` from the dataclass constructor itself, so a stale
-    operator YAML carrying either retired key fails loud at load time.
+class TestRetiredConsolidationKeysRejected:
+    """Retired ``consolidation:`` keys fail loud at config load, not silently.
+
+    ``ConsolidationScheduleConfig(**consolidation_raw)`` is a plain dataclass
+    constructor call (``paramem.server.config.build_server_config``); an
+    unrecognized key under ``consolidation:`` is not silently ignored -- it
+    raises ``TypeError`` from the dataclass constructor itself, so a stale
+    operator YAML carrying a retired key fails loud at load time. Covers, in
+    order of retirement: ``budget_derivation_enabled`` / ``donor_seeding_enabled``
+    (derived per-fold training budgets and donor seeding are now the
+    unconditional standard mechanism; validation arms passed, see
+    benchmarking.md), ``max_epochs`` (2026-07-26; the per-fold training
+    budget is unconditional and unclamped via ``paramem.utils.config.budget_for``),
+    and ``min_tier_key_floor`` / ``tier_fast_start`` (2026-07-27; the per-tier
+    key-count floor and fast-start weight-copy graduation were retired along
+    with the whole-fold accumulate guard and the ``accumulating`` terminal).
     """
 
     def test_stale_budget_derivation_enabled_key_raises(self, tmp_path):
@@ -301,6 +307,30 @@ class TestRetiredBudgetAndDonorFlagsRejected:
             """,
         )
         with pytest.raises(TypeError, match="max_epochs"):
+            load_server_config(yaml_file)
+
+    def test_stale_min_tier_key_floor_key_raises(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              min_tier_key_floor: 30
+            """,
+        )
+        with pytest.raises(TypeError, match="min_tier_key_floor"):
+            load_server_config(yaml_file)
+
+    def test_stale_tier_fast_start_key_raises(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              tier_fast_start: true
+            """,
+        )
+        with pytest.raises(TypeError, match="tier_fast_start"):
             load_server_config(yaml_file)
 
 
@@ -632,65 +662,6 @@ class TestTrainingHyperparamsFromYaml:
         )
         with pytest.raises(TypeError, match="training_lr_decay_steps"):
             load_server_config(yaml_file)
-
-
-class TestTierFloorConfigPlumbing:
-    """min_tier_key_floor and tier_fast_start wire through
-    ConsolidationScheduleConfig → consolidation_config property → ConsolidationConfig.
-    """
-
-    FIXTURE = "tests/fixtures/server.yaml"
-
-    def test_fixture_yaml_has_floor_and_fast_start(self):
-        """Fixture YAML contains both new keys under consolidation:."""
-        from paramem.server.config import load_server_config
-
-        config = load_server_config(self.FIXTURE)
-        assert config.consolidation.min_tier_key_floor == 30
-        assert config.consolidation.tier_fast_start is True
-
-    def test_consolidation_config_bridges_floor_and_fast_start(self):
-        """consolidation_config property propagates both fields to ConsolidationConfig."""
-        from paramem.server.config import load_server_config
-
-        config = load_server_config(self.FIXTURE)
-        cc = config.consolidation_config
-        assert cc.min_tier_key_floor == 30
-        assert cc.tier_fast_start is True
-
-    def test_yaml_override_respected(self, tmp_path):
-        """Custom YAML values for both fields are loaded correctly."""
-        import textwrap
-
-        from paramem.server.config import load_server_config
-
-        yaml_file = tmp_path / "server.yaml"
-        yaml_file.write_text(
-            textwrap.dedent("""\
-                model: mistral
-                consolidation:
-                  min_tier_key_floor: 50
-                  tier_fast_start: false
-            """),
-            encoding="utf-8",
-        )
-        config = load_server_config(yaml_file)
-        assert config.consolidation.min_tier_key_floor == 50
-        assert config.consolidation.tier_fast_start is False
-
-        cc = config.consolidation_config
-        assert cc.min_tier_key_floor == 50
-        assert cc.tier_fast_start is False
-
-    def test_defaults_when_keys_absent(self, tmp_path):
-        """When consolidation section is absent, defaults are 30 and True."""
-        from paramem.server.config import load_server_config
-
-        yaml_file = tmp_path / "server.yaml"
-        yaml_file.write_text("model: mistral\n", encoding="utf-8")
-        config = load_server_config(yaml_file)
-        assert config.consolidation.min_tier_key_floor == 30
-        assert config.consolidation.tier_fast_start is True
 
 
 class TestDefaultServerConfigPathIsCwdIndependent:

@@ -296,35 +296,27 @@ def on_removal_ledger(ledger: dict) -> None:
         logger.info("Debug removal_ledger written: %d entries", len(ledger))
 
 
-def on_fold_assignments(serve_assignment: dict, train_assignment: dict) -> None:
-    """Persist serve and train tier assignment maps.
+def on_fold_assignments(tier_keyed: dict) -> None:
+    """Persist the fold's per-tier key assignment.
 
     Writes ``<base>/fold/fold_assignments.json`` with per-tier key lists (not
     full entry dicts — keys are the stable identifiers; SPO is recoverable
     from the registry and the keyed graph snapshot).
 
-    Called after Pass-2 finalises ``serve_assignment`` (the two-map decoupling
-    point) and before ``_all_keyed`` is computed.
+    Called once the fold's per-tier assignment is final, before
+    ``_all_keyed`` is computed.
 
     Args:
-        serve_assignment: Mapping of tier → list of entry dicts.
-        train_assignment: Same shape; differs from ``serve_assignment`` only
-            for fast-start graduating tiers.
+        tier_keyed: Mapping of tier → list of entry dicts.
     """
     payload = {
-        "serve_assignment": {
-            tier: [e["key"] for e in entries] for tier, entries in serve_assignment.items()
-        },
-        "train_assignment": {
-            tier: [e["key"] for e in entries] for tier, entries in train_assignment.items()
-        },
+        "tier_keyed": {tier: [e["key"] for e in entries] for tier, entries in tier_keyed.items()},
     }
     for base in _active_bases():
         write_artifact(base / "fold" / "fold_assignments.json", payload)
         logger.info(
-            "Debug fold_assignments written: serve=%s train=%s",
-            {t: len(v) for t, v in serve_assignment.items()},
-            {t: len(v) for t, v in train_assignment.items()},
+            "Debug fold_assignments written: tier_keyed=%s",
+            {t: len(v) for t, v in tier_keyed.items()},
         )
 
 
@@ -370,7 +362,7 @@ def on_tier_delta(tier_delta: dict) -> None:
     ``"tier_delta"`` entry emitted in the fold result dict — a mapping of tier
     name to ``{active_before, active_after, staled_by_reason, minted}``.
 
-    Called once per fold, after ``serve_assignment`` and ``minted_by_tier`` are
+    Called once per fold, after ``tier_keyed`` and ``minted_by_tier`` are
     finalised.  Emitted for BOTH the train and simulate fold paths.
     ``staled_by_reason`` is derived from ``merger.removal_ledger`` and includes
     all removal reasons (dedup, enrichment_same_as, etc.).  For simulate mode,

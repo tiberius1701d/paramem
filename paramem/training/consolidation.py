@@ -408,10 +408,6 @@ class FoldScope:
             :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
             Refine stage.  ``True`` for the full fold in BOTH venues —
             promotion is a pure store operation with no weight dependency.
-        tier_floor: When ``True``, run the per-tier floor park/graduate pass
-            as a second pass after the build-entries stage.  ``True`` for the
-            full fold in BOTH venues — parking and graduation are pure store
-            operations; only the fast-start *weight copy* is venue-gated.
         subtractive_scope: Forwarded to
             :meth:`~ConsolidationLoop._apply_subtractive_removals_to_store`
             (``"interim"`` | ``"fold"``).
@@ -456,7 +452,6 @@ class FoldScope:
 
     # --- spine stage gates ---
     promote: bool = False
-    tier_floor: bool = False
     subtractive_scope: "Literal['interim', 'fold']" = "fold"
 
     # --- pending capture ---
@@ -2104,8 +2099,9 @@ class ConsolidationLoop:
     ) -> None:
         """Write the initial ``fold_resume.json`` marker once the assignment is finalized.
 
-        Called on the TRAINING path, AFTER the whole-fold accumulate guard,
-        so an accumulating early-return never leaves a stale marker.
+        Called on the TRAINING path once the per-tier assignment is final —
+        there is no early return between assignment and this call, so the
+        marker always reflects what the fold is about to train.
 
         ``completed_tiers`` starts empty; the first ``in_flight_tier`` is the
         first tier that has training entries.
@@ -2162,8 +2158,9 @@ class ConsolidationLoop:
             tier: The tier name that just completed training (``"episodic"``,
                 ``"semantic"``, or ``"procedural"``).
             checkpoint_path: Path to the retained ``checkpoint-N`` directory for
-                this tier, or ``None`` when the tier was a fast-start graduation
-                (no checkpoint dir exists; reload comes from the production slot).
+                this tier, or ``None`` when :meth:`_latest_checkpoint_in_dir`
+                found no checkpoint under the tier's training-scratch directory
+                (reload then falls back to the production slot).
         """
         state = self._read_fold_resume()
         if state is None:
@@ -2205,11 +2202,21 @@ class ConsolidationLoop:
     def _latest_checkpoint_in_dir(directory: Path) -> "str | None":
         """Return the path of the highest-numbered ``checkpoint-*`` dir under *directory*.
 
+        Globs recursively so a RAM-mode training run — whose ``checkpoint-N/``
+        dirs are HF Trainer's own writes into ``/dev/shm``, mirrored by
+        ``_RamEpochCopyCallback``/``_StagingResumeCallback`` to
+        ``<directory>/bg_checkpoint_epoch/checkpoint-N/`` — is found exactly
+        like the disk-mode default, where HF Trainer writes ``checkpoint-N/``
+        directly under *directory*.  Without this, RAM mode's checkpoint is
+        invisible here and ``_mark_tier_complete`` records ``None``, which
+        forces the next crash-resume to reload the tier's stale production
+        slot instead of its actually-trained checkpoint.
+
         Returns ``None`` when no matching directory is found.  Used to locate
         the durable epoch checkpoint for ``_mark_tier_complete``.
         """
         checkpoints = sorted(
-            directory.glob("checkpoint-*"),
+            directory.glob("**/checkpoint-*"),
             key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else -1,
         )
         for ckpt in reversed(checkpoints):
@@ -2299,7 +2306,6 @@ class ConsolidationLoop:
         max_interim_count: int = 7,
         interim_overflow_slack: int = 0,
         stamp: str | None = None,
-        recall_sanity_threshold: "float | None" = None,
     ) -> dict:
         """Unified interim-cycle entry: key prep + optional training + atomic persistence.
 
@@ -2377,11 +2383,6 @@ class ConsolidationLoop:
                 Counted against PEFT-resident adapters; the slack is proven
                 to fit VRAM at boot via ``required_working_set_bytes``.
             stamp: Override the computed sub-interval stamp (test injection).
-            recall_sanity_threshold: Accepted for caller override compatibility;
-                the active threshold is read from ``self.config.recall_sanity_threshold``
-                when this is ``None`` (the default).  Not currently consumed inside
-                this method — interim-cycle saves go through ``commit_tier_slot``,
-                which reads the threshold from the loop config.
 
         Returns:
             Result dict with keys ``{"triples_extracted", "new_keys",
@@ -2390,10 +2391,6 @@ class ConsolidationLoop:
             or ``"noop"``); ``venue`` is the training medium (``"train"`` or
             ``"simulate"``).
         """
-        # Resolve threshold from config when the caller did not supply an override.
-        if recall_sanity_threshold is None:
-            recall_sanity_threshold = self.config.recall_sanity_threshold
-
         # --- 1. Cycle counter ---
         self.cycle_count += 1
 
@@ -2515,7 +2512,6 @@ class ConsolidationLoop:
                     normalize=False,  # normalization is full-fold only
                     enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                     promote=False,
-                    tier_floor=False,
                     subtractive_scope="interim",
                 ),
                 adapter_name=adapter_name,
@@ -2754,8 +2750,8 @@ class ConsolidationLoop:
         :meth:`_build_all_edge_entries_into`, and the interim recital-dedup
         scope test.  ``store.get`` is cache-only: on a miss it returns ``None``
         and each of those places drops the key.  A dropped key does not reach
-        ``serve_assignment``, and the finalize step rewrites every main-tier
-        registry from ``serve_assignment`` — so a key the cache happened not to
+        ``tier_keyed``, and the finalize step rewrites every main-tier
+        registry from ``tier_keyed`` — so a key the cache happened not to
         hold is *deregistered and flushed to disk*, and the drift partition
         buckets it as an orphan.  That is silent data loss, and the store can
         legitimately be partially hydrated: ``app._build_store_contents``
@@ -3004,7 +3000,6 @@ class ConsolidationLoop:
         *,
         trainer=None,
         router=None,
-        recall_sanity_threshold: "float | None" = None,
         # interim-scope extras (only consumed when scope.persist == "interim_slot")
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
@@ -3037,7 +3032,7 @@ class ConsolidationLoop:
         venue's source of truth.  All grooming stages
         (:meth:`_materialize_consolidation_graph`,
         :meth:`_refine_consolidation_graph`, :meth:`_promote_mature_keys_inline`,
-        :meth:`_build_all_edge_entries_into`, the tier floor, the drift partition,
+        :meth:`_build_all_edge_entries_into`, the drift partition,
         :meth:`_apply_subtractive_removals_to_store`, the registry rewrite,
         :meth:`_build_tier_delta`) are shared and venue-agnostic.
 
@@ -3045,14 +3040,14 @@ class ConsolidationLoop:
 
         1. **Weight-only blocks with no simulate meaning** — the recall-miss
            reconstruction probe, ``main_tier_backup_scope``, the per-tier
-           training loop, the fast-start weight copy, the PEFT interim unload,
-           and the closing ``switch_adapter``.  In the disk venue ``self.model``
+           training loop, the PEFT interim unload, and the closing
+           ``switch_adapter``.  In the disk venue ``self.model``
            is a bare base model with no ``peft_config``, so these are skipped.
         2. **The persist medium** — adapter weights vs per-tier ``graph.json``,
            dispatched inside :meth:`_persist_fold`.
 
         **Return schema:** always the same schema, in both venues and from every
-        terminal return (including the accumulating early return).
+        terminal return.
 
         **Mode-fork-guard invariant:** this method and all callers dispatch on
         ``scope.source`` / ``scope.persist`` structural enum attributes — never on
@@ -3072,9 +3067,6 @@ class ConsolidationLoop:
                 machinery.
             router: Router instance whose ``reload()`` is called at fold completion
                 (``main_tiers`` path, both venues).  ``None`` is safe — skipped.
-            recall_sanity_threshold: Override for the recall gate (``main_tiers``
-                weights venue).  Reads ``self.config.recall_sanity_threshold``
-                when ``None``.
             adapter_name: Interim adapter name (``interim_slot`` path only).  Matches
                 ``scope.tier``.
             stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
@@ -3107,9 +3099,6 @@ class ConsolidationLoop:
                     "tier_delta": dict,
                 }
 
-            The accumulating early return additionally carries ``status`` and
-            ``accumulating_reason``.
-
             The ``interim_slot`` path additionally carries::
 
                 {
@@ -3123,16 +3112,13 @@ class ConsolidationLoop:
                     "recall_failed_session_ids": list[str],
                 }
         """
-        if recall_sanity_threshold is None:
-            recall_sanity_threshold = self.config.recall_sanity_threshold
-
         # ------------------------------------------------------------------
         # interim mini-fold (scope.persist == "interim_slot")
         # ------------------------------------------------------------------
         # Source: weights (train) or disk (simulate) — reconstruct scoped to
         # tier for both.  Persist: commit_tier_slot (writes adapter weights
         # for train, graph.json sidecar for simulate).  Single-tier training
-        # (weights only); promote=False, tier_floor=False.
+        # (weights only); promote=False.
         # Extracted from the training body of run_consolidation_cycle.
         # Transactional commit window: a raise from _persist_fold onward (or
         # from the simhash/store-write steps just before it) is compensated —
@@ -3843,7 +3829,7 @@ class ConsolidationLoop:
         # the adapters for recall misses, backs the main tiers up, retrains
         # them, and saves the weights; the disk venue skips those blocks and
         # persists per-tier graph.json instead (see _persist_fold).  Every
-        # other stage — promote, tier floor, drift partition, registry
+        # other stage — promote, drift partition, registry
         # rewrite, tier delta — runs identically in both.
         # ------------------------------------------------------------------
         from paramem.memory.interim_adapter import (
@@ -3857,8 +3843,8 @@ class ConsolidationLoop:
         )
 
         # --- Fold-stamp + crash-resume marker (full fold) ---
-        # Mint fold_stamp BEFORE any store mutation (promote/tier-floor/
-        # _build_all_edge_entries_into all mutate the store; the stamp must
+        # Mint fold_stamp BEFORE any store mutation (promote /
+        # _build_all_edge_entries_into both mutate the store; the stamp must
         # reflect the pristine on-disk registry so it is byte-identical on
         # re-entry after a crash).
         _fold_stamp_c = self._compute_fold_stamp(tier=None)
@@ -3902,16 +3888,13 @@ class ConsolidationLoop:
                 _marker_ta: "dict[str, list[dict]]" = _resume_marker.get(  # type: ignore[union-attr]
                     "train_assignment", {}
                 )
-                train_assignment = {
+                tier_keyed = {
                     t: list(_marker_ta.get(t, [])) for t in ("episodic", "semantic", "procedural")
                 }
-                serve_assignment = train_assignment  # drift not re-derived on resume
                 recall_miss_keys: list[str] = []
                 minted_by_tier: dict = {}
-                _fast_start_graduating: set[str] = set()
-                _floor = self.config.min_tier_key_floor
                 _train_active_before: dict[str, int] = {
-                    t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+                    t: len(tier_keyed[t]) for t in ("episodic", "semantic", "procedural")
                 }
                 # Drift counters zero on resume. Finalize never ran pre-crash, so drift
                 # soft-stale flips were NOT durably applied — they are intentionally skipped
@@ -3932,8 +3915,7 @@ class ConsolidationLoop:
                 _dataset_fingerprints = _resume_fingerprints
             else:
                 # -----------------------------------------------------------------
-                # FRESH-DERIVATION PATH: hydrate → reconstruct → promote → tier-floor
-                # → assign.
+                # FRESH-DERIVATION PATH: hydrate → reconstruct → promote → assign.
                 # -----------------------------------------------------------------
                 # --- Hydrate: every live key must have content before the store
                 # is read, or the finalize step below rewrites each main-tier
@@ -4000,153 +3982,27 @@ class ConsolidationLoop:
 
                 on_fold_graph(self.merger.graph, label="keyed")
 
-                # --- Per-tier floor gate (scope-gated) ---
-                _floor = self.config.min_tier_key_floor
-                _fast_start_graduating: set[str] = set()
-
-                def _tier_has_disk_slot(tier_name: str) -> bool:
-                    from paramem.adapters.manifest import is_slot_name as _isn
-
-                    tier_dir = self.output_dir / tier_name
-                    if not tier_dir.is_dir():
-                        return False
-                    if scope.source != "weights":
-                        # Disk venue: the tier's payload is graph.json, not a
-                        # timestamped weight slot.
-                        return (tier_dir / "graph.json").exists()
-                    return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
-
-                if scope.tier_floor:
-                    for _pt in ("semantic", "procedural"):
-                        _pt_entries = tier_keyed[_pt]
-                        if not _pt_entries:
-                            continue
-                        if len(_pt_entries) < _floor:
-                            logger.info(
-                                "_run_fold[main_tiers]: tier %s has %d key(s) < floor %d"
-                                " — parking in episodic until floor reached",
-                                _pt,
-                                len(_pt_entries),
-                                _floor,
-                            )
-                            for _pe in _pt_entries:
-                                tier_keyed["episodic"].append(_pe)
-                                _cur = self.store.tier_for_active_key(_pe["key"])
-                                if _cur is not None and _cur != "episodic":
-                                    self.store.move(_pe["key"], "episodic")
-                                self.promoted_keys.discard(_pe["key"])
-                            tier_keyed[_pt] = []
-                        else:
-                            _tier_is_live = _tier_has_disk_slot(_pt)
-                            if not _tier_is_live:
-                                # Fast start is a WEIGHT copy (episodic LoRA →
-                                # new tier) gated on a weight recall probe, so
-                                # it exists only in the weights venue.  The disk
-                                # venue graduates by rebooking the keys, which
-                                # is all graduation means without weights.
-                                if self.config.tier_fast_start and scope.source == "weights":
-                                    logger.info(
-                                        "_run_fold[main_tiers]: tier %s graduating (fast-start)"
-                                        " — %d key(s) >= floor %d; will copy episodic weights",
-                                        _pt,
-                                        len(_pt_entries),
-                                        _floor,
-                                    )
-                                    _fast_start_graduating.add(_pt)
-                                else:
-                                    logger.info(
-                                        "_run_fold[main_tiers]: tier %s graduating"
-                                        " — %d key(s) >= floor %d; keys rebooked to the tier",
-                                        _pt,
-                                        len(_pt_entries),
-                                        _floor,
-                                    )
-                                    for _pe in _pt_entries:
-                                        self.store.move(_pe["key"], _pt)
-
-                serve_assignment = tier_keyed
-
-                train_assignment: dict[str, list[dict]] = {
-                    t: list(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
-                }
-                for _fst in _fast_start_graduating:
-                    _ep_union: dict[str, dict] = {e["key"]: e for e in train_assignment["episodic"]}
-                    for _fse in serve_assignment[_fst]:
-                        _ep_union.setdefault(_fse["key"], _fse)
-                    train_assignment["episodic"] = list(_ep_union.values())
-                    train_assignment[_fst] = []
-
-                on_fold_assignments(serve_assignment, train_assignment)
+                on_fold_assignments(tier_keyed)
 
                 _train_active_before: dict[str, int] = {
-                    t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+                    t: len(tier_keyed[t]) for t in ("episodic", "semantic", "procedural")
                 }
 
-                # --- Whole-fold accumulate guard ---
-                _total_trainable = sum(len(v) for v in serve_assignment.values())
-                if _total_trainable < _floor:
-                    logger.info(
-                        "_run_fold[main_tiers]: total trainable keys %d < floor %d"
-                        " — returning accumulating.  At max_interim_count == 0 the"
-                        " caller leaves the consumed sessions pending; above 0 the"
-                        " keys stay in their interim slots until the floor is met.",
-                        _total_trainable,
-                        _floor,
-                    )
-                    _acc_parked = {
-                        t: len(serve_assignment[t])
-                        for t in ("semantic", "procedural")
-                        if len(serve_assignment[t]) > 0
-                    }
-                    if scope.source == "weights":
-                        for _bname in (
-                            "episodic_backup",
-                            "semantic_backup",
-                            "procedural_backup",
-                        ):
-                            if _bname in self.model.peft_config:
-                                self.model.delete_adapter(_bname)
-                                logger.debug(
-                                    "_run_fold[main_tiers]: cleaned up stale backup %s"
-                                    " (left by prior aborted fold) on accumulating return",
-                                    _bname,
-                                )
-                    return {
-                        "status": "accumulating",
-                        "accumulating_reason": {
-                            "floor": _floor,
-                            "parked": _acc_parked,
-                            "episodic": len(serve_assignment["episodic"]),
-                        },
-                        "tiers_rebuilt": [],
-                        "graph_drift_count": 0,
-                        "drift_deduplicated": 0,
-                        "drift_orphan": 0,
-                        "drift_genuine_loss": 0,
-                        "drift_intended_removal": 0,
-                        "drift_intended_removal_by_reason": {},
-                        "recall_miss_keys": [],
-                        "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
-                        "tier_keyed": serve_assignment,
-                        "rolled_back": False,
-                        "rollback_tier": None,
-                        "tier_delta": {},
-                    }
                 # end of fresh-derivation path.
                 # Compute dataset fingerprints and persist the fold assignment marker
-                # AFTER the accumulate guard (so accumulating returns never leave a
-                # stale marker).
+                # now that the assignment is final (there is no further mutation
+                # between here and the per-tier training loop below).
                 # Fingerprint is over sorted SPO tuples, NOT tokenized examples.
                 # Calling format_entry_training here (before the per-tier loop) would
                 # interfere with per-tier format spy patterns in existing tests and is
                 # unnecessary — SPO identity is the only change-detection signal needed.
                 _dataset_fingerprints: dict[str, str] = {}
                 for _t in ("episodic", "semantic", "procedural"):
-                    _ta_entries = train_assignment[_t]
+                    _ta_entries = tier_keyed[_t]
                     if _ta_entries:
                         _dataset_fingerprints[_t] = _fingerprint_entries(_ta_entries)
                 self._persist_fold_assignment(
-                    "main_tiers", _fold_stamp_c, train_assignment, _dataset_fingerprints
+                    "main_tiers", _fold_stamp_c, tier_keyed, _dataset_fingerprints
                 )
 
             # --- Drift partition (fresh-fold only; skipped on crash-resume) ---
@@ -4154,9 +4010,7 @@ class ConsolidationLoop:
             # are pristine.  Re-running subtractive removals would double-apply.
             # Counters are pre-zeroed in the resume fast-path above.
             if not _resume_c:
-                _all_keyed = {
-                    e["key"] for tier_list in serve_assignment.values() for e in tier_list
-                }
+                _all_keyed = {e["key"] for tier_list in tier_keyed.values() for e in tier_list}
 
                 for _surviving_key in _all_keyed:
                     _sbk = self.store.bookkeeping_for_key(_surviving_key)
@@ -4311,9 +4165,9 @@ class ConsolidationLoop:
                     "_run_fold[main_tiers]: key distribution — episodic=%d semantic=%d "
                     "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
                     " intended_removal=%d)",
-                    len(serve_assignment["episodic"]),
-                    len(serve_assignment["semantic"]),
-                    len(serve_assignment["procedural"]),
+                    len(tier_keyed["episodic"]),
+                    len(tier_keyed["semantic"]),
+                    len(tier_keyed["procedural"]),
                     graph_drift_count,
                     drift_deduplicated_count,
                     drift_orphan_count,
@@ -4328,12 +4182,10 @@ class ConsolidationLoop:
 
             if scope.source != "weights":
                 # Disk venue: no adapter weights exist, so there is nothing to
-                # back up, retrain, or fast-start-copy.  A tier counts as rebuilt
+                # back up or retrain. A tier counts as rebuilt
                 # when it carries keys to project — the same predicate the
                 # weights venue applies before it trains a tier.
-                tiers_rebuilt = [
-                    t for t in ("episodic", "semantic", "procedural") if serve_assignment[t]
-                ]
+                tiers_rebuilt = [t for t in ("episodic", "semantic", "procedural") if tier_keyed[t]]
             else:
                 # --- Build per-tier TrainingJob objects ---
                 from paramem.server.background_trainer import TrainingJob
@@ -4342,19 +4194,19 @@ class ConsolidationLoop:
 
                 jobs_by_tier = {
                     "episodic": TrainingJob(
-                        entries=train_assignment["episodic"],
+                        entries=tier_keyed["episodic"],
                         adapter_name="episodic",
                         adapter_config=self.episodic_config,
                         inference_fallback_adapter="episodic_backup",
                     ),
                     "semantic": TrainingJob(
-                        entries=train_assignment["semantic"],
+                        entries=tier_keyed["semantic"],
                         adapter_name="semantic",
                         adapter_config=self.semantic_config,
                         inference_fallback_adapter="semantic_backup",
                     ),
                     "procedural": TrainingJob(
-                        entries=train_assignment["procedural"],
+                        entries=tier_keyed["procedural"],
                         adapter_name="procedural",
                         adapter_config=self.procedural_config or self.episodic_config,
                         inference_fallback_adapter="procedural_backup",
@@ -4453,7 +4305,7 @@ class ConsolidationLoop:
                         backup_name = f"{tier}_backup"
                         job = jobs_by_tier[tier]
 
-                        if not job.entries and tier not in _fast_start_graduating:
+                        if not job.entries:
                             logger.info(
                                 "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild",
                                 tier,
@@ -4462,8 +4314,9 @@ class ConsolidationLoop:
 
                         # --- Crash-resume: reload completed tiers from durable checkpoint ---
                         if _resume_c and tier in _completed_in_marker:
-                            # The checkpoint path stored in the marker (may be absent for
-                            # fast-start tiers, which have no checkpoint-N dir).
+                            # The checkpoint path stored in the marker (may be absent
+                            # when _latest_checkpoint_in_dir found no checkpoint-N dir
+                            # for this tier).
                             _ckpt_path = _marker_checkpoints.get(tier)
                             logger.info(
                                 "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
@@ -4473,7 +4326,7 @@ class ConsolidationLoop:
                             )
                             # Delete the stale production slot (pre-crash _save_adapters never
                             # ran — weights are stale) and reload from the checkpoint dir or the
-                            # existing production slot for fast-start tiers.
+                            # existing production slot when no checkpoint was recorded.
                             # The per-tier backups created above mean the deleted
                             # slot is never the last adapter on the PeftModel
                             # (no base-unwrap needed).
@@ -4538,9 +4391,10 @@ class ConsolidationLoop:
 
                                         _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
                             else:
-                                # no checkpoint dir (fast-start tier, or checkpoint missing).
-                                # Reload from the EXISTING production slot on disk — it was not
-                                # overwritten (final _save_adapters never ran on crash).
+                                # no checkpoint-N dir recorded for this tier (see
+                                # _latest_checkpoint_in_dir). Reload from the EXISTING
+                                # production slot on disk — it was not overwritten
+                                # (final _save_adapters never ran on crash).
                                 from paramem.memory.interim_adapter import (
                                     adapter_slot_root_for_name as _asr_fn,
                                 )
@@ -4549,7 +4403,7 @@ class ConsolidationLoop:
                                 _prod_root = _asr_fn(self.output_dir, tier)
                                 _la(self.model, _prod_root.parent, tier)
                                 logger.info(
-                                    "_run_fold[main_tiers]: crash-resume (fast-start/no-ckpt)"
+                                    "_run_fold[main_tiers]: crash-resume (no recorded checkpoint)"
                                     " loaded %s from production slot %s",
                                     tier,
                                     _prod_root.parent,
@@ -4603,83 +4457,6 @@ class ConsolidationLoop:
                         from paramem.models.loader import switch_adapter as _sw
 
                         _sw(self.model, tier)
-
-                        # --- Fast-start graduation branch ---
-                        if tier in _fast_start_graduating:
-                            from paramem.models.loader import copy_adapter_weights as _copy_aw
-                            from paramem.models.loader import (
-                                copy_adapter_weights_subset as _copy_aw_subset,
-                            )
-
-                            if tier == "procedural":
-                                _copy_aw_subset(self.model, src="episodic", dst=tier)
-                                logger.info(
-                                    "_run_fold[main_tiers]: fast-start graduation — "
-                                    "copied episodic attn weights into procedural"
-                                    " (mlp stays zero-init)"
-                                )
-                            else:
-                                _copy_aw(self.model, src="episodic", dst=tier)
-                                logger.info(
-                                    "_run_fold[main_tiers]: fast-start graduation — "
-                                    "copied episodic weights into %s (full param set)",
-                                    tier,
-                                )
-
-                            _serve_entries = serve_assignment[tier]
-                            _probe_passing = self._probe_passing_keys(tier, _serve_entries)
-                            _probe_rate = (
-                                len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
-                            )
-                            logger.info(
-                                "_run_fold[main_tiers]: fast-start graduation probe %s"
-                                " — %d/%d passed (%.3f), threshold %.3f",
-                                tier,
-                                len(_probe_passing),
-                                len(_serve_entries),
-                                _probe_rate,
-                                recall_sanity_threshold,
-                            )
-
-                            if _probe_rate >= recall_sanity_threshold:
-                                for _fse in _serve_entries:
-                                    self.store.move(_fse["key"], tier)
-                                last_per_key_by_tier[tier] = None
-                                tiers_rebuilt.append(tier)
-                                # mark fast-start tier complete (no checkpoint-N dir
-                                # exists; _mark_tier_complete stores None for reload-from-
-                                # production-slot on a subsequent crash-resume).
-                                self._mark_tier_complete(tier, None)
-                                logger.info(
-                                    "_run_fold[main_tiers]: fast-start graduation accepted"
-                                    " for %s (%d keys rebooked)",
-                                    tier,
-                                    len(_serve_entries),
-                                )
-                                continue
-
-                            logger.warning(
-                                "_run_fold[main_tiers]: fast-start probe FAILED for %s"
-                                " (%.3f < %.3f) — falling back to train-from-scratch",
-                                tier,
-                                _probe_rate,
-                                recall_sanity_threshold,
-                            )
-                            _fast_start_graduating.discard(tier)
-                            job.entries = list(_serve_entries)
-                            for _fse in _serve_entries:
-                                self.store.move(_fse["key"], tier)
-                            if tier in self.model.peft_config:
-                                if backup_name in self.model.peft_config:
-                                    _sw(self.model, backup_name)
-                                self.model.delete_adapter(tier)
-                            self.model = create_adapter(self.model, tier_cfg, tier)
-                            _sw(self.model, tier)
-                            logger.debug(
-                                "_run_fold[main_tiers]: recreated fresh adapter %s for"
-                                " fallback training",
-                                tier,
-                            )
 
                         prior_job = None
                         recall_state = None
@@ -4923,7 +4700,7 @@ class ConsolidationLoop:
                     for _tier in ("episodic", "semantic", "procedural"):
                         _lpk = last_per_key_by_tier.get(_tier)
                         if _lpk is not None:
-                            _serve_keys = {e["key"] for e in serve_assignment[_tier]}
+                            _serve_keys = {e["key"] for e in tier_keyed[_tier]}
                             passing_sets_by_tier[_tier] = {
                                 r["key"] for r in _lpk if r["exact_match"]
                             } & _serve_keys
@@ -4931,7 +4708,7 @@ class ConsolidationLoop:
                             passing_sets_by_tier[_tier] = None
 
                 self._reset_main_tier_registries_and_simhashes(
-                    serve_assignment,
+                    tier_keyed,
                     passing_sets_by_tier,
                     soft_stale_by_tier=soft_stale_by_tier,
                 )
@@ -5011,7 +4788,7 @@ class ConsolidationLoop:
             _train_tiers = ("episodic", "semantic", "procedural")
             _train_tier_delta = self._build_tier_delta(
                 active_before=_train_active_before,
-                active_after={t: len(serve_assignment.get(t, [])) for t in _train_tiers},
+                active_after={t: len(tier_keyed.get(t, [])) for t in _train_tiers},
                 minted_by_tier=minted_by_tier,
             )
             on_tier_delta(_train_tier_delta)
@@ -5036,8 +4813,8 @@ class ConsolidationLoop:
                 "drift_intended_removal": drift_intended_removal_count,
                 "drift_intended_removal_by_reason": drift_intended_removal_by_reason,
                 "recall_miss_keys": sorted(recall_miss_keys),
-                "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
-                "tier_keyed": serve_assignment,
+                "keys_per_tier": {t: len(v) for t, v in tier_keyed.items()},
+                "tier_keyed": tier_keyed,
                 "rolled_back": False,
                 "rollback_tier": None,
                 "tier_delta": _train_tier_delta,
@@ -5054,19 +4831,18 @@ class ConsolidationLoop:
         consume_pending: bool = False,
         trainer=None,
         router=None,
-        recall_sanity_threshold: "float | None" = None,
     ) -> dict:
         """Run the full consolidation fold — the single public fold entry.
 
         The fold does what it is told.  Whether there is anything to consolidate at
         all is decided by the caller (the server's dispatch layer): this method has
         no content gate, no notion of who asked for the fold, and no way to bypass
-        the per-tier floor or the whole-fold accumulate guard.
+        the recall gate or the caller-side content gate.
 
         Both venues run the SAME stage spine over the SAME input — the
         :class:`~paramem.memory.store.MemoryStore`, whose main-tier and
         interim-slot registries are hydrated at boot and after every cycle.
-        Materialize → refine → promote → build entries → tier floor → drift
+        Materialize → refine → promote → build entries → drift
         partition → registry rewrite → persist → interim unload → router reload
         → tier delta is one code path.  *mode* selects only:
 
@@ -5106,8 +4882,6 @@ class ConsolidationLoop:
                 pattern.
             router: Router instance whose ``reload()`` is called at the end of the
                 atomic finalize sequence (both venues).  ``None`` is safe — skipped.
-            recall_sanity_threshold: Override for the recall gate (train only).  When
-                ``None``, ``self.config.recall_sanity_threshold`` is used.
 
         Returns:
             The full-fold result dict (see :meth:`_run_fold`) — one schema for both
@@ -5135,8 +4909,8 @@ class ConsolidationLoop:
             # Every artifact the fold and its nested passes emit lands in this
             # cycle's debug root; a calibration run, when one is open, adds its
             # own root independently.
-            # promote/tier_floor are ON: both are pure store operations, so they
-            # belong to this venue exactly as much as to the weights venue.
+            # promote is ON: it is a pure store operation, so it belongs to
+            # this venue exactly as much as to the weights venue.
             with self._artifact_scope():
                 return self._run_fold(
                     FoldScope(
@@ -5149,7 +4923,6 @@ class ConsolidationLoop:
                         normalize=(self.config.refinement_normalization == "on"),
                         enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                         promote=True,
-                        tier_floor=True,
                         subtractive_scope="fold",
                         keys_from=keys_from,
                     ),
@@ -5184,14 +4957,12 @@ class ConsolidationLoop:
                     normalize=(self.config.refinement_normalization == "on"),
                     enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                     promote=True,
-                    tier_floor=True,
                     subtractive_scope="fold",
                     consume_pending=consume_pending,
                     keys_from=keys_from,
                 ),
                 trainer=trainer,
                 router=router,
-                recall_sanity_threshold=recall_sanity_threshold,
             )
 
     def _promote_mature_keys_inline(self) -> list[str]:
@@ -5360,8 +5131,8 @@ class ConsolidationLoop:
                 ``dedup_target_keys``: those facts participate in the merge's
                 Case-1 identity (so a recited pending fact collapses onto
                 them) but must never acquire interim-adapter weight residence
-                (tier-floor invariant) or be retrained wholesale into every
-                interim slot.  Default ``None`` — today's behaviour,
+                (the main-tier/interim separation invariant) or be retrained
+                wholesale into every interim slot.  Default ``None`` — today's behaviour,
                 unaffected for every other caller.
 
         Returns:
@@ -5562,7 +5333,7 @@ class ConsolidationLoop:
                 # channel) — skip unconditionally.  Neither minted (already
                 # keyed) nor keyed-replayed into tier_keyed: excluding it here
                 # is what keeps main-tier facts out of the interim adapter's
-                # training set (tier-floor invariant).
+                # training set (the main-tier/interim separation invariant).
                 continue
 
             if not key:

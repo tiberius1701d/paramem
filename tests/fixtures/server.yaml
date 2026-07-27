@@ -251,8 +251,6 @@ consolidation:
   refinement_contradiction: "on"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
-  min_tier_key_floor: 30
-  tier_fast_start: true
   # Per-fold training-budget derivation and donor seeding are the
   # unconditional standard mechanism (no config knob, no fixed-budget mode,
   # no operator ceiling) -- see paramem.utils.config.budget_for /

@@ -589,7 +589,6 @@ class TestConsolidationArbitrator:
             "consume_pending",
             "trainer",
             "router",
-            "recall_sanity_threshold",
         }, f"unexpected fold-entry parameters: {sorted(params)}"
 
     def test_interim_door_noops_with_no_pending_sessions(self, tmp_path, monkeypatch) -> None:

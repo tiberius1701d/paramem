@@ -77,7 +77,7 @@ class RunRecord:
     outcome:
         Terminal outcome string for this op type.  Known values for
         ``"consolidation"``: ``"no_facts"``, ``"simulated"``, ``"trained"``,
-        ``"accumulating"``, ``"noop"``, ``"aborted"``, ``"migration_complete"``,
+        ``"noop"``, ``"aborted"``, ``"migration_complete"``,
         ``"migration_partial"``.  Extensible: new outcomes are additive.
     summary:
         Human-readable one-line description of the outcome (≤ ~80 chars).

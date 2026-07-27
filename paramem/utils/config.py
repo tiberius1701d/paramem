@@ -260,18 +260,6 @@ class ConsolidationConfig:
                 f"got {self.recall_sanity_threshold!r}"
             )
 
-    # Floor below which a tier's keys park in episodic until the tier's own
-    # population reaches this count.  30 is an UNVALIDATED conservative default —
-    # no experiment on the production model establishes it (calibration-pending).
-    # The floor is general: no consolidation trigger bypasses it.
-    min_tier_key_floor: int = 30
-    # Graduation strategy when a parked tier first crosses min_tier_key_floor.
-    # True = copy episodic's LoRA weights into the graduating tier and rebook
-    # the registry (training-free fast-start; default).  False = train the tier
-    # from scratch on its own now-large key set (principled baseline, opt-out).
-    # Governs semantic/procedural only; episodic always trains from scratch.
-    tier_fast_start: bool = True
-
 
 @dataclass
 class WandbConfig:

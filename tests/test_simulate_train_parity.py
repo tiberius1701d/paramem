@@ -956,7 +956,7 @@ class TestProbeKeysFromGraph:
 # ---------------------------------------------------------------------------
 
 
-def _make_bare_loop(tmp_path: Path, *, min_tier_key_floor: int = 0) -> ConsolidationLoop:
+def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     """Build the minimal ConsolidationLoop the disk-venue full fold needs.
 
     The disk venue runs the SAME spine as the weights venue, so this loop
@@ -985,9 +985,6 @@ def _make_bare_loop(tmp_path: Path, *, min_tier_key_floor: int = 0) -> Consolida
 
     Args:
         tmp_path: Adapter root for this loop.
-        min_tier_key_floor: Whole-fold accumulate floor.  Defaults to 0 so a
-            small fixture reaches the persist tail; pass the production default
-            (30) to exercise the accumulate guard.
 
     Model/tokenizer stay ``None`` — the disk venue holds no PeftModel, which is
     exactly what production does (``app.py`` leaves ``loop.model`` a bare base
@@ -1014,7 +1011,7 @@ def _make_bare_loop(tmp_path: Path, *, min_tier_key_floor: int = 0) -> Consolida
     # production path reaches the tier without them.
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50
-    loop.config = ConsolidationConfig(min_tier_key_floor=min_tier_key_floor)
+    loop.config = ConsolidationConfig()
     loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False, batch_size=1)
 
     store = MemoryStore(replay_enabled=True)
@@ -1352,30 +1349,6 @@ class TestConsolidateSimulateFold:
             "a fold that rebuilt nothing must not write a tier graph"
         )
 
-    def test_below_floor_fold_returns_accumulating(self, tmp_path):
-        """The key floor is general — the disk venue does not bypass it.
-
-        With the production floor, a fold whose whole trainable set is below it
-        returns ``status="accumulating"`` and rebuilds nothing, in either venue.
-        """
-        loop = _make_bare_loop(tmp_path, min_tier_key_floor=30)
-        _write_interim_graph(
-            loop,
-            "20260101T0000",
-            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
-        )
-
-        result = loop.consolidate(mode="simulate")
-
-        assert result["status"] == "accumulating", (
-            f"1 key < floor 30 must accumulate; got {result.get('status')!r}"
-        )
-        assert result["accumulating_reason"]["floor"] == 30
-        assert result["tiers_rebuilt"] == []
-        # The accumulating return carries the same schema as the terminal ones.
-        assert result["tier_delta"] == {}
-        assert not (tmp_path / "episodic" / "graph.json").exists()
-
     def test_current_interim_stamp_stays_none_across_the_fold(self, tmp_path):
         """The full fold never labels its debug artifacts with an interim stamp.
 
@@ -1493,8 +1466,7 @@ class TestConsolidateSimulateFold:
         loop = _make_bare_loop(tmp_path)
         # refinement_enrichment="on" + the cloud master switch on so consolidate
         # calls GraphTierRefiner.run_enrichment; base defaults (off/False) would skip it.
-        # min_tier_key_floor=0 so this 2-key fixture reaches the persist tail.
-        loop.config = ConsolidationConfig(refinement_enrichment="on", min_tier_key_floor=0)
+        loop.config = ConsolidationConfig(refinement_enrichment="on")
         loop.cloud_enabled = True
 
         # Seed one interim slot so there is merged content to coexist with.
@@ -2673,55 +2645,20 @@ class TestGraphLifecycle:
 
     # --- consolidate lifecycle tests ---
 
-    def test_consolidate_graph_empty_after_accumulating_return(self, tmp_path):
-        """merger.graph is empty after consolidate accumulating return.
-
-        The accumulating early return fires when total trainable keys < floor (30).
-        With an empty MemoryStore and no interim slots, _total_trainable == 0 < 30.
-
-        This test patches:
-        - _gpu_thread_lock.acquire(blocking=False) → False (pretend lock is held),
-          bypassing the entry guard without needing a real BackgroundTrainer.
-        - _materialize_consolidation_graph → (set(), []) to skip reconstruct_graph
-          (GPU call).
-
-        The real GraphMerger is used so reset_graph() in the finally actually clears
-        the graph.
-
-        Mutation check: without the cycle-end finally block, merger.graph retains the
-        pre-seeded edge.
-        """
-        from paramem.graph.merger import GraphMerger
-
-        loop = _build_loop(tmp_path)
-        loop.merger = GraphMerger(model=None)
-        # Pre-seed the graph with a real edge.
-        loop.merger.graph.add_node("Alice")
-        loop.merger.graph.add_node("Bob")
-        loop.merger.graph.add_edge("Alice", "Bob", predicate="knows")
-
-        assert loop.merger.graph.number_of_nodes() > 0, "Precondition: graph must be non-empty"
-
-        # Patch the GPU lock entry guard: replace the module-level lock object with
-        # a MagicMock whose acquire(blocking=False) returns False so the entry guard
-        # believes the lock is already held.  patch.object cannot patch a C-level
-        # threading.Lock attribute, so we replace the module-level name instead.
-        _mock_lock = MagicMock()
-        _mock_lock.acquire.return_value = False  # pretend caller already holds the lock
-        with patch("paramem.server.gpu_lock._gpu_thread_lock", _mock_lock):
-            result = loop.consolidate(mode="train", trainer=None)
-
-        assert result.get("status") == "accumulating", (
-            f"Expected status='accumulating' with 0 keys < floor 30; got {result!r}"
-        )
-        assert loop.merger.graph.number_of_nodes() == 0, (
-            "cycle-end graph reset regression: merger.graph must be empty on accumulating return; "
-            f"got {loop.merger.graph.number_of_nodes()} nodes"
-        )
-        assert loop.merger.graph.number_of_edges() == 0, (
-            "cycle-end graph reset regression: merger.graph must be empty on accumulating return; "
-            f"got {loop.merger.graph.number_of_edges()} edges"
-        )
+    # test_consolidate_graph_empty_after_accumulating_return was retired along
+    # with the accumulate guard it exercised (2026-07-27 fast-start/tier-floor
+    # retirement). It called consolidate(mode="train") with the pre-fold entry
+    # guard bypassed but WITHOUT the train-path GPU mocks (_patches_for_train_mode)
+    # applied, relying on the accumulate guard's early return to prevent the fold
+    # from ever reaching the real (unmocked) per-tier training loop. With the
+    # guard gone, this fixture's one pre-seeded keyless edge (Alice-knows-Bob) is
+    # minted into a real key and the fold proceeds into main_tier_backup_scope and
+    # _train_tier_adapter against a bare MagicMock model — not a clean terminal, and
+    # not a safe unit-test path. The graph-reset invariant this test guarded stays
+    # covered by test_graph_empty_after_successful_fold / test_graph_empty_after_noop_fold
+    # above (full-fold disk venue) and by
+    # test_run_consolidation_cycle_graph_empty_after_success / _after_abort below
+    # (interim-cycle path) — no replacement test is added here.
 
 
 # ---------------------------------------------------------------------------
@@ -2922,10 +2859,9 @@ class TestMaterializeConsolidationGraphDiskSource:
 class TestSimulateFoldReturnSchema:
     """The disk venue returns the SAME schema as the weights venue.
 
-    One schema, both venues, every terminal return — including the accumulating
-    early return — so callers never KeyError on a venue they did not expect.
-    Covered: the noop return (nothing in the store) and the active return
-    (interim slots folded into main).
+    One schema, both venues, every terminal return, so callers never KeyError
+    on a venue they did not expect.  Covered: the noop return (nothing in the
+    store) and the active return (interim slots folded into main).
     """
 
     _REQUIRED_KEYS = frozenset(
@@ -3136,35 +3072,6 @@ class TestSimulateFoldSpineStages:
             f"the promoted key must be projected into semantic/graph.json; got {semantic_keys!r}"
         )
 
-    def test_tier_floor_graduation_on_the_disk_venue(self, tmp_path):
-        """A semantic tier at the floor graduates instead of being parked.
-
-        Only the fast-start WEIGHT copy is venue-gated; parking and graduation
-        are store operations that run in both venues.  With enough keys to reach
-        the floor the tier keeps them (graduates); the below-floor branch —
-        already covered by ``test_below_floor_fold_returns_accumulating`` — would
-        park them back into episodic instead.
-        """
-        loop = _make_bare_loop(tmp_path, min_tier_key_floor=2)
-        loop.config.tier_fast_start = True  # must NOT reach the weight copy
-        _seed_store_tier(
-            loop,
-            "semantic",
-            [
-                {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
-                {"key": "graph2", "subject": "Alice", "predicate": "works_at", "object": "Acme"},
-            ],
-        )
-
-        result = loop.consolidate(mode="simulate")
-
-        assert [e["key"] for e in result["tier_keyed"]["semantic"]] == ["graph1", "graph2"], (
-            f"at the floor the tier graduates and keeps its keys; got {result['tier_keyed']!r}"
-        )
-        assert result["tier_keyed"]["episodic"] == [], "nothing may be parked at the floor"
-        assert loop.store.tier_for_active_key("graph1") == "semantic"
-        assert (tmp_path / "semantic" / "graph.json").exists()
-
     def test_router_reload_fires_on_the_simulate_fold(self, tmp_path):
         """The router is reloaded after a simulate fold, exactly as after a train fold.
 
@@ -3217,17 +3124,21 @@ class TestFoldHydratesAPartiallyPreloadedStore:
 
     The failure this locks down: ``store.get`` is cache-only, so every fold site
     that reads entry content used to drop a live key whose entry the boot preload
-    had not materialised.  A dropped key never reaches ``serve_assignment``, and
-    the finalize step rewrites every main-tier registry FROM ``serve_assignment``
+    had not materialised.  A dropped key never reaches ``tier_keyed``, and
+    the finalize step rewrites every main-tier registry FROM ``tier_keyed``
     and flushes it — so the key was deregistered on disk and the drift partition
     filed it as an orphan.  The content was still in the venue's source of truth
     the whole time; nothing ever asked for it.
 
     ``app._build_store_contents`` reports exactly this state as
-    ``boot_degraded={"reason": "preload_partial"}``, and a full cold cache is NOT
-    a substitute: that one is caught upstream by the ``min_tier_key_floor``
-    accumulate guard.  Both venues are covered — the disk venue reads the
-    per-tier ``graph.json``, the weights venue re-probes the adapters.
+    ``boot_degraded={"reason": "preload_partial"}``.  A full cold cache is a
+    distinct scenario, guarded upstream by :meth:`_hydrate_store_for_fold`
+    itself (which runs before every fresh derivation and materialises every
+    live key missing from the cache) — the retired ``min_tier_key_floor``
+    accumulate guard was only ever a coincidental second net for it, never
+    its owner, and no replacement guard is added here.  Both venues are
+    covered — the disk venue reads the per-tier ``graph.json``, the weights
+    venue re-probes the adapters.
     """
 
     _TRIPLES = [
@@ -3278,7 +3189,14 @@ class TestFoldHydratesAPartiallyPreloadedStore:
         ``probe_keys_grouped_by_adapter`` (stubbed here — the GPU probe is the
         one thing this test does not run).  The key must survive the fold.
         """
+        from peft import PeftModel
+
         loop = _build_loop(tmp_path)
+        # Retiring the per-tier key-count floor means this 2-key fixture now
+        # reaches the real per-tier training loop (main_tier_backup_scope
+        # requires a PeftModel) instead of returning early on the (deleted)
+        # accumulate guard.
+        loop.model.__class__ = PeftModel
         _seed_store_tier(loop, "episodic", self._TRIPLES[:1])
         _seed_store_tier(loop, "episodic", self._TRIPLES[1:], entries=False)
 
@@ -3326,6 +3244,19 @@ class TestFoldHydratesAPartiallyPreloadedStore:
             patches[1],
             patches[2],
             patches[3],
+            # The per-tier training loop (reached now that the accumulate
+            # guard is retired) touches real PEFT/model calls this MagicMock
+            # model cannot satisfy — stub them the same way the full-fold
+            # harness in test_consolidation.py does.
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
+            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
         ):
             result = loop.consolidate(mode="train")
 

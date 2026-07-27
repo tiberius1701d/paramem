@@ -1861,8 +1861,6 @@ class ServerConfig:
             refinement_normalization=self.consolidation.refinement_normalization,
             refinement_contradiction=self.consolidation.refinement_contradiction,
             recall_sanity_threshold=self.consolidation.recall_sanity_threshold,
-            min_tier_key_floor=self.consolidation.min_tier_key_floor,
-            tier_fast_start=self.consolidation.tier_fast_start,
         )
 
     @property

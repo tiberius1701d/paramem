@@ -89,7 +89,7 @@ def _make_minimal_loop(tmp_path):
         "in_training": MagicMock(),
     }
     loop.tokenizer = MagicMock()
-    loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+    loop.config = ConsolidationConfig()
     loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
     loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
     loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])

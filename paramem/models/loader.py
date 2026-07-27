@@ -957,8 +957,9 @@ def copy_adapter_weights_subset(model: PeftModel, src: str, dst: str) -> int:
 
     Unlike :func:`copy_adapter_weights` (which requires equal parameter sets),
     this helper requires only that ``set(src_keys) ⊆ set(dst_keys)``.  This
-    covers the episodic→procedural fast-start graduation case where episodic
-    targets 4 attn modules and procedural targets 7 (attn+mlp).
+    covers the donor-into-procedural case (:func:`~paramem.training.donor.build_donor`'s
+    seeding path, ``consolidation.py``) where the donor targets 4 attn
+    modules and procedural targets 7 (attn+mlp).
 
     - Tensors present in BOTH src and dst are copied under ``torch.no_grad()``.
     - Tensors present in dst but absent from src are explicitly ZEROED under
@@ -1021,11 +1022,11 @@ def copy_adapter_weights_subset(model: PeftModel, src: str, dst: str) -> int:
         for key in intersecting:
             dst_index[key].data.copy_(src_index[key].data)
         # Explicitly zero dst-only tensors (e.g. procedural's MLP modules
-        # graduating from episodic's attention-only donor) rather than relying
-        # on "PEFT zero-init" still holding. Under warm init dst may be a
-        # RESIDENT adapter reused across folds, not a freshly-created one (a
-        # prior fast-start graduation, or a warm-kept tier whose weights moved
-        # off zero during training), so leaving these untouched would silently
+        # seeded from an attention-only donor) rather than relying on "PEFT
+        # zero-init" still holding. Under warm init dst may be a RESIDENT
+        # adapter reused across folds, not a freshly-created one (a prior
+        # donor-seeding call, or a warm-kept tier whose weights moved off
+        # zero during training), so leaving these untouched would silently
         # break the "MLP stays zero-init" contract documented at the call site
         # (consolidation.py) and in architecture.md. Zeroing by construction
         # keeps that contract true unconditionally, regardless of dst's prior

@@ -228,26 +228,6 @@ consolidation:
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
-  # Floor below which a tier's keys park in episodic (the always-trained large
-  # tier) instead of training a small under-separated adapter. semantic/procedural
-  # keys accumulate in episodic until the tier's own population reaches this floor,
-  # then graduate. 30 is an UNVALIDATED conservative default — no experiment on the
-  # production model establishes it. Calibration-pending (GPU set-size sweep).
-  # The floor is general: no consolidation trigger bypasses it.
-  min_tier_key_floor: 30
-  # Graduation strategy when a parked tier first crosses min_tier_key_floor.
-  #   true (DEFAULT): copy the episodic adapter's LoRA weights into the graduating
-  #     tier and rebook the registry — TRAINING-FREE fast-start. The copied adapter
-  #     recalls its keys immediately at episodic's fidelity (episodic disk-verify
-  #     0.960 on 183 keys, above the 0.95 gate), because those keys were trained
-  #     mixed into the large episodic set (inherited dilution avoids small-set
-  #     under-separation). The 0.95 disk gate still runs on the copied adapter; if
-  #     it ever fails, that tier falls back to training from scratch for that cycle.
-  #   false (OPT-OUT, scientifically clean): train the tier from scratch on its own
-  #     now-large (>= floor) key set — every adapter is honestly trained on its own
-  #     keys, no inherited weights. The principled baseline and always-on safety net.
-  # Governs semantic/procedural graduation only; episodic always trains from scratch.
-  tier_fast_start: true
   # Per-fold training-budget derivation (standard mechanism, unconditional --
   # validated via Test 20). epochs/gradient-accumulation/lr_decay_steps are
   # ALWAYS derived from the fold's key-triple count at the training funnel

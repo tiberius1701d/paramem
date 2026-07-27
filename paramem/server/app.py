@@ -12030,11 +12030,8 @@ def _is_full_cycle_due(config) -> bool:
     sessions → don't dispatch" decision is the arbitrator's content gate
     (:func:`_consolidation_content_gate`, evaluated on the resolved action
     after this function returns), which returns ``noop_no_pending`` /
-    ``noop_no_named`` before the fold is ever entered.  The separate
-    ``accumulating`` outcome is a different case: the fold *was* dispatched
-    (content existed) but the total trainable key count fell below
-    ``min_tier_key_floor``.  At ``N == 0`` this function itself returns
-    ``True`` unconditionally.
+    ``noop_no_named`` before the fold is ever entered.  At ``N == 0`` this
+    function itself returns ``True`` unconditionally.
 
     ``N < 0`` is rejected at config load; the defensive belt below guards
     against any future code path that bypasses the validator.
@@ -12052,8 +12049,8 @@ def _is_full_cycle_due(config) -> bool:
     N = config.consolidation.max_interim_count
     # count==0 → full-fold-only consume-pending mode: every tick is a full cycle.
     # There are no interim dirs to count or age; return True unconditionally so
-    # the dispatcher routes every tick to the full path.  The noop/accumulating
-    # machinery in _run_full_cycle owns the "nothing to train" fast-path.
+    # the dispatcher routes every tick to the full path.  The noop machinery
+    # in _run_full_cycle owns the "nothing to train" fast-path.
     if N == 0:
         return True
     # Negative N is config-rejected upstream; defensive belt only.
@@ -13611,7 +13608,7 @@ def _run_stage_b_cycle(
     (``lock_held=True`` — idempotent, safe on paths that never evicted
     voice), and dispatches :func:`_finalize_stage_b_failure`.  A terminal
     that the caller wants to treat as a *normal*, non-incident outcome
-    (``aborted``, ``accumulating``, ``extraction_failed``, ...) must be
+    (``aborted``, ``noop``, ``extraction_failed``, ...) must be
     returned by *body*, not raised — raising always produces a *kind*
     incident.
 
@@ -14454,9 +14451,9 @@ def _finalize_full_status_only(
     *, outcome: str, summary: str, detail: dict, touch_last_consolidation: bool = False
 ) -> None:
     """Record-only finalizer for full-cycle terminals that touch no store/router
-    state: ``aborted``, ``accumulating``, and ``noop``.
+    state: ``aborted`` and ``noop``.
 
-    Each of these three terminals already ran its own outcome-specific
+    Each of these two terminals already ran its own outcome-specific
     logging inside the full-cycle body before returning; this finalizer's
     sole job is the durable run-status record and the flag clear, both of
     which must happen atomically with everything else ``_dispatch_finalize``
@@ -14468,10 +14465,9 @@ def _finalize_full_status_only(
         summary: Human-readable run-status summary.
         detail: Run-status detail payload.
         touch_last_consolidation: When ``True`` (the ``noop`` terminal only —
-            matches pre-refactor behavior; ``aborted``/``accumulating`` never
-            stamped this field), updates ``_state["last_consolidation"]``
-            before recording.  Distinct from the on-disk per-tier window
-            stamp, which ``accumulating`` deliberately leaves unadvanced.
+            matches pre-refactor behavior; ``aborted`` never stamped this
+            field), updates ``_state["last_consolidation"]`` before
+            recording.  Distinct from the on-disk per-tier window stamp.
     """
     if touch_last_consolidation:
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
@@ -14609,15 +14605,12 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
     Warm init is the default: a resident tier's weights are kept and trained
     in place (the funnel's staging copy warm-starts from them,
     ``paramem.training.trainer.train_adapter``). A tier is deleted and
-    recreated cold in exactly three cases: this call is a RECONCILE
+    recreated cold in exactly two cases: this call is a RECONCILE
     (``keys_from == "main_tiers"`` is that structural identity, exposed as
-    ``FoldScope.cold_init`` inside ``consolidate()``); a resident tier's LoRA
+    ``FoldScope.cold_init`` inside ``consolidate()``); or a resident tier's LoRA
     config no longer matches the tier config
-    (``paramem.models.loader.ensure_adapter_matching``); or a tier graduating
-    via fast-start copy (``tier_fast_start``) fails its pre-save recall
-    probe, in which case the fallback resets it to a fresh adapter for
-    train-from-scratch that same fold. In simulate mode it touches no PEFT
-    weights and persists each main tier as
+    (``paramem.models.loader.ensure_adapter_matching``). In simulate mode it
+    touches no PEFT weights and persists each main tier as
     ``<adapter_dir>/<tier>/graph.json`` — the projection ``DiskMemorySource``
     reads back at the next hydration.
 
@@ -14751,30 +14744,6 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # than retrofitting each downstream helper with no-op tolerance.
         # Clear the consolidating flag, record the no-op as a successful
         # cycle outcome, and return.
-        # Accumulating status must be distinguished from noop BEFORE the
-        # noop branch fires.  An accumulating fold returns tiers_rebuilt=[] AND
-        # status="accumulating" — sessions stay pending (same as noop).  No
-        # interim slot is purged on this outcome (purging is part of the
-        # rebuilt-mains finalize, which never runs here), so on the next tick
-        # _is_full_cycle_due still sees the same un-folded count/deadline and
-        # fires again — window_stamp plays no part; it is not read by the gate.
-        # Do not call mark_consolidated.
-        if result.get("status") == "accumulating":
-            _acc_reason = result.get("accumulating_reason", {})
-            logger.info(
-                "Full cycle accumulating — total keys below floor %d; "
-                "sessions left pending, no interim slots purged so next tick re-fires. "
-                "Reason: %s",
-                _acc_reason.get("floor", "?"),
-                _acc_reason,
-            )
-            return "accumulating", functools.partial(
-                _finalize_full_status_only,
-                outcome="accumulating",
-                summary=f"Accumulating — total keys below floor {_acc_reason.get('floor', '?')}",
-                detail={"accumulating_reason": _acc_reason, "tiers_rebuilt": []},
-            )
-
         if not result.get("tiers_rebuilt"):
             # MF-A Site A: at count==0 the consume-pending pre-stage extracted
             # sessions into merger.graph, but the fold found nothing new to train
