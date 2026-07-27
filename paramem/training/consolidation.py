@@ -6816,22 +6816,23 @@ class ConsolidationLoop:
         recursively re-triggering donor seeding on the adapter it is training):
         measure the target's LoRA-B Frobenius norm
         (:func:`~paramem.models.loader.measured_adapter_init_state`); on
-        ``"cold"``, resolve the current base model id and LoRA shape and check
-        :func:`~paramem.training.donor.donor_checkpoint_valid`. A missing OR
-        mismatched (base model OR LoRA shape) checkpoint is built fresh (for
-        the CURRENT base/shape — never seeds cross-base or cross-shape) via
-        :func:`~paramem.training.donor.build_donor` before this fold's own
-        training — a cold interim is the failure this mechanism exists to
-        fix. If the checkpoint is (now) valid, the donor is loaded into a
-        transient slot
+        ``"cold"``, resolve the current base model id and *adapter_config*'s
+        LoRA shape and check :func:`~paramem.training.donor.donor_checkpoint_valid`
+        against that shape's own topology directory. A missing OR mismatched
+        (base model OR topology) checkpoint is built fresh at *adapter_config*'s
+        topology (for the CURRENT base/shape — never seeds cross-base or
+        cross-topology) via :func:`~paramem.training.donor.build_donor`
+        before this fold's own training — a cold interim is the failure this
+        mechanism exists to fix. If the checkpoint is (now) valid, the donor
+        is loaded into a transient slot
         (:func:`~paramem.training.donor.load_donor_into_transient_slot`) and
         copied into *adapter_name* via
-        :func:`~paramem.models.loader.copy_adapter_weights_subset` (handles
-        both same-topology tiers and episodic-donor-into-procedural's larger
-        module set, zeroing the extra MLP tensors), and the transient slot is
-        always deleted in a ``finally``. An unresolvable base id, a checkpoint
-        that still fails to validate after the build attempt, or a build that
-        could not complete this fold
+        :func:`~paramem.models.loader.copy_adapter_weights` (the strict full
+        copy — the donor and target now always share the SAME topology, so
+        the parameter sets are equal by construction), and the transient
+        slot is always deleted in a ``finally``. An unresolvable base id, a
+        checkpoint that still fails to validate after the build attempt, or
+        a build that could not complete this fold
         (:class:`~paramem.training.donor.DonorBuildIncomplete`), skips
         seeding and logs — never raises.
         """
@@ -6843,7 +6844,7 @@ class ConsolidationLoop:
 
         donor_seeded = False
         if adapter_name != DONOR_BUILD_ADAPTER_NAME:
-            donor_seeded = self._maybe_seed_from_donor(adapter_name)
+            donor_seeded = self._maybe_seed_from_donor(adapter_name, adapter_config)
 
         derived_epochs, derived_accum, derived_lr_decay_steps = budget_for(len(entries))
         training_config = replace(
@@ -6879,8 +6880,9 @@ class ConsolidationLoop:
         metrics["donor_seeded"] = donor_seeded
         return metrics, recall_state
 
-    def _maybe_seed_from_donor(self, adapter_name: str) -> bool:
-        """Seed *adapter_name* from the donor checkpoint when it measures cold.
+    def _maybe_seed_from_donor(self, adapter_name: str, adapter_config) -> bool:
+        """Seed *adapter_name* from its topology's donor checkpoint when it
+        measures cold.
 
         Helper for :meth:`_train_tier_adapter`'s donor-seeding gate — see that
         method's docstring for the full decision tree. Returns ``True`` only
@@ -6891,6 +6893,15 @@ class ConsolidationLoop:
         build attempt that could not complete this fold —
         :class:`~paramem.training.donor.DonorBuildIncomplete`, caught here
         specifically), without raising.
+
+        Args:
+            adapter_name: The adapter slot being seeded.
+            adapter_config: *adapter_name*'s own ``AdapterConfig`` — the
+                same object ``_train_tier_adapter`` was called with. Its
+                shape (rank, alpha, target_modules) determines which
+                topology's donor checkpoint is resolved and, when a build
+                is needed, which topology :func:`~paramem.training.donor.build_donor`
+                writes into.
         """
         from paramem.models.loader import _lora_shape_fields
         from paramem.training.donor import (
@@ -6914,14 +6925,13 @@ class ConsolidationLoop:
             )
             return False
 
-        # The donor is always trained at the episodic topology
-        # (build_donor uses self.episodic_config unconditionally); comparing
-        # the CURRENT episodic shape against the checkpoint's recorded shape
-        # catches an operator rank/target-modules edit BEFORE
-        # copy_adapter_weights_subset would hit a tensor-shape mismatch and
-        # abort the fold.
-        lora_shape = _lora_shape_fields(self.episodic_config)
-        checkpoint_dir = donor_checkpoint_dir(self.output_dir)
+        # The donor is built/validated at the TARGET tier's own topology --
+        # comparing the CURRENT shape against the checkpoint's recorded
+        # shape catches an operator rank/target-modules edit BEFORE
+        # copy_adapter_weights would hit a tensor-shape mismatch and abort
+        # the fold.
+        lora_shape = _lora_shape_fields(adapter_config)
+        checkpoint_dir = donor_checkpoint_dir(self.output_dir, lora_shape)
         if not donor_checkpoint_valid(checkpoint_dir, base_model_id, lora_shape):
             logger.info(
                 "_maybe_seed_from_donor: donor checkpoint missing/mismatched "
@@ -6929,7 +6939,7 @@ class ConsolidationLoop:
                 base_model_id,
             )
             try:
-                build_donor(self)
+                build_donor(self, adapter_config=adapter_config)
             except DonorBuildIncomplete as exc:
                 logger.warning(
                     "_maybe_seed_from_donor: donor build did not complete this "
@@ -6948,11 +6958,11 @@ class ConsolidationLoop:
             )
             return False
 
-        from paramem.models.loader import active_adapter_name, copy_adapter_weights_subset
+        from paramem.models.loader import active_adapter_name, copy_adapter_weights
 
         try:
             load_donor_into_transient_slot(self.model, checkpoint_dir, DONOR_LOAD_ADAPTER_NAME)
-            copy_adapter_weights_subset(self.model, src=DONOR_LOAD_ADAPTER_NAME, dst=adapter_name)
+            copy_adapter_weights(self.model, src=DONOR_LOAD_ADAPTER_NAME, dst=adapter_name)
             logger.info(
                 "_maybe_seed_from_donor: seeded %s from donor checkpoint (base=%s)",
                 adapter_name,

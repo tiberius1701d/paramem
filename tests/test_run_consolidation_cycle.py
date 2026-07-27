@@ -453,7 +453,7 @@ class TestRegistryLastWriteOrder:
             patch.multiple(
                 "paramem.models.loader",
                 switch_adapter=MagicMock(),
-                copy_adapter_weights_subset=MagicMock(return_value=4),
+                copy_adapter_weights=MagicMock(),
             ),
             patch.multiple(
                 "paramem.training.donor",

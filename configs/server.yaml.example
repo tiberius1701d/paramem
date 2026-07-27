@@ -242,25 +242,47 @@ consolidation:
   #
   # Donor seeding (standard mechanism, unconditional -- validated via
   # Test 20). A measured-cold target adapter (LoRA-B ~= 0) is seeded from
-  # the donor checkpoint (paramem.training.donor) before training, instead
-  # of training from LoRA-zero. The donor is a synthetic crowded-predicate-
-  # cluster population (>= 128 keys, in practice 147 -- donor_entries returns
-  # whole 21-entry blocks) trained through the SAME funnel/budget table as
-  # any other fold. Keys graph1-200/proc1-200 are always reserved for it
-  # (real minting starts at 201). The checkpoint is NOT built at boot as a
-  # separate step: it is built INLINE, synchronously, the first time a fold
-  # measures a target adapter cold with no valid checkpoint yet -- that ONE
-  # fold absorbs a full donor training run (147 entries, anchored 30-epoch
-  # bucket -> 2220 steps, ~37 min at ~1.0s/step measured) in addition to its
-  # own training before it starts. Measured: an N=21 triggering fold (550 of
+  # ITS OWN TOPOLOGY's donor checkpoint (paramem.training.donor) before
+  # training, instead of training from LoRA-zero. Every distinct LoRA
+  # topology (rank, alpha, target_modules) gets its own checkpoint -- the
+  # shipped config has two: episodic+semantic+every interim adapter share
+  # one attention-only topology, procedural is the only attention+MLP
+  # topology. The donor is a synthetic crowded-predicate-cluster population
+  # (>= 128 keys, in practice 147 -- donor_entries returns whole 21-entry
+  # blocks) trained through the SAME funnel/budget table as any other fold,
+  # at either topology: 2220 steps (30-epoch bucket) either way -- the step
+  # count is topology-independent. Keys graph1-200/proc1-200 are always
+  # reserved for it (real minting starts at 201). A topology's checkpoint is
+  # NOT built at boot as a separate step: it is built INLINE, synchronously,
+  # the first time a fold measures a target of that topology cold with no
+  # valid checkpoint yet -- that ONE fold absorbs a full donor training run
+  # in addition to its own training before it starts. Measured (attention-
+  # only topology, ~1.0s/step -> ~37 min): an N=21 triggering fold (550 of
   # its own steps) pays ~5x its own wall time that one cycle; an N=2
   # triggering fold (160 of its own steps) pays ~14x -- the multiplier is
   # NOT a flat "roughly doubling": it shrinks as the triggering fold's own
   # key count grows, and the triggering fold is small by construction (the
-  # first measured-cold adapter in a deployment's lifetime, or after a
-  # base-model swap). Every fold after it reuses the persisted checkpoint
-  # until it is invalidated (base-model swap, a rank/target_modules edit on
-  # the episodic tier, or a change to the donor generation recipe itself).
+  # first measured-cold adapter OF THAT TOPOLOGY in a deployment's lifetime,
+  # or after a base-model swap). The attention+MLP topology's per-step cost
+  # is now measured too (Test 20, donor_build_smoke_procedural,
+  # 20260727_183637/build_results.json): attention-only ~1.0s/step -> ~37
+  # min; attention+MLP ~1.2285s/step -> ~45.5 min (both at the same 2220
+  # steps). In the worst case a deployment pays this cost twice across
+  # its lifetime (once per topology), never in the same fold. Every fold
+  # after the triggering one reuses that topology's persisted checkpoint
+  # until it is invalidated (base-model swap, a rank/target_modules edit to
+  # THAT topology, or a change to the donor generation recipe itself) -- an
+  # edit to a different tier's topology leaves this checkpoint valid. Disk:
+  # ~26 MiB per attention-only checkpoint, ~80 MiB per attention+MLP one,
+  # under <adapter_dir>/_donor/<topology>/. A restore wipes the whole donor
+  # tree (both topologies), so a restored deployment pays both inline builds
+  # again on first encounter. Each successful donor build also deletes any
+  # _donor/ child directory whose name is not a currently-live topology id
+  # (dot-prefixed children are skipped), so anything parked there by hand is
+  # removed on the next build. Disabling a tier (e.g.
+  # adapters.procedural.enabled: false) makes its donor's topology dead --
+  # the next build of another topology deletes it, and re-enabling the tier
+  # later costs a fresh inline build.
   # Recall-based early stopping. Default OFF; flip to true after one clean
   # cycle on your deployment to start saving training wall time by stopping
   # each fold once the staged adapter recalls its training set. See

@@ -346,6 +346,22 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.training.donor",
             "DONOR_META_FILENAME",
         ),
+        # DONOR_RECIPE_LEARNING_RATE / DONOR_RECIPE_DROPOUT: the smoke
+        # harness's own donor build must train at the SAME fixed recipe
+        # hyperparameters production's build_donor forces
+        # (dataclasses.replace(adapter_config, learning_rate=..., dropout=...))
+        # -- derived from these constants, never hand-copied literals
+        # (added 2026-07-27).
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.donor",
+            "DONOR_RECIPE_LEARNING_RATE",
+        ),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.donor",
+            "DONOR_RECIPE_DROPOUT",
+        ),
         # test_distillation_models.py / test_prompt_engineering.py
         (
             "experiments/test_distillation_models.py",

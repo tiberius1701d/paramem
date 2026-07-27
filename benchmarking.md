@@ -2378,6 +2378,55 @@ them as well.
   memorized population) — the mechanism `paramem.training.donor` /
   `ConsolidationLoop._maybe_seed_from_donor` implements.
 
+### Donor build cost at the 7-module (attention+MLP) procedural topology
+
+This is a **cost/feasibility measurement, not a recall arm** — it measures
+what the inline donor build costs (wall time, VRAM) at the procedural
+tier's attention+MLP topology, plus a strict-copy seed-verification check
+at the matched topology. No recall numbers exist for this cell.
+
+**Run:** `outputs/test20_smallN_cold_gate/donor_build_smoke_procedural/mistral/20260727_183637/`
+(`build_results.json` + `seed_results.json`).
+
+The build trained the standard 147-entry donor population (30 epochs,
+gradient-accumulation 2, matching the anchored `>=128` bucket) through the
+procedural topology's 7 target modules (`q_proj`, `v_proj`, `k_proj`,
+`o_proj`, `gate_proj`, `up_proj`, `down_proj`, rank 8 / alpha 16, recipe
+LR=1e-4, dropout=0.0) on Mistral 7B NF4:
+
+- **2220 realized optimizer steps** (topology-independent step count, per
+  `paramem/training/donor.py`'s module docstring).
+- **wall_train_seconds = 2727.16** (≈45.5 min), **mean_seconds_per_step =
+  1.2285**.
+- **VRAM:** free 6999 MiB before load -> 2885 MiB after load (load delta
+  4114 MiB) -> 2151 MiB after build; **peak_allocated_build_mib = 4544.68**,
+  **peak_reserved_build_mib = 4802.0**.
+
+Compared against the attention-only anchor already documented in
+`configs/server.yaml.example` (~1.0s/step, ~37 min total, also at 2220
+steps): the 7-module topology costs **~1.2285s/step, a +23% per-step
+increase** (`1.2285 / 1.0 - 1 ≈ 0.2285`) for **3.08x the trainable LoRA
+parameters** (rank 8 over 7 target modules vs. 4, computed from Mistral
+7B's module shapes: `r*(in+out)` summed per module gives 655,440 params at
+7 modules vs. 213,072 at 4 modules attention-only). A 3.08x parameter
+increase producing only a 1.23x per-step wall-time increase confirms the
+frozen base model's forward/backward dominates per-step cost, not the
+LoRA update itself — consistent with the prediction this note replaces in
+`paramem/training/donor.py` and `configs/server.yaml.example`.
+
+**VRAM feasibility:** the build's transient cost above the already-resident
+base model is `peak_reserved_build_mib (4802.0) - load_delta (4114) ≈ 688
+MiB` (≈690 MiB rounded) — within the live server's measured free headroom
+at the time a topology's first measured-cold fold triggers an inline
+build.
+
+**Strict-copy seed verification** (same run, `seed_results.json`): copying
+the built donor's full LoRA-B weights into a cold procedural adapter
+(matched topology) completed in **0.0093 s**, with LoRA-B Frobenius norm
+**0.0 before** the copy and **96.5032 after** — exactly equal to the
+donor's own `donor_lora_b_norm` (96.50319801270962), confirming the copy is
+a bit-identical seed, not a partial or corrupted one.
+
 ### Remaining gap
 
 - Divergence depth 5 (5-digit key numerals) is the one unmeasured

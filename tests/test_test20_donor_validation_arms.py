@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -31,6 +32,7 @@ import pytest
 
 from experiments.test20_smallN_cold_gate import (
     DONOR_BUILD_MARKER_FILENAME,
+    DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME,
     DONOR_META_FILENAME,
     _build_donor_checkpoint,
     _condition_label,
@@ -39,10 +41,12 @@ from experiments.test20_smallN_cold_gate import (
     _parse_args,
     _read_donor_meta,
     _resolve_donor_source,
+    _run_donor_build_smoke,
     _steps_per_epoch,
+    main,
 )
 from paramem.server.config import load_server_config
-from paramem.utils.config import TrainingConfig, budget_for
+from paramem.utils.config import AdapterConfig, TrainingConfig, budget_for
 
 
 def _write_slot(tmp_path: Path, name: str, weights: bytes = b"fake-weights") -> Path:
@@ -519,7 +523,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
         model, slot, donor_summary = _build_donor_checkpoint(
             object(),
             MagicMock(),
-            MagicMock(),
+            AdapterConfig(),
             base_training_config,
             _donor_build_env.checkpoint_root,
         )
@@ -543,7 +547,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
         model, slot, donor_summary = _build_donor_checkpoint(
             object(),
             MagicMock(),
-            MagicMock(),
+            AdapterConfig(),
             base_training_config,
             _donor_build_env.checkpoint_root,
         )
@@ -592,3 +596,194 @@ class TestReadDonorMetaToleratesMissingAccumFields:
         result = _read_donor_meta(slot)
         assert result["gradient_accumulation_steps"] == 2
         assert result["realized_optimizer_steps"] == 330
+
+
+class TestDonorBuildSmokeConflictingFlagsDerivedFromParser:
+    """``main()``'s ``--donor-build-smoke`` flag-conflict guard derives
+    "is this flag set" from the CLI parser's own defaults
+    (``vars(args)`` vs a ``parse_args([])`` baseline of the SAME parser)
+    rather than a hand-maintained mirror of the flag list — every dest
+    except the allowed trio (``--model``/``--resume``/``--donor-build-smoke``
+    itself) is a conflicting flag, so a newly-added flag is covered
+    automatically instead of silently bypassing the guard."""
+
+    @pytest.mark.parametrize(
+        "flag_args",
+        [
+            ["--n-entries", "3"],
+            ["--entries-json", "some_file.json"],
+            ["--epochs", "10"],
+            ["--warm-from", "/some/donor/dir"],
+            ["--arm", "custom_arm"],
+            ["--seeds", "42"],
+            ["--probe-before-training"],
+            ["--lr-decay-steps", "100"],
+            ["--accum", "2"],
+            ["--donor-init"],
+            ["--donor-checkpoint", "/some/slot"],
+        ],
+        ids=[
+            "n-entries",
+            "entries-json",
+            "epochs",
+            "warm-from",
+            "arm",
+            "seeds",
+            "probe-before-training",
+            "lr-decay-steps",
+            "accum",
+            "donor-init",
+            "donor-checkpoint",
+        ],
+    )
+    def test_each_conflicting_flag_fails_loud(self, monkeypatch, flag_args):
+        monkeypatch.setattr(sys, "argv", ["test20", "--donor-build-smoke", *flag_args])
+        with pytest.raises(SystemExit, match="mutually exclusive"):
+            main()
+
+    def test_model_and_resume_are_not_conflicting(self, monkeypatch):
+        """``--model``/``--resume`` are the allowed trio (alongside
+        ``--donor-build-smoke`` itself) — this must reach
+        ``_main_donor_build_smoke`` rather than raising the conflict
+        SystemExit (mocked out here since it would otherwise touch the GPU)."""
+        monkeypatch.setattr(sys, "argv", ["test20", "--donor-build-smoke", "--model", "mistral"])
+        main_smoke_mock = MagicMock()
+        monkeypatch.setattr(
+            "experiments.test20_smallN_cold_gate._main_donor_build_smoke", main_smoke_mock
+        )
+        main()
+        main_smoke_mock.assert_called_once()
+
+
+@pytest.fixture
+def _mock_cuda_telemetry(monkeypatch):
+    """CPU-safe stand-ins for the CUDA telemetry calls
+    ``_run_donor_build_smoke`` makes unconditionally in its build phase, so
+    these unit tests never touch a real CUDA context regardless of whether
+    the test host has a GPU."""
+    monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", MagicMock())
+    monkeypatch.setattr("torch.cuda.max_memory_allocated", MagicMock(return_value=0.0))
+    monkeypatch.setattr("torch.cuda.max_memory_reserved", MagicMock(return_value=0.0))
+    monkeypatch.setattr(
+        "experiments.test20_smallN_cold_gate._cuda_mem_get_info_mib",
+        MagicMock(return_value={"free_mib": 1.0, "total_mib": 2.0}),
+    )
+
+
+class TestRunDonorBuildSmokeTwoMarkerResume:
+    """``_run_donor_build_smoke``'s own two resumability markers — SEPARATE
+    from ``_build_or_reuse_own_donor_checkpoint``'s own
+    ``DONOR_BUILD_MARKER_FILENAME`` check (already covered by
+    ``TestResolveDonorSource``): ``build_results.json`` (build-phase result
+    skip) and ``DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME`` (seed-phase
+    no-op)."""
+
+    def test_existing_build_results_are_not_recomputed(
+        self, tmp_path, monkeypatch, _mock_cuda_telemetry
+    ):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "build_results.json").write_text(json.dumps({"sentinel": "pre-existing"}))
+        # Seed marker ALSO present so phase 2 is a no-op without further
+        # mocking -- this test isolates the build-results skip.
+        (run_dir / DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME).write_text(
+            json.dumps({"timestamp": 1, "success": True})
+        )
+
+        slot = tmp_path / "slot"
+        slot.mkdir()
+        build_mock = MagicMock(
+            return_value=(object(), slot, False, {"seed": 42, "n_entries": 147, "epochs": 30})
+        )
+        monkeypatch.setattr(
+            "experiments.test20_smallN_cold_gate._build_or_reuse_own_donor_checkpoint", build_mock
+        )
+        read_meta_mock = MagicMock()
+        monkeypatch.setattr("experiments.test20_smallN_cold_gate._read_donor_meta", read_meta_mock)
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        result = _run_donor_build_smoke(
+            object(),
+            MagicMock(),
+            cfg,
+            run_dir,
+            {"free_mib": 1.0, "total_mib": 2.0},
+            {"free_mib": 1.0, "total_mib": 2.0},
+        )
+
+        assert result is None
+        build_mock.assert_called_once()
+        # The build-phase results-recording branch (which reads
+        # donor_meta.json via _read_donor_meta) never ran.
+        read_meta_mock.assert_not_called()
+        # build_results.json is untouched -- proves the build-phase results
+        # were not recomputed/overwritten.
+        assert json.loads((run_dir / "build_results.json").read_text()) == {
+            "sentinel": "pre-existing"
+        }
+
+    def test_existing_seed_marker_makes_seed_phase_a_no_op(
+        self, tmp_path, monkeypatch, _mock_cuda_telemetry
+    ):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME).write_text(
+            json.dumps({"timestamp": 1, "success": True})
+        )
+
+        slot = tmp_path / "slot"
+        slot.mkdir()
+        (slot / "adapter_model.safetensors").write_bytes(b"weights")
+        build_mock = MagicMock(
+            return_value=(object(), slot, False, {"seed": 42, "n_entries": 147, "epochs": 30})
+        )
+        monkeypatch.setattr(
+            "experiments.test20_smallN_cold_gate._build_or_reuse_own_donor_checkpoint", build_mock
+        )
+        read_meta_mock = MagicMock(
+            return_value={
+                "seed": 42,
+                "n_entries": 147,
+                "epochs": 30,
+                "gradient_accumulation_steps": 2,
+                "realized_optimizer_steps": 2220,
+                "weights_sha256": "abc123",
+                "wall_train_seconds": 456.7,
+            }
+        )
+        monkeypatch.setattr("experiments.test20_smallN_cold_gate._read_donor_meta", read_meta_mock)
+        # Defensive mocks for the seed-phase collaborators -- must NEVER be
+        # invoked once the seed marker short-circuits the function; kept
+        # here so a regression that moves the marker check surfaces as a
+        # clean assertion failure rather than a real adapter-load attempt.
+        load_adapter_mock = MagicMock()
+        monkeypatch.setattr(
+            "experiments.test20_smallN_cold_gate.PeftModel.from_pretrained", load_adapter_mock
+        )
+        create_adapter_mock = MagicMock()
+        monkeypatch.setattr(
+            "experiments.test20_smallN_cold_gate.create_adapter", create_adapter_mock
+        )
+        copy_weights_mock = MagicMock()
+        monkeypatch.setattr(
+            "experiments.test20_smallN_cold_gate.copy_adapter_weights", copy_weights_mock
+        )
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        result = _run_donor_build_smoke(
+            object(),
+            MagicMock(),
+            cfg,
+            run_dir,
+            {"free_mib": 1.0, "total_mib": 2.0},
+            {"free_mib": 1.0, "total_mib": 2.0},
+        )
+
+        assert result is None
+        build_mock.assert_called_once()
+        create_adapter_mock.assert_not_called()
+        load_adapter_mock.assert_not_called()
+        copy_weights_mock.assert_not_called()
+        # The build-phase results ARE recorded (build_results.json did not
+        # pre-exist), proving only the SEED phase was skipped.
+        assert (run_dir / "build_results.json").is_file()

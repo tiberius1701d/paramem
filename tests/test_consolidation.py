@@ -4373,7 +4373,6 @@ class TestAbortSkipsCommit:
             patch.multiple(
                 "paramem.models.loader",
                 copy_adapter_weights=MagicMock(),
-                copy_adapter_weights_subset=MagicMock(return_value=4),
                 create_adapter=MagicMock(side_effect=lambda m, cfg, name: m),
                 switch_adapter=MagicMock(),
             ),
@@ -8332,7 +8331,6 @@ def _run_full_fold_mocked(
                 "paramem.models.loader.copy_adapter_weights",
                 **copy_adapter_weights_patch_kwargs,
             ),
-            patch("paramem.models.loader.copy_adapter_weights_subset"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters", unload_spy),
         ):
             return loop.consolidate(mode="train", keys_from=keys_from, trainer=None, router=None)
@@ -8341,111 +8339,20 @@ def _run_full_fold_mocked(
 
 
 # =============================================================================
-# TestAdapterWeightCopy — copy_adapter_weights / copy_adapter_weights_subset
+# TestAdapterWeightCopy — copy_adapter_weights
 # =============================================================================
 
 
 class TestAdapterWeightCopy:
-    """Unit tests for the two weight-copy helpers in ``paramem.models.loader``.
+    """Unit tests for the weight-copy helper in ``paramem.models.loader``.
 
     CPU-only parameter-tensor logic; no GPU/model needed.
     """
 
-    def test_copy_adapter_weights_subset_copies_intersecting(self):
-        """subset copy: src⊆dst copies intersecting tensors, leaves dst-only at init."""
-        from unittest.mock import MagicMock
-
-        import torch
-
-        from paramem.models.loader import copy_adapter_weights_subset
-
-        model = MagicMock()
-
-        # src has 1 param; dst has 2 (1 shared key "base_a", 1 dst-only "base_b").
-        # named_parameters is called twice by _index (once for src, once for dst);
-        # use side_effect to return a fresh list each time.
-        src_tensor_a = torch.ones(4, 4)
-        dst_tensor_a = torch.zeros(4, 4)
-        dst_tensor_b = torch.zeros(4, 4)
-
-        params = [
-            ("base_a.src.weight", src_tensor_a),  # key (base_a, .weight) in src
-            ("base_a.dst.weight", dst_tensor_a),  # key (base_a, .weight) in dst
-            ("base_b.dst.weight", dst_tensor_b),  # dst-only key (base_b, .weight)
-        ]
-        # Each call to named_parameters() must return a fresh iterable.
-        model.named_parameters.side_effect = lambda: iter(params)
-        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
-
-        count = copy_adapter_weights_subset(model, src="src", dst="dst")
-
-        assert count == 1, f"Expected 1 tensor copied (intersecting), got {count}"
-        # The shared tensor was copied from src into dst.
-        assert torch.allclose(dst_tensor_a, src_tensor_a), (
-            "Shared tensor must be copied from src to dst"
-        )
-        # dst-only tensor is unchanged.
-        assert torch.all(dst_tensor_b == 0), "dst-only tensor must stay at zero-init"
-
-    def test_copy_adapter_weights_subset_zeroes_prefilled_dst_only_tensor(self):
-        """A dst-only tensor that already holds NONZERO values (e.g. a
-        resident procedural adapter reused across a warm-init fold, not a
-        freshly-created one) is explicitly zeroed by the copy -- the
-        "MLP stays zero-init" contract must hold unconditionally, not only
-        when dst happens to already be at PEFT's zero-init."""
-        from unittest.mock import MagicMock
-
-        import torch
-
-        from paramem.models.loader import copy_adapter_weights_subset
-
-        model = MagicMock()
-
-        src_tensor_a = torch.ones(4, 4)
-        dst_tensor_a = torch.zeros(4, 4)
-        dst_tensor_b = torch.full((4, 4), 7.0)  # pre-filled NONZERO dst-only tensor
-
-        params = [
-            ("base_a.src.weight", src_tensor_a),
-            ("base_a.dst.weight", dst_tensor_a),
-            ("base_b.dst.weight", dst_tensor_b),
-        ]
-        model.named_parameters.side_effect = lambda: iter(params)
-        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
-
-        copy_adapter_weights_subset(model, src="src", dst="dst")
-
-        assert torch.all(dst_tensor_b == 0), (
-            "a pre-filled dst-only tensor must be explicitly zeroed by the copy"
-        )
-
-    def test_copy_adapter_weights_subset_raises_when_src_exceeds_dst(self):
-        """subset copy raises RuntimeError when src has a tensor dst lacks."""
-        from unittest.mock import MagicMock
-
-        import torch
-
-        from paramem.models.loader import copy_adapter_weights_subset
-
-        src_tensor = torch.ones(4, 4)
-        dst_tensor = torch.zeros(4, 4)
-
-        params = [
-            ("base_a.src.weight", src_tensor),  # in src
-            ("base_b.src.weight", src_tensor.clone()),  # in src but NOT in dst
-            ("base_a.dst.weight", dst_tensor),  # in dst
-        ]
-        model = MagicMock()
-        model.named_parameters.side_effect = lambda: iter(params)
-        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
-
-        with pytest.raises(RuntimeError, match="absent from dst"):
-            copy_adapter_weights_subset(model, src="src", dst="dst")
-
     def test_copy_adapter_weights_raises_on_set_inequality_regression(self):
-        """copy_adapter_weights (strict) still raises on any set inequality.
-
-        Regression guard: the subset helper must never loosen the strict function.
+        """copy_adapter_weights (strict) raises on any set inequality --
+        the sole donor-seeding weight-copy primitive since every donor and
+        target now share the SAME topology by construction.
         """
         from unittest.mock import MagicMock
 
@@ -8571,7 +8478,6 @@ class TestTierKeyedAssignmentInvariants:
                 patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
                 loop.consolidate(mode="train", trainer=None, router=None)
@@ -8745,7 +8651,6 @@ class TestTierKeyedAssignmentInvariants:
                 patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
                 patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
                 patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
                 loop.consolidate(mode="train", trainer=None, router=None)
@@ -16390,7 +16295,6 @@ class TestConsumePendingFullFold:
                 patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
-                patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
                 result = loop.consolidate(

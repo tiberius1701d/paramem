@@ -252,6 +252,52 @@ The exact-match rate metric itself is unaffected; only its ATTRIBUTION is —
 the donor's own (different) objects for those keys on every donor-init
 seed so this is never silently assumed away.
 
+``--donor-build-smoke`` (procedural-topology GPU feasibility/cost probe)
+-------------------------------------------------------------------------
+A SEPARATE, standalone mode (a GPU feasibility/cost measurement for
+building a donor checkpoint at the PROCEDURAL topology) dispatched by
+``main()`` before any of the above arm-configuration logic runs; mutually
+exclusive with every other flag except ``--model``/``--resume``. Builds ONE
+donor checkpoint at the PROCEDURAL topology — rank/alpha/target_modules
+from ``tests/fixtures/server.yaml``'s ``procedural_adapter_config`` via
+``load_server_config`` (never hardcoded) — reusing
+``_build_donor_checkpoint`` unchanged and
+``_build_or_reuse_own_donor_checkpoint`` (the resume-aware build-once
+machinery extracted from ``_resolve_donor_source``'s cases 2/3 — one shared
+implementation; ``--donor-init`` reaches it via ``_resolve_donor_source``,
+``--donor-build-smoke`` calls it directly since it never accepts an
+external ``--donor-checkpoint``). This build trains at
+``paramem.training.donor.DONOR_RECIPE_LEARNING_RATE``/
+``DONOR_RECIPE_DROPOUT`` — derived from those constants, never hand-copied
+— matching production ``build_donor``'s recipe fidelity unconditionally
+(the same recipe every ``_build_donor_checkpoint`` call now applies, for
+``--donor-init`` too). Then cold-seeds a FRESH procedural adapter
+from the built checkpoint via the SAME strict ``copy_adapter_weights`` call
+(raises loud on any parameter-set mismatch) the ``--warm-from``/
+``--donor-init`` arms already use, loaded via the SAME
+``_adapter_slot_for_load`` + ``PeftModel.from_pretrained``
+pattern ``_run_seed``'s Step 1b uses. No recall evaluation runs on the
+seeded adapter and production ``paramem.training.donor.build_donor`` is
+never exercised (this arm measures GPU feasibility/cost only — wall
+time, mean seconds/optimizer step, ``torch.cuda.mem_get_info`` sampled
+before load / after load / after build / after seed, and ``torch.cuda.
+max_memory_allocated``/``max_memory_reserved`` for the build phase — WSL2's
+``nvidia-smi`` is VRAM-blind, ``mem_get_info`` is authoritative). Resumable
+at the build/seed phase boundary: a rerun with the build phase's own
+``build_results.json`` already present skips straight to the seed phase; a
+rerun with the seed phase's own ``donor_build_smoke_seed_done.json`` marker
+already present is a no-op. ``--resume`` into an existing run dir fails
+loudly, before either phase runs, if the CURRENT fixture's
+``procedural_adapter_config`` topology disagrees with the run dir's own
+recorded ``smoke_config.json`` (mirrors ``main()``'s ``run_config.json``
+mismatch guard). See :func:`_run_donor_build_smoke` /
+:func:`_main_donor_build_smoke` for the full mechanism::
+
+    setsid nohup python \\
+        experiments/test20_smallN_cold_gate.py --model mistral \\
+        --donor-build-smoke \\
+        >outputs/test20_donor_build_smoke_procedural.log 2>&1 &
+
 Metric
 ------
 ``paramem.training.recall_eval.evaluate_indexed_recall`` (handles the
@@ -442,6 +488,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
@@ -477,6 +524,12 @@ from paramem.training.donor import (  # noqa: E402
     DONOR_DEFAULT_SEED,
     DONOR_META_FILENAME,
     DONOR_MIN_ENTRIES,
+    # DONOR_RECIPE_DROPOUT / DONOR_RECIPE_LEARNING_RATE: _build_donor_checkpoint
+    # derives its donor's own training hyperparameters from these two constants
+    # unconditionally (never hand-copies the literals) -- see that function's
+    # docstring and the module docstring's "--donor-build-smoke" section.
+    DONOR_RECIPE_DROPOUT,
+    DONOR_RECIPE_LEARNING_RATE,
     donor_entries,
 )
 from paramem.training.recall_eval import evaluate_indexed_recall  # noqa: E402
@@ -965,6 +1018,16 @@ def _build_donor_checkpoint(
     None) — the SAME funnel derivation production's own donor build uses,
     never a hardcoded module constant.
 
+    The donor's OWN training always runs at
+    ``paramem.training.donor.DONOR_RECIPE_LEARNING_RATE`` /
+    ``DONOR_RECIPE_DROPOUT`` (``dataclasses.replace(adapter_config,
+    learning_rate=..., dropout=...)``) rather than *adapter_config*'s own
+    ``learning_rate``/``dropout`` — matching production
+    ``paramem.training.donor.build_donor``'s recipe-fidelity contract
+    unconditionally (topology fields — rank/alpha/target_modules — are
+    UNCHANGED, since ``copy_adapter_weights`` only requires topology
+    equality, never hyperparameter equality).
+
     ``lr_decay_steps`` and ``gradient_accumulation_steps`` are ALWAYS
     derived from ``budget_for(len(entries))`` for the donor's own training,
     regardless of what *base_training_config* carries — an arm invoked with
@@ -979,10 +1042,14 @@ def _build_donor_checkpoint(
         model: Base model (unwrapped inside if currently a ``PeftModel`` —
             discards any resident adapter, matching ``_run_seed``'s Step 1).
         tokenizer: Tokenizer matching the model.
-        adapter_config: Production episodic ``AdapterConfig`` (the donor
-            trains at the SAME rank/alpha/target_modules as the arm it will
-            seed — ``copy_adapter_weights`` requires exact topology match).
-        base_training_config: Production episodic ``TrainingConfig``
+        adapter_config: The target tier's ``AdapterConfig`` (episodic for
+            ``--donor-init``; procedural for ``--donor-build-smoke`` — this
+            function is topology-agnostic). The donor trains at the SAME
+            rank/alpha/target_modules as the arm it will seed
+            (``copy_adapter_weights`` requires exact topology match);
+            ``learning_rate``/``dropout`` are always overridden to the donor
+            recipe (see above).
+        base_training_config: The target tier's ``TrainingConfig``
             (batch_size/lr/scheduler carried through unchanged; only
             ``num_epochs``/``seed``/``recall_early_stopping``/
             ``lr_decay_steps``/``gradient_accumulation_steps`` are
@@ -1008,12 +1075,12 @@ def _build_donor_checkpoint(
         itself). ``slot / DONOR_META_FILENAME`` (``"donor_meta.json"``) is
         also written — ``{seed, n_entries, epochs,
         gradient_accumulation_steps, realized_optimizer_steps,
-        weights_sha256}`` — the single source of truth
+        weights_sha256, wall_train_seconds}`` — the single source of truth
         ``_resolve_donor_source``/``_read_donor_meta`` read back later
         (including from a DIFFERENT run's ``--donor-checkpoint`` reuse,
         since it travels with the slot). ``_read_donor_meta`` tolerates the
-        absence of ``gradient_accumulation_steps``/``realized_optimizer_steps``
-        on slots built before this field was added.
+        absence of ``gradient_accumulation_steps``/``realized_optimizer_steps``/
+        ``wall_train_seconds`` on slots built before those fields were added.
     """
     entries = donor_entries(DONOR_DEFAULT_SEED, DONOR_MIN_ENTRIES)
     registry = build_registry(entries)
@@ -1022,10 +1089,19 @@ def _build_donor_checkpoint(
         len(entries), donor_epochs, donor_accum, base_training_config.batch_size
     )
 
+    # Topology (rank/alpha/target_modules) is UNCHANGED — only
+    # learning_rate/dropout are recipe-derived, never hand-copied — matching
+    # production build_donor's recipe-fidelity contract unconditionally.
+    donor_adapter_config = dataclasses.replace(
+        adapter_config,
+        learning_rate=DONOR_RECIPE_LEARNING_RATE,
+        dropout=DONOR_RECIPE_DROPOUT,
+    )
+
     if isinstance(model, PeftModel):
         model = model.base_model.model
     torch.manual_seed(DONOR_DEFAULT_SEED)
-    model = create_adapter(model, adapter_config, DONOR_BUILD_ADAPTER_NAME)
+    model = create_adapter(model, donor_adapter_config, DONOR_BUILD_ADAPTER_NAME)
     switch_adapter(model, DONOR_BUILD_ADAPTER_NAME)
 
     lora_b_norm_before = lora_b_frobenius_norm(model, DONOR_BUILD_ADAPTER_NAME)
@@ -1066,7 +1142,7 @@ def _build_donor_checkpoint(
         train_dataset=dataset,
         adapter_name=DONOR_BUILD_ADAPTER_NAME,
         training_config=donor_training_cfg,
-        adapter_config=adapter_config,
+        adapter_config=donor_adapter_config,
         output_dir=checkpoint_root / ".training_scratch",
         run_name="test20-donor-build",
         callbacks_extra=[step_cb],
@@ -1109,6 +1185,7 @@ def _build_donor_checkpoint(
         "gradient_accumulation_steps": donor_accum,
         "realized_optimizer_steps": realized_donor_steps,
         "weights_sha256": weights_sha256,
+        "wall_train_seconds": wall_train,
     }
     (slot / DONOR_META_FILENAME).write_text(json.dumps(donor_meta, indent=2))
 
@@ -1208,6 +1285,87 @@ def _read_donor_meta(slot: Path) -> dict:
     return meta
 
 
+def _build_or_reuse_own_donor_checkpoint(
+    run_dir: Path,
+    model,
+    tokenizer,
+    adapter_config,
+    base_training_config,
+) -> tuple[object, Path, bool, dict]:
+    """Resolve THIS run's OWN donor checkpoint — cases 2/3 of
+    :func:`_resolve_donor_source` (never an external ``--donor-checkpoint``,
+    which stays inline in that function's case 1).
+
+    2. This run already built its own donor checkpoint
+       (``run_dir/DONOR_BUILD_MARKER_FILENAME`` exists — the phase marker,
+       MINIMAL: just ``{slot, timestamp}``, since provenance lives in the
+       slot's own ``donor_meta.json``): reuse the slot recorded in the
+       marker WITHOUT retraining. Covers the resumability requirement — a
+       crash after the donor build (marker written) must not rebuild it on
+       retry.
+    3. Neither: build a fresh donor checkpoint via
+       :func:`_build_donor_checkpoint` under
+       ``run_dir/DONOR_CHECKPOINT_DIRNAME``, then write the (minimal) phase
+       marker.
+
+    Extracted as its own function (rather than inlined twice) so
+    ``--donor-build-smoke`` (never accepts an external ``--donor-checkpoint``)
+    and ``--donor-init`` (via ``_resolve_donor_source``'s cases 2/3) share
+    ONE resume-aware build/reuse implementation instead of each maintaining
+    its own marker bookkeeping.
+
+    Args:
+        run_dir: This run's arm-scoped output directory.
+        model: Base model or ``PeftModel`` (forwarded to
+            ``_build_donor_checkpoint`` when a fresh build is needed;
+            returned unchanged when reusing an existing marker).
+        tokenizer: Tokenizer matching the model.
+        adapter_config: The target tier's ``AdapterConfig`` (episodic for
+            ``--donor-init``; procedural for ``--donor-build-smoke`` — this
+            function is topology-agnostic).
+        base_training_config: ``TrainingConfig`` matching *adapter_config*'s
+            tier.
+
+    Returns:
+        Tuple of ``(model, slot_path, built_fresh, donor_meta)`` — see
+        :func:`_resolve_donor_source`'s own Returns section (identical
+        contract).
+
+    Raises:
+        SystemExit: The marker's recorded slot is missing its weights file.
+    """
+    marker_path = run_dir / DONOR_BUILD_MARKER_FILENAME
+    if marker_path.exists():
+        with open(marker_path) as f:
+            marker = json.load(f)
+        slot = Path(marker["slot"])
+        if not (slot / "adapter_model.safetensors").is_file():
+            raise SystemExit(
+                f"Donor build marker at {marker_path} points to a missing checkpoint "
+                f"({slot}) — delete the marker to force a rebuild."
+            )
+        donor_meta = _read_donor_meta(slot)
+        logger.info("Donor build: reusing this run's already-built checkpoint at %s", slot)
+        return model, slot, False, donor_meta
+
+    checkpoint_root = run_dir / DONOR_CHECKPOINT_DIRNAME
+    logger.info("Donor build: no checkpoint found — building fresh donor at %s", checkpoint_root)
+    model, slot, donor_summary = _build_donor_checkpoint(
+        model, tokenizer, adapter_config, base_training_config, checkpoint_root
+    )
+    donor_meta = {
+        "seed": donor_summary["seed"],
+        "n_entries": donor_summary["n_entries"],
+        "epochs": donor_summary["epochs"],
+        "weights_sha256": donor_summary["weights_sha256"],
+    }
+    marker = {"slot": str(slot), "timestamp": int(time.time())}
+    with open(marker_path, "w") as f:
+        json.dump(marker, f, indent=2)
+    logger.info("Donor build marker written: %s", marker_path)
+    return model, slot, True, donor_meta
+
+
 def _resolve_donor_source(
     donor_checkpoint_arg: str | None,
     run_dir: Path,
@@ -1218,24 +1376,11 @@ def _resolve_donor_source(
 ) -> tuple[object, Path, bool, dict]:
     """Resolve the donor checkpoint slot ``--donor-init`` copies into ``donor_scratch_dir``.
 
-    Three cases, in order:
-
-    1. ``--donor-checkpoint PATH`` given: reuse it directly (the donor
-       "builds once, arms reuse it" — no retraining). Fails loud if *PATH*
-       has no ``adapter_model.safetensors`` (:func:`_read_donor_meta` also
-       verifies its weights SHA-256 against ``PATH``'s own
-       ``donor_meta.json`` — M4).
-    2. This run already built its own donor checkpoint
-       (``run_dir/DONOR_BUILD_MARKER_FILENAME`` exists — the phase marker,
-       now MINIMAL: just ``{slot, timestamp}``, since provenance lives in
-       the slot's own ``donor_meta.json``): reuse the slot recorded in the
-       marker WITHOUT retraining. Covers the resumability requirement — a
-       crash after the donor build (marker written) must not rebuild it on
-       retry.
-    3. Neither: build a fresh donor checkpoint via
-       :func:`_build_donor_checkpoint` under
-       ``run_dir/DONOR_CHECKPOINT_DIRNAME``, then write the (minimal) phase
-       marker.
+    Case 1 (``--donor-checkpoint PATH`` given) is handled inline here; cases
+    2/3 (this run's own already-built or freshly-built checkpoint) delegate
+    to :func:`_build_or_reuse_own_donor_checkpoint` — see that function's
+    docstring for the full case-2/3 mechanism, and for why it exists as a
+    separate function rather than being inlined here twice.
 
     Args:
         donor_checkpoint_arg: ``args.donor_checkpoint`` (``None`` unless the
@@ -1272,36 +1417,433 @@ def _resolve_donor_source(
         logger.info("Donor-init: reusing external donor checkpoint at %s", slot)
         return model, slot, False, donor_meta
 
-    marker_path = run_dir / DONOR_BUILD_MARKER_FILENAME
-    if marker_path.exists():
-        with open(marker_path) as f:
-            marker = json.load(f)
-        slot = Path(marker["slot"])
-        if not (slot / "adapter_model.safetensors").is_file():
-            raise SystemExit(
-                f"Donor build marker at {marker_path} points to a missing checkpoint "
-                f"({slot}) — delete the marker to force a rebuild."
-            )
-        donor_meta = _read_donor_meta(slot)
-        logger.info("Donor-init: reusing this run's already-built checkpoint at %s", slot)
-        return model, slot, False, donor_meta
-
-    checkpoint_root = run_dir / DONOR_CHECKPOINT_DIRNAME
-    logger.info("Donor-init: no checkpoint found — building fresh donor at %s", checkpoint_root)
-    model, slot, donor_summary = _build_donor_checkpoint(
-        model, tokenizer, adapter_config, base_training_config, checkpoint_root
+    return _build_or_reuse_own_donor_checkpoint(
+        run_dir, model, tokenizer, adapter_config, base_training_config
     )
-    donor_meta = {
-        "seed": donor_summary["seed"],
-        "n_entries": donor_summary["n_entries"],
-        "epochs": donor_summary["epochs"],
-        "weights_sha256": donor_summary["weights_sha256"],
+
+
+# ---------------------------------------------------------------------------
+# --donor-build-smoke: procedural-topology donor build + cold-seed GPU cost
+# probe. Feeds the SAME _build_donor_checkpoint / _resolve_donor_source
+# machinery --donor-init already uses (topology-agnostic — adapter_config is
+# a parameter), never a second donor-build implementation.
+# ---------------------------------------------------------------------------
+
+DONOR_BUILD_SMOKE_ARM: str = "donor_build_smoke_procedural"
+"""Fixed arm label (== the ``model_output_dir`` subtree) for
+``--donor-build-smoke``. No ``--arm`` override — this mode always targets
+exactly one topology (procedural) and never runs the ``--n-entries``/
+``--seeds`` arm loop, so there is nothing for an arm label to disambiguate
+beyond the model name ``model_output_dir`` already scopes by."""
+
+DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME: str = "procedural_donor_smoke_seed"
+"""Trainable adapter name for the cold-seed phase. Asserted (like every
+``_run_seed`` trainable adapter) to never collide with a live tier name —
+see ``LIVE_TIER_NAMES``."""
+
+DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME: str = "donor_build_smoke_seed_done.json"
+"""Phase marker for the seed (``copy_adapter_weights``) phase — mirrors
+``DONOR_BUILD_MARKER_FILENAME``'s pattern for the build phase (already
+handled by ``_resolve_donor_source``'s own marker check, reused unchanged
+here). Presence means the seed phase ran to completion and recorded a
+result — success OR a caught failure (see ``_run_donor_build_smoke``) — so a
+rerun after this marker exists skips the seed phase entirely; a rerun after
+ONLY the build-phase marker exists (this one absent) skips straight to the
+seed phase instead of rebuilding the donor."""
+
+DONOR_BUILD_SMOKE_CONFIG_FILENAME: str = "smoke_config.json"
+"""Records this run's resolved procedural topology (rank/alpha/
+target_modules) — mirrors ``main()``'s ``run_config.json`` mismatch guard
+(see :func:`_main_donor_build_smoke`) for the much smaller, topology-only
+config surface this mode carries. A ``--resume`` invocation whose CURRENT
+``tests/fixtures/server.yaml`` ``procedural_adapter_config`` disagrees with
+the recorded value fails loud before either phase runs, rather than
+silently seeding a mismatched-topology adapter."""
+
+
+def _cuda_mem_get_info_mib() -> dict:
+    """Sample ``torch.cuda.mem_get_info`` as ``{"free_mib", "total_mib"}``.
+
+    WSL2's ``nvidia-smi`` is VRAM-blind (project rule) — ``mem_get_info`` is
+    the authoritative source for free/total device memory. The first call in
+    a process initializes the CUDA context if it has not already been
+    initialized (expected/harmless for the "before load" sample — it reflects
+    the context's own small footprint, not the base model).
+
+    Returns:
+        ``{"free_mib": float, "total_mib": float}``.
+    """
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    return {"free_mib": free_bytes / 1024**2, "total_mib": total_bytes / 1024**2}
+
+
+def _run_donor_build_smoke(
+    model,
+    tokenizer,
+    cfg,
+    run_dir: Path,
+    vram_before_load_mib: dict,
+    vram_after_load_mib: dict,
+) -> None:
+    """Build a procedural-topology donor checkpoint, then cold-seed a fresh
+    procedural adapter from it, recording GPU cost telemetry throughout.
+
+    Two resumable phases, each writing its own results file + (seed phase
+    only) done-marker:
+
+    1. **Build** — ``_build_or_reuse_own_donor_checkpoint(run_dir, ...)``
+       (the SAME resume-aware build/reuse logic ``--donor-init`` uses via
+       ``_resolve_donor_source``'s cases 2/3 — one shared implementation,
+       called directly here since ``--donor-build-smoke`` never accepts an
+       external ``--donor-checkpoint``, i.e. never needs
+       ``_resolve_donor_source``'s case 1): builds fresh via
+       ``_build_donor_checkpoint`` if no donor checkpoint exists yet under
+       *run_dir*, otherwise reuses it and verifies its weights SHA-256 — no
+       duplicated resume bookkeeping here. Topology (rank/alpha/
+       target_modules) comes from *cfg*'s ``procedural_adapter_config``;
+       ``_build_donor_checkpoint`` always trains at
+       ``DONOR_RECIPE_LEARNING_RATE``/``DONOR_RECIPE_DROPOUT`` (see that
+       function's docstring). ``torch.cuda.reset_peak_memory_stats()`` runs
+       immediately before the call so ``torch.cuda.max_memory_allocated()``/
+       ``torch.cuda.max_memory_reserved()`` after it reflect ONLY this build
+       (never a bare ``empty_cache`` — see CLAUDE.md). Skipped (falls
+       straight to reading the already-written ``build_results.json``) when
+       that file already exists from a prior invocation of this run dir —
+       this is what makes "the build phase completed" resumable at the
+       phase boundary, independent of whether the helper itself needed to
+       retrain (it does not, once its own marker exists).
+    2. **Seed** — unwrap, load the resolved donor slot fresh via
+       ``_adapter_slot_for_load`` + ``PeftModel.from_pretrained`` (the SAME
+       load pattern ``_run_seed``'s Step 1b already uses for
+       ``--warm-from``/``--donor-init`` — reused directly against the
+       resolved slot with no separate scratch-copy step, since this is a
+       checkpoint this run itself owns rather than a live external adapter
+       directory whose corruption would be data loss), ``torch.
+       manual_seed(DONOR_DEFAULT_SEED)`` before ``create_adapter`` (fresh
+       LoRA-zero, at the SAME ``procedural_adapter_config`` topology), then
+       the SAME strict ``copy_adapter_weights`` call the ``--warm-from``/
+       ``--donor-init`` arms use (raises ``RuntimeError`` on any
+       parameter-set mismatch — no special casing here). The destination
+       adapter's LoRA-B Frobenius norm is asserted ``== 0.0`` before the
+       copy (fresh cold adapter) and equal to the donor's own norm after
+       the copy lands — the same before/after norm proof ``_run_seed``'s
+       Hard Assertion #3 uses. No recall evaluation runs on the seeded
+       adapter (this arm measures GPU feasibility/cost, not recall
+       quality). The donor-immutability tier-name guard (the trainable
+       adapter name is never a live tier name) runs BEFORE the try block,
+       matching ``_run_seed``'s placement — a name collision is a
+       programming bug, not a measured smoke outcome, and must not be
+       swallowed by the except clause below. Any exception during the
+       load/copy is caught, its full traceback recorded in
+       ``seed_results.json``, and the phase marker is still written — a
+       measured failure is a valid smoke result, not a crash (boundary
+       error handling for this measurement's own success/failure signal —
+       see CLAUDE.md's try/except carve-out). A ``torch.cuda.
+       mem_get_info`` sample is recorded after the seed phase regardless of
+       outcome. Skipped entirely (no-op) once
+       ``DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME`` exists from a prior
+       invocation.
+
+    Args:
+        model: The freshly-loaded base model (never a ``PeftModel`` yet at
+            this call site — no prior adapter has been created this run).
+        tokenizer: Tokenizer matching *model*.
+        cfg: The loaded ``ServerConfig`` (``tests/fixtures/server.yaml``) —
+            ``cfg.procedural_adapter_config`` / ``cfg.training_config``
+            supply the topology/recipe (rank/alpha/target_modules from yaml,
+            never hardcoded).
+        run_dir: This run's arm-scoped output directory
+            (``model_output_dir(OUTPUT_BASE / DONOR_BUILD_SMOKE_ARM, model)``).
+        vram_before_load_mib: ``_cuda_mem_get_info_mib()`` sampled by the
+            caller immediately after entering ``acquire_gpu`` and BEFORE
+            ``load_model_and_config`` — recorded verbatim in
+            ``build_results.json``.
+        vram_after_load_mib: ``_cuda_mem_get_info_mib()`` sampled by the
+            caller immediately after ``load_model_and_config`` returns —
+            recorded verbatim in ``build_results.json``.
+    """
+    adapter_config = cfg.procedural_adapter_config
+    base_training_config = dataclasses.replace(cfg.training_config, recall_early_stopping=False)
+
+    build_results_path = run_dir / "build_results.json"
+    seed_marker_path = run_dir / DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME
+
+    # --- Phase 1: build (or reuse) the procedural-topology donor checkpoint.
+    _check_pause("before donor-build-smoke build phase")
+    torch.cuda.reset_peak_memory_stats()
+    t_build0 = time.time()
+    model, slot, built_fresh, donor_meta = _build_or_reuse_own_donor_checkpoint(
+        run_dir, model, tokenizer, adapter_config, base_training_config
+    )
+    wall_build_seconds = time.time() - t_build0
+    vram_after_build_mib = _cuda_mem_get_info_mib()
+    peak_allocated_build_mib = torch.cuda.max_memory_allocated() / 1024**2
+    peak_reserved_build_mib = torch.cuda.max_memory_reserved() / 1024**2
+
+    if build_results_path.exists():
+        logger.info(
+            "Donor-build-smoke: %s already present — build phase already recorded, "
+            "proceeding to seed phase.",
+            build_results_path,
+        )
+    else:
+        full_meta = _read_donor_meta(slot)
+        realized_steps = full_meta.get("realized_optimizer_steps")
+        wall_train_seconds = full_meta.get("wall_train_seconds")
+        # wall/step telemetry is only meaningful for a build that just
+        # trained IN THIS invocation — a resumed reuse (built_fresh=False)
+        # returns near-instantly (SHA-256 verification only), so recording
+        # its trivial wall clock as the build cost would be fiction.
+        # mean_seconds_per_step divides the TRAINING-ONLY clock
+        # (wall_train_seconds, captured inside _build_donor_checkpoint
+        # around its own train_adapter call) rather than wall_build_seconds
+        # (this phase's total wall clock, which also includes dataset
+        # assembly, the post-training recall probe, and
+        # atomic_save_adapter) — both numbers are recorded, each labelled
+        # for what it actually measures.
+        build_results = {
+            "topology": "procedural",
+            "adapter_config": {
+                "rank": adapter_config.rank,
+                "alpha": adapter_config.alpha,
+                "target_modules": adapter_config.target_modules,
+            },
+            "donor_recipe_learning_rate": DONOR_RECIPE_LEARNING_RATE,
+            "donor_recipe_dropout": DONOR_RECIPE_DROPOUT,
+            "n_entries": donor_meta.get("n_entries"),
+            "epochs": donor_meta.get("epochs"),
+            "gradient_accumulation_steps": full_meta.get("gradient_accumulation_steps"),
+            "realized_optimizer_steps": realized_steps,
+            "built_fresh": built_fresh,
+            "slot": str(slot),
+            "wall_build_seconds": wall_build_seconds if built_fresh else None,
+            "wall_train_seconds": wall_train_seconds if built_fresh else None,
+            "mean_seconds_per_step": (
+                wall_train_seconds / realized_steps
+                if built_fresh and realized_steps and wall_train_seconds
+                else None
+            ),
+            "vram_before_load_mib": vram_before_load_mib,
+            "vram_after_load_mib": vram_after_load_mib,
+            "vram_after_build_mib": vram_after_build_mib,
+            "peak_allocated_build_mib": peak_allocated_build_mib if built_fresh else None,
+            "peak_reserved_build_mib": peak_reserved_build_mib if built_fresh else None,
+        }
+        save_results(build_results, run_dir, filename="build_results.json")
+        logger.info(
+            "Donor-build-smoke: build phase complete (built_fresh=%s) — %s",
+            built_fresh,
+            build_results_path,
+        )
+
+    # --- Phase 2: cold-seed a fresh procedural adapter from the built donor.
+    if seed_marker_path.exists():
+        logger.info(
+            "Donor-build-smoke: %s already present — seed phase already recorded, nothing to do.",
+            seed_marker_path,
+        )
+        return
+
+    _check_pause("before donor-build-smoke seed phase")
+    if built_fresh:
+        logger.info("Cooldown before the seed phase (a fresh donor build just ran)")
+        _wait_for_cooldown(52)
+
+    if isinstance(model, PeftModel):
+        model = model.base_model.model
+
+    # Donor-immutability tier-name guard runs BEFORE the try block and
+    # BEFORE create_adapter/switch_adapter, matching _run_seed's placement
+    # (Steps 2-3) — a name collision is a programming bug, not a measured
+    # smoke outcome, and must not be swallowed by the except clause below.
+    assert DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME not in LIVE_TIER_NAMES, (
+        f"Donor-immutability guard FAILED: '{DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME}' "
+        f"collides with a live tier name {sorted(LIVE_TIER_NAMES)}."
+    )
+
+    try:
+        with _adapter_slot_for_load(slot) as load_path:
+            model = PeftModel.from_pretrained(
+                model, str(load_path), adapter_name=DONOR_ADAPTER_NAME
+            )
+
+        donor_norm = lora_b_frobenius_norm(model, DONOR_ADAPTER_NAME)
+
+        torch.manual_seed(DONOR_DEFAULT_SEED)
+        model = create_adapter(model, adapter_config, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
+        switch_adapter(model, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
+
+        norm_before = lora_b_frobenius_norm(model, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
+        assert norm_before == 0.0, (
+            f"Donor-build-smoke seed FAILED: destination adapter "
+            f"'{DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME}' LoRA-B Frobenius norm is "
+            f"{norm_before}, expected 0.0 (fresh cold adapter) before "
+            "copy_adapter_weights."
+        )
+
+        t_seed0 = time.time()
+        copy_adapter_weights(model, src=DONOR_ADAPTER_NAME, dst=DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
+        wall_copy_seconds = time.time() - t_seed0
+        norm_after = lora_b_frobenius_norm(model, DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME)
+        assert norm_after == donor_norm, (
+            f"Donor-build-smoke seed FAILED: destination adapter "
+            f"'{DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME}' LoRA-B Frobenius norm after "
+            f"copy ({norm_after}) != donor '{DONOR_ADAPTER_NAME}' norm ({donor_norm}) "
+            "— the copy did not land (or landed corrupted)."
+        )
+
+        seed_results = {
+            "success": True,
+            "adapter_name": DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME,
+            "donor_lora_b_norm": donor_norm,
+            "lora_b_norm_before_copy": norm_before,
+            "lora_b_norm_after_copy": norm_after,
+            "wall_copy_seconds": wall_copy_seconds,
+            "exception": None,
+        }
+        logger.info(
+            "Donor-build-smoke: seed phase succeeded — lora_b_norm %.6f -> %.6f in %.3fs",
+            norm_before,
+            norm_after,
+            wall_copy_seconds,
+        )
+    except Exception as exc:
+        # Boundary error handling for this measurement's own success/failure
+        # signal — a strict-copy failure (e.g. a parameter-set mismatch from
+        # copy_adapter_weights) IS a valid, measured smoke outcome, not a
+        # bug to mask; the full traceback is preserved so the failure is
+        # diagnosable from results.json alone.
+        seed_results = {
+            "success": False,
+            "adapter_name": DONOR_BUILD_SMOKE_SEED_ADAPTER_NAME,
+            "exception": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        }
+        logger.error("Donor-build-smoke: seed phase failed: %s", exc)
+
+    # Reviewer concern 2: a VRAM sample after the seed phase, regardless of
+    # outcome, for measurement-honesty parity with the build phase's own
+    # before/after-load/after-build samples.
+    seed_results["vram_after_seed_mib"] = _cuda_mem_get_info_mib()
+
+    save_results(seed_results, run_dir, filename="seed_results.json")
+    with open(seed_marker_path, "w") as f:
+        json.dump({"timestamp": int(time.time()), "success": seed_results["success"]}, f, indent=2)
+    logger.info(
+        "Donor-build-smoke: seed phase recorded (success=%s) — %s",
+        seed_results["success"],
+        seed_marker_path,
+    )
+
+
+def _main_donor_build_smoke(args: argparse.Namespace) -> None:
+    """Entry point for ``--donor-build-smoke``.
+
+    A GPU feasibility/cost measurement for the per-topology donor build:
+    builds ONE donor checkpoint at the PROCEDURAL topology
+    (rank/alpha/target_modules from ``tests/fixtures/server.yaml``'s
+    ``procedural_adapter_config`` via ``load_server_config`` — never
+    hardcoded) and cold-seeds a fresh procedural adapter from it, measuring
+    wall time, mean seconds/optimizer step, and VRAM (``torch.cuda.
+    mem_get_info`` before load / after load / after build / after seed,
+    plus ``torch.cuda.max_memory_allocated``/``max_memory_reserved`` for the
+    build phase — WSL2's ``nvidia-smi`` is VRAM-blind, ``mem_get_info`` is
+    authoritative). Does NOT run recall evaluation on the seeded adapter and
+    does NOT exercise production ``paramem.training.donor.build_donor``
+    (needs a live ``ConsolidationLoop`` this standalone experiment has no
+    business depending on — see ``_build_donor_checkpoint``'s own
+    docstring) — see :func:`_run_donor_build_smoke` for the full two-phase
+    mechanism.
+
+    Resumable at the build/seed phase boundary via
+    :func:`_run_donor_build_smoke`'s own marker/results-file checks;
+    ``--resume`` here means "find the latest run dir under this mode's own
+    output subtree" (:func:`_preflight_run_dir`, shared with ``main()``'s
+    per-arm ``--resume`` handling). Before either phase runs, this run's
+    resolved procedural topology is compared against the run dir's own
+    recorded ``DONOR_BUILD_SMOKE_CONFIG_FILENAME`` (``"smoke_config.json"``,
+    written on first invocation) — a mismatch (e.g. the fixture's
+    ``procedural_adapter_config`` changed between the original run and a
+    ``--resume``) fails loud rather than silently seeding a
+    mismatched-topology adapter, mirroring ``main()``'s ``run_config.json``
+    guard for the arm loop.
+
+    Designed to run daemonised (setsid/nohup) — no terminal interaction;
+    honours ``~/.training_pause`` at both phase boundaries (see
+    :func:`_run_donor_build_smoke`). Exits non-zero (``SystemExit(1)``) when
+    the recorded seed phase result is a measured failure — the caller
+    (shell/systemd) must be able to tell success from failure without
+    parsing ``seed_results.json`` itself. Markers/results files are written
+    before this exit, so a re-run after a measured seed failure is a no-op
+    (matching every other phase-marker skip in this mode), not a retry.
+
+    Args:
+        args: Parsed CLI args. Only ``args.model``/``args.resume`` are
+            read — every other arm-configuration flag is validated as
+            mutually exclusive with ``--donor-build-smoke`` by ``main()``
+            before this function is called.
+
+    Raises:
+        SystemExit: Free disk space is insufficient; this run dir's
+            recorded procedural topology disagrees with the current
+            fixture config; or the recorded seed-phase result is a
+            measured failure (exit code 1).
+    """
+    cfg = load_server_config(str(FIXTURE_CONFIG_PATH))
+
+    arm_base = OUTPUT_BASE / DONOR_BUILD_SMOKE_ARM
+    run_dir = _preflight_run_dir(arm_base, args.model, args.resume)
+
+    adapter_config = cfg.procedural_adapter_config
+    smoke_config = {
+        "model": args.model,
+        "topology": "procedural",
+        "rank": adapter_config.rank,
+        "alpha": adapter_config.alpha,
+        "target_modules": adapter_config.target_modules,
     }
-    marker = {"slot": str(slot), "timestamp": int(time.time())}
-    with open(marker_path, "w") as f:
-        json.dump(marker, f, indent=2)
-    logger.info("Donor build marker written: %s", marker_path)
-    return model, slot, True, donor_meta
+    smoke_config_path = run_dir / DONOR_BUILD_SMOKE_CONFIG_FILENAME
+    if smoke_config_path.exists():
+        with open(smoke_config_path) as f:
+            existing_smoke_config = json.load(f)
+        if existing_smoke_config != smoke_config:
+            raise SystemExit(
+                f"Run-config mismatch at {smoke_config_path}: this invocation's "
+                f"resolved procedural topology ({smoke_config}) disagrees with the "
+                f"recorded one ({existing_smoke_config}) — refusing to mix topologies "
+                "into the same run dir. Start a fresh run (a clean output dir) or "
+                "restore the matching tests/fixtures/server.yaml."
+            )
+        logger.info(
+            "Existing %s matches this invocation's procedural topology — resuming.",
+            smoke_config_path,
+        )
+    else:
+        with open(smoke_config_path, "w") as f:
+            json.dump(smoke_config, f, indent=2)
+        logger.info("Smoke config written: %s", smoke_config_path)
+
+    model_config = BENCHMARK_MODELS[args.model]
+    with acquire_gpu(interactive=True):
+        vram_before_load_mib = _cuda_mem_get_info_mib()
+        model, tokenizer = load_model_and_config(model_config)
+        vram_after_load_mib = _cuda_mem_get_info_mib()
+        _run_donor_build_smoke(
+            model, tokenizer, cfg, run_dir, vram_before_load_mib, vram_after_load_mib
+        )
+        unload_model(model, tokenizer)
+
+    with open(run_dir / "seed_results.json") as f:
+        seed_results = json.load(f)
+    success = seed_results["success"]
+
+    print("\n" + "=" * 72)
+    print(f"Test 20 — {DONOR_BUILD_SMOKE_ARM} ({args.model}) complete (seed success={success})")
+    print("=" * 72)
+    print(f"Results written to: {run_dir}")
+    logger.info("Donor-build-smoke complete (seed success=%s). Results: %s", success, run_dir)
+
+    if not success:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1718,6 +2260,50 @@ def _find_latest_run_dir(arm_base: Path, model_name: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _preflight_run_dir(arm_base: Path, model_name: str, resume: bool) -> Path:
+    """Resolve this run's output directory, verifying disk headroom first.
+
+    Shared by ``main()`` (per-arm loop) and ``_main_donor_build_smoke``
+    (fixed procedural arm) — resolves ``--resume``'s "latest run dir for
+    this arm/model" lookup via :func:`_find_latest_run_dir`, then verifies
+    free space in ``OUTPUT_BASE`` against ``DISK_HEADROOM_BYTES``. The run
+    directory itself is created only AFTER that check passes, so a
+    disk-full failure never leaves an empty run dir behind.
+
+    Args:
+        arm_base: Arm-scoped output base (``OUTPUT_BASE / arm``).
+        model_name: Model key (e.g. ``"mistral"``).
+        resume: Whether ``--resume`` was passed.
+
+    Returns:
+        The resolved run directory, created and ready to write into.
+
+    Raises:
+        SystemExit: Free space in ``OUTPUT_BASE`` is at or below
+            ``DISK_HEADROOM_BYTES``.
+    """
+    if resume:
+        latest = _find_latest_run_dir(arm_base, model_name)
+        if latest is None:
+            logger.warning("--resume: no prior run found under %s — starting fresh", arm_base)
+            run_dir = model_output_dir(arm_base, model_name)
+        else:
+            run_dir = latest
+            logger.info("Resuming from %s", run_dir)
+    else:
+        run_dir = model_output_dir(arm_base, model_name)
+
+    OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(OUTPUT_BASE).free
+    if free_bytes <= DISK_HEADROOM_BYTES:
+        raise SystemExit(
+            f"Insufficient disk space: {free_bytes / 1024**3:.1f} GB free in {OUTPUT_BASE}; "
+            f"need > {DISK_HEADROOM_BYTES / 1024**3:.0f} GB."
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 # ---------------------------------------------------------------------------
 # Compact summary printer
 # ---------------------------------------------------------------------------
@@ -1773,11 +2359,17 @@ def _print_summary_from_results(seed: int, results_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for test20.
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build test20's CLI ``ArgumentParser``.
+
+    Factored out of :func:`_parse_args` so ``main()``'s
+    ``--donor-build-smoke`` flag-conflict guard can derive "is this flag
+    set" from the SAME parser's own defaults (``parser.parse_args([])``)
+    rather than maintaining a second, hand-written mirror of the flag list
+    that silently goes stale when a new flag is added.
 
     Returns:
-        Parsed :class:`argparse.Namespace`.
+        A fresh, fully-configured :class:`argparse.ArgumentParser`.
     """
     parser = argparse.ArgumentParser(
         description="Test 20: Small-N Cold Indexed-Key Recall Gate (production recipe)"
@@ -1937,7 +2529,39 @@ def _parse_args() -> argparse.Namespace:
             "<run_dir>/donor_checkpoint/, recorded in donor_build_done.json for --resume."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--donor-build-smoke",
+        action="store_true",
+        help=(
+            "GPU feasibility/cost measurement for the per-topology donor build: build ONE "
+            "donor checkpoint at the PROCEDURAL topology "
+            "(tests/fixtures/server.yaml's procedural_adapter_config — rank/alpha/"
+            "target_modules, never hardcoded) at DONOR_RECIPE_LEARNING_RATE/"
+            "DONOR_RECIPE_DROPOUT and budget_for(len(donor_entries))'s derived epoch/accum "
+            "budget, then cold-seed a fresh procedural adapter from it via the SAME strict "
+            "copy_adapter_weights call --warm-from/--donor-init use. Measures wall time, mean "
+            "seconds/optimizer step, and VRAM (torch.cuda.mem_get_info before load/after "
+            "load/after build/after seed; torch.cuda.max_memory_allocated/max_memory_reserved "
+            "for the build phase). Does NOT "
+            "run recall evaluation on the seeded adapter and does NOT exercise production "
+            "paramem.training.donor.build_donor. Mutually exclusive with every other "
+            "arm-configuration flag (--n-entries/--entries-json/--epochs/--warm-from/"
+            "--donor-init/--donor-checkpoint/--arm/--seeds/--probe-before-training/"
+            "--lr-decay-steps/--accum) — only --model/--resume apply alongside it. Exits "
+            "non-zero if the recorded seed phase result is a measured failure. See "
+            "_main_donor_build_smoke for the full mechanism."
+        ),
+    )
+    return parser
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for test20.
+
+    Returns:
+        Parsed :class:`argparse.Namespace`.
+    """
+    return _build_arg_parser().parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -1994,11 +2618,41 @@ def main() -> None:
 
     Designed to run daemonised (setsid/nohup) — no terminal interaction;
     logs are flushed after every seed.
+
+    ``--donor-build-smoke`` is a SEPARATE, standalone entry point
+    (:func:`_main_donor_build_smoke`) dispatched before any of the
+    ``--n-entries``/``--entries-json``/arm-loop logic below runs — it never
+    reaches the seed loop or its recall evaluation. Every other
+    arm-configuration flag is validated as mutually exclusive with it here,
+    failing loud rather than silently ignoring a flag the smoke mode does
+    not use.
     """
     # Set CUDA alloc config before any torch import side effects matter.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     args = _parse_args()
+
+    if args.donor_build_smoke:
+        # Derived from the parser's OWN defaults (vars(args) vs a
+        # parse_args([]) baseline of the SAME parser) rather than a
+        # hand-maintained mirror of the flag list — every dest except the
+        # allowed trio is a conflicting flag, so a newly-added flag is
+        # covered automatically instead of silently bypassing this guard.
+        _allowed_with_donor_build_smoke = {"model", "resume", "donor_build_smoke"}
+        _defaults = vars(_build_arg_parser().parse_args([]))
+        _set_flags = sorted(
+            f"--{dest.replace('_', '-')}"
+            for dest, value in vars(args).items()
+            if dest not in _allowed_with_donor_build_smoke and value != _defaults[dest]
+        )
+        if _set_flags:
+            raise SystemExit(
+                "--donor-build-smoke is a standalone GPU feasibility/cost probe and is "
+                f"mutually exclusive with every arm-configuration flag; got {_set_flags} set "
+                "alongside it. Drop them — only --model/--resume apply."
+            )
+        _main_donor_build_smoke(args)
+        return
 
     # Resolve the effective seed set: --seeds overrides the module default
     # SEEDS=(0, 1, 2) (e.g. --seeds 42 for the production training seed);
@@ -2097,29 +2751,11 @@ def main() -> None:
     arm = args.arm or _default_arm_label(n_entries, expected_steps, is_real, mode)
 
     # Resolve output dir (arm-scoped so distinct arms never collide and
-    # --resume never crosses arms).
+    # --resume never crosses arms) and verify disk headroom (mirrors
+    # test16/test19 convention: free-space, not total-usage) before the
+    # run dir is created — shared with _main_donor_build_smoke.
     arm_base = OUTPUT_BASE / arm
-    if args.resume:
-        latest = _find_latest_run_dir(arm_base, args.model)
-        if latest is None:
-            logger.warning("--resume: no prior run found for arm=%s — starting fresh", arm)
-            run_dir = model_output_dir(arm_base, args.model)
-        else:
-            run_dir = latest
-            logger.info("Resuming arm=%s from %s", arm, run_dir)
-    else:
-        run_dir = model_output_dir(arm_base, args.model)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Disk space pre-flight (mirrors test16/test19 convention: free-space,
-    # not total-usage).
-    OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
-    free_bytes = shutil.disk_usage(OUTPUT_BASE).free
-    if free_bytes <= DISK_HEADROOM_BYTES:
-        raise SystemExit(
-            f"Insufficient disk space: {free_bytes / 1024**3:.1f} GB free in {OUTPUT_BASE}; "
-            f"need > {DISK_HEADROOM_BYTES / 1024**3:.0f} GB."
-        )
+    run_dir = _preflight_run_dir(arm_base, args.model, args.resume)
 
     registry = build_registry(entries)
     logger.info(
