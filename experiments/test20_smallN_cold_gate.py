@@ -12,44 +12,80 @@ must reproduce is **N=3 at 30 epochs (60 optimizer steps)** — the N=12
 condition (180 steps) is a separate, less severe arm and must not be
 conflated with it.
 
-Arms (parameterized via ``--n-entries`` / ``--epochs``)
-----------------------------------------------------------
+Arms (parameterized via ``--n-entries`` / ``--epochs`` / ``--accum``)
+----------------------------------------------------------------------
 N synthetic keys (default 12, a strict prefix of the fixed 12-fact list
 for smaller N), Mistral 7B, EPISODIC production recipe (rank 8, alpha 16,
-lr 1e-4, attention-only target_modules), COLD LoRA-zero init, ``--epochs``
-epochs (default 30), batch_size=1, gradient_accumulation_steps=2 ->
-``epochs * _steps_per_epoch(N, 1, 2)`` optimizer steps (derived, never
+lr 1e-4, attention-only target_modules), COLD LoRA-zero init. The epoch
+budget and ``gradient_accumulation_steps`` are DERIVED, not fixture
+fields: ``paramem.utils.config.budget_for(n_entries)`` — the SAME
+per-fold funnel production training calls on every fold
+(``ConsolidationLoop._train_tier_adapter``) — returns ``(epochs, accum,
+lr_decay_steps)`` for the resolved key count; ``--epochs`` / ``--accum`` /
+``--lr-decay-steps`` override the derived value explicitly when passed,
+otherwise the derived default applies (see "Recipe fidelity" below).
+``epochs * _steps_per_epoch(N, batch_size, accum)`` optimizer steps
+(``batch_size`` from the loaded fixture, today 1; derived, never
 hardcoded — see ``_expected_optimizer_steps``). Run at 3 seeds (0, 1, 2 by
 default; override with ``--seeds`` — e.g. ``--seeds 42`` for a single
 production-training-seed run); per-seed recall reported, plus the mean.
 Two decisive arms:
 
-  * ``--n-entries 3 --epochs 30``  -> 60 optimizer steps (the ORIGINAL
-    failure condition to reproduce).
-  * ``--n-entries 3 --epochs 180`` -> 360 optimizer steps (same N, 6x the
-    step budget — isolates whether more steps rescues the small-N arm).
+  * ``--n-entries 3 --epochs 30 --accum 2``  -> 60 optimizer steps (the
+    ORIGINAL failure condition to reproduce; BOTH flags override
+    ``budget_for(3)``'s derived 80-epoch/accum-1 default explicitly — the
+    original failure predates ``budget_for``'s per-N accum derivation,
+    which gives accum=1 for N=3 (the ``<16`` bucket); omitting ``--accum 2``
+    here reproduces a DIFFERENT arm, 90 steps).
+  * ``--n-entries 3 --epochs 180 --accum 2`` -> 360 optimizer steps (same
+    N, 6x the step budget — isolates whether more steps rescues the
+    small-N arm).
 
-The default (N=12, 30 epochs -> 180 steps) is the arm this script
-originally shipped with; it remains available unchanged via defaults.
+The bare-default invocation (``--model mistral`` only, N=12) derives its
+budget from ``budget_for(12)`` (the ``<16`` bucket: 80 epochs, accum 1) —
+the historical N=12/30-epoch/accum-2/180-step arm this script originally
+shipped with requires ``--epochs 30 --accum 2`` explicitly to reproduce
+(N=12 is also in the ``<16`` bucket, so BOTH fields need pinning, not just
+epochs).
 
 Recipe fidelity
 ----------------
 Loaded via ``load_server_config("tests/fixtures/server.yaml")`` — never
 ``load_config()`` or ``configs/server.yaml.example`` (project rule). The
 fixture's ``episodic_adapter_config`` supplies rank/alpha/lr/target_modules
-verbatim; ``training_config`` supplies batch_size=1,
-gradient_accumulation_steps=2, max_seq_length=1024, warmup_steps=0,
-lr_scheduler_type="linear", lr_decay_steps=None, weight_decay=0.1,
-gradient_checkpointing=True, max_grad_norm=1.0. Two fields are
-overridden IN CODE (never in the fixture) because the fixture pins them
-for its own production-fold posture and each would silently invalidate
-the requested arm if left as-is:
+verbatim; its ``training_config`` supplies batch_size=1,
+max_seq_length=1024, warmup_steps=0, lr_scheduler_type="linear",
+weight_decay=0.1, gradient_checkpointing=True, max_grad_norm=1.0 —
+unchanged. ``num_epochs``, ``gradient_accumulation_steps``, and
+``lr_decay_steps`` are NOT read from the fixture at all: production
+derives all three per-fold from ``paramem.utils.config.budget_for(n_keys)``
+(the unconditional funnel call in
+``ConsolidationLoop._train_tier_adapter``), and this harness calls the
+SAME function on the resolved ``n_entries`` to get the arm's default
+budget — the fixture stopped carrying ``gradient_accumulation_steps``/
+``num_epochs`` fields entirely once production's derivation shipped, so
+treating them as fixture values would be fiction. Three fields are
+therefore always set IN CODE, from ``budget_for(n_entries)`` unless the
+matching CLI flag overrides them explicitly:
 
-  * ``num_epochs``: fixture ships 30. Set to ``--epochs`` here so the
-    arm's step budget comes ONLY from the CLI flag, not the fixture.
-  * ``recall_early_stopping``: fixture ships True — would truncate the run
-    on 100% recall, making the expected step count fiction. Set to False
-    here.
+  * ``num_epochs``: ``budget_for(n_entries)[0]``, or ``--epochs`` when
+    explicit.
+  * ``gradient_accumulation_steps``: ``budget_for(n_entries)[1]``, or
+    ``--accum`` when explicit.
+  * ``lr_decay_steps``: ``budget_for(n_entries)[2]`` (``None`` for every
+    bucket in today's ``_BUDGET_TABLE``), or ``--lr-decay-steps`` when
+    explicit.
+
+A fourth field is always forced regardless of any derived value or CLI
+flag: ``recall_early_stopping=False`` — the fixture ships True, which
+would truncate the run on 100% recall, making the expected step count
+fiction.
+
+``_expected_optimizer_steps`` is always called with the SAME resolved
+epochs/accum/batch_size the run actually trains with — never a hardcoded
+module constant — so the derived expected-step count and the
+post-cfg-load Step 7 canary in ``_run_seed`` can never drift from each
+other by construction.
 
 The realized optimizer-step count is captured directly from HF Trainer's
 ``TrainerState.global_step`` via a local callback (``train_adapter`` does
@@ -147,17 +183,22 @@ Donor-init (``--donor-init`` / ``--donor-checkpoint``) — budget/donor validati
 exclusive with it — both resolve one donor source, never two): instead of
 an owner-supplied adapter directory, the donor is
 ``paramem.training.donor.donor_entries(DONOR_DEFAULT_SEED,
-DONOR_MIN_ENTRIES)`` (128 synthetic crowded-cluster keys, the same
-seed+recipe pure function production donor building uses — see
-``paramem.training.donor``'s module docstring for why this shape, not
-PerLTQA/longmemeval/diverse-predicate content, is the donor's content
-source) trained through THIS SCRIPT'S OWN ``train_adapter`` call path
-(``_build_donor_checkpoint`` — mirrors ``_run_seed``'s own
+DONOR_MIN_ENTRIES)`` (147 synthetic crowded-cluster keys —
+``donor_entries`` returns whole 21-entry blocks, so the requested 128
+rounds up — the same seed+recipe pure function production donor building
+uses — see ``paramem.training.donor``'s module docstring for why this
+shape, not PerLTQA/longmemeval/diverse-predicate content, is the donor's
+content source) trained through THIS SCRIPT'S OWN ``train_adapter`` call
+path (``_build_donor_checkpoint`` — mirrors ``_run_seed``'s own
 create/switch/train/probe/save sequence; deliberately NOT
 ``paramem.training.donor.build_donor``, which needs a live
 ``ConsolidationLoop`` this standalone experiment has no business
-depending on) at ``DONOR_BUILD_EPOCHS`` (30, the anchored bucket in
-``paramem.utils.config._BUDGET_TABLE``).
+depending on) at ``budget_for(len(donor_entries))``'s derived epoch/accum
+budget (147 entries -> the ``>=128`` bucket in
+``paramem.utils.config._BUDGET_TABLE``: 30 epochs, accum 2) — the SAME
+funnel derivation production's own donor build
+(``paramem.training.donor.build_donor``) uses, never a hardcoded module
+constant.
 
 The donor builds ONCE and arms reuse it: ``--donor-checkpoint SLOT_DIR``
 points at a prior ``--donor-init`` run's
@@ -175,12 +216,29 @@ every downstream mechanism — ``_run_seed``'s Step 1b load, Hard Assertions
 ``--lr-decay-steps N`` pins ``TrainingConfig.lr_decay_steps`` so the LR
 scheduler's decay window is comparable across arms run at different
 ``--epochs`` (the approved decay-pinned validation protocol pins decay for
-the 50-epoch bucket-2 arm and the donor-init arms; omitting the flag
-preserves today's ``None`` passthrough — decay derived from
-``len(dataloader) * num_epochs``, HF's default). This pin applies to the
-ARM's own target-fact training only — ``_build_donor_checkpoint`` always
-forces ``lr_decay_steps=None`` for the donor's own training regardless of
+the 50-epoch bucket-2 arm and the donor-init arms; omitting the flag uses
+``budget_for(n_entries)``'s derived value instead — ``None`` for every
+bucket in today's ``_BUDGET_TABLE``, i.e. ``create_scheduler``'s no-op
+passthrough, decay derived from ``len(dataloader) * num_epochs``, HF's
+default). This override applies to the ARM's own target-fact training
+only — ``_build_donor_checkpoint`` always derives the donor's own
+``lr_decay_steps`` from ``budget_for(len(donor_entries))`` regardless of
 this flag (see that function's docstring).
+
+``--accum N`` overrides ``TrainingConfig.gradient_accumulation_steps``,
+threaded into ``base_training_config`` the same way as ``--epochs`` and
+``--lr-decay-steps``. Omitting the flag uses ``budget_for(n_entries)``'s
+derived value instead of a hardcoded module constant — the fixture no
+longer carries a ``gradient_accumulation_steps`` field to fall back to
+(see "Recipe fidelity" above). ``_expected_optimizer_steps`` is always
+called with the SAME resolved accum value the run actually trains with,
+so the derived expected-step count and the post-cfg-load Step 7 canary in
+``_run_seed`` can never drift from each other. Like ``--lr-decay-steps``,
+this override applies to the ARM's own target-fact training only —
+``_build_donor_checkpoint`` always derives the donor's own
+``gradient_accumulation_steps`` from ``budget_for(len(donor_entries))``
+regardless of this flag (the donor's one-time build must reflect ITS OWN
+key count's bucket, not whichever arm happens to trigger it).
 
 **Confound (recorded, not eliminated):** the donor's block-0 is
 bit-identical to the fixed 21-key fixture, so a real-production-key arm's
@@ -255,18 +313,23 @@ dedicated, arm-scoped output subtree, so ``--resume`` never crosses arms).
 
 Daemonised launch (survives Claude exit)
 ------------------------------------------
+All N=3 examples below pin ``--accum 2`` explicitly — ``budget_for(3)``
+derives accum=1 (the ``<16`` bucket), so reproducing these historical
+step counts requires the override; omitting ``--accum 2`` runs a
+DIFFERENT (still valid, just differently-labeled) arm.
+
 The original synthetic failure condition (N=3, 30 epochs, 60 steps)::
 
     setsid nohup python \\
         experiments/test20_smallN_cold_gate.py --model mistral \\
-        --n-entries 3 --epochs 30 \\
+        --n-entries 3 --epochs 30 --accum 2 \\
         >outputs/test20_n3_e30.log 2>&1 &
 
 The step-budget-rescue arm (N=3, 180 epochs, 360 steps)::
 
     setsid nohup python \\
         experiments/test20_smallN_cold_gate.py --model mistral \\
-        --n-entries 3 --epochs 180 \\
+        --n-entries 3 --epochs 180 --accum 2 \\
         >outputs/test20_n3_e180.log 2>&1 &
 
 The REAL 3-triple production failure, cold (60 steps)::
@@ -274,7 +337,7 @@ The REAL 3-triple production failure, cold (60 steps)::
     setsid nohup python \\
         experiments/test20_smallN_cold_gate.py --model mistral \\
         --entries-json experiments/fixtures/real3_interim_failure.json \\
-        --epochs 30 \\
+        --epochs 30 --accum 2 \\
         >outputs/test20_real3_cold.log 2>&1 &
 
 The same real triples, warm-started from a donor adapter::
@@ -282,15 +345,15 @@ The same real triples, warm-started from a donor adapter::
     setsid nohup python \\
         experiments/test20_smallN_cold_gate.py --model mistral \\
         --entries-json experiments/fixtures/real3_interim_failure.json \\
-        --epochs 30 --warm-from /path/to/donor_adapter_dir \\
+        --epochs 30 --accum 2 --warm-from /path/to/donor_adapter_dir \\
         >outputs/test20_real3_warm.log 2>&1 &
 
 Resume (auto-detects the arm's own output subtree; ``--entries-json`` /
-``--warm-from`` must be repeated identically so the resolved ``--arm``
-matches)::
+``--accum`` / ``--warm-from`` must be repeated identically so the resolved
+``--arm`` matches)::
 
     python experiments/test20_smallN_cold_gate.py --model mistral \\
-        --n-entries 3 --epochs 30 --resume
+        --n-entries 3 --epochs 30 --accum 2 --resume
 
 The mechanism probe (``--probe-before-training``), real 3 triples, warm vs
 cold, 3 seeds each. WARM decrypts the donor adapter, so
@@ -299,14 +362,14 @@ cold, 3 seeds each. WARM decrypts the donor adapter, so
     export PARAMEM_DAILY_PASSPHRASE=... && setsid nohup python \\
         experiments/test20_smallN_cold_gate.py --model mistral \\
         --entries-json experiments/fixtures/real3_interim_failure.json \\
-        --epochs 30 --warm-from data/ha/adapters/episodic/20260710-224008 \\
+        --epochs 30 --accum 2 --warm-from data/ha/adapters/episodic/20260710-224008 \\
         --probe-before-training \\
         >outputs/test20_real3_warm_probe.log 2>&1 &
 
     setsid nohup python \\
         experiments/test20_smallN_cold_gate.py --model mistral \\
         --entries-json experiments/fixtures/real3_interim_failure.json \\
-        --epochs 30 --probe-before-training \\
+        --epochs 30 --accum 2 --probe-before-training \\
         >outputs/test20_real3_cold_probe.log 2>&1 &
 
 Budget/donor validation arms (exact-21 production keys). ``EXACT21_JSON``
@@ -389,6 +452,7 @@ from peft import PeftModel  # noqa: E402
 from transformers import TrainerCallback  # noqa: E402
 
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
+from experiments.utils.production import budget_for  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     IndexedDataset,
@@ -435,21 +499,17 @@ SEEDS = (0, 1, 2)
 # tests/fixtures/server.yaml / configs/server.yaml.example).
 RECALL_PROBE_BATCH_SIZE = 16
 
-# Default arm: the condition this script originally shipped with
-# (N=12, 30 epochs -> 180 steps). The decisive arm for the ORIGINAL
-# failure is N=3, 30 epochs (--n-entries 3 --epochs 30 -> 60 steps).
+# Default arm: N synthetic keys. The epoch/accum/lr-decay budget for ANY
+# N (arm or donor build) is DERIVED per fold via
+# paramem.utils.config.budget_for(n_entries) — the SAME function
+# production's per-fold funnel calls unconditionally (see module
+# docstring's "Arms" / "Recipe fidelity" sections) — never a hardcoded
+# module constant. --epochs / --accum / --lr-decay-steps override the
+# derived default explicitly when passed. The decisive arm for the
+# ORIGINAL failure is N=3, 30 epochs, accum=2 (--n-entries 3 --epochs 30
+# --accum 2 -> 60 steps, an explicit override of budget_for(3)'s derived
+# 80-epoch/accum-1 default on BOTH fields).
 DEFAULT_N_ENTRIES = 12
-DEFAULT_EPOCHS = 30
-
-# Production recipe values (tests/fixtures/server.yaml episodic
-# training_config) used ONLY to derive the expected optimizer-step count
-# before the fixture is loaded (needed for the default --arm label and the
-# early run_config log, both of which happen before GPU acquire / cfg
-# load). The post-cfg-load canary in _run_seed (Step 7) recomputes the
-# same derivation from the ACTUAL loaded TrainingConfig and fails loud if
-# these ever drift from the fixture.
-_RECIPE_BATCH_SIZE = 1
-_RECIPE_GRAD_ACCUM_STEPS = 2
 
 # Disk safety threshold (matches test16/test19 convention: free-space, not
 # total-usage).
@@ -470,11 +530,13 @@ LIVE_TIER_NAMES = frozenset({"episodic", "semantic", "procedural"})
 # --donor-init: build-your-own-donor constants (budget/donor validation arm)
 # ---------------------------------------------------------------------------
 
-# Epoch budget for the ONE-TIME donor build itself — the anchored bucket
-# (paramem.utils.config._BUDGET_TABLE's n_keys>=128 row: 30 epochs, the only
-# empirically-anchored bucket). Independent of --epochs (which budgets the
-# ARM's own target-fact training, not the donor's).
-DONOR_BUILD_EPOCHS = 30
+# The ONE-TIME donor build's own epoch/accum/lr-decay budget is DERIVED via
+# paramem.utils.config.budget_for(len(donor_entries)) inside
+# _build_donor_checkpoint — never a hardcoded module constant (mirrors
+# production's own donor build, paramem.training.donor.build_donor, which
+# gets its budget from the SAME funnel call in
+# ConsolidationLoop._train_tier_adapter). Independent of --epochs/--accum
+# (which budget the ARM's own target-fact training, not the donor's).
 
 # Sub-directory of the run dir holding a freshly-built donor checkpoint (only
 # used when --donor-init is set and --donor-checkpoint is NOT — i.e. this run
@@ -521,27 +583,30 @@ def _steps_per_epoch(n_examples: int, batch_size: int, gradient_accumulation_ste
     return max(_ceil_div(per_epoch_batches, gradient_accumulation_steps), 1)
 
 
-def _expected_optimizer_steps(n_entries: int, epochs: int) -> int:
-    """Derive the total optimizer-step count for the production recipe.
+def _expected_optimizer_steps(n_entries: int, epochs: int, accum: int, batch_size: int) -> int:
+    """Derive the total optimizer-step count for a resolved per-fold training budget.
 
-    Uses ``_steps_per_epoch`` with the fixture's batch_size=1,
-    gradient_accumulation_steps=2 (``_RECIPE_BATCH_SIZE`` /
-    ``_RECIPE_GRAD_ACCUM_STEPS``): ``epochs * _steps_per_epoch(n_entries, 1,
-    2)``. Called before the fixture config is loaded (for the default
-    ``--arm`` label and the early ``run_config.json`` log); ``_run_seed``'s
-    Step 7 canary independently recomputes the same formula from the actual
-    loaded ``TrainingConfig`` and will fail loud if the fixture's
-    batch_size / gradient_accumulation_steps ever drift from the hardcoded
-    recipe constants here.
+    Uses ``_steps_per_epoch`` with the SAME ``epochs`` / ``accum`` /
+    ``batch_size`` the run actually trains with — never a hardcoded module
+    constant. Callers resolve ``epochs``/``accum`` from
+    ``paramem.utils.config.budget_for(n_entries)`` (overridden by
+    ``--epochs``/``--accum`` when explicit) and ``batch_size`` from the
+    loaded fixture's ``TrainingConfig.batch_size`` before calling this
+    function, so the result and ``_run_seed``'s Step 7 canary (which
+    recomputes the identical formula from the actual ``TrainingConfig``
+    used to train) can never drift from each other by construction.
 
     Args:
-        n_entries: Number of synthetic keys in the arm.
-        epochs: Configured epoch budget (``--epochs``).
+        n_entries: Number of keys in the arm (or donor build).
+        epochs: Resolved epoch budget.
+        accum: Resolved ``gradient_accumulation_steps``.
+        batch_size: Resolved ``batch_size`` (today always 1 — see
+            ``paramem.utils.config._BUDGET_TABLE``'s module comment).
 
     Returns:
-        Total optimizer steps: ``_steps_per_epoch * epochs``.
+        Total optimizer steps: ``_steps_per_epoch(n_entries, batch_size, accum) * epochs``.
     """
-    spe = _steps_per_epoch(n_entries, _RECIPE_BATCH_SIZE, _RECIPE_GRAD_ACCUM_STEPS)
+    spe = _steps_per_epoch(n_entries, batch_size, accum)
     return spe * epochs
 
 
@@ -889,21 +954,26 @@ def _build_donor_checkpoint(
     (that helper trains via a live ``ConsolidationLoop._train_tier_adapter``
     — production server wiring this standalone experiment has no business
     depending on). Instead this mirrors ``_run_seed``'s own
-    create/switch/train/probe/save sequence, at ``DONOR_BUILD_EPOCHS`` (the
-    anchored 30-epoch bucket) on ``DONOR_MIN_ENTRIES`` (128) synthetic keys
-    generated by ``donor_entries(DONOR_DEFAULT_SEED, DONOR_MIN_ENTRIES)`` —
-    the same seed+recipe pure function production donor building uses, so
-    the triple set is bit-identical to what production would build.
+    create/switch/train/probe/save sequence, on ``DONOR_MIN_ENTRIES`` (128,
+    rounds up to 147 — ``donor_entries`` returns whole 21-entry blocks)
+    synthetic keys generated by ``donor_entries(DONOR_DEFAULT_SEED,
+    DONOR_MIN_ENTRIES)`` — the same seed+recipe pure function production
+    donor building uses, so the triple set is bit-identical to what
+    production would build. The epoch/accum/lr-decay budget for THIS
+    build is derived from ``paramem.utils.config.budget_for(len(entries))``
+    (147 entries -> the ``>=128`` bucket: 30 epochs, accum 2, lr_decay_steps
+    None) — the SAME funnel derivation production's own donor build uses,
+    never a hardcoded module constant.
 
-    ``lr_decay_steps`` is ALWAYS pinned to ``None`` for the donor's own
-    training, regardless of what *base_training_config* carries (an arm
-    invoked with ``--donor-init --lr-decay-steps 550`` would otherwise leak
-    that arm-comparability override into the donor build: at
-    ``DONOR_BUILD_EPOCHS``'s ~2220 steps, a 550-step decay window would
-    leave ~75% of the donor's own training at LR≈0). The donor build is a
-    ONE-TIME, its-own-recipe event (the anchored 30-epoch bucket) —
-    ``--lr-decay-steps`` is a per-ARM comparability knob for the target-fact
-    training only, never for the donor.
+    ``lr_decay_steps`` and ``gradient_accumulation_steps`` are ALWAYS
+    derived from ``budget_for(len(entries))`` for the donor's own training,
+    regardless of what *base_training_config* carries — an arm invoked with
+    ``--donor-init --lr-decay-steps 550 --accum 1`` would otherwise leak
+    that arm-comparability override into the donor build, changing its
+    realized optimizer-step count and decay window away from the bucket the
+    donor's own 147-key population is defined against. ``--lr-decay-steps``
+    / ``--accum`` are per-ARM knobs for the target-fact training only,
+    never for the donor.
 
     Args:
         model: Base model (unwrapped inside if currently a ``PeftModel`` —
@@ -913,10 +983,13 @@ def _build_donor_checkpoint(
             trains at the SAME rank/alpha/target_modules as the arm it will
             seed — ``copy_adapter_weights`` requires exact topology match).
         base_training_config: Production episodic ``TrainingConfig``
-            (batch/accum/lr/scheduler carried through unchanged; only
+            (batch_size/lr/scheduler carried through unchanged; only
             ``num_epochs``/``seed``/``recall_early_stopping``/
-            ``lr_decay_steps`` are overridden for the donor build — see
-            above for why ``lr_decay_steps`` is always forced to ``None``).
+            ``lr_decay_steps``/``gradient_accumulation_steps`` are
+            overridden for the donor build — see above for why the latter
+            two are always derived from ``budget_for(len(entries))``
+            regardless of an arm's ``--lr-decay-steps``/``--accum``
+            override).
         checkpoint_root: Directory ``atomic_save_adapter`` saves the donor
             slot under (``target_dir/<ts>/`` — the returned ``Path`` is that
             promoted slot).
@@ -928,16 +1001,26 @@ def _build_donor_checkpoint(
         exactly as it already discards any previous seed's adapters.
         ``donor_summary`` carries the donor's own final recall
         (``exact_count``/``total``/``rate``/``mean_confidence``/``per_key``
-        with verbatim ``raw_output``), the realized weights SHA-256, and the
+        with verbatim ``raw_output``), the realized weights SHA-256, the
+        realized optimizer-step count (asserted equal to the derived
+        expected count — mirrors the arm-side Hard Assertion #1), and the
         pre/post LoRA-B Frobenius norms (cold-init proof for the build
         itself). ``slot / DONOR_META_FILENAME`` (``"donor_meta.json"``) is
-        also written — ``{seed, n_entries, epochs, weights_sha256}`` — the
-        single source of truth ``_resolve_donor_source``/``_read_donor_meta``
-        read back later (including from a DIFFERENT run's
-        ``--donor-checkpoint`` reuse, since it travels with the slot).
+        also written — ``{seed, n_entries, epochs,
+        gradient_accumulation_steps, realized_optimizer_steps,
+        weights_sha256}`` — the single source of truth
+        ``_resolve_donor_source``/``_read_donor_meta`` read back later
+        (including from a DIFFERENT run's ``--donor-checkpoint`` reuse,
+        since it travels with the slot). ``_read_donor_meta`` tolerates the
+        absence of ``gradient_accumulation_steps``/``realized_optimizer_steps``
+        on slots built before this field was added.
     """
     entries = donor_entries(DONOR_DEFAULT_SEED, DONOR_MIN_ENTRIES)
     registry = build_registry(entries)
+    donor_epochs, donor_accum, donor_lr_decay_steps = budget_for(len(entries))
+    expected_donor_steps = _expected_optimizer_steps(
+        len(entries), donor_epochs, donor_accum, base_training_config.batch_size
+    )
 
     if isinstance(model, PeftModel):
         model = model.base_model.model
@@ -959,19 +1042,23 @@ def _build_donor_checkpoint(
     donor_training_cfg = dataclasses.replace(
         base_training_config,
         seed=DONOR_DEFAULT_SEED,
-        num_epochs=DONOR_BUILD_EPOCHS,
+        num_epochs=donor_epochs,
         recall_early_stopping=False,
-        # ALWAYS None for the donor's own training — never inherit an arm's
-        # --lr-decay-steps comparability override (see the docstring above).
-        lr_decay_steps=None,
+        # ALWAYS budget_for's derived value for the donor's own training —
+        # never inherit an arm's --lr-decay-steps/--accum override (see the
+        # docstring above).
+        lr_decay_steps=donor_lr_decay_steps,
+        gradient_accumulation_steps=donor_accum,
     )
 
     logger.info(
-        "Donor build: training %d entries, %d epochs, seed=%d",
+        "Donor build: training %d entries, %d epochs, accum=%d, seed=%d",
         len(examples),
-        DONOR_BUILD_EPOCHS,
+        donor_epochs,
+        donor_accum,
         DONOR_DEFAULT_SEED,
     )
+    step_cb = _StepCaptureCallback()
     t0 = time.time()
     metrics = train_adapter(
         model=model,
@@ -982,9 +1069,21 @@ def _build_donor_checkpoint(
         adapter_config=adapter_config,
         output_dir=checkpoint_root / ".training_scratch",
         run_name="test20-donor-build",
+        callbacks_extra=[step_cb],
     )
     wall_train = time.time() - t0
     train_loss = (metrics or {}).get("train_loss")
+
+    realized_donor_steps = step_cb.global_step
+    assert realized_donor_steps is not None, (
+        "Donor build: _StepCaptureCallback never fired on_train_end — no realized "
+        "step count captured."
+    )
+    assert realized_donor_steps == expected_donor_steps, (
+        f"Donor build: realized optimizer steps={realized_donor_steps}, expected "
+        f"{expected_donor_steps} (n_entries={len(entries)}, epochs={donor_epochs}, "
+        f"accum={donor_accum})."
+    )
 
     lora_b_norm_after = lora_b_frobenius_norm(model, DONOR_BUILD_ADAPTER_NAME)
     assert lora_b_norm_after > 0.0, (
@@ -1006,7 +1105,9 @@ def _build_donor_checkpoint(
     donor_meta = {
         "seed": DONOR_DEFAULT_SEED,
         "n_entries": len(entries),
-        "epochs": DONOR_BUILD_EPOCHS,
+        "epochs": donor_epochs,
+        "gradient_accumulation_steps": donor_accum,
+        "realized_optimizer_steps": realized_donor_steps,
         "weights_sha256": weights_sha256,
     }
     (slot / DONOR_META_FILENAME).write_text(json.dumps(donor_meta, indent=2))
@@ -1014,7 +1115,9 @@ def _build_donor_checkpoint(
     donor_summary = {
         "seed": DONOR_DEFAULT_SEED,
         "n_entries": len(entries),
-        "epochs": DONOR_BUILD_EPOCHS,
+        "epochs": donor_epochs,
+        "gradient_accumulation_steps": donor_accum,
+        "realized_optimizer_steps": realized_donor_steps,
         "slot": str(slot),
         "weights_sha256": weights_sha256,
         "lora_b_norm_before_training": lora_b_norm_before,
@@ -1045,7 +1148,8 @@ def _read_donor_meta(slot: Path) -> dict:
     """Read + verify *slot*'s ``DONOR_META_FILENAME`` (``"donor_meta.json"``).
 
     Single source of truth for a donor checkpoint's provenance
-    (``seed``/``n_entries``/``epochs``/``weights_sha256``), written once by
+    (``seed``/``n_entries``/``epochs``/``gradient_accumulation_steps``/
+    ``realized_optimizer_steps``/``weights_sha256``), written once by
     :func:`_build_donor_checkpoint` and read back from every reuse path —
     including ``--donor-checkpoint`` reuse from a run whose own
     ``run_dir`` is not otherwise reachable, which is why the meta file
@@ -1055,13 +1159,22 @@ def _read_donor_meta(slot: Path) -> dict:
     modified or corrupted after the build, and this fails loud rather than
     silently seeding from unverified weights.
 
+    ``gradient_accumulation_steps``/``realized_optimizer_steps`` are TOLERATED
+    when absent (logged at info level, never a hard failure) — slots built
+    before these fields were added (e.g. a pre-existing ``--donor-checkpoint``
+    reused by a newer harness invocation) have neither, and reuse must not
+    require rebuilding a perfectly valid checkpoint just to backfill
+    provenance fields this function does not otherwise need.
+
     Args:
         slot: A donor checkpoint slot directory (contains
             ``adapter_model.safetensors`` + ``DONOR_META_FILENAME``).
 
     Returns:
-        The parsed meta dict (``seed``, ``n_entries``, ``epochs``,
-        ``weights_sha256``).
+        The parsed meta dict (at minimum ``seed``, ``n_entries``, ``epochs``,
+        ``weights_sha256``; ``gradient_accumulation_steps``/
+        ``realized_optimizer_steps`` when the slot was built after they were
+        added).
 
     Raises:
         SystemExit: The meta file is missing, or the recomputed SHA-256
@@ -1084,6 +1197,13 @@ def _read_donor_meta(slot: Path) -> dict:
             f"{recorded_sha256!r}, but adapter_model.safetensors currently hashes to "
             f"{actual_sha256!r} — the weights file was modified or corrupted after "
             "the build. Refusing to seed from unverified weights."
+        )
+    if "gradient_accumulation_steps" not in meta or "realized_optimizer_steps" not in meta:
+        logger.info(
+            "Donor checkpoint slot %s predates gradient_accumulation_steps/"
+            "realized_optimizer_steps tracking in %s — proceeding without them.",
+            slot,
+            DONOR_META_FILENAME,
         )
     return meta
 
@@ -1247,9 +1367,12 @@ def _run_seed(
       5. ``format_entry_training`` (production entry/prompt path) +
          ``IndexedDataset``.
       6. Build the per-seed ``TrainingConfig`` (``seed=seed`` on top of
-         *base_training_config*, which already carries ``num_epochs``
-         (from ``--epochs``) and ``recall_early_stopping=False``). Hard
-         Assertion #2 re-checked immediately before the call.
+         *base_training_config*, which already carries ``num_epochs``/
+         ``gradient_accumulation_steps``/``lr_decay_steps`` (from
+         ``paramem.utils.config.budget_for(n_entries)``, overridden by
+         ``--epochs``/``--accum``/``--lr-decay-steps`` when explicit — see
+         ``main()``) and ``recall_early_stopping=False``). Hard Assertion
+         #2 re-checked immediately before the call.
       7. Verify the arm's own step-budget derivation
          (``_steps_per_epoch`` * ``num_epochs``) ==
          *expected_optimizer_steps* BEFORE training — a config-drift
@@ -1278,8 +1401,10 @@ def _run_seed(
         adapter_config: Production episodic ``AdapterConfig``
             (``cfg.episodic_adapter_config``).
         base_training_config: Production episodic ``TrainingConfig`` with
-            ``num_epochs`` (from ``--epochs``) and
-            ``recall_early_stopping=False`` already applied (seed is
+            ``num_epochs``/``gradient_accumulation_steps``/``lr_decay_steps``
+            (from ``budget_for(n_entries)``, overridden by
+            ``--epochs``/``--accum``/``--lr-decay-steps`` when explicit)
+            and ``recall_early_stopping=False`` already applied (seed is
             the only remaining per-call override).
         run_dir: Run output directory (already arm-scoped); ``seed<N>/``
             subdir created here.
@@ -1690,11 +1815,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=DEFAULT_EPOCHS,
+        default=None,
         help=(
-            "Epoch budget (default: 30). Combined with the resolved entry count this "
-            "derives the expected optimizer-step count via "
-            "_expected_optimizer_steps (_steps_per_epoch(N, batch=1, accum=2) * epochs)."
+            "Epoch budget, overriding the default derived from "
+            "paramem.utils.config.budget_for(n_entries) (the SAME per-fold funnel "
+            "production training calls on every fold) for the resolved entry count. "
+            "Default None uses budget_for's derived epochs. Combined with the resolved "
+            "accum/batch_size this derives the expected optimizer-step count via "
+            "_expected_optimizer_steps."
         ),
     )
     parser.add_argument(
@@ -1756,12 +1884,29 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Pin TrainingConfig.lr_decay_steps to this many steps, overriding the fixture's "
-            "None (today's behaviour: create_scheduler's no-op passthrough, decay window "
-            "derived from len(dataloader) * num_epochs). The approved decay-pinned validation "
-            "protocol pins decay explicitly so arms at different --epochs stay comparable "
-            "(decay shape decoupled from the epoch budget). Default None preserves today's "
-            "behaviour exactly — omitting this flag changes nothing."
+            "Pin TrainingConfig.lr_decay_steps to this many steps, overriding the default "
+            "derived from paramem.utils.config.budget_for(n_entries) (None for every bucket in "
+            "today's _BUDGET_TABLE — create_scheduler's no-op passthrough, decay window derived "
+            "from len(dataloader) * num_epochs). The approved decay-pinned validation protocol "
+            "pins decay explicitly so arms at different --epochs stay comparable (decay shape "
+            "decoupled from the epoch budget). Default None uses budget_for's derived value."
+        ),
+    )
+    parser.add_argument(
+        "--accum",
+        type=int,
+        default=None,
+        help=(
+            "Override TrainingConfig.gradient_accumulation_steps, threaded into "
+            "base_training_config the same way as --epochs / --lr-decay-steps. Default None "
+            "uses the default derived from paramem.utils.config.budget_for(n_entries) (the SAME "
+            "per-fold funnel production training calls on every fold) instead of a hardcoded "
+            "module constant — the fixture no longer carries a gradient_accumulation_steps "
+            "field. Must be >= 1. _expected_optimizer_steps takes the same resolved value so "
+            "the derived step count and the Step 7 drift canary in _run_seed stay consistent "
+            "with the actual training run. _build_donor_checkpoint always derives the donor's "
+            "own accum from budget_for(len(donor_entries)) regardless of this flag — see that "
+            "function's docstring."
         ),
     )
     parser.add_argument(
@@ -1770,12 +1915,13 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Seed the trainable adapter from a donor checkpoint built by training "
             "paramem.training.donor.donor_entries (128 synthetic keys, seed=DONOR_DEFAULT_SEED) "
-            "through this script's OWN train_adapter call path, at DONOR_BUILD_EPOCHS (30, the "
-            "anchored bucket) — NOT via paramem.training.donor.build_donor (that helper needs a "
-            "live ConsolidationLoop; this standalone experiment trains the donor itself). Feeds "
-            "the SAME donor_scratch_dir / copy_adapter_weights mechanism --warm-from already "
-            "uses in _run_seed (Hard Assertions #3/#4 apply unchanged). Mutually exclusive with "
-            "--warm-from (ambiguous donor source)."
+            "through this script's OWN train_adapter call path, at the epoch/accum budget "
+            "paramem.utils.config.budget_for(len(donor_entries)) derives (30 epochs, accum 2 for "
+            "the resulting 147-entry population) — NOT via paramem.training.donor.build_donor "
+            "(that helper needs a live ConsolidationLoop; this standalone experiment trains the "
+            "donor itself). Feeds the SAME donor_scratch_dir / copy_adapter_weights mechanism "
+            "--warm-from already uses in _run_seed (Hard Assertions #3/#4 apply unchanged). "
+            "Mutually exclusive with --warm-from (ambiguous donor source)."
         ),
     )
     parser.add_argument(
@@ -1802,21 +1948,36 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     """Entry point for Test 20.
 
-    Loads the model once, loads the production episodic recipe from
-    ``tests/fixtures/server.yaml`` (with the in-code overrides documented in
-    the module docstring: ``num_epochs`` from ``--epochs``,
-    ``recall_early_stopping=False``, ``lr_decay_steps`` from
-    ``--lr-decay-steps`` when set), cycles through the resolved seeds of the
-    resolved arm (``--n-entries`` / ``--entries-json`` / ``--epochs`` /
-    ``--lr-decay-steps`` / ``--warm-from`` / ``--donor-init`` /
-    ``--donor-checkpoint`` / ``--arm`` / ``--probe-before-training`` /
-    ``--seeds``) with per-seed adapter isolation, and writes per-seed
-    results + done markers under an arm-scoped output subtree. ``--seeds``
-    overrides the module default ``SEEDS = (0, 1, 2)`` (e.g. ``--seeds 42``
-    for a single production-seed run); omitting it reproduces today's
-    3-seed behaviour exactly, and the effective seed list — never the
-    module constant — is what is logged, written to ``run_config.json``,
-    and iterated by ``--resume``.
+    Loads ``tests/fixtures/server.yaml`` for ``episodic_adapter_config``
+    (rank/alpha/lr/target_modules) and ``training_config``'s fixture-sourced
+    fields (batch_size/max_seq_length/warmup/scheduler/weight_decay/
+    gradient_checkpointing/max_grad_norm) — this load has no GPU dependency,
+    so it happens BEFORE ``acquire_gpu``. ``num_epochs``/
+    ``gradient_accumulation_steps``/``lr_decay_steps`` are NOT fixture
+    fields: they are derived per-fold from
+    ``paramem.utils.config.budget_for(n_entries)`` (the SAME function
+    production's per-fold funnel calls unconditionally), overridden by
+    ``--epochs``/``--accum``/``--lr-decay-steps`` when explicit —
+    see the module docstring's "Recipe fidelity" section. Then cycles
+    through the resolved seeds of the resolved arm (``--n-entries`` /
+    ``--entries-json`` / ``--epochs`` / ``--lr-decay-steps`` / ``--accum`` /
+    ``--warm-from`` / ``--donor-init`` / ``--donor-checkpoint`` / ``--arm`` /
+    ``--probe-before-training`` / ``--seeds``) with per-seed adapter
+    isolation, and writes per-seed results + done markers under an
+    arm-scoped output subtree. ``--seeds`` overrides the module default
+    ``SEEDS = (0, 1, 2)`` (e.g. ``--seeds 42`` for a single production-seed
+    run); omitting it reproduces today's 3-seed behaviour exactly, and the
+    effective seed list — never the module constant — is what is logged,
+    written to ``run_config.json``, and iterated by ``--resume``.
+
+    ``--resume`` (or any repeat invocation landing on an existing run dir)
+    rebuilds the run-config dict from the CURRENT invocation's resolved
+    args/derived values and compares it against the existing
+    ``run_config.json`` on the fields that determine the training budget
+    (``epochs``, ``accum``, ``lr_decay_steps``, ``warm_from``,
+    ``donor_init``, ``donor_checkpoint``) — a mismatch fails loud rather
+    than silently mixing seeds trained under different conditions into one
+    result set.
 
     ``--warm-from`` and ``--donor-init`` are mutually exclusive donor
     sources (fails loud if both are set) feeding the SAME
@@ -1874,9 +2035,62 @@ def main() -> None:
             "--warm-from and --donor-init are mutually exclusive donor sources "
             "(both populate donor_scratch_dir) — pick one."
         )
+    # LOW-8: --accum must be a valid gradient_accumulation_steps value.
+    if args.accum is not None and args.accum < 1:
+        raise SystemExit(f"--accum must be >= 1; got {args.accum}.")
 
-    epochs = args.epochs
-    expected_steps = _expected_optimizer_steps(n_entries, epochs)
+    # Load the production episodic recipe from the test fixture — NEVER
+    # load_config() / configs/server.yaml.example. Pure YAML parse, no GPU
+    # dependency, so this happens before acquire_gpu (needed for the
+    # expected-step derivation below, which now uses the fixture's ACTUAL
+    # batch_size rather than a hardcoded constant).
+    cfg = load_server_config(str(FIXTURE_CONFIG_PATH))
+    adapter_config = cfg.episodic_adapter_config
+
+    # epochs/accum/lr_decay_steps are DERIVED per-fold via budget_for
+    # (paramem.utils.config) — the SAME function production's per-fold
+    # funnel (ConsolidationLoop._train_tier_adapter) calls unconditionally
+    # — never a hardcoded module constant. --epochs/--accum/--lr-decay-steps
+    # override the derived default explicitly when passed.
+    budget_epochs, budget_accum, budget_lr_decay_steps = budget_for(n_entries)
+    epochs = args.epochs if args.epochs is not None else budget_epochs
+    accum = args.accum if args.accum is not None else budget_accum
+    lr_decay_steps = (
+        args.lr_decay_steps if args.lr_decay_steps is not None else budget_lr_decay_steps
+    )
+
+    base_training_config = dataclasses.replace(
+        cfg.training_config,
+        num_epochs=epochs,
+        gradient_accumulation_steps=accum,
+        lr_decay_steps=lr_decay_steps,
+        recall_early_stopping=False,
+    )
+    expected_steps = _expected_optimizer_steps(
+        n_entries, epochs, accum, base_training_config.batch_size
+    )
+    logger.info(
+        "Recipe: rank=%d alpha=%d lr=%.0e target_modules=%s | "
+        "batch=%d accum=%d epochs=%d warmup=%d scheduler=%s wd=%.2f "
+        "lr_decay_steps=%s recall_early_stopping=%s | budget_for(%d)=(%d, %d, %s)",
+        adapter_config.rank,
+        adapter_config.alpha,
+        adapter_config.learning_rate,
+        adapter_config.target_modules,
+        base_training_config.batch_size,
+        base_training_config.gradient_accumulation_steps,
+        base_training_config.num_epochs,
+        base_training_config.warmup_steps,
+        base_training_config.lr_scheduler_type,
+        base_training_config.weight_decay,
+        base_training_config.lr_decay_steps,
+        base_training_config.recall_early_stopping,
+        n_entries,
+        budget_epochs,
+        budget_accum,
+        budget_lr_decay_steps,
+    )
+
     is_warm = args.warm_from is not None or args.donor_init
     mode = "donor" if args.donor_init else ("warm" if args.warm_from is not None else "cold")
     condition = _condition_label(mode, epochs)
@@ -1909,20 +2123,24 @@ def main() -> None:
 
     registry = build_registry(entries)
     logger.info(
-        "%s arm [%s]: N=%d %s keys, epochs=%d, expected_optimizer_steps=%d, warm_start=%s, "
-        "seeds=%s",
+        "%s arm [%s]: N=%d %s keys, epochs=%d, accum=%d, expected_optimizer_steps=%d, "
+        "warm_start=%s, seeds=%s",
         arm,
         condition,
         len(entries),
         "real" if is_real else "synthetic",
         epochs,
+        accum,
         expected_steps,
         is_warm,
         seeds,
     )
 
-    # Log run config early (before GPU acquire) so a crash before model load
-    # still leaves a record of what was attempted.
+    # MED-6: rebuild the run-config dict from THIS invocation's resolved
+    # args/derived values and compare against an existing run_config.json
+    # (--resume, or any repeat invocation landing on the same run dir) —
+    # fail loud on any mismatch in the fields that determine the training
+    # budget rather than silently mixing conditions into one result set.
     run_config = {
         "model": args.model,
         "arm": arm,
@@ -1931,21 +2149,63 @@ def main() -> None:
         "n_entries": n_entries,
         "entries_json": args.entries_json,
         "epochs": epochs,
-        "lr_decay_steps": args.lr_decay_steps,
+        "epochs_explicit": args.epochs is not None,
+        "accum": accum,
+        "accum_explicit": args.accum is not None,
+        "lr_decay_steps": lr_decay_steps,
+        "lr_decay_steps_explicit": args.lr_decay_steps is not None,
+        "budget_for_n_entries": [budget_epochs, budget_accum, budget_lr_decay_steps],
         "expected_optimizer_steps": expected_steps,
         "warm_from": args.warm_from,
         "donor_init": args.donor_init,
         "donor_checkpoint": args.donor_checkpoint,
         "probe_before_training": args.probe_before_training,
-        "recipe_source": "tests/fixtures/server.yaml (episodic_adapter_config + training_config)",
+        "recipe_source": (
+            "tests/fixtures/server.yaml (episodic_adapter_config; training_config's "
+            "batch_size/max_seq_length/warmup_steps/lr_scheduler_type/weight_decay/"
+            "gradient_checkpointing/max_grad_norm); num_epochs/gradient_accumulation_steps/"
+            "lr_decay_steps derived per paramem.utils.config.budget_for(n_entries), "
+            "overridden by --epochs/--accum/--lr-decay-steps when explicit"
+        ),
         "overrides": {
             "num_epochs": epochs,
+            "gradient_accumulation_steps": accum,
+            "lr_decay_steps": lr_decay_steps,
             "recall_early_stopping": False,
-            **({"lr_decay_steps": args.lr_decay_steps} if args.lr_decay_steps is not None else {}),
         },
     }
     run_config_path = run_dir / "run_config.json"
-    if not run_config_path.exists():
+    if run_config_path.exists():
+        with open(run_config_path) as f:
+            existing_run_config = json.load(f)
+        _budget_fields = (
+            "epochs",
+            "accum",
+            "lr_decay_steps",
+            "warm_from",
+            "donor_init",
+            "donor_checkpoint",
+        )
+        mismatches = {
+            field: (existing_run_config.get(field), run_config[field])
+            for field in _budget_fields
+            if existing_run_config.get(field) != run_config[field]
+        }
+        if mismatches:
+            raise SystemExit(
+                f"Run-config mismatch at {run_config_path}: this invocation's resolved "
+                f"args disagree with the existing run_config.json on "
+                f"{sorted(mismatches)} (existing vs this run: {mismatches}) — refusing "
+                "to mix training conditions into the same run dir. Start a fresh run "
+                "(new --arm or a clean output dir) or match the original invocation "
+                "exactly."
+            )
+        logger.info(
+            "Existing run_config.json at %s matches this invocation on the training-budget "
+            "fields — resuming.",
+            run_config_path,
+        )
+    else:
         with open(run_config_path, "w") as f:
             json.dump(run_config, f, indent=2)
         logger.info("Run config written: %s", run_config_path)
@@ -1955,32 +2215,6 @@ def main() -> None:
     with acquire_gpu(interactive=True):
         model, tokenizer = load_model_and_config(model_config)
 
-        # Load the production episodic recipe from the test fixture — NEVER
-        # load_config() / configs/server.yaml.example.
-        cfg = load_server_config(str(FIXTURE_CONFIG_PATH))
-        adapter_config = cfg.episodic_adapter_config
-        training_overrides = {"num_epochs": epochs, "recall_early_stopping": False}
-        if args.lr_decay_steps is not None:
-            training_overrides["lr_decay_steps"] = args.lr_decay_steps
-        base_training_config = dataclasses.replace(cfg.training_config, **training_overrides)
-        logger.info(
-            "Recipe: rank=%d alpha=%d lr=%.0e target_modules=%s | "
-            "batch=%d accum=%d epochs=%d warmup=%d scheduler=%s wd=%.2f "
-            "lr_decay_steps=%s recall_early_stopping=%s",
-            adapter_config.rank,
-            adapter_config.alpha,
-            adapter_config.learning_rate,
-            adapter_config.target_modules,
-            base_training_config.batch_size,
-            base_training_config.gradient_accumulation_steps,
-            base_training_config.num_epochs,
-            base_training_config.warmup_steps,
-            base_training_config.lr_scheduler_type,
-            base_training_config.weight_decay,
-            base_training_config.lr_decay_steps,
-            base_training_config.recall_early_stopping,
-        )
-
         # Donor resolution (--warm-from or --donor-init): copy the donor's
         # weights into this run's immutable scratch dir ONCE, and load the
         # donor ONLY from that copy in every seed (donor immutability — see
@@ -1988,8 +2222,9 @@ def main() -> None:
         # --donor-init never re-trains once its own checkpoint marker
         # exists — see _resolve_donor_source) so every seed of a given run
         # sees byte-identical donor weights. Runs here (inside acquire_gpu,
-        # after the recipe loads) because --donor-init's fresh-build path
-        # needs the loaded model/tokenizer/adapter_config/training_config;
+        # after the model loads — adapter_config/base_training_config were
+        # already resolved above, before acquire_gpu) because --donor-init's
+        # fresh-build path additionally needs the loaded model/tokenizer;
         # --warm-from's plain filesystem copy tags along on the same block
         # rather than duplicating the resume-marker handling.
         donor_scratch_dir: Path | None = None
@@ -2080,11 +2315,12 @@ def main() -> None:
                 len(entries),
             )
 
-        # B2: a fresh donor build just ran ~DONOR_BUILD_EPOCHS worth of GPU
-        # training (~2220 steps at DONOR_MIN_ENTRIES) immediately before the
-        # seed loop — cool down before the first seed instead of chaining
-        # straight into it (first_seed=True would otherwise skip the loop's
-        # own cooldown for exactly this case).
+        # B2: a fresh donor build just ran its own budget_for-derived epoch
+        # count worth of GPU training (~2220 steps at DONOR_MIN_ENTRIES's
+        # 147-entry population, 30 epochs) immediately before the seed loop
+        # — cool down before the first seed instead of chaining straight
+        # into it (first_seed=True would otherwise skip the loop's own
+        # cooldown for exactly this case).
         first_seed = not donor_built_fresh
         for seed in seeds:
             _check_pause(f"before seed {seed}")

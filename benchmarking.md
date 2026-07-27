@@ -2188,11 +2188,17 @@ The current run characterizes the repair primitive at one model (Mistral 7B nf4)
 All arms load the exact production 21-key set via `--entries-json` (never the
 script's synthetic generator): 15 episodic `graph*` keys + 6 procedural
 `proc*` keys, drawn from a real interim episodic/procedural cluster that
-previously failed at recall 0.762 in production. Recipe loaded from
+previously failed at recall 0.762 in production. `episodic_adapter_config`
+(rank 8, alpha 16, attention-only `target_modules`) and `training_config`'s
+fixture-sourced fields (batch_size=1, `lr_scheduler_type="linear"`,
+`weight_decay=0.1`, `gradient_checkpointing=True`) load from
 `tests/fixtures/server.yaml` (never `configs/server.yaml.example` — project
-rule): rank 8, alpha 16, attention-only `target_modules`, batch_size=1,
-gradient_accumulation_steps=2, `lr_scheduler_type="linear"`,
-`weight_decay=0.1`, `gradient_checkpointing=True`. `num_epochs` is set per
+rule). `gradient_accumulation_steps` is **not** a fixture field: it is
+derived per fold from `paramem.utils.config.budget_for(n_entries)` — the
+same function production's per-fold training funnel calls unconditionally
+— and comes out to accum 2 for the N=21/N=147-donor arms below (the
+`16-127`/`>=128` buckets) and accum 1 for the N=3 arm (the `<16` bucket).
+`num_epochs` is likewise `budget_for`-derived and overridden explicitly per
 arm; `recall_early_stopping` is forced OFF in every arm so the epoch budget
 is a hard walk, never truncated by the recall gate. Per the project's data
 rules, only condition names, key counts, and rates are reported below — no
@@ -2291,15 +2297,46 @@ needing its own population rebuilt to match the harder depth. Divergence
 depth 5 (5-digit key numerals) remains the one unmeasured extrapolation from
 this validation pass — see Remaining gap.
 
+### N=3: the `<16` bucket alone fully binds
+
+The `min_tier_key_floor` retirement makes N < 16 a live production condition
+that every arm above left unmeasured. A dedicated pair of arms closes this
+cell: 3 real keys (`proc501`-`proc503`, remapped from the production 21-key
+fixture, zero overlap with the donor's own key population) at the `<16`
+bucket's derived budget (`paramem.utils.config.budget_for(3)`: 80 epochs,
+accum 1), cold vs. donor-init reusing the SAME donor checkpoint used
+throughout this test, across all 4 seeds.
+
+| Condition | Steps | Key set | Seeds | Exact-match / 3 | Rate |
+|---|---|---|---|---|---|
+| cold 80ep | 240 | proc501-503, zero donor overlap | 42 / 0 / 1 / 2 | 3 / 3 / 3 / 3 | 1.000 (all 4 seeds) |
+| donor-init 80ep | 240 | proc501-503, zero donor overlap | 42 / 0 / 1 / 2 | 3 / 3 / 3 / 3 | 1.000 (all 4 seeds) |
+
+Both arms reach **1.000 mean confidence, 3/3 exact-match on all 4 seeds**;
+realized optimizer steps matched the derived 240 exactly on every seed (Hard
+Assertion #1 canary agreed). Cold-arm training wall time ranged 156.7-163.1 s
+per seed; donor-arm 151.4-154.6 s per seed. The donor arm's
+`donor_lora_b_norm_before_training`/`donor_lora_b_norm_after_training` held
+at a bit-identical 45.236 on every seed (donor weights verifiably loaded,
+never mutated — Hard Assertion #4), against the cold arm's 0.0 pre-training
+norm (cold-init proof — Hard Assertion #3).
+
+At N=3, the derived `<16`-bucket budget alone fully binds — donor seeding is
+compatible but not required at tiny N. The previously-unmeasured cell that
+the `min_tier_key_floor` retirement makes load-bearing is now anchored at 4
+seeds for both init modes.
+
 ### Protocol notes
 
 - `recall_early_stopping` forced OFF in every arm above.
 - The 50-epoch arms explicitly pin `lr_decay_steps=550` (decay-pinned) so
   the scheduler's decay window matches the realized step count rather than
   being derived from a different epoch count.
-- All arms use the exact production 21-key set (both `graph*` and `proc*`
-  prefixes) from a real interim fold, loaded via `--entries-json` — never
-  the script's synthetic diverse-predicate generator.
+- All arms use `--entries-json` — never the script's synthetic
+  diverse-predicate generator. Every arm above the N=3 section uses the
+  exact (or numerically shifted) production 21-key set (both `graph*` and
+  `proc*` prefixes) from a real interim fold; the N=3 arms use a 3-entry
+  subset of that same fixture, remapped to `proc501`-`proc503`.
 - Hard assertions built into the script (LoRA-B Frobenius norm zero before
   training for cold arms / non-zero for donor arms; donor-adapter norm
   bit-identical before/after each seed) held for every seed reported here.
@@ -2343,8 +2380,6 @@ them as well.
 
 ### Remaining gap
 
-- N <= 3 is unmeasured by this validation pass under the production
-  Mistral/episodic recipe used here.
 - Divergence depth 5 (5-digit key numerals) is the one unmeasured
   extrapolation on the depth axis; depths 3 and 4 are now covered (see
   "Depth scaling" above).

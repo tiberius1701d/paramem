@@ -86,7 +86,7 @@ from paramem.training.trainer import TrainingHooks, train_adapter
 from paramem.utils.artifacts import write_artifact
 
 # --- config ---------------------------------------------------------------
-from paramem.utils.config import AdapterConfig, ModelConfig, TrainingConfig
+from paramem.utils.config import AdapterConfig, ModelConfig, TrainingConfig, budget_for
 
 __all__ = [
     # adapters
@@ -141,4 +141,5 @@ __all__ = [
     "AdapterConfig",
     "ModelConfig",
     "TrainingConfig",
+    "budget_for",
 ]
