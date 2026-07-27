@@ -154,6 +154,27 @@ def anonymize_transcript(
         add_generation_prompt=True,
     )
 
+    # Payload-size telemetry at the boundary into the guarded generate call
+    # below — mirrors the extraction-side plaus_filter instrumentation
+    # (paramem.graph.extractor.judge_plausibility, "plaus_filter prompt:
+    # chars=%d tokens=%d max_new_tokens=%d"). This is the ONLY
+    # tokenization of `formatted` done purely for the count (generate_answer
+    # tokenizes again internally to build the generation tensors — that
+    # second call is unavoidable, it is not a re-tokenization for the same
+    # purpose). Discriminates the fold-tier caller (large chunk payload)
+    # from the session-tier caller (single-turn payload) at the one call
+    # site both funnel through.
+    try:
+        token_count = len(tokenizer(formatted, add_special_tokens=False)["input_ids"])
+    except Exception:  # noqa: BLE001
+        token_count = -1
+    logger.info(
+        "anonymize_transcript prompt: chars=%d tokens=%d max_new_tokens=%d",
+        len(formatted),
+        token_count,
+        max_tokens,
+    )
+
     # vram_scope: anonymization is the second-largest local generate after
     # main extraction and immediately precedes the plausibility filter.
     # Empty cache between this and the next phase so the filter's prefill

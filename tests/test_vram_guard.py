@@ -19,6 +19,7 @@ import torch
 from paramem.utils.vram_guard import (
     DEFAULT_PROCESS_FRACTION,
     VramExhausted,
+    _mem_snapshot_mib,
     apply_process_cap,
     check_vram_headroom,
     is_fatal_cuda_fault,
@@ -139,6 +140,211 @@ class TestVramScope:
                 # Clean path: empty_cache failure must not break the context manager.
                 with vram_scope("s007"):
                     pass
+
+
+class TestVramScopeTelemetry:
+    """``vram_scope`` logs an entry snapshot and, on the raise paths, a
+    second snapshot at the failure point — the discriminating telemetry
+    for a reproducible driver fault (``dxgkio_make_resident``) that
+    otherwise looks identical across every ``VramExhausted`` label.
+    """
+
+    def test_entry_snapshot_logged_with_all_four_figures(self, caplog):
+        import logging
+
+        vg_logger = logging.getLogger("paramem.utils.vram_guard")
+        prior_level = vg_logger.level
+        vg_logger.setLevel(logging.INFO)
+        vg_logger.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                    return_value=(2 * 2**30, 8 * 2**30),
+                ),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                    return_value=3 * 2**30,
+                ),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                    return_value=4 * 2**30,
+                ),
+            ):
+                with vram_scope("anonymize"):
+                    pass
+        finally:
+            vg_logger.removeHandler(caplog.handler)
+            vg_logger.setLevel(prior_level)
+
+        entry_lines = [
+            r.getMessage() for r in caplog.records if "vram_scope[anonymize] enter" in r.message
+        ]
+        assert len(entry_lines) == 1, f"expected one entry line, got: {caplog.text}"
+        line = entry_lines[0]
+        assert "free=2048 MiB" in line
+        assert "total=8192 MiB" in line
+        assert "allocated=3072 MiB" in line
+        assert "reserved=4096 MiB" in line
+
+    def test_no_entry_snapshot_logged_when_mem_get_info_fails(self, caplog):
+        """A driver query failure must not block entry — snapshot is skipped, not fatal."""
+        import logging
+
+        vg_logger = logging.getLogger("paramem.utils.vram_guard")
+        prior_level = vg_logger.level
+        vg_logger.setLevel(logging.INFO)
+        vg_logger.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                    side_effect=RuntimeError("driver unhealthy"),
+                ),
+            ):
+                with vram_scope("anonymize"):
+                    pass
+        finally:
+            vg_logger.removeHandler(caplog.handler)
+            vg_logger.setLevel(prior_level)
+
+        assert not [r for r in caplog.records if "vram_scope[anonymize] enter" in r.message]
+
+    def test_oom_failure_snapshot_logged_with_numbers(self, caplog):
+        import logging
+
+        vg_logger = logging.getLogger("paramem.utils.vram_guard")
+        prior_level = vg_logger.level
+        vg_logger.setLevel(logging.INFO)
+        vg_logger.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                    return_value=(64 * 2**20, 8 * 2**30),  # 64 MiB free at failure
+                ),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                    return_value=7 * 2**30,
+                ),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                    return_value=(7 * 2**30 + 512 * 2**20),
+                ),
+            ):
+                with pytest.raises(VramExhausted) as info:
+                    with vram_scope("anonymize"):
+                        raise torch.cuda.OutOfMemoryError("simulated")
+        finally:
+            vg_logger.removeHandler(caplog.handler)
+            vg_logger.setLevel(prior_level)
+
+        # Exception args are unchanged (label only) — callers pattern-match on this.
+        assert info.value.args == ("anonymize",)
+        fail_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "exhausted device memory" in r.message and "free=" in r.message
+        ]
+        assert len(fail_lines) == 1, f"expected one numbered failure line, got: {caplog.text}"
+        line = fail_lines[0]
+        assert "free=64 MiB" in line
+        assert "total=8192 MiB" in line
+        assert "allocated=7168 MiB" in line
+        assert "reserved=7680 MiB" in line
+
+    def test_driver_fault_failure_snapshot_logged_with_numbers(self, caplog):
+        import logging
+
+        vg_logger = logging.getLogger("paramem.utils.vram_guard")
+        prior_level = vg_logger.level
+        vg_logger.setLevel(logging.INFO)
+        vg_logger.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                    return_value=(128 * 2**20, 8 * 2**30),
+                ),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                    return_value=6 * 2**30,
+                ),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                    return_value=6 * 2**30,
+                ),
+            ):
+                with pytest.raises(VramExhausted) as info:
+                    with vram_scope("anonymize"):
+                        raise RuntimeError("CUDA driver error: device not ready")
+        finally:
+            vg_logger.removeHandler(caplog.handler)
+            vg_logger.setLevel(prior_level)
+
+        assert info.value.args == ("anonymize",)
+        fail_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "CUDA driver fault" in r.message and "free=" in r.message
+        ]
+        assert len(fail_lines) == 1, f"expected one numbered driver-fault line, got: {caplog.text}"
+        assert "free=128 MiB" in fail_lines[0]
+
+
+class TestMemSnapshotMib:
+    """Unit tests for the ``_mem_snapshot_mib`` telemetry primitive."""
+
+    def test_returns_four_mib_values_on_success(self):
+        with (
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(2 * 2**30, 8 * 2**30),
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                return_value=1 * 2**30,
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                return_value=(1 * 2**30 + 256 * 2**20),
+            ),
+        ):
+            snap = _mem_snapshot_mib()
+        assert snap is not None
+        free_mib, total_mib, allocated_mib, reserved_mib = snap
+        assert free_mib == pytest.approx(2048.0)
+        assert total_mib == pytest.approx(8192.0)
+        assert allocated_mib == pytest.approx(1024.0)
+        assert reserved_mib == pytest.approx(1280.0)
+
+    def test_returns_none_on_mem_get_info_failure(self):
+        with patch(
+            "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+            side_effect=RuntimeError("driver unhealthy"),
+        ):
+            assert _mem_snapshot_mib() is None
+
+    def test_returns_none_on_memory_allocated_failure(self):
+        with (
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(2 * 2**30, 8 * 2**30),
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                side_effect=RuntimeError("driver unhealthy"),
+            ),
+        ):
+            assert _mem_snapshot_mib() is None
 
 
 class TestCheckVramHeadroom:
@@ -335,7 +541,7 @@ class TestConsolidationIntegration:
         assert loop.extract_session.call_count == 1
 
     def test_training_oom_surfaces_training_phase_label(self, tmp_path):
-        """M2: vram_scope("training") at callsite 2 must label OOM as phase "training".
+        """vram_scope("training") at callsite 2 must label OOM as phase "training".
 
         ``_run_extraction_phase`` wraps the ``run_consolidation_cycle`` train call
         in ``vram_scope("training")``.  An OOM during training must raise

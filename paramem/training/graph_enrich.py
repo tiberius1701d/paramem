@@ -480,7 +480,7 @@ def enrich_graph(
     enrichment_relations: list[Relation] = []
     _edges_before = graph.number_of_edges()
 
-    for chunk_nodes in chunks:
+    for chunk_idx, chunk_nodes in enumerate(chunks):
         try:
             chunk_subgraph = graph.subgraph(chunk_nodes)
             # Enrichment edges are second-order facts derived from this
@@ -547,6 +547,21 @@ def enrich_graph(
             # when checkpointing is active).  The gradient-checkpointing
             # pair stays HERE, at the call site — it is a trainer
             # concern, not a cloud-egress concern.
+            #
+            # Chunk-identifying context for the per-call telemetry logged
+            # inside anonymize_transcript (paramem.cloud.anonymize): that
+            # call's "anonymize_transcript prompt: chars=... tokens=..."
+            # line has no notion of chunk identity, so this line — logged
+            # immediately before it fires — is what lets a fold's log
+            # stream be read as a per-chunk sequence rather than one
+            # anonymous "anonymize" entry per call.
+            logger.info(
+                "graph_enrichment: anonymize chunk %d/%d nodes=%d triples=%d",
+                chunk_idx + 1,
+                len(chunks),
+                len(chunk_nodes),
+                len(triples),
+            )
             _gc_disable()
             try:
                 payload = anonymize(

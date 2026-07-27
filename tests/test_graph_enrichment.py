@@ -5496,3 +5496,66 @@ class TestGraphEnrichmentFailureLoudness:
         assert not result["skipped"]
         assert result["chunks"] == 0, "no cloud call may be made when the mapping is None"
         assert result["new_edges"] == 0
+
+
+class TestChunkTelemetryLogging:
+    """``enrich_graph`` logs chunk-identifying context (index/total/node
+    count/triple count) immediately before each ``anonymize`` call, so a
+    fold's log stream can be read as a per-chunk sequence rather than one
+    anonymous "vram_scope[anonymize]" entry per call — see the module's
+    per-chunk loop just above the ``anonymize(...)`` call site.
+    """
+
+    def test_logs_chunk_index_total_nodes_and_triples(self, tmp_path, monkeypatch, caplog):
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        canned_result = (
+            [
+                {
+                    "subject": "Person0",
+                    "predicate": "colleague_of",
+                    "object": "Person1",
+                    "relation_type": "social",
+                    "confidence": 0.9,
+                }
+            ],
+            [],  # no same_as
+            "raw",
+            0,  # accepted: no relations dropped
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+        enrich_logger = logging.getLogger("paramem.training.graph_enrich")
+        prior_level = enrich_logger.level
+        enrich_logger.setLevel(logging.INFO)
+        enrich_logger.addHandler(caplog.handler)
+        try:
+            with patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=canned_result,
+            ):
+                result = _refiner_for(loop).run_enrichment()
+        finally:
+            enrich_logger.removeHandler(caplog.handler)
+            enrich_logger.setLevel(prior_level)
+
+        assert not result["skipped"]
+        assert result["chunks"] == 1, "expected exactly one chunk (11 nodes < 50-cap)"
+
+        chunk_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "graph_enrichment: anonymize chunk" in r.message
+        ]
+        assert len(chunk_lines) == 1, f"expected one chunk-telemetry line, got: {caplog.text}"
+        line = chunk_lines[0]
+        # Single chunk: index 1 of total 1.
+        assert "chunk 1/1" in line, line
+        # Node/triple counts are the loop-local values, not hardcoded zeros.
+        assert "nodes=" in line and "triples=" in line
+        nodes_part = line.split("nodes=")[1].split(" ")[0]
+        triples_part = line.split("triples=")[1]
+        assert int(nodes_part) > 0
+        assert int(triples_part) > 0

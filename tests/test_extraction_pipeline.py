@@ -2043,6 +2043,72 @@ class TestAnonymizerMappingOnlyContract:
             raw,
         )
 
+    def test_logs_payload_chars_tokens_and_max_new_tokens(self, caplog):
+        """``anonymize_transcript`` logs ONE INFO line — chars/tokens/
+        max_new_tokens — at the boundary into the guarded generate call, so a
+        fold's large-chunk payload can be discriminated from a session-tier
+        single-turn payload at the one call site both funnel through.
+
+        Mirrors the existing extraction-side ``judge_plausibility``
+        instrumentation's log-line style (``paramem.graph.extractor``,
+        ``"plaus_filter prompt: chars=%d tokens=%d max_new_tokens=%d"``).
+        """
+        import logging
+
+        from paramem.cloud.anonymize import anonymize_transcript
+        from paramem.graph.schema import facts_from_relations
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="0123456789")
+        # A real tokenizer call so the token count in the log is meaningful
+        # (not the MagicMock default-return-0 fallback).
+        tokenizer.side_effect = lambda *a, **kw: {"input_ids": list(range(7))}
+        raw = json.dumps(
+            {
+                "mapping": {},
+                "anonymized_transcript": "unchanged",
+            }
+        )
+
+        anonymize_logger = logging.getLogger("paramem.cloud.anonymize")
+        prior_level = anonymize_logger.level
+        anonymize_logger.setLevel(logging.INFO)
+        anonymize_logger.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+                patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            ):
+                anonymize_transcript(
+                    facts_from_relations(graph.relations),
+                    model,
+                    tokenizer,
+                    scrub={"person name"},
+                    max_tokens=999,
+                    user_prompt_template="{scrub_categories} {facts_json} {transcript}",
+                    system_prompt="system",
+                )
+        finally:
+            anonymize_logger.removeHandler(caplog.handler)
+            anonymize_logger.setLevel(prior_level)
+
+        lines = [
+            r.getMessage() for r in caplog.records if "anonymize_transcript prompt:" in r.message
+        ]
+        assert len(lines) == 1, f"expected one payload-telemetry line, got: {caplog.text}"
+        line = lines[0]
+        assert "chars=10" in line, line  # len("0123456789")
+        assert "tokens=7" in line, line
+        assert "max_new_tokens=999" in line, line
+
     def test_facts_are_built_from_graph_relations_not_the_model(self):
         """The cloud-facing fact array must equal ``graph.relations`` —
         same count, byte-identical predicates — even when the model's raw

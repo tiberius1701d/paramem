@@ -88,6 +88,36 @@ def _is_cuda_driver_fault(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CUDA_DRIVER_FAULT_MARKERS)
 
 
+def _mem_snapshot_mib() -> tuple[float, float, float, float] | None:
+    """Best-effort ``(free, total, allocated, reserved)`` in MiB, or ``None``.
+
+    ``free``/``total`` come from ``torch.cuda.mem_get_info()`` (the
+    driver's view — this is what a WSL2 ``dxgkio_make_resident`` fault
+    is actually contending over); ``allocated``/``reserved`` come from
+    PyTorch's own allocator (``memory_allocated`` / ``memory_reserved``)
+    so a caller can see the gap between what PyTorch thinks it holds and
+    what the driver reports as free. Callers must already have confirmed
+    ``torch.cuda.is_available()`` — this does not re-check. A query
+    failure (unhealthy driver) is logged at DEBUG and swallowed: a
+    telemetry snapshot must never mask or delay the caller's real
+    exception.
+    """
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        allocated_bytes = torch.cuda.memory_allocated()
+        reserved_bytes = torch.cuda.memory_reserved()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("vram_scope: memory snapshot query failed: %s", exc)
+        return None
+    mib = 1024 * 1024
+    return (
+        free_bytes / mib,
+        total_bytes / mib,
+        allocated_bytes / mib,
+        reserved_bytes / mib,
+    )
+
+
 # Sticky, process-fatal CUDA faults. Per CUDA semantics, once one of these is
 # raised the device context is poisoned: every subsequent GPU call in the
 # process returns the same error until the process exits. The ONLY recovery is
@@ -140,31 +170,84 @@ def vram_scope(label: str) -> Iterator[None]:
     :class:`VramExhausted` payload (typical values: an extract session
     id, ``"training"``).
 
+    On entry, when CUDA is available, logs ONE structured INFO line with
+    the driver's free/total device memory and PyTorch's
+    allocated/reserved figures (all MiB) — see :func:`_mem_snapshot_mib`.
+    This is permanent telemetry (not a debug print): it is what
+    discriminates "the call arrived starved of free VRAM" from "the call
+    itself over-allocated" when a phase fails, without which every
+    ``VramExhausted`` looks identical regardless of root cause.
+
     On exit (success or failure) calls ``torch.cuda.empty_cache()`` so
     fragmentation does not accumulate across phases. On
     ``torch.cuda.OutOfMemoryError`` — or a bare ``RuntimeError`` whose
     message matches a CUDA-driver-fault marker (WSL2 reports
     over-allocation as ``"device not ready"`` rather than a clean Python
-    OOM) — logs *label* and re-raises as :class:`VramExhausted`.
+    OOM) — logs *label* plus the same four memory figures captured again
+    at the failure point, and re-raises as :class:`VramExhausted`. The
+    exception's ``args`` stay ``(label,)`` (unchanged — callers pattern-
+    match on this); the memory figures are logged, not folded into the
+    exception, since neither raise site here constructs it with a
+    secondary message to append them to.
 
     No-op when CUDA is unavailable.
     """
     if not torch.cuda.is_available():
         yield
         return
+    snap = _mem_snapshot_mib()
+    if snap is not None:
+        free_mib, total_mib, allocated_mib, reserved_mib = snap
+        logger.info(
+            "vram_scope[%s] enter: free=%.0f MiB total=%.0f MiB allocated=%.0f MiB "
+            "reserved=%.0f MiB",
+            label,
+            free_mib,
+            total_mib,
+            allocated_mib,
+            reserved_mib,
+        )
     try:
         yield
     except torch.cuda.OutOfMemoryError as exc:
-        logger.error("VRAM guard: phase %s exhausted device memory: %s", label, exc)
+        fail_snap = _mem_snapshot_mib()
+        if fail_snap is not None:
+            free_mib, total_mib, allocated_mib, reserved_mib = fail_snap
+            logger.error(
+                "VRAM guard: phase %s exhausted device memory "
+                "(free=%.0f MiB total=%.0f MiB allocated=%.0f MiB reserved=%.0f MiB): %s",
+                label,
+                free_mib,
+                total_mib,
+                allocated_mib,
+                reserved_mib,
+                exc,
+            )
+        else:
+            logger.error("VRAM guard: phase %s exhausted device memory: %s", label, exc)
         safe_empty_cache()
         raise VramExhausted(label) from exc
     except RuntimeError as exc:
         if _is_cuda_driver_fault(exc):
-            logger.error(
-                "VRAM guard: phase %s hit CUDA driver fault (treating as VRAM exhausted): %s",
-                label,
-                exc,
-            )
+            fail_snap = _mem_snapshot_mib()
+            if fail_snap is not None:
+                free_mib, total_mib, allocated_mib, reserved_mib = fail_snap
+                logger.error(
+                    "VRAM guard: phase %s hit CUDA driver fault (treating as VRAM exhausted) "
+                    "(free=%.0f MiB total=%.0f MiB allocated=%.0f MiB reserved=%.0f MiB): %s",
+                    label,
+                    free_mib,
+                    total_mib,
+                    allocated_mib,
+                    reserved_mib,
+                    exc,
+                )
+            else:
+                logger.error(
+                    "VRAM guard: phase %s hit CUDA driver fault (treating as VRAM exhausted): %s",
+                    label,
+                    exc,
+                )
             safe_empty_cache()
             raise VramExhausted(label) from exc
         raise
