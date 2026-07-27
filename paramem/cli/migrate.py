@@ -210,9 +210,6 @@ def _render_shape_change_block(shape_changes: list[dict]) -> None:
                     delta_str = "-{" + ",".join(removed) + "}"
                 print(f"  {adapter_name}:  target_modules {old_str} → {delta_str}")
                 print(f"             {consequence}")
-            elif field == "dropout":
-                print(f"  {adapter_name}:  dropout {old_val} → {new_val}")
-                print(f"             {consequence}")
             else:
                 print(f"  {adapter_name}:  {field} {old_val} → {new_val}")
                 print(f"             {consequence}")

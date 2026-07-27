@@ -53,7 +53,6 @@ _MISTRAL_ADAPTER = AdapterConfig(
     rank=8,
     alpha=16,
     target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-    dropout=0.05,
 )
 
 # Procedural adapter config (attention + MLP, 7 modules) — matches
@@ -70,7 +69,6 @@ _PROCEDURAL_ADAPTER = AdapterConfig(
         "up_proj",
         "down_proj",
     ],
-    dropout=0.05,
 )
 
 # Real production 3-tier topology (episodic, semantic, procedural) — matches

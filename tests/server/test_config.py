@@ -430,6 +430,77 @@ class TestAdaptersFactoryDefaultMerge:
         assert cfg.adapters.procedural.enabled is True
 
 
+class TestAdapterDropoutConfig:
+    """``adapters.<tier>.dropout`` is a live yaml key (operator-settable).
+
+    Not a shape field (``paramem.models.loader._lora_shape_fields``
+    deliberately excludes it, ``ensure_adapter_matching`` never recreates a
+    resident adapter for a dropout-only edit) — so it carries no
+    ``target_modules``-style refuse-loud guard, only a value range check.
+    """
+
+    def test_default_dropout_is_zero(self, tmp_path):
+        """Omitting dropout in yaml falls through to 0.0 (mechanism kept, off)."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        assert cfg.adapters.episodic.dropout == 0.0
+        assert cfg.episodic_adapter_config.dropout == 0.0
+
+    def test_yaml_dropout_flows_to_adapter_config(self, tmp_path):
+        """A non-default yaml dropout reaches the built AdapterConfig."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              episodic:
+                enabled: true
+                target_modules: ["q_proj", "v_proj"]
+                dropout: 0.1
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        assert cfg.adapters.episodic.dropout == 0.1
+        assert cfg.episodic_adapter_config.dropout == 0.1
+
+    def test_negative_dropout_rejected(self, tmp_path):
+        """dropout < 0 is not a valid probability — reject at config load."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              episodic:
+                enabled: true
+                target_modules: ["q_proj", "v_proj"]
+                dropout: -0.1
+            """,
+        )
+        with pytest.raises(ValueError, match="adapters.\\*.dropout"):
+            load_server_config(yaml_file)
+
+    def test_dropout_of_one_rejected(self, tmp_path):
+        """dropout >= 1.0 zeroes every activation — reject at config load."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              episodic:
+                enabled: true
+                target_modules: ["q_proj", "v_proj"]
+                dropout: 1.0
+            """,
+        )
+        with pytest.raises(ValueError, match="adapters.\\*.dropout"):
+            load_server_config(yaml_file)
+
+
 # ---------------------------------------------------------------------------
 # RestartConfig / ProcessConfig
 # ---------------------------------------------------------------------------

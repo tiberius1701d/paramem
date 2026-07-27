@@ -460,6 +460,13 @@ def compute_tier_diff(live_yaml: dict, candidate_yaml: dict) -> list[TierDiffRow
 # ---------------------------------------------------------------------------
 
 # Canned consequence strings per field — describes the blast radius of each shape change.
+#
+# `dropout` is deliberately absent: it is training-time regularization, not
+# tensor shape/topology (paramem.models.loader._lora_shape_fields excludes
+# it, and ensure_adapter_matching / _check_manifest_fingerprints never
+# compare it against a resident adapter), so it never causes the
+# weight-discard-on-migrate-accept consequence described below and must not
+# be compared as a shape field in compute_shape_changes.
 _SHAPE_CONSEQUENCE: dict[str, str] = {
     "rank": (
         "current adapter weights (trained at the old rank) will be discarded "
@@ -472,7 +479,6 @@ _SHAPE_CONSEQUENCE: dict[str, str] = {
         "Same blast radius as a rank change."
     ),
     "target_modules": "same consequence.",
-    "dropout": "same consequence.",
 }
 
 
@@ -491,9 +497,11 @@ def compute_shape_changes(
     2. If no slot is found, skip silently (adapter not yet trained).
     3. If a slot exists but ``read_manifest`` raises, log WARN and skip (no
        row emitted).
-    4. Compare ``manifest.lora.{rank, alpha, dropout, target_modules}``
-       against the candidate config.  Emit one ``ShapeChange`` per differing
-       field.
+    4. Compare ``manifest.lora.{rank, alpha, target_modules}`` against the
+       candidate config.  Emit one ``ShapeChange`` per differing field.
+       ``dropout`` is NOT compared here — it is not a shape field (see
+       ``_SHAPE_CONSEQUENCE``'s module comment); an operator dropout edit
+       never carries the weight-discard consequence a real shape change does.
 
     Parameters
     ----------
@@ -541,8 +549,9 @@ def compute_shape_changes(
             )
             continue
 
-        # Compare each shape field.
-        for field in ("rank", "alpha", "dropout", "target_modules"):
+        # Compare each shape field. `dropout` is intentionally excluded — see
+        # the module comment above `_SHAPE_CONSEQUENCE`.
+        for field in ("rank", "alpha", "target_modules"):
             cand_val = adapter_vals.get(field)
             if cand_val is None:
                 continue  # field not present in candidate — no change to surface

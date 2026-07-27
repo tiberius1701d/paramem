@@ -50,8 +50,6 @@ _GLYPHS: dict[Tier, str] = {
 # ---------------------------------------------------------------------------
 EXTENSION_FIELDS: frozenset[str] = frozenset(
     {
-        "adapters.*.target_modules",
-        "adapters.*.dropout",
         # Planned pipeline flag — not in the shipped server.yaml yet but
         # documented in the consolidation block for future cloud provider routing.
         "consolidation.extraction_enrichment_provider_endpoint",
@@ -89,9 +87,13 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "adapters.*.rank": Tier.DESTRUCTIVE,
     "adapters.*.alpha": Tier.DESTRUCTIVE,
     "adapters.*.learning_rate": Tier.PIPELINE_ALTERING,
-    # Extension fields (not in shipped yaml — declared in EXTENSION_FIELDS above)
+    # dropout is training-time regularization, not tensor shape/topology —
+    # paramem.models.loader._lora_shape_fields deliberately excludes it, and
+    # ensure_adapter_matching/_check_manifest_fingerprints never compare it,
+    # so it carries the same "affects future training only" blast radius as
+    # learning_rate, not rank/alpha's weight-discarding one.
+    "adapters.*.dropout": Tier.PIPELINE_ALTERING,
     "adapters.*.target_modules": Tier.DESTRUCTIVE,
-    "adapters.*.dropout": Tier.DESTRUCTIVE,
     # --- consolidation ---
     "consolidation.refresh_cadence": Tier.PIPELINE_ALTERING,
     "consolidation.mode": Tier.PIPELINE_ALTERING,

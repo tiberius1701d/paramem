@@ -92,12 +92,14 @@ adapters:
     alpha: 16
     learning_rate: 1.0e-4
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]   # attention-only: indexed-key retrieval is routing, not representation
+    dropout: 0.0        # LoRA dropout; mechanism kept, off by default (see note below)
   semantic:
     enabled: true
     rank: 8
     alpha: 16
     learning_rate: 1.0e-5
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]   # attention-only (same as episodic) — consolidated knowledge routing
+    dropout: 0.0
   procedural:
     enabled: true       # behavioral patterns, routines, preferences
     rank: 8
@@ -110,6 +112,7 @@ adapters:
     # merges this from the factory default at config.py:1118-1134 when
     # omitted, but the yaml is the contract for load-bearing fields.
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    dropout: 0.0
 
 # EDITING rank / alpha / target_modules ON A LIVE STORE — a routine
 # (non-RECONCILE) fold trains warm: it keeps a resident tier's existing
@@ -117,12 +120,12 @@ adapters:
 # (paramem/models/loader.py) compares these three SHAPE-relevant fields
 # against the resident adapter on every fold and recreates cold on a
 # mismatch, so a rank/alpha/target_modules edit here takes effect on the
-# NEXT fold automatically. `dropout` (not set above; defaults from
-# AdapterConfig) is deliberately NOT compared — it changes training
-# regularization, not tensor shape, so an edit to it is picked up only the
-# next time the adapter is actually (re)created: at first boot, at an
-# operator-invoked `POST /reconsolidate` (RECONCILE cold rebuild), or
-# incidentally alongside a shape-relevant mismatch — never on a routine
+# NEXT fold automatically. `dropout` is NOT one of the three: it changes
+# training regularization, not tensor shape, so `ensure_adapter_matching`
+# never compares it — a warm-kept resident adapter keeps whatever dropout
+# it was created with. An edit to `dropout` here therefore takes effect
+# only the next time the adapter is actually (re)created (RECONCILE, first
+# boot, or a rank/alpha/target_modules mismatch), never on a routine
 # warm-kept fold.
 
 # ============================================================================

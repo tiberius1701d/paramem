@@ -1555,6 +1555,17 @@ class ServerAdapterConfig:
     # overrides to include MLP layers for representational imprinting of
     # persistent preferences/habits — see `ServerAdaptersConfig.procedural`.
     target_modules: list[str] = field(default_factory=lambda: list(_ATTENTION_TARGETS))
+    # LoRA dropout probability. Not a shape field (paramem.models.loader's
+    # `_lora_shape_fields` deliberately excludes it, and `_check_manifest_fingerprints`
+    # never compares it) — a warm-kept resident adapter keeps whatever dropout
+    # it was created with; an edit here takes effect only the next time the
+    # adapter is actually (re)created (RECONCILE, first boot, or a
+    # shape-relevant mismatch). Shipped default is 0.0 (mechanism kept, off).
+    dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.dropout < 1.0):
+            raise ValueError(f"adapters.*.dropout must be in [0, 1); got {self.dropout!r}")
 
 
 @dataclass
@@ -1761,17 +1772,21 @@ class ServerConfig:
         return MODEL_REGISTRY[self.model_name]
 
     def _make_adapter_config(self, sac: ServerAdapterConfig) -> AdapterConfig:
-        """Build an AdapterConfig with validated defaults (dropout=0.0).
+        """Build an AdapterConfig from a validated ServerAdapterConfig.
 
         Per-adapter `target_modules` are honoured — procedural targets MLP in
         addition to attention, episodic/semantic target attention only.
+        `dropout` comes from the yaml key `adapters.<tier>.dropout`
+        (``ServerAdapterConfig.dropout``, default ``0.0``) — not a shape
+        field, so it does not affect a resident adapter until the adapter is
+        next actually (re)created; see ``configs/server.yaml.example``.
         """
         return AdapterConfig(
             rank=sac.rank,
             alpha=sac.alpha,
             learning_rate=sac.learning_rate,
             target_modules=list(sac.target_modules),
-            dropout=0.0,
+            dropout=sac.dropout,
         )
 
     @property

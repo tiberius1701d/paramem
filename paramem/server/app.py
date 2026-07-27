@@ -679,8 +679,10 @@ class ShapeChange(BaseModel):
     adapter:
         Adapter name (e.g. ``"episodic"``).
     field:
-        LoRA field name: ``"rank"``, ``"alpha"``, ``"target_modules"``,
-        or ``"dropout"``.
+        LoRA shape field name: ``"rank"``, ``"alpha"``, or
+        ``"target_modules"``. ``dropout`` is never emitted here — it is
+        training-time regularization, not tensor shape, so it is excluded
+        from the comparison (see ``paramem.server.migration.compute_shape_changes``).
     old_value:
         Value in the on-disk ``meta.json``, or ``None`` when unavailable.
     new_value:
