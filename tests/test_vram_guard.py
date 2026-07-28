@@ -154,32 +154,25 @@ class TestVramScopeTelemetry:
     def test_entry_snapshot_logged_with_all_four_figures(self, caplog):
         import logging
 
-        vg_logger = logging.getLogger("paramem.utils.vram_guard")
-        prior_level = vg_logger.level
-        vg_logger.setLevel(logging.INFO)
-        vg_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
-                    return_value=(2 * 2**30, 8 * 2**30),
-                ),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.memory_allocated",
-                    return_value=3 * 2**30,
-                ),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.memory_reserved",
-                    return_value=4 * 2**30,
-                ),
-            ):
-                with vram_scope("anonymize"):
-                    pass
-        finally:
-            vg_logger.removeHandler(caplog.handler)
-            vg_logger.setLevel(prior_level)
+        caplog.set_level(logging.INFO, logger="paramem.utils.vram_guard")
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(2 * 2**30, 8 * 2**30),
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                return_value=3 * 2**30,
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                return_value=4 * 2**30,
+            ),
+        ):
+            with vram_scope("anonymize"):
+                pass
 
         entry_lines = [
             r.getMessage() for r in caplog.records if "vram_scope[anonymize] enter" in r.message
@@ -219,33 +212,26 @@ class TestVramScopeTelemetry:
     def test_oom_failure_snapshot_logged_with_numbers(self, caplog):
         import logging
 
-        vg_logger = logging.getLogger("paramem.utils.vram_guard")
-        prior_level = vg_logger.level
-        vg_logger.setLevel(logging.INFO)
-        vg_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
-                    return_value=(64 * 2**20, 8 * 2**30),  # 64 MiB free at failure
-                ),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.memory_allocated",
-                    return_value=7 * 2**30,
-                ),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.memory_reserved",
-                    return_value=(7 * 2**30 + 512 * 2**20),
-                ),
-            ):
-                with pytest.raises(VramExhausted) as info:
-                    with vram_scope("anonymize"):
-                        raise torch.cuda.OutOfMemoryError("simulated")
-        finally:
-            vg_logger.removeHandler(caplog.handler)
-            vg_logger.setLevel(prior_level)
+        caplog.set_level(logging.INFO, logger="paramem.utils.vram_guard")
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(64 * 2**20, 8 * 2**30),  # 64 MiB free at failure
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                return_value=7 * 2**30,
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                return_value=(7 * 2**30 + 512 * 2**20),
+            ),
+        ):
+            with pytest.raises(VramExhausted) as info:
+                with vram_scope("anonymize"):
+                    raise torch.cuda.OutOfMemoryError("simulated")
 
         # Exception args are unchanged (label only) — callers pattern-match on this.
         assert info.value.args == ("anonymize",)
@@ -264,33 +250,26 @@ class TestVramScopeTelemetry:
     def test_driver_fault_failure_snapshot_logged_with_numbers(self, caplog):
         import logging
 
-        vg_logger = logging.getLogger("paramem.utils.vram_guard")
-        prior_level = vg_logger.level
-        vg_logger.setLevel(logging.INFO)
-        vg_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
-                    return_value=(128 * 2**20, 8 * 2**30),
-                ),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.memory_allocated",
-                    return_value=6 * 2**30,
-                ),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.memory_reserved",
-                    return_value=6 * 2**30,
-                ),
-            ):
-                with pytest.raises(VramExhausted) as info:
-                    with vram_scope("anonymize"):
-                        raise RuntimeError("CUDA driver error: device not ready")
-        finally:
-            vg_logger.removeHandler(caplog.handler)
-            vg_logger.setLevel(prior_level)
+        caplog.set_level(logging.INFO, logger="paramem.utils.vram_guard")
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(128 * 2**20, 8 * 2**30),
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_allocated",
+                return_value=6 * 2**30,
+            ),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.memory_reserved",
+                return_value=6 * 2**30,
+            ),
+        ):
+            with pytest.raises(VramExhausted) as info:
+                with vram_scope("anonymize"):
+                    raise RuntimeError("CUDA driver error: device not ready")
 
         assert info.value.args == ("anonymize",)
         fail_lines = [

@@ -6257,19 +6257,12 @@ class TestChunkTelemetryLogging:
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
-        enrich_logger = logging.getLogger("paramem.training.graph_enrich")
-        prior_level = enrich_logger.level
-        enrich_logger.setLevel(logging.INFO)
-        enrich_logger.addHandler(caplog.handler)
-        try:
-            with patch(
-                "paramem.training.graph_enrich.request_graph_enrichment",
-                return_value=canned_result,
-            ):
-                result = _refiner_for(loop).run_enrichment()
-        finally:
-            enrich_logger.removeHandler(caplog.handler)
-            enrich_logger.setLevel(prior_level)
+        caplog.set_level(logging.INFO, logger="paramem.training.graph_enrich")
+        with patch(
+            "paramem.training.graph_enrich.request_graph_enrichment",
+            return_value=canned_result,
+        ):
+            result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
         assert result["chunks"] == 1, "expected exactly one chunk (11 nodes < 50-cap)"

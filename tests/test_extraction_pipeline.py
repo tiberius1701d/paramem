@@ -2279,27 +2279,20 @@ class TestAnonymizerMappingOnlyContract:
             }
         )
 
-        anonymize_logger = logging.getLogger("paramem.cloud.anonymize")
-        prior_level = anonymize_logger.level
-        anonymize_logger.setLevel(logging.INFO)
-        anonymize_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-                patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
-            ):
-                anonymize_transcript(
-                    facts_from_relations(graph.relations),
-                    model,
-                    tokenizer,
-                    scrub={"person name"},
-                    token_envelope=999,
-                    user_prompt_template="{scrub_categories} {facts_json} {transcript}",
-                    system_prompt="system",
-                )
-        finally:
-            anonymize_logger.removeHandler(caplog.handler)
-            anonymize_logger.setLevel(prior_level)
+        caplog.set_level(logging.INFO, logger="paramem.cloud.anonymize")
+        with (
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+        ):
+            anonymize_transcript(
+                facts_from_relations(graph.relations),
+                model,
+                tokenizer,
+                scrub={"person name"},
+                token_envelope=999,
+                user_prompt_template="{scrub_categories} {facts_json} {transcript}",
+                system_prompt="system",
+            )
 
         lines = [
             r.getMessage() for r in caplog.records if "anonymize_transcript prompt:" in r.message

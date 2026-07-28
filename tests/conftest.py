@@ -1,5 +1,45 @@
 """Shared pytest configuration and fixtures."""
 
+import os
+import subprocess
+import sys
+import sysconfig
+
+# --- Environment isolation gate (must run before any project import) --------
+#
+# FIX, if this gate fires:
+#
+#     conda activate paramem && unset PYTHONPATH && pytest tests/
+#
+# or make the environment clear it on every activation, once:
+#
+#     conda env config vars set PYTHONPATH= -n paramem
+#
+# Activating a conda env selects the interpreter and its site-packages; it
+# does NOT sanitize PYTHONPATH, and CPython puts PYTHONPATH on sys.path AHEAD
+# of the env's own site-packages.  A foreign tree there changes behaviour that
+# nothing asserts on directly: ROS's ``launch.logging`` calls
+# ``logging.setLoggerClass()``, so every logger built afterwards defaults to
+# ``propagate=False``, records never reach the root logger where pytest's
+# caplog listens, and log-assertion tests pass locally while CI reports them
+# red.  The server does not share this exposure — systemd user services do not
+# inherit the interactive shell.
+_ENV_SITE_PACKAGES = sysconfig.get_paths()["purelib"]
+_FOREIGN_SITE_PACKAGES = [
+    entry
+    for entry in sys.path
+    if entry.endswith("site-packages") and not entry.startswith(sys.prefix)
+]
+if _FOREIGN_SITE_PACKAGES:
+    raise RuntimeError(
+        "pytest is not running in an isolated environment.\n"
+        "Foreign site-packages on sys.path, ahead of this environment's own:\n  "
+        + "\n  ".join(_FOREIGN_SITE_PACKAGES)
+        + f"\nThis environment: {_ENV_SITE_PACKAGES}\n\n"
+        "Fix:       conda activate paramem && unset PYTHONPATH && pytest tests/\n"
+        "Permanent: conda env config vars set PYTHONPATH= -n paramem"
+    )
+
 # --- WSL2 / CUDA isolation gate (must run before any torch import) ----------
 #
 # On WSL2, ``import torch`` lazily loads ``libcuda.so`` and the first call to
@@ -16,9 +56,6 @@
 # allocation.  GPU-marked tests opt back in by passing ``--gpu`` to pytest
 # (this conftest re-exposes the device for those runs) or by being explicitly
 # selected via ``-m gpu``.
-import os
-import subprocess
-import sys
 
 
 def _gpu_explicitly_requested(argv: list[str]) -> bool:
