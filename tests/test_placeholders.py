@@ -33,6 +33,7 @@ from paramem.cloud.placeholders import (
     braced,
     invert_forward_mapping,
     mint_placeholder,
+    placeholder_prefix,
 )
 from paramem.config.taxonomy import (
     entity_type_to_prefix,
@@ -70,6 +71,27 @@ class TestBraced:
         # is a pure wrap, not idempotent — callers never feed it a
         # pre-braced token.
         assert braced("{Person_1}") == "{{Person_1}}"
+
+
+class TestPlaceholderPrefix:
+    """U2 — the cross-slice placeholder renumber's one splitter."""
+
+    def test_single_segment_prefix(self):
+        assert placeholder_prefix("Person_1") == "Person"
+
+    def test_multi_segment_prefix_preserved(self):
+        assert placeholder_prefix("Home_Address_1") == "Home_Address"
+
+    def test_unshaped_token_returns_none(self):
+        assert placeholder_prefix("notshaped") is None
+
+    def test_lowercase_leading_char_returns_none(self):
+        # PLACEHOLDER_SHAPE_RE requires each prefix segment to start
+        # PascalCase — a lowercase leading char fails the anchor.
+        assert placeholder_prefix("person_1") is None
+
+    def test_no_numeric_suffix_returns_none(self):
+        assert placeholder_prefix("Person") is None
 
 
 class TestEntityTypeToPrefix:
@@ -796,9 +818,8 @@ class TestReverseMapInversionAgreement:
         assert reverse == {"Person_1": "Alice"}
         # Realistic shape: Cloud can only propose a relation naming a
         # placeholder it was actually SHOWN — ``request_graph_enrichment``
-        # derives the anonymized triples directly from ``triples`` +
-        # ``payload.forward`` via ``insert_placeholders`` (no separate
-        # ``anon_facts`` field on the contract).
+        # derives the anonymized triples directly from ``payload.facts`` +
+        # ``payload.forward`` via ``insert_placeholders``.
         triples = [
             {
                 "subject": "Alice",
@@ -817,6 +838,7 @@ class TestReverseMapInversionAgreement:
             norm_stats={"inverted": 0, "dropped": 0},
             rekey_dropped=0,
             raw="",
+            facts=triples,
         )
         graph = SessionGraph(session_id="t", timestamp="", entities=[], relations=[])
         canned_raw = (
@@ -826,7 +848,6 @@ class TestReverseMapInversionAgreement:
         )
         with patch("paramem.graph.extractor._cloud_call", return_value=canned_raw):
             result = request_graph_enrichment(
-                triples=triples,
                 payload=payload,
                 graph=graph,
                 api_key="test-key",

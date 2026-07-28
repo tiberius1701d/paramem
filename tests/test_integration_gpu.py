@@ -193,9 +193,23 @@ class TestExtractProceduralGraph:
 
 class TestCloudFullFlow:
     def test_anonymize_transcript(self, model_and_tokenizer):
-        """Test that local model can anonymize extracted facts."""
+        """Test that local model can anonymize extracted facts.
+
+        ``anonymize_transcript`` takes ``facts: list[dict]`` (never a
+        ``SessionGraph``/``Relation`` object — see
+        ``paramem.graph.schema.facts_from_relations``, the one boundary
+        that renders a ``Relation`` into the plain-dict shape
+        ``paramem.cloud`` accepts) plus the caller-loaded prompt pair
+        (``user_prompt_template``/``system_prompt`` — no default, the
+        function never touches the filesystem itself). ``transcript=""``
+        (graph-tier shape: no transcript, just a fact list) pairs with the
+        facts-only ``anonymization_facts.txt`` template, matching how
+        ``paramem.training.graph_enrich.enrich_graph`` calls this same
+        primitive in production.
+        """
         from paramem.cloud.anonymize import anonymize_transcript
-        from paramem.graph.schema import Entity, Relation, SessionGraph
+        from paramem.graph.prompts import _load_prompt
+        from paramem.graph.schema import Entity, Relation, SessionGraph, facts_from_relations
 
         model, tokenizer = model_and_tokenizer
         graph = SessionGraph(
@@ -219,13 +233,15 @@ class TestCloudFullFlow:
         from paramem.server.config import SanitizationConfig
 
         mapping, anon_transcript, raw = anonymize_transcript(
-            graph,
+            facts_from_relations(graph.relations),
             model,
             tokenizer,
             # Same 5-category default the server config ships
             # (SanitizationConfig.scrub) — required kwarg, no code-side
             # default (the prompt is the sole scope authority).
             scrub=set(SanitizationConfig().scrub),
+            user_prompt_template=_load_prompt("anonymization_facts.txt", required=True),
+            system_prompt=_load_prompt("anonymization_system.txt", required=True),
         )
         # Mistral may or may not produce valid anonymization
         # Just verify no crash and correct return types
@@ -233,6 +249,106 @@ class TestCloudFullFlow:
             assert isinstance(mapping, dict)
         assert isinstance(anon_transcript, str)
         assert isinstance(raw, str)
+
+
+class TestGraphEnrichmentDegradeGPU:
+    """U5 GPU smoke test: the new ``aborted_reason`` plumbing and the
+    ``is_fatal_cuda_fault`` import in ``paramem.training.graph_enrich`` must
+    not break the happy path on real hardware.
+
+    Runs the REAL local anonymize chain (real ``generate()`` inside
+    ``anonymize_transcript``, wrapped by the real ``vram_scope``) through
+    ``GraphTierRefiner.run_enrichment`` — the only piece the CPU-side unit
+    tests in ``tests/test_graph_enrichment.py`` cannot exercise (they mock
+    ``torch.cuda.is_available``/``generate_answer`` to reach ``vram_scope``'s
+    real branches without a GPU). The cloud leg is stubbed (no network calls
+    in tests) since only the local generate() path is GPU-touching.
+    """
+
+    def test_run_enrichment_completes_with_no_aborted_reason(
+        self, model_and_tokenizer, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from paramem.memory.store import MemoryStore
+        from paramem.server.config import SanitizationConfig
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.graph_tier import GraphTierRefiner
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        model, tokenizer = model_and_tokenizer
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=tokenizer,
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=MemoryStore(replay_enabled=False),
+            output_dir=tmp_path,
+            save_cycle_snapshots=False,
+            extraction_scrub=set(SanitizationConfig().scrub),
+            extraction_enrichment_provider="anthropic",
+            extraction_enrichment_provider_model="claude-sonnet-4-6",
+            cloud_enabled=True,
+        )
+
+        graph = loop.merger.graph
+        for i in range(10):
+            graph.add_node(
+                f"person{i}",
+                entity_type="person",
+                attributes={"name": f"Person{i}"},
+                reinforcement_count=i + 1,
+                sessions=[f"s{i:03d}"],
+                first_seen=f"s{i:03d}",
+                last_seen=f"s{i:03d}",
+            )
+        graph.add_node(
+            "acmecorp",
+            entity_type="organization",
+            attributes={"name": "AcmeCorp"},
+            reinforcement_count=10,
+            sessions=["s000"],
+            first_seen="s000",
+            last_seen="s000",
+        )
+        for i in range(10):
+            graph.add_edge(
+                f"person{i}",
+                "acmecorp",
+                predicate="works at",
+                relation_type="factual",
+                confidence=1.0,
+                source="extraction",
+                sessions=["s000"],
+            )
+
+        refiner = GraphTierRefiner(
+            loop.merger,
+            model=loop.model,
+            tokenizer=loop.tokenizer,
+            extraction_config_provider=loop._current_extraction_config,
+            cloud_enabled=loop.cloud_enabled,
+            neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
+            max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
+            gc_disable=loop._disable_gradient_checkpointing,
+            gc_enable=loop._enable_gradient_checkpointing,
+        )
+
+        # Cloud leg stubbed (no network calls in tests); the local
+        # anonymize()/generate() leg above it runs for real on the GPU.
+        with patch(
+            "paramem.training.graph_enrich.request_graph_enrichment",
+            return_value=([], [], "raw", 0),
+        ):
+            result = refiner.run_enrichment()
+
+        assert result["skipped"] is False
+        assert "aborted_reason" in result
+        assert result["aborted_reason"] is None
 
 
 # --- 5 & 6. Training scheduler and extract_and_start_training ---

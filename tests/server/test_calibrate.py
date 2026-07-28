@@ -37,6 +37,7 @@ from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import SessionGraph
 from paramem.server.calibrate import (
     _CHAIN,
+    CalibrateAnonymizeFactsRequest,
     CalibrateChainRequest,
     CalibrateNameRequest,
     CalibrateNormalizeRequest,
@@ -46,6 +47,7 @@ from paramem.server.calibrate import (
     _production_turn_markers,
     _require_turn_marked_transcript,
     _run_calibration,
+    calibrate_anonymize_facts,
     calibrate_chain,
     calibrate_name,
     calibrate_normalize,
@@ -843,6 +845,231 @@ class TestCalibrateNormalize:
         assert "reinforcement_count" not in names
 
 
+def _anonymized_contract(**overrides):
+    """A canned ``AnonymizedContract`` for mocking
+    ``paramem.cloud.anonymize.anonymize`` — the shared primitive
+    ``calibrate_anonymize_facts`` and
+    ``paramem.training.graph_enrich.enrich_graph`` both call.
+    """
+    from paramem.cloud.anonymize import AnonymizedContract
+
+    fields = dict(
+        status="ok",
+        forward={"Alex": "Person_1"},
+        reverse={"Person_1": "Alex"},
+        anon_transcript="",
+        declared=frozenset({"Person_1"}),
+        norm_stats={"inverted": 0, "dropped": 0},
+        rekey_dropped=0,
+        raw='{"mapping": {"Alex": "Person_1"}}',
+        failure=None,
+        facts=[],
+        slices=1,
+        slices_failed=0,
+    )
+    fields.update(overrides)
+    return AnonymizedContract(**fields)
+
+
+def _state_with_extraction_config(*, scrub=None, anonymize_token_envelope=8192):
+    """``_state_enabled()`` plus a real-shaped ``loop.extraction.config``
+    — ``calibrate_anonymize_facts`` reads ``scrub``/``anonymize_token_envelope``
+    from there, the same object ``graph_enrich.enrich_graph`` reads in
+    production, never from the request.
+    """
+    state = _state_enabled()
+    ext_cfg = SimpleNamespace(
+        scrub=scrub if scrub is not None else {"person name"},
+        anonymize_token_envelope=anonymize_token_envelope,
+    )
+    state["consolidation_loop"].extraction.config = ext_cfg
+    state["consolidation_loop"].model = state["model"]
+    state["consolidation_loop"].tokenizer = state["tokenizer"]
+    return state
+
+
+class TestCalibrateAnonymizeFacts:
+    """Tests for CalibrateAnonymizeFactsRequest validation and
+    calibrate_anonymize_facts — the graph-tier facts-only anonymize
+    calibration stage (open nit n3)."""
+
+    def test_disabled_404(self):
+        req = CalibrateAnonymizeFactsRequest(facts=[])
+        with pytest.raises(HTTPException) as exc:
+            calibrate_anonymize_facts(_state_disabled(), req)
+        assert exc.value.status_code == 404
+
+    def test_consolidating_503(self):
+        state = _state_with_extraction_config()
+        state["consolidating"] = True
+        req = CalibrateAnonymizeFactsRequest(facts=[])
+        with pytest.raises(HTTPException) as exc:
+            calibrate_anonymize_facts(state, req)
+        assert exc.value.status_code == 503
+
+    def test_neither_facts_nor_snapshot_400(self):
+        state = _state_with_extraction_config()
+        req = CalibrateAnonymizeFactsRequest(facts=None, snapshot_path=None)
+        with pytest.raises(HTTPException) as exc:
+            calibrate_anonymize_facts(state, req)
+        assert exc.value.status_code == 400
+        assert "exactly one" in exc.value.detail.lower()
+
+    def test_both_facts_and_snapshot_400(self):
+        state = _state_with_extraction_config()
+        req = CalibrateAnonymizeFactsRequest(
+            facts=[{"subject": "Alex", "predicate": "p", "object": "Acme"}],
+            snapshot_path="/some/path.json",
+        )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_anonymize_facts(state, req)
+        assert exc.value.status_code == 400
+        assert "exactly one" in exc.value.detail.lower()
+
+    def test_empty_facts_list_400(self):
+        state = _state_with_extraction_config()
+        req = CalibrateAnonymizeFactsRequest(facts=[])
+        with pytest.raises(HTTPException) as exc:
+            calibrate_anonymize_facts(state, req)
+        assert exc.value.status_code == 400
+        assert "no facts" in exc.value.detail.lower()
+
+    def test_snapshot_node_link_flattening(self, tmp_path):
+        """Snapshot node-link edges are flattened into the fact list the
+        anonymize call is seeded with — reuses the SAME reader
+        calibrate_normalize uses (_relations_from_snapshot); edges with
+        no predicate are skipped."""
+        snap = {
+            "nodes": [{"id": "Alex"}, {"id": "Acme"}],
+            "links": [
+                {"source": "Alex", "target": "Acme", "predicate": "works_for"},
+                {"source": "Alex", "target": "Acme"},  # missing predicate — skip
+            ],
+        }
+        snap_path = tmp_path / "graph_merged_snapshot.json"
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        state = _state_with_extraction_config()
+        with patch(
+            "paramem.cloud.anonymize.anonymize",
+            return_value=_anonymized_contract(),
+        ) as mocked:
+            result = calibrate_anonymize_facts(
+                state, CalibrateAnonymizeFactsRequest(snapshot_path=str(snap_path))
+            )
+
+        assert result["stage"] == "anonymize_facts"
+        facts_arg = mocked.call_args.args[0]
+        assert len(facts_arg) == 1
+        assert facts_arg[0]["predicate"] == "works_for"
+
+    def test_runs_the_shared_anonymize_primitive_with_graph_tier_shape(self):
+        """The handler calls the SAME ``anonymize()`` primitive
+        ``graph_enrich.enrich_graph`` calls per chunk, with the graph-tier
+        call shape: ``transcript=""``, ``identity_domain`` derived from
+        the facts' own subject/object endpoints, ``scrub``/
+        ``token_envelope`` from ``loop.extraction.config`` — never a
+        request override.
+
+        Mutation: have the handler re-implement anonymization instead of
+        calling the shared primitive -> ``mocked`` is never called and
+        this fails.
+        """
+        state = _state_with_extraction_config(
+            scrub={"person name", "email address"}, anonymize_token_envelope=4321
+        )
+        facts = [
+            {"subject": "Alex", "predicate": "works_at", "object": "Acme"},
+            {"subject": "Riley", "predicate": "knows", "object": "Alex"},
+        ]
+        with patch(
+            "paramem.cloud.anonymize.anonymize",
+            return_value=_anonymized_contract(),
+        ) as mocked:
+            result = calibrate_anonymize_facts(state, CalibrateAnonymizeFactsRequest(facts=facts))
+
+        assert mocked.call_count == 1
+        call = mocked.call_args
+        assert call.args[0] == facts
+        assert call.kwargs["transcript"] == ""
+        assert call.kwargs["scrub"] == {"person name", "email address"}
+        assert call.kwargs["token_envelope"] == 4321
+        assert set(call.kwargs["identity_domain"]) == {"Alex", "Acme", "Riley"}
+        assert result["stage"] == "anonymize_facts"
+        assert result["parsed"]["mapping"] == {"Alex": "Person_1"}
+
+    def test_no_reimplementation_of_the_anonymize_chain(self):
+        """The handler must not re-derive mapping/reconciliation logic —
+        that lives in paramem.cloud.anonymize.anonymize, and a second
+        copy here is exactly the drift the shared primitive exists to
+        prevent."""
+        import ast
+
+        tree = ast.parse(inspect.getsource(calibrate_anonymize_facts).lstrip())
+        names = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Name, ast.Attribute))
+        }
+        assert "anonymize" in names  # calls the shared primitive
+        assert "anonymize_transcript" not in names  # never bypasses it
+        assert "_normalize_anonymization_mapping" not in names
+        assert "_build_anonymization_mapping" not in names
+
+    def test_anonymize_phase_recorded_in_response(self):
+        """``anonymize()`` opens no phase-trace scope itself (paramem.cloud
+        must not import paramem.graph); the handler opens
+        phase_trace("anonymize") around the call so prompt provenance and
+        the phases list are populated, the same way the session-tier
+        anonymize stage body already does."""
+        state = _state_with_extraction_config()
+        with patch(
+            "paramem.cloud.anonymize.anonymize",
+            return_value=_anonymized_contract(),
+        ):
+            result = calibrate_anonymize_facts(
+                state,
+                CalibrateAnonymizeFactsRequest(
+                    facts=[{"subject": "Alex", "predicate": "works_at", "object": "Acme"}]
+                ),
+            )
+
+        assert any(p["name"] == "anonymize" for p in result["phases"])
+
+    def test_prompt_variant_override_reaches_the_anonymize_facts_template(self, tmp_path):
+        """A ``prompt_variants`` override for ``anonymization_facts.txt``
+        is honoured — the same mechanism every other stage uses, proving
+        this stage's few-shots are tunable (the gap this stage closes)."""
+        from paramem.server.config import PathsConfig
+
+        variant_dir = tmp_path / "prompts"
+        variant_dir.mkdir()
+        (variant_dir / "calib_anonymization_facts.txt").write_text(
+            "SENTINEL {scrub_categories} {facts_json}", encoding="utf-8"
+        )
+
+        state = _state_with_extraction_config()
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+
+        captured_templates: list[str] = []
+
+        def _capture(*args, **kwargs):
+            captured_templates.append(kwargs.get("user_prompt_template", ""))
+            return _anonymized_contract()
+
+        with patch("paramem.cloud.anonymize.anonymize", side_effect=_capture):
+            calibrate_anonymize_facts(
+                state,
+                CalibrateAnonymizeFactsRequest(
+                    facts=[{"subject": "Alex", "predicate": "works_at", "object": "Acme"}],
+                    prompt_variants={"anonymization_facts.txt": "calib_anonymization_facts.txt"},
+                ),
+            )
+
+        assert captured_templates
+        assert captured_templates[0].startswith("SENTINEL")
+
+
 class TestEffectiveParamsSeed:
     """Verify seed threads through _effective_params for all three local stages."""
 
@@ -954,6 +1181,50 @@ class TestRunCalibrationResponseEnvelope:
         """Empty raw_output → n_output_tokens == -1."""
         result = self._run(raw_output="")
         assert result["n_output_tokens"] == -1
+
+    def test_n_tokens_minus1_when_no_tokenizer(self):
+        """No tokenizer in state → both fields stay -1 (U1's explicit
+        decision: the ``if tokenizer`` / ``if tokenizer and count_str``
+        sentinel guards at calibrate.py:668-670 are unchanged).  The real
+        endpoint path 503s on a missing tokenizer before reaching this
+        guard (``_preflight`` requires one) — patched to a no-op here to
+        isolate the guard's own behavior rather than re-test ``_preflight``."""
+        state = _state_enabled()
+        state["tokenizer"] = None
+        with patch("paramem.server.calibrate._preflight"):
+            result = self._run(state=state)
+        assert result["n_input_tokens"] == -1
+        assert result["n_output_tokens"] == -1
+
+    def test_n_input_tokens_uses_fallback_estimate_when_tokenizer_raises(self):
+        """A tokenizer that raises on call no longer collapses to -1 (U1):
+        ``estimate_tokens`` falls back to a conservative words-based
+        estimate instead — the raising-tokenizer case item 47 names as the
+        one thing this migration actually changes."""
+        from paramem.graph.phase_trace import record_prompt
+
+        state = _state_enabled()
+        state["tokenizer"].side_effect = RuntimeError("tokenizer boom")
+
+        def dispatch() -> tuple:
+            with phase_trace("anonymize"):
+                record_prompt(
+                    path="anonymization.txt",
+                    content="one two three four five six seven eight",
+                )
+            return "some raw output text", {"mapping": {}}
+
+        result = _run_calibration(
+            stage="anonymize",
+            guard=lambda: None,
+            dispatch=dispatch,
+            input_prompt_phase="anonymize",
+            state=state,
+            params=CalibrateParams(),
+            supports_seed=True,
+        )
+        assert result["n_input_tokens"] != -1
+        assert result["n_input_tokens"] > 0
 
     def test_phases_present_from_trace(self):
         """``phases`` is populated from the phase-trace records the

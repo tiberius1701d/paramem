@@ -61,6 +61,8 @@ class TestPipelineAlteringSamples:
             "consolidation.refresh_cadence",
             "consolidation.mode",
             "consolidation.extraction_enrichment_provider",
+            "consolidation.extraction_anonymize_token_envelope",
+            "consolidation.extraction_token_estimate_ratio",
             "agents.cloud.provider",
             "agents.cloud_providers.anthropic.model",
             "debug",

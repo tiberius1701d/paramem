@@ -484,10 +484,14 @@ class GraphTierRefiner:
             enrichment = self.run_enrichment()
             if not enrichment.get("skipped"):
                 logger.info(
-                    "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
+                    "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d "
+                    "anonymize_slices=%d privacy_skipped_slices=%d aborted_reason=%s",
                     enrichment.get("chunks", 0),
                     enrichment.get("new_edges", 0),
                     enrichment.get("same_as_merges", 0),
+                    enrichment.get("anonymize_slices", 0),
+                    enrichment.get("privacy_skipped_slices", 0),
+                    enrichment.get("aborted_reason"),
                 )
 
         reinforcements: "dict[str, tuple[str, str]]" = dict(

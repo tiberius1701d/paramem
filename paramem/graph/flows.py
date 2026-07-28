@@ -44,7 +44,7 @@ from pathlib import Path
 
 from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.cloud.anonymize import (
-    _DEFAULT_ANONYMIZER_MAX_TOKENS,
+    _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
     AnonymizedContract,
     anonymize,
     opted_out_contract,
@@ -558,6 +558,7 @@ def extract_graph(
     seed: int | None = None,
     timestamp: str | None = None,
     source_type: str = "transcript",
+    anonymize_token_envelope: int = _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -650,6 +651,14 @@ def extract_graph(
             to :func:`_parse_extraction` / :func:`_stamp_speaker_entity` as
             the Guard B gate for the document-only exact-full-name rewrite
             of third-person speaker mentions onto ``speaker_id``.
+        anonymize_token_envelope: Total (prompt + output) token budget the
+            ``anonymize`` stage's local ``generate()`` call(s) may occupy —
+            forwarded to :func:`~paramem.cloud.anonymize.anonymize` as
+            ``token_envelope``. Defaults to
+            :data:`~paramem.cloud.anonymize._DEFAULT_ANONYMIZER_TOKEN_ENVELOPE`
+            (session tier / calibration); production consolidation threads
+            ``consolidation.extraction_anonymize_token_envelope`` through
+            :meth:`~paramem.graph.extraction_pipeline.ExtractionPipeline.kwargs`.
     """
     # Open the extraction trace.  phase_trace() calls reachable from
     # any helper in this scope append to the same trace via contextvar;
@@ -715,6 +724,7 @@ def extract_graph(
                 plausibility_endpoint=plausibility_endpoint,
                 scrub=scrub,
                 correction_entity_types=correction_entity_types,
+                anonymize_token_envelope=anonymize_token_envelope,
             )
             state = run_flow(SESSION_EXTRACT, ctx, state)
             return state.graph
@@ -847,7 +857,12 @@ def anonymize_turn(
     # opted_out_contract`'s docstring for why this call site cannot just
     # call ``anonymize`` itself and let IT branch).
     if not scrub:
-        return opted_out_contract(transcript)
+        # This path has no facts at all — it returns BEFORE the local
+        # extraction pass (step 1 below) that would otherwise produce
+        # them, and this function's own docstring already states that a
+        # caller deriving the anonymized fact array from this contract
+        # "would always get []" (chat egress never reads payload.facts).
+        return opted_out_contract(transcript, facts=[])
 
     # The local_extract and anonymization few-shots (configs/prompts/
     # extraction.txt, configs/prompts/anonymization.txt) are calibrated
@@ -914,7 +929,7 @@ def anonymize_turn(
                 transcript=model_facing_transcript,
                 scrub=scrub,
                 speaker_name=speaker_name,
-                max_tokens=_DEFAULT_ANONYMIZER_MAX_TOKENS,
+                token_envelope=_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
                 user_prompt_template=anon_prompt,
                 system_prompt=anon_system,
             )

@@ -126,6 +126,26 @@ def mint_placeholder(existing_values: Iterable[object], prefix: str) -> str:
     return f"{prefix}_{max_n + 1}"
 
 
+def placeholder_prefix(token: str) -> str | None:
+    """Split a placeholder-shaped token into its prefix.
+
+    ``"Home_Address_1"`` -> ``"Home_Address"``; ``"Person_2"`` ->
+    ``"Person"``; ``None`` when *token* is not shaped per
+    :data:`PLACEHOLDER_SHAPE_RE` (the anchored full-string validator —
+    this function never partially matches an unshaped token).
+
+    THE only place a shaped token is split into prefix + numeric index.
+    Consumed by the cross-slice placeholder renumber in
+    :func:`~paramem.cloud.anonymize.anonymize` (a collision between two
+    slices' independently-minted placeholders is resolved by re-minting
+    onto the same prefix via :func:`mint_placeholder`) — never
+    re-implement the ``rsplit("_", 1)`` split at a second call site.
+    """
+    if not PLACEHOLDER_SHAPE_RE.match(token):
+        return None
+    return token.rsplit("_", 1)[0]
+
+
 def braced(token: str) -> str:
     """Wrap a bare placeholder token in braces: ``"Person_1"`` -> ``"{Person_1}"``.
 

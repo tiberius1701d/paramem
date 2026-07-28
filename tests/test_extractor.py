@@ -1099,6 +1099,7 @@ class TestAttributeTypedFactsSurviveTheFlow:
             plausibility_endpoint=None,
             scrub=frozenset({"person name"}),
             correction_entity_types=None,
+            anonymize_token_envelope=8192,
         )
 
     def _attribute_facts(self) -> list[dict]:

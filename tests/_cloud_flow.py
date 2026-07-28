@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
 from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, EnrichmentDelta
 from paramem.graph.flow import StageContext, StageSpec, StageState, run_flow
 from paramem.graph.flows import SESSION_EXTRACT
@@ -65,6 +66,7 @@ def run_cloud_stages(
     enrichment_provider_endpoint: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    anonymize_token_envelope: int = _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
     seed: int | None = None,
 ) -> SessionGraph:
     """Walk the cloud arc over ``graph`` and return the resulting graph.
@@ -113,6 +115,7 @@ def run_cloud_stages(
         plausibility_endpoint=plausibility_endpoint,
         scrub=scrub,
         correction_entity_types=correction_entity_types,
+        anonymize_token_envelope=anonymize_token_envelope,
     )
     return run_flow(cloud_arc_specs(), ctx, StageState(graph=graph)).graph
 

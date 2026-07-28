@@ -18,10 +18,12 @@ import torch
 
 from paramem.utils.vram_guard import (
     DEFAULT_PROCESS_FRACTION,
+    MIB_PER_TOKEN_TRANSIENT,
     VramExhausted,
     _mem_snapshot_mib,
     apply_process_cap,
     check_vram_headroom,
+    effective_token_envelope,
     is_fatal_cuda_fault,
     vram_scope,
 )
@@ -298,6 +300,126 @@ class TestVramScopeTelemetry:
         ]
         assert len(fail_lines) == 1, f"expected one numbered driver-fault line, got: {caplog.text}"
         assert "free=128 MiB" in fail_lines[0]
+
+
+class TestEffectiveTokenEnvelope:
+    """``effective_token_envelope`` — the dynamic VRAM clamp for the
+    anonymize token envelope (owner-approved 2026-07-28,
+    .agent/plan-anonymize-slicing.md §5.2/§5.3 background).
+
+    ``effective = min(configured_envelope, free_mib /
+    MIB_PER_TOKEN_TRANSIENT)`` — the configured value is a CEILING,
+    live free VRAM only sizes a call DOWN, never up.
+    """
+
+    def test_no_op_when_cuda_unavailable(self):
+        """CPU passthrough: no GPU query, effective == configured, free_mib
+        is None (not a numeric zero) — the CPU test suite never needs a
+        GPU to exercise this function."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=False),
+            patch("paramem.utils.vram_guard.safe_empty_cache") as empty,
+            patch("paramem.utils.vram_guard.torch.cuda.mem_get_info") as mem_get_info,
+        ):
+            effective, free_mib = effective_token_envelope(8192)
+        empty.assert_not_called()
+        mem_get_info.assert_not_called()
+        assert effective == 8192
+        assert free_mib is None
+
+    def test_free_high_configured_envelope_wins(self):
+        """Ample free VRAM: supportable tokens far exceed the configured
+        ceiling, so the configured value passes through unchanged."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(4096 * 2**20, 8192 * 2**20),
+            ),
+        ):
+            effective, free_mib = effective_token_envelope(8192)
+        assert effective == 8192
+        assert free_mib == pytest.approx(4096.0)
+
+    def test_free_low_clamp_wins(self):
+        """Tight free VRAM (the live fault's 1,191 MiB reading): the VRAM
+        clamp sizes the call BELOW the configured ceiling."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(1191 * 2**20, 8192 * 2**20),
+            ),
+        ):
+            effective, free_mib = effective_token_envelope(8192)
+        expected = int(1191 / MIB_PER_TOKEN_TRANSIENT)
+        assert effective == expected
+        assert effective < 8192
+        assert free_mib == pytest.approx(1191.0)
+
+    def test_boundary_free_exactly_matches_configured_envelope(self):
+        """Free VRAM supports EXACTLY the configured envelope: min()
+        resolves to the configured value at the boundary (either
+        formulation is correct at equality)."""
+        configured = 1000
+        free_mib_val = configured * MIB_PER_TOKEN_TRANSIENT
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(int(free_mib_val * 2**20), 8192 * 2**20),
+            ),
+        ):
+            effective, _free_mib = effective_token_envelope(configured)
+        assert effective == configured
+
+    def test_safe_empty_cache_called_before_measurement_never_bare_empty_cache(self):
+        """Reads via safe_empty_cache (never bare torch.cuda.empty_cache —
+        project rule: cuBLAS workspaces sit outside PyTorch's allocator and
+        a bare call would understate free VRAM)."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache") as empty,
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(4096 * 2**20, 8192 * 2**20),
+            ),
+        ):
+            effective_token_envelope(8192)
+        empty.assert_called_once_with()
+
+    def test_mem_get_info_failure_passes_through_configured_value(self):
+        """A driver query failure must not block the caller — passthrough,
+        same shape as the CUDA-unavailable case."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                side_effect=RuntimeError("driver unhealthy"),
+            ),
+        ):
+            effective, free_mib = effective_token_envelope(8192)
+        assert effective == 8192
+        assert free_mib is None
+
+    def test_never_exceeds_configured_envelope_regardless_of_free_vram(self):
+        """Live free VRAM only sizes a call DOWN, never up — an
+        implausibly huge free reading must never inflate the effective
+        envelope past the operator's configured ceiling."""
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(64 * 1024 * 2**20, 64 * 1024 * 2**20),
+            ),
+        ):
+            effective, _free_mib = effective_token_envelope(8192)
+        assert effective == 8192
 
 
 class TestMemSnapshotMib:

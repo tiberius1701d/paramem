@@ -7,12 +7,60 @@ any of the five migrated call sites.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
-from paramem.cloud.anonymize import AnonymizedContract, anonymize
+from paramem.cloud.anonymize import (
+    _MIN_ANONYMIZER_OUTPUT_TOKENS,
+    AnonymizedContract,
+    _render_anonymize_prompt,
+    _slice_facts_to_envelope,
+    anonymize,
+    anonymize_transcript,
+)
 from paramem.cloud.deanonymize import CloudScope, deanonymize_facts, deanonymize_text
 from paramem.cloud.placeholders import insert_placeholders
 from paramem.graph.schema import Relation, SessionGraph, facts_from_relations
+from paramem.utils.vram_guard import MIB_PER_TOKEN_TRANSIENT
+
+
+def _stub_tokenizer() -> MagicMock:
+    """A tokenizer stand-in whose ``apply_chat_template`` returns a fixed
+    string, so the local fact-boundary packer (``_slice_facts_to_envelope``,
+    exercised whenever ``transcript=""``) can render its own overhead probe
+    without touching a real model. ``anonymize_transcript`` itself is
+    mocked in every test in this module, so this tokenizer never reaches a
+    real ``generate()`` call — only the packer's own rendering.
+    """
+    tok = MagicMock()
+    tok.apply_chat_template = MagicMock(return_value="rendered-prompt")
+    return tok
+
+
+class _CountingTokenizer:
+    """Deterministic tokenizer double: one "token" per character.
+
+    ``apply_chat_template`` concatenates every message's ``content`` — no
+    chat-template markup — so the rendered prompt's length is exactly
+    predictable from the template + JSON content, and
+    ``estimate_tokens(text, tok) == len(text)`` exactly (via ``__call__``
+    returning one id per character). This makes the packing/derivation
+    arithmetic in ``_slice_facts_to_envelope`` / ``anonymize_transcript``
+    testable against hand-computed boundaries instead of an opaque mock.
+
+    The concatenated output also always contains
+    ``supports_system_role``'s ``"SYSROLE_CHECK_MARKER"`` probe string
+    (since concatenation never drops content), so
+    :func:`~paramem.models.loader.adapt_messages` never folds the system
+    message into the user turn — the rendered prompt is exactly
+    ``system_prompt + user_prompt``.
+    """
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        return "".join(m["content"] for m in messages)
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": list(range(len(text)))}
 
 
 def _graph(relations: list[Relation] | None = None, session_id: str = "s1") -> SessionGraph:
@@ -45,22 +93,42 @@ def _anonymize(graph: SessionGraph, **kwargs):
     return anonymize(facts_from_relations(graph.relations), **kwargs)
 
 
-class TestAnonymizeForCloudMaxTokensDefault:
-    """``anonymize``'s only model call is the
-    anonymizer, so its ``max_tokens`` default must match the anonymizer's
-    own budget (``_DEFAULT_ANONYMIZER_MAX_TOKENS`` = 2048), not the
-    graph-tier enrichment filter's larger budget
-    (``_DEFAULT_FILTER_MAX_TOKENS`` = 8192) — a caller who omits the
-    parameter must never get the wider budget.
+class TestAnonymizeForCloudTokenEnvelopeDefault:
+    """``anonymize`` and ``anonymize_transcript`` share ONE envelope
+    default (U2/U3 — the flat ``max_tokens``/``_DEFAULT_ANONYMIZER_MAX_TOKENS``
+    cap is retired). ``max_new_tokens`` is derived from this single
+    ``token_envelope``, never a second, independently-configured knob.
     """
 
-    def test_default_matches_anonymizer_budget(self):
+    def test_anonymize_default_matches_module_envelope(self):
         import inspect
 
-        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_MAX_TOKENS
+        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
 
-        default = inspect.signature(anonymize).parameters["max_tokens"].default
-        assert default == _DEFAULT_ANONYMIZER_MAX_TOKENS
+        default = inspect.signature(anonymize).parameters["token_envelope"].default
+        assert default == _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+
+    def test_anonymize_transcript_default_matches_module_envelope(self):
+        import inspect
+
+        from paramem.cloud.anonymize import (
+            _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
+            anonymize_transcript,
+        )
+
+        default = inspect.signature(anonymize_transcript).parameters["token_envelope"].default
+        assert default == _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+
+    def test_max_tokens_parameter_is_gone(self):
+        """The flat cap is deleted, not just defaulted — a caller passing
+        ``max_tokens=`` must get a clean TypeError, not silent
+        acceptance."""
+        import inspect
+
+        assert "max_tokens" not in inspect.signature(anonymize).parameters
+        from paramem.cloud.anonymize import anonymize_transcript
+
+        assert "max_tokens" not in inspect.signature(anonymize_transcript).parameters
 
 
 class TestAnonymizeForCloudOptOut:
@@ -212,7 +280,7 @@ class TestAnonymizeForCloudIdentityReconciliation:
             payload = _anonymize(
                 graph,
                 model=object(),
-                tokenizer=object(),
+                tokenizer=_stub_tokenizer(),
                 transcript="",
                 scrub={"person name"},
                 identity_domain=["yang ming", "acme"],
@@ -230,7 +298,7 @@ class TestAnonymizeForCloudIdentityReconciliation:
             payload = _anonymize(
                 graph,
                 model=object(),
-                tokenizer=object(),
+                tokenizer=_stub_tokenizer(),
                 transcript="",
                 scrub={"person name"},
                 identity_domain=["yang ming", "acme"],
@@ -267,7 +335,7 @@ class TestAnonymizeForCloudIdentityReconciliation:
             payload = _anonymize(
                 graph,
                 model=object(),
-                tokenizer=object(),
+                tokenizer=_stub_tokenizer(),
                 transcript="",
                 scrub={"person name"},
                 identity_domain=["yang ming", "acme"],
@@ -302,7 +370,7 @@ class TestAnonymizeForCloudIdentityReconciliation:
             payload = _anonymize(
                 graph,
                 model=object(),
-                tokenizer=object(),
+                tokenizer=_stub_tokenizer(),
                 transcript="",
                 scrub={"person name"},
                 identity_domain=["yang ming", "acme"],
@@ -331,7 +399,7 @@ class TestAnonymizeForCloudIdentityReconciliation:
             payload = _anonymize(
                 graph,
                 model=object(),
-                tokenizer=object(),
+                tokenizer=_stub_tokenizer(),
                 transcript="",
                 scrub={"person name"},
                 identity_domain=None,
@@ -361,7 +429,7 @@ class TestAnonymizeForCloudGuardDomainSeparation:
             payload = _anonymize(
                 graph,
                 model=object(),
-                tokenizer=object(),
+                tokenizer=_stub_tokenizer(),
                 transcript="",
                 scrub={"person name"},
                 # identity_domain (rekey domain) is LARGER than the
@@ -674,3 +742,984 @@ class TestUnbypassableRawReverseMap:
         params = inspect.signature(deanonymize_text).parameters
         assert list(params) == ["scope", "text"]
         assert params["scope"].annotation in ("CloudScope", CloudScope)
+
+
+# ---------------------------------------------------------------------------
+# U2 — fact-boundary slicing (.agent/plan-anonymize-slicing.md §7 items 5-11)
+# ---------------------------------------------------------------------------
+
+# A fixed 3-fact fixture used across the slicing tests below. Real packing
+# boundaries are hand-derived (via the module's own constants, never a
+# hardcoded guess) using _CountingTokenizer's exact char-per-token measure —
+# see the module docstring above for why that makes the arithmetic provable.
+_SLICE_FACTS = [
+    {"subject": "Alice", "predicate": "knows", "object": "Bob"},
+    {"subject": "Carol", "predicate": "knows", "object": "Dave"},
+    {"subject": "Erin", "predicate": "knows", "object": "Frank"},
+]
+_SLICE_TEMPLATE = "T{facts_json}"
+
+
+class TestFactBoundarySlicing:
+    """``_slice_facts_to_envelope`` — items 5-8, 11."""
+
+    def test_facts_fitting_envelope_yield_one_slice(self):
+        """Item 5: facts fitting the envelope -> exactly one slice, slice
+        == all facts. Hand-derived: at envelope=500 the packer's reserve
+        term is dominated by the ``_MIN_ANONYMIZER_OUTPUT_TOKENS`` (256)
+        floor (m5 fix), and ``base + all-three-fragments + 256 <= 500``
+        under ``_CountingTokenizer``'s exact char-per-token measure."""
+        slices = _slice_facts_to_envelope(
+            _SLICE_FACTS,
+            _CountingTokenizer(),
+            scrub={"person name"},
+            user_prompt_template=_SLICE_TEMPLATE,
+            system_prompt="",
+            token_envelope=500,
+        )
+        assert slices == [_SLICE_FACTS]
+
+    def test_facts_exceeding_envelope_split_preserving_order_no_split_fact(self):
+        """Item 6: N > 1 slices; every fact appears in exactly one slice,
+        order preserved, no fact split. Hand-derived boundary: at
+        envelope=200, even a SINGLE fact's own cost — dominated by the
+        ``_MIN_ANONYMIZER_OUTPUT_TOKENS`` (256) floor the packer reserves
+        per slice (m5 fix) — already exceeds 200 on its own, so each fact
+        lands in its own slice: exactly 3."""
+        slices = _slice_facts_to_envelope(
+            _SLICE_FACTS,
+            _CountingTokenizer(),
+            scrub={"person name"},
+            user_prompt_template=_SLICE_TEMPLATE,
+            system_prompt="",
+            token_envelope=200,
+        )
+        assert len(slices) == 3
+        # Order preserved, no fact split, every fact appears exactly once.
+        flattened = [f for s in slices for f in s]
+        assert flattened == _SLICE_FACTS
+
+    def test_single_oversized_fact_gets_its_own_slice_no_crash(self):
+        """Item 7: a single fact larger than the envelope is still
+        emitted as its own slice — no crash, no infinite loop."""
+        big_fact = {"subject": "Alice", "predicate": "knows", "object": "Bob"}
+        slices = _slice_facts_to_envelope(
+            [big_fact],
+            _CountingTokenizer(),
+            scrub={"person name"},
+            user_prompt_template=_SLICE_TEMPLATE,
+            system_prompt="",
+            token_envelope=1,  # far below any real cost
+        )
+        assert slices == [[big_fact]]
+
+    def test_empty_facts_returns_one_empty_slice(self):
+        """Item 8: empty facts -> exactly one (empty) slice — the
+        chat-egress shape, where the call must still run."""
+        slices = _slice_facts_to_envelope(
+            [],
+            _CountingTokenizer(),
+            scrub={"person name"},
+            user_prompt_template=_SLICE_TEMPLATE,
+            system_prompt="",
+            token_envelope=8192,
+        )
+        assert slices == [[]]
+
+    def test_compact_rendering_byte_identical_to_json_dumps_no_indent(self):
+        """Item 11: the rendered facts JSON is byte-identical to
+        ``json.dumps(facts)`` (compact, no ``indent=2`` artefact — no
+        ``'\\n  "subject"'`` in the rendered prompt)."""
+        rendered = _render_anonymize_prompt(
+            _SLICE_FACTS,
+            _CountingTokenizer(),
+            scrub={"person name"},
+            transcript="",
+            user_prompt_template="{facts_json}",
+            system_prompt="",
+        )
+        assert rendered == json.dumps(_SLICE_FACTS)
+        assert '\n  "subject"' not in rendered
+        assert "  " not in rendered  # no indent whitespace anywhere
+
+    def test_real_packer_slice_never_overruns_the_envelope(self):
+        """m5 missing test 2: for a slice produced by the REAL packer,
+        ``prompt_tokens + max_new_tokens <= token_envelope`` — the
+        property the whole packing change exists to enforce. Verified
+        for EVERY slice a larger, more realistic fact set packs into,
+        using ``_CountingTokenizer``'s exact char-per-token measure so
+        both sides of the inequality are provable, not approximate."""
+        tokenizer = _CountingTokenizer()
+        template = "T{facts_json}"
+        envelope = 600
+        facts = [
+            {"subject": f"Person{i}", "predicate": "knows", "object": f"Other{i}"}
+            for i in range(12)
+        ]
+
+        slices = _slice_facts_to_envelope(
+            facts,
+            tokenizer,
+            scrub={"person name"},
+            user_prompt_template=template,
+            system_prompt="",
+            token_envelope=envelope,
+        )
+        assert len(slices) > 1, "fixture must actually exercise multi-slice packing"
+
+        for slice_facts in slices:
+            expected_prompt = _render_anonymize_prompt(
+                slice_facts,
+                tokenizer,
+                scrub={"person name"},
+                transcript="",
+                user_prompt_template=template,
+                system_prompt="",
+            )
+            prompt_tokens = len(expected_prompt)  # _CountingTokenizer: 1 tok/char
+
+            captured = {}
+
+            def _fake_generate(model, tok, formatted, *, max_new_tokens, temperature, seed):
+                captured["max_new_tokens"] = max_new_tokens
+                return json.dumps({"mapping": {}, "anonymized_transcript": []})
+
+            with patch("paramem.cloud.anonymize.generate_answer", side_effect=_fake_generate):
+                anonymize_transcript(
+                    slice_facts,
+                    model=object(),
+                    tokenizer=tokenizer,
+                    scrub={"person name"},
+                    token_envelope=envelope,
+                    user_prompt_template=template,
+                    system_prompt="",
+                )
+
+            assert prompt_tokens + captured["max_new_tokens"] <= envelope, (
+                f"slice with {len(slice_facts)} fact(s): prompt_tokens={prompt_tokens} + "
+                f"max_new_tokens={captured['max_new_tokens']} > envelope={envelope}"
+            )
+
+
+class TestMaxNewTokensDerivation:
+    """``anonymize_transcript`` — item 10: ``max_new_tokens`` handed to
+    ``generate_answer`` equals ``envelope - measured prompt tokens``, and
+    equals ``_MIN_ANONYMIZER_OUTPUT_TOKENS`` in the clamped case."""
+
+    def test_max_new_tokens_equals_envelope_minus_prompt_tokens(self):
+        tokenizer = _CountingTokenizer()
+        template = "T{facts_json}"
+        prompt_tokens = len(template.format(facts_json=json.dumps([])))
+        envelope = prompt_tokens + 500  # comfortably above the reserve floor
+        captured = {}
+
+        def _fake_generate(model, tok, formatted, *, max_new_tokens, temperature, seed):
+            captured["max_new_tokens"] = max_new_tokens
+            return json.dumps({"mapping": {}, "anonymized_transcript": []})
+
+        with patch("paramem.cloud.anonymize.generate_answer", side_effect=_fake_generate):
+            anonymize_transcript(
+                [],
+                model=object(),
+                tokenizer=tokenizer,
+                scrub={"person name"},
+                token_envelope=envelope,
+                user_prompt_template=template,
+                system_prompt="",
+            )
+
+        assert captured["max_new_tokens"] == envelope - prompt_tokens
+
+    def test_max_new_tokens_clamped_to_floor_when_prompt_overruns_envelope(self):
+        tokenizer = _CountingTokenizer()
+        template = "T{facts_json}"
+        prompt_tokens = len(template.format(facts_json=json.dumps([])))
+        envelope = prompt_tokens - 10  # prompt alone already exceeds envelope
+        captured = {}
+
+        def _fake_generate(model, tok, formatted, *, max_new_tokens, temperature, seed):
+            captured["max_new_tokens"] = max_new_tokens
+            return json.dumps({"mapping": {}, "anonymized_transcript": []})
+
+        with patch("paramem.cloud.anonymize.generate_answer", side_effect=_fake_generate):
+            anonymize_transcript(
+                [],
+                model=object(),
+                tokenizer=tokenizer,
+                scrub={"person name"},
+                token_envelope=envelope,
+                user_prompt_template=template,
+                system_prompt="",
+            )
+
+        assert captured["max_new_tokens"] == _MIN_ANONYMIZER_OUTPUT_TOKENS
+
+
+class TestAtomicTranscriptSlicing:
+    """``anonymize`` — item 9: a non-empty transcript is atomic (never
+    sliced) regardless of how large ``facts`` is, plus the clamp WARNING
+    when the prompt alone overruns the envelope."""
+
+    def test_nonempty_transcript_makes_exactly_one_call_regardless_of_fact_count(self):
+        graph = _graph([_rel(f"Person{i}", "knows", f"Other{i}") for i in range(20)])
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=({}, "anon transcript", "raw"),
+        ) as mocked:
+            payload = _anonymize(
+                graph,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="a real transcript",
+                scrub={"person name"},
+            )
+        mocked.assert_called_once()
+        assert payload.slices == 1
+
+    def test_clamp_warning_fires_when_prompt_alone_overruns_the_envelope(self, caplog):
+        """A transcript-bearing call whose prompt alone leaves less than
+        the output reserve proceeds with the clamped allowance and logs a
+        WARNING naming the overshoot."""
+        import logging
+
+        tokenizer = _CountingTokenizer()
+        template = "T{transcript}"
+        long_transcript = "x" * 500
+        raw = json.dumps({"mapping": {}, "anonymized_transcript": "unchanged"})
+
+        anonymize_logger = logging.getLogger("paramem.cloud.anonymize")
+        prior_level = anonymize_logger.level
+        anonymize_logger.setLevel(logging.WARNING)
+        anonymize_logger.addHandler(caplog.handler)
+        try:
+            with patch("paramem.cloud.anonymize.generate_answer", return_value=raw):
+                anonymize_transcript(
+                    [],
+                    model=object(),
+                    tokenizer=tokenizer,
+                    scrub={"person name"},
+                    transcript=long_transcript,
+                    token_envelope=100,  # far smaller than the transcript alone
+                    user_prompt_template=template,
+                    system_prompt="",
+                )
+        finally:
+            anonymize_logger.removeHandler(caplog.handler)
+            anonymize_logger.setLevel(prior_level)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("clamped allowance" in r.getMessage() for r in warnings)
+
+
+class TestDynamicVramClamp:
+    """The dynamic VRAM clamp threaded through ``anonymize()`` (owner-
+    approved 2026-07-28, live-fold evidence: a packer-correct 8,192-token
+    call still faulted "device not ready" at 1,191 MiB free). One
+    measurement at ``anonymize()`` entry via
+    ``paramem.utils.vram_guard.effective_token_envelope``, threaded to
+    both the fact packer and every slice's ``anonymize_transcript`` call.
+    """
+
+    def test_free_high_configured_envelope_reaches_anonymize_transcript(self):
+        """Ample free VRAM: the effective envelope handed to
+        ``anonymize_transcript`` equals the CONFIGURED value unchanged."""
+        graph = _graph([_rel("Alice", "knows", "Bob")])
+        captured = {}
+
+        def _fake(*_args, **kwargs):
+            captured["token_envelope"] = kwargs["token_envelope"]
+            captured["configured_envelope"] = kwargs["configured_envelope"]
+            return ({}, "", "raw")
+
+        with (
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(4096 * 2**20, 8192 * 2**20),
+            ),
+        ):
+            _anonymize(
+                graph,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                token_envelope=8192,
+            )
+
+        assert captured["token_envelope"] == 8192
+        assert captured["configured_envelope"] == 8192
+
+    def test_free_low_clamp_reaches_anonymize_transcript_below_ceiling(self):
+        """Tight free VRAM (the live fault's 1,191 MiB reading): the
+        effective envelope handed to ``anonymize_transcript`` is SMALLER
+        than the configured ceiling, and the ceiling is still passed
+        through separately so it can be named in a WARNING."""
+        graph = _graph([_rel("Alice", "knows", "Bob")])
+        captured = {}
+
+        def _fake(*_args, **kwargs):
+            captured["token_envelope"] = kwargs["token_envelope"]
+            captured["configured_envelope"] = kwargs["configured_envelope"]
+            return ({}, "", "raw")
+
+        with (
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(1191 * 2**20, 8192 * 2**20),
+            ),
+        ):
+            _anonymize(
+                graph,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                token_envelope=8192,
+            )
+
+        assert captured["configured_envelope"] == 8192
+        assert captured["token_envelope"] == int(1191 / MIB_PER_TOKEN_TRANSIENT)
+        assert captured["token_envelope"] < 8192
+
+    def test_cpu_passthrough_no_cuda(self):
+        """No CUDA available: the effective envelope equals the configured
+        one and ``free_mib`` is ``None`` — CPU test suites never need a
+        GPU to exercise ``anonymize()``."""
+        graph = _graph([_rel("Alice", "knows", "Bob")])
+        captured = {}
+
+        def _fake(*_args, **kwargs):
+            captured["token_envelope"] = kwargs["token_envelope"]
+            captured["free_mib"] = kwargs["free_mib"]
+            return ({}, "", "raw")
+
+        with (
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=False),
+        ):
+            _anonymize(
+                graph,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                token_envelope=8192,
+            )
+
+        assert captured["token_envelope"] == 8192
+        assert captured["free_mib"] is None
+
+    def test_packer_and_derivation_end_to_end_respect_the_clamp(self):
+        """Full ``anonymize()`` call, REAL packer + REAL max_new_tokens
+        derivation (only ``generate_answer`` is mocked): a generous
+        configured ceiling but tight free VRAM must still force the real
+        packer to split into multiple slices, proving the effective
+        envelope reaches BOTH consumers named in the design (the packer
+        AND the per-slice derivation), not just one.
+        """
+        tokenizer = _CountingTokenizer()
+        facts = [
+            {"subject": f"Person{i}", "predicate": "knows", "object": f"Other{i}"}
+            for i in range(30)
+        ]
+        template = "T{facts_json}"
+        call_count = {"n": 0}
+
+        def _fake_generate(model, tok, formatted, *, max_new_tokens, temperature, seed):
+            call_count["n"] += 1
+            assert max_new_tokens >= _MIN_ANONYMIZER_OUTPUT_TOKENS
+            return json.dumps({"mapping": {}, "anonymized_transcript": []})
+
+        with (
+            patch("paramem.cloud.anonymize.generate_answer", side_effect=_fake_generate),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                # ~200 supportable tokens at MIB_PER_TOKEN_TRANSIENT — far
+                # below what 30 facts need, so VRAM (not the configured
+                # ceiling) is the binding constraint.
+                return_value=(int(200 * MIB_PER_TOKEN_TRANSIENT * 2**20), 8192 * 2**20),
+            ),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=tokenizer,
+                transcript="",
+                scrub={"person name"},
+                token_envelope=100_000,  # generous ceiling — VRAM must bind, not config
+                user_prompt_template=template,
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        assert payload.slices > 1
+        assert call_count["n"] == payload.slices
+        # No fact lost or duplicated across the VRAM-forced slicing.
+        assert len(payload.facts) == len(facts)
+
+    def test_atomic_path_warning_names_both_ceiling_and_clamped_value(self, caplog):
+        """A transcript-bearing (atomic) call whose EFFECTIVE VRAM-clamped
+        envelope is far below the configured ceiling logs a WARNING naming
+        BOTH values distinctly, so an operator can tell "the ceiling was
+        too small" apart from "live VRAM clamped it down"."""
+        import logging
+
+        tokenizer = _CountingTokenizer()
+        template = "T{transcript}"
+        transcript = "x" * 50
+        raw = json.dumps({"mapping": {}, "anonymized_transcript": "unchanged"})
+
+        anonymize_logger = logging.getLogger("paramem.cloud.anonymize")
+        prior_level = anonymize_logger.level
+        anonymize_logger.setLevel(logging.WARNING)
+        anonymize_logger.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+                patch("paramem.utils.vram_guard.safe_empty_cache"),
+                patch(
+                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                    return_value=(1 * 2**20, 8192 * 2**20),  # a handful of tokens supportable
+                ),
+            ):
+                graph = _graph([])
+                _anonymize(
+                    graph,
+                    model=object(),
+                    tokenizer=tokenizer,
+                    transcript=transcript,
+                    scrub={"person name"},
+                    token_envelope=8192,
+                    user_prompt_template=template,
+                )
+        finally:
+            anonymize_logger.removeHandler(caplog.handler)
+            anonymize_logger.setLevel(prior_level)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("effective envelope" in w and "operator ceiling 8192" in w for w in warnings), (
+            warnings
+        )
+
+
+class TestWithinSliceCanonCollisionSurvives:
+    """B1 regression guard (code review): the cross-KEY canon dedup in
+    ``anonymize``'s merge loop must be scoped to entries carried over
+    from a PRIOR slice only — never to two literal real-value keys that
+    canonicalize identically but both arrive within the SAME call.
+
+    ``_substitute_whole_words`` (the substitution primitive
+    ``insert_placeholders`` uses) matches EXACTLY, so if the merge loop
+    dropped the second of two canon-colliding keys, the dropped literal
+    spelling would never be substituted and would egress the cloud
+    payload UNMASKED. This is the transcript-bearing (single-slice,
+    atomic) path — the one production shape a naive "always dedup on
+    canonical key" fix would have silently broken.
+    """
+
+    def test_two_canon_colliding_keys_both_survive_with_distinct_placeholders(self):
+        graph = _graph(
+            [
+                _rel("José García", "knows", "Riley"),
+                _rel("Jose Garcia", "likes", "Coffee"),
+            ]
+        )
+        # The model sees two literal spellings of the same real-world
+        # entity (a diacritic-fold collision: canonical("José García") ==
+        # canonical("Jose Garcia")) and — plausibly, since nothing in its
+        # prompt tells it they're the same person — assigns them DIFFERENT
+        # placeholders.
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=(
+                {"José García": "Person_1", "Jose Garcia": "Person_2"},
+                "anon transcript",
+                "raw",
+            ),
+        ):
+            payload = _anonymize(
+                graph,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="a real transcript",
+                scrub={"person name"},
+            )
+
+        assert payload.status == "ok"
+        assert payload.slices == 1
+        # Both literal spellings survive in `forward` — neither is
+        # silently dropped by a canon-based dedup that (incorrectly)
+        # applied within this single call.
+        assert payload.forward == {"José García": "Person_1", "Jose Garcia": "Person_2"}
+        # Distinct placeholders — the within-call duplicate-placeholder
+        # closure (a SEPARATE mechanism, kept live/cumulative) is not
+        # what's under test here, but pinning it costs nothing.
+        assert len(set(payload.forward.values())) == 2
+
+
+# ---------------------------------------------------------------------------
+# U2 — cross-slice mapping merge (§7 items 12-15)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossSliceMappingMerge:
+    def test_same_entity_two_slices_first_wins_on_canonical_key(self):
+        """Item 12: the same entity named in two slices with different
+        placeholders -> first-wins on the canonical key; one entry in
+        ``forward``."""
+        facts = [
+            {"subject": "Alex", "predicate": "knows", "object": "Riley"},
+            {"subject": "Alex", "predicate": "likes", "object": "Coffee"},
+        ]
+
+        def _fake(slice_facts, *args, **kwargs):
+            # Both slices independently name "Alex" — slice 1 mints
+            # Person_1, slice 2 (a separate local call with no memory of
+            # slice 1) independently mints Person_9 for the SAME real
+            # value.
+            if slice_facts[0]["object"] == "Riley":
+                return ({"Alex": "Person_1"}, "", "raw1")
+            return ({"Alex": "Person_9"}, "", "raw2")
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]]],
+            ),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        # First-wins: slice 1's Person_1 decision survives; slice 2's
+        # independently-minted Person_9 for the same canonical real value
+        # never enters the merged table.
+        assert payload.forward == {"Alex": "Person_1"}
+        assert len(payload.forward) == 1
+
+    def test_two_distinct_entities_same_placeholder_renumbered(self):
+        """Item 13: two DIFFERENT entities assigned ``Person_1`` in their
+        respective slices -> the second is renumbered (``Person_2``);
+        every value in the merged ``forward`` map is unique."""
+        facts = [
+            {"subject": "Alex", "predicate": "knows", "object": "Riley"},
+            {"subject": "Jordan", "predicate": "knows", "object": "Casey"},
+        ]
+        call_count = 0
+
+        def _fake_anonymize_transcript(slice_facts, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Slice 1 sees "Alex", slice 2 sees "Jordan" — both minted
+            # Person_1 independently (as two separate local calls would).
+            names = {f["subject"] for f in slice_facts} | {f["object"] for f in slice_facts}
+            if "Alex" in names:
+                return ({"Alex": "Person_1"}, "", "raw1")
+            return ({"Jordan": "Person_1"}, "", "raw2")
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]]],
+            ),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                side_effect=_fake_anonymize_transcript,
+            ),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        assert len(payload.forward) == 2
+        assert set(payload.forward.values()) == {"Person_1", "Person_2"}
+        assert len(set(payload.forward.values())) == len(payload.forward)
+
+    def test_renumber_preserves_multi_segment_prefix(self):
+        """Item 14: the renumber picks the smallest free index per prefix
+        and preserves a multi-segment prefix
+        (``Home_Address_1`` -> ``Home_Address_2``)."""
+        facts = [
+            {"subject": "123 Main St", "predicate": "mentioned", "object": "x"},
+            {"subject": "456 Oak Ave", "predicate": "mentioned", "object": "y"},
+        ]
+
+        def _fake_anonymize_transcript(slice_facts, *args, **kwargs):
+            subj = slice_facts[0]["subject"]
+            return ({subj: "Home_Address_1"}, "", "raw")
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]]],
+            ),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                side_effect=_fake_anonymize_transcript,
+            ),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"physical address"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        assert set(payload.forward.values()) == {"Home_Address_1", "Home_Address_2"}
+
+    def test_placeholder_prefix_none_falls_back_without_raising(self):
+        """Item 15: ``placeholder_prefix`` returns ``None`` for an
+        unshaped token, and the exact fallback expression the per-slice
+        merge loop uses (``placeholder_prefix(placeholder) or "Thing"``)
+        substitutes ``"Thing"`` and ``mint_placeholder`` still mints a
+        fresh, non-colliding token — no exception.
+
+        (Reaching this fallback via a full ``anonymize()`` call is not
+        possible in practice: an unshaped model placeholder is dropped by
+        ``_normalize_anonymization_mapping`` before the merge loop ever
+        sees it — every value that survives normalize already matches
+        ``PLACEHOLDER_SHAPE_RE`` by construction. This test pins the
+        fallback EXPRESSION itself, defensive code for a shape the
+        merge's own callers cannot currently produce.)
+        """
+        from paramem.cloud.placeholders import mint_placeholder, placeholder_prefix
+
+        unshaped = "notshaped"
+        assert placeholder_prefix(unshaped) is None
+        used = {"Person_1"}
+        minted = mint_placeholder(used, placeholder_prefix(unshaped) or "Thing")
+        assert minted == "Thing_1"
+
+
+# ---------------------------------------------------------------------------
+# U2 — per-slice fail-closed (§7 items 16-19)
+# ---------------------------------------------------------------------------
+
+
+class TestPerSliceFailClosed:
+    def test_one_of_three_slices_parse_fails_others_survive(self):
+        """Item 16: slice 2 of 3 parse-fails -> status="ok",
+        slices_failed == 1, contract.facts excludes exactly slice 2's
+        facts, includes slices 1 and 3."""
+        facts = [
+            {"subject": "Alex", "predicate": "knows", "object": "Riley"},
+            {"subject": "Jordan", "predicate": "knows", "object": "Casey"},
+            {"subject": "Sam", "predicate": "knows", "object": "Drew"},
+        ]
+
+        def _fake(slice_facts, *args, **kwargs):
+            subj = slice_facts[0]["subject"]
+            if subj == "Jordan":
+                return (None, "", "raw-fail")
+            return ({subj: "Person_1"}, "", "raw-ok")
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]], [facts[2]]],
+            ),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        assert payload.slices == 3
+        assert payload.slices_failed == 1
+        assert payload.facts == [facts[0], facts[2]]
+
+    def test_all_slices_fail_yields_failed_status(self):
+        """Item 17: all slices fail -> status="failed", facts == [],
+        failure is "guard" when any guard fired, else "parse"."""
+        facts = [
+            {"subject": "Alex", "predicate": "knows", "object": "Riley"},
+            {"subject": "Jordan", "predicate": "knows", "object": "Casey"},
+        ]
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]]],
+            ),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(None, "", "raw-fail"),
+            ),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "failed"
+        assert payload.facts == []
+        assert payload.failure == "parse"
+
+    def test_all_slices_fail_via_guard_reports_guard_failure(self):
+        """Item 17 (guard variant): every slice fails via the
+        domain-scoped guard -> failure == "guard"."""
+        facts = [
+            {"subject": "Someone Unmatched", "predicate": "knows", "object": "Nobody Else"},
+        ]
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[facts],
+            ),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=({"Someone Unmatched": "Person_1"}, "", "raw"),
+            ),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                identity_domain=["a completely different node"],
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "failed"
+        assert payload.failure == "guard"
+        assert payload.facts == []
+
+    def test_guard_does_not_fire_on_speaker_only_slice(self):
+        """Item 18: a slice whose facts are all speaker-only endpoints
+        does NOT fire the guard even when the model named something that
+        failed reconciliation — the regression test for amendment point
+        3, now at the per-slice level."""
+        facts = [{"subject": "speaker0", "predicate": "likes", "object": "speaker1"}]
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[facts],
+            ),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=({"Someone Trimmed Off": "Person_1"}, "", "raw"),
+            ),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                identity_domain=["speaker0", "speaker1", "trimmed non-speaker node"],
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        assert payload.status == "ok"
+        assert payload.slices_failed == 0
+
+    def test_rekey_dropped_sums_across_slices_stays_per_entry(self):
+        """Item 19: ``rekey_dropped`` sums across slices and stays
+        per-entry (not per-slice)."""
+        facts = [
+            {"subject": "Alex", "predicate": "knows", "object": "known_node"},
+            {"subject": "Jordan", "predicate": "knows", "object": "known_node"},
+        ]
+
+        def _fake(slice_facts, *args, **kwargs):
+            subj = slice_facts[0]["subject"]
+            # Both entries name something that will NOT reconcile onto
+            # the domain (the domain only contains "known_node").
+            return ({subj: "Person_1"}, "", "raw")
+
+        with (
+            patch(
+                "paramem.cloud.anonymize._slice_facts_to_envelope",
+                return_value=[[facts[0]], [facts[1]]],
+            ),
+            patch("paramem.cloud.anonymize.anonymize_transcript", side_effect=_fake),
+        ):
+            payload = anonymize(
+                facts,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="",
+                scrub={"person name"},
+                identity_domain=["known_node"],
+                user_prompt_template="",
+                system_prompt="",
+            )
+
+        # Each slice's endpoints include "known_node" (a non-speaker
+        # name), but the reconciled mapping is empty only when NOTHING
+        # survives — here the guard fires per slice (each slice's sole
+        # mapping entry fails to reconcile), so both slices fail closed
+        # and rekey_dropped accumulates one drop per slice (2 total, not
+        # 1 "per-slice" count).
+        assert payload.rekey_dropped == 2
+
+
+# ---------------------------------------------------------------------------
+# D1 — anonymized_transcript validity rule matrix (§7 items 42-45)
+# ---------------------------------------------------------------------------
+
+
+class TestAnonymizedTranscriptValidityRuleMatrix:
+    """The four-cell matrix of plan §5.2 / §1.4, directly against
+    ``anonymize_transcript``."""
+
+    _TEMPLATE_KWARGS = {
+        "user_prompt_template": "{scrub_categories} {facts_json} {transcript}",
+        "system_prompt": "system",
+    }
+
+    def _run(self, *, transcript: str, raw: str):
+        tokenizer = _stub_tokenizer()
+        with patch("paramem.cloud.anonymize.generate_answer", return_value=raw):
+            return anonymize_transcript(
+                [{"subject": "Alex", "predicate": "knows", "object": "Riley"}],
+                model=object(),
+                tokenizer=tokenizer,
+                scrub={"person name"},
+                transcript=transcript,
+                **self._TEMPLATE_KWARGS,
+            )
+
+    def test_item_42_empty_transcript_any_mapping_missing_rewrite_is_ok(self):
+        """``transcript=""`` + any mapping + missing/[] rewrite ->
+        status="ok" (mapping returned, not None), anon_transcript=="",
+        NOT fail-closed. Direct regression guard for the graph tier:
+        mutation — restore the old empty-array check — makes every
+        enrichment chunk fail closed, and this test fails."""
+        raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
+        mapping, anon_transcript, raw_output = self._run(transcript="", raw=raw)
+        assert mapping == {"Alex": "Person_1"}
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+    def test_item_43_nonempty_transcript_empty_mapping_missing_rewrite_is_ok(self):
+        """Non-empty transcript + ``mapping == {}`` + missing rewrite ->
+        status="ok", empty forward/reverse (verified at the ``anonymize``
+        level below), and the caller-visible ``anon_transcript`` is the
+        ORIGINAL transcript verbatim — argument-sourced, never a model
+        artefact (checked at the ``anonymize`` level since
+        ``anonymize_transcript`` itself returns "" for the legitimate
+        empty case; the argument fallback happens one level up)."""
+        raw = json.dumps({"mapping": {}})
+        mapping, anon_transcript, raw_output = self._run(
+            transcript="[user] Alex knows Riley.", raw=raw
+        )
+        assert mapping == {}
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+        # Caller-visible outcome: anonymize() sources anon_transcript from
+        # the ORIGINAL argument transcript, never a model artefact —
+        # assert identity with the input string.
+        original_transcript = "[user] Alex knows Riley."
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=({}, "", raw),
+        ):
+            payload = anonymize(
+                [{"subject": "Alex", "predicate": "knows", "object": "Riley"}],
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript=original_transcript,
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+        assert payload.status == "ok"
+        assert payload.forward == {}
+        assert payload.reverse == {}
+        assert payload.anon_transcript is original_transcript
+
+    def test_item_44_nonempty_transcript_nonempty_mapping_missing_rewrite_fails_closed(self):
+        """Non-empty transcript + non-empty mapping + missing/empty
+        rewrite -> status="failed", failure="parse", forward/reverse
+        empty, anon_transcript=="", facts==[] (checked at the
+        ``anonymize`` level)."""
+        raw = json.dumps({"mapping": {"Alex": "Person_1"}})
+        mapping, anon_transcript, raw_output = self._run(
+            transcript="[user] Alex knows Riley.", raw=raw
+        )
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=(None, "", raw),
+        ):
+            payload = anonymize(
+                [{"subject": "Alex", "predicate": "knows", "object": "Riley"}],
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="[user] Alex knows Riley.",
+                scrub={"person name"},
+                user_prompt_template="",
+                system_prompt="",
+            )
+        assert payload.status == "failed"
+        assert payload.failure == "parse"
+        assert payload.forward == {}
+        assert payload.reverse == {}
+        assert payload.anon_transcript == ""
+        assert payload.facts == []
+
+    def test_item_45_malformed_array_fails_closed_regardless_of_state(self):
+        """A malformed array (a non-str element) stays fail-closed
+        regardless of transcript/mapping state (shape check unchanged) —
+        including over an EMPTY transcript, where every other malformed
+        shape would otherwise be legitimate-empty."""
+        raw = json.dumps(
+            {
+                "mapping": {"Alex": "Person_1"},
+                "anonymized_transcript": ["ok turn", 42],
+            }
+        )
+        mapping, anon_transcript, raw_output = self._run(transcript="", raw=raw)
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw

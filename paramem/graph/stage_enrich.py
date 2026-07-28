@@ -30,7 +30,6 @@ from paramem.graph.extractor import (
 )
 from paramem.graph.flow import StageContext, StageState
 from paramem.graph.phase_trace import chain_stopped, phase_trace
-from paramem.graph.schema import facts_from_relations
 
 logger = logging.getLogger(__name__)
 
@@ -157,27 +156,33 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
         # target) / phases[entity_correction].
         return dataclasses.replace(state, graph=graph, original_relation_count=original_count)
 
-    # The fact array — rendered via :func:`facts_from_relations`
-    # (``graph.relations`` -> plain dicts) then
+    # The fact array — rendered via
     # :func:`~paramem.cloud.placeholders.insert_placeholders`
     # (subject/object substituted through ``payload.forward``; every other
-    # field copied verbatim).  Facts are never taken from the model's
-    # response — the model's job is the TRANSCRIPT (``anon_transcript``,
-    # already built above); the fact array is always deterministic.  A
-    # fact can therefore never be lost, reworded, or dropped by the
-    # anonymizer, and a placeholder cannot be glued into a predicate at
-    # this stage (the motivating bug, ``language_proficiency_Language_3``,
-    # cannot occur here).  It can still occur in cloud's *returned* facts,
-    # which is why the deanon-stage predicate invariant
-    # (:func:`_apply_bindings`) stays.  An orphan placeholder in a fact is
-    # likewise impossible: every placeholder a fact can carry comes from
-    # this same forward map.  Correct to reuse here even though
-    # ``entity_correction`` ran between this payload's construction and
-    # this line — correction mutates only the REVERSE map's values, never
-    # the forward map ``anon_facts`` is built from.  With an empty
-    # ``mapping`` (opt-out), substitution is a no-op and facts egress
-    # verbatim.
-    anon_facts = insert_placeholders(facts_from_relations(graph.relations), payload.forward)
+    # field copied verbatim) over ``payload.facts`` — the (real-name,
+    # un-substituted) fact subset :func:`~paramem.cloud.anonymize.anonymize`
+    # already cleared for egress (the input facts minus any fail-closed
+    # slice's facts; see that function's docstring).  Facts are never
+    # taken from the model's response — the model's job is the TRANSCRIPT
+    # (``anon_transcript``, already built above); the fact array is always
+    # deterministic.  A fact can therefore never be lost, reworded, or
+    # dropped by the anonymizer, and a placeholder cannot be glued into a
+    # predicate at this stage (the motivating bug,
+    # ``language_proficiency_Language_3``, cannot occur here).  It can
+    # still occur in cloud's *returned* facts, which is why the
+    # deanon-stage predicate invariant (:func:`_apply_bindings`) stays.
+    # An orphan placeholder in a fact is likewise impossible: every
+    # placeholder a fact can carry comes from this same forward map.
+    # Correct to reuse here even though ``entity_correction`` ran between
+    # this payload's construction and this line — correction mutates only
+    # the REVERSE map's values, never the forward map (or ``payload.facts``)
+    # ``anon_facts`` is built from.  With an empty ``mapping`` (opt-out),
+    # substitution is a no-op and facts egress verbatim.  Nothing between
+    # the ``anonymize`` and ``enrich`` stages mutates ``graph.relations``,
+    # so ``payload.facts`` (captured at anonymize time) stays byte-parity
+    # with a fresh ``facts_from_relations(graph.relations)`` render for
+    # the session tier's single-slice ``status == "ok"`` case.
+    anon_facts = insert_placeholders(payload.facts, payload.forward)
 
     # Phase — cloud_enrich.  Cloud (Anthropic by default) runs the
     # enrichment prompt; emits enriched facts + new_entity_bindings +

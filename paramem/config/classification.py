@@ -103,6 +103,8 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.decay_window": Tier.PIPELINE_ALTERING,
     "consolidation.max_interim_count": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_max_tokens": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_anonymize_token_envelope": Tier.PIPELINE_ALTERING,
+    "consolidation.extraction_token_estimate_ratio": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_enrichment_provider": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_enrichment_provider_model": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_enrichment_provider_endpoint": Tier.PIPELINE_ALTERING,

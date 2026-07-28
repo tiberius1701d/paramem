@@ -334,6 +334,83 @@ class TestRetiredConsolidationKeysRejected:
             load_server_config(yaml_file)
 
 
+class TestAnonymizeTokenEnvelopeAndRatioConfig:
+    """U3 — item 32: the envelope/ratio defaults and their ``<= 0``
+    load-time rejection.
+    """
+
+    def test_defaults(self):
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig()
+        assert cfg.extraction_anonymize_token_envelope == 8192
+        assert cfg.extraction_token_estimate_ratio == 3.4
+
+    def test_envelope_zero_or_negative_rejected_at_load(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              extraction_anonymize_token_envelope: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="extraction_anonymize_token_envelope"):
+            load_server_config(yaml_file)
+
+    def test_ratio_zero_or_negative_rejected_at_load(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              extraction_token_estimate_ratio: -1.0
+            """,
+        )
+        with pytest.raises(ValueError, match="extraction_token_estimate_ratio"):
+            load_server_config(yaml_file)
+
+
+class TestRatioIsACheckedMirrorOfTheCodeConstant:
+    """M1 (code review): ``extraction_token_estimate_ratio`` governs
+    nothing at runtime — every ``estimate_tokens()`` call site uses the
+    module constant ``paramem.utils.tokens.MEASURED_TOKENS_PER_WORD``
+    directly. This key is a CHECKED MIRROR of that constant:
+    ``__post_init__`` rejects any yaml value that disagrees with it, so
+    the two can never silently drift apart. Tested both ways.
+    """
+
+    def test_value_matching_the_constant_loads_cleanly(self):
+        """The shipped default (3.4) equals the code constant — no
+        error, matching the pre-existing ``test_defaults`` case but
+        pinned here as the POSITIVE half of the checked-mirror contract."""
+        from paramem.server.config import ConsolidationScheduleConfig
+        from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD
+
+        cfg = ConsolidationScheduleConfig(extraction_token_estimate_ratio=MEASURED_TOKENS_PER_WORD)
+        assert cfg.extraction_token_estimate_ratio == MEASURED_TOKENS_PER_WORD
+
+    def test_value_disagreeing_with_the_constant_is_rejected_at_load(self, tmp_path):
+        """A POSITIVE ratio that simply does not match the code constant
+        (distinct from the separate ``<= 0`` rejection above) fails load
+        with an error naming the governing constant, telling the
+        operator both must move together after a re-measurement."""
+        from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD
+
+        mismatched = MEASURED_TOKENS_PER_WORD + 1.0
+        yaml_file = _write_yaml(
+            tmp_path,
+            f"""\
+            model: mistral
+            consolidation:
+              extraction_token_estimate_ratio: {mismatched}
+            """,
+        )
+        with pytest.raises(ValueError, match="MEASURED_TOKENS_PER_WORD") as excinfo:
+            load_server_config(yaml_file)
+        assert "extraction_token_estimate_ratio" in str(excinfo.value)
+
+
 class TestAdaptersFactoryDefaultMerge:
     """Loader contract for adapter target_modules under the explicit-yaml posture.
 

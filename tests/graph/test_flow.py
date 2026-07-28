@@ -71,6 +71,7 @@ def _make_ctx(**overrides) -> StageContext:
         plausibility_endpoint=None,
         scrub=frozenset(),
         correction_entity_types=None,
+        anonymize_token_envelope=8192,
     )
     fields.update(overrides)
     return StageContext(**fields)

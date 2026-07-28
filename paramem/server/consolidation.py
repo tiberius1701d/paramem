@@ -157,6 +157,9 @@ def create_consolidation_loop(
         extraction_temperature=0.0,
         extraction_max_tokens=config.consolidation.extraction_max_tokens,
         extraction_plausibility_max_tokens=config.consolidation.extraction_plausibility_max_tokens,
+        extraction_anonymize_token_envelope=(
+            config.consolidation.extraction_anonymize_token_envelope
+        ),
         save_cycle_snapshots=_save_cycle_snapshots,
         snapshot_dir=config.debug_dir if _save_cycle_snapshots else None,
         prompts_dir=config.prompts_dir,

@@ -15,23 +15,68 @@ are used for the real-pypdf tests.
 
 from __future__ import annotations
 
+import inspect
+import math
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from paramem.graph.document_chunker import (
+    _DOC_MAX_TOKENS,
+    _DOC_MIN_TOKENS,
     DocumentChunk,
     EmptyDocumentError,
     ScannedPdfRejectedError,
     UnsupportedFormatError,
     _coalesce_to_max_tokens,
+    _overlap_tokens_to_words,
     _split_into_sentences,
     chunk_document,
     chunk_markdown_file,
     chunk_pdf_file,
     chunk_text_file,
 )
+from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
+
+# Document-shape ratio (U6.1) — the same value recorded as tokens.py's
+# "document shape (CV)" row feeding MEASURED_TOKENS_PER_WORD, and the same
+# value document_chunker.py's _DOC_MAX_TOKENS derivation comment uses for
+# BOTH the cap conversion and the anon_template estimate (self-consistent,
+# one ratio throughout — review follow-up to finding M2).
+_R_PROSE = 1.9126
+_ANONYMIZATION_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent / "configs" / "prompts" / "anonymization.txt"
+)
+
+
+def _render_anon_template_text() -> str:
+    """Load and format the real anonymization.txt skeleton (empty
+    facts/scrub/transcript) — the same shape ``_render_anonymize_prompt``
+    produces before chat-template wrapping (``paramem/cloud/anonymize.py``).
+    """
+    template = _ANONYMIZATION_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return template.format(scrub_categories="", facts_json="[]", transcript="")
+
+
+def _live_anon_template_tokens() -> int:
+    """THE anon_template term for the ``_DOC_MAX_TOKENS`` derivation,
+    recomputed from the LIVE prompt file on every call — ``ceil(words *
+    r_prose)``, the SAME formula ``document_chunker.py``'s
+    ``_DOC_MAX_TOKENS`` derivation comment uses.
+
+    Review follow-up (to finding M2): a frozen tokenizer-measured constant
+    here, checked only against a wide word-count tolerance band, left a
+    real budget with only a few tokens of end-to-end slack that a small
+    template edit could silently overrun while the band check still
+    passed (the arithmetic test never actually consumed the live word
+    count). Recomputing THIS value directly — and using it in the
+    arithmetic checks below instead of a recorded literal — couples the
+    two: a template edit changes this return value on the next run, no
+    tolerance band needed (the computation is fully deterministic).
+    """
+    return math.ceil(len(_render_anon_template_text().split()) * _R_PROSE)
+
 
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 _TEXT_PDF = _FIXTURES_DIR / "text_pdf_sample.pdf"
@@ -90,16 +135,18 @@ class TestTxtChunker:
 
     def test_long_file_splits_at_paragraph_boundaries(self, tmp_path):
         """A file exceeding max_tokens splits into multiple chunks."""
-        # Build ~3000 words across 10 paragraphs separated by blank lines.
+        # Build 10 paragraphs of ~301 words each, separated by blank lines.
         para = "word " * 300 + "end."  # ~301 words
+        para_tokens = estimate_tokens(para)  # estimated-token cost of one paragraph
         content = "\n\n".join([para] * 10)
         path = _make_txt(tmp_path, content)
         chunks = chunk_text_file(path, max_tokens=1500)
         assert len(chunks) >= 2
-        # No single chunk should exceed max_tokens by more than one paragraph.
+        # No single chunk should exceed max_tokens by more than one
+        # paragraph's estimated-token cost — the greedy merge only
+        # overflows by the paragraph that triggered the split.
         for chunk in chunks[:-1]:
-            word_count = len(chunk.text.split())
-            assert word_count <= 1500 + 400  # one paragraph of slack
+            assert estimate_tokens(chunk.text) <= 1500 + para_tokens
 
     def test_chunk_indices_are_sequential(self, tmp_path):
         """chunk_index values start at 0 and increment by 1."""
@@ -504,20 +551,31 @@ class TestSplitIntoSentences:
 
 
 class TestCoalesceToMaxTokens:
+    """max_tokens/overlap_tokens are estimated-token thresholds (routed
+    through estimate_tokens), not raw word counts — values below are
+    recomputed against the shared estimator, not loosened from the old
+    word-count expectations (.agent/plan-anonymize-slicing.md U6, item 36).
+    """
+
     def test_packs_under_cap_into_one_chunk(self):
         sentences = ["A.", "B.", "C."]
-        out = _coalesce_to_max_tokens(sentences, max_tokens=10)
+        # Each 1-word sentence estimates to ceil(1 * ratio) tokens; three of
+        # them must all fit under the cap for a single merged chunk.
+        cap = 3 * estimate_tokens("A.")
+        out = _coalesce_to_max_tokens(sentences, max_tokens=cap)
         assert out == ["A. B. C."]
 
     def test_splits_at_sentence_boundary_when_cap_exceeded(self):
-        # Each sentence ~5 words; cap=10 means two sentences per chunk.
+        # Each sentence is 5 words; a cap sized for exactly two sentences'
+        # estimated-token cost packs two per chunk, not four.
         sentences = [
             "one two three four five.",
             "six seven eight nine ten.",
             "eleven twelve thirteen fourteen fifteen.",
             "sixteen seventeen eighteen nineteen twenty.",
         ]
-        out = _coalesce_to_max_tokens(sentences, max_tokens=10)
+        cap = 2 * estimate_tokens(sentences[0])
+        out = _coalesce_to_max_tokens(sentences, max_tokens=cap)
         assert len(out) == 2
         assert "one two three four five." in out[0]
         assert "six seven eight nine ten." in out[0]
@@ -526,9 +584,15 @@ class TestCoalesceToMaxTokens:
 
     def test_overlap_carries_trailing_words(self):
         sentences = ["a b c d e.", "f g h i j.", "k l m."]
-        out = _coalesce_to_max_tokens(sentences, max_tokens=5, overlap_tokens=2)
-        # First chunk: "a b c d e." (5 words, fills cap)
-        # Second chunk gets last 2 words of first as overlap prefix: "d e."
+        # Cap sized to exactly one 5-word sentence's estimated-token cost,
+        # so each sentence starts a new chunk; overlap_tokens is sized (via
+        # _overlap_tokens_to_words) to carry the trailing 2 words forward.
+        cap = estimate_tokens(sentences[0])
+        overlap_tokens = estimate_tokens("d e.")
+        assert _overlap_tokens_to_words(overlap_tokens) == 2
+        out = _coalesce_to_max_tokens(sentences, max_tokens=cap, overlap_tokens=overlap_tokens)
+        # First chunk: "a b c d e." (fills the cap on its own)
+        # Second chunk gets the last 2 words of the first as overlap prefix.
         assert out[0] == "a b c d e."
         assert out[1].startswith("d e.")
 
@@ -537,6 +601,174 @@ class TestCoalesceToMaxTokens:
         out = _coalesce_to_max_tokens(sentences, max_tokens=5)
         # Cap=5 but sentence is 10 words; never cut mid-sentence.
         assert out == ["one two three four five six seven eight nine ten."]
+
+
+class TestOverlapTokensToWords:
+    """_overlap_tokens_to_words converts the token-denominated
+    overlap_tokens budget into the word count _coalesce_to_max_tokens
+    slices — the unit-coherence fix at document_chunker.py's
+    _coalesce_to_max_tokens (U6, item 3 of the task: 'all counting routes
+    through estimate_tokens while the overlap-prefix construction stays
+    word-based where words are what it slices').
+    """
+
+    def test_zero_or_negative_yields_zero_words(self):
+        assert _overlap_tokens_to_words(0) == 0
+        assert _overlap_tokens_to_words(-5) == 0
+
+    def test_positive_overlap_tokens_yields_at_least_one_word(self):
+        assert _overlap_tokens_to_words(1) >= 1
+
+    def test_converts_via_the_shared_ratio(self):
+        # 2 words at the shared ratio round-trips back to 2 words.
+        two_word_tokens = estimate_tokens("d e.")
+        assert _overlap_tokens_to_words(two_word_tokens) == 2
+
+
+class TestChunkerDefaultsMatchDerivedConstants:
+    """The public chunker signatures' defaults are exactly the derived
+    module constants, not a separately hand-typed copy of the same number
+    (a drift risk item 36 would otherwise miss)."""
+
+    def test_chunk_text_file_default_is_doc_max_tokens(self):
+        assert inspect.signature(chunk_text_file).parameters["max_tokens"].default == (
+            _DOC_MAX_TOKENS
+        )
+
+    def test_chunk_markdown_file_default_is_doc_min_tokens(self):
+        assert inspect.signature(chunk_markdown_file).parameters["min_tokens"].default == (
+            _DOC_MIN_TOKENS
+        )
+
+    def test_chunk_pdf_file_defaults_match_both_constants(self):
+        params = inspect.signature(chunk_pdf_file).parameters
+        assert params["min_tokens"].default == _DOC_MIN_TOKENS
+        assert params["max_tokens"].default == _DOC_MAX_TOKENS
+
+
+class TestDocMaxTokensDerivation:
+    """Items 37/37b: the derivation link between the shipped
+    _DOC_MAX_TOKENS and the anonymize-call token envelope, pinned as a
+    live test rather than a commit-message-only claim
+    (.agent/plan-anonymize-slicing.md finding #5, §7 items 37/37b).
+    """
+
+    def test_derivation_link_holds_against_the_shipped_envelope(self):
+        """Item 37: 2 * cap_real + anon_template_tokens + reserve <=
+        envelope, computed from the real shipped envelope default, the
+        LIVE anonymize.py reserve constants (referenced symbolically via
+        import — review finding M2 — so a concurrent change to those
+        constants is picked up automatically rather than silently going
+        stale), and the LIVE anon_template recomputed from the current
+        prompt file (review follow-up: replaces a frozen tokenizer-measured
+        constant that was only loosely band-checked against the file — see
+        _live_anon_template_tokens's docstring). No tolerance band is
+        needed anywhere in this test: every term is either an exact live
+        import or a deterministic recomputation.  Fails if a future edit
+        raises _DOC_MAX_TOKENS, shrinks the envelope, grows the reserve, or
+        grows the template, without re-deriving the relationship.
+        """
+        from paramem.cloud.anonymize import (
+            _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
+            _MAPPING_ENTRY_OVERHEAD_TOKENS,
+            _OUTPUT_JSON_ENVELOPE_TOKENS,
+        )
+
+        reserve = _OUTPUT_JSON_ENVELOPE_TOKENS + _MAPPING_ENTRY_OVERHEAD_TOKENS
+        cap_real = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD * _R_PROSE
+        lhs = 2 * cap_real + _live_anon_template_tokens() + reserve
+        assert lhs <= _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE, (
+            f"derivation link broken: {lhs} > {_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE}"
+        )
+
+    def test_ratio_cancellation_invariant(self):
+        """Item 37b: the chunk-boundary comparison
+        (``estimate_tokens(text) <= max_tokens``, where ``max_tokens`` is
+        ``_DOC_MAX_TOKENS`` re-expressed as ``cap_words * ratio`` — the
+        estimator's own unit) is invariant under a change to the shipped
+        words->tokens ratio, because it reduces to ``words <= cap_words``
+        regardless of ratio.  Would fail if a future edit expressed the
+        cap in real tokens instead of the estimator's own unit (the ratio
+        would then no longer cancel and a base-model swap that shifts the
+        ratio would silently shrink or grow document chunks).
+        """
+        cap_words = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
+        word_counts = [round(cap_words) - 50, round(cap_words) + 50]
+        for ratio in (1.4, 3.4, 5.0, 8.0):  # a hypothetical base-model swap's ratio
+            scaled_cap_tokens = cap_words * ratio  # _DOC_MAX_TOKENS re-derived at this ratio
+            for words in word_counts:
+                text = "word " * words
+                fits_at_word_level = words <= cap_words
+                fits_via_estimator = (
+                    estimate_tokens(text, tokens_per_word=ratio) <= scaled_cap_tokens
+                )
+                assert fits_via_estimator == fits_at_word_level, (
+                    f"ratio={ratio} words={words}: boundary decision changed"
+                )
+
+
+class TestDocumentPathBudget:
+    """Missing test 3 (review finding, .agent/plan-anonymize-slicing.md
+    review): the full document-ingest budget — a chunk at the shipped cap,
+    used as the anonymize call's transcript INPUT, PLUS its
+    extracted-facts JSON, PLUS the chunk ECHOED BACK as the
+    ``anonymized_transcript`` rewrite — checked against the shipped
+    envelope with an EXPLICIT facts term.
+
+    This is the test that would have caught review finding B2:
+    ``TestDocMaxTokensDerivation``'s derivation-link test omits the facts
+    term entirely (it only checks
+    ``2 * cap_real + anon_template + reserve <= envelope``), so a
+    revision of ``_DOC_MAX_TOKENS`` that folds the facts term away again
+    (as an earlier revision of this derivation did — under-budgeting a
+    dense chunk's anonymize call by ~4x) would pass that test while still
+    regressing B2.  This test recomputes the facts contribution
+    explicitly at every run, so a future re-introduction of the folding
+    bug (an inflated ``_DOC_MAX_TOKENS``) fails HERE.
+    """
+
+    # f: extracted-facts-JSON-to-chunk token ratio.  Derived (not
+    # independently re-measured here) from
+    # paramem/graph/extractor.py's recorded "Empirical worst-case observed
+    # output for a dense resume chunk was ~2200 tokens" — a repo-recorded
+    # measurement over the chunker's then-~1500-word max, matching the
+    # numbers in document_chunker.py's _DOC_MAX_TOKENS derivation comment.
+    _DENSE_CHUNK_WORDS = 1500
+    _DENSE_CHUNK_OUTPUT_TOKENS = 2200
+
+    def test_dense_chunk_at_the_shipped_cap_fits_the_full_envelope(self):
+        from paramem.cloud.anonymize import (
+            _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
+            _MAPPING_ENTRY_OVERHEAD_TOKENS,
+            _OUTPUT_JSON_ENVELOPE_TOKENS,
+        )
+
+        reserve = _OUTPUT_JSON_ENVELOPE_TOKENS + _MAPPING_ENTRY_OVERHEAD_TOKENS
+        dense_chunk_real_tokens = self._DENSE_CHUNK_WORDS * _R_PROSE
+        f = self._DENSE_CHUNK_OUTPUT_TOKENS / dense_chunk_real_tokens
+
+        cap_words = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
+        chunk_real_tokens = cap_words * _R_PROSE
+
+        facts_tokens = f * chunk_real_tokens
+        chunk_input_tokens = chunk_real_tokens
+        chunk_echoed_output_tokens = chunk_real_tokens
+        anon_template_tokens = _live_anon_template_tokens()
+
+        total = (
+            anon_template_tokens
+            + facts_tokens
+            + chunk_input_tokens
+            + chunk_echoed_output_tokens
+            + reserve
+        )
+        assert total <= _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE, (
+            f"document-path budget broken at the shipped cap: "
+            f"{total:.0f} > {_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE} "
+            f"(anon_template={anon_template_tokens}, "
+            f"facts={facts_tokens:.0f}, chunk_in={chunk_input_tokens:.0f}, "
+            f"chunk_out={chunk_echoed_output_tokens:.0f}, reserve={reserve})"
+        )
 
 
 class TestPdfChunkerMaxTokens:

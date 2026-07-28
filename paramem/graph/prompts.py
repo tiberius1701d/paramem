@@ -206,9 +206,11 @@ def _load_prompt(
     local-model extraction prompts (``extraction.txt``,
     ``extraction_system.txt``, ``extraction_procedural.txt``).  Cloud
     cloud prompts (``cloud_enrichment.txt``, ``cloud_plausibility.txt``,
-    ``cloud_graph_enrichment.txt``) and ``anonymization.txt`` are
-    model-independent by design and always call this function with
-    ``model=None``.
+    ``cloud_graph_enrichment.txt``) and the two anonymization variants
+    (``anonymization.txt`` — session tier, has a ``{transcript}`` slot —
+    and ``anonymization_facts.txt`` — graph tier, facts-only, no
+    transcript machinery) are model-independent by design and always
+    call this function with ``model=None``.
 
     When *required* is ``True`` and the file is not found in any search
     directory, raises :exc:`FileNotFoundError` with the searched paths

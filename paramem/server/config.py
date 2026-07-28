@@ -18,6 +18,7 @@ from paramem.utils.config import (
     TrainingConfig,
 )
 from paramem.utils.paths import find_project_root
+from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD
 
 logger = logging.getLogger(__name__)
 
@@ -1107,6 +1108,46 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # (extraction_max_tokens − plausibility) × ~131 KB/token of peak ceiling
     # reduction on the worst-case generation.
     extraction_plausibility_max_tokens: int = 8192
+    # Total (prompt + output) token budget one local anonymize() call may
+    # occupy. 8192 is the sequence length vram.vram_cache_headroom_gib: 1.5
+    # was booked against ("single-sequence 8192-token Mistral KV cache is
+    # ~1 GiB; 0.5 GiB margin for activations"). max_new_tokens is DERIVED
+    # from this envelope minus the actual rendered prompt — never a second,
+    # independently-configured cap. Threaded through
+    # ExtractionPipeline.kwargs() to extract_graph's anonymize stage
+    # (session tier) and to graph_enrich.enrich_graph via
+    # ConsolidationLoop._current_extraction_config (graph tier).
+    # This value is the operator CEILING, not a guarantee: each call
+    # additionally clamps to live free VRAM (paramem.utils.vram_guard.
+    # effective_token_envelope, MIB_PER_TOKEN_TRANSIENT) — live evidence
+    # (2026-07-28) showed a packer-correct call sized exactly to this
+    # ceiling still faulting on a tighter-than-expected free-VRAM moment.
+    extraction_anonymize_token_envelope: int = 8192
+    # Fallback words->tokens ratio for paramem.utils.tokens.estimate_tokens
+    # when no live tokenizer is available (the CLI document chunker; an
+    # in-process caller whose tokenizer raised). MEASURED ONCE with the
+    # production tokenizer (Mistral 7B) over the three payload shapes the
+    # system ingests, shipped as their MAX so the fallback bounds rather
+    # than averages:
+    #   transcript shape    : 188 words   / 270 tokens  = 1.44 tokens/word
+    #   document shape (CV) : 1534 words  / 2934 tokens = 1.91 tokens/word
+    #   fact-JSON shape      : 2415 words / 8191 tokens = 3.39 tokens/word  <- MAX
+    #
+    # NOT independently governing: no estimate_tokens() call site reads
+    # this yaml value — every caller (in-process or CLI) uses the module
+    # constant paramem.utils.tokens.MEASURED_TOKENS_PER_WORD directly.
+    # This key is a CHECKED MIRROR of that constant, not a second source
+    # of truth: __post_init__ below rejects a value that disagrees with
+    # it, so the two can never silently drift apart. The key still exists
+    # (operator directive) so it is visible/documented in server.yaml and
+    # so the boot-time paramem.utils.tokens.check_ratio_drift call
+    # (paramem/server/app.py lifespan, after the tokenizer loads) has a
+    # yaml-editable value to re-measure against — but the value it reads
+    # is, by construction, always identical to the code constant.
+    # Per-tokenizer: after a base-model swap, re-measure and update BOTH
+    # this key and MEASURED_TOKENS_PER_WORD together — updating only one
+    # fails loudly at the next config load rather than silently drifting.
+    extraction_token_estimate_ratio: float = 3.4
     # Calibration endpoint — POST /calibrate/{extract,anonymize,plausibility}
     # exposes per-stage prompt iteration against the same Mistral instance the
     # production cycle uses. Default OFF — opt-in dev tool, never live in
@@ -1268,6 +1309,29 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
             raise ValueError(
                 f"consolidation.abort_quiesce_timeout_s must be > 0; "
                 f"got {self.abort_quiesce_timeout_s}"
+            )
+        if self.extraction_anonymize_token_envelope <= 0:
+            raise ValueError(
+                f"consolidation.extraction_anonymize_token_envelope must be > 0; "
+                f"got {self.extraction_anonymize_token_envelope!r}"
+            )
+        if self.extraction_token_estimate_ratio <= 0:
+            raise ValueError(
+                f"consolidation.extraction_token_estimate_ratio must be > 0; "
+                f"got {self.extraction_token_estimate_ratio!r}"
+            )
+        if self.extraction_token_estimate_ratio != MEASURED_TOKENS_PER_WORD:
+            raise ValueError(
+                f"consolidation.extraction_token_estimate_ratio "
+                f"({self.extraction_token_estimate_ratio!r}) does not match "
+                f"paramem.utils.tokens.MEASURED_TOKENS_PER_WORD "
+                f"({MEASURED_TOKENS_PER_WORD!r}). The code constant is the value "
+                f"every estimate_tokens() call site actually uses — this yaml key "
+                f"is a checked mirror of it, not an independent knob. After "
+                f"re-measuring the ratio (see that constant's comment for the "
+                f"measurement procedure), update BOTH the constant and this yaml "
+                f"key to the same new value; updating only one is rejected here "
+                f"rather than silently governing nothing."
             )
 
         judge = self.extraction_plausibility_judge

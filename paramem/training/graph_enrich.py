@@ -32,7 +32,7 @@ from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.memory.persistence import _IK_KEY_ATTR
 from paramem.utils.identity import canonical, is_speaker_id
-from paramem.utils.vram_guard import VramExhausted
+from paramem.utils.vram_guard import VramExhausted, is_fatal_cuda_fault
 
 if TYPE_CHECKING:
     from paramem.graph.extraction_pipeline import ExtractionConfig
@@ -318,8 +318,8 @@ def enrich_graph(
         extraction_config_provider: Zero-arg callable returning the
             :class:`~paramem.graph.extraction_pipeline.ExtractionConfig` whose
             ``enrichment_provider``, ``enrichment_provider_model``,
-            ``enrichment_provider_endpoint``, ``scrub``, and ``max_tokens`` fields drive
-            the cloud provider
+            ``enrichment_provider_endpoint``, ``scrub``, and
+            ``anonymize_token_envelope`` fields drive the cloud provider
             selection and cloud-egress contract. Deferred, not a resolved
             value: the caller's config typically lives behind a base-model
             holder that is released on the cloud-only path, and every skip
@@ -362,11 +362,55 @@ def enrich_graph(
               delta; it now sheds only the offending relation(s), counted
               here. Distinct from ``privacy_skipped_chunks`` (which fires
               before any cloud call is made).
+            - ``anonymize_slices`` (int): total local
+              :func:`~paramem.cloud.anonymize.anonymize_transcript`
+              (``generate()``) calls made across all chunks
+              (``sum(payload.slices)``) — NOT a count of
+              :func:`~paramem.cloud.anonymize.anonymize` invocations
+              (exactly one of those is made per chunk that reaches the
+              anonymize stage at all, opt-out included). A single
+              ``anonymize()`` call may now cost more than one underlying
+              local ``generate()`` call, since fact lists are packed into
+              token-envelope-bounded slices (see
+              :func:`~paramem.cloud.anonymize._slice_facts_to_envelope`);
+              ``payload.slices`` counts those. Accumulated for every chunk
+              whose payload ends up ``"ok"`` or ``"failed"`` (either way at
+              least one ``generate()`` call was attempted); an
+              ``"opted_out"`` chunk contributes 0 — ``opted_out_contract``
+              sets ``slices=0`` because no local call is made on that path
+              at all.
+            - ``privacy_skipped_slices`` (int): sum of
+              ``payload.slices_failed`` across all chunks — local calls
+              whose slice was dropped fail-closed (parse or guard
+              failure), so that slice's facts never reached the cloud.
+              Distinct from ``privacy_skipped_chunks``, which counts WHOLE
+              chunks skipped before any cloud call for that chunk (every
+              slice failed); ``privacy_skipped_slices`` is the finer
+              per-slice granularity and can be nonzero even when a
+              chunk's OTHER slices succeeded and their facts egressed —
+              that partial-withholding case also logs a per-chunk
+              WARNING (``0 < slices_failed < slices``).
             - ``skipped`` (bool): ``True`` when enrichment was bypassed.
             - ``skip_reason`` (str | None): reason token when skipped —
               ``"no_model"``, ``"floor"``, or ``"cloud_egress_blocked"``
               (the shared cloud-admission verdict said no; the individual
               unmet terms are in the accompanying warning, not the token).
+              A VRAM abort after N successful chunks is NOT a skip — the
+              pass ran and made progress — so ``skipped`` stays ``False``
+              and ``skip_reason`` stays ``None`` in that case; see
+              ``aborted_reason`` below.
+            - ``aborted_reason`` (str | None): ``None`` normally; ``"vram"``
+              when a :class:`~paramem.utils.vram_guard.VramExhausted`
+              stopped the chunk loop early.  The pass keeps whatever it
+              already merged from completed chunks (degrade granularity is
+              the CHUNK: ``anonymize()`` returns nothing until the whole
+              call completes, so a fault mid-chunk discards only that
+              chunk's own work) and returns normally rather than raising —
+              the caller (:meth:`~paramem.training.consolidation.
+              ConsolidationLoop._refine_consolidation_graph`) records an
+              incident and the fold trains on the merged-but-unenriched
+              graph.  Enrichment self-heals next cycle: the pass runs over
+              the cumulative graph every fold.
     """
     _noop = lambda: None  # noqa: E731
     _gc_disable = gc_disable or _noop
@@ -379,6 +423,9 @@ def enrich_graph(
         "privacy_skipped_chunks": 0,
         "mapping_rekey_dropped": 0,
         "dropped_relations": 0,
+        "aborted_reason": None,
+        "anonymize_slices": 0,
+        "privacy_skipped_slices": 0,
     }
 
     if model is None:
@@ -426,7 +473,13 @@ def enrich_graph(
     # (identical for every chunk), not per chunk, so a calibration
     # override / provenance-recording chokepoint (:func:`_load_prompt`)
     # is still honoured without re-reading the file per chunk.
-    anon_prompt = _load_prompt("anonymization.txt", required=True)
+    # ``anonymization_facts.txt`` (not the session tier's
+    # ``anonymization.txt``): this tier has no transcript at all
+    # (``transcript=""`` below), so the facts-only variant — same core
+    # contract, no transcript-rewrite half, output contract
+    # ``{"mapping": {...}}`` only — is the correct template; the
+    # §1.4 validity rule is satisfied via the transcript-empty leg.
+    anon_prompt = _load_prompt("anonymization_facts.txt", required=True)
     anon_system = _load_prompt("anonymization_system.txt", required=True)
     max_entities = max(1, max_entities_per_pass)
     hops = max(1, neighborhood_hops)
@@ -470,6 +523,15 @@ def enrich_graph(
     privacy_skipped_chunks = 0
     mapping_rekey_dropped = 0
     dropped_relations = 0
+    # Slice-level counters (U2 fact-boundary slicing) — see the docstring's
+    # Returns section. Accumulated per chunk from payload.slices /
+    # payload.slices_failed, whether that chunk's payload ends up "ok" or
+    # "failed".
+    anonymize_slices = 0
+    privacy_skipped_slices = 0
+    # None normally; set to "vram" when a VramExhausted stops the chunk loop
+    # early (see the except block below and the docstring's Returns section).
+    aborted_reason: str | None = None
     # Accumulates ik_keys from edges dropped by successful same_as contractions.
     # Keys are written to merger.removal_ledger after the loop completes
     # so the classifier can distinguish intended enrichment-driven removals from
@@ -525,11 +587,17 @@ def enrich_graph(
             # ``_substitute_whole_words`` compares against inside
             # ``triples``' subject/object fields below. (A)'s
             # domain-scoped fail-closed guard (step 6) is derived from
-            # ``facts`` — exactly ``triples`` here, the same triples this
-            # chunk sends to cloud — never from ``identity_domain`` (see
-            # that function's docstring for why the two domains must stay
-            # distinct). The anonymization prompt instructs the model to
-            # leave speaker{N} ids verbatim (never map them), so a
+            # ``facts`` — the SLICE's own facts at evaluation time (fact
+            # boundaries slice ``triples`` into token-envelope-bounded
+            # pieces, .agent/plan-anonymize-slicing.md U2/§5.2), NOT
+            # necessarily the whole ``triples`` list, and NOT the same as
+            # what this chunk ultimately sends to cloud: under partial
+            # withholding ``payload.facts`` is ``triples`` MINUS every
+            # fail-closed slice's facts (see ``AnonymizedContract``'s
+            # ``facts`` field docstring) — never from ``identity_domain``
+            # (see that function's docstring for why the two domains must
+            # stay distinct). The anonymization prompt instructs the model
+            # to leave speaker{N} ids verbatim (never map them), so a
             # speaker anchor never becomes a ``chunk_mapping`` entry here
             # — it is already anonymous and reaches the cloud payload bare
             # by design (ONE-lowercase-speaker{N} invariant), with no
@@ -539,7 +607,11 @@ def enrich_graph(
             # it exists ONLY as the diagnostics sink
             # ``request_graph_enrichment`` writes the binding-collision
             # findings to below; it is NOT how this chunk's facts reach
-            # that call (``triples`` is passed directly).
+            # that call — ``request_graph_enrichment`` reads
+            # ``payload.facts`` (the anonymize contract's egress-cleared
+            # subset of ``triples``), never ``triples`` directly (see that
+            # function's ``anon_triples = insert_placeholders(payload.facts,
+            # payload.forward)``, ``paramem/graph/extractor.py``).
             _chunk_session_graph = SessionGraph(session_id="__graph_enrichment__", timestamp="")
             # anonymize calls model.generate() internally (CLAUDE.md:
             # gradient checkpointing must be disabled around ANY
@@ -571,12 +643,19 @@ def enrich_graph(
                     transcript="",
                     scrub=scrub,
                     identity_domain=chunk_nodes,
-                    max_tokens=ext_cfg.max_tokens,
+                    token_envelope=ext_cfg.anonymize_token_envelope,
                     user_prompt_template=anon_prompt,
                     system_prompt=anon_system,
                 )
             finally:
                 _gc_enable()
+            # Slice-level counters — accumulated for every chunk that
+            # reaches this point, whether the payload ends up "ok" or
+            # "failed" (payload.slices / payload.slices_failed are
+            # meaningful in both cases: a "failed" payload means every
+            # slice failed, so slices_failed == slices).
+            anonymize_slices += payload.slices
+            privacy_skipped_slices += payload.slices_failed
             if payload.status == "failed":
                 # Two distinct fail-closed causes collapse to the SAME
                 # status; ``payload.failure`` names which one fired —
@@ -617,6 +696,20 @@ def enrich_graph(
                         "skipping cloud call (fail-closed)"
                     )
                 continue
+            if payload.slices_failed:
+                # status != "failed" here, so this is necessarily PARTIAL
+                # withholding (0 < slices_failed < slices): at least one
+                # slice of this chunk dropped fail-closed while the rest
+                # survived and will egress below — the operator-visible
+                # signal the whole-chunk-only privacy_skipped_chunks
+                # counter cannot surface on its own.
+                logger.warning(
+                    "graph_enrichment: %d/%d slice(s) dropped fail-closed for this "
+                    "chunk (partial withholding) — %d slice(s) still egress",
+                    payload.slices_failed,
+                    payload.slices,
+                    payload.slices - payload.slices_failed,
+                )
             mapping_rekey_dropped += payload.rekey_dropped
             if payload.rekey_dropped:
                 logger.warning(
@@ -626,7 +719,6 @@ def enrich_graph(
                     payload.rekey_dropped,
                 )
             result = request_graph_enrichment(
-                triples,
                 payload,
                 _chunk_session_graph,
                 api_key,
@@ -645,23 +737,56 @@ def enrich_graph(
             # ``_chunk_session_graph.diagnostics`` read back before the
             # throwaway graph is discarded.
             dropped_relations += dropped_relation_count
-        except VramExhausted:
-            # Not a chunk-level extraction failure — the caller (the
-            # per-cycle loop in app.py) must see this and retry rather
-            # than have it silently swallowed as a skipped chunk.
-            raise
+        except VramExhausted as exc:
+            # Fold-level degrade (U5), not a chunk-level skip: a VRAM
+            # exhaustion here means the driver is under pressure, and
+            # continuing the loop would very likely re-fault on the next
+            # chunk and burn minutes re-faulting — so this stops the WHOLE
+            # pass rather than trying the next chunk (``break``, not
+            # ``continue``).  Chunks that already completed keep their
+            # enrichment relations: they were already appended to
+            # ``enrichment_relations`` and are merged by the post-loop
+            # ``merger.merge_relations`` call below, which still runs after
+            # the ``break``.  The faulted chunk's own work is lost — no
+            # slice-level salvage (``anonymize()`` returns nothing until the
+            # whole call completes).  Enrichment self-heals next cycle: this
+            # pass runs over the cumulative graph every fold, so the skipped
+            # chunk's relations are simply re-discovered later.  The caller
+            # (``ConsolidationLoop._refine_consolidation_graph``) records an
+            # operator-visible incident from ``aborted_reason`` and the fold
+            # proceeds to training on the merged-but-unenriched graph.
+            logger.warning(
+                "graph_enrichment: VRAM exhausted on chunk %d/%d — stopping "
+                "the enrichment pass, keeping %d already-merged chunk(s): %s",
+                chunk_idx + 1,
+                len(chunks),
+                chunk_idx,
+                exc,
+            )
+            aborted_reason = "vram"
+            break
         except RuntimeError as exc:
-            # Narrow by design.  The only genuinely-failing runtime leg in
-            # this chunk body is the local ``generate()`` inside
-            # ``anonymize_transcript`` (the CUDA "device not ready"
-            # class); OOM already arrives as ``VramExhausted`` above.  The
+            # Sticky, process-fatal CUDA context faults (vram_guard.
+            # is_fatal_cuda_fault's contract: recovery is os._exit + process
+            # restart, NEVER an in-process release) must never be swallowed
+            # here — continuing to the next chunk would run every subsequent
+            # GPU call against a poisoned context.
+            if is_fatal_cuda_fault(exc):
+                raise
+            # Narrow by design otherwise.  The CUDA "device not ready"
+            # driver-fault class is converted to ``VramExhausted`` by
+            # ``vram_scope`` before it ever reaches this branch (see the
+            # ``except VramExhausted`` above) — this branch is UNREACHABLE
+            # for that class in production.  It exists for a genuinely
+            # different, non-driver-fault ``RuntimeError`` surfacing from
+            # the local ``generate()`` inside ``anonymize_transcript``.  The
             # cloud leg cannot raise — ``_cloud_call`` and the response
-            # parse both return ``None`` on failure — so a broad
-            # ``except Exception`` here could only ever swallow a
-            # programming error (e.g. a KeyError from a malformed prompt
-            # template), silently disabling graph enrichment forever.
-            # Those must kill the fold.  Widen by NAME if a legitimate
-            # runtime condition surfaces; never back to ``Exception``.
+            # parse both return ``None`` on failure — so a broad ``except
+            # Exception`` here could only ever swallow a programming error
+            # (e.g. a KeyError from a malformed prompt template), silently
+            # disabling graph enrichment forever.  Those must kill the fold.
+            # Widen by NAME if a legitimate runtime condition surfaces;
+            # never back to ``Exception``.
             logger.warning(
                 "graph_enrichment: runtime error during chunk — %s: %s",
                 type(exc).__name__,
@@ -840,7 +965,8 @@ def enrich_graph(
 
     logger.info(
         "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d "
-        "privacy_skipped_chunks=%d mapping_rekey_dropped=%d dropped_relations=%d",
+        "privacy_skipped_chunks=%d mapping_rekey_dropped=%d dropped_relations=%d "
+        "anonymize_slices=%d privacy_skipped_slices=%d aborted_reason=%s",
         provider,
         calls_made,
         total_new,
@@ -848,6 +974,9 @@ def enrich_graph(
         privacy_skipped_chunks,
         mapping_rekey_dropped,
         dropped_relations,
+        anonymize_slices,
+        privacy_skipped_slices,
+        aborted_reason,
     )
     # Write enrichment-collapsed ik_keys to the merger's removal ledger so the
     # drift classifier can route them to drift_intended_removal rather than
@@ -867,4 +996,7 @@ def enrich_graph(
         "dropped_relations": dropped_relations,
         "skipped": False,
         "skip_reason": None,
+        "aborted_reason": aborted_reason,
+        "anonymize_slices": anonymize_slices,
+        "privacy_skipped_slices": privacy_skipped_slices,
     }

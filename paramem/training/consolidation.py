@@ -525,6 +525,7 @@ class ConsolidationLoop:
         extraction_temperature: float = 0.0,
         extraction_max_tokens: int = 8192,
         extraction_plausibility_max_tokens: int = 8192,
+        extraction_anonymize_token_envelope: int = 8192,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
         run_id: str | None = None,
@@ -651,6 +652,7 @@ class ConsolidationLoop:
                 temperature=extraction_temperature,
                 max_tokens=extraction_max_tokens,
                 plausibility_max_tokens=extraction_plausibility_max_tokens,
+                anonymize_token_envelope=extraction_anonymize_token_envelope,
                 enrichment_provider=extraction_enrichment_provider,
                 enrichment_provider_model=extraction_enrichment_provider_model,
                 enrichment_provider_endpoint=extraction_enrichment_provider_endpoint,
@@ -6176,11 +6178,22 @@ class ConsolidationLoop:
            already-normalized graph. Constructed fresh on every call, never
            cached: ``self.model`` is re-wrapped by adapter operations elsewhere
            in the fold, so a cached refiner would risk pinning a stale handle.
-        2. Emit a debug snapshot ("enriched") after the refine step (or
+        2. When ``result.enrichment`` carries ``aborted_reason == "vram"``
+           (the enrichment pass stopped early on
+           :class:`~paramem.utils.vram_guard.VramExhausted` but kept
+           whatever it already merged — see
+           :func:`~paramem.training.graph_enrich.enrich_graph`'s
+           docstring), record an ``enrichment_degraded`` incident (severity
+           ``"warning"``) via the same :func:`~paramem.server.incidents.
+           record_incident` surface used elsewhere in this class, when
+           ``self._incidents_state_dir`` is configured.  Never raises: the
+           fold always proceeds past this step, training on the
+           merged-but-unenriched graph — enrichment self-heals next cycle.
+        3. Emit a debug snapshot ("enriched") after the refine step (or
            immediately when both stages are skipped). Emitted from the loop
            rather than the refiner, which calls :func:`on_normalization`
            directly for its own pass.
-        3. Two INDEPENDENTLY-guarded recurrence-bump blocks, reading the
+        4. Two INDEPENDENTLY-guarded recurrence-bump blocks, reading the
            reinforcement maps off the returned
            :class:`~paramem.training.graph_tier.RefineResult` (never unioned
            under one relaxed guard — each dict is consumed by its own loop with
@@ -6220,6 +6233,39 @@ class ConsolidationLoop:
         """
         refiner = self.build_tier_refiner(self.merger)
         result = refiner.refine(normalize=normalize, enrich=enrich)
+
+        # Surface a VRAM-driven enrichment degrade (U5) as an operator-visible
+        # incident — the SAME record_incident surface extract_session's
+        # cloud_enrichment_degraded path uses above.  result.enrichment is the
+        # raw diagnostics dict enrich_graph returns; aborted_reason == "vram"
+        # means the chunk loop stopped early on VramExhausted but kept
+        # whatever it already merged (see enrich_graph's docstring) rather
+        # than aborting the fold.  Severity "warning" (the fold succeeds
+        # regardless): enrichment self-heals next cycle, since the pass runs
+        # over the cumulative graph every fold, so there is nothing to retry
+        # here.
+        if (
+            result.enrichment is not None
+            and result.enrichment.get("aborted_reason") == "vram"
+            and self._incidents_state_dir is not None
+        ):
+            from paramem.server.incidents import record_incident
+
+            record_incident(
+                self._incidents_state_dir,
+                type="enrichment_degraded",
+                key="graph_enrich_vram",
+                severity="warning",
+                summary=(
+                    "Consolidation: graph-tier enrichment stopped early on VRAM "
+                    "exhaustion — kept already-merged chunks"
+                ),
+                detail={
+                    "type": "enrichment_degraded",
+                    "chunks": result.enrichment.get("chunks", 0),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
 
         # Debug: snapshot the refined graph (after normalization + enrichment, or
         # immediately when both are skipped at level off).

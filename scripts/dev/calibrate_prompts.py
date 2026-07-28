@@ -132,6 +132,7 @@ _STAGE_PROMPTS: dict[str, tuple[str, ...]] = {
     "enrich": ("enrich",),
     "plausibility": ("plausibility",),
     "normalize": ("normalize_filter",),
+    "anonymize_facts": ("anonymize_facts",),
     "name": ("name_user", "name_system"),
 }
 
@@ -484,6 +485,11 @@ _STAGE_FILENAME = {
     "enrich": "cloud_enrichment.txt",
     "plausibility": "cloud_plausibility.txt",
     "normalize_filter": "predicate_normalization.txt",
+    # Graph-tier facts-only anonymize variant — see
+    # configs/prompts/anonymization_facts.txt. Distinct from "anonymize"
+    # (the session-tier, transcript-bearing template) above; POST
+    # /calibrate/anonymize_facts, not /calibrate/anonymize.
+    "anonymize_facts": "anonymization_facts.txt",
     "name_user": "name_extraction.txt",
     "name_system": "name_extraction_system.txt",
 }
@@ -520,8 +526,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "comma-separated stage names; stages are stop points along the "
             "production pipeline — selecting fewer stages just spares out "
-            "the later steps. 'normalize' is a standalone graph-level stage "
-            "that requires --snapshot and cannot be combined with chunk stages."
+            "the later steps. 'normalize' and 'anonymize_facts' are standalone "
+            "graph-level stages that require --snapshot and cannot be combined "
+            "with chunk stages (or each other)."
         ),
     )
     parser.add_argument(
@@ -529,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "path to a graph_merged_snapshot.json (NetworkX node-link format). "
-            "Required when --stages includes 'normalize'. "
+            "Required when --stages includes 'normalize' or 'anonymize_facts'. "
             "Cannot be combined with chunk stages (extract, anonymize, enrich, plausibility)."
         ),
     )
@@ -631,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"--chunk {args.chunk} out of range (input has {len(chunks)} chunks)"
                 )
             chunks = [chunks[args.chunk]]
-    elif "normalize" not in stages:
+    elif "normalize" not in stages and "anonymize_facts" not in stages and "name" not in stages:
         raise SystemExit(
             "Error: --input is required for chunk stages "
             "(extract, anonymize, enrich, plausibility)."
@@ -660,6 +667,19 @@ def main(argv: list[str] | None = None) -> int:
     if "normalize" in stages and not args.snapshot:
         raise SystemExit(
             "Error: --stages normalize requires --snapshot <graph_merged_snapshot.json>"
+        )
+    # Guard: anonymize_facts cannot be combined with other stages — it uses
+    # --snapshot (the same graph-level artifact "normalize" reads), not
+    # --input.  Mirror the normalize mutual-exclusion pattern.
+    if "anonymize_facts" in stages and stages != ["anonymize_facts"]:
+        raise SystemExit(
+            "Error: 'anonymize_facts' cannot be combined with other stages "
+            "(extract, anonymize, enrich, plausibility, normalize, name). "
+            "Run it in a separate invocation: --stages anonymize_facts --snapshot <path>"
+        )
+    if "anonymize_facts" in stages and not args.snapshot:
+        raise SystemExit(
+            "Error: --stages anonymize_facts requires --snapshot <graph_merged_snapshot.json>"
         )
     # Guard: name cannot be combined with chunk stages (it uses --turns-jsonl,
     # not --input).  Mirror the normalize mutual-exclusion pattern.
@@ -833,6 +853,41 @@ def main(argv: list[str] | None = None) -> int:
                     "stage": "normalize",
                     "snapshot_path": args.snapshot,
                     "variance": _variance_report("normalize", normalize_runs),
+                },
+            )
+
+    # ----- anonymize_facts stage (graph-level, runs outside the chunk loop) -
+    # The facts-only anonymize variant graph-tier enrichment uses
+    # (configs/prompts/anonymization_facts.txt) — distinct from the
+    # session-tier "anonymize" chunk stage above. Reads the same --snapshot
+    # artifact "normalize" reads; the server derives facts + identity_domain
+    # from it (paramem.server.calibrate.calibrate_anonymize_facts).
+    if "anonymize_facts" in stages:
+        anonymize_facts_runs: list[dict] = []
+        for seed in seeds:
+            params = dict(params_base)
+            params["seed"] = seed
+            af = _post_stage(
+                args.server,
+                "anonymize_facts",
+                {
+                    "snapshot_path": args.snapshot,
+                    "prompt_variants": _variants(
+                        prompts_dir, args.prompt_prefix, "anonymize_facts"
+                    ),
+                    "params": {k: v for k, v in params.items() if v is not None},
+                },
+            )
+            anonymize_facts_runs.append({"seed": seed, **af})
+        for run in anonymize_facts_runs:
+            _record_run("anonymize_facts", str(run["seed"]), run)
+        if len(seeds) > 1:
+            write_artifact(
+                dump_dir / "05b_anonymize_facts.json",
+                {
+                    "stage": "anonymize_facts",
+                    "snapshot_path": args.snapshot,
+                    "variance": _variance_report("anonymize_facts", anonymize_facts_runs),
                 },
             )
 

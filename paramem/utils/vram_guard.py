@@ -1,6 +1,6 @@
 """Process-side VRAM safety net.
 
-Two integration points, one component:
+Three integration points, one component:
 
 1. :func:`apply_process_cap` — call once at server startup, before any
    GPU allocation. Sets ``torch.cuda.set_per_process_memory_fraction``
@@ -15,6 +15,13 @@ Two integration points, one component:
    ``torch.cuda.OutOfMemoryError`` it logs the phase label, clears the
    cache, and re-raises as :class:`VramExhausted` so the cycle handler
    aborts rather than silently continuing on indeterminate state.
+
+3. :func:`effective_token_envelope` — clamps an operator-configured
+   token envelope (e.g. ``consolidation.extraction_anonymize_token_envelope``)
+   down to what LIVE free VRAM can actually support, using the measured
+   :data:`MIB_PER_TOKEN_TRANSIENT` constant. The configured value stays
+   the ceiling; live free VRAM only sizes a call down, never up. Consumed
+   by :func:`paramem.cloud.anonymize.anonymize`.
 
 The component is intentionally a no-op when CUDA is unavailable so test
 suites and CPU-only environments are unaffected.
@@ -34,6 +41,30 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_PROCESS_FRACTION = 0.85
+
+# Measured VRAM cost per token of a transient local generate() call's
+# KV-cache + activation growth (prefill + decode combined) — the constant
+# behind the dynamic anonymize-envelope clamp
+# (paramem.cloud.anonymize.anonymize; .agent/plan-anonymize-slicing.md
+# §5.2/§5.3 background, owner-approved live-VRAM amendment 2026-07-28).
+#
+# Derivation (live-fold fault, journal 2026-07-28 06:48): an 8,192-token
+# call (prompt 7,257 + max_new 935 — the packer sized it exactly to the
+# configured envelope) faulted "device not ready" with only 1,191 MiB free
+# at entry; reserved climbed 4,698 -> 6,278 MiB (a 1,580 MiB jump) before
+# free hit 0. That gives a FLOOR of 1,191 / 8,192 ~= 0.145 MiB/token — an
+# UNDERESTIMATE, since the call never finished allocating (true demand was
+# higher than what 1,191 MiB could satisfy). A 4,249-token call completed
+# successfully with only 1,407 MiB free, giving a loose CEILING of
+# 1,407 / 4,249 ~= 0.331 MiB/token (loose: that call may not have needed
+# the full 1,407 MiB available, so the true per-token cost could be lower).
+#
+# Chosen conservatively toward FEWER supportable tokens (per owner
+# direction): 1.5x the measured floor (0.145 * 1.5 ~= 0.218, rounded to
+# 0.22) — inside the owner-specified 0.20-0.22 MiB/token band, comfortably
+# above the floor (never under-clamps the failing case) and well below the
+# loose ceiling (leaves margin against the successful case's variance).
+MIB_PER_TOKEN_TRANSIENT: float = 0.22
 
 
 class VramExhausted(RuntimeError):
@@ -368,6 +399,62 @@ def safe_empty_cache() -> None:
         torch.cuda.empty_cache()
     except Exception as exc:  # noqa: BLE001
         logger.warning("VRAM guard: empty_cache failed: %s", exc)
+
+
+def effective_token_envelope(configured_envelope: int) -> tuple[int, float | None]:
+    """Clamp *configured_envelope* to what LIVE free VRAM can support.
+
+    The operator-configured envelope
+    (``consolidation.extraction_anonymize_token_envelope``) stays the
+    ceiling; this function only sizes a call DOWN, never up. Returns
+    ``(effective_envelope, free_mib)``:
+
+    * ``effective_envelope = min(configured_envelope, free_mib /
+      MIB_PER_TOKEN_TRANSIENT)``, floored to an int.
+    * ``free_mib`` is the measured free VRAM in MiB, or ``None`` when CUDA
+      is unavailable or the driver query failed — a caller distinguishes
+      "not measured" from a real (possibly tiny) reading, and logs the
+      former without pretending it is a numeric zero.
+
+    No CUDA available -> ``(configured_envelope, None)``: a strict
+    passthrough so CPU-only test suites and environments never need a GPU
+    to exercise the calling code.
+
+    Calls :func:`safe_empty_cache` first — UNCONDITIONALLY, not only when
+    the reading looks tight — before reading
+    ``torch.cuda.mem_get_info()``. Two reasons: (1) never call bare
+    ``torch.cuda.empty_cache()`` directly (project rule — cuBLAS
+    workspaces sit outside PyTorch's allocator and a bare call leaves them
+    resident, understating free VRAM and eventually surfacing as a
+    "[Not Found]" ghost compute app); (2) the measurement is cheap
+    relative to the ``generate()`` call it sizes (this function's own
+    caller — :func:`~paramem.cloud.anonymize.anonymize` — invokes it at
+    most once per chunk/session, never in an inner per-slice loop), so
+    there is no cost-driven reason to skip the reclaim step and risk
+    reading stale, fragmentation-depressed free memory.
+
+    Measured ONCE per caller invocation (no mid-call re-measurement): a
+    caller that slices multiple local ``generate()`` calls off one
+    measurement (:func:`~paramem.cloud.anonymize.anonymize`'s per-slice
+    loop) gets a conservative sizing for later slices — each
+    ``generate()`` frees its own KV cache before the next one starts, so
+    free VRAM typically recovers between slices, and an entry-time
+    measurement therefore never OVER-estimates what a later slice can
+    use. Re-measuring per slice would not be wrong, but it is not what
+    this call does; that tradeoff is the caller's, not this function's.
+    """
+    if not torch.cuda.is_available():
+        return configured_envelope, None
+    safe_empty_cache()
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("effective_token_envelope: mem_get_info failed: %s", exc)
+        return configured_envelope, None
+    free_mib = free_bytes / (1024 * 1024)
+    supportable_tokens = int(free_mib / MIB_PER_TOKEN_TRANSIENT)
+    effective = min(configured_envelope, max(supportable_tokens, 0))
+    return effective, free_mib
 
 
 @contextmanager

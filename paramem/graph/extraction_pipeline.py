@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
 from paramem.graph.extractor import (
     DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     DEFAULT_SYSTEM_PROMPT_FILENAME,
@@ -116,6 +117,16 @@ class ExtractionConfig:
     # docstring for the same reasoning applied one layer down.
     scrub: set[str] | frozenset[str] = field(kw_only=True)
     correction_entity_types: set[str] | frozenset[str] | None = None
+    # Total (prompt + output) token budget one local anonymize() call may
+    # occupy — forwarded to extract_graph's anonymize_token_envelope
+    # parameter, which threads it to every anonymize stage the pipeline
+    # runs (session-tier extraction) AND is the same field graph-tier
+    # enrichment (paramem.training.graph_enrich.enrich_graph) reads off
+    # this same ExtractionConfig instance via
+    # ConsolidationLoop._current_extraction_config. Default matches
+    # anonymize.py's own module default; production sources
+    # consolidation.extraction_anonymize_token_envelope.
+    anonymize_token_envelope: int = _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
 
 
 def _require_speaker_id(overrides: dict) -> str:
@@ -266,6 +277,7 @@ class ExtractionPipeline:
             plausibility_endpoint=pick("plausibility_endpoint", cfg.plausibility_endpoint),
             scrub=pick("scrub", cfg.scrub),
             correction_entity_types=pick("correction_entity_types", cfg.correction_entity_types),
+            anonymize_token_envelope=pick("anonymize_token_envelope", cfg.anonymize_token_envelope),
             speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),

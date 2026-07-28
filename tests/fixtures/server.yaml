@@ -269,6 +269,8 @@ consolidation:
   recall_probe_batch_size: 16       # matches server.yaml.example; per-test overrides go in code
   extraction_max_tokens: 8192  # output-token budget — must match server.yaml.example to avoid silent truncation in simulate-mode probes (gated by tests/server/test_config_parity.py)
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap — must match server.yaml.example (parity-gated)
+  extraction_anonymize_token_envelope: 8192  # must match server.yaml.example (parity-gated)
+  extraction_token_estimate_ratio: 3.4  # must match server.yaml.example (parity-gated; per-tokenizer, pinned Mistral 7B in this fixture)
   calibrate_endpoint_enabled: false  # opt-in dev tool; off in tests by default
   extraction_enrichment_provider: anthropic  # dev-test posture: exercise cloud enrichment code paths. Cloud calls fall through gracefully when ANTHROPIC_API_KEY is unset.
   extraction_enrichment_provider_model: claude-sonnet-4-6  # model for the enrichment provider

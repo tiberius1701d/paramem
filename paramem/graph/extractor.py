@@ -38,6 +38,7 @@ from paramem.graph.relation_build import build_relations
 from paramem.graph.schema import SessionGraph
 from paramem.models.loader import adapt_messages, base_model_inference
 from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.tokens import estimate_tokens
 from paramem.utils.vram_guard import vram_scope
 
 logger = logging.getLogger(__name__)
@@ -79,10 +80,19 @@ class ExtractionFailed(RuntimeError):
 # (server.yaml ``consolidation.extraction_max_tokens``) governs the whole
 # chain.
 #
-# 8192 is sized for Mistral 7B against ~1500-word document chunks (the local
-# chunker's max). Empirical worst-case observed output for a dense resume
-# chunk was ~2200 tokens; 8192 gives ~3.7× headroom. If the chunker contract
-# changes, revisit jointly with that change.
+# 8192 is sized for Mistral 7B against document chunks up to
+# ``paramem.graph.document_chunker._DOC_MAX_TOKENS``, the local chunker's
+# max — currently ~934 words (revisited jointly, .agent/plan-anonymize-
+# slicing.md U6/review finding B2: _DOC_MAX_TOKENS is now DERIVED from the
+# anonymize-call token envelope rather than an independent ~1500-word
+# heuristic, and that derivation itself consumes the empirical figure
+# below). Empirical worst-case observed output for a dense resume chunk was
+# ~2200 tokens against the PRIOR ~1500-word max; 8192 still gives ample
+# headroom against the smaller current max (a smaller chunk produces
+# proportionally less extraction output, not more). If the chunker contract
+# changes again, revisit jointly with that change — this comment AND
+# ``_DOC_MAX_TOKENS``'s own derivation comment both consume the ~2200-token
+# figure and must be updated together.
 #
 # Plausibility output couples to chunk density. The filter's contract
 # (configs/prompts/cloud_plausibility.txt) is "Return ONLY a JSON array of
@@ -1669,7 +1679,6 @@ def request_enrichment(
 
 
 def request_graph_enrichment(
-    triples: list[dict],
     payload: AnonymizedContract,
     graph: SessionGraph,
     api_key: str,
@@ -1706,7 +1715,10 @@ def request_graph_enrichment(
 
     The chunk's anonymized ``subject``/``object`` fields come from
     :func:`~paramem.cloud.placeholders.insert_placeholders` applied
-    DIRECTLY to ``triples`` (never a ``Relation`` round trip through
+    DIRECTLY to ``payload.facts`` — the (real-name, un-substituted) triple
+    subset :func:`~paramem.cloud.anonymize.anonymize` already cleared for
+    egress (the caller's ``triples`` minus any fail-closed slice's triples;
+    see that function's docstring) — never a ``Relation`` round trip through
     ``graph.relations`` — the caller's throwaway per-chunk
     ``SessionGraph`` no longer carries relations at all; see ``graph``'s
     own docstring entry below): every other key on each triple dict
@@ -1775,13 +1787,12 @@ def request_graph_enrichment(
     ``{triples_json}`` placeholder.
 
     Args:
-        triples: List of ``{"subject", "predicate", "object", "relation_type",
-            "speaker_id"}`` dicts representing the chunk subgraph, from
-            :func:`~paramem.training.graph_enrich.serialize_subgraph_triples`
-            (unchanged — anonymization happens on its output here, not
-            inside it).
         payload: :class:`~paramem.cloud.anonymize.AnonymizedContract` —
             the caller's already-completed (A) result for this chunk.
+            ``payload.facts`` is the source of the triples this function
+            sends to cloud — no separate ``triples`` argument; a
+            fail-closed slice's triples never reach this function because
+            they never survived into ``payload.facts``.
         graph: The caller's throwaway per-chunk ``SessionGraph`` (carries
             no relations of its own — this function never reads
             ``graph.relations``) — the diagnostics sink this function
@@ -1812,7 +1823,7 @@ def request_graph_enrichment(
     ``configs/prompts/cloud_graph_enrichment.txt`` to tune; no code changes
     are needed.
     """
-    anon_triples = insert_placeholders(triples, payload.forward)
+    anon_triples = insert_placeholders(payload.facts, payload.forward)
 
     enrichment_prompt = _load_prompt("cloud_graph_enrichment.txt", required=True)
     system_prompt = _load_prompt("cloud_graph_enrichment_system.txt", required=True)
@@ -2524,10 +2535,7 @@ def judge_plausibility(
         add_generation_prompt=True,
     )
     # Token count is the actual KV-cache driver, not character count.
-    try:
-        token_count = len(tokenizer(formatted, add_special_tokens=False)["input_ids"])
-    except Exception:  # noqa: BLE001
-        token_count = -1
+    token_count = estimate_tokens(formatted, tokenizer)
     logger.info(
         "plaus_filter prompt: chars=%d tokens=%d max_new_tokens=%d",
         len(formatted),

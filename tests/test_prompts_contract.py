@@ -1316,6 +1316,134 @@ class TestAnonymizationPrompt:
         )
 
 
+class TestAnonymizationFactsPrompt:
+    """Contract tests for ``anonymization_facts.txt`` — the graph-tier,
+    facts-only anonymization variant (U4,
+    .agent/plan-anonymize-slicing.md). Shares the session-tier
+    ``anonymization.txt``'s core contract (shape, uniqueness, totality,
+    direction, the ``speaker{N}``-verbatim rule) but drops the
+    transcript-rewrite half entirely: no ``{transcript}`` slot, no
+    ``anonymized_transcript`` in the output contract.
+    """
+
+    def _render(self, tmpl: str) -> str:
+        return tmpl.format(
+            scrub_categories="person name, phone number",
+            facts_json='[{"subject": "Rowan", "predicate": "lives_in", '
+            '"object": "Millbrook", "relation_type": "factual", "confidence": 0.9}]',
+        )
+
+    def test_renders_with_scrub_categories_and_facts_json_no_transcript_slot(self):
+        """Item 27: renders with {scrub_categories} and {facts_json} and
+        declares no {transcript} slot; no stray unrendered {word} after
+        formatting."""
+        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        assert "{transcript}" not in tmpl, (
+            "anonymization_facts.txt must not declare a {transcript} slot — "
+            "there is no transcript at the graph tier."
+        )
+        rendered = self._render(tmpl)
+        assert "{facts_json}" not in rendered
+        assert "{scrub_categories}" not in rendered
+        stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
+        assert not stray, f"Stray unrendered placeholder(s) found: {stray!r}"
+
+    def test_shares_core_contract_shape_uniqueness_totality_direction(self):
+        """Item 28: carries the shared core contract — shape (PascalCase
+        + `_<N>`), uniqueness, totality, direction, and the
+        `speaker{N}`-verbatim rule, with no example mapping a `speaker{N}`
+        token."""
+        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        rendered = self._render(tmpl)
+        assert "PascalCase" in rendered or "Prefix" in rendered
+        assert "UNIQUE" in rendered or "unique" in rendered
+        assert "totality" in rendered.lower() or "every placeholder" in rendered.lower()
+        assert "real_value" in rendered or "real value" in rendered.lower()
+
+        lower = tmpl.lower()
+        assert "speaker" in lower and "verbatim" in lower, (
+            "anonymization_facts.txt must state the speaker{N}-stays-verbatim rule."
+        )
+        examples_section = tmpl[tmpl.index("## Examples") :]
+        assert "speaker" not in examples_section.lower(), (
+            "No anonymization_facts.txt example may map a speaker{N} token."
+        )
+
+    def test_examples_use_fictional_entities_no_city_org_product_positive_example(self):
+        """Item 29: examples use fictional entities only and contain no
+        city/org/product positive scrub example (City_1/Org_1/Product_1
+        absent)."""
+        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        for forbidden in ("City_1", "Org_1", "Product_1"):
+            assert forbidden not in tmpl, (
+                f"anonymization_facts.txt must not positively scrub-example {forbidden!r}."
+            )
+
+    def test_output_contract_is_mapping_only(self):
+        """Item 30: the facts template requests `mapping` and ONLY
+        `mapping` — no `anonymized_transcript` key, no `{transcript}`
+        slot — and renders correctly through the shared
+        `_render_anonymize_prompt` despite the unused `transcript=`
+        keyword."""
+        from paramem.cloud.anonymize import _render_anonymize_prompt
+
+        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        assert "anonymized_transcript" not in tmpl, (
+            "anonymization_facts.txt must not request anonymized_transcript — "
+            "there is no transcript at the graph tier."
+        )
+        tail = tmpl.strip().splitlines()[-1]
+        assert "mapping" in tail
+        assert "anonymized_transcript" not in tail
+
+        class _CountingTokenizer:
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                return "".join(m["content"] for m in messages)
+
+            def __call__(self, text, add_special_tokens=False):
+                return {"input_ids": list(range(len(text)))}
+
+        # Renders cleanly despite the unused transcript= keyword — proves
+        # the str.format-ignores-unused-kwargs claim the shared renderer
+        # relies on.
+        rendered = _render_anonymize_prompt(
+            [{"subject": "Rowan", "predicate": "lives_in", "object": "Millbrook"}],
+            _CountingTokenizer(),
+            scrub={"person name"},
+            transcript="this argument is unused by anonymization_facts.txt",
+            user_prompt_template=tmpl,
+            system_prompt="",
+        )
+        assert "this argument is unused" not in rendered
+        assert "{transcript}" not in rendered
+
+    def test_graph_enrich_loads_the_facts_variant_session_tier_loads_transcript_variant(self):
+        """Item 31: ``graph_enrich`` loads ``anonymization_facts.txt``
+        (and the session tier still loads ``anonymization.txt``) — a
+        direct source-level assertion at the chokepoint, so a copy-paste
+        regression to the transcript variant is caught.
+
+        A live ``_load_prompt`` spy over a full ``enrich_graph`` call is
+        not used here: every early-return guard (``no_model``, the
+        10-node floor, ``cloud_egress_blocked``) short-circuits BEFORE
+        the prompt load this test cares about, so a spy would only prove
+        the guards fire, not which template name is hardcoded past them.
+        """
+        import inspect
+
+        import paramem.training.graph_enrich as graph_enrich_module
+
+        source = inspect.getsource(graph_enrich_module.enrich_graph)
+        assert '"anonymization_facts.txt"' in source
+        assert '"anonymization.txt"' not in source
+
+        import paramem.graph.stage_anonymize as stage_anonymize_module
+
+        session_source = inspect.getsource(stage_anonymize_module._stage_anonymize)
+        assert '"anonymization.txt"' in session_source
+        assert '"anonymization_facts.txt"' not in session_source
+
+
 class TestEntityCorrectionPrompt:
     """Contract tests for ``entity_correction.txt`` (paramem.graph.entity_correction).
 

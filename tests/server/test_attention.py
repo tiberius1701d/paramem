@@ -27,6 +27,7 @@ from paramem.server.attention import (
     _collect_migration_items,
     _collect_pre_flight_items,
     _collect_sweeper_items,
+    _collect_token_ratio_drift_items,
     _collect_voice_degradation_items,
     _collect_vram_low_headroom_items,
     collect_attention_items,
@@ -1034,3 +1035,141 @@ def test_local_recall_inactive_no_store_but_buffer_with_pending():
     items = _collect_local_recall_inactive_items(state)
     assert len(items) == 1
     assert items[0].kind == "local_recall_inactive"
+
+
+# ---------------------------------------------------------------------------
+# _collect_token_ratio_drift_items
+# ---------------------------------------------------------------------------
+
+
+def test_token_ratio_drift_silent_when_no_warning_key():
+    """No ``token_ratio_drift_warning`` in state (the common case: the
+    boot-time check found no drift, or a tokenizer never loaded) → no
+    item."""
+    state = _live_state()
+    assert _collect_token_ratio_drift_items(state) == []
+
+
+def test_token_ratio_drift_fires_with_configured_and_observed_ratios():
+    """A non-empty ``token_ratio_drift_warning`` dict (written by the
+    lifespan's boot-time ``check_ratio_drift`` call, U3) fires exactly one
+    ``warning`` item naming both ratios (mirrors
+    ``_collect_vram_low_headroom_items``'s severity)."""
+    state = _live_state(token_ratio_drift_warning={"configured_ratio": 3.4, "observed_ratio": 4.1})
+    items = _collect_token_ratio_drift_items(state)
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "token_ratio_drift"
+    assert item.level == "warning"
+    assert "3.40" in item.summary
+    assert "4.10" in item.summary
+    assert item.action_hint is not None
+    assert "extraction_token_estimate_ratio" in item.action_hint
+    assert item.age_seconds is None
+
+
+def test_token_ratio_drift_included_in_collect_attention_items():
+    """The populator is wired into the public entry point."""
+    state = _live_state(token_ratio_drift_warning={"configured_ratio": 1.0, "observed_ratio": 2.0})
+    items = collect_attention_items(state, config=None)
+    kinds = {it.kind for it in items}
+    assert "token_ratio_drift" in kinds
+
+
+# ---------------------------------------------------------------------------
+# paramem.server.app._check_token_ratio_drift — the writer this module's
+# populator reads. Extracted out of the lifespan body into a named,
+# unit-testable function (missing test 4, code review) — see that
+# function's own docstring for why a lifespan-frame local was the wrong
+# home for it.
+# ---------------------------------------------------------------------------
+
+
+class _StubTokenizer:
+    """Deterministic tokenizer double: one id per character."""
+
+    def __call__(self, text: str, add_special_tokens: bool = False):
+        return {"input_ids": list(range(len(text)))}
+
+
+def _make_drift_config(ratio: float):
+    """Minimal object exposing the one attribute
+    ``_check_token_ratio_drift`` reads: ``config.consolidation.
+    extraction_token_estimate_ratio``."""
+    return SimpleNamespace(consolidation=SimpleNamespace(extraction_token_estimate_ratio=ratio))
+
+
+def test_check_token_ratio_drift_noop_without_tokenizer():
+    """No tokenizer loaded (cloud-only boot) -> no state write, no crash."""
+    import paramem.server.app as app_module
+
+    prior = app_module._state.get("tokenizer")
+    prior_warning = app_module._state.pop("token_ratio_drift_warning", None)
+    app_module._state["tokenizer"] = None
+    try:
+        app_module._check_token_ratio_drift(_make_drift_config(3.4))
+        assert "token_ratio_drift_warning" not in app_module._state
+    finally:
+        app_module._state["tokenizer"] = prior
+        if prior_warning is not None:
+            app_module._state["token_ratio_drift_warning"] = prior_warning
+        else:
+            app_module._state.pop("token_ratio_drift_warning", None)
+
+
+def test_check_token_ratio_drift_sets_warning_on_drift(caplog):
+    """A configured ratio well below what the (fake) live tokenizer
+    observes writes the attention-consumed state key and logs a
+    WARNING."""
+    import logging
+
+    import paramem.server.app as app_module
+
+    prior = app_module._state.get("tokenizer")
+    prior_warning = app_module._state.pop("token_ratio_drift_warning", None)
+    app_module._state["tokenizer"] = _StubTokenizer()
+    # The app logger does not propagate to root under this suite's
+    # configuration (same reason tests/test_intent.py and
+    # tests/test_graph_enrichment.py attach directly to the module
+    # logger) — caplog.at_level alone is silent here.
+    app_logger = logging.getLogger("paramem.server.app")
+    prior_level = app_logger.level
+    app_logger.setLevel(logging.WARNING)
+    app_logger.addHandler(caplog.handler)
+    try:
+        # 0.01 tok/word is far below any real synthetic sample's
+        # observed ratio under the one-id-per-character stub.
+        app_module._check_token_ratio_drift(_make_drift_config(0.01))
+        assert "token_ratio_drift_warning" in app_module._state
+        warn = app_module._state["token_ratio_drift_warning"]
+        assert warn["configured_ratio"] == 0.01
+        assert warn["observed_ratio"] > 0.01
+        assert any("Token-estimate ratio drift" in r.getMessage() for r in caplog.records)
+    finally:
+        app_logger.removeHandler(caplog.handler)
+        app_logger.setLevel(prior_level)
+        app_module._state["tokenizer"] = prior
+        if prior_warning is not None:
+            app_module._state["token_ratio_drift_warning"] = prior_warning
+        else:
+            app_module._state.pop("token_ratio_drift_warning", None)
+
+
+def test_check_token_ratio_drift_no_warning_when_ratio_covers_live_tokenizer():
+    """A configured ratio at/above what the live tokenizer observes
+    writes nothing — the no-drift branch."""
+    import paramem.server.app as app_module
+
+    prior = app_module._state.get("tokenizer")
+    prior_warning = app_module._state.pop("token_ratio_drift_warning", None)
+    app_module._state["tokenizer"] = _StubTokenizer()
+    try:
+        # 1000 tok/word bounds every synthetic sample's observed ratio.
+        app_module._check_token_ratio_drift(_make_drift_config(1000.0))
+        assert "token_ratio_drift_warning" not in app_module._state
+    finally:
+        app_module._state["tokenizer"] = prior
+        if prior_warning is not None:
+            app_module._state["token_ratio_drift_warning"] = prior_warning
+        else:
+            app_module._state.pop("token_ratio_drift_warning", None)

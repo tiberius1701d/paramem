@@ -1002,16 +1002,15 @@ class TestPipelineMaxTokensThreading:
         assert "max_tokens" in sig.parameters
 
     def test_extract_and_anonymize_pins_anonymizer_default(self):
-        """``anonymize_turn`` (chat
-        egress) must call ``anonymize`` with the anonymizer's
-        own default budget (``_DEFAULT_ANONYMIZER_MAX_TOKENS`` = 2048), not
-        silently inherit ``anonymize``'s own default — which is
-        ``_DEFAULT_FILTER_MAX_TOKENS`` (8192), sized for the graph-tier
-        enrichment filter call. Chat egress is user-facing: a pathological
-        non-terminating generation must not run 4x longer before the cap
-        stops it.
+        """``anonymize_turn`` (chat egress) must call ``anonymize`` with
+        the module's own default token envelope
+        (``_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE``) — deliberately not
+        operator-tuned, matching ``extract_graph``'s own call to the
+        module default ``_DEFAULT_FILTER_MAX_TOKENS`` at this same call
+        site. One envelope, no second cap (U2/U3): there is no longer a
+        flat 2048 chat-egress ceiling distinct from the envelope.
         """
-        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_MAX_TOKENS
+        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
         from paramem.graph.flows import anonymize_turn
 
         graph = _make_graph([("Alex", "lives_in", "Millfield")])
@@ -1050,7 +1049,7 @@ class TestPipelineMaxTokensThreading:
                 scrub={"person name"},
             )
 
-        assert captured.get("max_tokens") == _DEFAULT_ANONYMIZER_MAX_TOKENS
+        assert captured.get("token_envelope") == _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
 
 
 class TestPipelinePromptsDirThreading:
@@ -1978,6 +1977,208 @@ class TestCloudEnrichmentProvider:
         assert result.diagnostics["entity_correction_verdicts"] == canned_verdicts
 
 
+class TestContractCarriedFactsParity:
+    """U2 — item 20: ``stage_enrich``'s ``anon_facts`` under a session
+    flow equals the pre-change derivation
+    (``insert_placeholders(facts_from_relations(graph.relations),
+    payload.forward)``) — pins the claim that nothing mutates
+    ``graph.relations`` between the ``anonymize`` and ``enrich`` stages,
+    so ``payload.facts`` (captured at anonymize time) stays byte-parity
+    with a fresh render for the session tier's single-slice
+    ``status == "ok"`` case.
+    """
+
+    def test_anon_facts_sent_to_cloud_matches_pre_change_derivation(self):
+        from paramem.cloud.placeholders import insert_placeholders
+        from paramem.graph.schema import facts_from_relations
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield"), ("Alex", "works_with", "Dana")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                Entity(name="Dana", entity_type="person"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Dana": "Person_2"}
+        expected_forward = {"Alex": "Person_1", "Dana": "Person_2"}
+        expected_anon_facts = insert_placeholders(
+            facts_from_relations(graph.relations), expected_forward
+        )
+
+        captured: list[list[dict]] = []
+
+        def _capture_request_enrichment(anon_facts, *args, **kwargs):
+            captured.append(list(anon_facts))
+            from paramem.graph.extractor import EnrichmentDelta
+
+            return EnrichmentDelta(add=[], modify=[], drop=set(), bindings={}), "raw", {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=_capture_request_enrichment,
+            ),
+        ):
+            run_cloud_stages(
+                graph,
+                "Alex lives in Millfield and works with Dana.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                plausibility_judge="off",
+                scrub={"person name"},
+            )
+
+        assert captured, "expected request_enrichment to be called"
+        assert captured[0] == expected_anon_facts
+
+    def test_session_tier_opt_out_anon_facts_is_non_empty(self):
+        """Item 49 (session-tier counterpart): with ``scrub=set()``
+        (operator opt-out), ``anonymize()``'s opt-out branch carries the
+        input facts verbatim in ``payload.facts`` (BLOCKING-2 regression
+        guard: a ``facts=[]`` opt-out would silently withhold every fact
+        from a payload the operator asked to egress unmasked) — so
+        ``stage_enrich``'s ``anon_facts`` derivation is non-empty, not
+        ``[]``."""
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        captured: list[list[dict]] = []
+
+        def _capture_request_enrichment(anon_facts, *args, **kwargs):
+            captured.append(list(anon_facts))
+            from paramem.graph.extractor import EnrichmentDelta
+
+            return EnrichmentDelta(add=[], modify=[], drop=set(), bindings={}), "raw", {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.stage_enrich.request_enrichment",
+                side_effect=_capture_request_enrichment,
+            ),
+        ):
+            run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                plausibility_judge="off",
+                scrub=set(),
+            )
+
+        assert captured, "expected request_enrichment to be called"
+        assert captured[0] != [], "opt-out anon_facts must not be silently withheld"
+        assert len(captured[0]) == 1
+        assert captured[0][0]["subject"] == "Alex"
+
+
+class TestValidityRuleSessionFlowEndToEnd:
+    """U2/D1 — item 46: the two callers whose behaviour changes under the
+    §1.4 validity rule, exercised end-to-end (case 43: non-empty
+    transcript + ``mapping == {}`` + missing rewrite -> legitimate, not
+    fail-closed)."""
+
+    def test_stage_anonymize_proceeds_with_original_transcript_not_fallback(self):
+        """``_stage_anonymize`` does NOT divert to
+        ``_fallback_plausibility_on_raw`` on the legitimate-empty verdict
+        — the pre-D1 parser would have fail-closed here (empty
+        ``anonymized_transcript`` treated as failure regardless of
+        ``mapping``), triggering the raw-plausibility fallback instead of
+        letting the chain proceed with the original transcript."""
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        original_transcript = "Alex lives in Millfield."
+        fallback_calls = []
+
+        def fake_fallback(g, t, m, tok, reason, **_kwargs):
+            fallback_calls.append(reason)
+            return g
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=({}, "", "raw"),
+            ),
+            patch(
+                "paramem.graph.stage_anonymize._fallback_plausibility_on_raw",
+                side_effect=fake_fallback,
+            ),
+            patch("paramem.graph.stage_enrich.request_enrichment") as mock_enrich,
+        ):
+            mock_enrich.return_value = (None, None, {"parse_path": "no_response"})
+            try:
+                run_cloud_stages(
+                    graph,
+                    original_transcript,
+                    None,
+                    None,
+                    speaker_id="speaker0",
+                    correction_entity_types=set(),
+                    scrub={"person name"},
+                )
+            except Exception:
+                # The outage path raises ExtractionFailed past request_enrichment
+                # — irrelevant to this test, which only cares whether the
+                # anonymize stage diverted to the raw-plausibility fallback.
+                pass
+
+        assert fallback_calls == [], (
+            "the legitimate-empty verdict must not trigger the anon-failure fallback"
+        )
+
+    def test_anonymize_turn_returns_usable_contract_not_failed(self):
+        """``anonymize_turn`` (chat egress) returns a usable ``"ok"``
+        contract instead of the ``_failed`` sentinel on the same
+        legitimate-empty verdict."""
+        from paramem.graph.flows import anonymize_turn
+
+        graph = _make_graph([("Alex", "lives_in", "Millfield")])
+        model = MagicMock()
+        model.is_gradient_checkpointing = False
+        tokenizer = MagicMock()
+
+        with (
+            patch("paramem.graph.flows.extract_graph", return_value=graph),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=({}, "", "raw"),
+            ),
+        ):
+            payload = anonymize_turn(
+                "Alex lives in Millfield.",
+                model,
+                tokenizer,
+                scrub={"person name"},
+            )
+
+        assert payload.status != "failed"
+
+
 class TestAnonymizerMappingOnlyContract:
     """The anonymizer LLM returns exactly TWO artifacts: the
     ``mapping`` and its own ``anonymized_transcript`` rewrite. It never
@@ -2092,7 +2293,7 @@ class TestAnonymizerMappingOnlyContract:
                     model,
                     tokenizer,
                     scrub={"person name"},
-                    max_tokens=999,
+                    token_envelope=999,
                     user_prompt_template="{scrub_categories} {facts_json} {transcript}",
                     system_prompt="system",
                 )
@@ -2107,7 +2308,9 @@ class TestAnonymizerMappingOnlyContract:
         line = lines[0]
         assert "chars=10" in line, line  # len("0123456789")
         assert "tokens=7" in line, line
-        assert "max_new_tokens=999" in line, line
+        # max_new_tokens is now DERIVED — envelope (999) minus the measured
+        # prompt tokens (7) — never the raw envelope value itself.
+        assert "max_new_tokens=992" in line, line
 
     def test_facts_are_built_from_graph_relations_not_the_model(self):
         """The cloud-facing fact array must equal ``graph.relations`` —
@@ -2364,7 +2567,44 @@ class TestAnonymizerTranscriptArrayContract:
         assert mapping == {"Alex": "Person_1"}
         assert anon_transcript == "[user] Person_1 lives in Millfield."
 
-    def test_empty_array_fails_closed(self):
+    def test_empty_array_over_a_real_transcript_fails_closed(self):
+        """The empty-rewrite validity rule (.agent/plan-anonymize-slicing.md
+        §1.4): an empty array is legitimate ONLY when there was nothing to
+        rewrite (empty input transcript, or empty model mapping). Here the
+        model named something (non-empty ``mapping``) over a NON-EMPTY
+        input ``transcript`` but returned an empty rewrite — the
+        inconsistent shape, which stays fail-closed. (The
+        empty-transcript / empty-input-transcript legitimate-empty case is
+        pinned in tests/test_cloud_egress.py's validity-rule matrix.)
+        """
+        from paramem.cloud.anonymize import anonymize_transcript
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
+        with (
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, raw_output = anonymize_transcript(
+                self._facts(),
+                model,
+                tokenizer,
+                scrub={"person name"},
+                transcript="[user] Alex lives in Millfield.",
+                **self._TEMPLATE_KWARGS,
+            )
+
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+    def test_empty_array_over_an_empty_transcript_is_legitimate(self):
+        """The graph-tier shape: no input transcript at all
+        (``transcript=""``, the default) — an empty/missing rewrite is
+        legitimate regardless of ``mapping``'s content; the chain proceeds
+        with the model's mapping, never fail-closed."""
         from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
@@ -2379,7 +2619,7 @@ class TestAnonymizerTranscriptArrayContract:
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
-        assert mapping is None
+        assert mapping == {"Alex": "Person_1"}
         assert anon_transcript == ""
         assert raw_output == raw
 
@@ -2407,7 +2647,37 @@ class TestAnonymizerTranscriptArrayContract:
         assert anon_transcript == ""
         assert raw_output == raw
 
-    def test_missing_anonymized_transcript_key_fails_closed(self):
+    def test_missing_anonymized_transcript_key_over_a_real_transcript_fails_closed(self):
+        """Same §1.4 validity rule as the empty-array case above, missing
+        key instead of an empty array: over a NON-EMPTY input transcript
+        with a non-empty mapping, a missing rewrite is the inconsistent
+        shape and stays fail-closed."""
+        from paramem.cloud.anonymize import anonymize_transcript
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps({"mapping": {"Alex": "Person_1"}})
+        with (
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, raw_output = anonymize_transcript(
+                self._facts(),
+                model,
+                tokenizer,
+                scrub={"person name"},
+                transcript="[user] Alex lives in Millfield.",
+                **self._TEMPLATE_KWARGS,
+            )
+
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+    def test_missing_anonymized_transcript_key_over_an_empty_transcript_is_legitimate(self):
+        """The graph-tier shape: no input transcript at all — a missing
+        ``anonymized_transcript`` key is legitimate, not fail-closed."""
         from paramem.cloud.anonymize import anonymize_transcript
 
         model = MagicMock()
@@ -2422,7 +2692,7 @@ class TestAnonymizerTranscriptArrayContract:
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
             )
 
-        assert mapping is None
+        assert mapping == {"Alex": "Person_1"}
         assert anon_transcript == ""
         assert raw_output == raw
 

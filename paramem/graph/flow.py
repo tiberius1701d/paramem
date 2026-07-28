@@ -81,6 +81,7 @@ class StageContext:
     plausibility_endpoint: str | None
     scrub: set[str] | frozenset[str]
     correction_entity_types: set[str] | frozenset[str] | None
+    anonymize_token_envelope: int
 
 
 @dataclass(frozen=True)

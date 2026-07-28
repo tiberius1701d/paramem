@@ -103,6 +103,7 @@ from paramem.utils.identity import canonical as _canonical
 from paramem.utils.identity import is_speaker_id as _is_speaker_id
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 from paramem.utils.paths import find_project_root
+from paramem.utils.tokens import check_ratio_drift
 from paramem.utils.vram_guard import (
     VramExhausted,
     apply_process_cap,
@@ -1888,6 +1889,58 @@ def _fail_fast_cuda(exc: BaseException, phase: str) -> None:
     os._exit(1)  # systemd Restart=on-failure → fresh CUDA context
 
 
+def _check_token_ratio_drift(config) -> None:
+    """Boot-time token-estimate ratio drift check — the live consumer of
+    ``consolidation.extraction_token_estimate_ratio`` (see
+    :func:`paramem.utils.tokens.check_ratio_drift`'s docstring for why the
+    key would otherwise be inert).  Re-measures the words->tokens fallback
+    ratio against the LIVE tokenizer over synthetic samples; a non-``None``
+    result means a base-model swap shifted the ratio and the configured
+    fallback would under-budget a payload of that shape.  No-op when no
+    tokenizer has loaded (cloud-only boot).
+
+    Extracted out of the ``lifespan`` body as a named, unit-testable
+    function rather than an inline block with a lifespan-frame local: the
+    ``@asynccontextmanager`` lifespan stays suspended at its own ``yield``
+    for the app's whole lifetime, so any local it holds persists that
+    long too (see this module's BASE-MODEL HOLDER invariant note for the
+    general hazard) — a plain function call has no such lifetime and
+    leaves nothing behind once it returns.
+
+    Args:
+        config: The just-loaded :class:`~paramem.server.config.ServerConfig`
+            (the lifespan's own local, not necessarily yet mirrored into
+            ``_state["config"]`` at the point this is called).
+
+    Side effects:
+        On drift, logs a WARNING and sets
+        ``_state["token_ratio_drift_warning"] = {"configured_ratio":
+        float, "observed_ratio": float}`` — the dict
+        :func:`~paramem.server.attention._collect_token_ratio_drift_items`
+        reads to surface the persistent ``/status.attention`` item.
+    """
+    tokenizer = _state.get("tokenizer")
+    if tokenizer is None:
+        return
+    observed_ratio = check_ratio_drift(
+        tokenizer, config.consolidation.extraction_token_estimate_ratio
+    )
+    if observed_ratio is None:
+        return
+    logger.warning(
+        "Token-estimate ratio drift: configured %.2f tok/word, live tokenizer "
+        "observed %.2f tok/word — the estimate_tokens() fallback may "
+        "under-budget a payload of the dominant shape. Re-measure and update "
+        "consolidation.extraction_token_estimate_ratio.",
+        config.consolidation.extraction_token_estimate_ratio,
+        observed_ratio,
+    )
+    _state["token_ratio_drift_warning"] = {
+        "configured_ratio": config.consolidation.extraction_token_estimate_ratio,
+        "observed_ratio": observed_ratio,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
@@ -2291,6 +2344,12 @@ async def lifespan(app: FastAPI):
                 actual_bytes / 2**30,
                 delta_mib,
             )
+
+    # Boot-time token-estimate ratio drift check — see
+    # _check_token_ratio_drift's own docstring.  Runs only when a
+    # tokenizer actually loaded (cloud-only boot has none) — that guard
+    # lives inside the function, not here.
+    _check_token_ratio_drift(config)
 
     # Wyoming listener sockets — bound ONCE here in the lifespan with provider
     # lambdas so profile swaps (cpu⟷gpu) re-point the active pair without
@@ -7387,6 +7446,11 @@ async def calibrate_enrich_route(req: calibrate_module.CalibrateChainRequest):
 @app.post("/calibrate/normalize", dependencies=[Depends(require_admin)])
 async def calibrate_normalize_route(req: calibrate_module.CalibrateNormalizeRequest):
     return calibrate_module.calibrate_normalize(_state, req)
+
+
+@app.post("/calibrate/anonymize_facts", dependencies=[Depends(require_admin)])
+async def calibrate_anonymize_facts_route(req: calibrate_module.CalibrateAnonymizeFactsRequest):
+    return calibrate_module.calibrate_anonymize_facts(_state, req)
 
 
 @app.post("/calibrate/name", dependencies=[Depends(require_admin)])
@@ -13822,10 +13886,13 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
     executor-time snapshot so extraction never runs on an unattributed session.
 
     Voice eviction fires when the pending batch contains ANY document session.
-    Document chunks have no density bound — a dense ~1500-word chunk is the
-    regime that exhausts VRAM on this 8 GiB host once the ~1.5 GiB STT+TTS GPU
-    pair sits on top of the 4-bit base and the extraction chain's working-set
-    peak.  A *mixed* batch (one transcript probe + several dense docs) is the
+    Document chunks have no density bound — a dense ~934-word chunk (the
+    current ``paramem.graph.document_chunker._DOC_MAX_TOKENS`` ceiling,
+    derived from the anonymize-call token envelope — was ~1500 words before
+    that derivation landed) is the regime that exhausts VRAM on this 8 GiB
+    host once the ~1.5 GiB STT+TTS GPU pair sits on top of the 4-bit base
+    and the extraction chain's working-set peak.  A *mixed* batch (one
+    transcript probe + several dense docs) is the
     case that bit us: one transcript session used to keep voice resident through
     the dense doc extraction and the plausibility filter's KV-cache growth OOM'd
     mid-generate.  Eviction is cheap — the CPU STT/TTS pair stays resident, so

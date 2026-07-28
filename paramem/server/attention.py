@@ -830,6 +830,60 @@ def _collect_vram_low_headroom_items(state: dict) -> list[AttentionItem]:
     ]
 
 
+def _collect_token_ratio_drift_items(state: dict) -> list[AttentionItem]:
+    """Emit a warning when the live tokenizer's measured words->tokens
+    ratio exceeds the configured
+    ``consolidation.extraction_token_estimate_ratio``.
+
+    Written once at lifespan startup by
+    :func:`paramem.utils.tokens.check_ratio_drift` re-measuring against
+    the live tokenizer over synthetic samples — the staleness signal for
+    an operator who swapped the base model without re-measuring the
+    ratio (see that function's docstring for why the ratio needs a live
+    consumer at all: every in-process ``estimate_tokens`` call site has a
+    live tokenizer and never reaches the fallback path itself). Sticky
+    for the process lifetime; cleared only on restart (a fresh boot
+    re-measures).
+
+    The dict schema is::
+
+        {
+            "configured_ratio": float,
+            "observed_ratio": float,
+        }
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero or one item.
+    """
+    warn = state.get("token_ratio_drift_warning")
+    if not warn:
+        return []
+    configured = warn.get("configured_ratio", 0.0)
+    observed = warn.get("observed_ratio", 0.0)
+    return [
+        AttentionItem(
+            kind="token_ratio_drift",
+            level="warning",
+            summary=(
+                f"Token-estimate ratio drift: configured {configured:.2f} tok/word, "
+                f"live tokenizer observed {observed:.2f} tok/word"
+            ),
+            action_hint=(
+                "Re-measure and update consolidation.extraction_token_estimate_ratio "
+                "(see paramem/utils/tokens.py)."
+            ),
+            age_seconds=None,
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Stubs — backup, key rotation, and encryption populators (not yet wired)
 # ---------------------------------------------------------------------------
@@ -1291,4 +1345,5 @@ def collect_attention_items(
     items.extend(_collect_vram_overflow_items(state))
     items.extend(_collect_vram_post_load_budget_items(state))
     items.extend(_collect_vram_low_headroom_items(state))
+    items.extend(_collect_token_ratio_drift_items(state))
     return items

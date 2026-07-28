@@ -1,0 +1,100 @@
+Identify every value in the extracted facts below that is an instance of one of the listed PII categories and decide a type-prefixed placeholder for each. Return ONLY a `real_value → placeholder` mapping — no other keys.
+
+## Scope
+
+Categories to scrub: {scrub_categories}
+
+Placeholder a value ONLY if it is an instance of one of these categories. Everything else — city, organization, product, or any category not listed — stays verbatim, even if it is a proper noun or an identifying name of some kind.
+
+Doubt can come from two different questions. They are not the same question, and they resolve in opposite directions:
+- **Membership: is this category listed above at all?** A lookup, not a judgment — e.g. checking whether "city" appears in the category list. When THIS is what you're unsure about, leave the value verbatim.
+- **Instance: the category IS listed — is this particular value really an instance of it?** e.g. "phone number" is listed — is `+49 151 2345` a phone number or an order reference? When THIS is what you're unsure about, placeholder the value. Over-scrubbing here costs nothing lasting — it becomes an opaque token restored locally when the reply comes back. Under-scrubbing sends real PII to the cloud, and that can never be undone.
+
+## Placeholder shape contract
+
+Each placeholder is `<Prefix>_<N>` where:
+- `Prefix` is a PascalCase noun naming the value's category. Common prefixes are `Person`, `Phone`, `Email`, `Address`, `Profile`, but you may use any type-appropriate PascalCase prefix when one of these doesn't fit the listed categories.
+- `N` is a positive integer. Allocate the smallest free index per prefix in order of first appearance (`Person_1` before `Person_2`).
+- Each real value must map to a UNIQUE placeholder. No two real values share the same placeholder.
+
+## Rules
+
+- **`speaker{{N}}` (e.g. `speaker0`) is already anonymous — leave it VERBATIM.** It is the extractor's own anonymous handle for the person talking, not an identifying name. NEVER add a `speaker{{N}} → Person_N` entry to `mapping`, and never treat `speaker{{N}}` as a value to anonymize.
+- **Totality:** once you HAVE decided a value is in scope, you MUST add its `real_value → placeholder` entry to `mapping` in the same response — every placeholder decision you make must be backed by a mapping entry, with no exceptions.
+- Mapping direction is `real_value → placeholder`: the real value is the JSON KEY, the placeholder is the JSON VALUE.
+- Use the SAME placeholder for every occurrence of a value across the facts.
+- The facts below are the material to work from. Common nouns are NEVER added to the mapping, even if the extractor capitalised them. "Dog", "Partner", "Friend", "Assistant", "User" are common nouns — they are never PII regardless of scope.
+- Numeric values, dates, and currencies that do not belong to one of the listed categories stay verbatim. A phone number IS in scope when "phone number" is listed — mint a placeholder for it like any other in-scope value.
+
+## Examples
+
+POSITIVE — in-scope name substituted, out-of-scope place left verbatim (membership doubt — resolves to verbatim):
+scrub categories: person name
+facts: [{{"subject": "Rowan", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}]
+Output:
+{{"mapping": {{"Rowan": "Person_1"}}}}
+Note: "Millbrook" fails the MEMBERSHIP question — "city" is not a listed category at all — not the instance question. It stays verbatim.
+
+POSITIVE — instance-ambiguous value in a listed category, placeholdered on doubt (instance doubt — resolves to placeholder):
+scrub categories: physical address
+facts: [{{"subject": "Sable", "predicate": "mentioned", "object": "Lindenweg 12", "relation_type": "factual", "confidence": 1.0}}]
+Output:
+{{"mapping": {{"Lindenweg 12": "Address_1"}}}}
+Note: "physical address" IS listed, and the value is address-SHAPED even though nothing in the fact clarifies what it refers to — that is instance doubt, not membership doubt, so it resolves to a placeholder. ("Sable" stays verbatim here since "person name" is not in this example's scrub list.)
+
+POSITIVE — phone number:
+scrub categories: person name, phone number
+facts: [{{"subject": "Marlowe", "predicate": "has_phone", "object": "+44 20 7946 0958", "relation_type": "factual", "confidence": 1.0}}]
+Output:
+{{"mapping": {{"Marlowe": "Person_1", "+44 20 7946 0958": "Phone_1"}}}}
+
+POSITIVE — name and email in the same pass:
+scrub categories: person name, email address
+facts: [{{"subject": "Wren", "predicate": "has_email", "object": "wren@example.org", "relation_type": "factual", "confidence": 1.0}}]
+Output:
+{{"mapping": {{"Wren": "Person_1", "wren@example.org": "Email_1"}}}}
+
+POSITIVE — common noun stays verbatim:
+scrub categories: person name
+facts: [{{"subject": "Tegan", "predicate": "owns", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}, {{"subject": "Dog", "predicate": "has_name", "object": "Biscuit", "relation_type": "factual", "confidence": 0.9}}]
+Output:
+{{"mapping": {{"Tegan": "Person_1"}}}}
+Note: "Dog" appears in the facts, but it is a common noun and not one of the listed categories either way — it is not added to the mapping.
+
+POSITIVE — two distinct people in one pass, allocated in order of first appearance:
+scrub categories: person name
+facts: [{{"subject": "Idris", "predicate": "works_with", "object": "Noor", "relation_type": "factual", "confidence": 1.0}}, {{"subject": "Noor", "predicate": "manages", "object": "Idris", "relation_type": "factual", "confidence": 1.0}}]
+Output:
+{{"mapping": {{"Idris": "Person_1", "Noor": "Person_2"}}}}
+
+NEGATIVE — out-of-scope category over-scrubbed:
+scrub categories: person name
+facts: [{{"subject": "Farah", "predicate": "works_at", "object": "Vantex", "relation_type": "factual", "confidence": 1.0}}]
+WRONG: minting a placeholder for "Vantex" and adding it to `mapping`.
+"Vantex" is an organization, not one of the listed categories — placeholdering it over-scrubs. The same applies to products, cities, or any other category you were not told to scrub.
+RIGHT: {{"mapping": {{"Farah": "Person_1"}}}}
+
+NEGATIVE — mapping direction reversed:
+WRONG: {{"mapping": {{"Person_1": "Farah"}}}}
+RIGHT: {{"mapping": {{"Farah": "Person_1"}}}}
+The real value is the KEY; the placeholder is the VALUE.
+
+NEGATIVE — incomplete mapping (a decided-on value omitted):
+scrub categories: person name, phone number
+facts: [{{"subject": "Vantex Support", "predicate": "has_phone", "object": "+1 555 0142", "relation_type": "factual", "confidence": 1.0}}, {{"subject": "Farah", "predicate": "has_phone", "object": "+1 555 0199", "relation_type": "factual", "confidence": 1.0}}]
+WRONG: {{"mapping": {{"+1 555 0142": "Phone_1", "Farah": "Person_1"}}}}
+"+1 555 0199" is also an in-scope phone number — deciding to anonymize the first number but leaving the second unmapped is incomplete. Every value you decide to anonymize gets an entry, not just some of them.
+RIGHT: {{"mapping": {{"+1 555 0142": "Phone_1", "Farah": "Person_1", "+1 555 0199": "Phone_2"}}}}
+
+NEGATIVE — duplicate placeholder for two distinct values (uniqueness violation):
+WRONG: {{"mapping": {{"Farah": "Person_1", "Idris": "Person_1"}}}}
+Each real value must map to a unique placeholder. Allocate `Idris → Person_2`, not a duplicate of `Person_1`.
+
+NEGATIVE — self-mapped placeholder (key is a placeholder shape):
+WRONG: {{"mapping": {{"Person_1": "Person_1"}}}}
+Every mapping KEY must be a real value copied verbatim from the input facts. Never use a placeholder shape (`<Prefix>_<N>`) as a KEY.
+
+Facts (decide which values below need anonymizing):
+{facts_json}
+
+Return JSON only with exactly the key `mapping`. No prose, no markdown, no extra keys — there is no transcript at this tier, so nothing else belongs in the response.

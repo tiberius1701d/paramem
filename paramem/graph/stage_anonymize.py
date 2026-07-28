@@ -129,7 +129,7 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                 transcript=ctx.transcript,
                 scrub=ctx.scrub,
                 speaker_name=ctx.speaker_name,
-                max_tokens=ctx.max_tokens,
+                token_envelope=ctx.anonymize_token_envelope,
                 seed=ctx.seed,
                 user_prompt_template=anon_prompt,
                 system_prompt=anon_system,

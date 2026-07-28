@@ -70,14 +70,16 @@ from pydantic import BaseModel, Field
 from paramem.graph.phase_trace import (
     PhaseRecord,
     extraction_trace,
+    phase_trace,
     start_at,
     stop_at,
 )
-from paramem.graph.prompts import prompt_overrides
+from paramem.graph.prompts import _load_prompt, prompt_overrides
 from paramem.graph.schema import SessionGraph
 from paramem.server.gpu_lock import gpu_lock_sync
 from paramem.server.session_buffer import SessionBuffer
 from paramem.utils.artifacts import calibration_run, on_calibration_result, on_session_extracted
+from paramem.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +174,51 @@ class CalibrateNormalizeRequest(BaseModel):
     """
 
     relations: list[dict] | None = None
+    snapshot_path: str | None = None
+    prompt_variants: dict[str, str] = Field(default_factory=dict)
+    params: CalibrateParams = Field(default_factory=CalibrateParams)
+
+
+class CalibrateAnonymizeFactsRequest(BaseModel):
+    """Run the graph-tier anonymize step — the facts-only shape
+    :func:`~paramem.training.graph_enrich.enrich_graph` sends per chunk —
+    on an explicit fact list or a graph snapshot.
+
+    Distinct from ``/calibrate/anonymize`` (session tier: a transcript,
+    chained through :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline`).
+    The graph tier has no transcript at all; ``anonymize()`` is called
+    directly with ``transcript=""``, so this request carries a fact list
+    instead — mirroring :class:`CalibrateNormalizeRequest`'s two
+    equally-valid artifact sources:
+
+    * ``facts`` — flat list of fact dicts (``subject``, ``predicate``,
+      ``object``, and optionally ``relation_type``/``speaker_id`` —
+      the shape :func:`~paramem.training.graph_enrich.serialize_subgraph_triples`
+      produces), supplied directly by the caller.
+    * ``snapshot_path`` — path to a NetworkX node-link
+      ``graph_merged_snapshot.json`` on the server filesystem, read via
+      the same :func:`_relations_from_snapshot` reader
+      :class:`CalibrateNormalizeRequest` uses.
+
+    Exactly one of ``facts`` or ``snapshot_path`` must be provided;
+    supplying neither or both raises HTTP 400.
+
+    ``identity_domain`` (the reconciliation domain :func:`~paramem.cloud.
+    anonymize.anonymize` reconciles the model's mapping against) is
+    derived server-side from the resolved facts' own subject/object
+    endpoints — mirroring a production chunk's node list — never supplied
+    by the caller.  ``scrub`` and ``token_envelope`` are read from the
+    SAME ``ExtractionConfig`` production reads (never a request
+    override), so this calibrates against the operator's actual
+    configuration, not a synthetic one.
+
+    ``prompt_variants`` carries the operator's prompt variants, resolved
+    the same way every other calibration use case resolves them (see
+    :func:`_resolve_prompt_variants`); the one basename this stage loads
+    is ``anonymization_facts.txt``.
+    """
+
+    facts: list[dict] | None = None
     snapshot_path: str | None = None
     prompt_variants: dict[str, str] = Field(default_factory=dict)
     params: CalibrateParams = Field(default_factory=CalibrateParams)
@@ -282,13 +329,56 @@ def _resolve_prompt_variants(state: dict, variants: dict[str, str]) -> dict[str,
     return resolved
 
 
-def _count_tokens(tokenizer, text: str) -> int:
-    """Best-effort token count.  Returns ``-1`` when the tokenizer rejects
-    the input (rare; occurs on MagicMock test fixtures)."""
+def _relations_from_snapshot(snapshot_path: str) -> list[dict]:
+    """Load a NetworkX node-link ``graph_merged_snapshot.json`` into flat
+    ``{subject, predicate, object, relation_type, speaker_id}`` dicts.
+
+    THE one snapshot-to-relations reader — shared by
+    :func:`calibrate_normalize` and :func:`calibrate_anonymize_facts` so a
+    future snapshot-format change updates one place, not two independently
+    hand-rolled parses of the same file shape.
+
+    NetworkX node-link format: ``{"nodes": [...], "links": [...]}`` where
+    each link is ``{source, target, key, ...edge_data...}``. Edges missing
+    a ``predicate`` key are skipped (non-relation edges, if any). Raises
+    :class:`~fastapi.HTTPException` (400) when the path does not exist or
+    is not valid JSON — this is a guard-time check, called before any
+    model call.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    snap_path = _Path(snapshot_path)
+    if not snap_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"snapshot_path does not exist: {snap_path}",
+        )
     try:
-        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
-    except Exception:  # noqa: BLE001
-        return -1
+        snap = _json.loads(snap_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to read snapshot_path: {exc}",
+        ) from exc
+    links = snap.get("links", snap.get("edges", []))
+    relations: list[dict] = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        pred = link.get("predicate")
+        if not pred:
+            continue
+        relations.append(
+            {
+                "subject": str(link.get("source", "")),
+                "predicate": str(pred),
+                "object": str(link.get("target", "")),
+                "relation_type": str(link.get("relation_type", "factual")),
+                "speaker_id": str(link.get("speaker_id", "")),
+            }
+        )
+    return relations
 
 
 @contextmanager
@@ -665,9 +755,9 @@ def _run_calibration(
         prompts, input_prompt_text = _provenance_from_records(records, input_prompt_phase)
 
         tokenizer = state.get("tokenizer")
-        n_in = _count_tokens(tokenizer, input_prompt_text) if tokenizer else -1
+        n_in = estimate_tokens(input_prompt_text, tokenizer) if tokenizer else -1
         count_str = raw_output if isinstance(raw_output, str) else ""
-        n_out = _count_tokens(tokenizer, count_str) if (tokenizer and count_str) else -1
+        n_out = estimate_tokens(count_str, tokenizer) if (tokenizer and count_str) else -1
         model_id = getattr(state.get("model_id"), "name", state.get("model_id", "unknown"))
 
         response = {
@@ -953,41 +1043,7 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
             resolved["relations"] = req.relations
             return
 
-        # Load from a NetworkX node-link snapshot.
-        import json as _json
-        from pathlib import Path as _Path
-
-        snap_path = _Path(req.snapshot_path)  # type: ignore[arg-type]
-        if not snap_path.exists():
-            raise HTTPException(
-                status_code=400,
-                detail=f"snapshot_path does not exist: {snap_path}",
-            )
-        try:
-            snap = _json.loads(snap_path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to read snapshot_path: {exc}",
-            ) from exc
-        # NetworkX node-link format: {"nodes": [...], "links": [...]} where
-        # each link is {source, target, key, ...edge_data...}.
-        links = snap.get("links", snap.get("edges", []))
-        relations: list[dict] = []
-        for link in links:
-            if not isinstance(link, dict):
-                continue
-            pred = link.get("predicate")
-            if not pred:
-                continue
-            relations.append(
-                {
-                    "subject": str(link.get("source", "")),
-                    "predicate": str(pred),
-                    "object": str(link.get("target", "")),
-                }
-            )
-        resolved["relations"] = relations
+        resolved["relations"] = _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
 
     def dispatch() -> tuple[Any, dict]:
         loop = _ensure_calibration_loop(state)
@@ -1036,6 +1092,128 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
         guard=guard,
         dispatch=dispatch,
         input_prompt_phase="normalize",
+        state=state,
+        params=req.params,
+        supports_seed=True,
+    )
+
+
+def calibrate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) -> dict[str, Any]:
+    """Run the graph-tier anonymize step — the SAME local
+    :func:`~paramem.cloud.anonymize.anonymize` call
+    :func:`~paramem.training.graph_enrich.enrich_graph` makes per chunk —
+    on an explicit fact list or graph snapshot.
+
+    A standalone, non-chunk use case (mirrors :func:`calibrate_normalize`
+    and :func:`calibrate_name`, neither of which is part of
+    :data:`_CHAIN`): the artifact is a fact list, not a transcript, so
+    this never goes through :class:`~paramem.graph.extraction_pipeline.
+    ExtractionPipeline` — it calls the shared cloud-anonymize primitive
+    directly, exactly as production's graph-tier caller does.
+
+    ``scrub`` and ``token_envelope`` are read from ``loop.extraction.config``
+    — the SAME ``ExtractionConfig`` instance
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._current_extraction_config`
+    hands :func:`~paramem.training.graph_enrich.enrich_graph` in
+    production — never a request override, so a calibration run reports
+    on the operator's actual configured envelope, not a synthetic one.
+    ``identity_domain`` is derived from the resolved facts' own
+    subject/object endpoints, mirroring a production chunk's node list
+    (``chunk_nodes`` in ``enrich_graph``) — production has a live merged
+    graph to draw that list from; calibration has only the facts it was
+    handed, which is the faithful analogue.
+
+    ``anonymize()`` itself opens no phase-trace scope — ``paramem.cloud``
+    must not import ``paramem.graph`` (see that module's package
+    docstring) — and production's own call site
+    (``paramem.training.graph_enrich.enrich_graph``) does not wrap it in
+    one either, so this handler opens ``phase_trace("anonymize")``
+    itself, around the identical primitive call, the same way the
+    session-tier ``anonymize`` stage body
+    (:func:`~paramem.graph.stage_anonymize._stage_anonymize`) already
+    does — ``"anonymize"`` is also the only :data:`~paramem.graph.
+    phase_trace.PHASE_NAMES` member this call shape could carry (the
+    vocabulary is closed); the calibration STAGE label
+    (``"anonymize_facts"``, this use case's own name — distinct from the
+    phase name) is what tells the two apart in the response and at the
+    route level.
+    """
+    resolved: dict[str, Any] = {}
+
+    def guard() -> None:
+        has_facts = req.facts is not None
+        has_snapshot = req.snapshot_path is not None
+        if has_facts == has_snapshot:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Exactly one of 'facts' or 'snapshot_path' must be provided, "
+                    "not both and not neither."
+                ),
+            )
+        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
+        facts = req.facts if has_facts else _relations_from_snapshot(req.snapshot_path)  # type: ignore[arg-type]
+        if not facts:
+            raise HTTPException(
+                status_code=400,
+                detail="No facts to anonymize (empty facts list, or snapshot has no edges).",
+            )
+        resolved["facts"] = facts
+
+    def dispatch() -> tuple[Any, dict]:
+        from paramem.cloud.anonymize import anonymize
+
+        loop = _ensure_calibration_loop(state)
+        ext_cfg = loop.extraction.config
+        facts = resolved["facts"]
+        # Mirrors enrich_graph's chunk_nodes: every distinct subject/object
+        # surface across the facts this call anonymizes.
+        identity_domain = sorted(
+            {str(f.get("subject", "")) for f in facts if f.get("subject")}
+            | {str(f.get("object", "")) for f in facts if f.get("object")}
+        )
+        with phase_trace("anonymize") as t, prompt_overrides(resolved["overrides"]):
+            anon_prompt = _load_prompt("anonymization_facts.txt", required=True)
+            anon_system = _load_prompt("anonymization_system.txt", required=True)
+            payload = anonymize(
+                facts,
+                loop.model,
+                loop.tokenizer,
+                transcript="",
+                scrub=ext_cfg.scrub,
+                identity_domain=identity_domain,
+                token_envelope=ext_cfg.anonymize_token_envelope,
+                seed=req.params.seed,
+                user_prompt_template=anon_prompt,
+                system_prompt=anon_system,
+            )
+            t.set_raw(payload.raw)
+            t.set_parsed(
+                {
+                    "mapping": dict(payload.forward),
+                    "mapping_size": len(payload.forward),
+                    "status": payload.status,
+                    "failure": payload.failure,
+                    "slices": payload.slices,
+                    "slices_failed": payload.slices_failed,
+                }
+            )
+        parsed: dict[str, Any] = {
+            "status": payload.status,
+            "failure": payload.failure,
+            "mapping": dict(payload.forward),
+            "slices": payload.slices,
+            "slices_failed": payload.slices_failed,
+            "identity_domain_size": len(identity_domain),
+            "facts_count": len(facts),
+        }
+        return payload.raw, parsed
+
+    return _run_calibration(
+        stage="anonymize_facts",
+        guard=guard,
+        dispatch=dispatch,
+        input_prompt_phase="anonymize",
         state=state,
         params=req.params,
         supports_seed=True,
