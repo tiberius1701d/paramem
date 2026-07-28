@@ -401,9 +401,19 @@ class FoldScope:
             :meth:`~ConsolidationLoop._build_all_edge_entries_into`.  ``True``
             for the interim slot (new-entry tracking); ``False`` for the full fold.
         normalize: When ``True``, run the whole-graph normalization pass via
-            :meth:`~ConsolidationLoop._refine_consolidation_graph`.
+            :meth:`~ConsolidationLoop._refine_consolidation_graph`.  Pinned
+            ``False`` for the interim scope, structurally, like ``enrich``.
         enrich: When ``True``, run cloud graph enrichment via
-            :meth:`~ConsolidationLoop._refine_consolidation_graph`.
+            :meth:`~ConsolidationLoop._refine_consolidation_graph`.  Pinned
+            ``False`` for the interim scope regardless of
+            ``refinement_enrichment`` / ``cloud_enabled`` — graph-tier
+            enrichment is a full-fold-only pass.  Session-tier cloud
+            enrichment already runs at extraction time over the anonymized
+            transcript (:mod:`paramem.graph.stage_enrich`), which has
+            strictly better context than a graph-only pass would at interim
+            scope; the graph-only pass's measured interim output was 11/15
+            predicate paraphrases (2026-07-28); cross-session inference over
+            the cumulative graph remains the full fold's job.
         promote: When ``True``, call
             :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
             Refine stage.  ``True`` for the full fold in BOTH venues —
@@ -2339,9 +2349,10 @@ class ConsolidationLoop:
            to the current slot for the recall-miss diagnostic and to rebuild the
            keying surface (pending-session relations from ``merger.graph`` are
            passed as ``extra_relations`` so they survive the graph reset).
-        8c. Refine: call :meth:`_refine_consolidation_graph` with
-           ``enrich=(refinement_enrichment=="on" and cloud_enabled)`` so cloud
-           enrichment is gated.  The recurrence-bump runs at every level.
+        8c. Refine: call :meth:`_refine_consolidation_graph` with both
+           ``normalize`` and ``enrich`` pinned ``False`` — the interim scope
+           runs neither graph-tier pass (see :attr:`FoldScope.enrich` for the
+           rationale).  The recurrence-bump still runs at every level.
         9. Build interim key list via graph-walk (episodic + procedural entries).
            The interim slot holds BOTH factual (episodic) and preference
            (procedural) keys, trained with the attention-only episodic adapter
@@ -2512,7 +2523,7 @@ class ConsolidationLoop:
                     defer=True,
                     tag_new=True,
                     normalize=False,  # normalization is full-fold only
-                    enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
+                    enrich=False,  # graph enrichment is full-fold only
                     promote=False,
                     subtractive_scope="interim",
                 ),
@@ -2791,10 +2802,6 @@ class ConsolidationLoop:
         A source probe that raises is NOT swallowed: proceeding into the fold
         with an unknown-partial store is the data loss this method exists to
         prevent, so the exception aborts the fold before anything is rewritten.
-
-        Args:
-            scope: The immutable :class:`FoldScope` for the current fold.  Its
-                ``source`` selects the venue via :meth:`_venue_from_scope`.
         """
         from paramem.memory.source import build_memory_source
 
@@ -6170,14 +6177,16 @@ class ConsolidationLoop:
            bound to this loop's ``self.merger`` and the current ``self.model`` /
            ``self.tokenizer``, and call
            :meth:`~paramem.training.graph_tier.GraphTierRefiner.refine` with the
-           ``normalize`` / ``enrich`` flags.  ``refine()`` runs the whole-graph
-           local-model normalization pass (predicate alignment + entity merge +
-           predicate-synonym normalization) when ``normalize`` is ``True``, then
-           Cloud graph enrichment (additive second-order discovery) when
-           ``enrich`` is ``True`` — normalization first, so enrichment sees the
-           already-normalized graph. Constructed fresh on every call, never
-           cached: ``self.model`` is re-wrapped by adapter operations elsewhere
-           in the fold, so a cached refiner would risk pinning a stale handle.
+           ``normalize`` / ``enrich`` flags.  ``refine()`` runs Cloud graph
+           enrichment (additive second-order discovery) when ``enrich`` is
+           ``True``, THEN the whole-graph local-model normalization pass
+           (predicate alignment + entity merge + predicate-synonym
+           normalization) when ``normalize`` is ``True`` — enrichment first,
+           so normalization sees any predicate synonym enrichment just
+           minted and collapses it before the fold's key assembly reads the
+           graph. Constructed fresh on every call, never cached: ``self.model``
+           is re-wrapped by adapter operations elsewhere in the fold, so a
+           cached refiner would risk pinning a stale handle.
         2. When ``result.enrichment`` carries ``aborted_reason == "vram"``
            (the enrichment pass stopped early on
            :class:`~paramem.utils.vram_guard.VramExhausted` but kept
@@ -6188,7 +6197,9 @@ class ConsolidationLoop:
            record_incident` surface used elsewhere in this class, when
            ``self._incidents_state_dir`` is configured.  Never raises: the
            fold always proceeds past this step, training on the
-           merged-but-unenriched graph — enrichment self-heals next cycle.
+           merged-but-unenriched graph — enrichment self-heals at the next
+           FULL fold (the pass is full-fold only; an intervening interim
+           cycle never runs it, so recovery does not happen there).
         3. Emit a debug snapshot ("enriched") after the refine step (or
            immediately when both stages are skipped). Emitted from the loop
            rather than the refiner, which calls :func:`on_normalization`
@@ -6226,9 +6237,12 @@ class ConsolidationLoop:
                 Callers pass ``normalize=scope.normalize``.
                 Default ``False``.
             enrich: When ``True``, run cloud-cloud graph enrichment (additive
-                discovery).  Callers pass ``enrich=scope.enrich`` (the
-                scope field is set at construction to
-                ``refinement_enrichment=="on" and cloud_enabled``).
+                discovery).  Callers pass ``enrich=scope.enrich`` — at the
+                full fold ``scope.enrich`` is set at construction to
+                ``refinement_enrichment=="on" and cloud_enabled``; at the
+                interim scope it is pinned ``False`` unconditionally
+                (graph-tier enrichment is a full-fold-only pass — see
+                :attr:`FoldScope.enrich`).
                 Default ``False``.
         """
         refiner = self.build_tier_refiner(self.merger)
@@ -6241,9 +6255,10 @@ class ConsolidationLoop:
         # means the chunk loop stopped early on VramExhausted but kept
         # whatever it already merged (see enrich_graph's docstring) rather
         # than aborting the fold.  Severity "warning" (the fold succeeds
-        # regardless): enrichment self-heals next cycle, since the pass runs
-        # over the cumulative graph every fold, so there is nothing to retry
-        # here.
+        # regardless): enrichment self-heals at the next FULL fold, since the
+        # pass runs over the cumulative graph every full fold (never at an
+        # intervening interim cycle — full-fold only), so there is nothing to
+        # retry here.
         if (
             result.enrichment is not None
             and result.enrichment.get("aborted_reason") == "vram"

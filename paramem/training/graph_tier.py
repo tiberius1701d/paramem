@@ -202,10 +202,21 @@ class GraphTierRefiner:
         search path is used). GC disable/enable is handled inside
         :func:`normalize_predicates`.
 
-        Survivor selection: within each cluster, the predicate with the highest
-        ``reinforcement_count`` (summed across all edges for that predicate)
-        survives. Tie broken by max ``last_seen``; remaining ties by cluster
-        iteration order.
+        Survivor selection: within each cluster, ``_pred_sort_key`` returns a
+        three-term key and the predicate with the MAX key survives — ``(rec,
+        established, ls)``. ``rec`` (summed ``reinforcement_count`` across all
+        edges for that predicate) leads: a paraphrase genuinely reinforced
+        across sessions still wins. ``established`` is ``0`` when every edge
+        for that predicate is enrichment-sourced (``_EDGE_SOURCE_ATTR ==
+        "graph_enrichment"``) and ``1`` otherwise — a predicate carrying even
+        one organically-extracted edge is established, and an established
+        predicate never loses to an enrichment-only one on the ``ls``
+        tie-break. This term exists because an enrichment edge enters at
+        ``reinforcement_count=1`` (the same as any net-new edge) and inherits
+        its whole chunk's MAXIMUM ``last_seen``, so without it a 1-vs-1 group
+        would tie on ``rec`` and hand the win to the fresher-looking cloud
+        paraphrase. ``ls`` (max ``last_seen``) is the final tie-break;
+        remaining ties fall to cluster iteration order.
 
         Overlapping clusters (same predicate in two clusters — a model
         hallucination) are handled by ``_retired_in_so_group`` tracking per
@@ -220,8 +231,9 @@ class GraphTierRefiner:
         1. Build ``_flat_relations`` and ``_so_groups`` from all predicate-bearing
            edges in ``merger.graph``.
         2. Call :func:`normalize_predicates` with the resolved engine kwargs.
-        3. For each returned ``(can_s, can_o)`` cluster group: pick the MAX
-           ``reinforcement_count`` edge as survivor; retire the rest.
+        3. For each returned ``(can_s, can_o)`` cluster group: pick the
+           survivor per the three-term ``_pred_sort_key`` rule above
+           (``rec``, then ``established``, then ``ls``); retire the rest.
 
            a. Union ``sessions``, sum ``reinforcement_count``, max ``confidence``,
               max ``last_seen`` of all retired edges onto the survivor BEFORE removal.
@@ -247,7 +259,7 @@ class GraphTierRefiner:
                 - ``skipped`` (bool): ``True`` when the pass was bypassed.
                 - ``skip_reason`` (str | None): reason token when skipped.
         """
-        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.memory.persistence import _EDGE_SOURCE_ATTR, _IK_KEY_ATTR
 
         _empty = {"groups_collapsed": 0, "edges_retired": 0, "chunks": 0}
 
@@ -359,12 +371,33 @@ class GraphTierRefiner:
                     continue
 
                 # Survivor selection: MAX reinforcement_count (summed across all edges
-                # for that predicate); tie-broken by MAX last_seen (ISO string max).
+                # for that predicate); tie-broken by whether the predicate is
+                # established (not purely enrichment-sourced); remaining ties by
+                # MAX last_seen (ISO string max).
+                #
+                # An enrichment-sourced predicate must never retire an established
+                # one on a recency tie-break.  A net-new edge enters at
+                # reinforcement_count=1 (GraphMerger Case-3), and an enrichment edge
+                # inherits its chunk's MAX last_seen (graph_enrich: _chunk_last_seen),
+                # so a 1-vs-1 group would tie on `rec` and then hand the win to the
+                # cloud paraphrase.  Since the enrichment pass now runs BEFORE this
+                # one, that inversion is reachable without the `established` term.
                 def _pred_sort_key(cp: str) -> tuple:
                     edges = pred_map[cp]
                     rec = sum(e["edata"].get("reinforcement_count", 1) for e in edges)
+                    # A missing _EDGE_SOURCE_ATTR counts as established (organic
+                    # edges are not stamped with a source at all) — see
+                    # merger.py:910-911/1094-1095, which only stamp the attribute
+                    # when relation.edge_source is truthy.
+                    established = (
+                        0
+                        if all(
+                            e["edata"].get(_EDGE_SOURCE_ATTR) == "graph_enrichment" for e in edges
+                        )
+                        else 1
+                    )
                     ls = max((e["edata"].get("last_seen", "") for e in edges), default="")
-                    return (rec, ls)
+                    return (rec, established, ls)
 
                 _survivor_pred = max(cluster_preds, key=_pred_sort_key)
                 _survivor_edges = pred_map[_survivor_pred]
@@ -453,10 +486,31 @@ class GraphTierRefiner:
         }
 
     def refine(self, *, normalize: bool = False, enrich: bool = False) -> RefineResult:
-        """Run normalization, then enrichment, over this refiner's merger.
+        """Run enrichment, then normalization, over this refiner's merger.
 
-        Normalization runs first (when ``normalize`` is ``True``) so that, when
-        both passes run, enrichment operates on the already-normalized graph.
+        Enrichment runs first (when ``enrich`` is ``True``) so that, when both
+        passes run, normalization sees the cloud-emitted predicates and
+        collapses paraphrases before the fold mints keys from the graph — a
+        predicate normalized after key assembly is a key minted un-normalized.
+        Two second-order effects follow from this order: normalization's
+        10-node floor (:meth:`run_normalization`) is now evaluated after
+        enrichment has added nodes, so normalization can clear a floor it
+        previously failed (strictly more normalization, never less); and
+        ``same_as`` node contractions land before normalization, so predicate
+        grouping is computed over already-coreferenced ``(subject, object)``
+        pairs — strictly better grouping than grouping first and
+        coreferencing after. Survivor selection within
+        :meth:`run_normalization` additionally never lets an
+        enrichment-sourced predicate retire an established one on a recency
+        tie-break (see the ``established`` term in ``_pred_sort_key``) — this
+        is what keeps the new order safe against a cloud paraphrase (which
+        inherits its chunk's maximum ``last_seen``) winning a 1-vs-1 tie
+        against an organically-extracted predicate.  What the flip gives up:
+        the cloud model that generates enrichment relations now sees the
+        graph BEFORE normalization has collapsed any synonym predicates
+        (it read an already-normalized graph under the old order) — the
+        guarantee this order relies on instead is the reorder itself plus
+        the survivor key above, not a normalized input to the cloud call.
 
         Args:
             normalize: When ``True``, run :meth:`run_normalization`.
@@ -470,16 +524,6 @@ class GraphTierRefiner:
         normalization: "dict | None" = None
         enrichment: "dict | None" = None
 
-        if normalize:
-            normalization = self.run_normalization()
-            if not normalization.get("skipped"):
-                logger.info(
-                    "graph_normalization complete: chunks=%d groups_collapsed=%d edges_retired=%d",
-                    normalization.get("chunks", 0),
-                    normalization.get("groups_collapsed", 0),
-                    normalization.get("edges_retired", 0),
-                )
-
         if enrich:
             enrichment = self.run_enrichment()
             if not enrichment.get("skipped"):
@@ -492,6 +536,16 @@ class GraphTierRefiner:
                     enrichment.get("anonymize_slices", 0),
                     enrichment.get("privacy_skipped_slices", 0),
                     enrichment.get("aborted_reason"),
+                )
+
+        if normalize:
+            normalization = self.run_normalization()
+            if not normalization.get("skipped"):
+                logger.info(
+                    "graph_normalization complete: chunks=%d groups_collapsed=%d edges_retired=%d",
+                    normalization.get("chunks", 0),
+                    normalization.get("groups_collapsed", 0),
+                    normalization.get("edges_retired", 0),
                 )
 
         reinforcements: "dict[str, tuple[str, str]]" = dict(

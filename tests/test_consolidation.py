@@ -839,6 +839,63 @@ class TestInterimRefinementGate:
             f"Predicate 'knows' must appear in extra_relations; predicates={predicates}"
         )
 
+    def test_interim_scope_pins_enrich_false(self, monkeypatch, tmp_path):
+        """Structural pin: the interim FoldScope always sets enrich=False (and
+        normalize=False), regardless of refinement_enrichment / cloud_enabled.
+
+        Spies on ConsolidationLoop._run_fold to capture the FoldScope handed
+        to it from run_consolidation_cycle's interim entry point.  Fails if a
+        future change re-wires the interim enrich/normalize construction back
+        onto the config-driven expression the full fold uses
+        (``consolidation.py``'s ``FoldScope(... enrich=...)`` at the interim
+        construction site).
+        """
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import ConsolidationLoop, FoldScope
+
+        loop = self._build_loop(
+            monkeypatch, tmp_path, refinement_enrichment="on", cloud_enabled=True
+        )
+        # replay_enabled=True is required so run_consolidation_cycle passes guard #2.
+        loop.store._replay_enabled = True
+
+        with patch.object(loop.extraction, "run", return_value=self._session_graph):
+            episodic_rels, procedural_rels = loop.extract_session("t", "s_gate", speaker_id="spk0")
+
+        assert episodic_rels, (
+            "extract_session must return non-empty episodic_rels for the test to be valid"
+        )
+
+        captured_scopes: list[FoldScope] = []
+
+        def _spy_run_fold(self_inner, scope, **kwargs):
+            captured_scopes.append(scope)
+            return {"mode": "simulated"}
+
+        with patch.object(ConsolidationLoop, "_run_fold", _spy_run_fold):
+            loop.run_consolidation_cycle(
+                episodic_rels,
+                procedural_rels,
+                speaker_id="spk0",
+                mode="simulate",
+                run_label="s_gate",
+                stamp="20260601T0000",
+                max_interim_count=7,
+            )
+
+        assert len(captured_scopes) == 1, (
+            f"expected exactly one _run_fold call; got {len(captured_scopes)}"
+        )
+        scope = captured_scopes[0]
+        assert scope.enrich is False, (
+            "interim FoldScope.enrich must be pinned False even with "
+            f"refinement_enrichment='on' and cloud_enabled=True; got {scope.enrich}"
+        )
+        assert scope.normalize is False, (
+            f"interim FoldScope.normalize must be pinned False; got {scope.normalize}"
+        )
+
 
 class TestRefinementConfigRoundtrip:
     """Loading YAML with refinement knobs propagates through the property chain."""
@@ -6815,6 +6872,158 @@ class TestDriftPartitioning:
             f" caplog had: {[r.message for r in caplog.records]}"
         )
 
+    def test_intervening_enrichment_merge_preserves_dedup_bucketing_and_bump(self, tmp_path):
+        """Q4 regression: ``GraphMerger.merge()`` no longer resets
+        ``reinforcements``/``collapsed`` at entry (only ``reset_graph()``
+        does) -- so a real, non-empty enrichment merge that runs BETWEEN the
+        recon re-merge's Case-1 collapse and the fold's consumers no longer
+        silently wipes that collapse's bookkeeping.
+
+        Setup mirrors ``test_drift_partition_three_buckets``: key_dup1 and
+        key_dup2 share identical registry-true SPO, so the recon re-merge
+        fires a real Case-1 collapse (populates ``merger.reinforcements``/
+        ``merger.collapsed``).  ``GraphTierRefiner.run_enrichment`` is then
+        patched with a side_effect that performs a REAL non-empty
+        ``merge_relations`` call (the same shape a real cloud-enrichment
+        pass finding one new fact would produce) -- before the fix, this
+        call's ``merge()`` would reset both accumulators to empty before the
+        drift partition and the reinforcement-bump loop ever read them.
+
+        Pre-fix symptom (not asserted here, recorded for the record): with
+        ``merger.collapsed`` wiped, key_dup2 would fall through the drift
+        partition's ``_dk in _collapsed_set`` check into
+        ``elif _dk in _ledger`` (the ledger survives regardless -- it was
+        never reset by ``merge()``) and land in ``drift_intended_removal``
+        instead of ``drift_deduplicated``, without ever being soft-staled
+        via ``discard_keys``.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.graph_tier import GraphTierRefiner
+        from paramem.utils.config import ConsolidationConfig
+
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid1][_IK_KEY_ATTR] = "key_dup1"
+        eid2 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid2][_IK_KEY_ATTR] = "key_dup2"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)  # real merger for Case-1 collapse
+        # enrich=True at the full fold (refinement_enrichment="on" +
+        # cloud_enabled=True) -- refinement_normalization stays at its "on"
+        # default but the tiny recon graph (2-4 nodes) never clears the
+        # 10-node floor, so it safely no-ops without further mocking.
+        loop.config = ConsolidationConfig(refinement_enrichment="on")
+        loop.cloud_enabled = True
+
+        for key in ("key_dup1", "key_dup2"):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "speaker0",
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+            )
+
+        before_dup1_reinforcement = loop.store.bookkeeping_for_key("key_dup1")[
+            "reinforcement_count"
+        ]
+
+        def _fake_enrichment(self_inner):
+            # Real, non-empty merge -- exercises merge()'s (former) reset at
+            # entry with the same shape a real cloud-enrichment pass uses
+            # (graph_enrich.enrich_graph's own merge_relations call).
+            self_inner._merger.merge_relations(
+                [
+                    Relation(
+                        subject="Carol",
+                        predicate="knows",
+                        object="Dave",
+                        relation_type="social",
+                        confidence=0.9,
+                        speaker_id="speaker0",
+                        edge_source="graph_enrichment",
+                    )
+                ],
+                session_id="__test_enrichment__",
+                log_label="test enrichment",
+                resolve_contradictions=False,
+            )
+            return {"skipped": False, "chunks": 1, "new_edges": 1, "same_as_merges": 0}
+
+        from unittest.mock import patch
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=ReconstructionResult(graph=recon_g),
+                ),
+                patch.object(GraphTierRefiner, "run_enrichment", _fake_enrichment),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate(mode="train", trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert result["drift_deduplicated"] == 1, (
+            "key_dup2 must still be bucketed deduplicated despite the intervening "
+            f"enrichment merge; got {result}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            "the intervening enrichment merge must not misclassify the dedup "
+            f"collapse as genuine_loss; got {result}"
+        )
+        assert result["drift_intended_removal"] == 0, (
+            f"key_dup2 must not fall through to drift_intended_removal; got {result}"
+        )
+        assert loop.store.is_stale("key_dup2"), (
+            "key_dup2 must be soft-staled by the drift partition's dedup branch "
+            "even with an intervening enrichment merge"
+        )
+        after_dup1_reinforcement = loop.store.bookkeeping_for_key("key_dup1")["reinforcement_count"]
+        assert after_dup1_reinforcement == before_dup1_reinforcement + 1, (
+            "the recon-collapse reinforcement bump for the surviving key_dup1 "
+            "must still fire despite the intervening enrichment merge; "
+            f"before={before_dup1_reinforcement} after={after_dup1_reinforcement}"
+        )
+
 
 class TestDriftIntendedRemoval:
     """Tests for the drift_intended_removal bucket (merger ledger consumer).
@@ -10206,10 +10415,18 @@ class TestInterimRecitalDedup:
 
     # ------------------------------------------------------------------
     # 1c. adopt_reinforcements survives an intervening non-empty merge()
-    #     (the entire reason for the dedicated accumulator: merge() resets
-    #     merger.reinforcements/collapsed unconditionally at entry, but must
-    #     NOT reset adopt_reinforcements -- an interim enrichment merge runs
-    #     between the dedup merge and the refine bump loop in production).
+    #     call.  GraphMerger.merge() no longer resets
+    #     reinforcements/collapsed at entry at all (Q4 fix, 2026-07-28) --
+    #     reset happens ONLY in reset_graph(), the same lifecycle
+    #     adopt_reinforcements has always had.  Interim graph-tier
+    #     enrichment no longer exists as an intervening-merge source
+    #     (FoldScope.enrich is pinned False at interim, so no real
+    #     production call site puts a merge() between the interim dedup
+    #     merge and the refine bump loop any more).  This test therefore
+    #     exercises the accumulator-survival GUARANTEE directly, with an
+    #     arbitrary non-empty merge() standing in for any future intra-fold
+    #     merge that might land at that point, rather than simulating a
+    #     real pipeline sequence.
     # ------------------------------------------------------------------
 
     def test_recital_adopt_survives_intervening_enrichment_merge(self, tmp_path):
@@ -10263,14 +10480,15 @@ class TestInterimRecitalDedup:
             "setup precondition: the dedup merge's Case-1-adopt must record graph1"
         )
 
-        # Interpose a NON-EMPTY registry-relations merge -- the same shape as a
-        # real interim graph-enrichment pass, which runs between the dedup
-        # merge and the refine bump loop in production
-        # (_refine_consolidation_graph calls GraphTierRefiner.run_enrichment
-        # before the bump loop when enrich=True).  GraphMerger.merge() unconditionally
-        # resets self.reinforcements/self.collapsed at entry whenever it is
-        # invoked with a non-empty relation set -- this call reproduces that
-        # reset without depending on the cloud enrichment path.
+        # Interpose an arbitrary NON-EMPTY registry-relations merge between the
+        # dedup merge and the bump loop.  This is NOT simulating a real
+        # production call site any more -- interim graph-tier enrichment
+        # never runs (FoldScope.enrich is pinned False at interim), so no
+        # merge() can actually land here in production today.  It stands in
+        # for any future intra-fold merge that might, to prove the
+        # accumulator-survival guarantee is structural (reset-only-in-
+        # reset_graph()), not contingent on nothing else happening to merge
+        # in between.
         enrichment_relation = [
             Relation(
                 subject="bob",
@@ -10288,8 +10506,19 @@ class TestInterimRecitalDedup:
             resolve_contradictions=False,
         )
 
+        # reinforcements stays empty here for a reason UNRELATED to the
+        # intervening merge: this fixture's recon_relations is empty
+        # (keys=[] -- no slot keys reconstructed), so no Case-1 duplicate-SPO
+        # collision ever fires to populate it in the first place.  GraphMerger
+        # .merge() no longer resets reinforcements/collapsed at entry at all
+        # (Q4 fix) -- if this fixture instead reconstructed two same-SPO slot
+        # keys, reinforcements would still carry that collapse's entry after
+        # the intervening merge, undisturbed (see
+        # TestDriftPartitioning.test_intervening_enrichment_merge_preserves_dedup_bucketing_and_bump
+        # for that exact scenario, end-to-end at the full fold).
         assert loop.merger.reinforcements == {}, (
-            "setup precondition: the intervening merge must have reset reinforcements"
+            "precondition sanity check: this fixture's recon_relations is empty, "
+            f"so reinforcements was never populated; got {loop.merger.reinforcements}"
         )
         assert "graph1" in loop.merger.adopt_reinforcements, (
             "adopt_reinforcements MUST survive the intervening merge() call -- this is "

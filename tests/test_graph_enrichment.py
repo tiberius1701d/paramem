@@ -2388,13 +2388,16 @@ class TestGraphEnrichWithCloudUnit:
 
 
 class TestInterimEnrichmentHook:
-    """Rollover mini-enrichment inside run_consolidation_cycle.
+    """Interim refine inside run_consolidation_cycle runs NO graph-tier enrichment.
 
-    The rollover hook fires inside the 'normal fresh-interim' branch of
-    run_consolidation_cycle, i.e. when a new sub-interval stamp opens.  It
-    reuses `GraphTierRefiner.run_enrichment`, so these tests only verify
-    the gating logic and the accumulator lifecycle.  The full enrichment
-    path is covered by TestRunGraphEnrichment.
+    ``FoldScope.enrich`` is pinned ``False`` structurally at the interim
+    ``FoldScope`` construction site (``consolidation.py``), regardless of the
+    operator's ``refinement_enrichment`` knob or ``cloud_enabled`` — graph-tier
+    enrichment is a full-fold-only pass.  These tests pin
+    ``GraphTierRefiner.run_enrichment`` is never called from the
+    ``run_consolidation_cycle`` (interim) entry point, across every gating
+    combination.  The full-fold enrichment path is covered by
+    TestRunGraphEnrichment / TestRefineConsolidationGraph.
     """
 
     def _make_session_graph(self):
@@ -2426,8 +2429,15 @@ class TestInterimEnrichmentHook:
             ],
         )
 
-    def test_refinement_enrichment_on_calls_run_enrichment(self, tmp_path):
-        """refinement_enrichment='on' + cloud master switch on → run_enrichment called."""
+    def test_refinement_enrichment_on_does_not_enrich_at_interim(self, tmp_path):
+        """refinement_enrichment='on' + cloud master switch on → interim still
+
+        runs no graph-tier enrichment. ``FoldScope.enrich`` is pinned ``False``
+        structurally for every interim cycle (``consolidation.py`` interim
+        ``FoldScope`` construction site), regardless of the operator's
+        ``refinement_enrichment`` knob or whether cloud egress is enabled —
+        graph-tier enrichment is a full-fold-only pass.
+        """
         from paramem.training.key_registry import KeyRegistry
         from paramem.utils.config import ConsolidationConfig
 
@@ -2476,110 +2486,15 @@ class TestInterimEnrichmentHook:
                 stamp="20260420T1200",
             )
 
-        enrich_mock.assert_called_once()
-
-    def test_refinement_normalization_only_does_not_enrich(self, tmp_path):
-        """refinement_normalization='on' only → GraphTierRefiner.run_enrichment NOT called."""
-        from paramem.training.key_registry import KeyRegistry
-        from paramem.utils.config import ConsolidationConfig
-
-        loop = _make_loop(
-            tmp_path,
-            consolidation_config=ConsolidationConfig(
-                refinement_normalization="on", refinement_enrichment="off"
-            ),
-            replay_enabled=True,
-        )
-        for tier in ("episodic", "semantic", "procedural"):
-            loop.store.load_registry(tier, KeyRegistry())
-
-        _ep = [
-            {
-                "question": "q",
-                "answer": "a",
-                "subject": "S",
-                "predicate": "p",
-                "object": "O",
-            }
-        ]
-        loop.extract_session = MagicMock(return_value=(_ep, []))
-
-        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
-        with (
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                return_value=loop.model,
-            ),
-            patch("paramem.training.trainer.train_adapter", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-            patch.object(
-                GraphTierRefiner, "run_enrichment", return_value={"skipped": True}
-            ) as enrich_mock,
-        ):
-            eps, proc = loop.extract_session("t", "s1", "speaker0")
-            loop.run_consolidation_cycle(
-                eps,
-                proc,
-                speaker_id="speaker0",
-                mode="train",
-                run_label="s1",
-                schedule="12h",
-                max_interim_count=7,
-                stamp="20260420T1200",
-            )
-
         enrich_mock.assert_not_called()
 
-    def test_refinement_off_does_not_enrich(self, tmp_path):
-        """refinement_enrichment='off' (default) → GraphTierRefiner.run_enrichment NOT called."""
-        from paramem.training.key_registry import KeyRegistry
-
-        loop = _make_loop(
-            tmp_path,
-            replay_enabled=True,
-        )
-        # refinement_enrichment defaults to "off" in ConsolidationConfig default.
-        for tier in ("episodic", "semantic", "procedural"):
-            loop.store.load_registry(tier, KeyRegistry())
-
-        _ep = [
-            {
-                "question": "q",
-                "answer": "a",
-                "subject": "S",
-                "predicate": "p",
-                "object": "O",
-            }
-        ]
-        loop.extract_session = MagicMock(return_value=(_ep, []))
-
-        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
-        with (
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                return_value=loop.model,
-            ),
-            patch("paramem.training.trainer.train_adapter", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
-            patch.object(
-                GraphTierRefiner, "run_enrichment", return_value={"skipped": True}
-            ) as enrich_mock,
-        ):
-            eps, proc = loop.extract_session("t", "s1", "speaker0")
-            loop.run_consolidation_cycle(
-                eps,
-                proc,
-                speaker_id="speaker0",
-                mode="train",
-                run_label="s1",
-                schedule="12h",
-                max_interim_count=7,
-                stamp="20260420T1200",
-            )
-
-        enrich_mock.assert_not_called()
+    # test_refinement_normalization_only_does_not_enrich and
+    # test_refinement_off_does_not_enrich were collapsed into the on+cloud
+    # case above (code review, 2026-07-28): the interim gate is
+    # unconditional (see this class's docstring and
+    # test_interim_scope_pins_enrich_false in test_consolidation.py), so the
+    # on+cloud case above -- the single hardest config to satisfy -- already
+    # implies both weaker configs; testing them separately added no coverage.
 
     def test_rollover_hook_skipped_on_ring_full(self, tmp_path):
         """Ring-full (cap_pending) short-circuit does NOT fire the enrichment hook.
@@ -2813,6 +2728,211 @@ class TestRefineConsolidationGraph:
 
         norm_mock.assert_called_once()
         enrich_mock.assert_not_called()
+
+
+class TestRefineOrderEnrichThenNormalize:
+    """U2 — ``GraphTierRefiner.refine`` runs enrichment BEFORE normalization.
+
+    Unlike ``TestRefineConsolidationGraph`` (which mocks both passes away to
+    test ``_refine_consolidation_graph``'s wiring), these tests exercise the
+    refiner's REAL ``run_enrichment``/``run_normalization`` bodies — with
+    only the underlying cloud primitives (``request_graph_enrichment``,
+    ``normalize_predicates``) mocked — so the observed order and the
+    content interaction between the two passes are real, not asserted on
+    the caller's behalf.
+    """
+
+    # Enrichment-before-normalization call ORDER is pinned at the caller in
+    # test_simulate_train_parity.py::TestGraphTierSkipsAfterRelease
+    # .test_refine_stage_skips_both_passes_on_released_loop, which asserts
+    # call_order == ["enrichment", "normalization"] through
+    # _refine_consolidation_graph, the production entry point.  Not
+    # duplicated here at the refiner level.
+
+    def test_normalization_sees_enrichment_edges(self, tmp_path, monkeypatch):
+        """Defect regression pin (F2/F3): a cloud paraphrase minted by
+        enrichment is visible to (and collapsed by) normalization in the
+        SAME ``refine()`` call.  Before the flip, enrichment ran AFTER
+        normalization, so a cloud-coined paraphrase reached the fold's key
+        assembly un-normalized — this test fails on that ordering.
+
+        The (s,o) pair already carries an established predicate ("works
+        at", from ``_populate_graph``); enrichment mints a same-pair
+        paraphrase ("employed_by").  U3's survivor rule keeps the
+        established predicate as the survivor.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        canned_enrichment = (
+            [
+                {
+                    "subject": "Person0",
+                    "predicate": "employed_by",
+                    "object": "AcmeCorp",
+                    "relation_type": "factual",
+                    "confidence": 0.9,
+                }
+            ],
+            [],
+            "raw",
+            0,
+        )
+        canned_normalize = (
+            {("person0", "acmecorp"): [["works at", "employed by"]]},
+            {"model_calls": 1, "raw_outputs": []},
+        )
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=canned_enrichment,
+            ),
+            patch(
+                "paramem.training.graph_tier.normalize_predicates",
+                return_value=canned_normalize,
+            ),
+        ):
+            result = _refiner_for(loop).refine(normalize=True, enrich=True)
+
+        assert not result.enrichment["skipped"]
+        assert not result.normalization["skipped"]
+        assert result.normalization["edges_retired"] >= 1, (
+            "normalization must have retired the paraphrase edge -- it fails "
+            "to see it at all under the pre-flip (normalize-then-enrich) order"
+        )
+        surviving_preds = {
+            d.get("predicate")
+            for _, _, d in graph.out_edges("person0", data=True)
+            if d.get("predicate") in ("works at", "employed by")
+        }
+        assert surviving_preds == {"works at"}, (
+            f"the established predicate must survive the paraphrase collapse; got {surviving_preds}"
+        )
+
+    # Ledger append-only across passes/merges: removal_ledger's reset-only-
+    # in-reset_graph() lifecycle is pinned directly by
+    # test_merger.py::TestRemovalLedger.test_reset_graph_clears_removal_ledger;
+    # each reason code (predicate_synonym_collapse, enrichment_same_as) is
+    # pinned writing correctly in isolation by the many
+    # TestRunGraphNormalizationApply / TestEnrichmentRemovalLedger cases in
+    # this suite; and the ledger surviving an intervening cross-pass merge
+    # end-to-end is pinned by
+    # TestDriftPartitioning.test_intervening_enrichment_merge_preserves_dedup_bucketing_and_bump
+    # (test_consolidation.py, the Q4 regression).  A test asserting both
+    # reason codes coexist in one refine() call adds no further coverage
+    # (removal_ledger was never reset by merge() even before Q4 -- the fix
+    # only touched reinforcements/collapsed).
+
+
+class TestSurvivorRuleEstablishedOutranksEnrichment:
+    """U3 — ``_pred_sort_key``'s three-term survivor key: ``(rec, established,
+    last_seen)``.  Exercises ``GraphTierRefiner.run_normalization`` directly
+    (no need to run enrichment for real; the enrichment-sourced edge is
+    built directly with the exact ``reinforcement_count``/``last_seen``
+    shape F3 describes, so the arithmetic is pinned precisely).
+    """
+
+    def test_established_predicate_survives_enrichment_paraphrase_on_a_tie(self, tmp_path):
+        """F3 pin: a 1-vs-1 group -- one established edge
+        (reinforcement_count=1, OLDER last_seen) vs one enrichment edge
+        (reinforcement_count=1, edge_source='graph_enrichment', NEWER
+        last_seen -- the chunk-maximum an enrichment edge inherits).  Ties
+        on ``rec``; without U3 the tie-break falls straight to ``last_seen``
+        and hands the win to the paraphrase.  Fails without U3.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)  # clears the 10-node floor
+
+        established_eid = next(iter(graph["person0"]["acmecorp"]))
+        graph["person0"]["acmecorp"][established_eid]["reinforcement_count"] = 1
+        graph["person0"]["acmecorp"][established_eid]["last_seen"] = "s001"
+
+        graph.add_edge(
+            "person0",
+            "acmecorp",
+            predicate="employed by",
+            relation_type="factual",
+            confidence=0.9,
+            reinforcement_count=1,
+            last_seen="s999",  # newer -- the chunk's max last_seen
+            sessions=["s999"],
+            edge_source="graph_enrichment",
+        )
+
+        canned_normalize = (
+            {("person0", "acmecorp"): [["works at", "employed by"]]},
+            {"model_calls": 1, "raw_outputs": []},
+        )
+        with patch(
+            "paramem.training.graph_tier.normalize_predicates",
+            return_value=canned_normalize,
+        ):
+            result = _refiner_for(loop).run_normalization()
+
+        assert result["edges_retired"] == 1
+        surviving_preds = {
+            d.get("predicate")
+            for _, _, d in graph.out_edges("person0", data=True)
+            if d.get("predicate") in ("works at", "employed by")
+        }
+        assert surviving_preds == {"works at"}, (
+            f"the established predicate must survive the recency tie; got {surviving_preds}"
+        )
+
+    def test_reinforcement_count_still_leads(self, tmp_path):
+        """``rec`` is the LEADING term: an enrichment predicate reinforced
+        across sessions (summed rec=3) still beats an established one at
+        rec=1 -- the ``established`` term must not override a real
+        recurrence lead."""
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        established_eid = next(iter(graph["person0"]["acmecorp"]))
+        graph["person0"]["acmecorp"][established_eid]["reinforcement_count"] = 1
+        graph["person0"]["acmecorp"][established_eid]["last_seen"] = "s001"
+
+        graph.add_edge(
+            "person0",
+            "acmecorp",
+            predicate="employed by",
+            relation_type="factual",
+            confidence=0.9,
+            reinforcement_count=3,
+            last_seen="s500",
+            sessions=["s500"],
+            edge_source="graph_enrichment",
+        )
+
+        canned_normalize = (
+            {("person0", "acmecorp"): [["works at", "employed by"]]},
+            {"model_calls": 1, "raw_outputs": []},
+        )
+        with patch(
+            "paramem.training.graph_tier.normalize_predicates",
+            return_value=canned_normalize,
+        ):
+            result = _refiner_for(loop).run_normalization()
+
+        assert result["edges_retired"] == 1
+        surviving_preds = {
+            d.get("predicate")
+            for _, _, d in graph.out_edges("person0", data=True)
+            if d.get("predicate") in ("works at", "employed by")
+        }
+        assert surviving_preds == {"employed by"}, (
+            f"the reinforced enrichment predicate must win on rec alone; got {surviving_preds}"
+        )
+
+    # Two-established-predicates recency tie-break (neither edge
+    # enrichment-sourced) is covered by
+    # TestRunGraphNormalizationApply.test_provenance_last_seen_max_on_survivor
+    # (test_consolidation.py) -- identical shape (both organic, rec ties,
+    # last_seen decides) -- so it is not duplicated here.
 
 
 class TestRefineConsolidationGraphRecordsVramIncident:

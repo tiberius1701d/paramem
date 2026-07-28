@@ -2122,18 +2122,43 @@ class TestGraphTierSkipsAfterRelease:
         assert loop.extraction is None, "the skip path must not repopulate extraction"
 
     def test_refine_stage_skips_both_passes_on_released_loop(self, tmp_path):
-        """The Refine stage runs both passes on a released loop without raising.
+        """The Refine stage runs both passes, in order, on a released loop
+        without raising.
 
         Covers the caller as well as the passes: ``_refine_consolidation_graph``
         is the production entry point and must not evaluate tier arguments the
-        released loop can no longer supply.
+        released loop can no longer supply.  Also pins the full-fold pass
+        order at the caller: enrichment runs BEFORE normalization (the U2
+        flip), so the parity suite covers the caller's observed order, not
+        just ``GraphTierRefiner.refine``'s own unit tests.
         """
+        from unittest.mock import patch
+
         loop = self._released_loop(tmp_path)
         loop.store = MemoryStore(replay_enabled=True)
 
-        loop._refine_consolidation_graph([], normalize=True, enrich=True)
+        call_order: list[str] = []
+        _orig_enrichment = GraphTierRefiner.run_enrichment
+        _orig_normalization = GraphTierRefiner.run_normalization
+
+        def _spy_enrichment(self_inner):
+            call_order.append("enrichment")
+            return _orig_enrichment(self_inner)
+
+        def _spy_normalization(self_inner):
+            call_order.append("normalization")
+            return _orig_normalization(self_inner)
+
+        with (
+            patch.object(GraphTierRefiner, "run_enrichment", _spy_enrichment),
+            patch.object(GraphTierRefiner, "run_normalization", _spy_normalization),
+        ):
+            loop._refine_consolidation_graph([], normalize=True, enrich=True)
 
         assert loop.extraction is None
+        assert call_order == ["enrichment", "normalization"], (
+            f"expected enrichment before normalization; got {call_order}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3156,6 +3181,8 @@ class TestFoldHydratesAPartiallyPreloadedStore:
         been staled.
         """
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.source import DiskMemorySource
+        from paramem.memory.store import MemoryStore
 
         loop = _make_bare_loop(tmp_path)
         _write_interim_graph(loop, _STAMP, self._TRIPLES, store_state="hydrated")
@@ -3165,7 +3192,48 @@ class TestFoldHydratesAPartiallyPreloadedStore:
 
         assert loop.store.get("graph2") is None, "fixture must start with graph2 un-hydrated"
 
-        result = loop.consolidate(mode="simulate")
+        # Cardinality pin: the fold must probe the source exactly once,
+        # batched across every active key of every registered tier — never
+        # once per key, never once per read site.
+        disk_probe_calls: list[dict] = []
+        _orig_disk_probe = DiskMemorySource.probe
+        store_probe_calls: list[dict] = []
+        _orig_store_probe = MemoryStore.probe
+
+        def _spy_disk_probe(self_inner, keys_by_adapter, should_abort=None):
+            disk_probe_calls.append(dict(keys_by_adapter))
+            return _orig_disk_probe(self_inner, keys_by_adapter, should_abort)
+
+        def _spy_store_probe(self_inner, keys_by_adapter, **kwargs):
+            store_probe_calls.append(dict(keys_by_adapter))
+            return _orig_store_probe(self_inner, keys_by_adapter, **kwargs)
+
+        with (
+            patch.object(DiskMemorySource, "probe", _spy_disk_probe),
+            patch.object(MemoryStore, "probe", _spy_store_probe),
+        ):
+            result = loop.consolidate(mode="simulate")
+
+        assert len(disk_probe_calls) == 1, (
+            f"DiskMemorySource.probe must be called exactly once per fold "
+            f"(batched, never once per key); got {len(disk_probe_calls)}"
+        )
+        assert len(store_probe_calls) == 1, (
+            f"MemoryStore.probe (the one call site inside "
+            f"_hydrate_store_for_fold) must be called exactly once — no "
+            f"downstream re-probe from any of the other fold read sites; "
+            f"got {len(store_probe_calls)}"
+        )
+        source_probed_keys = {k for keys in disk_probe_calls[0].values() for k in keys}
+        assert source_probed_keys == {"graph2"}, (
+            "the single source probe must cover exactly the cache miss "
+            f"(graph1 is already warm); got {source_probed_keys}"
+        )
+        store_probed_keys = {k for keys in store_probe_calls[0].values() for k in keys}
+        assert store_probed_keys == {"graph1", "graph2"}, (
+            "MemoryStore.probe's single call must cover every active key of "
+            f"every registered tier; got {store_probed_keys}"
+        )
 
         keyed = {e["key"] for tier in result["tier_keyed"].values() for e in tier}
         assert keyed == {"graph1", "graph2"}, (
@@ -3219,17 +3287,28 @@ class TestFoldHydratesAPartiallyPreloadedStore:
 
         assert loop.store.get("graph2") is None, "fixture must start with graph2 un-hydrated"
 
+        from paramem.memory.store import MemoryStore
+
         probed: dict = {}
+        weight_probe_calls: list[dict] = []
 
         def _fake_probe(model, tokenizer, keys_by_adapter, **kwargs):
             """Stand in for the adapter probe: the weights still hold graph2."""
             probed.update(keys_by_adapter)
+            weight_probe_calls.append(dict(keys_by_adapter))
             out: dict = {}
             for keys in keys_by_adapter.values():
                 for key in keys:
                     triple = next((t for t in self._TRIPLES if t["key"] == key), None)
                     out[key] = None if triple is None else {**triple, "confidence": 1.0}
             return out
+
+        store_probe_calls: list[dict] = []
+        _orig_store_probe = MemoryStore.probe
+
+        def _spy_store_probe(self_inner, keys_by_adapter, **kwargs):
+            store_probe_calls.append(dict(keys_by_adapter))
+            return _orig_store_probe(self_inner, keys_by_adapter, **kwargs)
 
         # The consolidate(mode="train") entry guard requires the caller to hold
         # _gpu_thread_lock; a mock whose acquire() reports False satisfies it
@@ -3240,6 +3319,7 @@ class TestFoldHydratesAPartiallyPreloadedStore:
         with (
             patch("paramem.server.gpu_lock._gpu_thread_lock", _mock_lock),
             patch("paramem.memory.probe.probe_keys_grouped_by_adapter", _fake_probe),
+            patch.object(MemoryStore, "probe", _spy_store_probe),
             patches[0],
             patches[1],
             patches[2],
@@ -3263,6 +3343,27 @@ class TestFoldHydratesAPartiallyPreloadedStore:
         assert "graph2" in {k for keys in probed.values() for k in keys}, (
             "the fold must ask the weight source for the un-hydrated key"
         )
+        # Cardinality pin: exactly one batched weight-source probe, and
+        # exactly one MemoryStore.probe call (no downstream re-probe) —
+        # never once per key, never once per read site.
+        assert len(weight_probe_calls) == 1, (
+            f"probe_keys_grouped_by_adapter must be called exactly once per "
+            f"fold; got {len(weight_probe_calls)}"
+        )
+        assert len(store_probe_calls) == 1, (
+            f"MemoryStore.probe must be called exactly once (no downstream "
+            f"re-probe); got {len(store_probe_calls)}"
+        )
+        source_probed_keys = {k for keys in weight_probe_calls[0].values() for k in keys}
+        assert source_probed_keys == {"graph2"}, (
+            "the single source probe must cover exactly the cache miss "
+            f"(graph1 is already warm); got {source_probed_keys}"
+        )
+        store_probed_keys = {k for keys in store_probe_calls[0].values() for k in keys}
+        assert store_probed_keys == {"graph1", "graph2"}, (
+            "MemoryStore.probe's single call must cover every active key of "
+            f"every registered tier; got {store_probed_keys}"
+        )
         keyed = {e["key"] for tier in result["tier_keyed"].values() for e in tier}
         assert "graph2" in keyed, (
             f"the un-hydrated key must be re-probed from the weights and folded, not "
@@ -3272,3 +3373,37 @@ class TestFoldHydratesAPartiallyPreloadedStore:
             "graph2 must still be an active registered key after the fold"
         )
         assert not loop.store.is_stale("graph2"), "graph2 must not have been staled"
+
+    def test_warm_cache_fold_never_probes_the_source(self, tmp_path):
+        """A fully-hydrated store makes ZERO ``MemorySource.probe`` calls
+        while every key still folds -- pins the ``if misses:`` guard
+        (``store.py``) as the mechanism, and that the fold's ``memoize=True``
+        is not conditional on ``inference.preload_cache``."""
+        from unittest.mock import patch
+
+        from paramem.memory.source import DiskMemorySource
+
+        loop = _make_bare_loop(tmp_path)
+        _write_interim_graph(loop, _STAMP, self._TRIPLES, store_state="hydrated")
+        assert loop.store.get("graph1") is not None and loop.store.get("graph2") is not None, (
+            "fixture must start fully warm"
+        )
+
+        disk_probe_calls: list[dict] = []
+
+        def _spy_disk_probe(self_inner, keys_by_adapter, should_abort=None):
+            disk_probe_calls.append(dict(keys_by_adapter))
+            raise AssertionError(
+                "DiskMemorySource.probe must not be called against a fully-warm store"
+            )
+
+        with patch.object(DiskMemorySource, "probe", _spy_disk_probe):
+            result = loop.consolidate(mode="simulate")
+
+        assert disk_probe_calls == [], (
+            f"expected zero source probes against a warm cache; got {disk_probe_calls}"
+        )
+        keyed = {e["key"] for tier in result["tier_keyed"].values() for e in tier}
+        assert keyed == {"graph1", "graph2"}, (
+            f"both keys must still fold from a warm cache; tier_keyed carried {keyed}"
+        )

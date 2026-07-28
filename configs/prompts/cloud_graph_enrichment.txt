@@ -8,6 +8,7 @@ Required for both outputs:
 - Confidence ≥ 0.7. Emit nothing rather than guess.
 - each input triple includes a `speaker_id`; a non-empty `speaker_id` marks the subject as a speaker.
 - each emitted relation must include `"symmetric": true` or `"symmetric": false`.
+- when the relation you are about to assert is semantically one the input graph already names between the same two nodes, reuse that graph's EXACT predicate surface rather than coining a synonym (e.g. if the input already has `works_at`, do not emit `employed_by` for the same fact).
 
 
 ## Part 1 — RELATIONS
@@ -35,6 +36,9 @@ NEGATIVE — input has only `attended(Person_1, Org_2)` AND `attended(Person_2, 
 
 NEGATIVE — input already contains `colleague_of(Person_1, Person_2)` and NEITHER is a speaker:
 → DO NOT re-emit `colleague_of(Person_2, Person_1)` — symmetric pair, single direction only. DO NOT re-emit any input triple.
+
+NEGATIVE — input has `works_at(Person_1, Org_1)`:
+→ DO NOT emit `employed_by(Person_1, Org_1)`. Same relation, existing predicate surface — reuse `works_at` (or, since it is already in the input, emit nothing).
 
 NEGATIVE — input has triples about Person_1's program work but no node named `"€200M+"`, `"12 months"`, or `"Independent"`:
 → DO NOT emit `(Person_1, managed_program_value_of, "€200M+")`, `(Person_1, recovered_schedule_delay_of, "12 months")`, or `(Person_1, currently_employed_at, "Independent")`. Literal values (amounts, durations, dates, percentages, bare adjectives) are NOT graph nodes. The `subject` and `object` of every emitted relation must be a string that already appears as a node in the input graph — verbatim (the token, e.g. `Person_1`, not the real name it stands for). If no existing node captures the fact, emit nothing rather than minting a new one. Session-level extraction handles literal values as attributes; this pass does not.

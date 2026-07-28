@@ -259,8 +259,14 @@ class GraphMerger:
         self.model = model
         self.tokenizer = tokenizer
         self.contradictions_resolved = []  # log of resolved contradictions
-        # Per-merge/fold output lists — also initialised here so _upsert_relation
-        # is safe to call without a preceding merge() call (e.g. in unit tests).
+        # Per-fold output lists — also initialised here so _upsert_relation is
+        # safe to call without a preceding merge() call (e.g. in unit tests).
+        # Reset ONLY in reset_graph() (NOT in merge()) — same lifetime as
+        # removal_ledger/adopt_reinforcements below: both accumulate across
+        # every merge()/merge_relations() call within one fold (recon
+        # re-merge, extra-relations re-merge, interim recital-dedup re-merge,
+        # any intervening enrichment merge) and must survive intact until the
+        # fold's drift partition and reinforcement-bump loop read them.
         self.reinforcements: dict[str, tuple[str, str]] = {}
         # collapsed: incoming ik_keys that were deduplicated away in a Case-1
         # duplicate-SPO collapse.  Parallel to reinforcements (which records the
@@ -282,11 +288,18 @@ class GraphMerger:
         # when the interim recital-dedup merge's Case-1-adopt branch (relation
         # carries an indexed_key, existing edge is keyless) stamps that key onto a
         # recited pending fact's edge.  Populated ONLY in the dedup merge's
-        # Case-1-adopt; reset ONLY in reset_graph() (NOT in merge(), same lifetime
-        # as removal_ledger — it must survive an intervening interim enrichment
-        # merge()); consumed EXACTLY ONCE per fold at the reinforcement bump site
-        # in _refine_consolidation_graph — a second _refine invocation would
-        # double-bump (do not add one).
+        # Case-1-adopt (interim scope only — the full fold never passes
+        # dedup_target_keys); reset ONLY in reset_graph() (NOT in merge()), the
+        # same uniform lifecycle as removal_ledger/reinforcements/collapsed.
+        # That uniform lifecycle is what the FULL fold's own enrichment merge
+        # needs (see merge()'s docstring: reinforcements/collapsed must
+        # survive the full fold's re-merge -> enrichment merge -> bump-loop
+        # span) — adopt_reinforcements shares the rule for consistency across
+        # all four accumulators rather than carrying its own narrower one, even
+        # though the interim scope that populates it never runs an enrichment
+        # merge of its own to survive; consumed EXACTLY ONCE per fold at the
+        # reinforcement bump site in _refine_consolidation_graph — a second
+        # _refine invocation would double-bump (do not add one).
         self.adopt_reinforcements: dict[str, tuple[str, str]] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
@@ -340,12 +353,12 @@ class GraphMerger:
         Returns the updated cumulative graph.
 
         ``self.reinforcements`` is a ``dict[ik_key, (last_seen, first_seen)]``
-        of surviving keys for each Case-1 exact-duplicate collapse that fired
-        during this merge — i.e. every fold where an incoming
-        ``Relation.indexed_key`` matched an existing edge with an ``ik_key``
-        already stamped.  The surviving key is the existing edge's key (the
-        incoming duplicate drifts); the value is the freshest (``max``)
-        ``last_seen`` timestamp and the earliest (``min_nonempty``)
+        of surviving keys for each Case-1 exact-duplicate collapse that has
+        fired since the last :meth:`reset_graph` call — i.e. every fold where
+        an incoming ``Relation.indexed_key`` matched an existing edge with an
+        ``ik_key`` already stamped.  The surviving key is the existing edge's
+        key (the incoming duplicate drifts); the value is the freshest
+        (``max``) ``last_seen`` timestamp and the earliest (``min_nonempty``)
         ``first_seen`` timestamp after the collapse.  The bump_recurrence
         site reads these values to advance bookkeeping without fabricating
         ``now()``.  Only populated when ``Relation.indexed_key`` is set on
@@ -358,10 +371,20 @@ class GraphMerger:
         key whose edge was dropped.  Used by the drift-accounting site in the
         full consolidation fold to distinguish intended dedup (fact preserved
         under the twin key) from genuine reconstruction loss.
-        """
-        self.reinforcements: dict[str, tuple[str, str]] = {}
-        self.collapsed: list[str] = []
 
+        Neither accumulator is reset at the top of this method — like
+        ``removal_ledger`` and ``adopt_reinforcements``, both are reset ONLY
+        in :meth:`reset_graph`, so they accumulate across every ``merge()``
+        call within one fold (recon re-merge, extra-relations re-merge,
+        interim recital-dedup re-merge, and any intervening enrichment
+        merge) and survive intact until the fold's consumers read them.  A
+        per-call reset here would silently wipe a genuine Case-1 collapse
+        recorded by an earlier merge in the same fold the moment any later
+        merge in that fold ran — even one producing zero collapses of its
+        own — before the drift partition and reinforcement-bump loop in
+        :meth:`~paramem.training.consolidation.ConsolidationLoop._refine_consolidation_graph`
+        ever get to read them.
+        """
         session_id = session_graph.session_id
         timestamp = session_graph.timestamp
 

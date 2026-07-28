@@ -216,7 +216,7 @@ class ConsolidationConfig:
     # egress, and reaches ConsolidationLoop as an explicit constructor
     # argument.  A second copy on this dataclass is what let the pipeline and
     # the conversation agent disagree about whether cloud was on.
-    # graph-stage GraphTierRefiner.run_enrichment (cloud-only). off|on
+    # graph-stage GraphTierRefiner.run_enrichment (cloud-only), full-fold only. off|on
     refinement_enrichment: str = "off"
     refinement_normalization: str = "on"  # full-fold predicate-synonym collapse. off|on
     # Whether the merger resolves same-predicate/different-object cardinality

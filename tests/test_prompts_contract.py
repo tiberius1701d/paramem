@@ -1781,6 +1781,26 @@ class TestSpeakerDirectiveFile:
                 f"under the shipped scope; use org/place/thing surfaces instead."
             )
 
+    def test_cloud_graph_enrichment_instructs_predicate_reuse(self):
+        """cloud_graph_enrichment.txt must instruct the model to reuse an
+        existing predicate surface from the input graph rather than coin a
+        synonym for a relation the graph already names between the same two
+        nodes (U4) — a same-fold occurrence-reduction measure that
+        complements the U2/U3 ordering-and-survivor-rule guarantee (a
+        prompt instruction alone is not a guarantee, which is why this is a
+        `SHOULD`-strength nudge, not the enforcement mechanism)."""
+        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
+        lower = tmpl.lower()
+        assert "reuse" in lower and "predicate" in lower, (
+            "cloud_graph_enrichment.txt must instruct the model to reuse an "
+            "existing predicate surface rather than coin a synonym."
+        )
+        # The worked negative example (works_at / employed_by) must be present.
+        assert "works_at" in tmpl and "employed_by" in tmpl, (
+            "cloud_graph_enrichment.txt must carry a worked NEGATIVE example "
+            "for the predicate-reuse instruction (works_at / employed_by)."
+        )
+
 
 class TestNameExtractionPrompt:
     """Contract tests for the name-extraction prompt files.
