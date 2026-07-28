@@ -136,7 +136,7 @@ def _common_patches(loop):
         patch.object(
             ConsolidationLoop,
             "_resolve_target_slot",
-            return_value="episodic_interim_t001",
+            return_value="episodic_interim_20260417T0000",
         ),
         patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
         patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -212,7 +212,7 @@ class TestProceduralRoutedToInterim:
     """Per-cycle procedural training goes into the interim slot, not procedural MAIN.
 
     run_consolidation_cycle with a procedural-typed edge in merger.graph must
-    call train_adapter on the interim adapter (episodic_interim_t001), never on
+    call train_adapter on the interim adapter (episodic_interim_20260417T0000), never on
     the "procedural" MAIN adapter.
     """
 
@@ -255,12 +255,12 @@ class TestProceduralRoutedToInterim:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_interim_route",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         # Training must have fired exactly once, on the interim adapter.
         assert len(train_calls) == 1, f"Expected 1 train call; got {train_calls}"
-        assert train_calls[0] == "episodic_interim_t001", (
+        assert train_calls[0] == "episodic_interim_20260417T0000", (
             f"Procedural facts must train on interim slot; adapter was {train_calls[0]}"
         )
 
@@ -302,7 +302,7 @@ class TestSimulateModeRegistersProceduralKeys:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value="episodic_interim_t001",
+                return_value="episodic_interim_20260417T0000",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -331,13 +331,13 @@ class TestSimulateModeRegistersProceduralKeys:
                 speaker_id="speaker0",
                 mode="simulate",
                 run_label="test_simulate",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         # The proc-key must appear in the interim slot (adapter_name), not "procedural" main.
         # Store tier must equal weight residence: proc keys are trained into the interim
         # adapter, so they must be registered there.
-        interim_slot = "episodic_interim_t001"
+        interim_slot = "episodic_interim_20260417T0000"
         proc_puts = [(t, k) for t, k in store_put_calls if k.startswith("proc")]
         assert proc_puts, "simulate mode must store.put procedural keys; no proc-prefix put found"
         for tier, key in proc_puts:
@@ -418,7 +418,7 @@ class TestProceduralSessionPending:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_b7",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         # The session that produced the failing proc-key must be in keep-pending set.
@@ -467,7 +467,7 @@ class TestProceduralKeyRegisteredInInterimTier:
             store_put_calls.append((tier, key))
             return original_put(tier, key, entry, **kwargs)
 
-        interim_slot = "episodic_interim_t001"
+        interim_slot = "episodic_interim_20260417T0000"
         patches = _common_patches(loop) + [
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -493,7 +493,7 @@ class TestProceduralKeyRegisteredInInterimTier:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_tier_regression",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         proc_puts = [(t, k) for t, k in store_put_calls if k.startswith("proc")]
@@ -555,7 +555,7 @@ class TestProceduralKeyRegisteredInInterimTier:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_bk_preference",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         proc_bk = [c for c in bk_calls if c["key"].startswith("proc")]
@@ -582,7 +582,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         g.add_edge("gwen", "yoga", predicate="practices", relation_type="preference")
         loop.merger.graph = g
 
-        interim_slot = "episodic_interim_t001"
+        interim_slot = "episodic_interim_20260417T0000"
         patches = _common_patches(loop) + [
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -607,7 +607,7 @@ class TestProceduralKeyRegisteredInInterimTier:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_active_keys",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         interim_active = list(loop.store.active_keys_in_tier(interim_slot))

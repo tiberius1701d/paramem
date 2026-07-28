@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
 from paramem.graph.prompts import _load_speaker_directive_section
+from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
 from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
@@ -979,7 +980,7 @@ def _probe_and_reason(
         context_sections.append(f"[{LAYER_LABELS['procedural']}]\n" + "\n".join(procedural_facts))
 
     episodic_adapter_names = sorted(
-        (n for n in layers if n == "episodic" or n.startswith("episodic_interim_")),
+        (n for n in layers if n == "episodic" or n.startswith(INTERIM_NAME_PREFIX)),
         key=lambda n: (n != "episodic", n),
         reverse=True,
     )

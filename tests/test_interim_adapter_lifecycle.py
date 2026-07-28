@@ -17,7 +17,6 @@ No GPU required — all PEFT and model interactions use stub objects.
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,8 +24,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.memory.interim_adapter import (
+    INTERIM_NAME_PREFIX,
     create_interim_adapter,
     current_interim_stamp,
+    interim_dir_for_name,
+    interim_stamp_from_name,
     unload_interim_adapters,
 )
 from paramem.models.loader import main_tier_backup_scope
@@ -74,64 +76,64 @@ def _write_adapter_files(directory: Path, *, safetensors: bool = True) -> None:
 
 
 class TestCurrentInterimStamp:
-    def test_stamp_matches_expected_format(self) -> None:
-        """current_interim_stamp must return a string matching YYYYMMDDTHHMM."""
-        stamp = current_interim_stamp("every 1h")
-        assert re.match(r"^\d{8}T\d{4}$", stamp), (
-            f"Stamp {stamp!r} does not match YYYYMMDDTHHMM format"
-        )
+    def test_minted_stamp_round_trips_through_the_parser(self) -> None:
+        """The mint and the parser share INTERIM_STAMP_FORMAT.
 
-    def test_stamp_is_string(self) -> None:
-        """current_interim_stamp must return a plain str."""
-        assert isinstance(current_interim_stamp("every 1h"), str)
-
-    def test_stamp_length(self) -> None:
-        """YYYYMMDDTHHMM is always exactly 13 characters."""
-        assert len(current_interim_stamp("every 1h")) == 13
-
-
-# ---------------------------------------------------------------------------
-# Test 1 — startup glob picks up valid interim adapter dirs in sorted order
-# ---------------------------------------------------------------------------
-
-
-class TestStartupGlob:
-    def test_valid_interim_dirs_found_in_sorted_order(self, tmp_path: Path) -> None:
-        """Glob over adapter_dir returns episodic_interim_* dirs sorted by name.
-
-        This mirrors the sorted(config.adapter_dir.glob("episodic_interim_*"))
-        call in app.py.  The test verifies the file-system side (path existence
-        and correct glob pattern) without invoking load_adapter.
+        Asserted as a round trip rather than against a copy of the shape:
+        re-declaring ``\\d{8}T\\d{4}`` here would be a second renderer of the
+        format the module is the single source of.
         """
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            _write_adapter_files(tmp_path / name)
-        (tmp_path / "episodic").mkdir()  # main adapter — must not appear
+        stamp = current_interim_stamp("every 1h")
+        assert interim_stamp_from_name(f"{INTERIM_NAME_PREFIX}{stamp}") == stamp
 
-        found = [
-            p.name
-            for p in sorted(tmp_path.glob("episodic_interim_*"))
-            if p.is_dir()
-            and (p / "adapter_config.json").exists()
-            and (p / "adapter_model.safetensors").exists()
-        ]
 
-        assert found == [
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260418T0000",
-        ]
+# ---------------------------------------------------------------------------
+# Test 0b — interim_stamp_from_name: THE interim adapter name parser
+# ---------------------------------------------------------------------------
 
-    def test_main_adapter_dirs_excluded_by_glob_pattern(self, tmp_path: Path) -> None:
-        """Dirs named episodic / semantic / procedural do not match the glob."""
-        for name in ["episodic", "semantic", "procedural"]:
-            (tmp_path / name).mkdir()
 
-        found = list(tmp_path.glob("episodic_interim_*"))
-        assert found == []
+class TestInterimStampFromName:
+    """Contract for the single interim-name parser.
 
-    def test_empty_adapter_dir_produces_no_results(self, tmp_path: Path) -> None:
-        """An adapter_dir with no interim subdirs returns an empty list."""
-        found = list(tmp_path.glob("episodic_interim_*"))
-        assert found == []
+    Cases carried over from the retired ``router._interim_sort_key`` tests,
+    plus the two the previous ``\\d{8}T\\d{4}`` pattern accepted but that are
+    not real stamps.
+    """
+
+    def test_valid_name_returns_stamp(self) -> None:
+        assert interim_stamp_from_name("episodic_interim_20260417T0000") == "20260417T0000"
+
+    @pytest.mark.parametrize("name", ["episodic", "semantic", "procedural", ""])
+    def test_non_interim_names_return_none(self, name: str) -> None:
+        assert interim_stamp_from_name(name) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "episodic_interim_",
+            "episodic_interim_today",
+            "episodic_interim_2026-04-17",
+            "episodic_interim_20260417T0000_partial",
+        ],
+    )
+    def test_malformed_stamps_return_none(self, name: str) -> None:
+        assert interim_stamp_from_name(name) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "episodic_interim_99999999T9999",  # shape-valid, not a real datetime
+            "episodic_interim_20260417T2400",  # hour 24 does not exist
+            "episodic_interim_2026041T000",  # short fields; strptime alone accepts this
+        ],
+    )
+    def test_shape_valid_but_impossible_stamps_return_none(self, name: str) -> None:
+        assert interim_stamp_from_name(name) is None
+
+    def test_dir_for_name_raises_on_malformed(self, tmp_path: Path) -> None:
+        """Path construction must not silently produce ``interim_today/``."""
+        with pytest.raises(ValueError, match="Not an interim adapter name"):
+            interim_dir_for_name(tmp_path, "episodic_interim_today")
 
 
 # ---------------------------------------------------------------------------
@@ -742,12 +744,6 @@ class TestCurrentInterimStampWithCadence:
             assert stamp == "20260418T1400", (
                 f"off-variant {cadence!r} should floor to 14:00, got {stamp}"
             )
-
-    def test_stamp_format_matches_yyyymmddthhmm(self) -> None:
-        """The stamp always matches the YYYYMMDDTHHMM format."""
-        now = datetime(2026, 4, 18, 9, 5, 0)
-        stamp = current_interim_stamp("every 30m", _now=now)
-        assert re.match(r"^\d{8}T\d{4}$", stamp), f"Unexpected format: {stamp!r}"
 
     def test_every_2h_floors_to_2h_boundary(self) -> None:
         """refresh_cadence='every 2h' → boundary every 2h from midnight.

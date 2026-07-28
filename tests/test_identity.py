@@ -252,10 +252,11 @@ class TestProseFold:
 class TestIsSpeakerId:
     """``is_speaker_id`` structural test for the ``speaker{N}`` format.
 
-    The canonical stored form is lowercase (``"speaker0"``).  The regex also
-    accepts residual cased forms (``"Speaker0"``) so the ingest safety-net can
-    detect and coerce them.  Coercion output is always lowercase — this class
-    only tests the structural predicate, not the coercion.
+    The canonical stored form is lowercase (``"speaker0"``).  The predicate
+    also accepts a leading-capital form (``"Speaker0"``) so the ingest
+    safety-net can detect and coerce it; ``"SPEAKER0"`` is NOT accepted.
+    Coercion output is always lowercase — this class only tests the
+    structural predicate, not the coercion.
     """
 
     def test_lowercase_single_digit(self):

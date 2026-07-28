@@ -11,7 +11,7 @@ from paramem.server.router import (
     QueryRouter,
     RoutingPlan,
     RoutingStep,
-    _interim_sort_key,
+    _interim_tiers_newest_first,
     _is_interrogative,
 )
 
@@ -251,30 +251,36 @@ class TestIsInterrogative:
 
 
 # ---------------------------------------------------------------------------
-# _interim_sort_key
+# _interim_tiers_newest_first
+#
+# Only the two branches the end-to-end probe-order tests cannot reach live
+# here.  Newest-first ordering and main-tier filtering are covered more
+# strongly by TestPersonalTierOrder::test_interim_adapters_sort_newest_first,
+# which drives the real router over a real store; name PARSING is
+# contract-tested at its owner,
+# tests/test_interim_adapter_lifecycle.py::TestInterimStampFromName.
 # ---------------------------------------------------------------------------
 
 
-class TestInterimSortKey:
-    def test_valid_interim_name_returns_stamp(self):
-        assert _interim_sort_key("episodic_interim_20260417T0000") == "20260417T0000"
+class _FakeStore:
+    def __init__(self, tiers):
+        self._tiers = tiers
 
-    def test_main_adapter_returns_none(self):
-        for name in ("episodic", "semantic", "procedural"):
-            assert _interim_sort_key(name) is None
+    def tiers_with_registry(self):
+        return list(self._tiers)
 
-    def test_partial_prefix_returns_none(self):
-        assert _interim_sort_key("episodic_interim_") is None
 
-    def test_non_stamp_returns_none(self):
-        assert _interim_sort_key("episodic_interim_today") is None
+class TestInterimTiersNewestFirst:
+    def test_none_store_yields_empty(self):
+        """Replay-disabled store — the branch that makes interim slots
+        silently unreachable."""
+        assert _interim_tiers_newest_first(None) == []
 
-    def test_old_date_format_returns_none(self):
-        # The old YYYY-MM-DD format is no longer valid for interim adapters.
-        assert _interim_sort_key("episodic_interim_2026-04-17") is None
-
-    def test_extra_suffix_returns_none(self):
-        assert _interim_sort_key("episodic_interim_20260417T0000_partial") is None
+    def test_malformed_interim_names_are_filtered_out(self):
+        """A slot name that carries the prefix but no valid stamp is dropped
+        rather than sorted as ``""``."""
+        store = _FakeStore(["episodic_interim_today", "episodic_interim_99999999T9999"])
+        assert _interim_tiers_newest_first(store) == []
 
 
 # ---------------------------------------------------------------------------

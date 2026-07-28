@@ -20,6 +20,7 @@ from paramem.cloud.placeholders import PLACEHOLDER_TOKEN_RE
 from paramem.graph.extractor import build_speaker_context
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt, prompt_overrides
+from paramem.utils.identity import is_speaker_id
 
 
 class TestLoadPromptPerModelResolution:
@@ -559,8 +560,10 @@ class TestExtractionPromptThirdPartySubjectContract:
         tmpl = _extraction_prompt(model)
         subjects = re.findall(r'"subject":\s*"([^"]+)"', tmpl)
         assert subjects, "No relation subjects found in prompt — scan regex drifted."
-        allowed = re.compile(r"^(speaker\d+|[A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*)*)$")
-        offenders = [s for s in subjects if not allowed.match(s)]
+        # Speaker-id membership is asked of the owner of that format
+        # (paramem/utils/identity.py), never re-spelled as a pattern here.
+        proper_name = re.compile(r"^[A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*)*$")
+        offenders = [s for s in subjects if not is_speaker_id(s) and not proper_name.match(s)]
         assert not offenders, (
             f"Generic/common-noun or lowercase subject(s) found in relation "
             f"subject position: {offenders!r} — only a speaker id or a "

@@ -68,7 +68,7 @@ from paramem.backup.types import (
 
 # iter_interim_dirs is imported at module level (no cycle: interim_adapter
 # does not import from paramem.backup.backup).
-from paramem.memory.interim_adapter import iter_interim_dirs
+from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_interim_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -935,7 +935,7 @@ def write_bundle(
     # A bundle without episodic is not a valid recall-recovery set.
     if "episodic" in adapter_dirs:
         episodic_keys = {
-            k for k in adapters_record if k == "episodic" or k.startswith("episodic_interim_")
+            k for k in adapters_record if k == "episodic" or k.startswith(INTERIM_NAME_PREFIX)
         }
         if not episodic_keys:
             raise BackupError(
@@ -1355,9 +1355,6 @@ def restore_bundle(
         bundle path is preserved; the operator should restore from it.
     """
     from paramem.memory.interim_adapter import (  # noqa: PLC0415
-        INTERIM_NAME_PREFIX as _INTERIM_NAME_PREFIX,
-    )
-    from paramem.memory.interim_adapter import (  # noqa: PLC0415
         adapter_slot_root_for_name,
     )
 
@@ -1572,7 +1569,7 @@ def restore_bundle(
                 _atomic_write_file(src_bytes, dst)
 
             # Record the new slot dir for the clean-slate sweep (part A).
-            if adapter_name.startswith(_INTERIM_NAME_PREFIX):
+            if adapter_name.startswith(INTERIM_NAME_PREFIX):
                 # Interim adapters: tier_root IS the interim family dir
                 # (adapter_slot_root_for_name returns <adapters>/episodic/interim_<stamp>/).
                 restored_interim_slots[adapter_name] = (tier_root, new_slot_dir)

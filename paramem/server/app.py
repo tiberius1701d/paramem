@@ -12136,7 +12136,10 @@ def _oldest_interim_stamp(config) -> "str | None":
     if not dirs:
         return None
     oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
-    return interim_stamp_from_name(oldest_name)
+    stamp = interim_stamp_from_name(oldest_name)
+    if stamp is None:
+        raise ValueError(f"Corrupt interim slot name on disk: {oldest_name!r}")
+    return stamp
 
 
 def _full_cycle_deadline_dt(config) -> "datetime | None":
@@ -12155,7 +12158,11 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
     Single source of truth for both :func:`_is_full_cycle_due` (gate) and
     :func:`_seconds_until_next_full_consolidation` (predictor).
     """
-    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
+    from paramem.memory.interim_adapter import (
+        INTERIM_STAMP_FORMAT,
+        interim_stamp_from_name,
+        iter_interim_dirs,
+    )
 
     full_period_seconds = config.consolidation.consolidation_period_seconds
     if full_period_seconds is None:
@@ -12165,7 +12172,9 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
         return None
     oldest_name, _ = dirs[0]
     oldest_stamp = interim_stamp_from_name(oldest_name)
-    oldest_dt = datetime.strptime(oldest_stamp, "%Y%m%dT%H%M")
+    if oldest_stamp is None:
+        raise ValueError(f"Corrupt interim slot name on disk: {oldest_name!r}")
+    oldest_dt = datetime.strptime(oldest_stamp, INTERIM_STAMP_FORMAT)
     return oldest_dt + timedelta(seconds=full_period_seconds)
 
 

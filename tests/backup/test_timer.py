@@ -210,7 +210,7 @@ class TestReconcileWritesUnits:
 
 class TestComputeSchedulePeriodSecondsBackupValues:
     def test_interval_seconds_for_daily_time(self):
-        """'daily 04:00' → 86400 (via strip_daily_prefix normalisation)."""
+        """'daily 04:00' → 86400 (via the daily-prefix strip in parse_schedule_atom)."""
         assert compute_schedule_period_seconds("daily 04:00") == 86400
 
     def test_interval_seconds_for_hhmm(self):

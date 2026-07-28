@@ -2,7 +2,6 @@
 
 import logging
 import os
-import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -22,8 +21,11 @@ from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD
 
 logger = logging.getLogger(__name__)
 
-# Pattern for ${VAR_NAME} env var references in YAML values
-_ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+# Delimiters for ${VAR_NAME} env var references in YAML values.  A literal
+# scan, not a shape: the reference is fully described by its two delimiters,
+# and the name between them is whatever the operator wrote.
+_ENV_REF_OPEN = "${"
+_ENV_REF_CLOSE = "}"
 
 # Project root — the nearest ``pyproject.toml`` ancestor. ParaMem deploys from
 # a repo checkout (editable install under systemd), so this always resolves;
@@ -73,16 +75,27 @@ def _interpolate_env_vars(value):
     an API key (long alphanumeric string) instead of an env var reference.
     """
     if isinstance(value, str):
-
-        def _replace(match):
-            var_name = match.group(1)
+        out: list[str] = []
+        rest = value
+        while True:
+            before, sep, after = rest.partition(_ENV_REF_OPEN)
+            if not sep:
+                out.append(rest)
+                break
+            var_name, closed, remainder = after.partition(_ENV_REF_CLOSE)
+            if not closed:
+                # Unterminated reference — emit the rest verbatim, matching
+                # the previous pattern, which simply did not match here.
+                out.append(rest)
+                break
+            out.append(before)
             env_val = os.environ.get(var_name)
             if env_val is None:
                 logger.warning("Env var %s not set, using empty string", var_name)
-                return ""
-            return env_val
-
-        return _ENV_VAR_PATTERN.sub(_replace, value)
+                env_val = ""
+            out.append(env_val)
+            rest = remainder
+        return "".join(out)
     if isinstance(value, dict):
         return {k: _interpolate_env_vars(v) for k, v in value.items()}
     if isinstance(value, list):

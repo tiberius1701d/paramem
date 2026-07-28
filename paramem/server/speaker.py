@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+from paramem.utils.identity import SPEAKER_ID_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +346,7 @@ class SpeakerStore:
 
         Caller MUST hold ``self._lock`` (counter mutation is not atomic).
         """
-        speaker_id = f"speaker{self._next_anon_index}"
+        speaker_id = f"{SPEAKER_ID_PREFIX}{self._next_anon_index}"
         self._next_anon_index += 1
         return speaker_id
 

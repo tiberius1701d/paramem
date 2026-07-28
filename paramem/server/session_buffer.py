@@ -34,9 +34,9 @@ The original document bytes are stored as ``<doc_id>.origdoc`` in
 import json
 import logging
 import os
-import re
 import secrets
 import shutil
+import string
 from collections import defaultdict
 from collections.abc import Set
 from datetime import datetime, timedelta, timezone
@@ -76,7 +76,8 @@ STATE_IDENTIFIED = "identified"
 RETIRED_RECALL_FAILED_SUBDIR = "retired_recall_failed"
 
 # Characters outside this set are filesystem-unsafe in a JSONL filename.
-_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+# An allowlist, not a shape — membership testing expresses it directly.
+_SAFE_ID_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
 
 
 def _mint_session_id(conversation_id: str) -> str:
@@ -87,7 +88,7 @@ def _mint_session_id(conversation_id: str) -> str:
     sessions opened for the same conversation_id in the same second never
     collide on the JSONL filename.
     """
-    safe = _UNSAFE_ID_CHARS.sub("_", conversation_id)
+    safe = "".join(c if c in _SAFE_ID_CHARS else "_" for c in conversation_id)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{safe}-{stamp}-{secrets.token_hex(4)}"
 

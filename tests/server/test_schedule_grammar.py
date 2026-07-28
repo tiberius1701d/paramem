@@ -3,7 +3,8 @@ grammar, incl. the suspend/power-off catch-up gate helpers added alongside
 the systemd_timer heartbeat rework.
 
 Covers:
-- strip_daily_prefix: "daily HH:MM" -> "HH:MM" normalisation.
+- parse_schedule_atom: the accept/reject boundary, incl. the "daily HH:MM"
+  operator idiom.
 - compute_schedule_period_seconds accepting the "daily HH:MM" idiom (the
   TRAP this catch-up-gate change had to resolve — the default backup
   schedule is "daily 04:00").
@@ -19,37 +20,79 @@ from paramem.server.schedule_grammar import (
     compute_schedule_period_seconds,
     is_calendar_exact,
     is_due,
-    strip_daily_prefix,
+    parse_schedule_atom,
 )
 
 # ---------------------------------------------------------------------------
-# strip_daily_prefix
+# parse_schedule_atom — the accept/reject boundary
+#
+# Asserted directly because no other helper can serve as the oracle:
+# is_calendar_exact returns True both for a valid anchored atom AND for
+# unparseable input, so a widening of the grammar is invisible through it.
 # ---------------------------------------------------------------------------
 
 
-class TestStripDailyPrefix:
-    def test_daily_hhmm_strips_to_hhmm(self):
-        assert strip_daily_prefix("daily 04:00") == "04:00"
+class TestParseScheduleAtomBoundary:
+    @pytest.mark.parametrize(
+        ("schedule", "kind"),
+        [
+            (None, "off"),
+            ("", "off"),
+            ("off", "off"),
+            ("Daily 4:00", "hhmm"),
+            ("disabled", "off"),
+            ("none", "off"),
+            ("weekly", "weekly"),
+            ("daily", "daily"),
+            ("04:00", "hhmm"),
+            ("4:00", "hhmm"),
+            ("23:59", "hhmm"),
+            ("00:00", "hhmm"),
+            ("daily 04:00", "hhmm"),
+            ("DAILY 04:00", "hhmm"),
+            ("12h", "interval"),
+            ("every 12h", "interval"),
+            ("every 30m", "interval"),
+            ("every 2H", "interval"),
+            ("every 30M", "interval"),
+        ],
+    )
+    def test_accepted_forms(self, schedule: str, kind: str) -> None:
+        atom = parse_schedule_atom(schedule)
+        assert atom is not None, f"{schedule!r} must parse"
+        assert atom.kind == kind
 
-    def test_daily_hhmm_case_insensitive(self):
-        assert strip_daily_prefix("DAILY 04:00") == "04:00"
-        assert strip_daily_prefix("Daily 4:00") == "4:00"
+    @pytest.mark.parametrize(
+        "schedule",
+        [
+            "bogus",
+            "biweekly",
+            "every",
+            "every 0h",  # zero interval
+            "every -1h",
+            "25:00",  # hour out of range
+            "12:60",  # minute out of range
+            "4:0",  # minute must be two digits
+            "12",  # no unit
+            "12d",  # unsupported unit
+            "daily 25:00",  # prefix idiom does not bypass the range check
+            "daily off",  # consuming the prefix must not re-open the atom list
+            "daily foo",
+            "every 12 h m",
+        ],
+    )
+    def test_rejected_forms(self, schedule: str) -> None:
+        assert parse_schedule_atom(schedule) is None, f"{schedule!r} must not parse"
 
-    def test_bare_daily_unchanged(self):
-        """Bare 'daily' is its own grammar atom, not this idiom."""
-        assert strip_daily_prefix("daily") == "daily"
+    def test_hhmm_range_check_survives_the_daily_prefix(self) -> None:
+        """The shared _HHMM_SHAPE fragment is shape-only; the range check is
+        applied once, after the prefix idiom is normalised away."""
+        assert parse_schedule_atom("daily 23:59").kind == "hhmm"
+        assert parse_schedule_atom("daily 24:00") is None
 
-    def test_hhmm_unchanged(self):
-        assert strip_daily_prefix("04:00") == "04:00"
-
-    def test_interval_unchanged(self):
-        assert strip_daily_prefix("every 12h") == "every 12h"
-
-    def test_none_returns_none(self):
-        assert strip_daily_prefix(None) is None
-
-    def test_off_unchanged(self):
-        assert strip_daily_prefix("off") == "off"
+    def test_unparseable_raises_in_compute_period(self) -> None:
+        with pytest.raises(ValueError, match="Unrecognised schedule string"):
+            compute_schedule_period_seconds("bogus")
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +104,7 @@ class TestComputeSchedulePeriodSecondsDailyPrefix:
     def test_daily_hhmm_returns_86400(self):
         """'daily 04:00' (the server.yaml default backup schedule) → 86400.
 
-        Before strip_daily_prefix was hoisted into parse_schedule_atom, this
+        Before the daily-prefix strip was hoisted into parse_schedule_atom, this
         raised ValueError — only paramem.backup.timer.reconcile normalised
         the idiom, and compute_schedule_period_seconds did not.
         """

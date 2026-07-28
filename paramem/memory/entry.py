@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
+from itertools import groupby
 
 from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
 from paramem.utils.identity import canonical
@@ -104,11 +105,16 @@ def _clean_generation_artifacts(text: str) -> str:
     Returns:
         Cleaned text with bold markers removed and excess newlines collapsed.
     """
-    import re
-
     text = text.replace("**", "")
-    text = re.sub(r"\n{3,}", "\n", text)
-    return text
+    # Collapse runs of 3+ newlines to one, preserving a 2-newline paragraph
+    # break.  ``groupby`` yields maximal runs, which is what makes this exact:
+    # repeated ``"\n\n\n" -> "\n"`` replacement is NOT equivalent (it leaves a
+    # 4-newline run as two newlines).
+    out: list[str] = []
+    for ch, grp in groupby(text):
+        run = len(list(grp))
+        out.append("\n" if ch == "\n" and run >= 3 else ch * run)
+    return "".join(out)
 
 
 RECALL_TEMPLATE = "Recall the fact stored under key '{key}'."

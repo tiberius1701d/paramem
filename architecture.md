@@ -420,6 +420,49 @@ RAG pipeline uses the same embedding model already installed (all-MiniLM-L6-v2) 
 
 The RAG pipeline is evaluation infrastructure, not a competing product. It exists to diagnose where parametric memory wins or loses vs retrieval.
 
+### AD-22: One Declaration Per Name Shape; Regex Confined to Two Modules
+
+Every name format the system mints is declared exactly once, at the mint, and
+parsed by composing from that same declaration. A shape written twice — once
+where it is built, once where it is recognised — drifts silently, because
+nothing links the two.
+
+Applied to the three internal formats:
+
+- **Interim adapter names.** `INTERIM_NAME_PREFIX` and `INTERIM_STAMP_FORMAT`
+  in `paramem/memory/interim_adapter.py` are the sole declaration.
+  `interim_stamp_from_name` validates by round-tripping through the format
+  constant, so the shape has no second expression as a pattern or a literal
+  length — and a stamp that is well-formed but not a real datetime is
+  rejected, which a shape-only check cannot do.
+- **Speaker ids.** `SPEAKER_ID_PREFIX` in `paramem/utils/identity.py` is
+  shared by the mint (`SpeakerStore`) and the structural gate
+  (`is_speaker_id`).
+- **Placeholder tokens.** `_BARE_PLACEHOLDER_SHAPE` in
+  `paramem/cloud/placeholders.py` is composed into both the anchored
+  validator and the in-text scanner.
+
+Regex is permitted in exactly two modules, and the criterion is structural
+rather than a judgement about the text being matched:
+
+| Module | Patterns | Fragment |
+|---|---|---|
+| `paramem/cloud/placeholders.py` | `PLACEHOLDER_SHAPE_RE`, `PLACEHOLDER_TOKEN_RE` | `_BARE_PLACEHOLDER_SHAPE` |
+| `paramem/server/schedule_grammar.py` | `_INTERVAL_RE`, `_HHMM_RE` | none needed — no shape appears twice |
+
+A fragment constant is the remedy for a shape used by more than one pattern,
+not a habit. `schedule_grammar` needs none: the `daily HH:MM` operator idiom
+is a prefix strip inside `parse_schedule_atom`, not a third pattern
+re-spelling the time it already knows how to match.
+
+A pattern is admissible only where it describes genuinely structured text and
+composes from a single fragment declaration. Everywhere else, a string
+primitive expresses the same rule with no pattern to keep in step: prefix and
+suffix tests for minted names, membership tests for character allowlists,
+`partition` for delimiter scans, `groupby` for run collapsing. Adding a
+pattern outside these two modules — or a second, independent spelling of a
+shape inside them — is a defect, not a style preference.
+
 ## Superseded Decisions
 
 **AD-9: Curriculum-Aware Replay** — superseded by AD-10. A per-cycle probe-and-weight-sampling mechanism over an external replay pool was designed to address low sampling coverage (~8% per cycle). It was removed when the replay-pool architecture itself was replaced by reconstruction-from-weights (AD-10), which requires no external corpus and uses recall misses as the retry signal instead of curriculum sampling.

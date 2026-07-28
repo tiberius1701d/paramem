@@ -31,11 +31,14 @@ digits):
 * ``"HH:MM"`` / ``"daily HH:MM"``                   → daily at HH:MM
 * ``"Nh"`` / ``"Nm"`` / ``"every Nh"`` / ``"every Nm"`` → interval
 
-Regex usage here is permitted because the grammar is fully controlled
-(operators write these strings into ``server.yaml``; we document the
-form). The project-wide rule about not using regex for intent
-classification on free-form user text does *not* apply to a bounded
-internal grammar — only one place to update if the grammar changes.
+Regex usage here is one of the project's two permitted sites (the other is
+``cloud/placeholders.py``); both are recorded in ``architecture.md``.  The
+admissibility rule is structural, not a judgement about this module: each
+shape is declared exactly ONCE as a fragment constant and composed into the
+patterns that need it, so a grammar change is a single edit and no second
+renderer can drift from it.  Operators write these strings into
+``server.yaml``, so the input is bounded and trusted — but that is what makes
+regex *safe* here, not what makes it *admissible*.
 """
 
 from __future__ import annotations
@@ -47,29 +50,11 @@ from dataclasses import dataclass
 _OFF_VALUES = frozenset({"", "off", "disabled", "none"})
 
 # Bounded grammar — these match a finite set of accepted strings, not
-# user-supplied free text. Parsed once on config load.
+# user-supplied free text. Parsed once on config load.  Each shape appears
+# in exactly one pattern; the ``daily HH:MM`` idiom is a prefix strip in
+# parse_schedule_atom, not a third pattern re-spelling the time.
 _INTERVAL_RE = re.compile(r"^(?:every\s+)?(\d+)\s*([hm])$", re.IGNORECASE)
-_HHMM_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
-_DAILY_HHMM_RE = re.compile(r"^daily\s+(\d{1,2}:\d{2})$", re.IGNORECASE)
-
-
-def strip_daily_prefix(schedule: str | None) -> str | None:
-    """Normalise the ``"daily HH:MM"`` operator idiom to bare ``"HH:MM"``.
-
-    ``"daily 04:00"`` -> ``"04:00"``; any other input (including bare
-    ``"daily"``, its own grammar atom) is returned unchanged.
-
-    Applied once at the top of :func:`parse_schedule_atom` so every consumer
-    accepts the idiom uniformly — previously only
-    ``paramem.backup.timer.reconcile`` normalised it, with its own private
-    regex. Widening the grammar here is deliberate: ``compute_schedule_period_seconds``
-    and the systemd-timer parser now accept the same idiom the backup
-    schedule has always used.
-    """
-    if schedule is None:
-        return None
-    m = _DAILY_HHMM_RE.match(schedule.strip())
-    return m.group(1) if m else schedule
+_HHMM_RE = re.compile(r"^(\d{1,2}:\d{2})$")
 
 
 @dataclass(frozen=True)
@@ -92,6 +77,25 @@ class ParsedSchedule:
     mm: int = 0
 
 
+def _parse_hhmm(s: str) -> ParsedSchedule | None:
+    """Parse a bare ``HH:MM`` time into an ``hhmm`` atom, else ``None``.
+
+    THE only place a time is recognised — both the bare form and the
+    ``"daily HH:MM"`` idiom land here, so the shape is matched and
+    range-checked exactly once per input.  (The idiom previously had its
+    own pattern, which matched the time, discarded the result, and left the
+    bare-form branch to match it a second time.)
+    """
+    m = _HHMM_RE.match(s)
+    if not m:
+        return None
+    hh_text, _, mm_text = m.group(1).partition(":")
+    hh, mm = int(hh_text), int(mm_text)
+    if 0 <= hh < 24 and 0 <= mm < 60:
+        return ParsedSchedule(kind="hhmm", hh=hh, mm=mm)
+    return None
+
+
 def parse_schedule_atom(schedule: str | None) -> ParsedSchedule | None:
     """Parse a schedule string into a structured atom.
 
@@ -107,8 +111,16 @@ def parse_schedule_atom(schedule: str | None) -> ParsedSchedule | None:
     interval counts return ``None`` here so the caller can decide whether
     to raise or fall back.
     """
-    schedule = strip_daily_prefix(schedule)
     s = (schedule or "").strip()
+
+    # ``"daily HH:MM"`` is an operator idiom for a daily schedule anchored
+    # at HH:MM (the ``schedule: "daily 04:00"`` default in server.yaml).
+    # Bare ``"daily"`` is its own atom, so the prefix is only consumed when
+    # something follows it; and once consumed the remainder must be a time —
+    # ``"daily off"`` is not a way to spell ``"off"``.
+    if s[:5].lower() == "daily" and s[5:6].isspace():
+        return _parse_hhmm(s[6:].lstrip())
+
     lower = s.lower()
     if lower in _OFF_VALUES:
         return ParsedSchedule(kind="off")
@@ -125,14 +137,7 @@ def parse_schedule_atom(schedule: str | None) -> ParsedSchedule | None:
             return None
         return ParsedSchedule(kind="interval", count=count, unit=unit)
 
-    m = _HHMM_RE.match(s)
-    if m:
-        hh = int(m.group(1))
-        mm = int(m.group(2))
-        if 0 <= hh < 24 and 0 <= mm < 60:
-            return ParsedSchedule(kind="hhmm", hh=hh, mm=mm)
-
-    return None
+    return _parse_hhmm(s)
 
 
 def compute_schedule_period_seconds(schedule: str) -> int | None:

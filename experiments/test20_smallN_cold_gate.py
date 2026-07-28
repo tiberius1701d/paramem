@@ -498,7 +498,6 @@ import torch  # noqa: E402
 from peft import PeftModel  # noqa: E402
 from transformers import TrainerCallback  # noqa: E402
 
-from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.production import budget_for  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
@@ -1823,6 +1822,12 @@ def _main_donor_build_smoke(args: argparse.Namespace) -> None:
             json.dump(smoke_config, f, indent=2)
         logger.info("Smoke config written: %s", smoke_config_path)
 
+    # Imported here, not at module scope: gpu_guard ships from lab-tools
+    # (separate repo, not on PyPI) and is absent in CI.  Only the GPU entry
+    # points need it, so keeping it out of module scope lets the pure-Python
+    # helpers in this file be imported — and unit-tested — without it.
+    from experiments.utils.gpu_guard import acquire_gpu
+
     model_config = BENCHMARK_MODELS[args.model]
     with acquire_gpu(interactive=True):
         vram_before_load_mib = _cuda_mem_get_info_mib()
@@ -2846,6 +2851,9 @@ def main() -> None:
         with open(run_config_path, "w") as f:
             json.dump(run_config, f, indent=2)
         logger.info("Run config written: %s", run_config_path)
+
+    # See _main_donor_build_smoke for why this is not a module-scope import.
+    from experiments.utils.gpu_guard import acquire_gpu
 
     model_config = BENCHMARK_MODELS[args.model]
 

@@ -27,7 +27,6 @@ HA entity graph.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -100,15 +99,37 @@ class RoutingPlan:
 _PERSONAL_TIERS_PRE_INTERIM = ("procedural",)
 _PERSONAL_TIERS_POST_INTERIM = ("episodic", "semantic")
 
-_INTERIM_DATE_RE = re.compile(r"^episodic_interim_(\d{8}T\d{4})$")
 
+def _interim_tiers_newest_first(store) -> list[str]:
+    """Interim slot names carried by *store*, newest stamp first.
 
-def _interim_sort_key(adapter_name: str) -> str | None:
-    """Extract the YYYYMMDDTHHMM stamp from an ``episodic_interim_<stamp>``
-    name, or ``None`` for non-interim names.  Used to sort interim tiers
-    newest-first for the PERSONAL probe order."""
-    m = _INTERIM_DATE_RE.match(adapter_name)
-    return m.group(1) if m else None
+    THE only enumeration of interim tiers for probe ordering — both
+    :meth:`Router._personal_tier_order` and
+    :meth:`Router._command_interim_tiers` compose it rather than repeating
+    the filter-then-sort.  Name parsing is
+    :func:`~paramem.memory.interim_adapter.interim_stamp_from_name`; this
+    module does not re-declare the name shape.
+
+    A ``None`` *store* (no registry — replay-disabled) yields an empty
+    list, which is what makes interim slots silently unreachable in that
+    configuration (see :meth:`Router._personal_tier_order`).
+    """
+    # Function-local: interim_adapter's lifecycle half pulls in PEFT/torch,
+    # and router is otherwise import-light.  Same reason app.py and
+    # consolidation.py import this module inside their call sites.
+    from paramem.memory.interim_adapter import interim_stamp_from_name
+
+    if store is None:
+        return []
+    stamped = [
+        (stamp, tier)
+        for tier in store.tiers_with_registry()
+        if (stamp := interim_stamp_from_name(tier)) is not None
+    ]
+    # Sort on the stamp alone: Python's stable sort then preserves the
+    # store's enumeration order for any two slots sharing a stamp.
+    stamped.sort(key=lambda pair: pair[0], reverse=True)
+    return [tier for _, tier in stamped]
 
 
 # ``_is_interrogative`` + ``_INTERROGATIVE_*`` are NOT consumed by routing
@@ -362,16 +383,9 @@ class QueryRouter:
         replay-disabled stores (no lifecycle tracking → no interim
         rotation), but worth noting because the degradation is silent.
         """
-        store = self._memory_store
-        interim_names: list[str] = []
-        if store is not None:
-            for tier in store.tiers_with_registry():
-                if _interim_sort_key(tier) is not None:
-                    interim_names.append(tier)
-            interim_names.sort(key=lambda n: _interim_sort_key(n) or "", reverse=True)
         return [
             *_PERSONAL_TIERS_PRE_INTERIM,
-            *interim_names,
+            *_interim_tiers_newest_first(self._memory_store),
             *_PERSONAL_TIERS_POST_INTERIM,
         ]
 
@@ -383,14 +397,7 @@ class QueryRouter:
         slots are returned; ``procedural`` MAIN is handled separately in
         :meth:`_steps_for_intent`.
         """
-        store = self._memory_store
-        interim_names: list[str] = []
-        if store is not None:
-            for tier in store.tiers_with_registry():
-                if _interim_sort_key(tier) is not None:
-                    interim_names.append(tier)
-            interim_names.sort(key=lambda n: _interim_sort_key(n) or "", reverse=True)
-        return interim_names
+        return _interim_tiers_newest_first(self._memory_store)
 
     def _tier_keys(self, tier: str, *, preference_only: bool = False) -> set[str]:
         """Active key set for *tier*.

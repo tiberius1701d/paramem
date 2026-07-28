@@ -1576,9 +1576,11 @@ class ConsolidationLoop:
         # the GPU lock is held for the full per-tier rebuild (consolidate requires
         # this in train mode — see its entry guard).
         # submit_and_wait blocks until the worker finishes and re-raises on error.
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
         _folded = False
         if "episodic" in self.model.peft_config or any(
-            k.startswith("episodic_interim_") for k in self.model.peft_config
+            k.startswith(INTERIM_NAME_PREFIX) for k in self.model.peft_config
         ):
             from paramem.server.background_trainer import BackgroundTrainer
 
@@ -2294,9 +2296,11 @@ class ConsolidationLoop:
 
         # Episodic interim slot: scratch nested under the interim sub-dir of
         # the episodic tier (sibling of <slot_date>/).
-        if adapter_name.startswith(INTERIM_NAME_PREFIX):
-            stamp = interim_stamp_from_name(adapter_name)
+        stamp = interim_stamp_from_name(adapter_name)
+        if stamp is not None:
             return self.output_dir / "episodic" / f"interim_{stamp}"
+        if adapter_name.startswith(INTERIM_NAME_PREFIX):
+            raise ValueError(f"Malformed interim adapter name: {adapter_name!r}")
 
         if adapter_name not in ("episodic", "semantic", "procedural"):
             raise ValueError(f"Unknown adapter name for training output dir: {adapter_name!r}")
@@ -2437,9 +2441,14 @@ class ConsolidationLoop:
         self._tag_speaker_id_defaults(procedural_rels, speaker_id)
 
         # --- 5. Resolve stamp and target slot ---
-        if stamp is None:
-            from paramem.memory.interim_adapter import current_interim_stamp as _cis
+        from paramem.memory.interim_adapter import (
+            INTERIM_NAME_PREFIX,
+        )
+        from paramem.memory.interim_adapter import (
+            current_interim_stamp as _cis,
+        )
 
+        if stamp is None:
             stamp = _cis(schedule)
 
         adapter_name = self._resolve_target_slot(stamp)
@@ -2452,7 +2461,7 @@ class ConsolidationLoop:
         # registry is live.  Simulate has no PEFT slots so the count is
         # meaningless; simulate always falls through to _run_fold.
         existing_interim_count = len(
-            [a for a in self.model.peft_config if a.startswith("episodic_interim_")]
+            [a for a in self.model.peft_config if a.startswith(INTERIM_NAME_PREFIX)]
         )
         _gate_active = (
             mode != "simulate"

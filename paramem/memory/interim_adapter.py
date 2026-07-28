@@ -72,14 +72,40 @@ logger = logging.getLogger(__name__)
 INTERIM_NAME_PREFIX = "episodic_interim_"
 INTERIM_DIR_PREFIX = "interim_"
 
+# THE single declaration of the interim stamp format.  Every mint
+# (:func:`current_interim_stamp`), every validation
+# (:func:`interim_stamp_from_name`) and every re-parse to a datetime
+# (``app._full_cycle_deadline_dt``) composes from this one constant — the
+# shape is never re-declared as a pattern or a literal length.
+INTERIM_STAMP_FORMAT = "%Y%m%dT%H%M"
 
-def interim_stamp_from_name(name: str) -> str:
-    """Extract the YYYYMMDDTHHMM stamp from an interim adapter name."""
+
+def interim_stamp_from_name(name: str) -> str | None:
+    """Return the validated stamp from an interim adapter name, else ``None``.
+
+    ``"episodic_interim_20260417T0000"`` -> ``"20260417T0000"``.  Returns
+    ``None`` when *name* does not carry :data:`INTERIM_NAME_PREFIX`, or when
+    the tail is not a real :data:`INTERIM_STAMP_FORMAT` stamp.
+
+    THE only place an interim adapter name is parsed.  Validation is a
+    round-trip through :data:`INTERIM_STAMP_FORMAT` — ``strptime`` alone
+    accepts short fields (``"2026041T000"`` parses), so the re-rendered
+    stamp must equal the input.  This makes the format constant the sole
+    authority on the shape: there is no second length or pattern to keep
+    in step, and unlike a shape-only check it also rejects stamps that are
+    well-formed but not real datetimes (``"99999999T9999"``).
+
+    Total by contract: callers that require a stamp raise on ``None``
+    themselves, at the point where the failure means something specific.
+    """
     if not name.startswith(INTERIM_NAME_PREFIX):
-        raise ValueError(
-            f"Not an interim adapter name: {name!r} (expected '{INTERIM_NAME_PREFIX}<stamp>')"
-        )
-    return name[len(INTERIM_NAME_PREFIX) :]
+        return None
+    stamp = name[len(INTERIM_NAME_PREFIX) :]
+    try:
+        parsed = datetime.strptime(stamp, INTERIM_STAMP_FORMAT)
+    except ValueError:
+        return None
+    return stamp if parsed.strftime(INTERIM_STAMP_FORMAT) == stamp else None
 
 
 def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
@@ -87,8 +113,19 @@ def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
 
     Maps ``"episodic_interim_<stamp>"`` →
     ``<adapter_dir>/episodic/interim_<stamp>/``.
+
+    Raises:
+        ValueError: if *name* is not a well-formed interim adapter name —
+            building a path from an unvalidated stamp would silently create
+            a directory like ``interim_today/``.
     """
-    return adapter_dir / "episodic" / f"{INTERIM_DIR_PREFIX}{interim_stamp_from_name(name)}"
+    stamp = interim_stamp_from_name(name)
+    if stamp is None:
+        raise ValueError(
+            f"Not an interim adapter name: {name!r} "
+            f"(expected '{INTERIM_NAME_PREFIX}<{INTERIM_STAMP_FORMAT}>')"
+        )
+    return adapter_dir / "episodic" / f"{INTERIM_DIR_PREFIX}{stamp}"
 
 
 def iter_interim_dirs(
@@ -212,7 +249,7 @@ def current_interim_stamp(
     floored_seconds = (seconds_since_midnight // sub_interval) * sub_interval
 
     floored_dt = midnight + timedelta(seconds=floored_seconds)
-    return floored_dt.strftime("%Y%m%dT%H%M")
+    return floored_dt.strftime(INTERIM_STAMP_FORMAT)
 
 
 def current_full_consolidation_stamp(

@@ -14,7 +14,6 @@ expected; IDE autocomplete on ``entity.entity_type`` will degrade to
 from __future__ import annotations
 
 import logging
-import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -266,8 +265,11 @@ def entity_type_to_prefix(entity_type: str) -> str:
     closed = anonymizer_type_to_prefix().get(e)
     if closed is not None:
         return closed
-    parts = re.split(r"[\s_\-]+", e)
-    pascal = "".join(p.capitalize() for p in parts if p)
+    # ``canonical`` has already folded ``_`` and whitespace runs to single
+    # spaces, so only ``-`` (which it preserves verbatim) still separates
+    # words here.  Splitting on ``[\s_\-]+`` again would re-apply a fold that
+    # has already run.
+    pascal = "".join(p.capitalize() for p in e.replace("-", " ").split())
     return pascal or "Entity"
 
 

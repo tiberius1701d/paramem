@@ -65,15 +65,14 @@ lowercases any matching token at the extraction boundary (a deliberate, scoped
 exception to the "extraction only `.strip()`s" rule for display entities).
 """
 
-import re
 import unicodedata
 
-# Compiled once: matches the system speaker-id format "speaker{N}" (the
-# canonical lowercase form) where N is one or more decimal digits.
-# Case-insensitive so a residual cased form like "Speaker0" also passes the
-# structural test — the regex tolerates the cased form as input; it is never
-# the canonical form.
-_SPEAKER_ID_RE = re.compile(r"^[Ss]peaker\d+$")
+# THE single declaration of the speaker-id format: the canonical lowercase
+# prefix followed by a decimal index.  Both the mint
+# (``server.speaker.SpeakerStore``) and the structural gate
+# (:func:`is_speaker_id`) compose from this constant, so the shape is never
+# rendered twice.
+SPEAKER_ID_PREFIX = "speaker"
 
 
 def canonical(s: str, mode: str = "full") -> str:
@@ -187,19 +186,25 @@ def is_speaker_id(s: str) -> bool:
     """Return ``True`` when *s* is a speaker-id of the form ``speaker{N}``.
 
     The canonical stored form is lowercase (``"speaker0"``, ``"speaker12"``).
-    The regex keeps ``[Ss]`` so the ingest safety-net can also detect and
-    coerce any residual cased form (``"Speaker0"``) that a model emits — the
-    coercion output is ALWAYS lowercase.  The structural test is purely
-    syntactic — it does NOT check whether the id corresponds to a registered
-    speaker.
+    The prefix test is case-insensitive so the ingest safety-net can also
+    detect and coerce any residual cased form (``"Speaker0"``) that a model
+    emits — the coercion output is ALWAYS lowercase.  The structural test is
+    purely syntactic — it does NOT check whether the id corresponds to a
+    registered speaker.
+
+    The index test is ``str.isdecimal``, which accepts exactly Unicode
+    category Nd — the same set the previous ``\\d`` pattern matched.
+    ``str.isdigit`` would additionally accept superscripts and is NOT
+    equivalent.
 
     Args:
         s: String to test.
 
     Returns:
-        ``True`` iff *s* matches ``[Ss]peaker`` followed by one or more decimal
-        digits and nothing else.  ``False`` for partial matches (``"Speaker"``,
-        ``"speaker"``, ``"alex"``, ``"SpeakerX"``) and empty strings.
+        ``True`` iff *s* is :data:`SPEAKER_ID_PREFIX` (in any case) followed by
+        one or more decimal digits and nothing else.  ``False`` for partial
+        matches (``"Speaker"``, ``"speaker"``, ``"alex"``, ``"SpeakerX"``) and
+        empty strings.
 
     Examples::
 
@@ -216,4 +221,8 @@ def is_speaker_id(s: str) -> bool:
     """
     if not s:
         return False
-    return bool(_SPEAKER_ID_RE.match(s))
+    # Only the leading character is case-tolerant, matching the previous
+    # ``[Ss]peaker`` pattern exactly: "Speaker0" passes, "SPEAKER0" does not.
+    if s[:1].lower() + s[1 : len(SPEAKER_ID_PREFIX)] != SPEAKER_ID_PREFIX:
+        return False
+    return s[len(SPEAKER_ID_PREFIX) :].isdecimal()

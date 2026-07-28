@@ -625,7 +625,7 @@ class TestInterimBookkeepingRegionCrash:
         # session_buffer.bump_retry_and_release — the crash injection site.
         loop.run_consolidation_cycle.return_value = {
             "mode": "trained",
-            "adapter_name": "episodic_interim_t001",
+            "adapter_name": "episodic_interim_20260417T0000",
             "new_keys": [],
             "recall_failed_session_ids": ["sess-1"],
             "overflow_slot": False,

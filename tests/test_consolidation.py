@@ -3243,7 +3243,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value="episodic_interim_t001",
+                return_value="episodic_interim_20260417T0000",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -3276,7 +3276,7 @@ class TestAbortSkipsCommit:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_cycle",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         assert result.get("mode") == "aborted", (
@@ -3344,7 +3344,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value="episodic_interim_t001",
+                return_value="episodic_interim_20260417T0000",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -3376,7 +3376,7 @@ class TestAbortSkipsCommit:
                 speaker_id="speaker0",
                 mode="train",
                 run_label="test_proc_abort",
-                stamp="t001",
+                stamp="20260417T0000",
             )
 
         assert result.get("mode") == "aborted", (
@@ -5060,7 +5060,7 @@ class TestInterimCommitFailureRollback:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value="episodic_interim_t001",
+                return_value="episodic_interim_20260417T0000",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -5101,15 +5101,15 @@ class TestInterimCommitFailureRollback:
                     speaker_id="speaker0",
                     mode="train",
                     run_label="test_rollback",
-                    stamp="t001",
+                    stamp="20260417T0000",
                 )
 
     def test_failed_commit_drops_the_fresh_interim_tier(self, monkeypatch, tmp_path):
         """The freshly-minted interim tier has no entries/registry after the raise."""
         loop = self._make_loop(monkeypatch, tmp_path)
         self._run_cycle_expecting_failure(loop)
-        assert loop.store.entries_in_tier("episodic_interim_t001") == {}
-        assert loop.store.has_registry("episodic_interim_t001") is False
+        assert loop.store.entries_in_tier("episodic_interim_20260417T0000") == {}
+        assert loop.store.has_registry("episodic_interim_20260417T0000") is False
 
     def test_failed_commit_reactivates_soft_staled_key(self, monkeypatch, tmp_path):
         """graph_stale is soft-staled mid-cycle, then re-activated on failure."""
@@ -5233,7 +5233,7 @@ class TestInterimCommitFailureRollbackSimulate:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value="episodic_interim_t001",
+                return_value="episodic_interim_20260417T0000",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_persist_fold", side_effect=RuntimeError("disk full")),
@@ -5253,15 +5253,15 @@ class TestInterimCommitFailureRollbackSimulate:
                     speaker_id="speaker0",
                     mode="simulate",
                     run_label="test_simulate_rollback",
-                    stamp="t001",
+                    stamp="20260417T0000",
                 )
 
     def test_failed_commit_drops_the_fresh_interim_tier(self, monkeypatch, tmp_path):
         """The freshly-minted (disk-venue) interim tier has no entries/registry."""
         loop = self._make_loop(monkeypatch, tmp_path)
         self._run_cycle_expecting_failure(loop)
-        assert loop.store.entries_in_tier("episodic_interim_t001") == {}
-        assert loop.store.has_registry("episodic_interim_t001") is False
+        assert loop.store.entries_in_tier("episodic_interim_20260417T0000") == {}
+        assert loop.store.has_registry("episodic_interim_20260417T0000") is False
 
     def test_failed_commit_reactivates_soft_staled_key(self, monkeypatch, tmp_path):
         """graph_stale is soft-staled mid-cycle, then re-activated on failure."""
@@ -14495,9 +14495,11 @@ class TestFullConsolidationOverdueKey:
         """
         from datetime import datetime, timedelta
 
+        from paramem.memory.interim_adapter import INTERIM_STAMP_FORMAT
+
         dt = datetime.now() - timedelta(seconds=seconds)
         # Floor to minute precision — same granularity as interim_stamp_from_name.
-        return dt.strftime("%Y%m%dT%H%M")
+        return dt.strftime(INTERIM_STAMP_FORMAT)
 
     def test_overdue_returns_oldest_stamp(self, tmp_path):
         """Oldest interim aged ≥ 2× period → returns oldest stamp."""
@@ -15151,11 +15153,12 @@ class TestOldestInterimStamp:
         """Returns a recent stamp regardless of age (no age gate)."""
         from datetime import datetime
 
+        from paramem.memory.interim_adapter import INTERIM_STAMP_FORMAT
         from paramem.server.app import _oldest_interim_stamp
 
         cfg = self._make_config(tmp_path)
         # Use a recent timestamp that would NOT be overdue.
-        now_stamp = datetime.now().strftime("%Y%m%dT%H%M")
+        now_stamp = datetime.now().strftime(INTERIM_STAMP_FORMAT)
         self._write_interim_dir(tmp_path, now_stamp)
         stamp = _oldest_interim_stamp(cfg)
         assert stamp == now_stamp, (
@@ -15173,7 +15176,9 @@ class TestOldestInterimStamp:
         # Write a very recent stamp — age << 2×period.
         from datetime import datetime
 
-        now_stamp = datetime.now().strftime("%Y%m%dT%H%M")
+        from paramem.memory.interim_adapter import INTERIM_STAMP_FORMAT
+
+        now_stamp = datetime.now().strftime(INTERIM_STAMP_FORMAT)
         self._write_interim_dir(tmp_path, now_stamp)
         assert _full_consolidation_overdue_key(cfg) is None, (
             "_full_consolidation_overdue_key must return None when oldest stamp is young"

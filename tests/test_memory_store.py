@@ -593,22 +593,22 @@ class TestMoveDelete:
 class TestDropTier:
     def test_drop_tier_removes_entries_registry_and_bookkeeping(self):
         s = MemoryStore()
-        s.put("episodic_interim_t001", "graph1", _entry("graph1"), simhash=0xCAFE)
+        s.put("episodic_interim_20260417T0000", "graph1", _entry("graph1"), simhash=0xCAFE)
         s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
-        s.drop_tier("episodic_interim_t001")
-        assert s.entries_in_tier("episodic_interim_t001") == {}
-        assert s.has_registry("episodic_interim_t001") is False
+        s.drop_tier("episodic_interim_20260417T0000")
+        assert s.entries_in_tier("episodic_interim_20260417T0000") == {}
+        assert s.has_registry("episodic_interim_20260417T0000") is False
         assert s.bookkeeping_for_key("graph1") is None
 
     def test_drop_tier_does_not_touch_other_tiers(self):
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"), simhash=1)
         s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
-        s.put("episodic_interim_t001", "graph2", _entry("graph2"), simhash=2)
-        s.drop_tier("episodic_interim_t001")
+        s.put("episodic_interim_20260417T0000", "graph2", _entry("graph2"), simhash=2)
+        s.drop_tier("episodic_interim_20260417T0000")
         assert s.get("graph1") == _entry("graph1")
         assert s.bookkeeping_for_key("graph1") is not None
-        assert s.entries_in_tier("episodic_interim_t001") == {}
+        assert s.entries_in_tier("episodic_interim_20260417T0000") == {}
 
     def test_drop_tier_unknown_tier_is_noop(self):
         s = MemoryStore()
