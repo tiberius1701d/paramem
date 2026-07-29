@@ -9774,6 +9774,12 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
         loop.output_dir = trial_adapter_dir
         trial_adapter_dir.mkdir(parents=True, exist_ok=True)
 
+        # Donor stores stay on the LIVE root: the trial's adapters are cold by
+        # construction, so without this every trial pays a full inline donor
+        # build into its own scratch tree. Borrowing is read-only, so a trial
+        # can neither add to nor prune the live donor stores.
+        loop.borrow_donor_cache(trial_config.adapter_dir)
+
         # CRITICAL Fix 1: redirect registry writes to a trial-isolated directory
         # (sibling of trial_adapter/, e.g. data/ha/state/trial_registry/).
         # _save_registry / _save_key_metadata check these attributes and use them

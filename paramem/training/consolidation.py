@@ -519,6 +519,11 @@ class ConsolidationLoop:
     # gets no cloud egress unless it says so.
     cloud_enabled: bool = False
 
+    # Same reason.  ``None`` means donor stores live beside this loop's own
+    # tier stores; ``borrow_donor_cache`` sets an instance attribute pointing
+    # at another root's cache, read-only (see that method).
+    _borrowed_donor_root: "Path | None" = None
+
     def __init__(
         self,
         model,
@@ -6950,6 +6955,43 @@ class ConsolidationLoop:
         metrics["donor_seeded"] = donor_seeded
         return metrics, recall_state
 
+    @property
+    def donor_adapter_root(self) -> Path:
+        """Adapter root whose donor stores this loop resolves against.
+
+        ``self.output_dir`` unless :meth:`borrow_donor_cache` pointed this
+        loop at another root's cache.
+        """
+        return self._borrowed_donor_root or self.output_dir
+
+    @property
+    def _borrowed_donor_cache(self) -> bool:
+        """True when this loop reads a donor cache it does not own."""
+        return self._borrowed_donor_root is not None
+
+    def borrow_donor_cache(self, adapter_root: "Path | str") -> None:
+        """Resolve donors against *adapter_root*'s stores, read-only.
+
+        For a loop whose ``output_dir`` is a scratch tree but whose base
+        model matches a real deployment's — a migration trial. Without this
+        the trial resolves donors under its own empty output dir, misses,
+        and pays a full inline donor build (37-45 min measured, see
+        :mod:`paramem.training.donor`) for an artifact the deployment
+        already holds.
+
+        Borrowing is read-only BY CONSTRUCTION, not by a second flag: a
+        borrowed cache is never built into and never pruned, so a trial
+        running a candidate config can neither add a store to nor remove one
+        from the live tree. When the borrowed cache holds nothing valid for
+        this loop's base model and topology — the base-swap trial case — the
+        target simply trains cold.
+
+        Args:
+            adapter_root: The adapter root to borrow from — in production
+                ``config.adapter_dir``, the live deployment's own root.
+        """
+        self._borrowed_donor_root = Path(adapter_root)
+
     def _maybe_seed_from_donor(self, adapter_name: str, adapter_config) -> bool:
         """Seed *adapter_name* from its topology's donor checkpoint when it
         measures cold.
@@ -6978,8 +7020,8 @@ class ConsolidationLoop:
             DONOR_LOAD_ADAPTER_NAME,
             DonorBuildIncomplete,
             build_donor,
-            donor_checkpoint_dir,
             donor_checkpoint_valid,
+            donor_store_dir,
             load_donor_into_transient_slot,
         )
 
@@ -7001,8 +7043,17 @@ class ConsolidationLoop:
         # copy_adapter_weights would hit a tensor-shape mismatch and abort
         # the fold.
         lora_shape = _lora_shape_fields(adapter_config)
-        checkpoint_dir = donor_checkpoint_dir(self.output_dir, lora_shape)
-        if not donor_checkpoint_valid(checkpoint_dir, base_model_id, lora_shape):
+        store_dir = donor_store_dir(self.donor_adapter_root, base_model_id, lora_shape)
+        if not donor_checkpoint_valid(store_dir, base_model_id, lora_shape):
+            if self._borrowed_donor_cache:
+                logger.info(
+                    "_maybe_seed_from_donor: borrowed donor cache at %s holds no "
+                    "valid checkpoint for this base/topology -- training %s cold "
+                    "(a borrowing loop never builds into a cache it does not own)",
+                    self.donor_adapter_root,
+                    adapter_name,
+                )
+                return False
             logger.info(
                 "_maybe_seed_from_donor: donor checkpoint missing/mismatched "
                 "for base %s -- building before this fold's training",
@@ -7020,18 +7071,18 @@ class ConsolidationLoop:
                 )
                 return False
 
-        if not donor_checkpoint_valid(checkpoint_dir, base_model_id, lora_shape):
-            logger.warning(
-                "_maybe_seed_from_donor: skipping donor seeding for %s -- "
-                "no valid checkpoint after build attempt",
-                adapter_name,
-            )
-            return False
+            if not donor_checkpoint_valid(store_dir, base_model_id, lora_shape):
+                logger.warning(
+                    "_maybe_seed_from_donor: skipping donor seeding for %s -- "
+                    "no valid checkpoint after build attempt",
+                    adapter_name,
+                )
+                return False
 
         from paramem.models.loader import active_adapter_name, copy_adapter_weights
 
         try:
-            load_donor_into_transient_slot(self.model, checkpoint_dir, DONOR_LOAD_ADAPTER_NAME)
+            load_donor_into_transient_slot(self.model, store_dir, DONOR_LOAD_ADAPTER_NAME)
             copy_adapter_weights(self.model, src=DONOR_LOAD_ADAPTER_NAME, dst=adapter_name)
             logger.info(
                 "_maybe_seed_from_donor: seeded %s from donor checkpoint (base=%s)",
@@ -7039,6 +7090,23 @@ class ConsolidationLoop:
                 base_model_id,
             )
             return True
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            # Boundary error handling for an on-disk artifact: the checkpoint
+            # validated, so its bytes are intact and its metadata matches --
+            # but loading can still fail for reasons validation cannot see,
+            # chiefly an age-encrypted donor on a process with no daily
+            # identity loaded (_adapter_slot_for_load -> read_maybe_encrypted).
+            # Seeding is an optimization over cold init; nothing about the
+            # fold's correctness depends on it, so a failure here costs the
+            # seed, never the fold. Every other branch of this method already
+            # degrades this way -- this was the one that propagated.
+            logger.warning(
+                "_maybe_seed_from_donor: donor load/copy failed for %s (%s) -- "
+                "training cold this fold",
+                adapter_name,
+                exc,
+            )
+            return False
         finally:
             if DONOR_LOAD_ADAPTER_NAME in self.model.peft_config:
                 if active_adapter_name(self.model) == DONOR_LOAD_ADAPTER_NAME:

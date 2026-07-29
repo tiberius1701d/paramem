@@ -8,8 +8,9 @@ funnel this module trains through (``ConsolidationLoop._train_tier_adapter``)
 stays exactly where it was. This module owns the donor's three concerns
 instead: (1) deterministically generating the synthetic crowded-cluster
 training population (:func:`donor_entries`), (2) persisting and validating
-each topology's own trained donor checkpoint outside every boot-scan glob
-(:func:`donor_checkpoint_dir` / :func:`donor_checkpoint_valid`), and
+each (base model, topology) pair's own trained donor checkpoint as an
+adapter store beside the main tiers
+(:func:`donor_store_dir` / :func:`donor_checkpoint_valid`), and
 (3) building the donor by training it through
 ``ConsolidationLoop._train_tier_adapter`` on a transient adapter slot
 (:func:`build_donor`). Consumed by ``ConsolidationLoop._train_tier_adapter``
@@ -89,10 +90,11 @@ verbatim.
 
 Build timing (operational note)
 ---------------------------------
-Every LoRA topology gets its OWN donor checkpoint, built lazily by the
-same single call site (``ConsolidationLoop._maybe_seed_from_donor``,
-inside ``_train_tier_adapter``): when the TARGET tier's topology
-checkpoint is missing or stale, :func:`build_donor` runs INLINE,
+Every (base model, LoRA topology) pair gets its OWN donor checkpoint,
+built lazily by the same single call site
+(``ConsolidationLoop._maybe_seed_from_donor``, inside
+``_train_tier_adapter``): when the TARGET tier's store holds no valid
+checkpoint, :func:`build_donor` runs INLINE,
 synchronously, at that topology, before that fold's own training. The
 step count is topology-INDEPENDENT: 147 entries -- ``donor_entries``
 returns whole 21-entry blocks, so ``DONOR_MIN_ENTRIES=128`` requested
@@ -133,7 +135,6 @@ import hashlib
 import json
 import logging
 import random
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -164,36 +165,29 @@ counters — ``ConsolidationLoop._indexed_next_index`` /
 ``max(DONOR_KEY_FLOOR, high_water_from_store)`` (see module docstring)."""
 
 # --- Donor checkpoint location ----------------------------------------------
-DONOR_CHECKPOINT_DIRNAME: str = "_donor"
-"""Sub-directory of ``ConsolidationLoop.output_dir`` (== ``config.adapter_dir``
-in production) holding the donor tree — one level deeper than a single
-checkpoint: ``_donor/<topology_id>/<stamp>/``, one topology directory per
-distinct LoRA shape (:func:`donor_topology_id`), each holding its own
-promoted slot. Chosen so NEITHER production boot-scan path can ever mount
-it: ``_mount_adapters_from_slots``
-(``paramem/server/app.py``) enumerates a hardcoded 3-tuple
-``("episodic", "semantic", "procedural")`` for main tiers and calls
-``iter_interim_dirs(config.adapter_dir)`` for interim slots, which globs
-only ``<adapter_dir>/episodic/interim_*``
-(``paramem/memory/interim_adapter.py``); the legacy-layout detector globs
-``<adapter_dir>/episodic_interim_*`` at the top level
-(``detect_legacy_adapter_layout``); and the backup safety-bundle path
-(``paramem/backup/backup.py``) also iterates the same fixed 3-tuple.
-``_donor`` matches none of these three enumeration patterns, so it is
-structurally unreachable from every mount/backup path without a dedicated
-opt-in reader — none exists.
+DONOR_STORE_PREFIX: str = "donor-"
+"""Name prefix of a donor's adapter store, a SIBLING of the main tiers under
+``ConsolidationLoop.donor_adapter_root``: ``donor-<topology_id>-b<base8>/<stamp>/``.
 
-Stricter than "never mounted": ``restore_bundle``
-(``paramem/backup/backup.py``) actively DESTROYS it. Its adapters-root walk
-treats any top-level entry that is not one of the three recognised main
-tiers as a stray and ``shutil.rmtree``'s it unconditionally (unless listed
-in ``infra_paths()``, which ``_donor`` is not) — so a restore always wipes
-every topology's donor checkpoint along with any other unrecognised
-directory. Operational consequence: the first measured-cold fold of EACH
-topology after a restore rebuilds that topology's donor inline again (see
-:func:`build_donor`'s call site, ``ConsolidationLoop._maybe_seed_from_donor``)
-— expected, not a bug; each checkpoint is a rebuildable cache, never a
-source of truth."""
+A donor is an adapter checkpoint store, structurally identical to a main
+tier: the same ``atomic_save_adapter`` writes it, the same ``meta.json``
+(:class:`~paramem.adapters.manifest.AdapterManifest`) describes it, the same
+``find_live_slot`` resolves its promoted slot, and the same backup / restore
+/ prune routines own its lifecycle. It is therefore stored where the tiers
+are stored, and needs no store-specific handling anywhere.
+
+What a donor is NOT is a MEMORY tier: it carries no keyed entries, no
+``indexed_key_registry.json``, and no ``graph.json``, so it is absent from
+every memory-tier enumeration — including ``_mount_adapters_from_slots``
+(``paramem/server/app.py``), which is what keeps a donor out of inference.
+That exclusion is now a property of the concept ("not a memory tier")
+rather than an accident of a glob failing to match a hidden directory.
+
+The trailing ``b<base8>`` is a digest over the base model id, so donors for
+different base models occupy different stores instead of overwriting one
+another within a shared topology directory. Directory identity is a cache
+bucket only; applicability is decided by :func:`donor_checkpoint_valid`
+against the slot's recorded manifest."""
 
 DONOR_META_FILENAME: str = "donor_meta.json"
 DONOR_RECIPE_ID: str = "crowded_cluster_v1"
@@ -428,47 +422,60 @@ def donor_topology_id(lora_shape: dict) -> str:
     return f"r{normalized['r']}-a{normalized['lora_alpha']}-{n}mod-{digest}"
 
 
-def donor_root(adapter_root: "Path | str") -> Path:
-    """Return the donor tree root under *adapter_root* (``loop.output_dir``)."""
-    return Path(adapter_root) / DONOR_CHECKPOINT_DIRNAME
+def iter_donor_stores(adapter_root: "Path | str") -> "list[tuple[str, Path]]":
+    """Return ``(store_name, store_dir)`` for every donor store under *adapter_root*.
+
+    The donor counterpart of
+    :func:`~paramem.memory.interim_adapter.iter_interim_dirs`: enumeration
+    is per store KIND (only the kind knows its own naming), while everything
+    downstream — capture, restore, slot resolution, retention — is the
+    shared adapter-store machinery. Callers that must treat every adapter
+    store alike (the backup bundle writer and the restore sweep) use this to
+    discover donors instead of naming them, so adding or removing a donor
+    store needs no change on their side.
+
+    Sorted by name for deterministic bundle contents.
+    """
+    root = Path(adapter_root)
+    if not root.is_dir():
+        return []
+    return sorted(
+        (p.name, p) for p in root.iterdir() if p.is_dir() and p.name.startswith(DONOR_STORE_PREFIX)
+    )
 
 
-def donor_checkpoint_dir(adapter_root: "Path | str", lora_shape: dict) -> Path:
-    """Return the checkpoint directory for ONE topology under *adapter_root*.
+def donor_base_digest(base_model_id: str) -> str:
+    """Return the 8-hex-char store-name digest for *base_model_id*.
 
-    ``<adapter_root>/_donor/<topology_id>`` — the leaf is defined in terms
-    of :func:`donor_root`, and the topology id comes from
-    :func:`donor_topology_id` applied to *lora_shape*.
+    Keeps donors for different base models in different stores. A digest
+    (not the raw id) because a HuggingFace model id contains ``/`` and is
+    unbounded in length, neither of which a directory name tolerates.
+    """
+    return hashlib.sha256(base_model_id.encode()).hexdigest()[:8]
+
+
+def donor_store_dir(adapter_root: "Path | str", base_model_id: str, lora_shape: dict) -> Path:
+    """Return the donor adapter store for ONE (base model, topology) pair.
+
+    ``<adapter_root>/donor-<topology_id>-b<base8>`` — a sibling of the main
+    tier stores, holding promoted ``<stamp>/`` slots exactly as they do (see
+    :data:`DONOR_STORE_PREFIX`). Resolve the live slot inside it with
+    ``find_live_slot(store, "")``: :func:`build_donor` stamps every donor
+    manifest with an empty ``registry_sha256`` (a donor has no key
+    registry), which is the case that resolver documents an empty
+    *live_registry_sha256* as matching.
 
     Args:
-        adapter_root: ``loop.output_dir`` (== ``config.adapter_dir`` in
-            production).
+        adapter_root: The adapter root whose donor stores this resolves
+            against — ``ConsolidationLoop.donor_adapter_root``.
+        base_model_id: The base model's ``config._name_or_path``.
         lora_shape: The target tier's :func:`~paramem.models.loader._lora_shape_fields`
-            dict — determines which topology's directory this resolves to.
+            dict — determines which topology this resolves to.
     """
-    return donor_root(adapter_root) / donor_topology_id(lora_shape)
-
-
-def _latest_donor_slot(checkpoint_dir: Path) -> "Path | None":
-    """Return the most-recently-written donor slot under *checkpoint_dir*, or ``None``.
-
-    Donor slots are written by :func:`build_donor` via
-    :func:`~paramem.models.loader.atomic_save_adapter`, which names each slot
-    with its own sortable ``YYYYMMDD-HHMMSS`` stamp
-    (``paramem.models.loader._make_slot_ts``) — the lexicographically-greatest
-    child directory is therefore the newest. Unlike production tiers'
-    ``find_live_slot`` (registry-sha256 matching across possibly-divergent
-    slots), no hash resolution is needed here: there is exactly one donor
-    artifact per topology at a time (:func:`build_donor` prunes every prior
-    slot within the same topology after a successful save), rebuilt
-    wholesale, never partially updated.
-    Directories whose name starts with ``.`` (PEFT/HF scratch — ``.pending``,
-    the training scratch dir) are skipped.
-    """
-    if not checkpoint_dir.is_dir():
-        return None
-    slots = sorted(p for p in checkpoint_dir.iterdir() if p.is_dir() and not p.name.startswith("."))
-    return slots[-1] if slots else None
+    store_name = (
+        f"{DONOR_STORE_PREFIX}{donor_topology_id(lora_shape)}-b{donor_base_digest(base_model_id)}"
+    )
+    return Path(adapter_root) / store_name
 
 
 def _triples_hash(entries: list[dict]) -> str:
@@ -490,17 +497,32 @@ def _triples_hash(entries: list[dict]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def donor_checkpoint_valid(
-    checkpoint_dir: Path, base_model_id: "str | None", lora_shape: dict
-) -> bool:
-    """True when a donor checkpoint exists under *checkpoint_dir*, matches
-    both *base_model_id* and *lora_shape*, and regenerating its recorded
+def _manifest_lora_shape(manifest) -> dict:
+    """Return a :func:`donor_topology_id`-shaped dict from a manifest's ``lora``.
+
+    One direction only: the manifest is the recorded shape, and
+    :func:`~paramem.models.loader._lora_shape_fields` is the live one. Both
+    feed the SAME :func:`donor_topology_id`, so there is one topology
+    comparison, not two shape schemas.
+    """
+    return {
+        "r": manifest.lora.rank,
+        "lora_alpha": manifest.lora.alpha,
+        "target_modules": list(manifest.lora.target_modules),
+    }
+
+
+def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_shape: dict) -> bool:
+    """True when a donor checkpoint exists under *store_dir*, its weights
+    verify against their recorded digest, its manifest matches both
+    *base_model_id* and *lora_shape*, and regenerating its recorded
     ``(seed, n_requested)`` through :func:`donor_entries` reproduces its
     recorded triple set exactly.
 
     Args:
-        checkpoint_dir: The value returned by :func:`donor_checkpoint_dir`.
-        base_model_id: The CURRENT base model's ``config._name_or_path``.
+        store_dir: The value returned by :func:`donor_store_dir`.
+        base_model_id: The CURRENT base model's ``config._name_or_path``,
+            compared against the slot manifest's ``base_model.repo``.
             ``None`` (base id unresolved) always returns ``False`` — LoRA
             weights do not transfer across bases, and an unresolved id means
             the comparison cannot be trusted either way.
@@ -508,24 +530,31 @@ def donor_checkpoint_valid(
             :func:`~paramem.models.loader._lora_shape_fields` (rank, alpha,
             target_modules — the SAME function ``ensure_adapter_matching``
             compares a resident adapter against; one implementation, not a
-            second shape check). *checkpoint_dir* is already topology-scoped
-            by the caller (:func:`donor_checkpoint_dir`), so this comparison
-            catches a slot that was hand-moved into the wrong topology's
-            directory (see the module's migration guidance) rather than
-            crash later inside ``copy_adapter_weights`` on a tensor-shape
-            mismatch.
+            second shape check), compared against the slot manifest's own
+            ``lora``. *store_dir* is already keyed by (base model, topology)
+            by the caller (:func:`donor_store_dir`), so this comparison
+            catches a slot that was hand-moved into the wrong store rather
+            than crash later inside ``copy_adapter_weights`` on a
+            tensor-shape mismatch.
 
-    Validity requires ALL of: (1) a donor slot exists with both
-    ``adapter_model.safetensors`` and a parseable ``donor_meta.json``;
-    (2) ``meta["base_model_id"] == base_model_id``; (3)
+    Validity requires ALL of: (1) ``find_live_slot`` resolves a slot
+    carrying ``adapter_model.safetensors``, a readable ``meta.json``
+    manifest, and a parseable ``donor_meta.json``;
+    (2) ``manifest.base_model.repo == base_model_id``; (3)
     ``meta["recipe"] == DONOR_RECIPE_ID`` -- an operator bump of
     :data:`DONOR_RECIPE_ID` (after editing the fixture, the synthesis
     logic, or either fixed hyperparameter) invalidates every existing
     checkpoint outright, regardless of how the other checks would score,
     so the next measured-cold fold rebuilds from the new recipe; (4) the
-    recorded shape's topology id (:func:`donor_topology_id`) equals the
-    current shape's topology id — order-insensitive on ``target_modules``;
-    (5) regeneration -- ``donor_entries(meta["seed"], meta["n_requested"])``,
+    weights on disk hash to the recorded ``meta["weights_sha256"]`` -- the
+    ONE check that reads the artifact this checkpoint exists to hand over
+    rather than metadata about it, so a truncated or corrupt file is
+    rebuilt here instead of raising inside the caller's load; a checkpoint
+    recording no digest is unverifiable and therefore invalid; (5) the
+    manifest's recorded shape's topology id (:func:`donor_topology_id`)
+    equals the current shape's topology id — order-insensitive on
+    ``target_modules``;
+    (6) regeneration -- ``donor_entries(meta["seed"], meta["n_requested"])``,
     canonically hashed (:func:`_triples_hash`), matches the recorded hash.
     Checkpoints written before ``triples_hash`` existed in the meta schema
     (additive, no schema break) are compared by hashing their own recorded
@@ -543,24 +572,32 @@ def donor_checkpoint_valid(
     on. This covers not just missing fields but wrong-typed ones: a
     non-numeric ``n_requested`` (e.g. a string), list-shaped ``triples``
     entries instead of dicts, an entry missing one of
-    ``key``/``subject``/``predicate``/``object``, or a recorded
-    ``lora_shape`` malformed enough that :func:`donor_topology_id` itself
-    raises (``KeyError``/``TypeError``/``ValueError`` -- e.g. ``null``, a
-    bare string, or a dict missing ``r``) -- the topology-id comparison is
-    evaluated inside the SAME ``try`` as the regeneration check so this
-    stays true.
+    ``key``/``subject``/``predicate``/``object``, or a manifest whose
+    ``lora`` is malformed enough that :func:`donor_topology_id` itself
+    raises (``KeyError``/``TypeError``/``ValueError``/``AttributeError``)
+    -- the topology-id comparison is evaluated inside the SAME ``try`` as
+    the regeneration check so this stays true. An unreadable or
+    schema-invalid ``meta.json`` is caught as ``ManifestError`` at the
+    read, on the same never-raise contract.
 
     Returns:
-        ``False`` on any of: no slot, missing artifacts, unparseable meta,
-        base id mismatch, recipe id mismatch (including missing), topology
-        mismatch (including a malformed recorded shape), a meta missing
-        ``seed`` or ``n_requested`` (cannot be regenerated), any other
-        malformed meta shape (see above), or a regeneration hash mismatch.
-        ``True`` only when every check passes.
+        ``False`` on any of: no slot, missing artifacts, unreadable
+        manifest, unparseable meta, base id mismatch, recipe id mismatch
+        (including missing), a missing or mismatched weights digest,
+        topology mismatch (including a malformed recorded shape), a meta
+        missing ``seed`` or ``n_requested`` (cannot be regenerated), any
+        other malformed meta shape (see above), or a regeneration hash
+        mismatch. ``True`` only when every check passes.
     """
+    from paramem.adapters.manifest import (
+        ManifestError,
+        find_live_slot,
+        read_manifest,
+    )
+
     if base_model_id is None:
         return False
-    slot = _latest_donor_slot(Path(checkpoint_dir))
+    slot = find_live_slot(Path(store_dir), "")
     if slot is None:
         return False
     meta_path = slot / DONOR_META_FILENAME
@@ -568,12 +605,27 @@ def donor_checkpoint_valid(
     if not meta_path.exists() or not weights_path.exists():
         return False
     try:
+        manifest = read_manifest(slot)
+    except ManifestError:
+        return False
+    if manifest.base_model.repo != base_model_id:
+        return False
+    try:
         meta = json.loads(meta_path.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    if meta.get("base_model_id") != base_model_id:
-        return False
     if meta.get("recipe") != DONOR_RECIPE_ID:
+        return False
+
+    # The weights are the artifact this checkpoint EXISTS to hand over, and
+    # every check above reads metadata about them rather than the bytes
+    # themselves. Without this, a truncated or corrupt safetensors file
+    # validates, and the failure surfaces inside the caller's load — far past
+    # the point where "invalid -> rebuild" is still available.
+    recorded_weights_hash = meta.get("weights_sha256")
+    if recorded_weights_hash is None:
+        return False
+    if hashlib.sha256(weights_path.read_bytes()).hexdigest() != recorded_weights_hash:
         return False
 
     seed = meta.get("seed")
@@ -581,7 +633,7 @@ def donor_checkpoint_valid(
     if seed is None or n_requested is None:
         return False
     try:
-        if donor_topology_id(meta.get("lora_shape")) != donor_topology_id(lora_shape):
+        if donor_topology_id(_manifest_lora_shape(manifest)) != donor_topology_id(lora_shape):
             return False
 
         regenerated = donor_entries(seed, n_requested)
@@ -593,7 +645,7 @@ def donor_checkpoint_valid(
             if recorded_triples is None:
                 return False
             recorded_hash = _triples_hash(recorded_triples)
-    except (TypeError, KeyError, ValueError):
+    except (TypeError, KeyError, ValueError, AttributeError):
         # Boundary error handling for an on-disk artifact whose shape is
         # not guaranteed: donor_meta.json can be malformed in ways that
         # are NOT "field absent" -- a recorded lora_shape malformed enough
@@ -919,49 +971,6 @@ def _drop_transient_slot(model, name: str, *, fallback_adapter: str) -> None:
         model.delete_adapter(name)
 
 
-def _prune_other_donor_slots(topology_dir: Path, keep: Path) -> None:
-    """Delete every donor slot under ONE topology's directory except *keep*.
-
-    Called by :func:`build_donor` after a successful save: unlike production
-    tiers (which retain a bounded number of prior slots for rollback,
-    ``ConsolidationLoop._prune_old_slots`` /
-    ``consolidation.training_keep_prior_slots``), the donor is a rebuildable
-    cache with exactly one live artifact per topology at a time by design
-    (see :func:`_latest_donor_slot`'s docstring) — there is no rollback use
-    case for an old donor checkpoint, so nothing is retained. Directories
-    starting with ``.`` (``.pending``, the training scratch dir) are left
-    alone; this only prunes prior promoted slots.
-    """
-    if not topology_dir.is_dir():
-        return
-    for child in topology_dir.iterdir():
-        if child.is_dir() and not child.name.startswith(".") and child != keep:
-            shutil.rmtree(child, ignore_errors=True)
-
-
-def _prune_dead_topologies(root: Path, live_ids: "set[str]") -> None:
-    """Delete topology directories under *root* whose id is not in *live_ids*.
-
-    Called by :func:`build_donor` after a successful save, alongside
-    :func:`_prune_other_donor_slots`: the per-slot prune bounds each
-    topology's OWN history to one artifact, and this bounds the number of
-    topology directories the donor tree can ever accumulate. A topology
-    stops being live when no tier's current ``AdapterConfig`` maps to it
-    any more (an operator rank/target-modules edit, or a tier being
-    disabled) — its directory is then garbage: nothing will ever build,
-    validate, or load from it again. Directories starting with ``.`` are
-    left alone (mirrors :func:`_prune_other_donor_slots`'s dot-prefix
-    skip); this also garbage-collects a legacy flat ``_donor/<stamp>/``
-    layout (pre-topology-scoping), whose stamp name is never a live
-    topology id.
-    """
-    if not root.is_dir():
-        return
-    for child in root.iterdir():
-        if child.is_dir() and not child.name.startswith(".") and child.name not in live_ids:
-            shutil.rmtree(child, ignore_errors=True)
-
-
 def build_donor(
     loop: "ConsolidationLoop",
     *,
@@ -1016,21 +1025,25 @@ def build_donor(
     On success, saves via :func:`~paramem.models.loader.atomic_save_adapter`
     (the same primitive every production tier save uses — atomic write,
     age-envelope encryption when the daily identity is loaded) into the
-    topology directory (:func:`donor_checkpoint_dir`), writes
-    ``donor_meta.json`` (seed, recipe, the resulting triple set, its
-    canonical hash (:func:`_triples_hash`, read back by
-    :func:`donor_checkpoint_valid`'s regeneration check), weights SHA-256,
-    base model id, and *adapter_config*'s LoRA shape fields — see
-    :func:`donor_checkpoint_valid`) alongside the weights, prunes every
-    other slot within the SAME topology (:func:`_prune_other_donor_slots`
-    — exactly one donor artifact per topology persists at a time), prunes
-    any topology directory that is no longer live
-    (:func:`_prune_dead_topologies`, whose live-id set is the shape just
-    built here UNION the loop's own three tier configs — the just-built
-    shape is included unconditionally so this build can never delete its
-    own fresh output even when no tier config happens to match it, e.g. a
-    stale or ad-hoc *adapter_config*), then deletes the transient slot in
-    a ``finally`` regardless of outcome.
+    donor store (:func:`donor_store_dir`). Storage metadata is a
+    ``meta.json`` :class:`~paramem.adapters.manifest.AdapterManifest` built
+    by the ONE provider every save path uses
+    (:func:`~paramem.adapters.manifest.build_manifest_for`) — base-model and
+    tokenizer fingerprints and the LoRA shape live there, and its
+    ``registry_sha256`` is empty because a donor carries no key registry,
+    which is what lets ``find_live_slot`` resolve the promoted slot.
+    ``donor_meta.json`` alongside it carries only what is donor-specific
+    (seed, recipe, the resulting triple set, its canonical hash
+    (:func:`_triples_hash`, read back by :func:`donor_checkpoint_valid`'s
+    regeneration check), and the weights SHA-256 that same function
+    verifies the bytes against) — never a second copy of the base model or
+    shape. Every other slot within the SAME store is then pruned through
+    the shared ``ConsolidationLoop._prune_old_slots`` at ``keep=0`` (exactly
+    one donor artifact per (base model, topology) persists at a time), and
+    the transient slot is deleted in a ``finally`` regardless of outcome.
+    Nothing outside this store is touched: another base model's or
+    topology's store is left intact, because a config change makes a donor
+    inapplicable, never wrong.
 
     Args:
         loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`
@@ -1055,6 +1068,7 @@ def build_donor(
     """
     from dataclasses import replace as _dataclasses_replace
 
+    from paramem.adapters.manifest import build_manifest_for
     from paramem.backup.backup import sweep_orphan_pending
     from paramem.models.loader import (
         _lora_shape_fields,
@@ -1067,8 +1081,8 @@ def build_donor(
     base_model_id = getattr(loop.model.get_base_model().config, "_name_or_path", None)
 
     lora_shape = _lora_shape_fields(adapter_config)
-    topology_dir = donor_checkpoint_dir(loop.output_dir, lora_shape)
-    sweep_orphan_pending(topology_dir)
+    store_dir = donor_store_dir(loop.donor_adapter_root, base_model_id, lora_shape)
+    sweep_orphan_pending(store_dir)
     build_name = DONOR_BUILD_ADAPTER_NAME
     _drop_transient_slot(loop.model, build_name, fallback_adapter="episodic")
 
@@ -1086,7 +1100,7 @@ def build_donor(
             adapter_name=build_name,
             adapter_config=recipe_config,
             training_config=loop.training_config,
-            output_dir=topology_dir / ".training_scratch",
+            output_dir=store_dir / ".training_scratch",
             run_name="donor-build",
             phase_name="donor-build",
         )
@@ -1094,11 +1108,28 @@ def build_donor(
             raise DonorBuildIncomplete(
                 f"donor training did not complete (metrics={metrics!r}) -- no checkpoint persisted"
             )
-        topology_dir.mkdir(parents=True, exist_ok=True)
-        final_slot = atomic_save_adapter(loop.model, topology_dir, build_name)
+        store_dir.mkdir(parents=True, exist_ok=True)
+        # A donor's storage metadata is an AdapterManifest like any other
+        # store's: base-model + tokenizer fingerprint and LoRA shape come from
+        # the ONE provider every save path uses, and the empty
+        # registry_sha256 (a donor carries no key registry) is what makes
+        # find_live_slot resolve its promoted slot.
+        manifest = build_manifest_for(
+            loop.model,
+            loop.tokenizer,
+            build_name,
+            registry_path=None,
+            registry_sha256_override="",
+            key_count=len(entries),
+            adapter_root=Path(loop.donor_adapter_root),
+        )
+        final_slot = atomic_save_adapter(loop.model, store_dir, build_name, manifest=manifest)
         weights_sha256 = hashlib.sha256(
             (final_slot / "adapter_model.safetensors").read_bytes()
         ).hexdigest()
+        # Donor-SPECIFIC content only: base model and LoRA shape live in the
+        # manifest above and are never copied here, so there is one recorded
+        # answer to "what is this checkpoint for", not two that can drift.
         meta = {
             "seed": seed,
             "recipe": DONOR_RECIPE_ID,
@@ -1106,17 +1137,14 @@ def build_donor(
             "triples": entries,
             "triples_hash": _triples_hash(entries),
             "weights_sha256": weights_sha256,
-            "base_model_id": base_model_id,
-            "lora_shape": lora_shape,
         }
         (final_slot / DONOR_META_FILENAME).write_text(json.dumps(meta))
-        _prune_other_donor_slots(topology_dir, keep=final_slot)
-        live_ids = {donor_topology_id(lora_shape)} | {
-            donor_topology_id(_lora_shape_fields(c))
-            for c in (loop.episodic_config, loop.semantic_config, loop.procedural_config)
-            if c is not None
-        }
-        _prune_dead_topologies(donor_root(loop.output_dir), live_ids)
+        # Same retention routine every tier store uses; keep=0 because a donor
+        # rebuild in the SAME store only happens when the prior slot can never
+        # be valid again (recipe bump, generator drift, corrupt weights) -- a
+        # base or topology change resolves to a DIFFERENT store and leaves its
+        # predecessor untouched.
+        loop._prune_old_slots(store_dir, final_slot, keep=0)
         logger.info(
             "build_donor: trained + persisted donor checkpoint at %s (n=%d, seed=%d, base=%s)",
             final_slot,
@@ -1129,8 +1157,8 @@ def build_donor(
         _drop_transient_slot(loop.model, build_name, fallback_adapter="episodic")
 
 
-def load_donor_into_transient_slot(model, checkpoint_dir: Path, transient_name: str) -> None:
-    """Load the donor checkpoint under *checkpoint_dir* onto *model* as *transient_name*.
+def load_donor_into_transient_slot(model, store_dir: Path, transient_name: str) -> None:
+    """Load the donor checkpoint under *store_dir* onto *model* as *transient_name*.
 
     Mirrors ``ConsolidationLoop._verify_saved_adapter_from_disk``'s PEFT
     pitfall handling: ``model.load_adapter`` (never
@@ -1143,18 +1171,19 @@ def load_donor_into_transient_slot(model, checkpoint_dir: Path, transient_name: 
 
     Args:
         model: The live ``PeftModel``.
-        checkpoint_dir: The value returned by :func:`donor_checkpoint_dir`.
+        store_dir: The value returned by :func:`donor_store_dir`.
         transient_name: Adapter name to mount the checkpoint as (the
             caller deletes it once the copy-in completes).
 
     Raises:
-        FileNotFoundError: No donor slot exists under *checkpoint_dir*.
+        FileNotFoundError: No donor slot exists under *store_dir*.
     """
+    from paramem.adapters.manifest import find_live_slot
     from paramem.models.loader import _adapter_slot_for_load
 
-    slot = _latest_donor_slot(Path(checkpoint_dir))
+    slot = find_live_slot(Path(store_dir), "")
     if slot is None:
-        raise FileNotFoundError(f"No donor checkpoint found under {checkpoint_dir}")
+        raise FileNotFoundError(f"No donor checkpoint found under {store_dir}")
     with _adapter_slot_for_load(slot) as load_path:
         model.load_adapter(str(load_path), adapter_name=transient_name)
     if model.peft_config[transient_name].base_model_name_or_path is None:

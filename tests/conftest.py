@@ -204,7 +204,7 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
 
     Both the cache path and the destination path are derived through the
     SAME production primitives ``_maybe_seed_from_donor`` itself uses
-    (:func:`~paramem.training.donor.donor_checkpoint_dir` for the path,
+    (:func:`~paramem.training.donor.donor_store_dir` for the path,
     :func:`~paramem.training.donor.donor_checkpoint_valid` for the gate) --
     this fixture never re-derives the topology id or the validity rule.
 
@@ -230,7 +230,7 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
     import shutil
 
     from paramem.models.loader import _lora_shape_fields
-    from paramem.training.donor import donor_checkpoint_dir, donor_checkpoint_valid
+    from paramem.training.donor import donor_checkpoint_valid, donor_store_dir
 
     model, _tokenizer = model_and_tokenizer
     base_model_id = getattr(model.config, "_name_or_path", None)
@@ -240,8 +240,8 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
 
     def _seed(adapter_config) -> None:
         lora_shape = _lora_shape_fields(adapter_config)
-        cache_dir = donor_checkpoint_dir(cache_adapter_root, lora_shape)
-        dest_dir = donor_checkpoint_dir(tmp_path, lora_shape)
+        cache_dir = donor_store_dir(cache_adapter_root, base_model_id, lora_shape)
+        dest_dir = donor_store_dir(tmp_path, base_model_id, lora_shape)
         cache_was_valid = donor_checkpoint_valid(cache_dir, base_model_id, lora_shape)
         if cache_was_valid:
             dest_dir.parent.mkdir(parents=True, exist_ok=True)

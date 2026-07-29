@@ -69,6 +69,25 @@ from paramem.backup.types import (
 # iter_interim_dirs is imported at module level (no cycle: interim_adapter
 # does not import from paramem.backup.backup).
 from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_interim_dirs
+from paramem.training.donor import DONOR_STORE_PREFIX, iter_donor_stores
+
+# The durable files a slot directory can hold — ONE list, read by both
+# write_bundle's capture and restore_bundle's write-back so a file added to
+# one can never be silently dropped by the other.  Training scaffolding
+# (checkpoint-*/, in_training/, bg_checkpoint/, staging_resume.json) is never
+# copied: only these names are, so scaffolding is excluded structurally
+# (_ADAPTER_EXCLUDED_PATTERNS / _ADAPTER_EXCLUDED_DIR_PREFIXES document the
+# contract).  Absent names are skipped, so a name that only some store kinds
+# write costs nothing to the others: donor_meta.json exists only in donor
+# slots and carries the recipe/seed/triples/weights-digest that
+# paramem.training.donor.donor_checkpoint_valid needs — a donor restored
+# without it validates as invalid and is rebuilt at 37-45 min of GPU.
+SLOT_DURABLE_FILES: tuple[str, ...] = (
+    "adapter_model.safetensors",
+    "adapter_config.json",
+    "meta.json",
+    "donor_meta.json",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -763,13 +782,6 @@ def write_bundle(
         files_inventory.append(entry)
 
     # --- helper: capture one adapter slot (main or interim) ---
-    # _WEIGHT_FILES lists the three durable files in every slot directory.
-    # Training scaffolding (checkpoint-*/, in_training/, bg_checkpoint/,
-    # staging_resume.json) is never copied: we only copy the named files below,
-    # so scaffolding is excluded structurally.  _ADAPTER_EXCLUDED_PATTERNS and
-    # _ADAPTER_EXCLUDED_DIR_PREFIXES document the exclusion contract explicitly.
-    _WEIGHT_FILES = ("adapter_model.safetensors", "adapter_config.json", "meta.json")
-
     def _capture_adapter_slot(
         bundle_key: str,
         slot_path: Path,
@@ -823,7 +835,7 @@ def write_bundle(
             }
 
         adapter_dst_dir = pending_slot / dst_prefix
-        for fname in _WEIGHT_FILES:
+        for fname in SLOT_DURABLE_FILES:
             src = slot_path / fname
             if not src.exists():
                 continue
@@ -928,6 +940,32 @@ def write_bundle(
                 slot_path=interim_slot,
                 tier_root=interim_dir,  # interim registries live at the interim-family dir root
                 dst_prefix=f"adapters/{interim_name}",
+            )
+
+    # --- capture donor stores ---
+    # Donors are adapter stores like any other, so they are captured through
+    # the same helper.  Captured under BOTH adapter scopes, unlike interim
+    # families: adapter_scope selects which slots satisfy RECALL, and a donor
+    # satisfies none — it is here so a restore or a migration rollback puts
+    # back an artifact that costs 37-45 min of GPU per store to rebuild.
+    # Resolved with an empty registry hash because a donor carries no key
+    # registry (paramem.training.donor.build_donor stamps its manifest that
+    # way, which is the case find_live_slot documents as matching).
+    if adapter_dirs:
+        adapter_base_dir = next(iter(adapter_dirs.values())).parent
+        for donor_name, donor_dir in iter_donor_stores(adapter_base_dir):
+            donor_slot = find_live_slot(donor_dir, "")
+            if donor_slot is None:
+                logger.debug(
+                    "write_bundle: no live slot in donor store %s; skipping",
+                    donor_dir,
+                )
+                continue
+            _capture_adapter_slot(
+                bundle_key=donor_name,
+                slot_path=donor_slot,
+                tier_root=donor_dir,
+                dst_prefix=f"adapters/{donor_name}",
             )
 
     # --- fail-loud check for episodic primary recall ---
@@ -1307,10 +1345,12 @@ def restore_bundle(
     5e. **Clean-slate sweep** (after 5d, inside the step-5 try): make
         ``data_dir/adapters/`` contain EXACTLY the bundle's adapters.  Removes
         orphan main tiers (whole tier absent from bundle), orphan interim
-        families, stale slot dirs inside kept tiers, stale registries in
-        episodic-as-interim tiers, and legacy top-level entries.  Orphan
-        adapter removals are recorded in ``RestoreResult.pruned_orphans``;
-        within-tier stale-slot cleanup is logged at INFO/DEBUG.
+        families, orphan donor stores, stale slot dirs inside kept tiers and
+        kept donor stores, stale registries in episodic-as-interim tiers, and
+        legacy top-level entries.  Orphan adapter removals are recorded in
+        ``RestoreResult.pruned_orphans`` (``kind`` is ``"main"``,
+        ``"interim"`` or ``"donor"``); within-store stale-slot cleanup is
+        logged at INFO/DEBUG.
 
     6. Return :class:`RestoreResult` with ``restart_required=True`` — no hot
        VRAM swap (8 GB; mounted adapters are stale until restart).
@@ -1525,16 +1565,11 @@ def restore_bundle(
             # find_live_slot will resolve it as live once the registry is swapped).
             new_slot_pending, new_ts = _promote_slot(tier_root)
 
-            # Copy the three weight files (adapter_model.safetensors, adapter_config.json,
-            # meta.json) into the new slot.
-            _SLOT_WEIGHT_FILES = {
-                "adapter_model.safetensors",
-                "adapter_config.json",
-                "meta.json",
-            }
+            # Copy the slot's durable files into the new slot — the same
+            # list write_bundle captured them with (SLOT_DURABLE_FILES).
             for entry in adapter_files:
                 fname = Path(entry["path"]).name
-                if fname not in _SLOT_WEIGHT_FILES:
+                if fname not in SLOT_DURABLE_FILES:
                     continue
                 src = bundle_slot_dir / entry["path"]
                 dst = new_slot_pending / fname
@@ -1848,8 +1883,44 @@ def restore_bundle(
                             )
                             child.unlink()
 
+                elif top_entry.name.startswith(DONOR_STORE_PREFIX):
+                    # Donor store — an adapter store, so it gets the same
+                    # treatment as a main tier: kept when the bundle carried
+                    # it, cleaned down to exactly the slot just restored, and
+                    # pruned as an orphan when the bundle did not. It is NOT a
+                    # stray: the branch below would delete a store this restore
+                    # had just written, and rebuilding one costs 37-45 min of
+                    # GPU.
+                    kept_donor_slot = restored_main_slots.get(top_entry.name)
+                    if kept_donor_slot is None:
+                        shutil.rmtree(top_entry)
+                        pruned_orphans.append(
+                            {"name": top_entry.name, "kind": "donor", "active_keys": 0}
+                        )
+                        logger.warning(
+                            "restore_bundle: pruned orphan donor store %r "
+                            "— not present in bundle recovery set. "
+                            "Safety bundle at %s can restore it if needed.",
+                            top_entry.name,
+                            safety_slot,
+                        )
+                        continue
+                    for child in list(top_entry.iterdir()):
+                        if child == kept_donor_slot:
+                            continue
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                        logger.debug(
+                            "restore_bundle: removed stale donor entry %s/%s",
+                            top_entry.name,
+                            child.name,
+                        )
+
                 else:
-                    # Top-level entry under adapters/ that is not a recognised main tier.
+                    # Top-level entry under adapters/ that is not a recognised
+                    # adapter store.
                     # This covers legacy flat episodic_interim_* dirs (pre-hierarchy-refactor
                     # layout) and stray files.  Remove unconditionally — the bundle never
                     # captures these paths and they must not be mounted at boot.

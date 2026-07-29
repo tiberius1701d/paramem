@@ -29,15 +29,15 @@ from paramem.training.donor import (
     DONOR_RECIPE_DROPOUT,
     DONOR_RECIPE_ID,
     DONOR_RECIPE_LEARNING_RATE,
+    DONOR_STORE_PREFIX,
     DonorBuildIncomplete,
-    _latest_donor_slot,
     _triples_hash,
     build_donor,
-    donor_checkpoint_dir,
     donor_checkpoint_valid,
     donor_entries,
-    donor_root,
+    donor_store_dir,
     donor_topology_id,
+    iter_donor_stores,
     load_donor_into_transient_slot,
 )
 from paramem.utils.config import AdapterConfig, TrainingConfig
@@ -54,6 +54,7 @@ _SINGLE_VALUED_PREDICATES = ("birth date", "graduation date", "has spouse")
 
 _LORA_SHAPE = {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}
 _PROC_LORA_SHAPE = {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj", "gate_proj"]}
+_BASE_ID = "test/base-model"
 
 
 def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
@@ -87,7 +88,7 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     # that does nothing either, those assertions passed whether or not the
     # cleanup code ran at all.
     loop.model.delete_adapter.side_effect = lambda name: loop.model.peft_config.pop(name, None)
-    loop.model.get_base_model.return_value.config._name_or_path = "test/base-model"
+    loop.model.get_base_model.return_value.config._name_or_path = _BASE_ID
     loop.tokenizer = MagicMock()
     loop.training_config = TrainingConfig()
     loop.episodic_config = AdapterConfig(rank=8, alpha=16, target_modules=["q_proj"])
@@ -99,18 +100,59 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     return loop
 
 
+def _write_slot_manifest(slot: Path, base_model_id: str, lora_shape: dict) -> None:
+    """Write the storage manifest a donor slot now carries like any store.
+
+    ``registry_sha256`` is empty because a donor has no key registry — the
+    value ``find_live_slot`` resolves a donor slot on.
+    """
+    from paramem.adapters.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+        AdapterManifest,
+        BaseModelFingerprint,
+        LoRAShape,
+        TokenizerFingerprint,
+        write_manifest,
+    )
+
+    write_manifest(
+        slot,
+        AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=slot.parent.name,
+            trained_at="2026-01-01T00:00:00Z",
+            base_model=BaseModelFingerprint(repo=base_model_id, sha="deadbeef", hash="sha256:cafe"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path=base_model_id, vocab_size=32768, merges_hash="feed"
+            ),
+            lora=LoRAShape(
+                rank=int(lora_shape["r"]),
+                alpha=int(lora_shape["lora_alpha"]),
+                dropout=0.0,
+                target_modules=tuple(lora_shape.get("target_modules") or []),
+            ),
+            registry_sha256="",
+            key_count=0,
+            synthesized=False,
+            window_stamp="",
+        ),
+    )
+
+
 def _write_donor_slot(
     checkpoint_dir: Path,
     *,
     stamp: str = "20260101-000000",
-    base_model_id: str = "test/base",
+    base_model_id: str = _BASE_ID,
     lora_shape: dict | None = None,
     seed: int = 1,
     n_requested: int = DONOR_MIN_ENTRIES,
     triples_hash: "str | None" = "__auto__",
+    weights_sha256: "str | None" = "__auto__",
     recipe: "str | None" = DONOR_RECIPE_ID,
     meta_text: str | None = None,
     write_weights: bool = True,
+    write_manifest: bool = True,
 ) -> Path:
     """Write a minimal on-disk donor slot for TestDonorCheckpoint fixtures.
 
@@ -131,15 +173,16 @@ def _write_donor_slot(
     """
     slot = checkpoint_dir / stamp
     slot.mkdir(parents=True, exist_ok=True)
+    weights = b"weights"
     if write_weights:
-        (slot / "adapter_model.safetensors").write_bytes(b"weights")
+        (slot / "adapter_model.safetensors").write_bytes(weights)
+    if write_manifest:
+        _write_slot_manifest(slot, base_model_id, lora_shape or _LORA_SHAPE)
     if meta_text is not None:
         (slot / "donor_meta.json").write_text(meta_text)
     else:
         entries = donor_entries(seed, n_requested)
         meta = {
-            "base_model_id": base_model_id,
-            "lora_shape": lora_shape or _LORA_SHAPE,
             "seed": seed,
             "n_requested": n_requested,
             "triples": entries,
@@ -150,6 +193,10 @@ def _write_donor_slot(
             meta["triples_hash"] = _triples_hash(entries)
         elif triples_hash is not None:
             meta["triples_hash"] = triples_hash
+        if weights_sha256 == "__auto__":
+            meta["weights_sha256"] = hashlib.sha256(weights).hexdigest()
+        elif weights_sha256 is not None:
+            meta["weights_sha256"] = weights_sha256
         (slot / "donor_meta.json").write_text(json.dumps(meta))
     return slot
 
@@ -377,85 +424,118 @@ class TestDonorEntries:
 class TestDonorCheckpoint:
     """Checkpoint persistence + validation primitives."""
 
-    def test_donor_checkpoint_dir_is_a_dedicated_subdir(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        assert ckpt == tmp_path / "_donor" / donor_topology_id(_LORA_SHAPE)
-        assert ckpt.parent == tmp_path / "_donor"
+    def test_donor_store_is_a_sibling_of_the_tier_stores(self, tmp_path):
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        # A flat sibling of episodic/semantic/procedural — that is what lets
+        # the shared backup, restore and retention routines own it.
+        assert ckpt.parent == tmp_path
+        assert ckpt.name.startswith(DONOR_STORE_PREFIX)
+        assert donor_topology_id(_LORA_SHAPE) in ckpt.name
         # Must not collide with any production tier name.
         assert ckpt.name not in ("episodic", "semantic", "procedural")
 
+    def test_stores_split_by_base_model_at_one_topology(self, tmp_path):
+        """A base swap must not overwrite the previous base's donor."""
+        a = donor_store_dir(tmp_path, "org/base-a", _LORA_SHAPE)
+        b = donor_store_dir(tmp_path, "org/base-b", _LORA_SHAPE)
+        assert a != b
+        assert a.parent == b.parent == tmp_path
+
     def test_donor_checkpoint_valid_false_when_absent(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_donor_checkpoint_valid_false_when_base_id_none(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         assert donor_checkpoint_valid(ckpt, None, _LORA_SHAPE) is False
 
     def test_donor_checkpoint_valid_true_on_matching_base_and_shape(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(ckpt, base_model_id="test/base", lora_shape=_LORA_SHAPE)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is True
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, lora_shape=_LORA_SHAPE)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is True
 
     def test_donor_checkpoint_valid_false_on_base_mismatch(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(ckpt, base_model_id="other/base", lora_shape=_LORA_SHAPE)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_donor_checkpoint_valid_false_on_lora_shape_mismatch(self, tmp_path):
         """An operator rank edit invalidates a checkpoint trained at the
         old shape, forcing a rebuild instead of crashing later inside
         copy_adapter_weights on a tensor-shape mismatch."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(
             ckpt,
-            base_model_id="test/base",
+            base_model_id=_BASE_ID,
             lora_shape={"r": 16, "lora_alpha": 32, "target_modules": ["q_proj"]},
         )
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_valid_true_when_recorded_target_modules_are_reordered(self, tmp_path):
         """The donor's topology comparison is order-insensitive on
         target_modules (matching ensure_adapter_matching's set comparison) --
         a purely cosmetic yaml reorder must not force a 37-min rebuild."""
-        ckpt = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
         reordered = {
             "r": 8,
             "lora_alpha": 16,
             "target_modules": list(reversed(_PROC_LORA_SHAPE["target_modules"])),
         }
-        _write_donor_slot(ckpt, base_model_id="test/base", lora_shape=reordered)
-        assert donor_checkpoint_valid(ckpt, "test/base", _PROC_LORA_SHAPE) is True
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, lora_shape=reordered)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _PROC_LORA_SHAPE) is True
 
     def test_valid_false_when_slot_records_a_different_topology(self, tmp_path):
         """A slot hand-moved into the wrong topology's directory (or
         corrupted to record a different shape) must be rejected even though
         the directory name itself is topology-scoped -- the recorded shape
         is the self-description check, not merely decorative."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(ckpt, base_model_id="test/base", lora_shape=_PROC_LORA_SHAPE)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, lora_shape=_PROC_LORA_SHAPE)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_donor_checkpoint_valid_false_on_unparseable_meta(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(ckpt, meta_text="{not valid json")
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_donor_checkpoint_valid_false_on_missing_safetensors(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(ckpt, base_model_id="test/base", write_weights=False)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, write_weights=False)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
-    def test_latest_donor_slot_picks_newest_and_skips_dot_dirs(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        (ckpt / "20260101-000000").mkdir(parents=True)
-        (ckpt / "20260201-000000").mkdir(parents=True)
+    def test_slot_resolution_skips_scratch_dirs(self, tmp_path):
+        """find_live_slot (the shared resolver) picks the manifested slot and
+        ignores training scratch, so no donor-specific resolver is needed."""
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, stamp="20260201-000000")
         (ckpt / ".training_scratch").mkdir(parents=True)
         (ckpt / ".pending").mkdir(parents=True)
-        assert _latest_donor_slot(ckpt).name == "20260201-000000"
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is True
 
-    def test_latest_donor_slot_none_when_dir_absent(self, tmp_path):
-        assert _latest_donor_slot(donor_checkpoint_dir(tmp_path, _LORA_SHAPE)) is None
+    def test_invalid_when_store_absent(self, tmp_path):
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
+
+    def test_invalid_when_slot_has_no_manifest(self, tmp_path):
+        """A slot the shared resolver cannot see is not a usable donor."""
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, write_manifest=False)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
+
+    def test_invalid_when_weights_do_not_match_recorded_digest(self, tmp_path):
+        """The check that reads the artifact itself, not metadata about it:
+        a corrupt donor is rebuilt here instead of raising inside the load."""
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        slot = _write_donor_slot(ckpt)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is True
+        (slot / "adapter_model.safetensors").write_bytes(b"corrupted")
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
+
+    def test_invalid_when_no_weights_digest_recorded(self, tmp_path):
+        """Unverifiable is not the same as valid."""
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, weights_sha256=None)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
 
 class TestDonorCheckpointRegenerationCheck:
@@ -466,9 +546,9 @@ class TestDonorCheckpointRegenerationCheck:
     """
 
     def test_valid_when_regeneration_matches_recorded_hash(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(ckpt, base_model_id="test/base", seed=7, n_requested=DONOR_MIN_ENTRIES)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is True
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, seed=7, n_requested=DONOR_MIN_ENTRIES)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is True
 
     def test_invalid_when_recipe_drifts_from_recorded_hash(self, tmp_path):
         """Simulates a donor_entries code change since the checkpoint was
@@ -476,27 +556,27 @@ class TestDonorCheckpointRegenerationCheck:
         DIFFERENT content (patched to a different seed's set), so the
         checkpoint must be rejected -- a stale checkpoint would otherwise
         silently seed content other than what its recorded seed claims."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(ckpt, base_model_id="test/base", seed=7, n_requested=DONOR_MIN_ENTRIES)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, seed=7, n_requested=DONOR_MIN_ENTRIES)
 
         drifted_entries = donor_entries(8, DONOR_MIN_ENTRIES)  # a different seed's content
         with patch("paramem.training.donor.donor_entries", return_value=drifted_entries):
-            assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+            assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_missing_triples_hash_falls_back_to_hashing_recorded_triples(self, tmp_path):
         """Pre-existing checkpoints (written before ``triples_hash`` existed
         in the schema, additive field, no schema break) are validated by
         hashing their own recorded ``triples`` instead of requiring the new
         field."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(
             ckpt,
-            base_model_id="test/base",
+            base_model_id=_BASE_ID,
             seed=7,
             n_requested=DONOR_MIN_ENTRIES,
             triples_hash=None,
         )
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is True
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is True
 
     def test_mismatched_explicit_triples_hash_is_invalid(self, tmp_path):
         """A recorded triples_hash that does not match the regenerated hash
@@ -504,38 +584,38 @@ class TestDonorCheckpointRegenerationCheck:
         the mismatch comparison directly, as opposed to
         test_invalid_when_recipe_drifts_from_recorded_hash above, which
         exercises it via a patched donor_entries."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(
             ckpt,
-            base_model_id="test/base",
+            base_model_id=_BASE_ID,
             seed=7,
             n_requested=DONOR_MIN_ENTRIES,
             triples_hash="0" * 64,  # deliberately wrong
         )
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_missing_seed_or_n_requested_is_invalid(self, tmp_path):
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(
             ckpt,
             meta_text=json.dumps(
                 {
-                    "base_model_id": "test/base",
+                    "base_model_id": _BASE_ID,
                     "recipe": DONOR_RECIPE_ID,
                     "lora_shape": _LORA_SHAPE,
                 }
             ),
         )
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_malformed_list_shaped_triples_never_raises(self, tmp_path):
         """A corrupted meta.json recording "triples" as list-shaped entries
         (not dicts) must read as invalid -- never raise TypeError out of
         this function (the documented False-never-raise contract both
         callers rely on)."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         meta = {
-            "base_model_id": "test/base",
+            "base_model_id": _BASE_ID,
             "recipe": DONOR_RECIPE_ID,
             "lora_shape": _LORA_SHAPE,
             "seed": 7,
@@ -543,14 +623,14 @@ class TestDonorCheckpointRegenerationCheck:
             "triples": [["graph1", "s", "p", "o"]],  # list-shaped, not dicts
         }
         _write_donor_slot(ckpt, meta_text=json.dumps(meta))
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_malformed_missing_object_field_never_raises(self, tmp_path):
         """A recorded triple missing the "object" key must read as invalid,
         never raise KeyError."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         meta = {
-            "base_model_id": "test/base",
+            "base_model_id": _BASE_ID,
             "recipe": DONOR_RECIPE_ID,
             "lora_shape": _LORA_SHAPE,
             "seed": 7,
@@ -558,14 +638,14 @@ class TestDonorCheckpointRegenerationCheck:
             "triples": [{"key": "graph1", "subject": "s", "predicate": "p"}],
         }
         _write_donor_slot(ckpt, meta_text=json.dumps(meta))
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_malformed_str_n_requested_never_raises(self, tmp_path):
         """A recorded n_requested typed as a string (not an int) must read
         as invalid, never raise TypeError out of donor_entries' arithmetic."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         meta = {
-            "base_model_id": "test/base",
+            "base_model_id": _BASE_ID,
             "recipe": DONOR_RECIPE_ID,
             "lora_shape": _LORA_SHAPE,
             "seed": 7,
@@ -575,7 +655,7 @@ class TestDonorCheckpointRegenerationCheck:
             ],
         }
         _write_donor_slot(ckpt, meta_text=json.dumps(meta))
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     @pytest.mark.parametrize(
         "malformed_lora_shape",
@@ -589,9 +669,9 @@ class TestDonorCheckpointRegenerationCheck:
         topology-id comparison is evaluated inside the SAME try as the
         regeneration check (moved there alongside the order-insensitive
         topology-id comparison)."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         meta = {
-            "base_model_id": "test/base",
+            "base_model_id": _BASE_ID,
             "recipe": DONOR_RECIPE_ID,
             "lora_shape": malformed_lora_shape,
             "seed": 7,
@@ -599,7 +679,7 @@ class TestDonorCheckpointRegenerationCheck:
             "triples": donor_entries(7, DONOR_MIN_ENTRIES),
         }
         _write_donor_slot(ckpt, meta_text=json.dumps(meta))
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_valid_false_on_recipe_mismatch(self, tmp_path):
         """F2: a slot whose meta records a different recipe id than the
@@ -608,11 +688,11 @@ class TestDonorCheckpointRegenerationCheck:
         hyperparameter change) must invalidate every existing checkpoint so
         the next measured-cold fold rebuilds under the new recipe, even
         though base_model_id/topology/regeneration would otherwise match."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
         _write_donor_slot(
-            ckpt, base_model_id="test/base", lora_shape=_LORA_SHAPE, recipe="some_other_recipe_v0"
+            ckpt, base_model_id=_BASE_ID, lora_shape=_LORA_SHAPE, recipe="some_other_recipe_v0"
         )
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
     def test_valid_false_on_missing_recipe_field(self, tmp_path):
         """A checkpoint written before the recipe field existed in the meta
@@ -621,9 +701,9 @@ class TestDonorCheckpointRegenerationCheck:
         field: build_donor has always written it, so its absence means
         either corruption or a pre-donor-checkpoint artifact, and either
         way the safe outcome is a rebuild."""
-        ckpt = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(ckpt, base_model_id="test/base", lora_shape=_LORA_SHAPE, recipe=None)
-        assert donor_checkpoint_valid(ckpt, "test/base", _LORA_SHAPE) is False
+        ckpt = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(ckpt, base_model_id=_BASE_ID, lora_shape=_LORA_SHAPE, recipe=None)
+        assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
 
 class TestTriplesHash:
@@ -715,23 +795,32 @@ class TestDonorTopologyId:
         assert episodic_id == semantic_id
         assert procedural_id != episodic_id
 
-    def test_checkpoint_dir_is_topology_scoped_under_donor_root(self, tmp_path):
-        attn_dir = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        proc_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
+    def test_store_dir_is_topology_scoped_at_the_adapter_root(self, tmp_path):
+        attn_dir = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        proc_dir = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
 
-        assert attn_dir == donor_root(tmp_path) / donor_topology_id(_LORA_SHAPE)
-        assert attn_dir.parent == donor_root(tmp_path)
+        assert attn_dir.parent == tmp_path
+        assert donor_topology_id(_LORA_SHAPE) in attn_dir.name
         assert attn_dir != proc_dir
 
 
-def _fake_atomic_save_adapter(model, target_dir, adapter_name):
+def _fake_atomic_save_adapter(model, target_dir, adapter_name, *, manifest=None):
     """Stand-in for paramem.models.loader.atomic_save_adapter: writes a
     real (tiny, fake-content) slot so the donor's SHA-256 + meta write can
-    run against actual bytes on disk, without touching PEFT/torch save."""
+    run against actual bytes on disk, without touching PEFT/torch save.
+
+    Writes *manifest* through the real ``write_manifest``, mirroring the
+    production save: without a ``meta.json`` the slot is invisible to
+    ``find_live_slot``, so a round-trip test would report "no checkpoint"
+    rather than exercising validation."""
+    from paramem.adapters.manifest import write_manifest
+
     target_dir = Path(target_dir)
     slot = target_dir / "20260726-000000"
     slot.mkdir(parents=True, exist_ok=True)
     (slot / "adapter_model.safetensors").write_bytes(b"fake-donor-weights")
+    if manifest is not None:
+        write_manifest(slot, manifest)
     return slot
 
 
@@ -750,6 +839,44 @@ def _fake_create_adapter(model, cfg, name):
     model.peft_config[name] = MagicMock()
     model._last_create_adapter_cfg = cfg
     return model
+
+
+def _fake_build_manifest_for(
+    model, tokenizer, adapter_name, *, registry_sha256_override=None, **kwargs
+):
+    """Stand-in for the real fingerprinter, which needs a live model.
+
+    Reads the LoRA shape off the config ``build_donor`` actually created the
+    adapter with (``_last_create_adapter_cfg``), so the manifest a build
+    writes carries the topology that build used — the property
+    ``donor_checkpoint_valid`` compares against.
+    """
+    from paramem.adapters.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+        AdapterManifest,
+        BaseModelFingerprint,
+        LoRAShape,
+        TokenizerFingerprint,
+    )
+
+    cfg = model._last_create_adapter_cfg
+    return AdapterManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        name=adapter_name,
+        trained_at="2026-07-26T00:00:00Z",
+        base_model=BaseModelFingerprint(repo=_BASE_ID, sha="deadbeef", hash="sha256:cafe"),
+        tokenizer=TokenizerFingerprint(name_or_path=_BASE_ID, vocab_size=32768, merges_hash="feed"),
+        lora=LoRAShape(
+            rank=cfg.rank,
+            alpha=cfg.alpha,
+            dropout=0.0,
+            target_modules=tuple(cfg.target_modules),
+        ),
+        registry_sha256=registry_sha256_override or "",
+        key_count=kwargs.get("key_count", 0),
+        synthesized=False,
+        window_stamp="",
+    )
 
 
 @contextlib.contextmanager
@@ -774,6 +901,14 @@ def _patched_build_donor_primitives(*, save_side_effect=_fake_atomic_save_adapte
         ) as mock_save,
         patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
         patch("paramem.models.loader.switch_adapter"),
+        # The loop stub's model is a MagicMock, so the real fingerprinter
+        # would read MagicMocks into the manifest and fail to serialise.
+        # Stand in a manifest whose base/shape match what these tests assert
+        # validity against.
+        patch(
+            "paramem.adapters.manifest.build_manifest_for",
+            side_effect=_fake_build_manifest_for,
+        ),
     ):
         yield mock_save
 
@@ -844,7 +979,9 @@ class TestBuildDonor:
         assert created_cfg.learning_rate == DONOR_RECIPE_LEARNING_RATE
         assert created_cfg.dropout == DONOR_RECIPE_DROPOUT
 
-    def test_persists_meta_with_seed_recipe_triples_sha_base_id_and_lora_shape(self, tmp_path):
+    def test_persists_donor_content_meta_and_a_storage_manifest(self, tmp_path):
+        """Storage metadata in meta.json, donor content in donor_meta.json --
+        one recorded answer to "what is this checkpoint for", never two."""
         loop = _make_bare_loop(tmp_path)
         loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
 
@@ -855,15 +992,24 @@ class TestBuildDonor:
 
         meta = json.loads((slot / "donor_meta.json").read_text())
         assert meta["seed"] == 42
-        assert meta["base_model_id"] == "test/base-model"
         assert meta["recipe"]
         assert len(meta["triples"]) >= DONOR_MIN_ENTRIES
-        assert meta["lora_shape"] == {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}
         expected_sha = hashlib.sha256((slot / "adapter_model.safetensors").read_bytes()).hexdigest()
         assert meta["weights_sha256"] == expected_sha
         # triples_hash is the canonical hash of the SAME recorded triples --
         # donor_checkpoint_valid's regeneration check reads this field.
         assert meta["triples_hash"] == _triples_hash(meta["triples"])
+        # Base model and shape belong to the manifest and are NOT duplicated.
+        assert "base_model_id" not in meta
+        assert "lora_shape" not in meta
+
+        manifest = json.loads((slot / "meta.json").read_text())
+        assert manifest["base_model"]["repo"] == _BASE_ID
+        assert manifest["lora"]["rank"] == 8
+        assert manifest["lora"]["alpha"] == 16
+        # No key registry -- what makes find_live_slot resolve a donor slot.
+        assert manifest["registry_sha256"] == ""
+        assert manifest["key_count"] == len(meta["triples"])
 
     def test_build_then_donor_checkpoint_valid_round_trip(self, tmp_path):
         """build_donor's persisted checkpoint must validate as True through
@@ -876,9 +1022,9 @@ class TestBuildDonor:
         with _patched_build_donor_primitives():
             build_donor(loop, adapter_config=loop.episodic_config, seed=42, n=DONOR_MIN_ENTRIES)
 
-        checkpoint_dir = donor_checkpoint_dir(loop.output_dir, _LORA_SHAPE)
+        checkpoint_dir = donor_store_dir(loop.output_dir, _BASE_ID, _LORA_SHAPE)
         lora_shape = {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}
-        assert donor_checkpoint_valid(checkpoint_dir, "test/base-model", lora_shape) is True
+        assert donor_checkpoint_valid(checkpoint_dir, _BASE_ID, lora_shape) is True
 
     def test_transient_slot_deleted_even_on_training_failure(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
@@ -907,8 +1053,8 @@ class TestBuildDonor:
             build_donor(loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES)
 
         assert not mock_save.called
-        assert not donor_checkpoint_dir(tmp_path, _LORA_SHAPE).exists() or not any(
-            donor_checkpoint_dir(tmp_path, _LORA_SHAPE).iterdir()
+        assert not donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE).exists() or not any(
+            donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE).iterdir()
         )
         assert DONOR_BUILD_ADAPTER_NAME not in loop.model.peft_config
 
@@ -927,15 +1073,15 @@ class TestBuildDonor:
         assert not mock_save.called
         assert DONOR_BUILD_ADAPTER_NAME not in loop.model.peft_config
 
-    def test_prunes_older_slots_within_the_same_topology_only(self, tmp_path):
-        """Exactly one donor artifact per topology persists at a time --
-        a stale slot within the SAME topology is pruned; the build itself
-        (this test's own live-id set = only episodic's topology) leaves
-        nothing else to disturb."""
+    def test_prunes_older_slots_within_the_same_store_only(self, tmp_path):
+        """Exactly one donor artifact per (base model, topology) persists at
+        a time. A rebuild in the SAME store only happens when the prior slot
+        can never be valid again, so nothing is retained -- but it is the
+        shared tier retention routine doing it, not a donor-specific one."""
         loop = _make_bare_loop(tmp_path)
         loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
-        checkpoint_root = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        stale_slot = checkpoint_root / "20200101-000000"
+        store_root = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        stale_slot = store_root / "20200101-000000"
         stale_slot.mkdir(parents=True)
         (stale_slot / "adapter_model.safetensors").write_bytes(b"stale")
 
@@ -944,8 +1090,40 @@ class TestBuildDonor:
                 loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES
             )
 
-        remaining = {p.name for p in checkpoint_root.iterdir() if p.is_dir()}
+        remaining = {p.name for p in store_root.iterdir() if p.is_dir()}
         assert remaining == {slot.name}
+
+    def test_a_build_never_touches_another_stores_donor(self, tmp_path):
+        """A config change makes a donor inapplicable, never wrong: building
+        at one topology leaves every other store -- including a tier that is
+        no longer configured at all -- intact."""
+        loop = _make_bare_loop(tmp_path)
+        loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
+        other_store = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
+        _write_donor_slot(other_store, lora_shape=_PROC_LORA_SHAPE)
+        other_base_store = donor_store_dir(tmp_path, "org/other-base", _LORA_SHAPE)
+        _write_donor_slot(other_base_store, base_model_id="org/other-base")
+        # Procedural disabled entirely — must NOT cost its donor.
+        loop.procedural_config = None
+
+        with _patched_build_donor_primitives():
+            build_donor(loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES)
+
+        assert donor_checkpoint_valid(other_store, _BASE_ID, _PROC_LORA_SHAPE) is True
+        assert donor_checkpoint_valid(other_base_store, "org/other-base", _LORA_SHAPE) is True
+
+    def test_iter_donor_stores_finds_every_store_and_no_tier(self, tmp_path):
+        """The discovery the shared backup/restore routines use."""
+        (tmp_path / "episodic").mkdir()
+        (tmp_path / "semantic").mkdir()
+        a = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        b = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+
+        found = dict(iter_donor_stores(tmp_path))
+
+        assert set(found) == {a.name, b.name}
 
     def test_build_donor_writes_into_the_target_topology_dir(self, tmp_path):
         """A build triggered by the procedural config lands under
@@ -960,7 +1138,7 @@ class TestBuildDonor:
                 loop, adapter_config=loop.procedural_config, seed=1, n=DONOR_MIN_ENTRIES
             )
 
-        expected_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
+        expected_dir = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
         assert slot.parent == expected_dir
         call_kwargs = loop._train_tier_adapter.call_args.kwargs
         assert call_kwargs["adapter_config"].target_modules == loop.procedural_config.target_modules
@@ -971,82 +1149,15 @@ class TestBuildDonor:
         are independent artifacts."""
         loop = _make_bare_loop(tmp_path)
         loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
-        attn_dir = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        _write_donor_slot(attn_dir, base_model_id="test/base-model", lora_shape=_LORA_SHAPE)
+        attn_dir = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        _write_donor_slot(attn_dir, base_model_id=_BASE_ID, lora_shape=_LORA_SHAPE)
 
         with _patched_build_donor_primitives():
             build_donor(loop, adapter_config=loop.procedural_config, seed=1, n=DONOR_MIN_ENTRIES)
 
-        proc_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
+        proc_dir = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
         assert any(attn_dir.iterdir()), "the pre-existing attention-topology slot must survive"
         assert any(proc_dir.iterdir()), "the new procedural-topology slot must have been written"
-
-    def test_prunes_topology_dirs_that_are_no_longer_live(self, tmp_path):
-        """A topology directory whose id matches no CURRENT tier config
-        (an operator rank edit -- here a legacy r16 attention-only donor) is
-        garbage-collected on the next build; both LIVE topology dirs survive,
-        and a dot-prefixed scratch child is left alone."""
-        loop = _make_bare_loop(tmp_path)
-        loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
-
-        dead_shape = {"r": 16, "lora_alpha": 32, "target_modules": ["q_proj"]}
-        dead_dir = donor_checkpoint_dir(tmp_path, dead_shape)
-        _write_donor_slot(dead_dir, base_model_id="test/base-model", lora_shape=dead_shape)
-        proc_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
-        _write_donor_slot(proc_dir, base_model_id="test/base-model", lora_shape=_PROC_LORA_SHAPE)
-        dot_child = donor_root(tmp_path) / ".pending"
-        dot_child.mkdir(parents=True)
-
-        with _patched_build_donor_primitives():
-            build_donor(loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES)
-
-        remaining = {p.name for p in donor_root(tmp_path).iterdir() if p.is_dir()}
-        assert dead_dir.name not in remaining, "a dead (no longer live) topology dir must be pruned"
-        assert proc_dir.name in remaining, "the live procedural topology dir must survive"
-        assert donor_topology_id(_LORA_SHAPE) in remaining, (
-            "the just-built episodic-topology dir must be present"
-        )
-        assert dot_child.name in remaining, "dot-prefixed children must never be pruned"
-
-    def test_disabling_procedural_makes_its_donor_dir_dead(self, tmp_path):
-        """Disabling procedural (procedural_config=None) removes it from
-        the live-id set, so the NEXT attention-topology build deletes the
-        procedural donor dir -- pins the intended (operator-surprising)
-        disable/re-enable cost of dead-topology pruning."""
-        loop = _make_bare_loop(tmp_path)
-        loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
-        proc_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
-        _write_donor_slot(proc_dir, base_model_id="test/base-model", lora_shape=_PROC_LORA_SHAPE)
-
-        loop.procedural_config = None
-
-        with _patched_build_donor_primitives():
-            build_donor(loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES)
-
-        remaining = {p.name for p in donor_root(tmp_path).iterdir() if p.is_dir()}
-        assert proc_dir.name not in remaining, (
-            "disabling procedural must make its donor dir dead on the next build"
-        )
-
-    def test_build_donor_survives_prune_when_no_tier_config_matches_built_shape(self, tmp_path):
-        """Never prune the topology just built: live_ids must include the
-        shape being built even when none of the loop's three tier configs
-        happens to match it (e.g. a stale or ad-hoc adapter_config) --
-        otherwise _prune_dead_topologies would delete build_donor's own
-        fresh output in the same call, so the post-condition ("a checkpoint
-        now exists at this topology") no longer depends on a caller-side
-        invariant about the tier configs."""
-        loop = _make_bare_loop(tmp_path)
-        loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
-        # None of episodic/semantic/procedural matches this shape.
-        orphan_config = AdapterConfig(rank=32, alpha=64, target_modules=["q_proj"])
-
-        with _patched_build_donor_primitives():
-            slot = build_donor(loop, adapter_config=orphan_config, seed=1, n=DONOR_MIN_ENTRIES)
-
-        assert slot.exists() and any(slot.iterdir()), (
-            "the just-built slot must survive its own build's dead-topology prune pass"
-        )
 
     def test_build_then_valid_round_trip_per_topology(self, tmp_path):
         """Building at each of the two topologies validates True at
@@ -1059,9 +1170,9 @@ class TestBuildDonor:
             build_donor(loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES)
             build_donor(loop, adapter_config=loop.procedural_config, seed=1, n=DONOR_MIN_ENTRIES)
 
-        attn_dir = donor_checkpoint_dir(tmp_path, _LORA_SHAPE)
-        proc_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
-        base_id = "test/base-model"
+        attn_dir = donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE)
+        proc_dir = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
+        base_id = _BASE_ID
         assert donor_checkpoint_valid(attn_dir, base_id, _LORA_SHAPE) is True
         assert donor_checkpoint_valid(attn_dir, base_id, _PROC_LORA_SHAPE) is False
         assert donor_checkpoint_valid(proc_dir, base_id, _PROC_LORA_SHAPE) is True
@@ -1148,13 +1259,18 @@ class TestSeedingHook:
 
         assert seeded is True
         mock_copy.assert_called_once_with(loop.model, src=DONOR_LOAD_ADAPTER_NAME, dst="procedural")
-        expected_dir = donor_checkpoint_dir(tmp_path, _PROC_LORA_SHAPE)
+        expected_dir = donor_store_dir(tmp_path, _BASE_ID, _PROC_LORA_SHAPE)
         mock_load.assert_called_once_with(loop.model, expected_dir, DONOR_LOAD_ADAPTER_NAME)
 
-    def test_transient_deleted_when_copy_raises(self, tmp_path):
-        """A copy_adapter_weights failure (e.g. a genuine tensor-shape
-        mismatch the lora_shape check missed) must still leave the
-        transient slot cleaned up, not leaked."""
+    def test_copy_failure_degrades_to_cold_and_deletes_the_transient(self, tmp_path):
+        """Seeding is an optimization over cold init, so a load/copy failure
+        costs the seed, never the fold -- the same way every other branch of
+        this method already degrades. The transient slot is still cleaned up.
+
+        The live case this covers is an age-encrypted donor on a process with
+        no daily identity loaded: validation passes (bytes and metadata are
+        intact) and the decrypt inside the load is the first thing to fail.
+        """
         loop = _make_bare_loop(tmp_path)
         loop.training_config = TrainingConfig()
         import torch
@@ -1182,10 +1298,10 @@ class TestSeedingHook:
                 "paramem.models.loader.copy_adapter_weights",
                 side_effect=RuntimeError("shape mismatch"),
             ),
-            pytest.raises(RuntimeError, match="shape mismatch"),
         ):
-            loop._maybe_seed_from_donor("episodic", loop.episodic_config)
+            seeded = loop._maybe_seed_from_donor("episodic", loop.episodic_config)
 
+        assert seeded is False
         assert DONOR_LOAD_ADAPTER_NAME not in loop.model.peft_config
 
     def test_base_id_mismatch_skips_without_crash(self, tmp_path):
@@ -1337,4 +1453,73 @@ class TestLoadDonorIntoTransientSlot:
     def test_raises_when_no_checkpoint(self, tmp_path):
         model = MagicMock()
         with pytest.raises(FileNotFoundError):
-            load_donor_into_transient_slot(model, donor_checkpoint_dir(tmp_path, _LORA_SHAPE), "_x")
+            load_donor_into_transient_slot(
+                model, donor_store_dir(tmp_path, _BASE_ID, _LORA_SHAPE), "_x"
+            )
+
+
+class TestBorrowedDonorCache:
+    """A loop whose output_dir is a scratch tree (a migration trial) reads the
+    live deployment's donor stores instead of rebuilding them, and can never
+    write to what it borrows."""
+
+    def test_donor_root_defaults_to_the_loops_own_output_dir(self, tmp_path):
+        loop = _make_bare_loop(tmp_path)
+        assert loop.donor_adapter_root == loop.output_dir
+
+    def test_borrowing_redirects_resolution_to_the_lent_root(self, tmp_path):
+        live_root = tmp_path / "live"
+        live_root.mkdir()
+        loop = _make_bare_loop(tmp_path / "trial")
+        loop.borrow_donor_cache(live_root)
+        assert loop.donor_adapter_root == live_root
+
+    def test_borrowed_loop_seeds_from_the_lent_store_without_building(self, tmp_path):
+        live_root = tmp_path / "live"
+        live_root.mkdir()
+        _write_donor_slot(donor_store_dir(live_root, _BASE_ID, _LORA_SHAPE))
+        loop = _make_bare_loop(tmp_path / "trial")
+        loop.borrow_donor_cache(live_root)
+
+        def _load_side_effect(model, store_dir, transient_name):
+            model.peft_config[transient_name] = MagicMock()
+
+        with (
+            patch("paramem.training.donor.build_donor") as mock_build,
+            patch(
+                "paramem.training.donor.load_donor_into_transient_slot",
+                side_effect=_load_side_effect,
+            ),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch(
+                "paramem.models.loader.measured_adapter_init_state",
+                return_value="cold",
+            ),
+            patch(
+                "paramem.training.consolidation.measured_adapter_init_state", return_value="cold"
+            ),
+        ):
+            seeded = loop._maybe_seed_from_donor("episodic", loop.episodic_config)
+
+        assert seeded is True
+        mock_build.assert_not_called()
+
+    def test_borrowed_loop_never_builds_into_a_cache_it_does_not_own(self, tmp_path):
+        """The base-swap trial case: nothing valid in the lent cache for this
+        base/topology, so the target trains cold rather than writing there."""
+        live_root = tmp_path / "live"
+        live_root.mkdir()
+        loop = _make_bare_loop(tmp_path / "trial")
+        loop.borrow_donor_cache(live_root)
+
+        with (
+            patch("paramem.training.donor.build_donor") as mock_build,
+            patch(
+                "paramem.training.consolidation.measured_adapter_init_state", return_value="cold"
+            ),
+        ):
+            seeded = loop._maybe_seed_from_donor("episodic", loop.episodic_config)
+
+        assert seeded is False
+        mock_build.assert_not_called()
+        assert iter_donor_stores(live_root) == []
