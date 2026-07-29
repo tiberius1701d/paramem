@@ -494,7 +494,10 @@ def _inject_turns(
     resolve speaker identity from the voice fingerprint.
 
     Args:
-        conv_id: Conversation ID; becomes the session_id / JSONL filename.
+        conv_id: Conversation ID. The server mints a session_id from it
+            (``{conv_id}-{stamp}-{hex}``, never equal to *conv_id* itself —
+            see :func:`_minted_session_id`'s docstring) and that minted id,
+            not *conv_id*, becomes the JSONL filename.
         text_turns: List of user-side text turns (2 turns for content).
         token: Bearer token (used only if the server was configured with auth;
             /chat is public but we pass it so the token-based speaker path
@@ -532,14 +535,66 @@ def _pending_count(token: str | None) -> int | None:
     return body.get("pending_sessions")
 
 
+def _minted_session_id(conv_id: str) -> str | None:
+    """Resolve the minted session_id for *conv_id*, or ``None`` if unresolved.
+
+    ``SessionBuffer._mint_session_id`` unconditionally rotates a caller's
+    conversation_id into ``{safe_conversation_id}-{YYYYMMDDThhmmssZ}-{8 hex}``
+    on first turn — session_id is NEVER equal to conversation_id.
+    Every on-disk artifact (pending JSONL, discard-sink JSONL,
+    debug snapshot directory) is named after that minted id, not *conv_id*.
+
+    Since this script drives the server over HTTP (a separate process; no
+    response field surfaces the minted id — ``ChatResponse`` has no
+    ``session_id``), the id is instead recovered by prefix-glob across every
+    location that could currently hold the live artifact: the still-pending
+    ``sessions/`` directory, the discard-sink retention directory, and the
+    debug snapshot tree. Exactly one of those holds the artifact at any
+    point in this script's fixed 3-conversation flow (a conv_id here is
+    never re-opened into a second session), so the three locations must
+    agree on at most one candidate id.
+
+    Returns:
+        The resolved session_id string, or ``None`` if no artifact for
+        *conv_id* exists yet under any of the three locations.
+
+    Raises:
+        AssertionError: if more than one distinct minted id is found for
+            the same *conv_id* — this probe's flow never re-opens a
+            conv_id into a second session, so that would indicate a bug
+            in the probe itself, not a soft ambiguity to average over.
+    """
+    candidates: set[str] = set()
+    candidates.update(p.stem for p in (TEST_DATA_ROOT / "sessions").glob(f"{conv_id}-*.jsonl"))
+    candidates.update(
+        p.stem for p in (TEST_DATA_ROOT / "debug" / "discarded_sessions").glob(f"{conv_id}-*.jsonl")
+    )
+    candidates.update(
+        p.name
+        for p in (TEST_DATA_ROOT / "debug").glob(f"episodic/cycle_*/run_*/sessions/{conv_id}-*")
+        if p.is_dir()
+    )
+    assert len(candidates) <= 1, (
+        f"Expected at most one minted session_id for conv_id={conv_id!r}; "
+        f"found {sorted(candidates)}"
+    )
+    return next(iter(candidates), None)
+
+
 def _snapshot_exists_for(conv_id: str) -> bool:
     """True iff a graph_snapshot.json exists under debug/episodic for *conv_id*.
 
-    Pattern: ``debug/episodic/cycle_*/run_*/sessions/<conv_id>/graph_snapshot.json``
+    Resolves *conv_id*'s minted session_id via :func:`_minted_session_id`
+    first — the snapshot directory is named after the session_id, not the
+    caller's conversation_id (see that function's docstring). Pattern:
+    ``debug/episodic/cycle_*/run_*/sessions/<session_id>/graph_snapshot.json``.
     Mirrors the glob in ``_read_session_snapshots`` (probe_qwen line 441-443).
     """
+    session_id = _minted_session_id(conv_id)
+    if session_id is None:
+        return False
     debug_path = TEST_DATA_ROOT / "debug"
-    pattern = f"episodic/cycle_*/run_*/sessions/{conv_id}/graph_snapshot.json"
+    pattern = f"episodic/cycle_*/run_*/sessions/{session_id}/graph_snapshot.json"
     return any(debug_path.glob(pattern))
 
 
@@ -550,18 +605,28 @@ def _discard_sink_jsonl(conv_id: str) -> Path:
     (``paramem/server/consolidation.py`` line 94).  ``mark_consolidated`` with
     ``retention_dir=discard_session_sink(config)`` moves the session's JSONL to
     ``retention_dir/<session_id>.jsonl`` (flat layout for transcript sessions,
-    ``session_buffer.py`` line 591).  The session_id == conversation_id.
+    ``session_buffer.py`` line 591). session_id is the MINTED id, resolved via
+    :func:`_minted_session_id` — never the caller's conversation_id (see that
+    function's docstring). Falls back to the not-yet-discarded conv_id-keyed
+    path (guaranteed to not exist) when the id has not resolved yet, so
+    ``.exists()`` still returns the correct ``False``.
     """
-    return TEST_DATA_ROOT / "debug" / "discarded_sessions" / f"{conv_id}.jsonl"
+    session_id = _minted_session_id(conv_id) or conv_id
+    return TEST_DATA_ROOT / "debug" / "discarded_sessions" / f"{session_id}.jsonl"
 
 
 def _session_still_pending(conv_id: str) -> bool:
     """True iff the session JSONL still exists in the sessions directory.
 
     ``mark_consolidated`` moves the JSONL from ``sessions/<session_id>.jsonl``
-    to the retention dir, so absence = consumed.  Presence = still pending.
+    to the retention dir, so absence = consumed. session_id is the MINTED id
+    (never the caller's conversation_id — see :func:`_minted_session_id`'s
+    docstring); the JSONL itself is the source :func:`_minted_session_id`
+    resolves from while still pending, so this checks directly for any
+    ``{conv_id}-*.jsonl`` match rather than round-tripping through the
+    resolver.
     """
-    return (TEST_DATA_ROOT / "sessions" / f"{conv_id}.jsonl").exists()
+    return any((TEST_DATA_ROOT / "sessions").glob(f"{conv_id}-*.jsonl"))
 
 
 # ---------------------------------------------------------------------------
@@ -836,7 +901,9 @@ def main() -> int:
 
         # --- Assertion: NAMED session -> extracted (graph_snapshot.json present) ---
         # In simulate mode, ConsolidationLoop runs extraction and writes
-        # debug/episodic/cycle_N/run_*/sessions/<conv_id>/graph_snapshot.json.
+        # debug/episodic/cycle_N/run_*/sessions/<session_id>/graph_snapshot.json
+        # (session_id is the minted id, not CONV_NAMED — see
+        # _minted_session_id's docstring; _snapshot_exists_for resolves it).
         # This only fires when named_count > 0 and the tick returns "started".
         if tick1_status == "started":
             assertions.check(

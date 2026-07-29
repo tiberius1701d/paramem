@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import sysconfig
+from pathlib import Path
 
 # --- Environment isolation gate (must run before any project import) --------
 #
@@ -186,6 +187,79 @@ def gpu_base_model():
     # workspaces are freed alongside the PyTorch allocator pool.
     del model
     safe_empty_cache()
+
+
+@pytest.fixture
+def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
+    """Warm a test's ``tmp_path`` donor tree from a session-persistent cache.
+
+    Building a donor checkpoint (``paramem.training.donor.build_donor``)
+    trains a real adapter and costs ~37 minutes; a test that passes
+    ``output_dir=tmp_path`` (a fresh directory every run) always misses and
+    pays that cost. This fixture keeps ONE unencrypted donor per topology
+    under ``tests/fixtures/sandbox/data/ha/adapters`` (gitignored) and
+    copies it into the test's own ``tmp_path`` donor directory before the
+    test runs, so :meth:`~paramem.training.consolidation.ConsolidationLoop
+    ._maybe_seed_from_donor` finds a valid checkpoint on first look.
+
+    Both the cache path and the destination path are derived through the
+    SAME production primitives ``_maybe_seed_from_donor`` itself uses
+    (:func:`~paramem.training.donor.donor_checkpoint_dir` for the path,
+    :func:`~paramem.training.donor.donor_checkpoint_valid` for the gate) --
+    this fixture never re-derives the topology id or the validity rule.
+
+    Returns a ``seed(adapter_config)`` callable. The test calls it with the
+    SAME ``AdapterConfig`` instance it passes to ``ConsolidationLoop`` as
+    the tier being seeded, so the resolved topology always matches what the
+    loop will build/validate against -- there is no second, fixture-local
+    guess at rank/alpha/target_modules.
+
+    ``base_model_id`` is read from the real loaded model
+    (``model.config._name_or_path``), mirroring
+    ``self.model.get_base_model().config._name_or_path`` in
+    ``_maybe_seed_from_donor`` (this fixture's model is the plain,
+    not-yet-PEFT-wrapped base model, so no ``get_base_model()`` unwrap is
+    needed).
+
+    On teardown: if the cache was empty/invalid at setup and the test's run
+    produced a valid donor under ``tmp_path``, copy it into the cache so the
+    next invocation is warm. The cache shipped with this repo is already
+    populated for Mistral 7B / rank 8 / alpha 16 / 4 target modules, so this
+    branch does not fire in that configuration.
+    """
+    import shutil
+
+    from paramem.models.loader import _lora_shape_fields
+    from paramem.training.donor import donor_checkpoint_dir, donor_checkpoint_valid
+
+    model, _tokenizer = model_and_tokenizer
+    base_model_id = getattr(model.config, "_name_or_path", None)
+    cache_adapter_root = Path(__file__).parent / "fixtures" / "sandbox" / "data" / "ha" / "adapters"
+
+    seeded: dict = {}
+
+    def _seed(adapter_config) -> None:
+        lora_shape = _lora_shape_fields(adapter_config)
+        cache_dir = donor_checkpoint_dir(cache_adapter_root, lora_shape)
+        dest_dir = donor_checkpoint_dir(tmp_path, lora_shape)
+        cache_was_valid = donor_checkpoint_valid(cache_dir, base_model_id, lora_shape)
+        if cache_was_valid:
+            dest_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(cache_dir, dest_dir)
+        seeded["cache_dir"] = cache_dir
+        seeded["dest_dir"] = dest_dir
+        seeded["lora_shape"] = lora_shape
+        seeded["cache_was_valid"] = cache_was_valid
+
+    yield _seed
+
+    if seeded and not seeded["cache_was_valid"]:
+        dest_dir = seeded["dest_dir"]
+        cache_dir = seeded["cache_dir"]
+        lora_shape = seeded["lora_shape"]
+        if donor_checkpoint_valid(dest_dir, base_model_id, lora_shape):
+            cache_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(dest_dir, cache_dir)
 
 
 @pytest.fixture(autouse=True)

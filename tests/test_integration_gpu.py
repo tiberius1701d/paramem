@@ -880,8 +880,14 @@ class TestRunExtractGraphHelper:
 
 
 class TestBatchConsolidationE2E:
-    def test_extract_session_and_train(self, model_and_tokenizer, tmp_path):
-        """End-to-end: extract sessions → prepare → train."""
+    def test_extract_session_and_train(self, model_and_tokenizer, tmp_path, donor_checkpoint_cache):
+        """End-to-end: extract sessions → prepare → train.
+
+        Uses the ``donor_checkpoint_cache`` fixture (``conftest.py``) so the
+        episodic tier's donor seed comes from the gitignored sandbox cache
+        instead of being rebuilt from scratch under this test's fresh
+        ``tmp_path`` (a ~37-minute build) on every run.
+        """
         from paramem.memory.store import MemoryStore
         from paramem.server.config import SanitizationConfig
         from paramem.training.consolidation import ConsolidationLoop
@@ -893,6 +899,9 @@ class TestBatchConsolidationE2E:
 
         model, tokenizer = model_and_tokenizer
 
+        episodic_adapter_config = AdapterConfig()
+        donor_checkpoint_cache(episodic_adapter_config)
+
         loop = ConsolidationLoop(
             model=model,
             tokenizer=tokenizer,
@@ -901,7 +910,7 @@ class TestBatchConsolidationE2E:
             # probe requires recall == recall_sanity_threshold (default 1.0),
             # which 2 epochs cannot reach.
             training_config=TrainingConfig(num_epochs=30),
-            episodic_adapter_config=AdapterConfig(),
+            episodic_adapter_config=episodic_adapter_config,
             semantic_adapter_config=AdapterConfig(),
             memory_store=MemoryStore(replay_enabled=True),
             output_dir=tmp_path,
@@ -950,7 +959,7 @@ class TestVRAMBudget:
     b) **Real VRAM occupation (confirmation path).** When the
        configuration does fit by the math, the full chain actually loads
        on the GPU — base model + Whisper STT + TTS + 3 main adapters +
-       14 interim adapters + staging slot — and real
+       7 interim adapters + staging slot — and real
        ``torch.cuda.mem_get_info()`` confirms we stay under the hardware
        cap. This catches drift between the validator's static estimate
        and the true working set (e.g. if STT/TTS grow, or an adapter
@@ -1068,7 +1077,7 @@ class TestVRAMBudget:
                 peft_overhead_bytes=peft_overhead_bytes,
                 baseline_vram_gib=server_cfg.vram.baseline_vram_gib,
                 model_id=server_cfg.model_config.model_id,
-                headroom_gib=self._HARDWARE_CAP_GIB,
+                headroom_gib=server_cfg.vram.vram_cache_headroom_gib,
                 stt_bytes=stt_bytes,
                 tts_bytes=tts_bytes,
             )
@@ -1293,6 +1302,22 @@ class TestSimulateModePromptIteration:
             },
         )
 
+        # Capture the real minted session id BEFORE consolidation consumes
+        # pending state.  `SessionBuffer._mint_session_id`
+        # unconditionally rotates the caller's conversation_id into
+        # `{safe_conversation_id}-{YYYYMMDDThhmmssZ}-{8 hex}`, and every
+        # downstream artifact directory (get_pending, extract_session,
+        # on_session_extracted) is named after that minted id, not the
+        # conversation handle "sim-test-001".  `_run_extraction_phase`
+        # defaults to `mark_sessions=True`, which retires the session from
+        # the buffer, so `get_pending()` must be read here, not after.
+        pending_before = buffer.get_pending()
+        assert len(pending_before) == 1, (
+            f"Expected exactly one pending session before consolidation; "
+            f"got {len(pending_before)}: {pending_before}"
+        )
+        minted_session_id = pending_before[0]["session_id"]
+
         # run_consolidation was deleted; use _run_extraction_phase via _state.
         # MemoryStore is lifespan-owned in production; construct it here with
         # the same replay flag the server derives from config.
@@ -1339,14 +1364,14 @@ class TestSimulateModePromptIteration:
         #     sessions/<sid>/graph_snapshot.json
         # Test setup pins cfg.paths.debug = tmp_path / "data" / "debug".
         snapshots = list(
-            cfg.paths.debug.glob("episodic/**/sessions/sim-test-001/graph_snapshot.json")
+            cfg.paths.debug.glob(f"episodic/**/sessions/{minted_session_id}/graph_snapshot.json")
         )
         assert len(snapshots) == 1, (
             f"Expected exactly one per-session graph_snapshot.json under "
             f"{cfg.paths.debug}; found {len(snapshots)}: {snapshots}"
         )
         graph = _json.loads(snapshots[0].read_text())
-        assert graph["session_id"] == "sim-test-001"
+        assert graph["session_id"] == minted_session_id
         phase_records = graph.get("diagnostics", {}).get("phases", [])
         phase_names = [p["name"] for p in phase_records if isinstance(p, dict)]
         assert "local_extract" in phase_names, (
