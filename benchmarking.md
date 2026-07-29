@@ -3500,10 +3500,10 @@ Same speaker, pyannote 512-dim embeddings:
 
 ### Privacy Mode
 
-- `debug: false` in server.yaml: transcripts live only in RAM. After consolidation, knowledge is in the adapter weights — no textual traces remain on disk.
-- `debug: true` (default): transcripts written to JSONL files for inspection, archived after consolidation.
-- age-encrypted session snapshots on graceful shutdown (SIGUSR1, SIGTERM): snapshot saved to disk, restored on startup, deleted immediately after restore. Unconsolidated conversations survive controlled restarts. Uncontrolled kills (SIGKILL, power loss) lose unconsolidated data — acceptable.
-- Snapshots gated on the daily age identity: configure `PARAMEM_DAILY_PASSPHRASE` + `~/.config/paramem/daily_key.age`. No key = snapshots disabled.
+- **Transcripts are always written to disk.** Every turn is appended to a per-session JSONL as it is served. No configuration setting disables this, and each turn is committed to stable storage, so transcripts survive a power loss and not merely a clean shutdown.
+- **They persist until a consolidation consumes them — not on a timer.** Nothing ages out: a session no consolidation ever extracts stays on disk indefinitely. After ten idle minutes a conversation only rolls over to a new session id; the previous transcript stays pending.
+- **`retain_sessions` and `debug` govern what happens at that point, not before it.** When either is true the transcript is archived once consolidated; only when both are false is it deleted. That both-false configuration is the only one in which no textual trace remains and knowledge lives solely in the adapter weights.
+- **age-encrypted session snapshots** on graceful shutdown (SIGUSR1, SIGTERM) are an additional copy of in-flight state — restored on startup, deleted immediately after. Gated on the daily age identity (`PARAMEM_DAILY_PASSPHRASE` + `~/.config/paramem/daily_key.age`); no key = snapshots disabled.
 
 ### Resilience
 
