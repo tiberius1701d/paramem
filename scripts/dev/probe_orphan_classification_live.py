@@ -119,27 +119,17 @@ HOLDABLE_AGE_SLEEP_S = 65
 PROD_CONFIG_PATH = _PROJECT_ROOT / "configs" / "server.yaml"
 
 # ---------------------------------------------------------------------------
-# Inlined helpers (sourced from experiments/probe_qwen_realpath_validation.py)
+# Inlined helpers
 # ---------------------------------------------------------------------------
-# These six functions are copied verbatim from the probe_qwen source with only
-# the minimum adjustments needed to stand alone (module-level name references).
-#
-# Source line refs:
-#   _resolve_api_token  line 122  — env -> .env fallback
-#   _wait_for_cooldown  line 136  — gpu-cooldown.sh wrapper
-#   _port_free          line 157  — TCP socket probe
-#   _wait_port_free     line 164  — loop until port free
-#   _poll_health        line 177  — GET /health poller
-#   _http_post          line 198  — POST helper with bearer auth
+# Token resolution, GPU cooldown, port probing, health polling and an
+# authenticated POST helper, kept here so this probe runs standalone without
+# importing the experiments package.
 
 
 def _resolve_api_token() -> str | None:
     """Resolve PARAMEM_API_TOKEN from ambient env or .env file.
 
     Returns the token string or None when absent.
-
-    Source: experiments/probe_qwen_realpath_validation.py line 122.
-    Adjusted: ``project_root`` -> ``_PROJECT_ROOT``.
     """
     token = os.environ.get("PARAMEM_API_TOKEN")
     if token:
@@ -155,8 +145,6 @@ def _wait_for_cooldown(target: int = 52) -> None:
 
     Shells out to gpu-cooldown.sh.  Falls back to a 60-second sleep when
     the script is unavailable (e.g. non-GPU CI runner).
-
-    Source: experiments/probe_qwen_realpath_validation.py line 136.
     """
     try:
         subprocess.run(
@@ -174,10 +162,7 @@ def _wait_for_cooldown(target: int = 52) -> None:
 
 
 def _port_free(port: int) -> bool:
-    """Return True when nothing is bound to 127.0.0.1:<port>.
-
-    Source: experiments/probe_qwen_realpath_validation.py line 157.
-    """
+    """Return True when nothing is bound to 127.0.0.1:<port>."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1)
         return s.connect_ex(("127.0.0.1", port)) != 0
@@ -187,8 +172,6 @@ def _wait_port_free(port: int, timeout: int = 30) -> bool:
     """Wait up to *timeout* seconds for *port* to become free.
 
     Returns True when the port is free, False on timeout.
-
-    Source: experiments/probe_qwen_realpath_validation.py line 164.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -202,8 +185,6 @@ def _poll_health(base_url: str, token: str | None, timeout: int) -> bool:
     """Poll GET /health until 200 or *timeout* seconds elapse.
 
     Returns True when the server is up, False on timeout.
-
-    Source: experiments/probe_qwen_realpath_validation.py line 177.
     """
     import urllib.request
 
@@ -224,11 +205,8 @@ def _poll_health(base_url: str, token: str | None, timeout: int) -> bool:
 def _http_post(url: str, token: str | None, payload: dict | None = None) -> tuple[int, dict]:
     """POST *payload* (as JSON) to *url* with optional bearer auth.
 
-    Returns (status_code, response_dict).
-
-    Source: experiments/probe_qwen_realpath_validation.py line 198.
-    Adjusted: timeout uses ``CONSOLIDATE_WAIT_TIMEOUT_S`` (local constant)
-    instead of ``CONSOLIDATE_TIMEOUT_S`` from probe_qwen.
+    Returns (status_code, response_dict).  Timeout is
+    ``CONSOLIDATE_WAIT_TIMEOUT_S``.
     """
     import json as _json
     import urllib.error
@@ -254,7 +232,7 @@ def _http_post(url: str, token: str | None, payload: dict | None = None) -> tupl
 
 
 # ---------------------------------------------------------------------------
-# Config builder (adapted from _build_cell_config, probe_qwen line 226)
+# Config builder
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +333,7 @@ def _build_test_config() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Speaker-profile seeder (adapted from _seed_speaker_profile, probe_qwen line 369)
+# Speaker-profile seeder
 # ---------------------------------------------------------------------------
 
 
@@ -397,7 +375,7 @@ def _seed_speaker_profiles() -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP GET helper (not in probe_qwen — only _http_post is there)
+# HTTP GET helper
 # ---------------------------------------------------------------------------
 
 
@@ -428,17 +406,15 @@ def _http_get(url: str, token: str | None, timeout: int = 10) -> tuple[int, dict
 
 
 # ---------------------------------------------------------------------------
-# Consolidation-done waiter (adapted from _wait_for_consolidation, probe_qwen
-# line 488 — without the chunk-count fast-path; instead polls consolidating flag)
+# Consolidation-done waiter (polls the consolidating flag)
 # ---------------------------------------------------------------------------
 
 
 def _wait_consolidation_done(token: str | None, timeout: int = CONSOLIDATE_WAIT_TIMEOUT_S) -> bool:
     """Block until the background consolidation cycle finishes (consolidating=False x2).
 
-    Adapted from probe_qwen's ``_wait_for_consolidation`` (line 488) but without
-    the ``EXPECTED_CHUNKS`` graph-snapshot fast-path (chat sessions do not
-    necessarily produce snapshots — only NAMED sessions do, and only one is NAMED).
+    There is no graph-snapshot fast-path: chat sessions do not necessarily
+    produce snapshots — only NAMED sessions do, and only one is NAMED.
 
     Polls GET /status every 3 s.  Returns True when ``consolidating==False`` for
     2 consecutive polls OR when the timeout elapses (returns False on timeout).
@@ -588,7 +564,6 @@ def _snapshot_exists_for(conv_id: str) -> bool:
     first — the snapshot directory is named after the session_id, not the
     caller's conversation_id (see that function's docstring). Pattern:
     ``debug/episodic/cycle_*/run_*/sessions/<session_id>/graph_snapshot.json``.
-    Mirrors the glob in ``_read_session_snapshots`` (probe_qwen line 441-443).
     """
     session_id = _minted_session_id(conv_id)
     if session_id is None:
