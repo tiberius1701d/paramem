@@ -235,16 +235,8 @@ class TestSymlinkSkip:
         symlink_slot = config_kind_dir / "20260101-000000"
         symlink_slot.symlink_to(outside)
 
-        named_logger = logging.getLogger("paramem.backup.enumerate")
-        orig_propagate = named_logger.propagate
-        named_logger.propagate = True
         caplog.set_level(logging.WARNING, logger="paramem.backup.enumerate")
-        named_logger.addHandler(caplog.handler)
-        try:
-            enumerate_backups(base, kind=ArtifactKind.CONFIG)
-        finally:
-            named_logger.removeHandler(caplog.handler)
-            named_logger.propagate = orig_propagate
+        enumerate_backups(base, kind=ArtifactKind.CONFIG)
 
         symlink_warnings = [r for r in caplog.records if "symlink" in r.message.lower()]
         assert symlink_warnings, (

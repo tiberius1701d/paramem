@@ -2172,16 +2172,8 @@ class TestRecallFailedSessionStaysPending:
         # Pre-seed durable store to count=1 so bump brings it to cap (2).
         bump_retry_count(state_dir, sid)
 
-        # Explicitly wire caplog handler into the session_buffer logger so the
-        # WARNING emitted by bump_retry_and_release is captured by caplog.
-        # Pattern from tests/test_interim_adapter_lifecycle.py (caplog handler wire).
-        sb_logger = logging.getLogger("paramem.server.session_buffer")
-        sb_logger.addHandler(caplog.handler)
-        sb_logger.setLevel(logging.WARNING)
-        try:
-            released = buf.bump_retry_and_release({sid})
-        finally:
-            sb_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.server.session_buffer")
+        released = buf.bump_retry_and_release({sid})
 
         assert sid in released
 

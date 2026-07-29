@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import networkx as nx
@@ -1157,26 +1156,6 @@ class TestChunkCapRespected:
             )
 
 
-@contextmanager
-def _capture_enrich_logs(caplog):
-    """Capture ``paramem.training.graph_enrich`` records into *caplog*.
-
-    ``caplog.at_level`` alone is silent here — the module logger does not
-    propagate to root under this suite's configuration — so the fixture's
-    handler is attached to the specific logger, as
-    ``tests/test_intent.py`` does for the same reason.
-    """
-    enrich_logger = logging.getLogger("paramem.training.graph_enrich")
-    prior_level = enrich_logger.level
-    enrich_logger.setLevel(logging.WARNING)
-    enrich_logger.addHandler(caplog.handler)
-    try:
-        yield
-    finally:
-        enrich_logger.removeHandler(caplog.handler)
-        enrich_logger.setLevel(prior_level)
-
-
 class TestCloudEgressRefusedSkipsGracefully:
     """Every unmet cloud-admission term skips this pass with no crash.
 
@@ -1195,9 +1174,9 @@ class TestCloudEgressRefusedSkipsGracefully:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
         call_spy = MagicMock()
-        with _capture_enrich_logs(caplog):
-            with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
-                result = _refiner_for(loop).run_enrichment()
+        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
+            result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "cloud_egress_blocked"
@@ -1211,9 +1190,9 @@ class TestCloudEgressRefusedSkipsGracefully:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with _capture_enrich_logs(caplog):
-            with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
-                result = _refiner_for(loop).run_enrichment()
+        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
+            result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "cloud_egress_blocked"
@@ -1230,9 +1209,9 @@ class TestCloudEgressRefusedSkipsGracefully:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
-        with _capture_enrich_logs(caplog):
-            with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
-                result = _refiner_for(loop).run_enrichment()
+        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
+        with patch("paramem.training.graph_enrich.request_graph_enrichment", call_spy):
+            result = _refiner_for(loop).run_enrichment()
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "cloud_egress_blocked"
@@ -2045,25 +2024,18 @@ class TestSliceCounters:
         _populate_graph(graph, n_persons=10)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        enrich_logger = logging.getLogger("paramem.training.graph_enrich")
-        prior_level = enrich_logger.level
-        enrich_logger.setLevel(logging.WARNING)
-        enrich_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch(
-                    "paramem.training.graph_enrich.anonymize",
-                    return_value=self._payload(status="ok", slices=3, slices_failed=1),
-                ),
-                patch(
-                    "paramem.training.graph_enrich.request_graph_enrichment",
-                    return_value=([], [], "raw", 0),
-                ),
-            ):
-                _refiner_for(loop).run_enrichment()
-        finally:
-            enrich_logger.removeHandler(caplog.handler)
-            enrich_logger.setLevel(prior_level)
+        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
+        with (
+            patch(
+                "paramem.training.graph_enrich.anonymize",
+                return_value=self._payload(status="ok", slices=3, slices_failed=1),
+            ),
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=([], [], "raw", 0),
+            ),
+        ):
+            _refiner_for(loop).run_enrichment()
 
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any("partial withholding" in m for m in warnings), warnings
@@ -2079,25 +2051,18 @@ class TestSliceCounters:
         _populate_graph(graph, n_persons=10)
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        enrich_logger = logging.getLogger("paramem.training.graph_enrich")
-        prior_level = enrich_logger.level
-        enrich_logger.setLevel(logging.WARNING)
-        enrich_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch(
-                    "paramem.training.graph_enrich.anonymize",
-                    return_value=self._payload(status="ok", slices=2, slices_failed=0),
-                ),
-                patch(
-                    "paramem.training.graph_enrich.request_graph_enrichment",
-                    return_value=([], [], "raw", 0),
-                ),
-            ):
-                _refiner_for(loop).run_enrichment()
-        finally:
-            enrich_logger.removeHandler(caplog.handler)
-            enrich_logger.setLevel(prior_level)
+        caplog.set_level(logging.WARNING, logger="paramem.training.graph_enrich")
+        with (
+            patch(
+                "paramem.training.graph_enrich.anonymize",
+                return_value=self._payload(status="ok", slices=2, slices_failed=0),
+            ),
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=([], [], "raw", 0),
+            ),
+        ):
+            _refiner_for(loop).run_enrichment()
 
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert not any("partial withholding" in m for m in warnings), warnings

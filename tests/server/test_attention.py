@@ -1128,14 +1128,7 @@ def test_check_token_ratio_drift_sets_warning_on_drift(caplog):
     prior = app_module._state.get("tokenizer")
     prior_warning = app_module._state.pop("token_ratio_drift_warning", None)
     app_module._state["tokenizer"] = _StubTokenizer()
-    # The app logger does not propagate to root under this suite's
-    # configuration (same reason tests/test_intent.py and
-    # tests/test_graph_enrichment.py attach directly to the module
-    # logger) — caplog.at_level alone is silent here.
-    app_logger = logging.getLogger("paramem.server.app")
-    prior_level = app_logger.level
-    app_logger.setLevel(logging.WARNING)
-    app_logger.addHandler(caplog.handler)
+    caplog.set_level(logging.WARNING, logger="paramem.server.app")
     try:
         # 0.01 tok/word is far below any real synthetic sample's
         # observed ratio under the one-id-per-character stub.
@@ -1146,8 +1139,6 @@ def test_check_token_ratio_drift_sets_warning_on_drift(caplog):
         assert warn["observed_ratio"] > 0.01
         assert any("Token-estimate ratio drift" in r.getMessage() for r in caplog.records)
     finally:
-        app_logger.removeHandler(caplog.handler)
-        app_logger.setLevel(prior_level)
         app_module._state["tokenizer"] = prior
         if prior_warning is not None:
             app_module._state["token_ratio_drift_warning"] = prior_warning

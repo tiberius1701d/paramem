@@ -975,14 +975,8 @@ class TestLookupHashFromManifests:
             ),
         )
 
-        # caplog.at_level alone does not capture in this project (log propagation
-        # is intercepted); attach the handler directly to the named logger.
-        named_logger = logging.getLogger("paramem.adapters.manifest")
-        named_logger.addHandler(caplog.handler)
-        try:
-            result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
-        finally:
-            named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.adapters.manifest")
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
 
         assert result == "sha256:newer_hash"
         assert any(
@@ -1004,12 +998,8 @@ class TestLookupHashFromManifests:
                 _make_manifest_with_base("hf/model", "abc123", "sha256:consistent"),
             )
 
-        named_logger = logging.getLogger("paramem.adapters.manifest")
-        named_logger.addHandler(caplog.handler)
-        try:
-            result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
-        finally:
-            named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.adapters.manifest")
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
 
         assert result == "sha256:consistent"
         warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1169,20 +1159,15 @@ class TestBuildManifestForHashPaths:
 
         model = self._make_model(name="hf/bogus_repo_xyz", commit="deadbeef")
 
-        # Attach handler directly — caplog.at_level alone won't capture in this project
-        named_logger = logging.getLogger("paramem.adapters.manifest")
-        named_logger.addHandler(caplog.handler)
-        try:
-            with patch("paramem.adapters.manifest._resolve_base_safetensors", return_value=None):
-                m = build_manifest_for(
-                    model,
-                    self._make_tokenizer(),
-                    "episodic",
-                    registry_path=None,
-                    adapter_root=tmp_path,
-                )
-        finally:
-            named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.adapters.manifest")
+        with patch("paramem.adapters.manifest._resolve_base_safetensors", return_value=None):
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                adapter_root=tmp_path,
+            )
 
         assert m.base_model.hash == UNKNOWN
         warn_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]

@@ -754,20 +754,10 @@ class TestLiveSlotManifestReStamp:
             config=cfg,
         )
 
-        # Explicitly wire caplog's handler onto the named logger so TestClient's
-        # ASGI scope emits records into caplog.  Pattern from test_auto_reclaim_live_reload.py.
-        named = logging.getLogger("paramem.server.app")
-        orig_propagate = named.propagate
-        named.propagate = True
         caplog.set_level(logging.ERROR, logger="paramem.server.app")
-        named.addHandler(caplog.handler)
-        try:
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
-        finally:
-            named.removeHandler(caplog.handler)
-            named.propagate = orig_propagate
+        with patch("paramem.memory.persistence.save_registry"):
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200, resp.text
         # An ERROR must be logged about the missing slot.

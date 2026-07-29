@@ -1391,9 +1391,8 @@ class TestEnumerateBundle:
         assert records[0].kind == ArtifactKind.SNAPSHOT_BUNDLE
         assert records[0].is_bundle is True
 
-    def test_bundle_not_flagged_invalid(self, tmp_path) -> None:
+    def test_bundle_not_flagged_invalid(self, tmp_path, caplog) -> None:
         """enumerate_backups must not log the bundle slot as invalid/unreadable."""
-        import io
         import logging
 
         fixtures = _make_fixtures(tmp_path)
@@ -1407,21 +1406,10 @@ class TestEnumerateBundle:
         )
 
         backups_root = fixtures["base_dir"].parent
-        named_logger = logging.getLogger("paramem.backup.enumerate")
-        orig_propagate = named_logger.propagate
-        named_logger.propagate = True
+        caplog.set_level(logging.WARNING, logger="paramem.backup.enumerate")
+        records = enumerate_backups(backups_root)
 
-        log_capture = io.StringIO()
-        handler = logging.StreamHandler(log_capture)
-        handler.setLevel(logging.WARNING)
-        named_logger.addHandler(handler)
-        try:
-            records = enumerate_backups(backups_root)
-        finally:
-            named_logger.removeHandler(handler)
-            named_logger.propagate = orig_propagate
-
-        warnings_text = log_capture.getvalue()
+        warnings_text = caplog.text
         assert "unreadable" not in warnings_text.lower(), (
             f"enumerate_backups emitted 'unreadable' warning for bundle slot: {warnings_text!r}"
         )

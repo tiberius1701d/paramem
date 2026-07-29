@@ -188,24 +188,17 @@ class TestVramScopeTelemetry:
         """A driver query failure must not block entry — snapshot is skipped, not fatal."""
         import logging
 
-        vg_logger = logging.getLogger("paramem.utils.vram_guard")
-        prior_level = vg_logger.level
-        vg_logger.setLevel(logging.INFO)
-        vg_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-                patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
-                    side_effect=RuntimeError("driver unhealthy"),
-                ),
-            ):
-                with vram_scope("anonymize"):
-                    pass
-        finally:
-            vg_logger.removeHandler(caplog.handler)
-            vg_logger.setLevel(prior_level)
+        caplog.set_level(logging.INFO, logger="paramem.utils.vram_guard")
+        with (
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.torch.cuda.empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                side_effect=RuntimeError("driver unhealthy"),
+            ),
+        ):
+            with vram_scope("anonymize"):
+                pass
 
         assert not [r for r in caplog.records if "vram_scope[anonymize] enter" in r.message]
 

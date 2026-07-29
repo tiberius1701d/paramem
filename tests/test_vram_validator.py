@@ -423,18 +423,10 @@ def test_estimate_stt_bytes_returns_zero_on_cache_miss(caplog):
     """Cache miss (predictor returns None) → 0 with INFO log."""
     from paramem.server.vram_validator import estimate_stt_bytes
 
-    named = logging.getLogger("paramem.server.vram_validator")
-    orig_propagate = named.propagate
-    named.propagate = True
     caplog.set_level(logging.INFO, logger="paramem.server.vram_validator")
-    named.addHandler(caplog.handler)
-    try:
-        cfg = _FakeSTTConfig(device="cuda")
-        with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=None):
-            result = estimate_stt_bytes(cfg, workspace_factor=_STT_WORKSPACE_FACTOR)
-    finally:
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
+    cfg = _FakeSTTConfig(device="cuda")
+    with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=None):
+        result = estimate_stt_bytes(cfg, workspace_factor=_STT_WORKSPACE_FACTOR)
 
     assert result == 0
     assert "STT not cached" in caplog.text or "live gate" in caplog.text.lower()

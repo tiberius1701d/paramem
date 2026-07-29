@@ -154,19 +154,15 @@ class TestStartupSkipsHalfPresent:
         _write_adapter_files(interim_dir, safetensors=False)  # only config, no weights
 
         named_logger = logging.getLogger("paramem.server.app")
-        named_logger.addHandler(caplog.handler)
-        named_logger.setLevel(logging.WARNING)
-        try:
-            for path in sorted(tmp_path.glob("episodic_interim_*")):
-                if not path.is_dir():
-                    continue
-                if (
-                    not (path / "adapter_config.json").exists()
-                    or not (path / "adapter_model.safetensors").exists()
-                ):
-                    named_logger.warning("Skipping half-present interim adapter: %s", path.name)
-        finally:
-            named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        for path in sorted(tmp_path.glob("episodic_interim_*")):
+            if not path.is_dir():
+                continue
+            if (
+                not (path / "adapter_config.json").exists()
+                or not (path / "adapter_model.safetensors").exists()
+            ):
+                named_logger.warning("Skipping half-present interim adapter: %s", path.name)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings, "Expected at least one WARNING for the half-present adapter"
@@ -183,19 +179,15 @@ class TestStartupSkipsHalfPresent:
         # adapter_config.json intentionally absent
 
         named_logger = logging.getLogger("paramem.server.app")
-        named_logger.addHandler(caplog.handler)
-        named_logger.setLevel(logging.WARNING)
-        try:
-            for path in sorted(tmp_path.glob("episodic_interim_*")):
-                if not path.is_dir():
-                    continue
-                if (
-                    not (path / "adapter_config.json").exists()
-                    or not (path / "adapter_model.safetensors").exists()
-                ):
-                    named_logger.warning("Skipping half-present interim adapter: %s", path.name)
-        finally:
-            named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        for path in sorted(tmp_path.glob("episodic_interim_*")):
+            if not path.is_dir():
+                continue
+            if (
+                not (path / "adapter_config.json").exists()
+                or not (path / "adapter_model.safetensors").exists()
+            ):
+                named_logger.warning("Skipping half-present interim adapter: %s", path.name)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings
@@ -209,19 +201,15 @@ class TestStartupSkipsHalfPresent:
         _write_adapter_files(interim_dir)  # both files present
 
         named_logger = logging.getLogger("paramem.server.app")
-        named_logger.addHandler(caplog.handler)
-        named_logger.setLevel(logging.WARNING)
-        try:
-            for path in sorted(tmp_path.glob("episodic_interim_*")):
-                if not path.is_dir():
-                    continue
-                if (
-                    not (path / "adapter_config.json").exists()
-                    or not (path / "adapter_model.safetensors").exists()
-                ):
-                    named_logger.warning("Skipping half-present interim adapter: %s", path.name)
-        finally:
-            named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        for path in sorted(tmp_path.glob("episodic_interim_*")):
+            if not path.is_dir():
+                continue
+            if (
+                not (path / "adapter_config.json").exists()
+                or not (path / "adapter_model.safetensors").exists()
+            ):
+                named_logger.warning("Skipping half-present interim adapter: %s", path.name)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert not warnings, (
@@ -432,16 +420,11 @@ class TestEnsureAdapterMatching:
         resident.lora_alpha = adapter_config.alpha
         resident.target_modules = list(adapter_config.target_modules)
 
-        loader_logger = logging.getLogger("paramem.models.loader")
-        loader_logger.addHandler(caplog.handler)
-        loader_logger.setLevel(logging.WARNING)
-        try:
-            with patch("paramem.models.loader.create_adapter"):
-                from paramem.models.loader import ensure_adapter_matching
+        caplog.set_level(logging.WARNING, logger="paramem.models.loader")
+        with patch("paramem.models.loader.create_adapter"):
+            from paramem.models.loader import ensure_adapter_matching
 
-                ensure_adapter_matching(model, adapter_config, "episodic")
-        finally:
-            loader_logger.removeHandler(caplog.handler)
+            ensure_adapter_matching(model, adapter_config, "episodic")
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings, "expected a mismatch warning"

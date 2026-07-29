@@ -518,24 +518,15 @@ class TestFailClean:
 
 
 class TestLogStartupPosture:
-    """Tests for log_startup_posture's four output states.
-
-    The project pattern for caplog (see tests/test_vram_validator.py) is to
-    attach caplog.handler directly to the named logger, because some installed
-    packages set propagate=False which breaks the default caplog propagation path.
-    """
+    """Tests for log_startup_posture's four output states."""
 
     def _capture(self, caplog, level, fn, *args, **kwargs):
-        """Attach caplog.handler to the auth logger, call fn, detach."""
-        import logging
+        """Capture the auth logger at *level* while running *fn*.
 
-        named = logging.getLogger("paramem.server.auth")
-        named.addHandler(caplog.handler)
-        named.setLevel(level)
-        try:
-            fn(*args, **kwargs)
-        finally:
-            named.removeHandler(caplog.handler)
+        Names the logger once for every state test below.
+        """
+        caplog.set_level(level, logger="paramem.server.auth")
+        fn(*args, **kwargs)
 
     def test_off_state(self, caplog):
         """No shared token, 0 user tokens → AUTH: OFF warning."""

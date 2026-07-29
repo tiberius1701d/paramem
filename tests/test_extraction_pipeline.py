@@ -5067,19 +5067,8 @@ class TestBindingCollisions:
 
         reverse_mapping = {"Org_1": "Acme"}
         cloud_bindings = {"Org_1": "Wrong Corp"}
-        # caplog.at_level() silently fails here because the logger is not
-        # propagating to the root; attach the handler to the specific
-        # logger directly (see test_skips_unrecognised_class_filenames pattern
-        # in test_intent.py).
-        placeholders_logger = logging.getLogger("paramem.cloud.placeholders")
-        prior_level = placeholders_logger.level
-        placeholders_logger.setLevel(logging.WARNING)
-        placeholders_logger.addHandler(caplog.handler)
-        try:
-            collisions = _binding_collisions(reverse_mapping, cloud_bindings=cloud_bindings)
-        finally:
-            placeholders_logger.removeHandler(caplog.handler)
-            placeholders_logger.setLevel(prior_level)
+        caplog.set_level(logging.WARNING, logger="paramem.cloud.placeholders")
+        collisions = _binding_collisions(reverse_mapping, cloud_bindings=cloud_bindings)
         assert collisions == ["Org_1"]
         assert any("collision" in r.getMessage().lower() for r in caplog.records)
 
@@ -5354,35 +5343,28 @@ class TestBindingTotalityRejection:
         # The per-triple rejection WARNING now originates in
         # paramem.graph.stage_enrich (carved out of extractor.py's
         # _cloud_pipeline) — attach to that logger, not extractor's.
-        extractor_logger = logging.getLogger("paramem.graph.stage_enrich")
-        prior_level = extractor_logger.level
-        extractor_logger.setLevel(logging.WARNING)
-        extractor_logger.addHandler(caplog.handler)
-        try:
-            with extraction_trace() as trace:
-                with (
-                    patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-                    patch(
-                        "paramem.cloud.anonymize.anonymize_transcript",
-                        return_value=(mapping, "anonymized transcript", ""),
-                    ),
-                    patch(
-                        "paramem.graph.stage_enrich.request_enrichment",
-                        return_value=(delta, None, {}),
-                    ),
-                ):
-                    result = run_cloud_stages(
-                        graph,
-                        "Alex lives in Millfield",
-                        None,
-                        None,
-                        speaker_id="speaker0",
-                        correction_entity_types=set(),
-                        scrub={"person name"},
-                    )
-        finally:
-            extractor_logger.removeHandler(caplog.handler)
-            extractor_logger.setLevel(prior_level)
+        caplog.set_level(logging.WARNING, logger="paramem.graph.stage_enrich")
+        with extraction_trace() as trace:
+            with (
+                patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+                patch(
+                    "paramem.cloud.anonymize.anonymize_transcript",
+                    return_value=(mapping, "anonymized transcript", ""),
+                ),
+                patch(
+                    "paramem.graph.stage_enrich.request_enrichment",
+                    return_value=(delta, None, {}),
+                ),
+            ):
+                result = run_cloud_stages(
+                    graph,
+                    "Alex lives in Millfield",
+                    None,
+                    None,
+                    speaker_id="speaker0",
+                    correction_entity_types=set(),
+                    scrub={"person name"},
+                )
 
         # Only the untouched fact survives — dropped index 0 stays
         # dropped (unconditional), the 5 orphan adds are each rejected.

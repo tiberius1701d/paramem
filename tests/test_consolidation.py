@@ -6756,14 +6756,8 @@ class TestDriftPartitioning:
                 key, speaker_id="speaker0", relation_type="factual", first_seen=""
             )
 
-        # caplog.at_level alone does not capture in this project (log propagation
-        # is intercepted); attach the handler directly to the named logger.
-        _named_logger = logging.getLogger("paramem.training.consolidation")
-        _named_logger.addHandler(caplog.handler)
-        try:
-            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
-        finally:
-            _named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.training.consolidation")
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
         assert result["drift_genuine_loss"] == 0, (
             f"Expected drift_genuine_loss=0 (dedup only); got {result['drift_genuine_loss']}"
@@ -6848,14 +6842,8 @@ class TestDriftPartitioning:
             "key_no_pred", speaker_id="speaker0", relation_type="factual", first_seen=""
         )
 
-        # caplog.at_level alone does not capture in this project (log propagation
-        # is intercepted); attach the handler directly to the named logger.
-        _named_logger = logging.getLogger("paramem.training.consolidation")
-        _named_logger.addHandler(caplog.handler)
-        try:
-            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
-        finally:
-            _named_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.training.consolidation")
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
         assert result["drift_genuine_loss"] == 1, (
             f"Expected drift_genuine_loss=1 (key_no_pred has subject but no predicate "
@@ -18023,13 +18011,8 @@ class TestMainTierInitPolicy:
         loop = self._seeded_loop(tmp_path)
         loop.model.peft_config["episodic"].r = 999  # target is rank=4 (see _make_loop)
 
-        loader_logger = logging.getLogger("paramem.models.loader")
-        loader_logger.addHandler(caplog.handler)
-        loader_logger.setLevel(logging.WARNING)
-        try:
-            _run_full_fold_mocked(loop, keys_from="all_tiers")
-        finally:
-            loader_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.models.loader")
+        _run_full_fold_mocked(loop, keys_from="all_tiers")
 
         assert any(c.args == ("episodic",) for c in loop.model.delete_adapter.call_args_list), (
             "expected delete_adapter('episodic') on config mismatch"

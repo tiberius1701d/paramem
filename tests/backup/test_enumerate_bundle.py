@@ -215,16 +215,8 @@ class TestCorruptBundleManifest:
         slot.mkdir(parents=True)
         (slot / "bundle.meta.json").write_text("{}", encoding="utf-8")  # missing required fields
 
-        named_logger = logging.getLogger("paramem.backup.enumerate")
-        orig_propagate = named_logger.propagate
-        named_logger.propagate = True
         caplog.set_level(logging.WARNING, logger="paramem.backup.enumerate")
-        named_logger.addHandler(caplog.handler)
-        try:
-            enumerate_backups(base)
-        finally:
-            named_logger.removeHandler(caplog.handler)
-            named_logger.propagate = orig_propagate
+        enumerate_backups(base)
 
         warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warn_records, "Expected a WARNING log for corrupt bundle manifest, got none."

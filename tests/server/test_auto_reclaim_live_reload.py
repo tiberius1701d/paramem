@@ -185,46 +185,36 @@ def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
         # _state["mode"] from a prior test.
         app_module._state["mode"] = "local"
 
-    named = logging.getLogger("paramem.server.app")
-    orig_propagate = named.propagate
-    named.propagate = True
     caplog.set_level(logging.WARNING, logger="paramem.server.app")
-    named.addHandler(caplog.handler)
 
-    try:
-        with (
-            patch.dict(app_module._state, state_patch, clear=False),
-            patch("paramem.server.app._gpu_has_compute_processes", return_value=False),
-            patch(
-                "paramem.server.app._get_hold_state", return_value=_make_hold_state(active=False)
-            ),
-            patch("paramem.server.app._live_reload_base_model", side_effect=fake_reload),
-            patch("paramem.server.app._set_voice_pipeline_profile"),
-            patch("paramem.server.app._restart_service") as mock_restart,
-            patch("paramem.server.gpu_lock.gpu_lock", _make_null_gpu_lock()),
-            patch("asyncio.sleep", side_effect=fake_sleep),
-        ):
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch("paramem.server.app._gpu_has_compute_processes", return_value=False),
+        patch("paramem.server.app._get_hold_state", return_value=_make_hold_state(active=False)),
+        patch("paramem.server.app._live_reload_base_model", side_effect=fake_reload),
+        patch("paramem.server.app._set_voice_pipeline_profile"),
+        patch("paramem.server.app._restart_service") as mock_restart,
+        patch("paramem.server.gpu_lock.gpu_lock", _make_null_gpu_lock()),
+        patch("asyncio.sleep", side_effect=fake_sleep),
+    ):
 
-            async def _run():
-                event_loop = asyncio.get_event_loop()
+        async def _run():
+            event_loop = asyncio.get_event_loop()
 
-                async def _fake_rie(_exc, fn, *args):
-                    fn(*args)
+            async def _fake_rie(_exc, fn, *args):
+                fn(*args)
 
-                event_loop.run_in_executor = _fake_rie
-                try:
-                    await app_module._auto_reclaim_loop(interval_minutes=0)
-                except asyncio.CancelledError:
-                    pass
+            event_loop.run_in_executor = _fake_rie
+            try:
+                await app_module._auto_reclaim_loop(interval_minutes=0)
+            except asyncio.CancelledError:
+                pass
 
-            asyncio.run(_run())
+        asyncio.run(_run())
 
-            mock_restart.assert_not_called()
-            # After failure + success: error cleared.
-            assert app_module._state.get("last_reclaim_error") is None
-    finally:
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
+        mock_restart.assert_not_called()
+        # After failure + success: error cleared.
+        assert app_module._state.get("last_reclaim_error") is None
 
     warn_records = [
         r for r in caplog.records if r.levelno == logging.WARNING and "reclaim" in r.message.lower()

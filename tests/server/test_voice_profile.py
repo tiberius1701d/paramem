@@ -296,29 +296,21 @@ def test_stt_load_failure_updates_profile_and_warns(caplog):
     new_stt.load.return_value = False
     new_tts = _make_tts_instance()
 
-    named = logging.getLogger("paramem.server.app")
-    orig_propagate = named.propagate
-    named.propagate = True
     caplog.set_level(logging.WARNING, logger="paramem.server.app")
-    named.addHandler(caplog.handler)
-    try:
-        with (
-            _profile_state("cpu", stt_cpu=stt_cpu, tts_cpu=tts_cpu),
-            patch("paramem.server.gpu_lock.gpu_lock_sync") as mock_lock,
-            patch("paramem.server.stt.WhisperSTT", return_value=new_stt),
-            patch("paramem.server.tts.TTSManager", return_value=new_tts),
-        ):
-            mock_lock.return_value.__enter__ = MagicMock(return_value=None)
-            mock_lock.return_value.__exit__ = MagicMock(return_value=False)
-            new_tts.is_loaded = True
+    with (
+        _profile_state("cpu", stt_cpu=stt_cpu, tts_cpu=tts_cpu),
+        patch("paramem.server.gpu_lock.gpu_lock_sync") as mock_lock,
+        patch("paramem.server.stt.WhisperSTT", return_value=new_stt),
+        patch("paramem.server.tts.TTSManager", return_value=new_tts),
+    ):
+        mock_lock.return_value.__enter__ = MagicMock(return_value=None)
+        mock_lock.return_value.__exit__ = MagicMock(return_value=False)
+        new_tts.is_loaded = True
 
-            app_module._set_voice_pipeline_profile("gpu")
+        app_module._set_voice_pipeline_profile("gpu")
 
-            # Profile updated despite load failure.
-            assert app_module._state["voice_profile"] == "gpu"
-    finally:
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
+        # Profile updated despite load failure.
+        assert app_module._state["voice_profile"] == "gpu"
 
     assert any("STT load failed" in r.message for r in caplog.records), (
         "WARN about STT load failure expected"
@@ -425,11 +417,7 @@ def test_stt_cpu_pair_not_stored_when_load_fails(caplog):
     failing_stt = _make_stt_instance()
     failing_stt.load.return_value = False
 
-    named = logging.getLogger("paramem.server.app")
-    orig_propagate = named.propagate
-    named.propagate = True
     caplog.set_level(logging.WARNING, logger="paramem.server.app")
-    named.addHandler(caplog.handler)
 
     prior_stt_cpu = app_module._state.get("stt_cpu", _SENTINEL := object())
     try:
@@ -459,8 +447,6 @@ def test_stt_cpu_pair_not_stored_when_load_fails(caplog):
             app_module._state.pop("stt_cpu", None)
         else:
             app_module._state["stt_cpu"] = prior_stt_cpu
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
 
     assert any("STT CPU pair failed to load" in r.message for r in caplog.records), (
         "WARNING about STT CPU load failure expected"
@@ -482,11 +468,7 @@ def test_tts_cpu_pair_not_stored_when_load_fails(caplog):
     failing_tts = _make_tts_instance()
     failing_tts.is_loaded = False
 
-    named = logging.getLogger("paramem.server.app")
-    orig_propagate = named.propagate
-    named.propagate = True
     caplog.set_level(logging.WARNING, logger="paramem.server.app")
-    named.addHandler(caplog.handler)
 
     _SENTINEL = object()
     prior_tts_cpu = app_module._state.get("tts_cpu", _SENTINEL)
@@ -515,8 +497,6 @@ def test_tts_cpu_pair_not_stored_when_load_fails(caplog):
             app_module._state.pop("tts_cpu", None)
         else:
             app_module._state["tts_cpu"] = prior_tts_cpu
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
 
     assert any("TTS CPU pair failed to load" in r.message for r in caplog.records), (
         "WARNING about TTS CPU load failure expected"

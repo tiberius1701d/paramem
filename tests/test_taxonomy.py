@@ -92,33 +92,7 @@ class TestRelationTypes:
 
 
 class TestEmptyAndMalformedYaml:
-    """Tests for Fix 2: empty/partial/malformed YAML falls back with a logged error.
-
-    Note: The ROS launch package (loaded by the ament pytest plugins) overrides
-    the logging.Logger class and sets ``propagate=False`` on every new logger.
-    This prevents pytest's caplog handler (which lives on the root logger) from
-    capturing records from ``paramem.config.taxonomy``.  The workaround is to
-    attach caplog's handler directly to the named logger and force propagation on
-    before the call under test.
-    """
-
-    def _attach_caplog(self, caplog, level: int) -> tuple:
-        """Attach caplog's handler to the taxonomy logger directly.
-
-        Returns ``(named_logger, orig_propagate)`` so the caller can restore state.
-        """
-        import logging
-
-        named = logging.getLogger("paramem.config.taxonomy")
-        orig_propagate = named.propagate
-        named.propagate = True
-        caplog.set_level(level, logger="paramem.config.taxonomy")
-        named.addHandler(caplog.handler)
-        return named, orig_propagate
-
-    def _detach_caplog(self, caplog, named, orig_propagate: bool) -> None:
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
+    """Tests for Fix 2: empty/partial/malformed YAML falls back with a logged error."""
 
     def test_empty_yaml_returns_fallback(self, tmp_path, caplog, monkeypatch):
         """An empty YAML file (missing all required keys) must return the hardcoded fallback."""
@@ -136,11 +110,8 @@ class TestEmptyAndMalformedYaml:
         reset_cache()
         empty = tmp_path / "empty.yaml"
         empty.write_text("")
-        named, orig_p = self._attach_caplog(caplog, logging.ERROR)
-        try:
-            cfg = load_schema_config(str(empty))
-        finally:
-            self._detach_caplog(caplog, named, orig_p)
+        caplog.set_level(logging.ERROR, logger="paramem.config.taxonomy")
+        cfg = load_schema_config(str(empty))
         assert cfg == sentinel
         assert any("schema" in r.getMessage().lower() for r in caplog.records)
         reset_cache()
@@ -161,11 +132,8 @@ class TestEmptyAndMalformedYaml:
         reset_cache()
         bad = tmp_path / "bad.yaml"
         bad.write_text(":\n  -invalid\n")  # unparseable
-        named, orig_p = self._attach_caplog(caplog, logging.ERROR)
-        try:
-            cfg = load_schema_config(str(bad))
-        finally:
-            self._detach_caplog(caplog, named, orig_p)
+        caplog.set_level(logging.ERROR, logger="paramem.config.taxonomy")
+        cfg = load_schema_config(str(bad))
         assert cfg == sentinel
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records, "expected logger.error on malformed yaml"

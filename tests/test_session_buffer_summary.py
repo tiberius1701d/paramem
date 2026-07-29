@@ -1121,16 +1121,8 @@ class TestReadJsonlTornTail:
             f.write(json.dumps(good_turn) + "\n")
             f.write('{"role": "user", "text": "cut off mid-wri')  # torn, no closing brace
 
-        # Explicitly wire caplog handler into the session_buffer logger
-        # (pattern from tests/test_run_consolidation_cycle.py) so the
-        # WARNING emitted by _read_jsonl is captured.
-        sb_logger = logging.getLogger("paramem.server.session_buffer")
-        sb_logger.addHandler(caplog.handler)
-        sb_logger.setLevel(logging.WARNING)
-        try:
-            turns = SessionBuffer._read_jsonl(path)
-        finally:
-            sb_logger.removeHandler(caplog.handler)
+        caplog.set_level(logging.WARNING, logger="paramem.server.session_buffer")
+        turns = SessionBuffer._read_jsonl(path)
 
         assert turns == [good_turn]
         assert any("malformed" in r.message for r in caplog.records), (

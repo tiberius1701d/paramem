@@ -225,19 +225,10 @@ class TestLoadExemplars:
         encoder = _stub_encoder()
         encoder.model.encode.return_value = np.array([[1.0, 0.0]], dtype=np.float32)
 
-        # caplog.at_level() silently fails here because the logger is not
-        # propagating to the root; attach the handler to the specific logger directly.
         import logging as _logging
 
-        intent_logger = _logging.getLogger("paramem.server.intent")
-        prior_level = intent_logger.level
-        intent_logger.setLevel(_logging.WARNING)
-        intent_logger.addHandler(caplog.handler)
-        try:
-            bank = load_exemplars(config, encoder=encoder)
-        finally:
-            intent_logger.removeHandler(caplog.handler)
-            intent_logger.setLevel(prior_level)
+        caplog.set_level(_logging.WARNING, logger="paramem.server.intent")
+        bank = load_exemplars(config, encoder=encoder)
 
         assert bank is not None
         assert bank.intents == [Intent.PERSONAL]

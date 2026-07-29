@@ -987,25 +987,18 @@ class TestAtomicTranscriptSlicing:
         long_transcript = "x" * 500
         raw = json.dumps({"mapping": {}, "anonymized_transcript": "unchanged"})
 
-        anonymize_logger = logging.getLogger("paramem.cloud.anonymize")
-        prior_level = anonymize_logger.level
-        anonymize_logger.setLevel(logging.WARNING)
-        anonymize_logger.addHandler(caplog.handler)
-        try:
-            with patch("paramem.cloud.anonymize.generate_answer", return_value=raw):
-                anonymize_transcript(
-                    [],
-                    model=object(),
-                    tokenizer=tokenizer,
-                    scrub={"person name"},
-                    transcript=long_transcript,
-                    token_envelope=100,  # far smaller than the transcript alone
-                    user_prompt_template=template,
-                    system_prompt="",
-                )
-        finally:
-            anonymize_logger.removeHandler(caplog.handler)
-            anonymize_logger.setLevel(prior_level)
+        caplog.set_level(logging.WARNING, logger="paramem.cloud.anonymize")
+        with patch("paramem.cloud.anonymize.generate_answer", return_value=raw):
+            anonymize_transcript(
+                [],
+                model=object(),
+                tokenizer=tokenizer,
+                scrub={"person name"},
+                transcript=long_transcript,
+                token_envelope=100,  # far smaller than the transcript alone
+                user_prompt_template=template,
+                system_prompt="",
+            )
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("clamped allowance" in r.getMessage() for r in warnings)
@@ -1177,33 +1170,26 @@ class TestDynamicVramClamp:
         transcript = "x" * 50
         raw = json.dumps({"mapping": {}, "anonymized_transcript": "unchanged"})
 
-        anonymize_logger = logging.getLogger("paramem.cloud.anonymize")
-        prior_level = anonymize_logger.level
-        anonymize_logger.setLevel(logging.WARNING)
-        anonymize_logger.addHandler(caplog.handler)
-        try:
-            with (
-                patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-                patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
-                patch("paramem.utils.vram_guard.safe_empty_cache"),
-                patch(
-                    "paramem.utils.vram_guard.torch.cuda.mem_get_info",
-                    return_value=(1 * 2**20, 8192 * 2**20),  # a handful of tokens supportable
-                ),
-            ):
-                graph = _graph([])
-                _anonymize(
-                    graph,
-                    model=object(),
-                    tokenizer=tokenizer,
-                    transcript=transcript,
-                    scrub={"person name"},
-                    token_envelope=8192,
-                    user_prompt_template=template,
-                )
-        finally:
-            anonymize_logger.removeHandler(caplog.handler)
-            anonymize_logger.setLevel(prior_level)
+        caplog.set_level(logging.WARNING, logger="paramem.cloud.anonymize")
+        with (
+            patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
+            patch("paramem.utils.vram_guard.torch.cuda.is_available", return_value=True),
+            patch("paramem.utils.vram_guard.safe_empty_cache"),
+            patch(
+                "paramem.utils.vram_guard.torch.cuda.mem_get_info",
+                return_value=(1 * 2**20, 8192 * 2**20),  # a handful of tokens supportable
+            ),
+        ):
+            graph = _graph([])
+            _anonymize(
+                graph,
+                model=object(),
+                tokenizer=tokenizer,
+                transcript=transcript,
+                scrub={"person name"},
+                token_envelope=8192,
+                user_prompt_template=template,
+            )
 
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any("effective envelope" in w and "operator ceiling 8192" in w for w in warnings), (
