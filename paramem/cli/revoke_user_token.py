@@ -149,7 +149,7 @@ def run(args: argparse.Namespace) -> int:
         I/O error, store write failure).
     """
     from paramem.server.user_tokens import UserTokenStore
-    from paramem.utils.identity import canonical, is_speaker_id
+    from paramem.utils.identity import as_speaker_id
 
     data_dir = _resolve_data_dir(args)
     if data_dir is None:
@@ -172,11 +172,12 @@ def run(args: argparse.Namespace) -> int:
 
     # --speaker: revoke all tokens for the named speaker.
     if args.speaker is not None:
-        # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0")
-        # to the canonical lowercase form so the preview match below (and the
-        # revoke_speaker() call) agree with the canonical form store.list()
-        # returns for entries minted via the same coercion.
-        speaker = canonical(args.speaker) if is_speaker_id(args.speaker) else args.speaker
+        # Ingest safety-net: resolve any cased form (e.g. "Speaker0") to the
+        # canonical form so the preview match below (and the revoke_speaker()
+        # call) agree with the form store.list() returns for entries minted
+        # through the same resolution.
+        canonical_sid = as_speaker_id(args.speaker)
+        speaker = canonical_sid if canonical_sid is not None else args.speaker
 
         # Preview what will be revoked.
         entries = store.list()

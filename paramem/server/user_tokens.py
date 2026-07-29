@@ -57,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
-from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.identity import as_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -268,17 +268,18 @@ class UserTokenStore:
         """
         if scope not in _ALLOWED_SCOPES:
             raise ValueError(f"Invalid scope {scope!r}; must be one of {_ALLOWED_SCOPES}")
-        if speaker_id is not None and not is_speaker_id(speaker_id):
-            raise ValueError(
-                f"mint: speaker_id={speaker_id!r} is not a canonical speaker{{N}} id. "
-                "Tokens must reference a canonical speaker{N} id (e.g. 'speaker0') or "
-                "pass speaker_id=None for an unattributed shared-device token."
-            )
-        # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0") a
-        # caller passes to the canonical lowercase form, mirroring
-        # ``_normalize_extraction``'s is_speaker_id-gated coercion.
-        if is_speaker_id(speaker_id):
-            speaker_id = canonical(speaker_id)
+        if speaker_id is not None:
+            # One fold decides membership and yields the stored form: a cased
+            # form ("Speaker0", "SPEAKER0") is accepted and resolved here, so
+            # every entry is keyed by the one canonical speaker{N} id.
+            canonical_sid = as_speaker_id(speaker_id)
+            if canonical_sid is None:
+                raise ValueError(
+                    f"mint: speaker_id={speaker_id!r} is not a canonical speaker{{N}} id. "
+                    "Tokens must reference a canonical speaker{N} id (e.g. 'speaker0') or "
+                    "pass speaker_id=None for an unattributed shared-device token."
+                )
+            speaker_id = canonical_sid
         token = secrets.token_urlsafe(32)
         key = _sha256hex(token)
         entry: dict = {
@@ -437,10 +438,11 @@ class UserTokenStore:
                 "unattributed tokens.  Use revoke_label() to revoke an "
                 "unattributed token by its label instead."
             )
-        # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0")
-        # so it matches the canonical lowercase form stored by mint().
-        if is_speaker_id(speaker_id):
-            speaker_id = canonical(speaker_id)
+        # Ingest safety-net: resolve any cased form so it matches the canonical
+        # form stored by mint().
+        canonical_sid = as_speaker_id(speaker_id)
+        if canonical_sid is not None:
+            speaker_id = canonical_sid
         count = 0
         with self._lock:
             for entry in self._tokens.values():

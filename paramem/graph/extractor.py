@@ -37,7 +37,7 @@ from paramem.graph.prompts import _load_prompt
 from paramem.graph.relation_build import build_relations
 from paramem.graph.schema import SessionGraph
 from paramem.models.loader import adapt_messages, base_model_inference
-from paramem.utils.identity import canonical, is_speaker_id
+from paramem.utils.identity import as_speaker_id, canonical, is_speaker_id
 from paramem.utils.tokens import estimate_tokens
 from paramem.utils.vram_guard import vram_scope
 
@@ -961,13 +961,15 @@ def _normalize_extraction(data: dict) -> dict:
             if isinstance(raw_name, list):
                 raw_name = raw_name[0] if raw_name else "unknown"
             norm["name"] = str(raw_name).strip()
-            # Ingest safety-net: canonicalize any speaker-id token at the single
-            # normalization boundary.  Extraction prompts instruct the model to
-            # emit lowercase speaker{N} directly; this coerces any residual cased
-            # form (e.g. "Speaker0") a model emits despite the instruction.
-            # ONLY speaker-id tokens are coerced — display names are untouched.
-            if is_speaker_id(norm["name"]):
-                norm["name"] = canonical(norm["name"])
+            # Ingest safety-net: resolve any speaker-id token to its canonical
+            # form at the single normalization boundary.  Extraction prompts
+            # instruct the model to emit lowercase speaker{N} directly; this
+            # resolves any residual cased form ("Speaker0", "SPEAKER0") a model
+            # emits despite the instruction.  ONLY speaker-id tokens are
+            # resolved — display names are untouched.
+            name_sid = as_speaker_id(norm["name"])
+            if name_sid is not None:
+                norm["name"] = name_sid
             raw_type = ent.get("entity_type") or ent.get("type", "concept")
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else "concept"
@@ -1018,11 +1020,14 @@ def _normalize_extraction(data: dict) -> dict:
                 raw_obj = raw_obj[0] if raw_obj else "unknown"
             subject = str(raw_subj).strip()
             obj = str(raw_obj).strip()
-            # Ingest safety-net: canonicalize any speaker-id token at this boundary.
-            if is_speaker_id(subject):
-                subject = canonical(subject)
-            if is_speaker_id(obj):
-                obj = canonical(obj)
+            # Ingest safety-net: resolve any speaker-id token to its canonical
+            # form at this boundary.
+            subj_sid = as_speaker_id(subject)
+            if subj_sid is not None:
+                subject = subj_sid
+            obj_sid = as_speaker_id(obj)
+            if obj_sid is not None:
+                obj = obj_sid
 
             # Filter self-loops (e.g. "KIT studied at KIT").  This is the sole
             # self-loop guard; the merger has none.  Comparing canonical forms

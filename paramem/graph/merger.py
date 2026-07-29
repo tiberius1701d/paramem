@@ -400,24 +400,16 @@ class GraphMerger:
             subj_surface = relation.subject
             obj_surface = relation.object
             # Fallback resolution for endpoints not present in entity_name_map:
-            # speaker endpoints (is_speaker_id) pass through verbatim — the
-            # token is already lowercase (ingest safety-net + mint guarantee).
-            # Routing through canonical_id would be semantically wrong (it also
-            # folds separators/diacritics) even though speaker ids only contain
-            # ASCII alpha+digits and the result would be identical; keep the
-            # branch so the path is explicit and not merged with non-speaker ids.
-            # Non-speaker endpoints resolve via canonical_id (node-key model A).
+            # canonical_id is the node-key fold for EVERY endpoint, speaker or
+            # not.  A speaker id is already its own canonical form, so the fold
+            # is a no-op on it and there is no separate speaker branch to keep.
             if subj_surface in entity_name_map:
                 subject = entity_name_map[subj_surface]
-            elif is_speaker_id(subj_surface):
-                subject = subj_surface
             else:
                 subject = canonical_id(subj_surface)
 
             if obj_surface in entity_name_map:
                 obj = entity_name_map[obj_surface]
-            elif is_speaker_id(obj_surface):
-                obj = obj_surface
             else:
                 obj = canonical_id(obj_surface)
 

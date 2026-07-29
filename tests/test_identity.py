@@ -24,6 +24,7 @@ lowercase-uniform refactor — speaker equality is plain ``==``.
 """
 
 from paramem.utils.identity import (
+    as_speaker_id,
     canonical,
     is_speaker_id,
     prose_fold,
@@ -252,11 +253,12 @@ class TestProseFold:
 class TestIsSpeakerId:
     """``is_speaker_id`` structural test for the ``speaker{N}`` format.
 
-    The canonical stored form is lowercase (``"speaker0"``).  The predicate
-    also accepts a leading-capital form (``"Speaker0"``) so the ingest
-    safety-net can detect and coerce it; ``"SPEAKER0"`` is NOT accepted.
-    Coercion output is always lowercase — this class only tests the
-    structural predicate, not the coercion.
+    Membership is decided on the ``canonical`` fold, so EVERY surface form is
+    accepted — ``"speaker0"``, ``"Speaker0"``, ``"SPEAKER0"``.  Speaker ids
+    carry no case rule of their own.  ``"speaker_0"`` is NOT one: ``_`` is a
+    blank under ``canonical``, so the index no longer follows the prefix
+    directly.  This class tests the predicate; :class:`TestAsSpeakerId` covers
+    the canonical form it returns.
     """
 
     def test_lowercase_single_digit(self):
@@ -294,3 +296,44 @@ class TestIsSpeakerId:
     def test_prefix_only_false(self):
         """String must ONLY contain the speaker{N} pattern, no trailing chars."""
         assert is_speaker_id("speaker0Extra") is False
+
+    def test_upper_case_accepted(self):
+        """No separate case rule — canonical folds it like any identity string."""
+        assert is_speaker_id("SPEAKER0") is True
+
+    def test_mixed_case_accepted(self):
+        assert is_speaker_id("sPeAkEr12") is True
+
+    def test_underscore_separator_false(self):
+        """``_`` is a blank under canonical — the index must follow directly."""
+        assert is_speaker_id("speaker_0") is False
+
+
+class TestAsSpeakerId:
+    """``as_speaker_id`` — the single speaker-id boundary.
+
+    Decides membership AND returns the canonical form in one fold, so no
+    caller re-folds the value.
+    """
+
+    def test_canonical_form_unchanged(self):
+        assert as_speaker_id("speaker0") == "speaker0"
+
+    def test_cased_forms_resolve_to_canonical(self):
+        assert as_speaker_id("Speaker0") == "speaker0"
+        assert as_speaker_id("SPEAKER0") == "speaker0"
+        assert as_speaker_id("sPeAkEr12") == "speaker12"
+
+    def test_idempotent(self):
+        once = as_speaker_id("SPEAKER0")
+        assert as_speaker_id(once) == once
+
+    def test_non_speaker_returns_none(self):
+        assert as_speaker_id("alex") is None
+        assert as_speaker_id("speaker") is None
+        assert as_speaker_id("speaker0Extra") is None
+        assert as_speaker_id("") is None
+
+    def test_underscore_separator_returns_none(self):
+        """``_`` folds to a blank — ``speaker_0`` is not a speaker id."""
+        assert as_speaker_id("speaker_0") is None

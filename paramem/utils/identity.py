@@ -59,10 +59,14 @@ profile key in :class:`~paramem.server.speaker.SpeakerStore`, the
 ``speaker_id`` attribute on graph nodes, and the ``speaker_id`` field on
 :class:`~paramem.graph.schema.Relation` and :class:`~paramem.memory.entry`
 objects.  Speaker equality is plain ``==`` — no bridging function is needed.
-:func:`is_speaker_id` is the structural gate for the ``speaker{N}`` format.
-The ingest safety-net in :func:`~paramem.graph.extractor._normalize_extraction`
-lowercases any matching token at the extraction boundary (a deliberate, scoped
-exception to the "extraction only `.strip()`s" rule for display entities).
+:func:`as_speaker_id` is the single gate for the ``speaker{N}`` format: it
+decides membership on the :func:`canonical` fold AND returns the canonical
+form, so speaker ids carry no case rule of their own and no caller re-folds
+the value.  :func:`is_speaker_id` is its membership half, for classifier call
+sites that do not need the value.  The ingest safety-nets
+(:func:`~paramem.graph.extractor._normalize_extraction`, token mint/revoke)
+resolve any matching token through it at their boundary — a deliberate, scoped
+exception to the "extraction only `.strip()`s" rule for display entities.
 """
 
 import unicodedata
@@ -182,47 +186,68 @@ def prose_fold(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def is_speaker_id(s: str) -> bool:
-    """Return ``True`` when *s* is a speaker-id of the form ``speaker{N}``.
+def as_speaker_id(s: str) -> str | None:
+    """Return the canonical speaker id for *s*, or ``None`` if it is not one.
 
-    The canonical stored form is lowercase (``"speaker0"``, ``"speaker12"``).
-    The prefix test is case-insensitive so the ingest safety-net can also
-    detect and coerce any residual cased form (``"Speaker0"``) that a model
-    emits — the coercion output is ALWAYS lowercase.  The structural test is
-    purely syntactic — it does NOT check whether the id corresponds to a
-    registered speaker.
+    THE speaker-id boundary: it decides membership AND returns the canonical
+    form, so a caller never re-folds the value.  Membership is tested on
+    ``canonical(s)``, so every surface form of a speaker id — ``"speaker0"``,
+    ``"Speaker0"``, ``"SPEAKER0"`` — resolves to the one stored form under the
+    same fold that produces every other identity string.  There is no second
+    case rule for speaker ids.
 
-    The index test is ``str.isdecimal``, which accepts exactly Unicode
-    category Nd — the same set the previous ``\\d`` pattern matched.
-    ``str.isdigit`` would additionally accept superscripts and is NOT
-    equivalent.
+    ``_`` and whitespace are blanks under :func:`canonical`, so ``"speaker_0"``
+    folds to ``"speaker 0"`` and is correctly NOT a speaker id — the index must
+    follow the prefix directly.  The index test is ``str.isdecimal``, which
+    accepts exactly Unicode category Nd; ``str.isdigit`` would additionally
+    accept superscripts and is NOT equivalent.
+
+    The test is purely structural — it does NOT check whether the id
+    corresponds to a registered speaker.
 
     Args:
-        s: String to test.
+        s: String to test, in any surface form.
 
     Returns:
-        ``True`` iff *s* is :data:`SPEAKER_ID_PREFIX` (in any case) followed by
-        one or more decimal digits and nothing else.  ``False`` for partial
-        matches (``"Speaker"``, ``"speaker"``, ``"alex"``, ``"SpeakerX"``) and
-        empty strings.
+        The canonical ``speaker{N}`` id, or ``None`` when *s* is not one
+        (``"Speaker"``, ``"speaker"``, ``"alex"``, ``"speaker_0"``, ``""``).
+
+    Examples::
+
+        >>> as_speaker_id("speaker0")
+        'speaker0'
+        >>> as_speaker_id("SPEAKER0")
+        'speaker0'
+        >>> as_speaker_id("speaker_0") is None
+        True
+        >>> as_speaker_id("alex") is None
+        True
+    """
+    if not s:
+        return None
+    c = canonical(s)
+    if not c.startswith(SPEAKER_ID_PREFIX):
+        return None
+    return c if c[len(SPEAKER_ID_PREFIX) :].isdecimal() else None
+
+
+def is_speaker_id(s: str) -> bool:
+    """Return ``True`` when *s* is a speaker id in any surface form.
+
+    Membership half of :func:`as_speaker_id`, for the classifier call sites
+    that only ask the question.  Where the canonical form is also needed, call
+    :func:`as_speaker_id` and use its return value — re-folding the value after
+    this returns ``True`` applies the same transformation twice.
 
     Examples::
 
         >>> is_speaker_id("speaker0")
         True
-        >>> is_speaker_id("speaker12")
-        True
-        >>> is_speaker_id("Speaker0")
+        >>> is_speaker_id("SPEAKER0")
         True
         >>> is_speaker_id("Speaker")
         False
         >>> is_speaker_id("alex")
         False
     """
-    if not s:
-        return False
-    # Only the leading character is case-tolerant, matching the previous
-    # ``[Ss]peaker`` pattern exactly: "Speaker0" passes, "SPEAKER0" does not.
-    if s[:1].lower() + s[1 : len(SPEAKER_ID_PREFIX)] != SPEAKER_ID_PREFIX:
-        return False
-    return s[len(SPEAKER_ID_PREFIX) :].isdecimal()
+    return as_speaker_id(s) is not None
