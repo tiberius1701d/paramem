@@ -1655,9 +1655,11 @@ class ConsolidationLoop:
             stamp: The sub-interval stamp (``YYYYMMDDTHHMM``).
 
         Returns:
-            Adapter name string ``f"episodic_interim_{stamp}"``.
+            Adapter name string ``"episodic_interim_<stamp>"``.
         """
-        return f"episodic_interim_{stamp}"
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+        return f"{INTERIM_NAME_PREFIX}{stamp}"
 
     def _mint_keyed_entries(
         self,

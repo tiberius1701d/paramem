@@ -307,7 +307,7 @@ def create_interim_adapter(
         Updated PeftModel (same object when the adapter already exists;
         may be re-assigned by create_adapter when adding a new adapter).
     """
-    name = f"episodic_interim_{stamp}"
+    name = f"{INTERIM_NAME_PREFIX}{stamp}"
     if name in model.peft_config:
         logger.debug("Interim adapter already exists for %s — no-op", stamp)
         return model
