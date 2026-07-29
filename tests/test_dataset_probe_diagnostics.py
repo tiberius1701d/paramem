@@ -11,16 +11,8 @@ Before _as_count was introduced, computing raw_fact_count via
 No GPU, no model load, no network access.
 """
 
-import pytest
-
-# experiments.dataset_probe imports gpu_guard transitively (via
-# experiments.utils.gpu_guard).  gpu_guard ships from lab-tools (separate
-# repo, not on PyPI); CI does not install it.  Skip the file rather than
-# erroring at collection — these unit tests don't exercise the acquire path.
-pytest.importorskip("gpu_guard")
-
-from experiments.dataset_probe import _build_session_diagnostics  # noqa: E402
-from experiments.utils.dataset_types import DatasetSession  # noqa: E402
+from experiments.dataset_probe import _build_session_diagnostics
+from experiments.utils.dataset_types import DatasetSession
 
 # ---------------------------------------------------------------------------
 # Helpers

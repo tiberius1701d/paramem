@@ -43,7 +43,6 @@ load_dotenv(_PROJECT_ROOT / ".env")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from experiments.utils.dataset_types import DatasetSession  # noqa: E402
-from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.longmemeval_loader import LongMemEvalLoader  # noqa: E402
 from experiments.utils.perltqa_loader import PerLTQALoader  # noqa: E402
 from experiments.utils.speaker_names import SpeakerNamePool  # noqa: E402
@@ -832,6 +831,11 @@ def main() -> None:
         plausibility_judge = "auto"
 
     # --- 5. Acquire GPU + model ---
+    # Imported here, not at module scope: gpu_guard ships from lab-tools (a
+    # separate repo, not on PyPI) and is absent in CI.  Keeping it off the
+    # import path lets this module's pure logic be unit-tested there.
+    from experiments.utils.gpu_guard import acquire_gpu
+
     with acquire_gpu():
         logger.info("GPU acquired")
         wait_for_cooldown(52)
