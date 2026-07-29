@@ -510,7 +510,7 @@ class TestAdaptersFactoryDefaultMerge:
 class TestAdapterDropoutConfig:
     """``adapters.<tier>.dropout`` is a live yaml key (operator-settable).
 
-    Not a shape field (``paramem.models.loader._lora_shape_fields``
+    Not a shape field (``paramem.models.loader.lora_shape_fields``
     deliberately excludes it, ``ensure_adapter_matching`` never recreates a
     resident adapter for a dropout-only edit) — so it carries no
     ``target_modules``-style refuse-loud guard, only a value range check.

@@ -65,6 +65,7 @@ from paramem.models.loader import (
     create_adapter,
     load_adapter,
     load_base_model,
+    lora_shape_fields,
     save_adapter,
     switch_adapter,
     unload_model,
@@ -77,6 +78,11 @@ from paramem.server.gpu_lock import gpu_lock_sync
 
 # --- training -------------------------------------------------------------
 from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.donor import (
+    DONOR_RECIPE_ID,
+    donor_slot_valid,
+    triples_hash,
+)
 from paramem.training.early_stop import EarlyStopPolicy
 from paramem.training.recall_eval import evaluate_indexed_recall, probe_entries
 from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
@@ -142,4 +148,8 @@ __all__ = [
     "ModelConfig",
     "TrainingConfig",
     "budget_for",
+    "DONOR_RECIPE_ID",
+    "donor_slot_valid",
+    "triples_hash",
+    "lora_shape_fields",
 ]

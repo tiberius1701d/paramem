@@ -462,7 +462,7 @@ def compute_tier_diff(live_yaml: dict, candidate_yaml: dict) -> list[TierDiffRow
 # Canned consequence strings per field — describes the blast radius of each shape change.
 #
 # `dropout` is deliberately absent: it is training-time regularization, not
-# tensor shape/topology (paramem.models.loader._lora_shape_fields excludes
+# tensor shape/topology (paramem.models.loader.lora_shape_fields excludes
 # it, and ensure_adapter_matching / _check_manifest_fingerprints never
 # compare it against a resident adapter), so it never causes the
 # weight-discard-on-migrate-accept consequence described below and must not

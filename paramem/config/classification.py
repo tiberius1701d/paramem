@@ -88,7 +88,7 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "adapters.*.alpha": Tier.DESTRUCTIVE,
     "adapters.*.learning_rate": Tier.PIPELINE_ALTERING,
     # dropout is training-time regularization, not tensor shape/topology —
-    # paramem.models.loader._lora_shape_fields deliberately excludes it, and
+    # paramem.models.loader.lora_shape_fields deliberately excludes it, and
     # ensure_adapter_matching/_check_manifest_fingerprints never compare it,
     # so it carries the same "affects future training only" blast radius as
     # learning_rate, not rank/alpha's weight-discarding one.

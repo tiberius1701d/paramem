@@ -391,7 +391,7 @@ def _load_fixture() -> list[dict]:
 def donor_topology_id(lora_shape: dict) -> str:
     """Canonical, filesystem-safe identity of a LoRA topology.
 
-    Sole input: a :func:`~paramem.models.loader._lora_shape_fields` dict
+    Sole input: a :func:`~paramem.models.loader.lora_shape_fields` dict
     (the project's single topology descriptor). ``target_modules`` is
     sorted, matching ``ensure_adapter_matching``'s set comparison
     (``paramem.models.loader``, ``ensure_adapter_matching``) — module
@@ -399,7 +399,7 @@ def donor_topology_id(lora_shape: dict) -> str:
 
     Args:
         lora_shape: ``{"r", "lora_alpha", "target_modules"}`` as returned
-            by :func:`~paramem.models.loader._lora_shape_fields`.
+            by :func:`~paramem.models.loader.lora_shape_fields`.
 
     Returns:
         A string of the form ``r{rank}-a{alpha}-{n}mod-{digest}`` where
@@ -469,7 +469,7 @@ def donor_store_dir(adapter_root: "Path | str", base_model_id: str, lora_shape: 
         adapter_root: The adapter root whose donor stores this resolves
             against — ``ConsolidationLoop.donor_adapter_root``.
         base_model_id: The base model's ``config._name_or_path``.
-        lora_shape: The target tier's :func:`~paramem.models.loader._lora_shape_fields`
+        lora_shape: The target tier's :func:`~paramem.models.loader.lora_shape_fields`
             dict — determines which topology this resolves to.
     """
     store_name = (
@@ -478,7 +478,7 @@ def donor_store_dir(adapter_root: "Path | str", base_model_id: str, lora_shape: 
     return Path(adapter_root) / store_name
 
 
-def _triples_hash(entries: list[dict]) -> str:
+def triples_hash(entries: list[dict]) -> str:
     """Canonical SHA-256 hex digest of a donor triple set.
 
     Order-independent: entries are reduced to ``(key, subject, predicate,
@@ -501,7 +501,7 @@ def _manifest_lora_shape(manifest) -> dict:
     """Return a :func:`donor_topology_id`-shaped dict from a manifest's ``lora``.
 
     One direction only: the manifest is the recorded shape, and
-    :func:`~paramem.models.loader._lora_shape_fields` is the live one. Both
+    :func:`~paramem.models.loader.lora_shape_fields` is the live one. Both
     feed the SAME :func:`donor_topology_id`, so there is one topology
     comparison, not two shape schemas.
     """
@@ -527,7 +527,7 @@ def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_sh
             weights do not transfer across bases, and an unresolved id means
             the comparison cannot be trusted either way.
         lora_shape: The TARGET tier's shape fields, from
-            :func:`~paramem.models.loader._lora_shape_fields` (rank, alpha,
+            :func:`~paramem.models.loader.lora_shape_fields` (rank, alpha,
             target_modules — the SAME function ``ensure_adapter_matching``
             compares a resident adapter against; one implementation, not a
             second shape check), compared against the slot manifest's own
@@ -555,7 +555,7 @@ def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_sh
     equals the current shape's topology id — order-insensitive on
     ``target_modules``;
     (6) regeneration -- ``donor_entries(meta["seed"], meta["n_requested"])``,
-    canonically hashed (:func:`_triples_hash`), matches the recorded hash.
+    canonically hashed (:func:`triples_hash`), matches the recorded hash.
     Checkpoints written before ``triples_hash`` existed in the meta schema
     (additive, no schema break) are compared by hashing their own recorded
     ``meta["triples"]`` instead of requiring the new field. A regeneration
@@ -589,17 +589,35 @@ def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_sh
         other malformed meta shape (see above), or a regeneration hash
         mismatch. ``True`` only when every check passes.
     """
-    from paramem.adapters.manifest import (
-        ManifestError,
-        find_live_slot,
-        read_manifest,
-    )
+    from paramem.adapters.manifest import find_live_slot
 
     if base_model_id is None:
         return False
     slot = find_live_slot(Path(store_dir), "")
     if slot is None:
         return False
+    return donor_slot_valid(slot, base_model_id, lora_shape)
+
+
+def donor_slot_valid(slot: Path, base_model_id: "str | None", lora_shape: dict) -> bool:
+    """True when ONE donor slot is valid for *base_model_id* and *lora_shape*.
+
+    The whole of the validity rule; :func:`donor_checkpoint_valid` is the
+    store-scoped entry point that resolves the live slot and delegates here.
+    Split out because a donor slot is also handled outside a store — a
+    detached slot path, or a copy of one — and those callers must apply the
+    SAME rule rather than re-implement a weaker version of it
+    (``experiments/test20_smallN_cold_gate.py`` verifies both a
+    ``--donor-checkpoint`` slot and its own scratch copytree this way).
+
+    Same never-raise contract and same checks as
+    :func:`donor_checkpoint_valid` — see that function's docstring.
+    """
+    from paramem.adapters.manifest import ManifestError, read_manifest
+
+    if base_model_id is None:
+        return False
+    slot = Path(slot)
     meta_path = slot / DONOR_META_FILENAME
     weights_path = slot / "adapter_model.safetensors"
     if not meta_path.exists() or not weights_path.exists():
@@ -637,14 +655,14 @@ def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_sh
             return False
 
         regenerated = donor_entries(seed, n_requested)
-        regenerated_hash = _triples_hash(regenerated)
+        regenerated_hash = triples_hash(regenerated)
 
         recorded_hash = meta.get("triples_hash")
         if recorded_hash is None:
             recorded_triples = meta.get("triples")
             if recorded_triples is None:
                 return False
-            recorded_hash = _triples_hash(recorded_triples)
+            recorded_hash = triples_hash(recorded_triples)
     except (TypeError, KeyError, ValueError, AttributeError):
         # Boundary error handling for an on-disk artifact whose shape is
         # not guaranteed: donor_meta.json can be malformed in ways that
@@ -653,7 +671,7 @@ def donor_checkpoint_valid(store_dir: Path, base_model_id: "str | None", lora_sh
         # recorded as a non-numeric string (TypeError from donor_entries'
         # arithmetic), triples recorded as list-shaped entries instead of
         # dicts, or an entry missing one of key/subject/predicate/object
-        # (both raise from _triples_hash's e["..."] indexing), or a
+        # (both raise from triples_hash's e["..."] indexing), or a
         # recorded n_requested below DONOR_MIN_ENTRIES (ValueError from
         # donor_entries itself). Every one of these must read as "cannot
         # verify" -> invalid, never propagate -- this function's contract
@@ -1034,7 +1052,7 @@ def build_donor(
     which is what lets ``find_live_slot`` resolve the promoted slot.
     ``donor_meta.json`` alongside it carries only what is donor-specific
     (seed, recipe, the resulting triple set, its canonical hash
-    (:func:`_triples_hash`, read back by :func:`donor_checkpoint_valid`'s
+    (:func:`triples_hash`, read back by :func:`donor_checkpoint_valid`'s
     regeneration check), and the weights SHA-256 that same function
     verifies the bytes against) — never a second copy of the base model or
     shape. Every other slot within the SAME store is then pruned through
@@ -1071,16 +1089,16 @@ def build_donor(
     from paramem.adapters.manifest import build_manifest_for
     from paramem.backup.backup import sweep_orphan_pending
     from paramem.models.loader import (
-        _lora_shape_fields,
         atomic_save_adapter,
         create_adapter,
+        lora_shape_fields,
         switch_adapter,
     )
 
     entries = donor_entries(seed, n)
     base_model_id = getattr(loop.model.get_base_model().config, "_name_or_path", None)
 
-    lora_shape = _lora_shape_fields(adapter_config)
+    lora_shape = lora_shape_fields(adapter_config)
     store_dir = donor_store_dir(loop.donor_adapter_root, base_model_id, lora_shape)
     sweep_orphan_pending(store_dir)
     build_name = DONOR_BUILD_ADAPTER_NAME
@@ -1135,7 +1153,7 @@ def build_donor(
             "recipe": DONOR_RECIPE_ID,
             "n_requested": n,
             "triples": entries,
-            "triples_hash": _triples_hash(entries),
+            "triples_hash": triples_hash(entries),
             "weights_sha256": weights_sha256,
         }
         (final_slot / DONOR_META_FILENAME).write_text(json.dumps(meta))

@@ -19,11 +19,11 @@ from paramem.training.donor import (
     DONOR_META_FILENAME,
     DONOR_MIN_ENTRIES,
     DONOR_RECIPE_ID,
-    _triples_hash,
     donor_checkpoint_valid,
     donor_entries,
     donor_store_dir,
     iter_donor_stores,
+    triples_hash,
 )
 from scripts.migrate.relocate_donor_adapters import relocate
 
@@ -98,7 +98,7 @@ def _write_legacy_donor(
                 "recipe": DONOR_RECIPE_ID,
                 "n_requested": DONOR_MIN_ENTRIES,
                 "triples": entries,
-                "triples_hash": _triples_hash(entries),
+                "triples_hash": triples_hash(entries),
                 "weights_sha256": hashlib.sha256(_WEIGHTS).hexdigest(),
                 "base_model_id": base_repo,
                 "lora_shape": _LORA_SHAPE,

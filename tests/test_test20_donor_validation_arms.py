@@ -32,6 +32,7 @@ import pytest
 
 from experiments.test20_smallN_cold_gate import (
     DONOR_BUILD_MARKER_FILENAME,
+    DONOR_BUILD_PROVENANCE_FILENAME,
     DONOR_BUILD_SMOKE_SEED_MARKER_FILENAME,
     DONOR_META_FILENAME,
     _build_donor_checkpoint,
@@ -48,22 +49,112 @@ from experiments.test20_smallN_cold_gate import (
 from paramem.server.config import load_server_config
 from paramem.utils.config import AdapterConfig, TrainingConfig, budget_for
 
+_BASE_ID = "test/base-model"
+_LORA_SHAPE = {"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}
+# (base_model_id, lora_shape) — what _read_donor_meta verifies a slot against.
+_VERIFY = (_BASE_ID, _LORA_SHAPE)
 
-def _write_slot(tmp_path: Path, name: str, weights: bytes = b"fake-weights") -> Path:
-    """Create a donor checkpoint slot with real weights + a matching, valid
-    ``donor_meta.json`` — the shape both ``_read_donor_meta`` and every
-    ``_resolve_donor_source`` reuse branch require."""
+
+def _write_slot(
+    tmp_path: Path,
+    name: str,
+    weights: bytes = b"fake-weights",
+    *,
+    provenance: bool = True,
+) -> Path:
+    """Create a slot that satisfies the PRODUCTION donor contract.
+
+    ``_read_donor_meta`` now verifies through
+    ``paramem.training.donor.donor_slot_valid`` — the same rule the production
+    seeding hook applies — so a fixture slot needs what any donor slot needs:
+    a ``meta.json`` manifest carrying the base model and LoRA shape, and a
+    ``donor_meta.json`` whose recorded triple set regenerates from its seed
+    and whose digest matches the weights on disk.
+
+    *provenance* writes this script's own build-provenance file alongside;
+    ``False`` produces the shape a PRODUCTION-built donor has (valid, but with
+    no build fields to report).
+    """
+    from paramem.adapters.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+        AdapterManifest,
+        BaseModelFingerprint,
+        LoRAShape,
+        TokenizerFingerprint,
+        write_manifest,
+    )
+    from paramem.training.donor import (
+        DONOR_MIN_ENTRIES,
+        DONOR_RECIPE_ID,
+        donor_entries,
+        triples_hash,
+    )
+
     slot = tmp_path / name
     slot.mkdir()
     (slot / "adapter_model.safetensors").write_bytes(weights)
-    meta = {
-        "seed": 42,
-        "n_entries": 128,
-        "epochs": 30,
-        "weights_sha256": hashlib.sha256(weights).hexdigest(),
-    }
-    (slot / DONOR_META_FILENAME).write_text(json.dumps(meta))
+    write_manifest(
+        slot,
+        AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=name,
+            trained_at="2026-01-01T00:00:00Z",
+            base_model=BaseModelFingerprint(repo=_BASE_ID, sha="abc", hash="sha256:def"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path=_BASE_ID, vocab_size=32768, merges_hash="feed"
+            ),
+            lora=LoRAShape(
+                rank=_LORA_SHAPE["r"],
+                alpha=_LORA_SHAPE["lora_alpha"],
+                dropout=0.0,
+                target_modules=tuple(_LORA_SHAPE["target_modules"]),
+            ),
+            registry_sha256="",
+            key_count=0,
+            synthesized=False,
+            window_stamp="",
+        ),
+    )
+    entries = donor_entries(42, DONOR_MIN_ENTRIES)
+    (slot / DONOR_META_FILENAME).write_text(
+        json.dumps(
+            {
+                "seed": 42,
+                "recipe": DONOR_RECIPE_ID,
+                "n_requested": DONOR_MIN_ENTRIES,
+                "triples": entries,
+                "triples_hash": triples_hash(entries),
+                "weights_sha256": hashlib.sha256(weights).hexdigest(),
+            }
+        )
+    )
+    if provenance:
+        (slot / DONOR_BUILD_PROVENANCE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "n_entries": len(entries),
+                    "epochs": 30,
+                    "gradient_accumulation_steps": 2,
+                    "realized_optimizer_steps": 2220,
+                    "wall_train_seconds": 123.4,
+                }
+            )
+        )
     return slot
+
+
+def _stub_model():
+    """Model stub whose ``_donor_verification_context`` yields ``_BASE_ID``."""
+    return SimpleNamespace(config=SimpleNamespace(_name_or_path=_BASE_ID))
+
+
+def _stub_adapter_config() -> AdapterConfig:
+    """AdapterConfig whose ``lora_shape_fields`` yields ``_LORA_SHAPE``."""
+    return AdapterConfig(
+        rank=_LORA_SHAPE["r"],
+        alpha=_LORA_SHAPE["lora_alpha"],
+        target_modules=list(_LORA_SHAPE["target_modules"]),
+    )
 
 
 class TestConditionLabel:
@@ -119,9 +210,9 @@ class TestReadDonorMeta:
 
     def test_valid_slot_returns_meta(self, tmp_path):
         slot = _write_slot(tmp_path, "valid_slot", weights=b"real-donor-weights")
-        meta = _read_donor_meta(slot)
+        meta = _read_donor_meta(slot, *_VERIFY)
         assert meta["seed"] == 42
-        assert meta["n_entries"] == 128
+        assert meta["n_entries"] == 147
         assert meta["epochs"] == 30
         assert meta["weights_sha256"] == hashlib.sha256(b"real-donor-weights").hexdigest()
 
@@ -130,14 +221,14 @@ class TestReadDonorMeta:
         slot.mkdir()
         (slot / "adapter_model.safetensors").write_bytes(b"weights")
         with pytest.raises(SystemExit, match=DONOR_META_FILENAME):
-            _read_donor_meta(slot)
+            _read_donor_meta(slot, *_VERIFY)
 
     def test_sha_mismatch_raises(self, tmp_path):
         slot = _write_slot(tmp_path, "tampered_slot", weights=b"original-weights")
         # Simulate post-build corruption/modification.
         (slot / "adapter_model.safetensors").write_bytes(b"tampered-weights")
-        with pytest.raises(SystemExit, match="mismatch"):
-            _read_donor_meta(slot)
+        with pytest.raises(SystemExit, match="digest that no longer matches"):
+            _read_donor_meta(slot, *_VERIFY)
 
 
 class TestResolveDonorSource:
@@ -158,9 +249,9 @@ class TestResolveDonorSource:
             "experiments.test20_smallN_cold_gate._build_donor_checkpoint", build_mock
         )
 
-        model = object()
+        model = _stub_model()
         result_model, result_slot, built_fresh, donor_meta = _resolve_donor_source(
-            str(slot), run_dir, model, MagicMock(), MagicMock(), MagicMock()
+            str(slot), run_dir, model, MagicMock(), _stub_adapter_config(), MagicMock()
         )
 
         assert result_model is model
@@ -178,7 +269,12 @@ class TestResolveDonorSource:
 
         with pytest.raises(SystemExit, match="adapter_model.safetensors"):
             _resolve_donor_source(
-                str(empty_dir), run_dir, object(), MagicMock(), MagicMock(), MagicMock()
+                str(empty_dir),
+                run_dir,
+                _stub_model(),
+                MagicMock(),
+                _stub_adapter_config(),
+                MagicMock(),
             )
 
     def test_external_checkpoint_sha_mismatch_fails_loud(self, tmp_path):
@@ -190,9 +286,9 @@ class TestResolveDonorSource:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
 
-        with pytest.raises(SystemExit, match="mismatch"):
+        with pytest.raises(SystemExit, match="digest that no longer matches"):
             _resolve_donor_source(
-                str(slot), run_dir, object(), MagicMock(), MagicMock(), MagicMock()
+                str(slot), run_dir, _stub_model(), MagicMock(), _stub_adapter_config(), MagicMock()
             )
 
     def test_reuses_existing_build_marker_without_rebuilding(self, tmp_path, monkeypatch):
@@ -211,9 +307,9 @@ class TestResolveDonorSource:
             "experiments.test20_smallN_cold_gate._build_donor_checkpoint", build_mock
         )
 
-        model = object()
+        model = _stub_model()
         result_model, result_slot, built_fresh, donor_meta = _resolve_donor_source(
-            None, run_dir, model, MagicMock(), MagicMock(), MagicMock()
+            None, run_dir, model, MagicMock(), _stub_adapter_config(), MagicMock()
         )
 
         assert result_model is model
@@ -229,7 +325,9 @@ class TestResolveDonorSource:
         (run_dir / DONOR_BUILD_MARKER_FILENAME).write_text(json.dumps(marker))
 
         with pytest.raises(SystemExit, match="Donor build marker"):
-            _resolve_donor_source(None, run_dir, object(), MagicMock(), MagicMock(), MagicMock())
+            _resolve_donor_source(
+                None, run_dir, _stub_model(), MagicMock(), _stub_adapter_config(), MagicMock()
+            )
 
     def test_builds_fresh_and_writes_marker_when_nothing_exists(self, tmp_path, monkeypatch):
         run_dir = tmp_path / "run"
@@ -247,9 +345,9 @@ class TestResolveDonorSource:
             "experiments.test20_smallN_cold_gate._build_donor_checkpoint", build_mock
         )
 
-        input_model = object()
+        input_model = _stub_model()
         tokenizer = MagicMock()
-        adapter_config = MagicMock()
+        adapter_config = _stub_adapter_config()
         training_config = MagicMock()
         result_model, result_slot, built_fresh, donor_meta = _resolve_donor_source(
             None, run_dir, input_model, tokenizer, adapter_config, training_config
@@ -295,13 +393,13 @@ class TestResolveDonorSource:
         )
 
         _, _, built_fresh_1, _ = _resolve_donor_source(
-            None, run_dir, object(), MagicMock(), MagicMock(), MagicMock()
+            None, run_dir, _stub_model(), MagicMock(), _stub_adapter_config(), MagicMock()
         )
         assert build_mock.call_count == 1
         assert built_fresh_1 is True
 
         _, _, built_fresh_2, _ = _resolve_donor_source(
-            None, run_dir, object(), MagicMock(), MagicMock(), MagicMock()
+            None, run_dir, _stub_model(), MagicMock(), _stub_adapter_config(), MagicMock()
         )
         assert build_mock.call_count == 1  # not called again
         assert built_fresh_2 is False
@@ -484,11 +582,49 @@ def _donor_build_env(tmp_path, monkeypatch):
         ),
     )
 
-    def _fake_atomic_save_adapter(model, checkpoint_root, adapter_name):
+    def _fake_atomic_save_adapter(model, checkpoint_root, adapter_name, *, manifest=None):
+        from paramem.adapters.manifest import write_manifest
+
         slot = checkpoint_root / "20260726-000000"
         slot.mkdir(parents=True)
         (slot / "adapter_model.safetensors").write_bytes(b"donor-weights")
+        if manifest is not None:
+            write_manifest(slot, manifest)
         return slot
+
+    def _fake_build_manifest_for(model, tokenizer, adapter_name, **kwargs):
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+        )
+
+        return AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=adapter_name,
+            trained_at="2026-07-26T00:00:00Z",
+            base_model=BaseModelFingerprint(repo=_BASE_ID, sha="abc", hash="sha256:def"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path=_BASE_ID, vocab_size=32768, merges_hash="feed"
+            ),
+            lora=LoRAShape(
+                rank=_LORA_SHAPE["r"],
+                alpha=_LORA_SHAPE["lora_alpha"],
+                dropout=0.0,
+                target_modules=tuple(_LORA_SHAPE["target_modules"]),
+            ),
+            registry_sha256=kwargs.get("registry_sha256_override") or "",
+            key_count=kwargs.get("key_count", 0),
+            synthesized=False,
+            window_stamp="",
+        )
+
+    monkeypatch.setattr(
+        "experiments.test20_smallN_cold_gate.build_manifest_for",
+        MagicMock(side_effect=_fake_build_manifest_for),
+    )
 
     monkeypatch.setattr(
         "experiments.test20_smallN_cold_gate.atomic_save_adapter",
@@ -521,7 +657,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
         )
 
         model, slot, donor_summary = _build_donor_checkpoint(
-            object(),
+            _stub_model(),
             MagicMock(),
             AdapterConfig(),
             base_training_config,
@@ -545,7 +681,7 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
         )
 
         model, slot, donor_summary = _build_donor_checkpoint(
-            object(),
+            _stub_model(),
             MagicMock(),
             AdapterConfig(),
             base_training_config,
@@ -554,48 +690,50 @@ class TestBuildDonorCheckpointDerivesOwnBudget:
 
         assert donor_summary["gradient_accumulation_steps"] == expected_accum
         assert donor_summary["realized_optimizer_steps"] == expected_steps
+        # Build measurements live in this script's own provenance file...
+        provenance = json.loads((slot / DONOR_BUILD_PROVENANCE_FILENAME).read_text())
+        assert provenance["gradient_accumulation_steps"] == expected_accum
+        assert provenance["realized_optimizer_steps"] == expected_steps
+        # ...while donor_meta.json carries the production donor identity only.
         meta = json.loads((slot / DONOR_META_FILENAME).read_text())
-        assert meta["gradient_accumulation_steps"] == expected_accum
-        assert meta["realized_optimizer_steps"] == expected_steps
         assert meta["weights_sha256"] == donor_summary["weights_sha256"]
+        assert meta["recipe"]
+        assert "gradient_accumulation_steps" not in meta
 
 
-class TestReadDonorMetaToleratesMissingAccumFields:
-    """``_read_donor_meta`` must NOT fail loud when a slot predates
-    ``gradient_accumulation_steps``/``realized_optimizer_steps`` tracking —
-    a pre-existing ``--donor-checkpoint`` reused by a newer harness
-    invocation has neither field."""
+class TestReadDonorMetaBuildProvenance:
+    """Donor identity and this script's build measurements are separate files,
+    so a slot built by PRODUCTION is a valid donor that simply carries no build
+    provenance — reported as null, never fabricated."""
 
-    def test_slot_without_new_fields_reads_successfully(self, tmp_path, monkeypatch):
+    def test_build_fields_come_from_the_provenance_file(self, tmp_path):
+        slot = _write_slot(tmp_path, "own_build")
+
+        result = _read_donor_meta(slot, *_VERIFY)
+
+        assert result["seed"] == 42
+        assert result["epochs"] == 30
+        assert result["gradient_accumulation_steps"] == 2
+        assert result["realized_optimizer_steps"] == 2220
+        assert result["wall_train_seconds"] == 123.4
+
+    def test_production_built_slot_is_valid_with_null_build_fields(self, tmp_path, monkeypatch):
         # caplog is unreliable in this environment (a third-party pytest
         # plugin reconfigures the logging module during collection), so
-        # the info-log assertion patches the module's logger directly
-        # instead of relying on log capture.
+        # the info-log assertion patches the module's logger directly.
         info_mock = MagicMock()
         monkeypatch.setattr("experiments.test20_smallN_cold_gate.logger.info", info_mock)
 
-        slot = _write_slot(tmp_path, "legacy_slot")
-        meta = json.loads((slot / DONOR_META_FILENAME).read_text())
-        assert "gradient_accumulation_steps" not in meta
-        assert "realized_optimizer_steps" not in meta
+        slot = _write_slot(tmp_path, "production_slot", provenance=False)
 
-        result = _read_donor_meta(slot)
+        result = _read_donor_meta(slot, *_VERIFY)
 
         assert result["seed"] == 42
+        assert result["n_entries"] == 147
+        assert result["epochs"] is None
+        assert result["realized_optimizer_steps"] is None
         assert info_mock.called
-        logged_message = info_mock.call_args[0][0]
-        assert "predates" in logged_message
-
-    def test_slot_with_new_fields_reads_successfully(self, tmp_path):
-        slot = _write_slot(tmp_path, "modern_slot")
-        meta = json.loads((slot / DONOR_META_FILENAME).read_text())
-        meta["gradient_accumulation_steps"] = 2
-        meta["realized_optimizer_steps"] = 330
-        (slot / DONOR_META_FILENAME).write_text(json.dumps(meta))
-
-        result = _read_donor_meta(slot)
-        assert result["gradient_accumulation_steps"] == 2
-        assert result["realized_optimizer_steps"] == 330
+        assert "provenance" in info_mock.call_args[0][0]
 
 
 class TestDonorBuildSmokeConflictingFlagsDerivedFromParser:
@@ -693,7 +831,7 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
         slot = tmp_path / "slot"
         slot.mkdir()
         build_mock = MagicMock(
-            return_value=(object(), slot, False, {"seed": 42, "n_entries": 147, "epochs": 30})
+            return_value=(_stub_model(), slot, False, {"seed": 42, "n_entries": 147, "epochs": 30})
         )
         monkeypatch.setattr(
             "experiments.test20_smallN_cold_gate._build_or_reuse_own_donor_checkpoint", build_mock
@@ -703,7 +841,7 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
 
         cfg = load_server_config("tests/fixtures/server.yaml")
         result = _run_donor_build_smoke(
-            object(),
+            _stub_model(),
             MagicMock(),
             cfg,
             run_dir,
@@ -735,7 +873,7 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
         slot.mkdir()
         (slot / "adapter_model.safetensors").write_bytes(b"weights")
         build_mock = MagicMock(
-            return_value=(object(), slot, False, {"seed": 42, "n_entries": 147, "epochs": 30})
+            return_value=(_stub_model(), slot, False, {"seed": 42, "n_entries": 147, "epochs": 30})
         )
         monkeypatch.setattr(
             "experiments.test20_smallN_cold_gate._build_or_reuse_own_donor_checkpoint", build_mock
@@ -771,7 +909,7 @@ class TestRunDonorBuildSmokeTwoMarkerResume:
 
         cfg = load_server_config("tests/fixtures/server.yaml")
         result = _run_donor_build_smoke(
-            object(),
+            _stub_model(),
             MagicMock(),
             cfg,
             run_dir,

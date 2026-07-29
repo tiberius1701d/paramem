@@ -7015,7 +7015,7 @@ class ConsolidationLoop:
                 is needed, which topology :func:`~paramem.training.donor.build_donor`
                 writes into.
         """
-        from paramem.models.loader import _lora_shape_fields
+        from paramem.models.loader import lora_shape_fields
         from paramem.training.donor import (
             DONOR_LOAD_ADAPTER_NAME,
             DonorBuildIncomplete,
@@ -7042,7 +7042,7 @@ class ConsolidationLoop:
         # shape catches an operator rank/target-modules edit BEFORE
         # copy_adapter_weights would hit a tensor-shape mismatch and abort
         # the fold.
-        lora_shape = _lora_shape_fields(adapter_config)
+        lora_shape = lora_shape_fields(adapter_config)
         store_dir = donor_store_dir(self.donor_adapter_root, base_model_id, lora_shape)
         if not donor_checkpoint_valid(store_dir, base_model_id, lora_shape):
             if self._borrowed_donor_cache:

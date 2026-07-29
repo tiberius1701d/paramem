@@ -31,7 +31,6 @@ from paramem.training.donor import (
     DONOR_RECIPE_LEARNING_RATE,
     DONOR_STORE_PREFIX,
     DonorBuildIncomplete,
-    _triples_hash,
     build_donor,
     donor_checkpoint_valid,
     donor_entries,
@@ -39,6 +38,7 @@ from paramem.training.donor import (
     donor_topology_id,
     iter_donor_stores,
     load_donor_into_transient_slot,
+    triples_hash,
 )
 from paramem.utils.config import AdapterConfig, TrainingConfig
 
@@ -147,7 +147,7 @@ def _write_donor_slot(
     lora_shape: dict | None = None,
     seed: int = 1,
     n_requested: int = DONOR_MIN_ENTRIES,
-    triples_hash: "str | None" = "__auto__",
+    triples_hash_override: "str | None" = "__auto__",
     weights_sha256: "str | None" = "__auto__",
     recipe: "str | None" = DONOR_RECIPE_ID,
     meta_text: str | None = None,
@@ -161,7 +161,7 @@ def _write_donor_slot(
     construction, so a caller exercising only ``base_model_id``/
     ``lora_shape`` logic gets a slot that also passes
     ``donor_checkpoint_valid``'s regeneration check without having to think
-    about it. ``triples_hash="__auto__"`` (default) computes the correct
+    about it. ``triples_hash_override="__auto__"`` (default) computes the correct
     hash; pass ``None`` to omit the field entirely (exercises the
     pre-``triples_hash``-schema compatibility path, which falls back to
     hashing the recorded ``triples``); pass an explicit string to force a
@@ -189,10 +189,10 @@ def _write_donor_slot(
         }
         if recipe is not None:
             meta["recipe"] = recipe
-        if triples_hash == "__auto__":
-            meta["triples_hash"] = _triples_hash(entries)
-        elif triples_hash is not None:
-            meta["triples_hash"] = triples_hash
+        if triples_hash_override == "__auto__":
+            meta["triples_hash"] = triples_hash(entries)
+        elif triples_hash_override is not None:
+            meta["triples_hash"] = triples_hash_override
         if weights_sha256 == "__auto__":
             meta["weights_sha256"] = hashlib.sha256(weights).hexdigest()
         elif weights_sha256 is not None:
@@ -574,7 +574,7 @@ class TestDonorCheckpointRegenerationCheck:
             base_model_id=_BASE_ID,
             seed=7,
             n_requested=DONOR_MIN_ENTRIES,
-            triples_hash=None,
+            triples_hash_override=None,
         )
         assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is True
 
@@ -590,7 +590,7 @@ class TestDonorCheckpointRegenerationCheck:
             base_model_id=_BASE_ID,
             seed=7,
             n_requested=DONOR_MIN_ENTRIES,
-            triples_hash="0" * 64,  # deliberately wrong
+            triples_hash_override="0" * 64,  # deliberately wrong
         )
         assert donor_checkpoint_valid(ckpt, _BASE_ID, _LORA_SHAPE) is False
 
@@ -707,14 +707,14 @@ class TestDonorCheckpointRegenerationCheck:
 
 
 class TestTriplesHash:
-    """_triples_hash is a pure, order-independent canonical hash."""
+    """triples_hash is a pure, order-independent canonical hash."""
 
     def test_order_independent_for_shuffled_input(self):
         entries = donor_entries(seed=3, n=DONOR_MIN_ENTRIES)
         shuffled = list(entries)
         random.Random(99).shuffle(shuffled)
         assert shuffled != entries, "shuffle must actually reorder for this to be a real test"
-        assert _triples_hash(entries) == _triples_hash(shuffled)
+        assert triples_hash(entries) == triples_hash(shuffled)
 
 
 class TestDonorTopologyId:
@@ -784,13 +784,13 @@ class TestDonorTopologyId:
         the shipped test fixture carries -- episodic and semantic (both
         attention-only) collapse to ONE topology id; procedural
         (attention+MLP) is a distinct second one."""
-        from paramem.models.loader import _lora_shape_fields
+        from paramem.models.loader import lora_shape_fields
         from paramem.server.config import load_server_config
 
         cfg = load_server_config("tests/fixtures/server.yaml")
-        episodic_id = donor_topology_id(_lora_shape_fields(cfg.episodic_adapter_config))
-        semantic_id = donor_topology_id(_lora_shape_fields(cfg.semantic_adapter_config))
-        procedural_id = donor_topology_id(_lora_shape_fields(cfg.procedural_adapter_config))
+        episodic_id = donor_topology_id(lora_shape_fields(cfg.episodic_adapter_config))
+        semantic_id = donor_topology_id(lora_shape_fields(cfg.semantic_adapter_config))
+        procedural_id = donor_topology_id(lora_shape_fields(cfg.procedural_adapter_config))
 
         assert episodic_id == semantic_id
         assert procedural_id != episodic_id
@@ -998,7 +998,7 @@ class TestBuildDonor:
         assert meta["weights_sha256"] == expected_sha
         # triples_hash is the canonical hash of the SAME recorded triples --
         # donor_checkpoint_valid's regeneration check reads this field.
-        assert meta["triples_hash"] == _triples_hash(meta["triples"])
+        assert meta["triples_hash"] == triples_hash(meta["triples"])
         # Base model and shape belong to the manifest and are NOT duplicated.
         assert "base_model_id" not in meta
         assert "lora_shape" not in meta

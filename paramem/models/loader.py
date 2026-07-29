@@ -474,7 +474,7 @@ def unload_model(model, tokenizer=None) -> None:
     logger.info("Model unloaded, CUDA cache cleared")
 
 
-def _lora_shape_fields(adapter_config: AdapterConfig) -> dict:
+def lora_shape_fields(adapter_config: AdapterConfig) -> dict:
     """Return the ``AdapterConfig`` fields that determine a LoRA adapter's
     tensor topology: ``r`` (rank — determines tensor shape directly),
     ``lora_alpha`` (the scaling factor PEFT applies at forward time), and
@@ -516,7 +516,7 @@ def create_adapter(
     re-wrapping (which causes tensor name nesting on save/reload).
     """
     lora_config = LoraConfig(
-        **_lora_shape_fields(adapter_config),
+        **lora_shape_fields(adapter_config),
         lora_dropout=adapter_config.dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -1073,7 +1073,7 @@ def ensure_adapter_matching(
 
     - Absent: cold birth via :func:`create_adapter` — there are no weights
       to preserve, so there is nothing to compare or keep warm.
-    - Present, config matches (:func:`_lora_shape_fields`: ``r``,
+    - Present, config matches (:func:`lora_shape_fields`: ``r``,
       ``lora_alpha``, ``target_modules``): no-op. This is the warm path —
       the caller's staging copy (``trainer.py:944-948``) then warm-starts
       from these weights.
@@ -1120,7 +1120,7 @@ def ensure_adapter_matching(
         return create_adapter(model, adapter_config, adapter_name)
 
     resident = peft_config[adapter_name]
-    target_fields = _lora_shape_fields(adapter_config)
+    target_fields = lora_shape_fields(adapter_config)
     mismatches: list[str] = []
     for field_name, target_value in target_fields.items():
         resident_value = getattr(resident, field_name, None)

@@ -498,7 +498,14 @@ import torch  # noqa: E402
 from peft import PeftModel  # noqa: E402
 from transformers import TrainerCallback  # noqa: E402
 
-from experiments.utils.production import budget_for  # noqa: E402
+from experiments.utils.production import (  # noqa: E402
+    DONOR_RECIPE_ID,
+    budget_for,  # noqa: E402
+    build_manifest_for,
+    donor_slot_valid,
+    lora_shape_fields,
+    triples_hash,
+)
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     IndexedDataset,
@@ -604,6 +611,11 @@ DONOR_CHECKPOINT_DIRNAME = "donor_checkpoint"
 # granularity — a crash mid-seed already requires retraining that whole
 # seed).
 DONOR_BUILD_MARKER_FILENAME = "donor_build_done.json"
+DONOR_BUILD_PROVENANCE_FILENAME = "test20_donor_build_provenance.json"
+"""Per-slot record of how THIS script trained a donor (steps, wall time).
+Distinct from ``donor_meta.json``, which records what the donor IS in the
+production schema -- one filename per schema, so a production donor slot
+passed to ``--donor-checkpoint`` is unambiguous."""
 
 
 # ---------------------------------------------------------------------------
@@ -1171,23 +1183,53 @@ def _build_donor_checkpoint(
     recall = _run_recall_probe(model, tokenizer, entries, registry, DONOR_BUILD_ADAPTER_NAME)
 
     checkpoint_root.mkdir(parents=True, exist_ok=True)
-    slot = atomic_save_adapter(model, checkpoint_root, DONOR_BUILD_ADAPTER_NAME)
+    # Save through the SAME primitives a production donor build uses, so this
+    # slot is a valid production donor store slot -- one on-disk contract, one
+    # validity rule (paramem.training.donor.donor_slot_valid) rather than a
+    # second, weaker one local to this script. registry_sha256 is empty
+    # because a donor carries no key registry; that is what lets
+    # find_live_slot resolve the slot.
+    manifest = build_manifest_for(
+        model,
+        tokenizer,
+        DONOR_BUILD_ADAPTER_NAME,
+        registry_path=None,
+        registry_sha256_override="",
+        key_count=len(entries),
+        adapter_root=checkpoint_root,
+    )
+    slot = atomic_save_adapter(model, checkpoint_root, DONOR_BUILD_ADAPTER_NAME, manifest=manifest)
     weights_sha256 = hashlib.sha256((slot / "adapter_model.safetensors").read_bytes()).hexdigest()
 
-    # Per-slot provenance — the single source of truth _read_donor_meta
-    # verifies against and H1's key-overlap computation reads back, even
-    # from a DIFFERENT run reusing this slot via --donor-checkpoint (it
-    # travels with the slot, never with this run's own markers).
+    # Donor identity, in the production schema -- what this checkpoint IS.
+    # seed + n_requested regenerate the exact entry list, so nothing about the
+    # donor's content needs a second recording.
     donor_meta = {
         "seed": DONOR_DEFAULT_SEED,
-        "n_entries": len(entries),
-        "epochs": donor_epochs,
-        "gradient_accumulation_steps": donor_accum,
-        "realized_optimizer_steps": realized_donor_steps,
+        "recipe": DONOR_RECIPE_ID,
+        "n_requested": DONOR_MIN_ENTRIES,
+        "triples": entries,
+        "triples_hash": triples_hash(entries),
         "weights_sha256": weights_sha256,
-        "wall_train_seconds": wall_train,
     }
     (slot / DONOR_META_FILENAME).write_text(json.dumps(donor_meta, indent=2))
+
+    # How THIS run trained it -- measurement provenance, not donor identity.
+    # A separate file so the two schemas can never collide on one name: a
+    # production donor slot fed to --donor-checkpoint is then simply a donor
+    # without build provenance, not a slot whose meta means something else.
+    (slot / DONOR_BUILD_PROVENANCE_FILENAME).write_text(
+        json.dumps(
+            {
+                "n_entries": len(entries),
+                "epochs": donor_epochs,
+                "gradient_accumulation_steps": donor_accum,
+                "realized_optimizer_steps": realized_donor_steps,
+                "wall_train_seconds": wall_train,
+            },
+            indent=2,
+        )
+    )
 
     donor_summary = {
         "seed": DONOR_DEFAULT_SEED,
@@ -1221,68 +1263,77 @@ def _build_donor_checkpoint(
     return model, slot, donor_summary
 
 
-def _read_donor_meta(slot: Path) -> dict:
-    """Read + verify *slot*'s ``DONOR_META_FILENAME`` (``"donor_meta.json"``).
+def _donor_verification_context(model, adapter_config) -> tuple[str, dict]:
+    """Return ``(base_model_id, lora_shape)`` for a donor slot verification.
 
-    Single source of truth for a donor checkpoint's provenance
-    (``seed``/``n_entries``/``epochs``/``gradient_accumulation_steps``/
-    ``realized_optimizer_steps``/``weights_sha256``), written once by
-    :func:`_build_donor_checkpoint` and read back from every reuse path —
-    including ``--donor-checkpoint`` reuse from a run whose own
-    ``run_dir`` is not otherwise reachable, which is why the meta file
-    lives INSIDE the slot rather than only in a run-scoped marker.
-    Recomputes ``adapter_model.safetensors``'s SHA-256 and compares it
-    against the recorded value — a mismatch means the weights file was
-    modified or corrupted after the build, and this fails loud rather than
-    silently seeding from unverified weights.
+    Derived once here rather than at each verification site: both values come
+    from state the caller already holds, and a site that re-derived them
+    differently would verify against a different contract than the rest.
+    """
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    return getattr(base.config, "_name_or_path", None), lora_shape_fields(adapter_config)
 
-    ``gradient_accumulation_steps``/``realized_optimizer_steps`` are TOLERATED
-    when absent (logged at info level, never a hard failure) — slots built
-    before these fields were added (e.g. a pre-existing ``--donor-checkpoint``
-    reused by a newer harness invocation) have neither, and reuse must not
-    require rebuilding a perfectly valid checkpoint just to backfill
-    provenance fields this function does not otherwise need.
 
-    Args:
-        slot: A donor checkpoint slot directory (contains
-            ``adapter_model.safetensors`` + ``DONOR_META_FILENAME``).
+def _read_donor_meta(slot: Path, base_model_id: str, lora_shape: dict) -> dict:
+    """Verify *slot* is a valid donor and return what this script reads back.
+
+    Validity is ``paramem.training.donor.donor_slot_valid`` -- the SAME rule
+    the production seeding hook applies (manifest base model + topology,
+    recipe id, weights digest, and regeneration of the recorded triple set
+    from its seed). This script does not re-implement any part of it; it only
+    turns the boolean into the fail-loud ``SystemExit`` its arms expect,
+    because seeding from a checkpoint that cannot be verified would silently
+    corrupt the arm's result rather than stop it.
+
+    *slot* is a slot directory, not a store: this script verifies a detached
+    ``--donor-checkpoint`` path and its own scratch copytree, neither of which
+    sits inside a store. That is why the slot-scoped primitive exists.
 
     Returns:
-        The parsed meta dict (at minimum ``seed``, ``n_entries``, ``epochs``,
-        ``weights_sha256``; ``gradient_accumulation_steps``/
-        ``realized_optimizer_steps`` when the slot was built after they were
-        added).
+        ``seed`` and ``n_entries`` (the donor's identity, from the production
+        meta -- ``n_entries`` is the length of the recorded triple set) plus
+        ``epochs``/``gradient_accumulation_steps``/``realized_optimizer_steps``/
+        ``wall_train_seconds`` when the slot carries this script's build
+        provenance. A production-built donor carries none of the latter; they
+        come back ``None`` and are reported as such rather than fabricated.
 
     Raises:
-        SystemExit: The meta file is missing, or the recomputed SHA-256
-            does not match the recorded one.
+        SystemExit: the slot is not a valid donor checkpoint.
     """
-    meta_path = slot / DONOR_META_FILENAME
-    if not meta_path.is_file():
+    if not donor_slot_valid(slot, base_model_id, lora_shape):
         raise SystemExit(
-            f"Donor checkpoint slot {slot} has no {DONOR_META_FILENAME} — cannot "
-            "verify its weights or recover its provenance (seed/n_entries/epochs)."
+            f"Donor checkpoint at {slot} is not valid for base {base_model_id!r} and "
+            f"this arm's LoRA shape. Refusing to seed from an unverified checkpoint. "
+            f"Causes: missing/corrupt weights or {DONOR_META_FILENAME}, a weights "
+            f"digest that no longer matches, a different base model or topology, or "
+            f"a donor recipe change since it was built."
         )
-    with open(meta_path) as f:
+    with open(slot / DONOR_META_FILENAME) as f:
         meta = json.load(f)
-    weights_path = slot / "adapter_model.safetensors"
-    actual_sha256 = hashlib.sha256(weights_path.read_bytes()).hexdigest()
-    recorded_sha256 = meta.get("weights_sha256")
-    if actual_sha256 != recorded_sha256:
-        raise SystemExit(
-            f"Donor checkpoint SHA-256 mismatch at {slot}: {meta_path} records "
-            f"{recorded_sha256!r}, but adapter_model.safetensors currently hashes to "
-            f"{actual_sha256!r} — the weights file was modified or corrupted after "
-            "the build. Refusing to seed from unverified weights."
-        )
-    if "gradient_accumulation_steps" not in meta or "realized_optimizer_steps" not in meta:
+
+    provenance_path = slot / DONOR_BUILD_PROVENANCE_FILENAME
+    provenance: dict = {}
+    if provenance_path.is_file():
+        with open(provenance_path) as f:
+            provenance = json.load(f)
+    else:
         logger.info(
-            "Donor checkpoint slot %s predates gradient_accumulation_steps/"
-            "realized_optimizer_steps tracking in %s — proceeding without them.",
+            "Donor slot %s carries no %s (a production-built donor, or one built "
+            "before this script recorded build provenance) — reporting its build "
+            "fields as null.",
             slot,
-            DONOR_META_FILENAME,
+            DONOR_BUILD_PROVENANCE_FILENAME,
         )
-    return meta
+
+    return {
+        "seed": meta["seed"],
+        "n_entries": len(meta["triples"]),
+        "weights_sha256": meta["weights_sha256"],
+        "epochs": provenance.get("epochs"),
+        "gradient_accumulation_steps": provenance.get("gradient_accumulation_steps"),
+        "realized_optimizer_steps": provenance.get("realized_optimizer_steps"),
+        "wall_train_seconds": provenance.get("wall_train_seconds"),
+    }
 
 
 def _build_or_reuse_own_donor_checkpoint(
@@ -1344,7 +1395,7 @@ def _build_or_reuse_own_donor_checkpoint(
                 f"Donor build marker at {marker_path} points to a missing checkpoint "
                 f"({slot}) — delete the marker to force a rebuild."
             )
-        donor_meta = _read_donor_meta(slot)
+        donor_meta = _read_donor_meta(slot, *_donor_verification_context(model, adapter_config))
         logger.info("Donor build: reusing this run's already-built checkpoint at %s", slot)
         return model, slot, False, donor_meta
 
@@ -1413,7 +1464,7 @@ def _resolve_donor_source(
                 f"--donor-checkpoint {slot} has no adapter_model.safetensors — "
                 "not a valid donor checkpoint slot."
             )
-        donor_meta = _read_donor_meta(slot)
+        donor_meta = _read_donor_meta(slot, *_donor_verification_context(model, adapter_config))
         logger.info("Donor-init: reusing external donor checkpoint at %s", slot)
         return model, slot, False, donor_meta
 
@@ -1587,7 +1638,7 @@ def _run_donor_build_smoke(
             build_results_path,
         )
     else:
-        full_meta = _read_donor_meta(slot)
+        full_meta = _read_donor_meta(slot, *_donor_verification_context(model, adapter_config))
         realized_steps = full_meta.get("realized_optimizer_steps")
         wall_train_seconds = full_meta.get("wall_train_seconds")
         # wall/step telemetry is only meaningful for a build that just
@@ -2891,7 +2942,10 @@ def main() -> None:
                     # resolved slot, including donor_meta.json) — never the
                     # original --donor-checkpoint path, which may no longer
                     # be reachable by the time a run resumes.
-                    donor_meta = _read_donor_meta(donor_scratch_dir)
+                    donor_meta = _read_donor_meta(
+                        donor_scratch_dir,
+                        *_donor_verification_context(model, adapter_config),
+                    )
             else:
                 # B3: this is a phase boundary (donor build or a fresh
                 # copytree) — honour the pause gate before starting it, not

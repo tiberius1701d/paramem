@@ -229,7 +229,7 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
     """
     import shutil
 
-    from paramem.models.loader import _lora_shape_fields
+    from paramem.models.loader import lora_shape_fields
     from paramem.training.donor import donor_checkpoint_valid, donor_store_dir
 
     model, _tokenizer = model_and_tokenizer
@@ -239,7 +239,7 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
     seeded: dict = {}
 
     def _seed(adapter_config) -> None:
-        lora_shape = _lora_shape_fields(adapter_config)
+        lora_shape = lora_shape_fields(adapter_config)
         cache_dir = donor_store_dir(cache_adapter_root, base_model_id, lora_shape)
         dest_dir = donor_store_dir(tmp_path, base_model_id, lora_shape)
         cache_was_valid = donor_checkpoint_valid(cache_dir, base_model_id, lora_shape)

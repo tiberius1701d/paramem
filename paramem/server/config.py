@@ -1634,7 +1634,7 @@ class ServerAdapterConfig:
     # persistent preferences/habits — see `ServerAdaptersConfig.procedural`.
     target_modules: list[str] = field(default_factory=lambda: list(_ATTENTION_TARGETS))
     # LoRA dropout probability. Not a shape field (paramem.models.loader's
-    # `_lora_shape_fields` deliberately excludes it, and `_check_manifest_fingerprints`
+    # `lora_shape_fields` deliberately excludes it, and `_check_manifest_fingerprints`
     # never compares it) — a warm-kept resident adapter keeps whatever dropout
     # it was created with; an edit here takes effect only the next time the
     # adapter is actually (re)created (RECONCILE, first boot, or a
