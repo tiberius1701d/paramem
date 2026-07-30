@@ -100,7 +100,13 @@ def test_attention_item_frozen():
 
 
 def test_attention_item_to_dict():
-    """to_dict() returns all 5 fields."""
+    """to_dict() returns every field of the /status row.
+
+    Compared exactly: this is a public response shape, so an added field is a
+    payload change that must be noticed here rather than discovered by a
+    consumer.  ``incident_id`` is None for rows not raised from the incident
+    store.
+    """
     item = AttentionItem(
         kind="migration_trial_pass",
         level="action_required",
@@ -115,6 +121,7 @@ def test_attention_item_to_dict():
         "summary": "TRIAL active",
         "action_hint": "paramem migrate-accept",
         "age_seconds": 600,
+        "incident_id": None,
     }
 
 

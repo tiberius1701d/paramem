@@ -50,6 +50,15 @@ class AttentionItem:
     kind:
         Stable identifier for the alert class.  See the populator
         functions in this module for the catalog of emitted kinds.
+        Deliberately coarse: one incident TYPE can be active under several
+        keys at once, and every one of them reports the same ``kind``.  Use
+        ``incident_id`` to tell those apart.
+    incident_id:
+        ``Incident.id`` (``"{type}:{key}"``) for rows raised from the
+        incident store, ``None`` for every other row.  The discriminator a
+        machine consumer needs: ``enrichment_degraded`` alone can be active
+        for the session-tier pass and the graph-tier pass simultaneously,
+        and only the key separates them.
     level:
         ``"action_required"`` (yellow), ``"failed"`` (red), or
         ``"info"`` (cyan).  Used by the pstatus renderer to choose the
@@ -71,6 +80,7 @@ class AttentionItem:
     summary: str
     action_hint: str | None
     age_seconds: int | None
+    incident_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a plain dict suitable for JSON embedding.
@@ -78,8 +88,8 @@ class AttentionItem:
         Returns
         -------
         dict[str, Any]
-            All five fields present; ``action_hint`` and ``age_seconds``
-            may be ``None``.
+            All fields present; ``action_hint``, ``age_seconds`` and
+            ``incident_id`` may be ``None``.
         """
         return asdict(self)
 
@@ -1098,6 +1108,7 @@ def _collect_incident_items(state: dict, config) -> list[AttentionItem]:
         items.append(
             AttentionItem(
                 kind=f"incident_{incident.type}",
+                incident_id=incident.id,
                 level=incident.severity,
                 summary=incident.summary,
                 action_hint=(

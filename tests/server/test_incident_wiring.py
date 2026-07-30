@@ -879,3 +879,81 @@ class TestEveryRecordedTypeHasAClearSite:
             "these incident types are recorded but never resolved, so they stay on "
             f"GET /status forever: {missing}"
         )
+
+
+class TestSameTypeDifferentKeysStaySeparate:
+    """``enrichment_degraded`` can be active for two pipeline stages at once.
+
+    The session-tier pass (per transcript, at extraction) and the graph-tier
+    pass (over the merged graph, full fold only) share one incident type and
+    are told apart only by key.  Both halves of that have to hold: resolving
+    one must not clear the other, and ``/status`` must let a consumer tell
+    which stage is degraded without parsing prose.
+    """
+
+    @staticmethod
+    def _record_both(state_dir: Path) -> None:
+        record_incident(
+            state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="Session-tier cloud enrichment degraded",
+            detail={},
+        )
+        record_incident(
+            state_dir,
+            type="enrichment_degraded",
+            key="graph_enrich_vram",
+            severity="warning",
+            summary="Graph-tier cloud enrichment degraded",
+            detail={},
+        )
+
+    def test_resolving_one_stage_leaves_the_other_active(self, tmp_path):
+        """Recovery of one pass must not silence a still-degraded other pass."""
+        state_dir = tmp_path / "state"
+        self._record_both(state_dir)
+
+        resolve_incident(state_dir, "enrichment_degraded", "cloud_enrich")
+
+        by_id = {i.id: i.status for i in read_incidents(state_dir)}
+        assert by_id["enrichment_degraded:cloud_enrich"] == "resolved"
+        assert by_id["enrichment_degraded:graph_enrich_vram"] == "active", (
+            f"the graph-tier degradation must survive a session-tier recovery — got {by_id}"
+        )
+
+    def test_status_rows_are_distinguishable_by_incident_id(self, tmp_path):
+        """Both rows carry the same ``kind``; only ``incident_id`` separates them."""
+        state_dir = tmp_path / "state"
+        self._record_both(state_dir)
+
+        cfg = MagicMock()
+        cfg.paths.data = tmp_path
+        items = [i for i in _collect_incident_items({}, cfg) if "enrichment" in i.kind]
+
+        assert len(items) == 2
+        assert {i.kind for i in items} == {"incident_enrichment_degraded"}, (
+            "kind is per-type by design, so it cannot discriminate the two stages"
+        )
+        assert {i.incident_id for i in items} == {
+            "enrichment_degraded:cloud_enrich",
+            "enrichment_degraded:graph_enrich_vram",
+        }
+        # The field survives serialisation into the /status payload.
+        assert all("incident_id" in i.to_dict() for i in items)
+
+    def test_non_incident_rows_carry_no_incident_id(self, tmp_path):
+        """``incident_id`` is None for rows that do not come from the store."""
+        from paramem.server.attention import AttentionItem
+
+        assert (
+            AttentionItem(
+                kind="token_ratio_drift",
+                level="warning",
+                summary="drift",
+                action_hint=None,
+                age_seconds=None,
+            ).incident_id
+            is None
+        )

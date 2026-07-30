@@ -1502,8 +1502,8 @@ class ConsolidationLoop:
                     key="cloud_enrich",
                     severity="warning",
                     summary=(
-                        "Consolidation: cloud enrichment degraded — kept "
-                        "pre-enrichment facts (unparseable response)"
+                        "Session-tier cloud enrichment degraded (per transcript, at "
+                        "extraction) — unparseable response; kept pre-enrichment facts"
                     ),
                     detail={
                         "type": "enrichment_degraded",
@@ -6288,8 +6288,8 @@ class ConsolidationLoop:
                     key="graph_enrich_vram",
                     severity="warning",
                     summary=(
-                        "Consolidation: graph-tier enrichment stopped early on VRAM "
-                        "exhaustion — kept already-merged chunks"
+                        "Graph-tier cloud enrichment degraded (merged graph, full fold "
+                        "only) — VRAM exhausted; kept already-merged chunks"
                     ),
                     detail={
                         "type": "enrichment_degraded",
