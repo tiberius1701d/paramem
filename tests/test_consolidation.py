@@ -5046,7 +5046,7 @@ class TestInterimCommitFailureRollback:
             relation_type="factual",
         )
         loop.merger.graph = real_graph
-        loop.merger.removal_ledger = {"graph_stale": {"reason": "entity_merge"}}
+        loop.merger.removal_ledger = {"graph_stale": {"reason": "predicate_synonym_collapse"}}
 
         trained_metrics = {"train_loss": 0.2, "aborted": False}
 
@@ -5227,7 +5227,7 @@ class TestInterimCommitFailureRollbackSimulate:
             relation_type="factual",
         )
         loop.merger.graph = real_graph
-        loop.merger.removal_ledger = {"graph_stale": {"reason": "entity_merge"}}
+        loop.merger.removal_ledger = {"graph_stale": {"reason": "predicate_synonym_collapse"}}
 
         with (
             patch.object(
@@ -5330,6 +5330,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
         loop = object.__new__(ConsolidationLoop)
+        loop._incidents_state_dir = None
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.model.peft_config = {
@@ -6339,7 +6340,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         """Fold with refinement_contradiction='on' + distinct last_seen timestamps:
         the recency rule fires (Case-2, REPLACE-classified) and the fresher key
         (Berlin, 2026-01-02) wins; the staler key (Munich, 2026-01-01) is retired
-        and soft-staled via _apply_subtractive_removals_to_store(scope='fold').
+        and soft-staled via _apply_subtractive_removals_to_store(fold_name="full").
         """
         from unittest.mock import MagicMock, patch
 
@@ -6861,29 +6862,26 @@ class TestDriftPartitioning:
         )
 
     def test_intervening_enrichment_merge_preserves_dedup_bucketing_and_bump(self, tmp_path):
-        """Q4 regression: ``GraphMerger.merge()`` no longer resets
-        ``reinforcements``/``collapsed`` at entry (only ``reset_graph()``
-        does) -- so a real, non-empty enrichment merge that runs BETWEEN the
-        recon re-merge's Case-1 collapse and the fold's consumers no longer
-        silently wipes that collapse's bookkeeping.
+        """Accumulator-lifetime regression: ``GraphMerger.merge()`` resets no
+        accumulator at entry -- ``collapsed`` and ``removal_ledger`` are
+        cleared only by ``reset_graph()`` -- so a real, non-empty enrichment
+        merge that runs BETWEEN the recon re-merge's Case-1 collapse and the
+        fold's consumers no longer silently wipes that collapse's bookkeeping.
 
         Setup mirrors ``test_drift_partition_three_buckets``: key_dup1 and
         key_dup2 share identical registry-true SPO, so the recon re-merge
-        fires a real Case-1 collapse (populates ``merger.reinforcements``/
-        ``merger.collapsed``).  ``GraphTierRefiner.run_enrichment`` is then
+        fires a real Case-1 collapse (recording it in ``merger.collapsed`` and
+        ``merger.removal_ledger``).  ``GraphTierRefiner.run_enrichment`` is then
         patched with a side_effect that performs a REAL non-empty
-        ``merge_relations`` call (the same shape a real cloud-enrichment
-        pass finding one new fact would produce) -- before the fix, this
-        call's ``merge()`` would reset both accumulators to empty before the
-        drift partition and the reinforcement-bump loop ever read them.
+        ``merge_relations`` call (the same shape a real cloud-enrichment pass
+        finding one new fact would produce).  That intervening merge must not
+        disturb either accumulator: both are reset only by ``reset_graph``, and
+        the drift partition and the reinforcement-credit pass read them after it.
 
-        Pre-fix symptom (not asserted here, recorded for the record): with
-        ``merger.collapsed`` wiped, key_dup2 would fall through the drift
-        partition's ``_dk in _collapsed_set`` check into
-        ``elif _dk in _ledger`` (the ledger survives regardless -- it was
-        never reset by ``merge()``) and land in ``drift_intended_removal``
-        instead of ``drift_deduplicated``, without ever being soft-staled
-        via ``discard_keys``.
+        A wiped ``merger.collapsed`` would not fail loudly — key_dup2 would fall
+        through the drift partition's ``_dk in _collapsed_set`` check into
+        ``elif _dk in _ledger`` and land in ``drift_intended_removal`` instead of
+        ``drift_deduplicated``, never soft-staled via ``discard_keys``.
         """
         import networkx as nx
 
@@ -6909,7 +6907,12 @@ class TestDriftPartitioning:
         loop.config = ConsolidationConfig(refinement_enrichment="on")
         loop.cloud_enabled = True
 
-        for key in ("key_dup1", "key_dup2"):
+        # Dated to different sessions: the collapse of the two keys is a genuine
+        # re-sighting, so the survivor earns as well as inherits.
+        for key, seen in (
+            ("key_dup1", "2026-01-01T00:00:00Z"),
+            ("key_dup2", "2026-02-01T00:00:00Z"),
+        ):
             loop.store.put(
                 "episodic",
                 key,
@@ -6923,7 +6926,11 @@ class TestDriftPartitioning:
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+                key,
+                speaker_id="speaker0",
+                relation_type="factual",
+                last_seen=seen,
+                first_seen=seen,
             )
 
         before_dup1_reinforcement = loop.store.bookkeeping_for_key("key_dup1")[
@@ -7116,7 +7123,7 @@ class TestDriftIntendedRemoval:
             # GraphTierRefiner.run_enrichment does.
             loop.merger.removal_ledger["key_enrichment"] = {
                 "reason": "enrichment_same_as",
-                "merged_into": "alice",
+                "keep_node": "alice",
             }
             return {"skipped": False, "new_edges": 0, "same_as_contractions": 1}
 
@@ -7218,7 +7225,7 @@ class TestDriftIntendedRemoval:
         # intended_removal (the _collapsed_set branch must win).
         loop.merger.removal_ledger["key_dup2"] = {
             "reason": "dedup",
-            "surviving_twin": "key_dup1",
+            "survivor_key": "key_dup1",
         }
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -7330,8 +7337,8 @@ class TestFoldGraphDebug:
 
         base_dir = self._base(tmp_path)
         ledger = {
-            "key_dup": {"reason": "dedup", "surviving_twin": "key_ok"},
-            "key_enriched": {"reason": "enrichment_same_as", "merged_into": "Alice"},
+            "key_dup": {"reason": "dedup", "survivor_key": "key_ok"},
+            "key_enriched": {"reason": "enrichment_same_as", "keep_node": "Alice"},
         }
         with debug_run(base_dir):
             on_removal_ledger(ledger)
@@ -7425,8 +7432,55 @@ class TestBookkeepingSchema:
         assert bk["reinforcement_count"] == 1
         assert bk["last_reinforced_cycle"] == 0
 
-    def test_bump_recurrence_increments_and_refreshes_cycle(self):
-        """bump_recurrence increments reinforcement_count and sets last_reinforced_cycle."""
+    def test_reinforce_earns_on_a_later_sighting(self):
+        """A sighting bearing a NEW timestamp adds exactly 1 and refreshes the cycle."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "graph3",
+            speaker_id="S0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+        store.reinforce(
+            "graph3",
+            cycle=7,
+            first_seen="2026-01-01T00:00:00Z",
+            timestamp="2026-02-01T00:00:00Z",
+            reobserved=True,
+        )
+        bk = store.bookkeeping_for_key("graph3")
+        assert bk["reinforcement_count"] == 2
+        assert bk["last_reinforced_cycle"] == 7
+        # Other fields must be untouched.
+        assert bk["speaker_id"] == "S0"
+
+    def test_reinforce_does_not_earn_within_one_transcript(self):
+        """A sighting bearing the SAME timestamp is the same transcript — being
+        mentioned twice in one conversation is multiplicity, not reinforcement."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "graph3",
+            speaker_id="S0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+        store.reinforce(
+            "graph3",
+            cycle=7,
+            first_seen="2026-01-01T00:00:00Z",
+            timestamp="2026-01-01T00:00:00Z",
+            reobserved=True,
+        )
+        assert store.bookkeeping_for_key("graph3")["reinforcement_count"] == 1
+
+    def test_reinforce_does_not_earn_without_a_timestamp(self):
+        """An empty timestamp is 'unknown', never evidence of a temporal gap."""
         store = self._make_store()
         store.set_bookkeeping(
             "graph3",
@@ -7436,24 +7490,138 @@ class TestBookkeepingSchema:
             last_reinforced_cycle=1,
             first_seen="",
         )
-        store.bump_recurrence("graph3", cycle=7, first_seen="")
-        bk = store.bookkeeping_for_key("graph3")
-        assert bk["reinforcement_count"] == 2
-        assert bk["last_reinforced_cycle"] == 7
-        # Other fields must be untouched.
-        assert bk["speaker_id"] == "S0"
+        store.reinforce("graph3", cycle=7, first_seen="", reobserved=True)
+        assert store.bookkeeping_for_key("graph3")["reinforcement_count"] == 1
 
-    def test_bump_recurrence_creates_record_when_absent(self):
-        """bump_recurrence on unknown key creates a minimal record."""
+    def test_reinforce_inherits_the_highest_absorbed_count(self):
+        """A survivor inherits the maturity of the keys merged into it, so a
+        collapse cannot demote a promoted fact back to episodic."""
         store = self._make_store()
-        store.bump_recurrence("graph_new", cycle=4, first_seen="")
+        for key, count in (("survivor", 1), ("retired_a", 5), ("retired_b", 3)):
+            store.set_bookkeeping(
+                key,
+                speaker_id="speaker0",
+                relation_type="factual",
+                reinforcement_count=count,
+                last_reinforced_cycle=0,
+                first_seen="",
+            )
+        store.reinforce("survivor", cycle=2, first_seen="", absorbing=["retired_a", "retired_b"])
+        assert store.bookkeeping_for_key("survivor")["reinforcement_count"] == 5
+
+    def test_reinforce_inheritance_never_lowers_an_existing_count(self):
+        """max, not assignment — absorbing a less mature key changes nothing."""
+        store = self._make_store()
+        for key, count in (("survivor", 7), ("retired", 2)):
+            store.set_bookkeeping(
+                key,
+                speaker_id="speaker0",
+                relation_type="factual",
+                reinforcement_count=count,
+                last_reinforced_cycle=0,
+                first_seen="",
+            )
+        store.reinforce("survivor", cycle=2, first_seen="", absorbing=["retired"])
+        assert store.bookkeeping_for_key("survivor")["reinforcement_count"] == 7
+
+    def test_reinforce_inheritance_is_idempotent(self):
+        """Inheritance alone is a max, so re-running a fold cannot compound the
+        counter and manufacture a promotion."""
+        store = self._make_store()
+        for key, count in (("survivor", 1), ("retired", 4)):
+            store.set_bookkeeping(
+                key,
+                speaker_id="speaker0",
+                relation_type="factual",
+                reinforcement_count=count,
+                last_reinforced_cycle=0,
+                first_seen="",
+            )
+        for _ in range(3):
+            store.reinforce("survivor", cycle=2, first_seen="", absorbing=["retired"])
+        assert store.bookkeeping_for_key("survivor")["reinforcement_count"] == 4
+
+    def test_reinforce_inherits_then_earns(self):
+        """Inheritance and earning compose in that order, so the result does not
+        depend on which key of the pair happened to survive the merge."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "survivor",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+        store.set_bookkeeping(
+            "retired",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=5,
+            last_reinforced_cycle=0,
+            last_seen="2026-02-01T00:00:00Z",
+            first_seen="2026-02-01T00:00:00Z",
+        )
+        store.reinforce(
+            "survivor",
+            cycle=2,
+            first_seen="2026-02-01T00:00:00Z",
+            timestamp="2026-02-01T00:00:00Z",
+            absorbing=["retired"],
+            reobserved=True,
+        )
+        assert store.bookkeeping_for_key("survivor")["reinforcement_count"] == 6
+
+    def test_reinforce_ignores_unknown_absorbed_keys(self):
+        """A key with no bookkeeping record contributes nothing to inherit."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "survivor",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=2,
+            last_reinforced_cycle=0,
+            first_seen="",
+        )
+        store.reinforce("survivor", cycle=2, first_seen="", absorbing=["never_seen"])
+        assert store.bookkeeping_for_key("survivor")["reinforcement_count"] == 2
+
+    def test_reinforce_creates_record_when_absent(self):
+        """reinforce on an unknown key creates a minimal record.
+
+        An absent record counts as 0 prior sightings, so a first earned credit
+        lands at 1 and an inherited count lands intact rather than at 1.
+        """
+        store = self._make_store()
+        store.reinforce(
+            "graph_new",
+            cycle=4,
+            first_seen="",
+            timestamp="2026-01-01T00:00:00Z",
+            reobserved=True,
+        )
         bk = store.bookkeeping_for_key("graph_new")
         assert bk is not None
         assert bk["reinforcement_count"] == 1
         assert bk["last_reinforced_cycle"] == 4
 
-    def test_bump_recurrence_preserves_speaker_id(self):
-        """bump_recurrence does NOT reset speaker_id."""
+    def test_reinforce_creating_a_record_keeps_the_inherited_count(self):
+        """A survivor with no bookkeeping yet must not flatten what it inherits."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "retired",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=6,
+            last_reinforced_cycle=0,
+            first_seen="",
+        )
+        store.reinforce("survivor", cycle=4, first_seen="", absorbing=["retired"])
+        assert store.bookkeeping_for_key("survivor")["reinforcement_count"] == 6
+
+    def test_reinforce_preserves_speaker_id(self):
+        """reinforce does NOT reset speaker_id."""
         store = self._make_store()
         store.set_bookkeeping(
             "k",
@@ -7463,11 +7631,11 @@ class TestBookkeepingSchema:
             last_reinforced_cycle=0,
             first_seen="",
         )
-        store.bump_recurrence("k", cycle=10, first_seen="")
+        store.reinforce("k", cycle=10, first_seen="", reobserved=True)
         assert store.bookkeeping_for_key("k")["speaker_id"] == "speaker99"
 
-    def test_bump_recurrence_does_not_regress_last_seen(self):
-        """bump_recurrence with an OLDER timestamp must not regress an existing
+    def test_reinforce_does_not_regress_last_seen(self):
+        """reinforce with an OLDER timestamp must not regress an existing
         newer last_seen — the invariant is max(existing, incoming)."""
         store = self._make_store()
         store.set_bookkeeping(
@@ -7478,15 +7646,14 @@ class TestBookkeepingSchema:
             first_seen="",
         )
         # Pass an older timestamp — must NOT overwrite the existing newer value.
-        store.bump_recurrence("k", cycle=5, timestamp="2026-05-01T08:00:00Z", first_seen="")
+        store.reinforce("k", cycle=5, timestamp="2026-05-01T08:00:00Z", first_seen="")
         bk = store.bookkeeping_for_key("k")
         assert bk["last_seen"] == "2026-06-20T12:00:00Z", (
-            f"bump_recurrence with older timestamp must not regress last_seen; "
-            f"got {bk['last_seen']!r}"
+            f"reinforce with older timestamp must not regress last_seen; got {bk['last_seen']!r}"
         )
 
-    def test_bump_recurrence_advances_last_seen_to_newer(self):
-        """bump_recurrence with a NEWER timestamp must advance last_seen."""
+    def test_reinforce_advances_last_seen_to_newer(self):
+        """reinforce with a NEWER timestamp must advance last_seen."""
         store = self._make_store()
         store.set_bookkeeping(
             "k2",
@@ -7495,14 +7662,14 @@ class TestBookkeepingSchema:
             last_seen="2026-05-01T08:00:00Z",
             first_seen="",
         )
-        store.bump_recurrence("k2", cycle=5, timestamp="2026-06-20T12:00:00Z", first_seen="")
+        store.reinforce("k2", cycle=5, timestamp="2026-06-20T12:00:00Z", first_seen="")
         bk = store.bookkeeping_for_key("k2")
         assert bk["last_seen"] == "2026-06-20T12:00:00Z", (
-            f"bump_recurrence with newer timestamp must advance last_seen; got {bk['last_seen']!r}"
+            f"reinforce with newer timestamp must advance last_seen; got {bk['last_seen']!r}"
         )
 
-    def test_bump_recurrence_does_not_regress_first_seen(self):
-        """bump_recurrence with a LATER first_seen must not regress an existing
+    def test_reinforce_does_not_regress_first_seen(self):
+        """reinforce with a LATER first_seen must not regress an existing
         earlier first_seen — the invariant is min_nonempty(existing, incoming)."""
         store = self._make_store()
         store.set_bookkeeping(
@@ -7512,15 +7679,15 @@ class TestBookkeepingSchema:
             first_seen="2026-01-01T00:00:00Z",
         )
         # Pass a LATER first_seen — must NOT overwrite the existing earlier value.
-        store.bump_recurrence("k3", cycle=5, first_seen="2026-06-01T00:00:00Z")
+        store.reinforce("k3", cycle=5, first_seen="2026-06-01T00:00:00Z")
         bk = store.bookkeeping_for_key("k3")
         assert bk["first_seen"] == "2026-01-01T00:00:00Z", (
-            f"bump_recurrence with a later first_seen must not regress the earlier "
+            f"reinforce with a later first_seen must not regress the earlier "
             f"value; got {bk['first_seen']!r}"
         )
 
-    def test_bump_recurrence_advances_first_seen_to_earlier(self):
-        """bump_recurrence with an EARLIER first_seen must advance (lower) first_seen."""
+    def test_reinforce_advances_first_seen_to_earlier(self):
+        """reinforce with an EARLIER first_seen must advance (lower) first_seen."""
         store = self._make_store()
         store.set_bookkeeping(
             "k4",
@@ -7528,14 +7695,14 @@ class TestBookkeepingSchema:
             relation_type="factual",
             first_seen="2026-06-01T00:00:00Z",
         )
-        store.bump_recurrence("k4", cycle=5, first_seen="2026-01-01T00:00:00Z")
+        store.reinforce("k4", cycle=5, first_seen="2026-01-01T00:00:00Z")
         bk = store.bookkeeping_for_key("k4")
         assert bk["first_seen"] == "2026-01-01T00:00:00Z", (
-            f"bump_recurrence with an earlier first_seen must advance the window "
+            f"reinforce with an earlier first_seen must advance the window "
             f"start; got {bk['first_seen']!r}"
         )
 
-    def test_bump_recurrence_empty_first_seen_never_wins_min(self):
+    def test_reinforce_empty_first_seen_never_wins_min(self):
         """An empty incoming first_seen ('unknown') must never overwrite an
         existing dated first_seen — min_nonempty treats '' as absent, not as
         the earliest possible time."""
@@ -7546,7 +7713,7 @@ class TestBookkeepingSchema:
             relation_type="factual",
             first_seen="2026-03-01T00:00:00Z",
         )
-        store.bump_recurrence("k5", cycle=5, first_seen="")
+        store.reinforce("k5", cycle=5, first_seen="")
         bk = store.bookkeeping_for_key("k5")
         assert bk["first_seen"] == "2026-03-01T00:00:00Z", (
             f"empty incoming first_seen must not clobber a dated existing value; "
@@ -7882,20 +8049,21 @@ class TestLastSeenFlowThroughMint:
             f"last_seen must advance to the newest assertion; got {edge_data['last_seen']!r}"
         )
 
-    def test_reinforcements_bump_advances_bookkeeping_last_seen(self, tmp_path):
-        """INVARIANT (a): when merger.reinforcements carries a newer timestamp for a
-        survivor key, bump_recurrence advances bookkeeping last_seen to that value
-        (and first_seen to the collapsed min).
+    def test_collapse_credit_advances_bookkeeping_last_seen(self, tmp_path):
+        """INVARIANT (a): a survivor absorbing a key with a newer last_seen and an
+        earlier first_seen has its own window widened to both.
 
-        This tests the full consolidation path: merger.reinforcements dict →
-        _refine_consolidation_graph bump loop → bump_recurrence → bookkeeping.
+        This tests the full consolidation path: removal_ledger →
+        _credit_reinforcement → reinforce → bookkeeping.  The timestamps come
+        from the ABSORBED key's own bookkeeping, so the survivor's window is
+        the union of the two — no transient edge state involved.
         """
         from paramem.graph.schema import Relation
 
         loop = self._make_loop(tmp_path)
         loop.cycle_count = 3
 
-        # Set bookkeeping directly (no registry needed — bump_recurrence only
+        # Set bookkeeping directly (no registry needed — reinforce only
         # reads _bookkeeping, not the KeyRegistry).
         loop.store.set_bookkeeping(
             "graph10",
@@ -7906,11 +8074,18 @@ class TestLastSeenFlowThroughMint:
             last_seen="2026-05-01T08:00:00Z",
             first_seen="2026-01-01T00:00:00Z",
         )
+        loop.store.set_bookkeeping(
+            "graph11",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
+            last_seen="2026-06-25T10:00:00Z",
+            first_seen="2025-12-01T00:00:00Z",
+        )
 
-        # Simulate Case-1 collapse: reinforcements carries the survivor with a
-        # newer last_seen and an earlier first_seen (both already merged by the
-        # merger before this dict is populated).
-        loop.merger.reinforcements = {"graph10": ("2026-06-25T10:00:00Z", "2025-12-01T00:00:00Z")}
+        # Simulate Case-1 collapse: graph11 drifts, graph10 survives.
+        loop.merger.removal_ledger = {"graph11": {"reason": "dedup", "survivor_key": "graph10"}}
 
         recon_rel = Relation(
             subject="speaker0",
@@ -7927,12 +8102,11 @@ class TestLastSeenFlowThroughMint:
             f"reinforcement_count must be bumped; got {bk['reinforcement_count']}"
         )
         assert bk["last_seen"] == "2026-06-25T10:00:00Z", (
-            "last_seen must advance to the new session timestamp via reinforcements→bump; "
-            f"got {bk['last_seen']!r}"
+            f"last_seen must advance to the absorbed key's newer timestamp; got {bk['last_seen']!r}"
         )
         assert bk["first_seen"] == "2025-12-01T00:00:00Z", (
-            "first_seen must advance to the earlier collapsed timestamp via "
-            f"reinforcements→bump; got {bk['first_seen']!r}"
+            "first_seen must advance to the absorbed key's earlier timestamp; "
+            f"got {bk['first_seen']!r}"
         )
 
 
@@ -8287,13 +8461,18 @@ class TestBookkeepingBasedPromotion:
             "Decay candidate must NOT be deleted (passive fade policy)"
         )
 
-    def test_recurrence_bump_in_fold_via_reinforcements(self, tmp_path):
-        """fold with two active keys sharing one (s,p,o) bumps recurrence on the survivor.
+    def test_collapse_credit_in_fold_preserves_maturity(self, tmp_path):
+        """A fold collapsing two keys for one (s,p,o) leaves the survivor with the
+        maturity of the pair, not with its own.
 
-        Uses a real GraphMerger (model=None) which applies Case-1 collapse and
-        records the surviving key in merger.reinforcements.  After _run_with_mocks,
-        the survivor's bookkeeping.reinforcement_count must equal 2 and
-        bookkeeping.last_reinforced_cycle must equal loop.cycle_count.
+        Uses a real GraphMerger (model=None), which applies Case-1 collapse and
+        names the survivor in ``removal_ledger``.  The two keys are dated to
+        different sessions and carry different counts: whichever survives must
+        end at ``max(1, 5) + 1 == 6``, and the result must not depend on which
+        key the merge order picked.  A survivor that kept only its own count
+        would land at 2: the retired key is staled straight after, so its
+        maturity is gone and a promoted fact drops back to episodic while the
+        fold's own accounting reports no loss at all.
         """
         import networkx as nx
 
@@ -8314,7 +8493,10 @@ class TestBookkeepingBasedPromotion:
         loop.merger = GraphMerger(model=None)
         loop.cycle_count = 7
 
-        for key in ("graph1", "graph2"):
+        for key, count, seen in (
+            ("graph1", 1, "2026-01-01T00:00:00Z"),
+            ("graph2", 5, "2026-03-01T00:00:00Z"),
+        ):
             loop.store.put(
                 "episodic",
                 key,
@@ -8331,25 +8513,33 @@ class TestBookkeepingBasedPromotion:
                 key,
                 speaker_id="S0",
                 relation_type="factual",
-                reinforcement_count=1,
+                reinforcement_count=count,
                 last_reinforced_cycle=1,
-                first_seen="",
+                last_seen=seen,
+                first_seen=seen,
             )
 
         TestConsolidateInterimAdaptersFullFlow._run_with_mocks(
             loop, tmp_path, ReconstructionResult(graph=recon_g)
         )
 
-        # The surviving key (the one that remained in tier_keyed) must have
-        # reinforcement_count == 2 (was bumped by the Case-1 collapse).
+        # The surviving key inherits the pair's highest count and earns one for
+        # the re-sighting: max(1, 5) + 1.
         surviving_key = None
         for key in ("graph1", "graph2"):
             bk = loop.store.bookkeeping_for_key(key)
-            if bk and bk["reinforcement_count"] == 2:
+            if bk and bk["reinforcement_count"] == 6:
                 surviving_key = key
                 break
         assert surviving_key is not None, (
-            "One key must have reinforcement_count==2 after duplicate-SPO collapse"
+            "One key must have reinforcement_count==6 after the duplicate-SPO "
+            "collapse (inherited 5, earned 1); got "
+            + repr(
+                {
+                    k: (loop.store.bookkeeping_for_key(k) or {}).get("reinforcement_count")
+                    for k in ("graph1", "graph2")
+                }
+            )
         )
         bk = loop.store.bookkeeping_for_key(surviving_key)
         assert bk["last_reinforced_cycle"] == 7, (
@@ -9029,11 +9219,14 @@ class TestHarvestKeylessEdgesSpeakerId:
         assert bk["speaker_id"] == "", f"Expected speaker_id='', got {bk['speaker_id']!r}"
 
     def test_speaker_id_population_via_real_merger_path(self, tmp_path):
-        """Population-2 (new): speaker_id flows edge→bookkeeping via the real merger.
+        """speaker_id flows edge→bookkeeping via the real merger.
 
         A Relation with speaker_id="spk-1" is merged through loop.merger.merge
-        (not added directly to graph). The A-1 Case-3 stamp puts speaker_id on
-        the edge; C-1 reads it; the minted bookkeeping record carries "spk-1".
+        (not added directly to graph). GraphMerger's Case-3 branch stamps the
+        Relation's speaker_id onto the net-new edge unconditionally (a net-new
+        edge has no prior value to preserve); the entry builder then resolves
+        speaker_id edge-first, falling back to the subject node's attribute and
+        finally to "". The minted bookkeeping record carries "spk-1".
         """
         from peft import PeftModel
 
@@ -9709,7 +9902,7 @@ class TestMaterializeInterimExtraRelations:
        appear in recall_miss_keys.  recall_miss_keys is computed against
        store.all_active_keys() BEFORE the reset — unregistered relations are
        invisible to the miss set.
-    4. dcf4189 speaker_id invariant: a minted interim key inherits speaker_id
+    4. speaker_id invariant: a minted interim key inherits speaker_id
        from the relation dict through the graph-walk keying step — the
        materialize step does not disrupt this flow.
     """
@@ -9875,7 +10068,8 @@ class TestMaterializeInterimExtraRelations:
           adopt writes ik_key to the new keyless edge on a same-SPO collision
           (recurrence bump).
         - The edge with ik_key='graph1' must be present.
-        - The merger.reinforcements dict records the surviving key → last_seen (bump path).
+        - ``merger.adopt_reinforcements`` records the adopted main key and the
+          merged timestamps the credit pass advances bookkeeping with.
         """
         from unittest.mock import patch
 
@@ -9997,7 +10191,7 @@ class TestMaterializeInterimExtraRelations:
         )
 
     # ------------------------------------------------------------------
-    # 4. dcf4189 speaker_id inheritance through the materialize path
+    # 4. speaker_id inheritance through the materialize path
     # ------------------------------------------------------------------
 
     def test_speaker_id_preserved_through_materialize_in_cycle(self, tmp_path):
@@ -10007,7 +10201,7 @@ class TestMaterializeInterimExtraRelations:
         _materialize_consolidation_graph runs BEFORE the graph-walk keying step.
         The key-prep reads speaker_id from episodic_rels (via _mint_keyed_entries),
         NOT from graph nodes.  This test verifies that adding the materialize step
-        does not corrupt speaker_id in minted keys (dcf4189 invariant).
+        does not corrupt speaker_id in minted keys.
 
         Strategy: run a simulate cycle with episodic_rels carrying explicit
         speaker_ids, mock reconstruct_graph internals, and assert the minted
@@ -10084,7 +10278,7 @@ class TestMaterializeInterimExtraRelations:
         (_build_all_edge_entries_into, defer=True).  When the materialize stub returns
         (set(), []) and the merger graph is empty, the walk produces zero keys
         — the store's tier is empty after the cycle (expected here).
-        Tests that verify key minting (dcf4189, speaker_id) are in
+        Tests that verify key minting and speaker_id inheritance are in
         TestInterimKeyedWalk.
         """
 
@@ -10143,7 +10337,7 @@ class TestInterimRecitalDedup:
     _build_all_edge_entries_into, and the session-scoped selection formula
     inside _run_fold's interim fresh-derivation branch).
 
-    Covered invariants (v2 amendments #1-#6):
+    Covered invariants:
 
     1. A recited exact triple (matches a merged-in main-tier dedup target)
        collapses onto the main key via the merger's Case-1 identity and
@@ -10159,9 +10353,9 @@ class TestInterimRecitalDedup:
     6. Dedup-LAST ordering: a session fact contradicting a main-tier dedup
        target does NOT soft-stale/retire the main key even with
        refinement_contradiction="on".
-    7. R1 edge case (pre-existing interim-slot key sharing identical SPO
-       with a main-tier dedup target) is benign under dedup-LAST: the slot
-       key survives/trains; no cross-tier bump_recurrence lands on the
+    7. A pre-existing interim-slot key sharing identical SPO with a
+       main-tier dedup target is benign under dedup-LAST: the slot
+       key survives/trains; no cross-tier reinforcement credit lands on the
        main key.
     8. Session-scoping: the real _run_fold call site passes dedup_target_keys
        containing only main-tier keys that touch an entity mentioned in
@@ -10199,6 +10393,7 @@ class TestInterimRecitalDedup:
             {name: cfg}
         )
         loop.tokenizer = MagicMock()
+        loop._incidents_state_dir = None
         loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -10307,14 +10502,11 @@ class TestInterimRecitalDedup:
             f"primary recital path must not soft-stale anything; got {loop.merger.removal_ledger}"
         )
         # The recital-dedup Case-1-adopt branch records the main key in
-        # adopt_reinforcements -- exactly once -- NOT in reinforcements (that
-        # dict is reserved for the both-keyed-collision elif).
+        # adopt_reinforcements -- exactly once.  It removes no edge, so it
+        # never writes a removal-ledger entry (asserted empty above); the
+        # both-keyed collision is what does.
         assert loop.merger.adopt_reinforcements == {"graph1": ("", "")}, (
             f"dedup adopt must credit graph1 exactly once; got {loop.merger.adopt_reinforcements}"
-        )
-        assert loop.merger.reinforcements == {}, (
-            f"the Case-1-adopt path must never populate reinforcements; got "
-            f"{loop.merger.reinforcements}"
         )
 
         tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
@@ -10403,10 +10595,10 @@ class TestInterimRecitalDedup:
 
     # ------------------------------------------------------------------
     # 1c. adopt_reinforcements survives an intervening non-empty merge()
-    #     call.  GraphMerger.merge() no longer resets
-    #     reinforcements/collapsed at entry at all (Q4 fix, 2026-07-28) --
-    #     reset happens ONLY in reset_graph(), the same lifecycle
-    #     adopt_reinforcements has always had.  Interim graph-tier
+    #     call.  GraphMerger.merge() resets no accumulator at entry:
+    #     collapsed, removal_ledger and adopt_reinforcements are cleared
+    #     ONLY in reset_graph(), so all three share one lifecycle and
+    #     accumulate across every merge() within a fold.  Interim graph-tier
     #     enrichment no longer exists as an intervening-merge source
     #     (FoldScope.enrich is pinned False at interim, so no real
     #     production call site puts a merge() between the interim dedup
@@ -10494,19 +10686,19 @@ class TestInterimRecitalDedup:
             resolve_contradictions=False,
         )
 
-        # reinforcements stays empty here for a reason UNRELATED to the
+        # The ledger stays empty here for a reason UNRELATED to the
         # intervening merge: this fixture's recon_relations is empty
         # (keys=[] -- no slot keys reconstructed), so no Case-1 duplicate-SPO
-        # collision ever fires to populate it in the first place.  GraphMerger
-        # .merge() no longer resets reinforcements/collapsed at entry at all
-        # (Q4 fix) -- if this fixture instead reconstructed two same-SPO slot
-        # keys, reinforcements would still carry that collapse's entry after
-        # the intervening merge, undisturbed (see
+        # collision ever fires to record one in the first place.  merge() does
+        # not reset removal_ledger/collapsed at entry (only reset_graph does),
+        # so had this fixture reconstructed two same-SPO slot keys, the ledger
+        # would still carry that collapse's entry after the intervening merge,
+        # undisturbed (see
         # TestDriftPartitioning.test_intervening_enrichment_merge_preserves_dedup_bucketing_and_bump
         # for that exact scenario, end-to-end at the full fold).
-        assert loop.merger.reinforcements == {}, (
+        assert loop.merger.removal_ledger == {}, (
             "precondition sanity check: this fixture's recon_relations is empty, "
-            f"so reinforcements was never populated; got {loop.merger.reinforcements}"
+            f"so no collapse was ever recorded; got {loop.merger.removal_ledger}"
         )
         assert "graph1" in loop.merger.adopt_reinforcements, (
             "adopt_reinforcements MUST survive the intervening merge() call -- this is "
@@ -10858,8 +11050,8 @@ class TestInterimRecitalDedup:
         )
 
     # ------------------------------------------------------------------
-    # 7. R1 edge case: slot-key/main-key SPO collision is benign under
-    #    dedup-LAST — the slot key survives; no cross-tier bump on main.
+    # 7. A slot-key/main-key SPO collision is benign under dedup-LAST —
+    #    the slot key survives; no cross-tier bump on main.
     # ------------------------------------------------------------------
 
     def test_r1_benign_slot_key_survives_no_cross_tier_bump(self, tmp_path):
@@ -10883,8 +11075,15 @@ class TestInterimRecitalDedup:
             },
             simhash=1,
         )
+        # Dated distinctly from the slot key: the two sightings come from
+        # different sessions, which is what makes the collapse a genuine
+        # re-observation rather than one transcript saying it twice.
         loop.store.set_bookkeeping(
-            "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
+            "graph_main",
+            speaker_id="spk-a",
+            relation_type="factual",
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
         )
 
         # Pre-existing interim slot key with the SAME (s,p,o) -- the anomaly.
@@ -10901,7 +11100,11 @@ class TestInterimRecitalDedup:
             simhash=2,
         )
         loop.store.set_bookkeeping(
-            "graph_slot", speaker_id="spk-a", relation_type="factual", first_seen=""
+            "graph_slot",
+            speaker_id="spk-a",
+            relation_type="factual",
+            last_seen="2026-01-05T00:00:00Z",
+            first_seen="2026-01-05T00:00:00Z",
         )
 
         with patch(
@@ -10921,19 +11124,17 @@ class TestInterimRecitalDedup:
             f"slot key must survive as the edge's ik_key under dedup-LAST; got {surviving_keys}"
         )
         assert "graph_main" in loop.merger.collapsed
-        assert loop.merger.removal_ledger.get("graph_main", {}).get("surviving_twin") == (
+        assert loop.merger.removal_ledger.get("graph_main", {}).get("survivor_key") == (
             "graph_slot"
         )
-        assert "graph_main" not in loop.merger.reinforcements, (
-            "no cross-tier bump_recurrence on the main-tier key"
+        assert "graph_slot" not in loop.merger.removal_ledger, (
+            "no cross-tier credit on the surviving slot key -- it is the survivor, not a removal"
         )
-        assert "graph_slot" in loop.merger.reinforcements, (
-            "the surviving slot key is recorded for the fold's bump_recurrence pass"
-        )
-        # The R1 collision rides the both-keyed-collision elif, never the
+        # The slot/main collision rides the both-keyed-collision elif, never the
         # Case-1-adopt branch -- graph_main must never enter adopt_reinforcements.
         assert "graph_main" not in loop.merger.adopt_reinforcements, (
-            "R1 collision must not credit the main key via adopt_reinforcements; "
+            "the slot/main SPO collision must not credit the main key via "
+            "adopt_reinforcements; "
             f"got {loop.merger.adopt_reinforcements}"
         )
 
@@ -10942,16 +11143,12 @@ class TestInterimRecitalDedup:
         main_before = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
         slot_before = loop.store.bookkeeping_for_key("graph_slot")["reinforcement_count"]
         loop.cycle_count = 3
-        # recon_relations must be the REAL (non-empty) list from the materialize
-        # call above (keys=["graph_slot"]) -- the reinforcements bump block is
-        # guarded by `if recon_relations:` (the original, unrelaxed contract), so
-        # passing [] here would wrongly skip the slot key's expected bump.
         loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
         main_after = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
         slot_after = loop.store.bookkeeping_for_key("graph_slot")["reinforcement_count"]
         assert main_after == main_before, (
-            "the R1 collision must not bump the main key's reinforcement via the "
-            f"interim cycle; before={main_before} after={main_after}"
+            "the slot/main SPO collision must not bump the main key's reinforcement "
+            f"via the interim cycle; before={main_before} after={main_after}"
         )
         assert slot_after == slot_before + 1, (
             "the surviving slot key IS expected to bump (same-tier, benign, "
@@ -10963,30 +11160,30 @@ class TestInterimRecitalDedup:
             tier_keyed, defer=True, tag_new=True, exclude_keys={"graph_main"}
         )
         assert any(e["key"] == "graph_slot" for e in tier_keyed["episodic"]), (
-            "the slot key must survive/train despite the R1 collision"
+            "the slot key must survive/train despite the SPO collision with the main key"
         )
         assert not any(e["key"] == "graph_main" for e in tier_keyed["episodic"])
 
     # ------------------------------------------------------------------
-    # 7b. R1 cross-fold no-leak: the interim-time "dedup" collapse of the
+    # 7b. Cross-fold no-leak: the interim-time "dedup" collapse of the
     #     main key must not survive (via merger.collapsed/removal_ledger)
-    #     into a SUBSEQUENT full fold's drift-partition step.  Exercises
-    #     barrier 1 specifically: reset_graph() (called unconditionally at
-    #     the top of every _materialize_consolidation_graph invocation,
-    #     including the full fold's own) must clear the interim cycle's
-    #     leftover collapsed/removal_ledger state before the full fold's
-    #     own registry-true recon and drift-partition run.
+    #     into a SUBSEQUENT full fold's drift-partition step.  Exercises the
+    #     reset_graph() barrier specifically: reset_graph() (called
+    #     unconditionally at the top of every _materialize_consolidation_graph
+    #     invocation, including the full fold's own) must clear the interim
+    #     cycle's leftover collapsed/removal_ledger state before the full
+    #     fold's own registry-true recon and drift-partition run.
     # ------------------------------------------------------------------
 
     def test_r1_interim_collapse_does_not_leak_into_subsequent_full_fold(self, tmp_path):
-        """R1 collision + a SUBSEQUENT full fold: graph_main survives.
+        """Slot/main SPO collision + a SUBSEQUENT full fold: graph_main survives.
 
         Setup mirrors test_r1_benign_slot_key_survives_no_cross_tier_bump:
         an interim slot key ("graph_slot") and a main-tier key
         ("graph_main") share identical canonical SPO, and the (unconditional)
         interim cycle's dedup-LAST merge collapses "graph_main" onto
         "graph_slot" -- recorded in merger.collapsed /
-        removal_ledger[reason="dedup", surviving_twin="graph_slot"].
+        removal_ledger[reason="dedup", survivor_key="graph_slot"].
 
         A SUBSEQUENT full fold is then driven through the production entry
         (consolidate, via
@@ -11000,17 +11197,16 @@ class TestInterimRecitalDedup:
         drift_deduplicated key -- an independent, correct verdict, the
         opposite of the interim cycle's verdict.
 
-        Barrier-1 assertion: removal_ledger["graph_main"] (the STALE
-        interim-time entry, surviving_twin="graph_slot") must be GONE by
+        reset_graph() barrier assertion: removal_ledger["graph_main"] (the
+        STALE interim-time entry, survivor_key="graph_slot") must be GONE by
         the time the full fold's drift-partition reads
         self.merger.removal_ledger -- reset_graph() wipes it before the
         full fold's own recon runs.  If reset_graph() were skipped, that
         stale entry would still be present after the full fold.
 
-        Outcome assertions (the coordinator's requested regression pin):
-        graph_main is still ACTIVE after the full fold -- not soft-staled,
-        not in soft_stale_by_tier (checked via store.is_stale), still in
-        episodic's active keys.
+        Outcome assertions: graph_main is still ACTIVE after the full fold --
+        not soft-staled, not in soft_stale_by_tier (checked via
+        store.is_stale), still in episodic's active keys.
         """
         from unittest.mock import patch
 
@@ -11044,7 +11240,7 @@ class TestInterimRecitalDedup:
             "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
         )
 
-        # Pre-existing interim slot key with the SAME (s,p,o) -- the R1
+        # Pre-existing interim slot key with the SAME (s,p,o) -- the
         # anomaly.  Registered SECOND (its own, later-created registry).
         loop.store.load_registry(_adapter, KeyRegistry())
         loop.store.put(
@@ -11063,7 +11259,7 @@ class TestInterimRecitalDedup:
             "graph_slot", speaker_id="spk-a", relation_type="factual", first_seen=""
         )
 
-        # --- Interim cycle: reuse the R1 fixture's direct-call mechanism to
+        # --- Interim cycle: reuse the direct-call mechanism to
         # cheaply reproduce the "interim cycle already ran" state on
         # self.merger, exactly as test_r1_benign_slot_key_survives_no_cross_tier_bump
         # does (real GraphMerger so Case-1 collapse actually fires). ---
@@ -11083,12 +11279,12 @@ class TestInterimRecitalDedup:
                 dedup_target_keys=["graph_main"],
             )
 
-        # Setup preconditions (mirrors the R1 unit test above).
+        # Setup preconditions (mirrors the collision unit test above).
         assert "graph_main" in loop.merger.collapsed, (
             "setup precondition: the interim dedup-LAST merge must collapse graph_main"
         )
         assert (
-            loop.merger.removal_ledger.get("graph_main", {}).get("surviving_twin") == "graph_slot"
+            loop.merger.removal_ledger.get("graph_main", {}).get("survivor_key") == "graph_slot"
         ), "setup precondition: graph_main's interim-time surviving twin must be graph_slot"
         assert not loop.store.is_stale("graph_main"), (
             "setup precondition: the interim collapse must not itself soft-stale graph_main"
@@ -11099,7 +11295,7 @@ class TestInterimRecitalDedup:
             loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph())
         )
 
-        # Barrier 1: the interim cycle's stale removal_ledger/collapsed
+        # reset_graph() barrier: the interim cycle's stale removal_ledger/collapsed
         # attribution for graph_main must be gone by the time the full
         # fold's drift-partition reads self.merger.removal_ledger /
         # self.merger.collapsed -- reset_graph() (unconditional, at the top
@@ -11251,8 +11447,14 @@ class TestInterimRecitalDedup:
             },
             simhash=1,
         )
+        # Dated earlier than the reciting session below: the recital is a
+        # later sighting of the same fact, not the same transcript again.
         loop.store.set_bookkeeping(
-            "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
+            "graph_main",
+            speaker_id="spk-a",
+            relation_type="factual",
+            last_seen="2026-01-01T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
         )
         main_before = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
 
@@ -11261,7 +11463,7 @@ class TestInterimRecitalDedup:
         loop.merger.merge(
             SessionGraph(
                 session_id="s1",
-                timestamp="",
+                timestamp="2026-02-01T00:00:00Z",
                 entities=[],
                 relations=[
                     Relation(
@@ -11403,14 +11605,14 @@ class TestInterimRecitalDedup:
 
 
 # ---------------------------------------------------------------------------
-# Multi-speaker dcf4189 invariant + keyed-walk vs flat parity
+# Multi-speaker speaker_id invariant + keyed-walk vs flat parity
 # ---------------------------------------------------------------------------
 
 
 class TestInterimKeyedWalk:
     """Keyed-walk acceptance tests: speaker_id and SPO-content parity.
 
-    1. Multi-speaker dcf4189 invariant: two pending facts from DISTINCT
+    1. Multi-speaker speaker_id invariant: two pending facts from DISTINCT
        speakers in one interim cycle must yield minted keys with DIFFERENT,
        correct speaker_ids — they must NOT collapse to a single default.
 
@@ -11496,7 +11698,7 @@ class TestInterimKeyedWalk:
         return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
 
     # ------------------------------------------------------------------
-    # 1. Multi-speaker dcf4189 invariant through the graph-walk
+    # 1. Multi-speaker speaker_id invariant through the graph-walk
     # ------------------------------------------------------------------
 
     def test_two_speakers_yield_distinct_speaker_ids_in_minted_keys(self, tmp_path):
@@ -11504,8 +11706,9 @@ class TestInterimKeyedWalk:
         yield minted keys whose speaker_ids are DIFFERENT and correct — neither
         must collapse to the caller default.
 
-        Regression class: dcf4189 fixed keyless-edge minting inheriting
-        speaker_id from the graph subject node rather than falling back to "".
+        Regression class: keyless-edge minting must inherit speaker_id from the
+        edge (stamped by the merger from Relation.speaker_id), else from the
+        graph subject node — never fall back to "".
         Without entity re-synthesis in _materialize_consolidation_graph,
         both minted keys would carry speaker_id="" because the merged graph
         lacked speaker_id attributes on the subject nodes.
@@ -11585,14 +11788,14 @@ class TestInterimKeyedWalk:
         # The two minted keys must carry DIFFERENT speaker_ids — not collapsed.
         assert len(speaker_ids_found) == 2, (
             f"Both minted keys collapsed to the same speaker_id: {speaker_ids_found!r}. "
-            "dcf4189 regression: subject-node speaker_id not inherited from entity re-synthesis."
+            "Regression: subject-node speaker_id not inherited from entity re-synthesis."
         )
 
         # Neither must be the caller default ("").
         assert "" not in speaker_ids_found, (
             f"At least one minted key fell back to speaker_id=''; "
             f"speaker_ids found: {speaker_ids_found!r}. "
-            "dcf4189 regression: speaker_id not stamped by entity synthesis."
+            "Regression: speaker_id not stamped by entity synthesis."
         )
 
 
@@ -11609,9 +11812,9 @@ class TestMergeRegistryRelationsUnification:
     extra-relations (pending-session) path.
 
     Tests:
-    - MRR-1: recon path (no extra_relations) produces person node with speaker_id.
-    - MRR-2: extra_relations path still produces person nodes (dcf4189 regression guard).
-    - MRR-3: non-speaker relations produce no spurious person nodes.
+    - recon path (no extra_relations) produces person node with speaker_id.
+    - extra_relations path still produces person nodes (regression guard).
+    - non-speaker relations produce no spurious person nodes.
     """
 
     @staticmethod
@@ -11689,7 +11892,7 @@ class TestMergeRegistryRelationsUnification:
         return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
 
     # ------------------------------------------------------------------
-    # MRR-1: recon path produces person node with speaker_id
+    # recon path produces person node with speaker_id
     # ------------------------------------------------------------------
 
     def test_recon_path_produces_person_node_with_speaker_id(self, tmp_path):
@@ -11742,7 +11945,7 @@ class TestMergeRegistryRelationsUnification:
             )
 
         # The merged graph must have a node for the speaker subject.
-        # §0 invariant (Step 2): speaker node keys are the casefolded speaker_id.
+        # Speaker node keys are the casefolded speaker_id.
         # GraphMerger._resolve_entity returns entity.speaker_id verbatim.
         node_key = "speaker0"  # casefolded: "speaker0" IS the canonical form
         assert node_key in loop.merger.graph.nodes, (
@@ -11765,13 +11968,13 @@ class TestMergeRegistryRelationsUnification:
         )
 
     # ------------------------------------------------------------------
-    # MRR-2: extra_relations path still produces person nodes (dcf4189 guard)
+    # extra_relations path still produces person nodes (regression guard)
     # ------------------------------------------------------------------
 
     def test_extra_relations_path_still_produces_person_nodes(self, tmp_path):
         """extra_relations (pending-session) path continues to produce person nodes.
 
-        Verifies that the dcf4189 fix (speaker_id on extra_relations nodes) is
+        Verifies that speaker_id stamping on extra_relations subject nodes is
         preserved through the GraphMerger.merge_relations unification.  Passes
         extra_relations with speaker subjects and no registered keys so the recon
         path is a no-op; only the extra path runs.
@@ -11799,7 +12002,7 @@ class TestMergeRegistryRelationsUnification:
         ):
             loop._materialize_consolidation_graph(extra_relations=extra_relations)
 
-        # §0 invariant (Step 2): speaker node keys are the casefolded speaker_id.
+        # Speaker node keys are the casefolded speaker_id.
         node_key = "speaker1"  # casefolded: "speaker1" == "speaker1"
         assert node_key in loop.merger.graph.nodes, (
             f"Extra-relations path: speaker subject node {node_key!r} missing; "
@@ -11816,7 +12019,7 @@ class TestMergeRegistryRelationsUnification:
         )
 
     # ------------------------------------------------------------------
-    # MRR-3: non-speaker relations do not produce spurious person nodes
+    # non-speaker relations do not produce spurious person nodes
     # ------------------------------------------------------------------
 
     def test_non_speaker_relation_produces_no_person_node(self, tmp_path):
@@ -12351,7 +12554,7 @@ class TestSameAsSpeakerPairGuard:
 
 
 class TestSubtractiveRemovalsHelperInterim:
-    """_apply_subtractive_removals_to_store(scope='interim') soft-stales the correct reasons.
+    """_apply_subtractive_removals_to_store(fold_name="interim") soft-stales the correct reasons.
 
     Tests:
     - predicate_synonym_collapse is soft-staled at interim scope.
@@ -12447,7 +12650,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
         assert not loop.store.is_stale("graph_collapse_k1"), "Precondition: key must be active"
 
-        result = loop._apply_subtractive_removals_to_store(scope="interim")
+        result = loop._apply_subtractive_removals_to_store(fold_name="interim")
 
         assert loop.store.is_stale("graph_collapse_k1"), (
             "predicate_synonym_collapse key must be soft-staled at interim scope"
@@ -12489,7 +12692,7 @@ class TestSubtractiveRemovalsHelperInterim:
             register=True,
         )
 
-        loop._apply_subtractive_removals_to_store(scope="interim")
+        loop._apply_subtractive_removals_to_store(fold_name="interim")
 
         assert loop.store.is_stale("graph_contra_k1"), (
             "contradiction_same_pred key must be soft-staled at interim scope"
@@ -12525,7 +12728,7 @@ class TestSubtractiveRemovalsHelperInterim:
             register=True,
         )
 
-        loop._apply_subtractive_removals_to_store(scope="interim")
+        loop._apply_subtractive_removals_to_store(fold_name="interim")
 
         assert not loop.store.is_stale("graph_enrich_k1"), (
             "enrichment_same_as key must NOT be soft-staled at interim scope "
@@ -12552,7 +12755,7 @@ class TestSubtractiveRemovalsHelperInterim:
         )
         # Do NOT register the key — it is absent from the store.
 
-        result = loop._apply_subtractive_removals_to_store(scope="interim")
+        result = loop._apply_subtractive_removals_to_store(fold_name="interim")
 
         # No crash; result contains no entry for the absent key.
         all_stale_keys = {k for tier in result.values() for k in tier}
@@ -12570,7 +12773,7 @@ class TestSubtractiveRemovalsHelperInterim:
 
         The test drives the post-fix ordering directly:
         1. Register key as active.
-        2. ``_apply_subtractive_removals_to_store(scope='interim')`` — stales in memory.
+        2. ``_apply_subtractive_removals_to_store(fold_name="interim")`` — stales in memory.
         3. ``commit_tier_slot(mode='simulate')`` — serializes the now-staled registry.
         4. Reload registry from disk into a fresh ``KeyRegistry`` instance.
         5. Assert the reloaded registry shows the key as stale (not active).
@@ -12609,7 +12812,7 @@ class TestSubtractiveRemovalsHelperInterim:
         assert not loop.store.is_stale(_key), "Precondition: key must be active before staling"
 
         # Step 2: soft-stale in memory (must precede commit).
-        loop._apply_subtractive_removals_to_store(scope="interim")
+        loop._apply_subtractive_removals_to_store(fold_name="interim")
         assert loop.store.is_stale(_key), "Key must be stale in memory after M5 stage"
 
         # Step 3: commit — serializes the already-staled registry to disk.
@@ -12640,11 +12843,11 @@ class TestSubtractiveRemovalsHelperInterim:
 
 
 class TestSubtractiveRemovalsHelperFold:
-    """_apply_subtractive_removals_to_store(scope='fold') scoping invariants.
+    """_apply_subtractive_removals_to_store(fold_name="full") scoping invariants.
 
     Tests:
-    - ASRF-1: predicate_synonym_collapse IS soft-staled at fold (time-invariant).
-    - ASRF-2: contradiction_same_pred IS soft-staled at fold (recency-backed: the merger
+    - predicate_synonym_collapse IS soft-staled at fold (time-invariant).
+    - contradiction_same_pred IS soft-staled at fold (recency-backed: the merger
       only emits the ledger entry when timestamps pick a unique winner; empty/tied → coexist
       → no entry → no stale).
     """
@@ -12702,7 +12905,7 @@ class TestSubtractiveRemovalsHelperFold:
         return loop
 
     def test_synonym_collapse_soft_staled_at_fold(self, tmp_path):
-        """ASRF-1: predicate_synonym_collapse is soft-staled at fold scope (time-invariant)."""
+        """predicate_synonym_collapse is soft-staled at fold scope (time-invariant)."""
         loop = self._make_loop_with_ledger(
             tmp_path,
             ledger={
@@ -12728,7 +12931,7 @@ class TestSubtractiveRemovalsHelperFold:
             register=True,
         )
 
-        result = loop._apply_subtractive_removals_to_store(scope="fold")
+        result = loop._apply_subtractive_removals_to_store(fold_name="full")
 
         assert loop.store.is_stale("graph_fold_collapse_k1"), (
             "predicate_synonym_collapse key must be soft-staled at fold scope"
@@ -12738,7 +12941,7 @@ class TestSubtractiveRemovalsHelperFold:
         )
 
     def test_contradiction_same_pred_soft_staled_at_fold(self, tmp_path):
-        """ASRF-2: contradiction_same_pred IS soft-staled at fold scope.
+        """contradiction_same_pred IS soft-staled at fold scope.
 
         The merger only emits a contradiction_same_pred ledger entry when timestamps
         pick a UNIQUE winner (freshest last_seen wins).  An empty/tied pair never
@@ -12770,7 +12973,7 @@ class TestSubtractiveRemovalsHelperFold:
             register=True,
         )
 
-        result = loop._apply_subtractive_removals_to_store(scope="fold")
+        result = loop._apply_subtractive_removals_to_store(fold_name="full")
 
         assert loop.store.is_stale("graph_fold_contra_k1"), (
             "contradiction_same_pred key must be soft-staled at fold scope "
@@ -12782,7 +12985,7 @@ class TestSubtractiveRemovalsHelperFold:
         )
 
     def test_empty_last_seen_tied_no_ledger_entry_no_stale_at_fold(self, tmp_path):
-        """ASRF-3: no ledger entry emitted by merger for empty/tied timestamps →
+        """No ledger entry emitted by merger for empty/tied timestamps →
         _apply_subtractive_removals_to_store has nothing to act on at fold scope.
 
         This verifies the ledger-gate invariant: the merger only writes
@@ -12804,7 +13007,7 @@ class TestSubtractiveRemovalsHelperFold:
             register=True,
         )
 
-        result = loop._apply_subtractive_removals_to_store(scope="fold")
+        result = loop._apply_subtractive_removals_to_store(fold_name="full")
 
         assert not loop.store.is_stale("graph_tied_k1"), (
             "Key with no ledger entry must NOT be staled (tied timestamps → coexist → no entry)"
@@ -13166,11 +13369,11 @@ class TestExtractJsonBlockRelationsEnvelope:
     the normalization prompt.
 
     Tests:
-    - REL-1: wrapped {"relations":[...]} envelope parsed and returned.
-    - REL-2: bare array [{...}] with subject/predicate/object elements accepted.
-    - REL-3: markdown-fenced {"relations":[...]} accepted (fence stripped).
-    - REL-4: no JSON at all raises ValueError.
-    - REL-5: multiple relation entries preserved.
+    - wrapped {"relations":[...]} envelope parsed and returned.
+    - bare array [{...}] with subject/predicate/object elements accepted.
+    - markdown-fenced {"relations":[...]} accepted (fence stripped).
+    - no JSON at all raises ValueError.
+    - multiple relation entries preserved.
     """
 
     @staticmethod
@@ -13182,7 +13385,7 @@ class TestExtractJsonBlockRelationsEnvelope:
         return json.loads(_extract_json_block(raw))
 
     def test_relations_envelope_parsed(self):
-        """REL-1: {"relations":[...]} envelope is accepted by _extract_json_block."""
+        """{"relations":[...]} envelope is accepted by _extract_json_block."""
         raw = '{"relations": [{"subject": "Alex", "predicate": "works_for", "object": "Acme"}]}'
         result = self._parse(raw)
         assert isinstance(result, dict)
@@ -13191,27 +13394,27 @@ class TestExtractJsonBlockRelationsEnvelope:
         assert result["relations"][0]["predicate"] == "works_for"
 
     def test_bare_array_with_spo_elements_accepted(self):
-        """REL-2: bare array where first element has subject/predicate/object is accepted."""
+        """Bare array where first element has subject/predicate/object is accepted."""
         raw = '[{"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}]'
         result = self._parse(raw)
         assert isinstance(result, list)
         assert result[0]["object"] == "Berlin"
 
     def test_markdown_fenced_relations_envelope(self):
-        """REL-3: code-fenced {"relations":[...]} is parsed after fence-stripping."""
+        """Code-fenced {"relations":[...]} is parsed after fence-stripping."""
         raw = '```json\n{"relations": [{"subject": "A", "predicate": "b", "object": "C"}]}\n```'
         result = self._parse(raw)
         assert "relations" in result
 
     def test_no_json_raises(self):
-        """REL-4: no JSON in output → ValueError from _extract_json_block."""
+        """No JSON in output → ValueError from _extract_json_block."""
         from paramem.graph.extractor import _extract_json_block
 
         with pytest.raises((ValueError, Exception)):
             _extract_json_block("The graph has no redundancy.")
 
     def test_multiple_relation_entries_preserved(self):
-        """REL-5: multiple relation entries are all present in parsed output."""
+        """Multiple relation entries are all present in parsed output."""
         raw = (
             '{"relations": ['
             '{"subject": "Morgan", "predicate": "born_in", "object": "Germany"},'
@@ -13243,19 +13446,19 @@ class TestRunGraphNormalizationApply:
     ``"predicate_synonym_collapse"``.
 
     Tests:
-    - NDA-1: two keyed synonym predicates for same (s,o) — model returns cluster →
-             lower-rec keyed edge removed + removal_ledger 'predicate_synonym_collapse'.
-    - NDA-2: two keyless synonym predicates — lower-rec edge removed, no ledger entry.
-    - NDA-3: provenance (sessions union, recurrence sum, max confidence) is
-             carried onto the survivor (MAX rec) before retired edges are removed.
-    - NDA-4: single-predicate (s,o) group → no model call; graph unchanged.
-    - NDA-5: model returns empty clusters → no-op (graph unchanged).
-    - NDA-6: model=None → skipped=True, graph unchanged.
-    - NDA-7: graph < 10 nodes → skipped=True (floor).
-    - NDA-8: mixed keyed + keyless — keyed retired → ledger; keyless retired → no ledger;
-             MAX-rec survivor intact; result counts correct.
-    - NDA-9: single-predicate (s,o) group not touched even when another group is collapsed.
-    - NDA-10: multi-predicate group collapsed; graph updated correctly.
+    - two keyed synonym predicates for same (s,o) — model returns cluster →
+      lower-rec keyed edge removed + removal_ledger 'predicate_synonym_collapse'.
+    - two keyless synonym predicates — lower-rec edge removed, no ledger entry.
+    - provenance (sessions union, recurrence sum, max confidence) is carried onto
+      the survivor (MAX rec) before retired edges are removed.
+    - single-predicate (s,o) group → no model call; graph unchanged.
+    - model returns empty clusters → no-op (graph unchanged).
+    - model=None → skipped=True, graph unchanged.
+    - graph < 10 nodes → skipped=True (floor).
+    - mixed keyed + keyless — keyed retired → ledger; keyless retired → no ledger;
+      MAX-rec survivor intact; result counts correct.
+    - single-predicate (s,o) group not touched even when another group is collapsed.
+    - multi-predicate group collapsed; graph updated correctly.
     """
 
     # ---------------------------------------------------------------------------
@@ -13394,7 +13597,7 @@ class TestRunGraphNormalizationApply:
     # ---------------------------------------------------------------------------
 
     def test_keyed_synonym_retired_and_ledgered(self, tmp_path):
-        """NDA-1: two keyed synonym predicates for same (s,o) — model returns cluster.
+        """Two keyed synonym predicates for same (s,o) — model returns cluster.
 
         Graph: jordan -> techcorp with keyed edges 'works_for' (graph42, rec=1) and
         'employed_by' (graph87, rec=2).  Model returns cluster [works_for, employed_by].
@@ -13438,7 +13641,7 @@ class TestRunGraphNormalizationApply:
         assert result["skipped"] is False
 
     def test_keyless_synonym_retired_no_ledger(self, tmp_path):
-        """NDA-2: two keyless synonym predicates — lower-rec edge removed, no ledger entry.
+        """Two keyless synonym predicates — lower-rec edge removed, no ledger entry.
 
         Fresh-ingest case: facts arrive keyless.  Graph has two keyless edges for
         (jordan, techcorp): 'works_for' (rec=1) and 'employed_by' (rec=3).
@@ -13477,7 +13680,7 @@ class TestRunGraphNormalizationApply:
         assert result["groups_collapsed"] == 1
 
     def test_provenance_unioned_onto_survivor(self, tmp_path):
-        """NDA-3: sessions, recurrence, and confidence are unioned onto the survivor.
+        """Sessions, recurrence, and confidence are unioned onto the survivor.
 
         Graph: morgan -> germany with 'born_in' (graph12, sessions=['s1'], rec=1)
         and 'birthplace' (graph34, sessions=['s2'], rec=2, confidence=0.95).
@@ -13619,7 +13822,7 @@ class TestRunGraphNormalizationApply:
         )
 
     def test_single_predicate_group_no_model_call(self, tmp_path):
-        """NDA-4: single-predicate (s,o) group is never a candidate — no model call.
+        """Single-predicate (s,o) group is never a candidate — no model call.
 
         Graph: morgan -> germany with only 'born_in' (graph12).  The group has only
         one predicate so it never reaches normalize_predicates as a candidate.
@@ -13652,7 +13855,7 @@ class TestRunGraphNormalizationApply:
         assert result["chunks"] == 0, "no model calls for single-predicate group"
 
     def test_empty_clusters_response_is_noop(self, tmp_path):
-        """NDA-5: model returns empty clusters for a group → no retirement.
+        """Model returns empty clusters for a group → no retirement.
 
         Graph: jordan -> techcorp with 'works_for' (graph42) and 'employed_by' (graph87).
         Model returns {"clusters": []} — predicates are NOT synonyms.
@@ -13685,7 +13888,7 @@ class TestRunGraphNormalizationApply:
         assert result["groups_collapsed"] == 0
 
     def test_no_model_returns_skipped(self, tmp_path):
-        """NDA-6: model=None → pass skipped immediately, graph unchanged."""
+        """model=None → pass skipped immediately, graph unchanged."""
         loop = self._make_loop(tmp_path, model=None)
         loop.model = None
 
@@ -13697,7 +13900,7 @@ class TestRunGraphNormalizationApply:
         assert loop.merger.graph.number_of_nodes() == initial_nodes
 
     def test_small_graph_returns_skipped(self, tmp_path):
-        """NDA-7: graph < 10 nodes → pass skipped (below floor)."""
+        """Graph < 10 nodes → pass skipped (below floor)."""
         loop = self._make_loop(tmp_path, node_count=5)
 
         result = _refiner_for(loop).run_normalization()
@@ -13706,7 +13909,7 @@ class TestRunGraphNormalizationApply:
         assert result["skip_reason"] == "floor"
 
     def test_mixed_keyed_and_keyless_correct_ledger(self, tmp_path):
-        """NDA-8: mixed keyed + keyless — keyed retired -> ledger; keyless retired -> no ledger.
+        """Mixed keyed + keyless — keyed retired -> ledger; keyless retired -> no ledger.
 
         Graph: jordan -> techcorp with three edges (all rec=1):
         - 'works_for', keyed graph42 (survivor — first in cluster, tiebreaker)
@@ -13751,7 +13954,7 @@ class TestRunGraphNormalizationApply:
         assert result["groups_collapsed"] == 1
 
     def test_single_predicate_group_untouched_when_other_group_collapsed(self, tmp_path):
-        """NDA-9: single-predicate (s,o) group is not touched when another group is collapsed.
+        """Single-predicate (s,o) group is not touched when another group is collapsed.
 
         Graph: sam -> berlin with only 'lives_in' (graph99) — single predicate, not a
         candidate.  jordan -> techcorp has 'works_for' (graph42) and 'employed_by' (graph87)
@@ -13785,7 +13988,7 @@ class TestRunGraphNormalizationApply:
         assert result["groups_collapsed"] == 1
 
     def test_max_rec_survivor_selected(self, tmp_path):
-        """NDA-10: MAX reinforcement_count edge survives; lower-rec edge retired.
+        """MAX reinforcement_count edge survives; lower-rec edge retired.
 
         Graph: morgan -> germany with 'born_in' (graph12, rec=1) and
         'birthplace' (graph34, rec=2).  Cluster collapses both.
@@ -13834,14 +14037,14 @@ class TestRunGraphNormalizationCloudEngine:
     """``GraphTierRefiner.run_normalization`` cloud wiring and fail-loud tests.
 
     Tests:
-    - Cloud-1: cloud_enabled=True + provider + api_key in env → normalize_predicates
-              called with ``cloud=`` kwarg, NOT ``model=``.
-    - Cloud-2: cloud_enabled=True + provider present but NO api_key in env → local
-              fallback: normalize_predicates called with ``model=`` kwarg.
-    - DBG-1: after retirement, on_normalization receives non-empty raw_outputs list
-             and non-empty decisions list.
-    - FL-1:  FileNotFoundError raised when predicate_normalization.txt is missing
-             (graph ≥ 10 nodes, model present).
+    - cloud_enabled=True + provider + api_key in env → normalize_predicates
+      called with ``cloud=`` kwarg, NOT ``model=``.
+    - cloud_enabled=True + provider present but NO api_key in env → local
+      fallback: normalize_predicates called with ``model=`` kwarg.
+    - after retirement, on_normalization receives non-empty raw_outputs list
+      and non-empty decisions list.
+    - FileNotFoundError raised when predicate_normalization.txt is missing
+      (graph ≥ 10 nodes, model present).
     """
 
     @staticmethod
@@ -13939,7 +14142,7 @@ class TestRunGraphNormalizationCloudEngine:
     _PROMPT_STUB = "dummy {predicates_json}"
 
     def test_cloud_engine_selected_when_enabled_with_api_key(self, tmp_path, monkeypatch):
-        """Cloud-1: cloud_enabled=True + provider + env api_key → primitive gets cloud=."""
+        """cloud_enabled=True + provider + env api_key → primitive gets cloud=."""
 
         from unittest.mock import patch
 
@@ -13981,7 +14184,7 @@ class TestRunGraphNormalizationCloudEngine:
         assert captured["cloud"]["api_key"] == "sk-test-key"
 
     def test_local_fallback_when_api_key_absent(self, tmp_path, monkeypatch):
-        """Cloud-2: cloud_enabled=True but NO api_key → local fallback (model= kwarg)."""
+        """cloud_enabled=True but NO api_key → local fallback (model= kwarg)."""
         from unittest.mock import patch
 
         # Ensure the env var is absent.
@@ -14021,7 +14224,7 @@ class TestRunGraphNormalizationCloudEngine:
         )
 
     def test_on_normalization_receives_nonempty_raw_outputs_and_decisions(self, tmp_path):
-        """DBG-1: after retirement, on_normalization receives non-empty raw_outputs
+        """After retirement, on_normalization receives non-empty raw_outputs
         and non-empty decisions — the debug snapshot has real data to write."""
         import json
         from unittest.mock import patch
@@ -14060,7 +14263,7 @@ class TestRunGraphNormalizationCloudEngine:
         assert call["decisions"], "decisions must be non-empty when clusters were produced"
 
     def test_fail_loud_when_prompt_missing(self, tmp_path):
-        """FL-1: FileNotFoundError raised when predicate_normalization.txt is missing.
+        """FileNotFoundError raised when predicate_normalization.txt is missing.
 
         The prompt load now happens inside ``normalize_predicates`` itself,
         gated on ``relations`` being non-empty (it fires before the
@@ -14097,9 +14300,9 @@ class TestNormalizationDebugSnapshot:
     the shared artifact primitive and writes normalization_snapshot.json under fold/.
 
     Tests:
-    - DS-1: save_cycle_snapshots=True → normalization_snapshot.json written with
-            raw_outputs, decisions, and applied counts (index-delta schema).
-    - DS-2: save_cycle_snapshots=False → no file written (self-gated no-op).
+    - save_cycle_snapshots=True → normalization_snapshot.json written with
+      raw_outputs, decisions, and applied counts (index-delta schema).
+    - save_cycle_snapshots=False → no file written (self-gated no-op).
     """
 
     @staticmethod
@@ -14128,7 +14331,7 @@ class TestNormalizationDebugSnapshot:
         return loop
 
     def test_normalization_snapshot_written_when_debug_enabled(self, tmp_path):
-        """DS-1: save_cycle_snapshots=True → normalization_snapshot.json written."""
+        """save_cycle_snapshots=True → normalization_snapshot.json written."""
         import json
 
         loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=True)
@@ -14148,7 +14351,7 @@ class TestNormalizationDebugSnapshot:
         assert payload["applied"] == applied
 
     def test_normalization_snapshot_not_written_when_debug_disabled(self, tmp_path):
-        """DS-2: save_cycle_snapshots=False → no file written (self-gated no-op)."""
+        """save_cycle_snapshots=False → no file written (self-gated no-op)."""
         loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=False)
 
         raw_outputs = ["raw output"]
@@ -14285,9 +14488,9 @@ class TestNormalizationLevelGating:
     """_refine_consolidation_graph gates GraphTierRefiner normalization/enrichment on bool flags.
 
     Tests:
-    - LG-1: normalize=False → normalization NOT called.
-    - LG-2: normalize=True, enrich=False → normalization IS called, enrichment NOT.
-    - LG-3: normalize=True, enrich=True → both called.
+    - normalize=False → normalization NOT called.
+    - normalize=True, enrich=False → normalization IS called, enrichment NOT.
+    - normalize=True, enrich=True → both called.
     """
 
     @staticmethod
@@ -14308,6 +14511,7 @@ class TestNormalizationLevelGating:
         loop = object.__new__(ConsolidationLoop)
         loop.model = MagicMock()
         loop.tokenizer = MagicMock()
+        loop._incidents_state_dir = None
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
             refinement_normalization=refinement_normalization,
@@ -14362,7 +14566,7 @@ class TestNormalizationLevelGating:
     }
 
     def test_normalize_false_normalization_not_called(self, tmp_path):
-        """LG-1: normalize=False → normalization not called."""
+        """normalize=False → normalization not called."""
         from unittest.mock import patch
 
         loop = self._make_loop_for_refine(tmp_path, refinement_normalization="off")
@@ -14380,7 +14584,7 @@ class TestNormalizationLevelGating:
         mock_norm.assert_not_called()
 
     def test_normalize_true_enrich_false_normalization_called_only(self, tmp_path):
-        """LG-2: normalize=True, enrich=False → normalization IS called, enrichment NOT."""
+        """normalize=True, enrich=False → normalization IS called, enrichment NOT."""
         from unittest.mock import patch
 
         loop = self._make_loop_for_refine(tmp_path, refinement_normalization="on")
@@ -14403,7 +14607,7 @@ class TestNormalizationLevelGating:
         mock_enrich.assert_not_called()
 
     def test_normalize_true_enrich_true_both_called(self, tmp_path):
-        """LG-3: normalize=True, enrich=True → both normalization and enrichment called."""
+        """normalize=True, enrich=True → both normalization and enrichment called."""
         from unittest.mock import patch
 
         loop = self._make_loop_for_refine(
@@ -15341,9 +15545,9 @@ class TestThreeWayGate:
     def test_aborted_overflow_fold_does_not_get_overflow_slot(self, tmp_path):
         """An overflow fold that returns mode='aborted' must NOT have overflow_slot=True.
 
-        Guards FIX-2: only a real 'trained' mint propagates the tag.  An aborted
-        overflow fold must not trigger the interim_cap_reached incident on the
-        app.py consumer side.
+        Only a real 'trained' mint propagates the tag.  An aborted overflow fold
+        must not trigger the interim_cap_reached incident on the app.py consumer
+        side.
         """
         from unittest.mock import patch
 
@@ -15430,14 +15634,15 @@ class TestS5IncidentEmission:
         """_overflow_incident_for must return None when overflow_slot is True but mode is
         'aborted' — no slot was minted, so no interim_cap_reached incident should fire.
 
-        Guards FIX-2: the production emission site checks overflow_slot on the dict
-        returned by run_consolidation_cycle, which only sets the flag when mode=='trained'.
+        The production emission site checks overflow_slot on the dict returned by
+        run_consolidation_cycle, which only sets the flag when mode=='trained'.
         This test asserts the mapping itself also handles the case defensively.
         """
         from paramem.server.app import _overflow_incident_for
 
         # overflow_slot=True with mode='aborted' is not reachable from consolidation.py
-        # after FIX-2, but _overflow_incident_for is a pure function and must be robust.
+        # (it only tags the flag when mode=='trained'), but _overflow_incident_for is a
+        # pure function and must be robust.
         # The mapping is keyed on overflow_slot flag, so it would emit cap_reached here.
         # This documents the expected behavior: the guard lives in consolidation.py
         # (only sets overflow_slot when mode=='trained'), not in the mapping.
@@ -16412,6 +16617,7 @@ class TestConsumePendingFullFold:
             merger_graph = nx.MultiDiGraph()
 
         loop = object.__new__(ConsolidationLoop)
+        loop._incidents_state_dir = None
         loop.model = MagicMock()
         loop.model.__class__ = PeftModel
         loop.model.peft_config = {

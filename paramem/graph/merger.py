@@ -184,7 +184,7 @@ def _synth_speaker_entities(relations: "list[Relation]") -> "list[Entity]":
     node before the edge walk in
     :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`
     reads it.  Without the entity the node would lack ``speaker_id``, causing
-    minted keys to fall back to ``speaker_id=""`` (dcf4189 regression).
+    minted keys to fall back to ``speaker_id=""``.
 
     Args:
         relations: The list of :class:`Relation` objects from which speaker
@@ -261,45 +261,43 @@ class GraphMerger:
         self.contradictions_resolved = []  # log of resolved contradictions
         # Per-fold output lists — also initialised here so _upsert_relation is
         # safe to call without a preceding merge() call (e.g. in unit tests).
-        # Reset ONLY in reset_graph() (NOT in merge()) — same lifetime as
-        # removal_ledger/adopt_reinforcements below: both accumulate across
-        # every merge()/merge_relations() call within one fold (recon
-        # re-merge, extra-relations re-merge, interim recital-dedup re-merge,
-        # any intervening enrichment merge) and must survive intact until the
-        # fold's drift partition and reinforcement-bump loop read them.
-        self.reinforcements: dict[str, tuple[str, str]] = {}
+        # Reset ONLY in reset_graph() (NOT in merge()) — every accumulator
+        # below accumulates across every merge()/merge_relations() call within
+        # one fold (recon re-merge, extra-relations re-merge, interim
+        # recital-dedup re-merge, any intervening enrichment merge) and must
+        # survive intact until the fold's drift partition and
+        # reinforcement-credit pass read them.
         # collapsed: incoming ik_keys that were deduplicated away in a Case-1
-        # duplicate-SPO collapse.  Parallel to reinforcements (which records the
-        # surviving key); collapsed records the drifting key.  Used by the
+        # duplicate-SPO collapse — the drifting key, whose survivor is named by
+        # the ledger entry written in the same branch.  Used by the
         # drift-accounting site in consolidation to distinguish intended dedup
         # from genuine reconstruction loss.
         self.collapsed: list[str] = []
         # removal_ledger: records every edge REMOVAL keyed by the removed edge's
-        # ik_key, with a stable reason code.  Complements collapsed/reinforcements
-        # (different lifetimes — collapsed/reinforcements carry soft-stale and
-        # recurrence semantics; the ledger carries removal cause for drift
-        # accounting and future contradiction observability).  Reset in
-        # reset_graph(), NOT in merge() — must survive the fold's
-        # reset_graph→re-merge→enrich→classify span.
+        # ik_key, with a stable reason code.  Reset in reset_graph(), NOT in
+        # merge() — must survive the fold's reset_graph→re-merge→enrich→classify
+        # span.
         # reason ∈ {"dedup", "contradiction_same_pred",
-        #            "enrichment_same_as", "predicate_synonym_collapse", "semantic_dedup"}
+        #            "enrichment_same_as", "predicate_synonym_collapse"}
+        # ``survivor_key`` is present exactly when the removed fact carries
+        # forward under another indexed key — "dedup" and
+        # "predicate_synonym_collapse".  It is the fold's reinforcement-credit
+        # input: the survivor inherits the removed keys' maturity, which would
+        # otherwise be discarded when they are staled.  A contradiction is a
+        # supersession (a DIFFERENT fact won, see old_object/new_object) and an
+        # enrichment same_as is a node contraction (see keep_node), so neither
+        # designates a surviving key and neither carries a ``survivor_key``.
         self.removal_ledger: dict[str, dict] = {}
         # adopt_reinforcements: main-tier ik_key -> (last_seen, first_seen) recorded
         # when the interim recital-dedup merge's Case-1-adopt branch (relation
         # carries an indexed_key, existing edge is keyless) stamps that key onto a
         # recited pending fact's edge.  Populated ONLY in the dedup merge's
         # Case-1-adopt (interim scope only — the full fold never passes
-        # dedup_target_keys); reset ONLY in reset_graph() (NOT in merge()), the
-        # same uniform lifecycle as removal_ledger/reinforcements/collapsed.
-        # That uniform lifecycle is what the FULL fold's own enrichment merge
-        # needs (see merge()'s docstring: reinforcements/collapsed must
-        # survive the full fold's re-merge -> enrichment merge -> bump-loop
-        # span) — adopt_reinforcements shares the rule for consistency across
-        # all four accumulators rather than carrying its own narrower one, even
-        # though the interim scope that populates it never runs an enrichment
-        # merge of its own to survive; consumed EXACTLY ONCE per fold at the
-        # reinforcement bump site in _refine_consolidation_graph — a second
-        # _refine invocation would double-bump (do not add one).
+        # dedup_target_keys).  No edge is removed, so there is no ledger entry
+        # to carry it: this is the credit pass's second input, and its own
+        # accumulator for that reason.  Consumed EXACTLY ONCE per fold at the
+        # reinforcement-credit site in _refine_consolidation_graph — a second
+        # _refine invocation would double-credit (do not add one).
         self.adopt_reinforcements: dict[str, tuple[str, str]] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
@@ -346,42 +344,35 @@ class GraphMerger:
             credit_adopt_reinforcement: When ``True``, the Case-1-adopt branch
                 (an incoming keyed relation adopts its ``indexed_key`` onto a
                 pre-existing keyless edge) also records the adopted key in
-                ``self.adopt_reinforcements`` for the fold's reinforcement bump
-                pass.  Default ``False`` for every caller except the interim
-                recital-dedup merge.
+                ``self.adopt_reinforcements`` for the fold's
+                reinforcement-credit pass.  Default ``False`` for every caller
+                except the interim recital-dedup merge.
 
         Returns the updated cumulative graph.
 
-        ``self.reinforcements`` is a ``dict[ik_key, (last_seen, first_seen)]``
-        of surviving keys for each Case-1 exact-duplicate collapse that has
-        fired since the last :meth:`reset_graph` call — i.e. every fold where
-        an incoming ``Relation.indexed_key`` matched an existing edge with an
-        ``ik_key`` already stamped.  The surviving key is the existing edge's
-        key (the incoming duplicate drifts); the value is the freshest
-        (``max``) ``last_seen`` timestamp and the earliest (``min_nonempty``)
-        ``first_seen`` timestamp after the collapse.  The bump_recurrence
-        site reads these values to advance bookkeeping without fabricating
-        ``now()``.  Only populated when ``Relation.indexed_key`` is set on
-        the incoming relation (fold-only path); always empty during normal
-        live ingest where ``Relation.indexed_key is None``.
+        ``self.collapsed`` is the list of INCOMING ``ik_key`` strings that were
+        deduplicated away by a Case-1 exact-duplicate collapse since the last
+        :meth:`reset_graph` call — i.e. every fold where an incoming
+        ``Relation.indexed_key`` matched an existing edge with an ``ik_key``
+        already stamped.  The surviving key is the existing edge's key (the
+        incoming duplicate drifts) and is named by the ``removal_ledger`` entry
+        written in the same branch, under ``survivor_key``.  Used by the
+        drift-accounting site in the full consolidation fold to distinguish
+        intended dedup (fact preserved under the surviving key) from genuine
+        reconstruction loss.  Only populated when ``Relation.indexed_key`` is
+        set on the incoming relation (fold-only path); always empty during
+        normal live ingest where ``Relation.indexed_key is None``.
 
-        ``self.collapsed`` is the parallel list of INCOMING ``ik_key`` strings
-        that were deduplicated away in each such collapse.  Where
-        ``reinforcements`` records the surviving key, ``collapsed`` records the
-        key whose edge was dropped.  Used by the drift-accounting site in the
-        full consolidation fold to distinguish intended dedup (fact preserved
-        under the twin key) from genuine reconstruction loss.
-
-        Neither accumulator is reset at the top of this method — like
-        ``removal_ledger`` and ``adopt_reinforcements``, both are reset ONLY
-        in :meth:`reset_graph`, so they accumulate across every ``merge()``
-        call within one fold (recon re-merge, extra-relations re-merge,
-        interim recital-dedup re-merge, and any intervening enrichment
-        merge) and survive intact until the fold's consumers read them.  A
-        per-call reset here would silently wipe a genuine Case-1 collapse
-        recorded by an earlier merge in the same fold the moment any later
-        merge in that fold ran — even one producing zero collapses of its
-        own — before the drift partition and reinforcement-bump loop in
+        No accumulator is reset at the top of this method — ``collapsed``,
+        ``removal_ledger`` and ``adopt_reinforcements`` are all reset ONLY in
+        :meth:`reset_graph`, so they accumulate across every ``merge()`` call
+        within one fold (recon re-merge, extra-relations re-merge, interim
+        recital-dedup re-merge, and any intervening enrichment merge) and
+        survive intact until the fold's consumers read them.  A per-call reset
+        here would silently wipe a genuine Case-1 collapse recorded by an
+        earlier merge in the same fold the moment any later merge in that fold
+        ran — even one producing zero collapses of its own — before the drift
+        partition and reinforcement-credit pass in
         :meth:`~paramem.training.consolidation.ConsolidationLoop._refine_consolidation_graph`
         ever get to read them.
         """
@@ -531,7 +522,7 @@ class GraphMerger:
         :func:`_synth_speaker_entities`, which stamps ``speaker_id`` onto
         speaker subject nodes.  This ensures the edge walk in
         :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`
-        reads the correct ``speaker_id`` from each node (dcf4189 invariant).
+        reads the correct ``speaker_id`` from each node.
         Without this, reconstructed/synthesised person nodes would be stored
         as ``entity_type="concept"`` with no ``speaker_id``, and
         graph-enrichment would root facts at unattributed nodes.
@@ -775,7 +766,7 @@ class GraphMerger:
            existing edge (fold-only provenance carry-through).  When
            ``credit_adopt_reinforcement`` is ``True``, the adopted key is also
            recorded in ``self.adopt_reinforcements`` for the fold's
-           reinforcement bump pass (interim recital-dedup only).
+           reinforcement-credit pass (interim recital-dedup only).
         2. Same (subject, predicate) but different object — cardinality resolution
            when a model is present and ``resolve_contradictions=True``:
 
@@ -804,7 +795,7 @@ class GraphMerger:
 
         normalized_pred = canonical_id(relation.predicate)
 
-        # E-2: symmetric direction canonicalization — collapse (A,P,B) / (B,P,A) into
+        # Symmetric-direction canonicalization — collapse (A,P,B) / (B,P,A) into
         # a single direction so Case-1 reinforcement deduplicates them.
         # Guard: when ANY speaker endpoint is involved, keep the recorded direction
         # (recall is always speaker-anchored, so demoting a speaker out of the
@@ -859,8 +850,11 @@ class GraphMerger:
                 if credit_adopt_reinforcement:
                     # The edge's last_seen/first_seen are already merged
                     # (max/min_nonempty, above) over the recited pending fact
-                    # and the main-tier dedup target — the exact values
-                    # bump_recurrence wants; no now() fabrication.
+                    # and the main-tier dedup target — the exact values the
+                    # credit pass wants; no now() fabrication.  The merged
+                    # last_seen is also its temporal-order evidence: it exceeds
+                    # the key's stored last_seen only when the recital came
+                    # from a later session.
                     self.adopt_reinforcements[relation.indexed_key] = (
                         edge.get("last_seen", ""),
                         edge.get("first_seen", ""),
@@ -868,20 +862,12 @@ class GraphMerger:
             # Case-1 reinforcement: when BOTH the existing edge AND the incoming
             # relation carry an ik_key, this is a fold-time duplicate-SPO collapse.
             # The SURVIVING key is the existing edge's ik_key (the incoming
-            # relation.indexed_key drifts).  Record the survivor for the fold's
-            # bump_recurrence pass.
+            # relation.indexed_key drifts); the ledger entry below names it, and
+            # the fold's reinforcement-credit pass reads it from there.
             # NOTE: existing_key is the NetworkX integer edge id, NOT the key
             # string.  The survivor's key string is read from the edge attribute.
             elif relation.indexed_key and edge.get(_IK_KEY_ATTR):
                 surviving_ik = edge.get(_IK_KEY_ATTR)
-                if surviving_ik:
-                    # Record surviving key → (freshest last_seen, earliest first_seen)
-                    # so bump_recurrence can advance bookkeeping without fabricating
-                    # now().
-                    self.reinforcements[surviving_ik] = (
-                        edge.get("last_seen", ""),
-                        edge.get("first_seen", ""),
-                    )
                 # Record the incoming (drifting) key so the drift-accounting site
                 # in the full consolidation fold can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
@@ -903,7 +889,7 @@ class GraphMerger:
                 )
                 self.removal_ledger[relation.indexed_key] = {
                     "reason": "dedup",
-                    "surviving_twin": surviving_ik,
+                    "survivor_key": surviving_ik,
                     "pre_surfaces": {
                         "incoming": {
                             "subject": relation.subject,
@@ -917,7 +903,7 @@ class GraphMerger:
                         },
                     },
                 }
-            # A-2 + B-4: first-non-empty-wins adopts for speaker_id and edge_source.
+            # First-non-empty-wins adopts for speaker_id and edge_source.
             # Run unconditionally after the ik_key if/elif chain so they never
             # disturb the elif's adopt-vs-reinforce accounting.
             if relation.speaker_id and not edge.get("speaker_id"):
@@ -1103,7 +1089,7 @@ class GraphMerger:
         self.graph[subject][obj][new_eid]["first_seen"] = relation.first_seen or timestamp
         if relation.indexed_key:
             self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key
-        # A-1 + B-4: stamp speaker_id unconditionally (net-new edge has no prior value)
+        # Stamp speaker_id unconditionally (a net-new edge has no prior value)
         # and stamp edge_source conditionally (only when the carry-slot is non-empty).
         self.graph[subject][obj][new_eid]["speaker_id"] = relation.speaker_id
         if relation.edge_source:
@@ -1123,7 +1109,6 @@ class GraphMerger:
         - ``graph`` — fresh MultiDiGraph (no prior edges/nodes)
         - ``_predicate_cardinality`` — per-predicate COEXIST/REPLACE cache
         - ``contradictions_resolved`` — log of prior resolves
-        - ``reinforcements`` — prior fold's Case-1 surviving keys
         - ``collapsed`` — prior fold's Case-1 deduplicated (incoming) keys
         - ``removal_ledger`` — prior fold's reason-coded edge removal records
         - ``adopt_reinforcements`` — prior fold's dedup-adopt credited main keys
@@ -1136,7 +1121,6 @@ class GraphMerger:
         self.graph = nx.MultiDiGraph()
         self._predicate_cardinality = {}
         self.contradictions_resolved = []
-        self.reinforcements = {}
         self.collapsed = []
         self.removal_ledger = {}
         self.adopt_reinforcements = {}

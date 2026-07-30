@@ -19,7 +19,7 @@ from torch.utils.data import Dataset
 
 from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
-from paramem.graph.merger import GraphMerger
+from paramem.graph.merger import GraphMerger, min_nonempty
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.relation_prep import (
@@ -418,9 +418,6 @@ class FoldScope:
             :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
             Refine stage.  ``True`` for the full fold in BOTH venues —
             promotion is a pure store operation with no weight dependency.
-        subtractive_scope: Forwarded to
-            :meth:`~ConsolidationLoop._apply_subtractive_removals_to_store`
-            (``"interim"`` | ``"fold"``).
         consume_pending: When ``True``, the fold snapshots the pending-session
             relations sitting in ``merger.graph`` via
             :meth:`~ConsolidationLoop._capture_pending_relations` and feeds them
@@ -447,7 +444,7 @@ class FoldScope:
     """
 
     # --- identity / dispatch ---
-    name: str  # "interim" | "full"  (log/debug label only)
+    name: str  # "interim" | "full" — the fold's label in log records
     source: "Literal['weights', 'disk']"
     persist: "Literal['interim_slot', 'main_tiers']"
 
@@ -462,7 +459,6 @@ class FoldScope:
 
     # --- spine stage gates ---
     promote: bool = False
-    subtractive_scope: "Literal['interim', 'fold']" = "fold"
 
     # --- pending capture ---
     consume_pending: bool = False  # merge pending-session relations in-fold
@@ -1484,28 +1480,38 @@ class ConsolidationLoop:
         # the way this method already calls ``on_session_extracted`` and
         # ``_save_adapters`` calls ``save_adapter``.  ``session_graph`` is this
         # method's own local, not a side-channel read.  Severity ``"warning"``
-        # (the run succeeded); keyed by phase so repeated hiccups bump one
-        # incident rather than flooding the store.
+        # (the run succeeded); keyed ``cloud_enrich`` so repeated hiccups bump
+        # one incident rather than flooding the store.
+        #
+        # The clean run is the other half of the same report: an incident
+        # auto-resolves on the next success of the op it describes
+        # (``incidents`` module docstring), and this is the only site that
+        # observes whether session-tier cloud enrichment degraded.  Resolving by
+        # (type, key) leaves the graph-tier sub-condition alone — it has its own
+        # record/resolve site at the end of the fold's Refine stage.
         degraded = session_graph.diagnostics.get("cloud_enrichment_degraded")
-        if degraded is not None and self._incidents_state_dir is not None:
-            from paramem.server.incidents import record_incident
+        if self._incidents_state_dir is not None:
+            from paramem.server.incidents import record_incident, resolve_incident
 
-            record_incident(
-                self._incidents_state_dir,
-                type="enrichment_degraded",
-                key="cloud_enrich",
-                severity="warning",
-                summary=(
-                    "Consolidation: cloud enrichment degraded — kept "
-                    "pre-enrichment facts (unparseable response)"
-                ),
-                detail={
-                    "type": "enrichment_degraded",
-                    "session_id": session_id,
-                    **degraded,
-                    "at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+            if degraded is None:
+                resolve_incident(self._incidents_state_dir, "enrichment_degraded", "cloud_enrich")
+            else:
+                record_incident(
+                    self._incidents_state_dir,
+                    type="enrichment_degraded",
+                    key="cloud_enrich",
+                    severity="warning",
+                    summary=(
+                        "Consolidation: cloud enrichment degraded — kept "
+                        "pre-enrichment facts (unparseable response)"
+                    ),
+                    detail={
+                        "type": "enrichment_degraded",
+                        "session_id": session_id,
+                        **degraded,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
 
         # Release reclaimable device memory back to the WSL2 dxg layer at every
         # session boundary.  PyTorch's caching allocator retains freed blocks
@@ -2462,8 +2468,8 @@ class ConsolidationLoop:
 
         # --- 6. 3-way gate (train mode only) ---
         # Count source: PEFT-resident adapters (what the VRAM ceiling constrains;
-        # see SF-9: on-disk count and PEFT count measure different things and
-        # converge only at tick boundaries).
+        # on-disk count and PEFT count measure different things and converge
+        # only at tick boundaries).
         # Gate terms apply only when: train mode AND target slot is new AND
         # registry is live.  Simulate has no PEFT slots so the count is
         # meaningless; simulate always falls through to _run_fold.
@@ -2541,7 +2547,6 @@ class ConsolidationLoop:
                     normalize=False,  # normalization is full-fold only
                     enrich=False,  # graph enrichment is full-fold only
                     promote=False,
-                    subtractive_scope="interim",
                 ),
                 adapter_name=adapter_name,
                 stamp=stamp,
@@ -2559,37 +2564,36 @@ class ConsolidationLoop:
     def _apply_subtractive_removals_to_store(
         self,
         *,
-        scope: str,
+        fold_name: str,
     ) -> "dict[str, dict[str, dict]]":
         """Consume ``merger.removal_ledger`` entries and soft-stale their keys.
 
         This is the shared soft-stale stage called by BOTH
         ``run_consolidation_cycle`` (interim) and ``consolidate`` (full fold)
         after every merge that can produce subtractive removals.  The
-        shared body is identical for both scopes; the persist/registry-seed step
-        that follows is scope-specific and stays in the caller.
+        The body is identical whichever fold calls it; the persist/registry-seed
+        step that follows differs per fold and stays in the caller.
 
-        **Always-stale reasons (both scopes):**
+        **Always-stale reasons (both folds):**
         - ``"predicate_synonym_collapse"`` — synonym-predicate collapse from the
           whole-graph normalization pass
           (:meth:`~paramem.training.graph_tier.GraphTierRefiner.run_normalization`).
-        - ``"semantic_dedup"`` — near-duplicate triple collapse from the normalization
-          pass.
-        - ``"entity_merge"`` — edge incident to a same_as variant node (normalization
-          pass stale+add).
         - ``"contradiction_same_pred"`` — recency-backed contradiction removal:
           the merger only emits this ledger entry when timestamps pick a unique
-          winner; empty/tied → no entry → no stale.  Safe to stale at fold scope
-          because a timestamp-less key that tied would never appear here.
+          winner; empty/tied → no entry → no stale.  Safe to stale at the full
+          fold too, because a timestamp-less key that tied would never appear here.
 
         ``"enrichment_same_as"`` and other retain-only reasons stay in the fold's
         ``drift_intended_removal`` bucket (handled inline in the fold spine);
         this helper does NOT soft-stale those.
 
         Args:
-            scope: ``"interim"`` or ``"fold"``.  The stale logic is identical at
-                both scopes; the parameter is kept for logging context and
-                compatibility with existing callers.
+            fold_name: ``FoldScope.name`` of the fold doing the staling, used as
+                the label in this stage's log records — the interim tick and the
+                full fold both reach it, and a key that vanished needs to be
+                traceable to the one that dropped it.  Nothing else reads it: the
+                stale logic is identical whichever fold runs, and the callee
+                cannot know which one it is.
 
         Returns:
             ``soft_stale_by_tier`` — a per-tier dict mapping staled key strings
@@ -2603,17 +2607,13 @@ class ConsolidationLoop:
             registry; ``commit_tier_slot`` persists it on success).
         """
         _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
-        # Reasons that become soft-stale at ALL scopes (ingest, interim, fold).
+        # Reasons that become soft-stale wherever they are recorded.
         # predicate_synonym_collapse: synonym-predicate collapse (normalization pass).
-        # semantic_dedup: near-duplicate triple collapse (normalization pass).
-        # entity_merge: edge incident to a same_as variant node (normalization pass).
         # contradiction_same_pred: recency-backed contradiction (freshest last_seen wins).
         #   The merger only writes this entry when timestamps pick a unique winner;
-        #   empty/tied → coexist (no entry) → safe to stale at fold scope too.
+        #   empty/tied → coexist (no entry) → safe to stale at the full fold too.
         _always_stale_reasons = {
             "predicate_synonym_collapse",
-            "semantic_dedup",
-            "entity_merge",
             "contradiction_same_pred",
         }
 
@@ -2642,10 +2642,10 @@ class ConsolidationLoop:
                     _stale_rec["simhash"] = _dk_simhash
                 soft_stale_by_tier.setdefault(_dk_tier, {})[_ik] = _stale_rec
             logger.info(
-                "subtractive_removal soft-staled key=%s reason=%s scope=%s",
+                "subtractive_removal soft-staled key=%s reason=%s fold=%s",
                 _ik,
                 _reason,
-                scope,
+                fold_name,
             )
 
         return soft_stale_by_tier
@@ -2724,8 +2724,9 @@ class ConsolidationLoop:
             _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
             _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
             _er_subj_node = _g.nodes.get(_er_subj, {})
-            # C-2: prefer edge-carried speaker_id (stamped by merger A-1/A-2),
-            # fall back to subject node's speaker_id when the edge carries none.
+            # Prefer edge-carried speaker_id (the merger stamps it on a net-new
+            # edge and adopts it onto a keyless one), and fall back to the subject
+            # node's speaker_id when the edge carries none.
             _er_spk = _er_data.get("speaker_id") or _er_subj_node.get("speaker_id", "")
             _result.append(
                 Relation(
@@ -3324,7 +3325,7 @@ class ConsolidationLoop:
                     # (Case-1 can never miss a legitimate target).  A recital's
                     # reinforcement is credited to the surviving main key via the
                     # merger's adopt_reinforcements accumulator, consumed by
-                    # _refine_consolidation_graph's bump loop.
+                    # _refine_consolidation_graph's reinforcement-credit pass.
                     _session_entities = {r.subject for r in (_extra or [])} | {
                         r.object for r in (_extra or [])
                     }
@@ -3700,7 +3701,7 @@ class ConsolidationLoop:
 
                     # --- Shared soft-stale stage ---
                     _soft_stale_by_tier = self._apply_subtractive_removals_to_store(
-                        scope=scope.subtractive_scope
+                        fold_name=scope.name
                     )
 
                     # --- Persist interim slot ---
@@ -4043,7 +4044,7 @@ class ConsolidationLoop:
                         _sbk["last_reinforced_cycle"] = self.cycle_count
 
                 _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(
-                    scope=scope.subtractive_scope
+                    fold_name=scope.name
                 )
 
                 # Drift is measured against the keys THIS fold owns: a key the
@@ -4948,7 +4949,6 @@ class ConsolidationLoop:
                         normalize=(self.config.refinement_normalization == "on"),
                         enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                         promote=True,
-                        subtractive_scope="fold",
                         keys_from=keys_from,
                     ),
                     router=router,
@@ -4982,7 +4982,6 @@ class ConsolidationLoop:
                     normalize=(self.config.refinement_normalization == "on"),
                     enrich=(self.config.refinement_enrichment == "on" and self.cloud_enabled),
                     promote=True,
-                    subtractive_scope="fold",
                     consume_pending=consume_pending,
                     keys_from=keys_from,
                 ),
@@ -4995,11 +4994,16 @@ class ConsolidationLoop:
 
         Mirrors the logic of the removed ``server.consolidation._promote_mature_keys``
         helper but runs INSIDE the fold spine, AFTER the
-        recurrence-bump step and BEFORE ``tier_keyed`` is built.  This ordering
-        guarantees that reconstruction probes each key against the adapter tier
-        where its weights actually live (episodic) rather than against the
-        semantic adapter that has not yet learned the key — the root cause of
-        silent post-promotion fact loss.
+        reinforcement-credit pass and BEFORE ``tier_keyed`` is built.  This
+        ordering guarantees that reconstruction probes each key against the
+        adapter tier where its weights actually live (episodic) rather than
+        against the semantic adapter that has not yet learned the key — the root
+        cause of silent post-promotion fact loss.
+
+        It is also why the credit pass sits at the end of Refine rather than at
+        the staling site that discards the retired keys' counts: a survivor that
+        inherited its group's maturity must be promotable in THIS fold, and
+        staling runs after ``tier_keyed`` is built.
 
         Reads thresholds from ``self.config`` (``ConsolidationConfig``), which
         is set at construction time.  Does NOT import ``ServerConfig`` — this
@@ -5196,7 +5200,7 @@ class ConsolidationLoop:
         # (subject, predicate) pairs emitted by the edge walk below — read by
         # the node-attribute walk after it to skip a node attribute whose
         # pair was already emitted as an edge (defensive dedup for a mixed
-        # graph, e.g. a pre-Unit-4 fold artifact still carrying an edge for
+        # graph left by an earlier fold layout, still carrying an edge for
         # what a fresh extraction would now route to node["attributes"]).
         _emitted_pairs: set[tuple[str, str]] = set()
 
@@ -5380,10 +5384,11 @@ class ConsolidationLoop:
                 _obj_display = (
                     self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
                 )
-                # C-1: resolve speaker_id from the edge first (stamped by the merger
-                # A-1 from Relation.speaker_id), then fall back to the subject node's
-                # top-level speaker_id attribute.  When both are empty, try the
-                # unique-speaker-predecessor fallback (concept-rooted enrichment edges
+                # Resolve speaker_id from the edge first (the merger stamps it
+                # there from Relation.speaker_id on a net-new edge), then fall back
+                # to the subject node's top-level speaker_id attribute.  When both
+                # are empty, try the unique-speaker-predecessor fallback
+                # (concept-rooted enrichment edges
                 # whose subject is a role/project/org concept with exactly one speaker
                 # pointing in).  Terminal fallback is "" (allow_empty path).
                 _edge_sid = _t_data.get("speaker_id", None)
@@ -5517,8 +5522,8 @@ class ConsolidationLoop:
                     continue
                 attr_pred = attr_predicate(attr_key)
                 if (_n, attr_pred) in _emitted_pairs:
-                    # Defensive dedup: a mixed graph (e.g. a pre-Unit-4 fold
-                    # artifact) already emitted this (subject, predicate)
+                    # Defensive dedup: a mixed graph left by an earlier fold
+                    # layout already emitted this (subject, predicate)
                     # pair as an edge — never emit it twice.
                     continue
 
@@ -5874,8 +5879,8 @@ class ConsolidationLoop:
         :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
         ``speaker_id`` onto the subject node so that
         :meth:`_build_all_edge_entries_into` reads the correct ``speaker_id``
-        (dcf4189 invariant: minted interim keys must inherit their subject node's
-        ``speaker_id``, not fall back to ``""``).
+        (minted interim keys must inherit their subject node's ``speaker_id``,
+        not fall back to ``""``).
         Non-speaker subjects (``speaker_id == ""``) require no entity — their nodes
         remain attribute-free for ``speaker_id``, which resolves to ``""`` in the
         walk (correct default).
@@ -6185,7 +6190,7 @@ class ConsolidationLoop:
         normalize: bool = False,
         enrich: bool = False,
     ) -> None:
-        """Run graph normalization, enrichment, and recurrence bumps after the Materialize stage.
+        """Run graph normalization, enrichment, and reinforcement credit after Materialize.
 
         This is the *Refine* stage of the fold pipeline:
 
@@ -6203,51 +6208,43 @@ class ConsolidationLoop:
            graph. Constructed fresh on every call, never cached: ``self.model``
            is re-wrapped by adapter operations elsewhere in the fold, so a
            cached refiner would risk pinning a stale handle.
-        2. When ``result.enrichment`` carries ``aborted_reason == "vram"``
-           (the enrichment pass stopped early on
-           :class:`~paramem.utils.vram_guard.VramExhausted` but kept
-           whatever it already merged — see
-           :func:`~paramem.training.graph_enrich.enrich_graph`'s
-           docstring), record an ``enrichment_degraded`` incident (severity
-           ``"warning"``) via the same :func:`~paramem.server.incidents.
-           record_incident` surface used elsewhere in this class, when
-           ``self._incidents_state_dir`` is configured.  Never raises: the
-           fold always proceeds past this step, training on the
-           merged-but-unenriched graph — enrichment self-heals at the next
-           FULL fold (the pass is full-fold only; an intervening interim
-           cycle never runs it, so recovery does not happen there).
+        2. Report the graph-tier enrichment outcome as an incident, when
+           ``self._incidents_state_dir`` is configured.  ``aborted_reason ==
+           "vram"`` (the pass stopped early on
+           :class:`~paramem.utils.vram_guard.VramExhausted` but kept whatever it
+           already merged — see
+           :func:`~paramem.training.graph_enrich.enrich_graph`'s docstring)
+           records ``enrichment_degraded`` at severity ``"warning"``; a pass that
+           ran to completion resolves it.  This is the only site that observes
+           that outcome, so it owns both halves — a resolve wired anywhere else
+           would be guessing.  ``result.enrichment is None`` means the pass never
+           ran (enrichment off, or an interim scope), which is not evidence of
+           recovery and clears nothing.  Never raises: the fold always proceeds
+           past this step, training on the merged-but-unenriched graph —
+           enrichment self-heals at the next FULL fold (the pass is full-fold
+           only; an intervening interim cycle never runs it, so recovery does
+           not happen there).
         3. Emit a debug snapshot ("enriched") after the refine step (or
            immediately when both stages are skipped). Emitted from the loop
            rather than the refiner, which calls :func:`on_normalization`
            directly for its own pass.
-        4. Two INDEPENDENTLY-guarded recurrence-bump blocks, reading the
-           reinforcement maps off the returned
-           :class:`~paramem.training.graph_tier.RefineResult` (never unioned
-           under one relaxed guard — each dict is consumed by its own loop with
-           its own guard, so the recital-dedup credit adds a bump without
-           changing the pre-existing ``reinforcements`` bump contract):
-
-           - If ``recon_relations`` is non-empty, scan ``result.reinforcements``
-             for Case-1 duplicate-SPO collapses and call
-             :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
-             surviving key.  This guard is byte-identical to the original
-             contract: a re-merge must actually have run for this bump to fire.
-           - If ``result.adopt_reinforcements`` is non-empty, call
-             :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
-             main-tier key credited by the interim recital-dedup merge's
-             Case-1-adopt.  This guard is independent of ``recon_relations`` —
-             a recital-only interim cycle has empty ``recon_relations`` (no slot
-             keys reconstructed) but a non-empty ``adopt_reinforcements``, and
-             must still bump.  The two dicts are disjoint by construction (see
-             the block below), so no key is ever double-bumped across the two.
+        4. :meth:`_credit_reinforcement`, the fold's single reinforcement-credit
+           pass, over the two channels a merge produces: the merger's
+           ``removal_ledger`` (every collapse that named a ``survivor_key``) and
+           ``result.adopt_reinforcements`` (the interim recital-dedup
+           Case-1-adopt, which removes no edge and so has no ledger entry).
+           Its position is load-bearing in both directions: the ledger is
+           complete only once enrichment and normalization have run, and the
+           promotion gate that consumes the credited counts runs immediately
+           after Refine.  The staling that discards the retired keys' counts
+           runs later still, past key assembly, so a credit applied there would
+           reach promotion a whole fold late.
 
         Args:
             recon_relations: The list of registry-true :class:`Relation` objects
-                produced by :meth:`_materialize_consolidation_graph`.  Used as
-                the guard for the ``result.reinforcements`` bump block only (see
-                point 3) — when empty, that block is skipped (no re-merge was
-                performed so ``result.reinforcements`` will be empty too).  Does
-                NOT gate the independent ``adopt_reinforcements`` bump block.
+                produced by :meth:`_materialize_consolidation_graph`.  Passed
+                through to the graph-tier passes; the credit pass reads the
+                merger's own accumulators and does not need it.
             normalize: When ``True``, run the local-model predicate-synonym
                 normalization pass.
                 Callers pass ``normalize=scope.normalize``.
@@ -6264,7 +6261,7 @@ class ConsolidationLoop:
         refiner = self.build_tier_refiner(self.merger)
         result = refiner.refine(normalize=normalize, enrich=enrich)
 
-        # Surface a VRAM-driven enrichment degrade (U5) as an operator-visible
+        # Surface a VRAM-driven enrichment degrade as an operator-visible
         # incident — the SAME record_incident surface extract_session's
         # cloud_enrichment_degraded path uses above.  result.enrichment is the
         # raw diagnostics dict enrich_graph returns; aborted_reason == "vram"
@@ -6275,89 +6272,126 @@ class ConsolidationLoop:
         # pass runs over the cumulative graph every full fold (never at an
         # intervening interim cycle — full-fold only), so there is nothing to
         # retry here.
-        if (
-            result.enrichment is not None
-            and result.enrichment.get("aborted_reason") == "vram"
-            and self._incidents_state_dir is not None
-        ):
-            from paramem.server.incidents import record_incident
+        #
+        # A pass that ran to completion is the success this incident resolves
+        # on, and this is the only site that observes it.  ``result.enrichment
+        # is None`` means the pass never ran (enrichment off, or an interim
+        # scope), which is not evidence of recovery and must not clear a
+        # standing incident.
+        if result.enrichment is not None and self._incidents_state_dir is not None:
+            from paramem.server.incidents import record_incident, resolve_incident
 
-            record_incident(
-                self._incidents_state_dir,
-                type="enrichment_degraded",
-                key="graph_enrich_vram",
-                severity="warning",
-                summary=(
-                    "Consolidation: graph-tier enrichment stopped early on VRAM "
-                    "exhaustion — kept already-merged chunks"
-                ),
-                detail={
-                    "type": "enrichment_degraded",
-                    "chunks": result.enrichment.get("chunks", 0),
-                    "at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+            if result.enrichment.get("aborted_reason") == "vram":
+                record_incident(
+                    self._incidents_state_dir,
+                    type="enrichment_degraded",
+                    key="graph_enrich_vram",
+                    severity="warning",
+                    summary=(
+                        "Consolidation: graph-tier enrichment stopped early on VRAM "
+                        "exhaustion — kept already-merged chunks"
+                    ),
+                    detail={
+                        "type": "enrichment_degraded",
+                        "chunks": result.enrichment.get("chunks", 0),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            else:
+                resolve_incident(
+                    self._incidents_state_dir, "enrichment_degraded", "graph_enrich_vram"
+                )
 
         # Debug: snapshot the refined graph (after normalization + enrichment, or
         # immediately when both are skipped at level off).
         # Self-gated; no-op when save_cycle_snapshots=False.
         on_fold_graph(self.merger.graph, label="enriched")
 
-        if recon_relations:
-            # --- Reinforcement bump: Case-1 duplicate-SPO collapses ---
-            # result.reinforcements contains the surviving ik_key for every Case-1
-            # collision fired during the re-merge.  A collision means two active keys
-            # shared the same (s,p,o) — the incoming key drifts and the existing
-            # edge's key is the survivor.  The survivor's reinforcement_count
-            # represents how many times this fact was independently extracted
-            # (and re-keyed) across sessions before this fold collapsed the duplicates.
-            # result.reinforcements is dict[ik_key, (last_seen, first_seen)] —
-            # the freshest last_seen and earliest first_seen are carried directly
-            # from the edge so bump_recurrence can advance bookkeeping without
-            # fabricating now().  This guard (recon_relations non-empty) is the
-            # original, unchanged contract — the recital-dedup credit does not
-            # relax it; it only adds the independent adopt-credit block below.
-            for _rein_key, (_rein_ls, _rein_fs) in result.reinforcements.items():
-                if _rein_key:
-                    self.store.bump_recurrence(
-                        _rein_key,
-                        cycle=self.cycle_count,
-                        timestamp=_rein_ls,
-                        first_seen=_rein_fs,
-                    )
-                    logger.debug(
-                        "_refine_consolidation_graph: bumped recurrence for key=%s "
-                        "(intra-fold duplicate-SPO collapse)",
-                        _rein_key,
-                    )
+        self._credit_reinforcement(result.adopt_reinforcements)
 
-        # --- Reinforcement bump: interim recital-dedup Case-1-adopt credits ---
-        # result.adopt_reinforcements contains the main-tier ik_key credited by the
-        # interim recital-dedup merge's Case-1-adopt (a recited pending fact adopts
-        # a main key onto its keyless edge).  Independently guarded from the block
-        # above — NOT unioned under one relaxed guard — so this credit is additive
-        # and never changes when the ``reinforcements`` block fires.  A recital-only
-        # interim cycle has empty ``recon_relations`` (no slot keys reconstructed)
-        # but a non-empty ``adopt_reinforcements``, and must still bump here.  The
-        # two dicts are disjoint by construction (reinforcements records the
-        # SLOT/surviving key from the both-keyed collision elif — both edges
-        # keyed; adopt_reinforcements records the MAIN key from the Case-1-adopt
-        # branch — existing edge keyless), so no key is ever double-bumped across
-        # the two blocks.
-        if result.adopt_reinforcements:
-            for _rein_key, (_rein_ls, _rein_fs) in result.adopt_reinforcements.items():
-                if _rein_key:
-                    self.store.bump_recurrence(
-                        _rein_key,
-                        cycle=self.cycle_count,
-                        timestamp=_rein_ls,
-                        first_seen=_rein_fs,
-                    )
-                    logger.debug(
-                        "_refine_consolidation_graph: bumped recurrence for key=%s "
-                        "(recital-dedup adopt)",
-                        _rein_key,
-                    )
+    #: Ledger reasons whose collapse is an independent sighting of the fact and
+    #: may therefore EARN a reinforcement (subject to the store's temporal-order
+    #: check).  A predicate-synonym collapse is absent deliberately: it rewrites
+    #: how a fact is spelled, it does not observe the fact again.
+    _REOBSERVED_REASONS = frozenset({"dedup"})
+
+    def _credit_reinforcement(self, adopt_reinforcements: "dict[str, tuple[str, str]]") -> None:
+        """Transfer reinforcement credit to the survivors of this fold's merges.
+
+        Every collapse folds one or more keys' facts into a single surviving
+        key and stales the keys left behind.  Their durable
+        ``reinforcement_count`` is the promotion signal, so a collapse that
+        drops it silently demotes a mature fact out of semantic — the facts
+        survive, their standing does not.  This pass moves that standing across
+        before the staling discards it.
+
+        Two channels, one rule:
+
+        - ``merger.removal_ledger`` — every entry carrying a ``survivor_key``
+          (a ``dedup`` or ``predicate_synonym_collapse`` collapse).  The
+          survivor inherits the retired keys' counts.  Entries without one are
+          skipped: a contradiction superseded the fact with a DIFFERENT one and
+          an enrichment same_as contracted nodes, so neither has a survivor to
+          credit.
+        - ``adopt_reinforcements`` — the interim recital-dedup Case-1-adopt,
+          where a recited pending fact adopts an existing main-tier key onto its
+          keyless edge.  No edge is removed, so it has no ledger entry and
+          nothing to inherit; it is a re-sighting and only earns.
+
+        The timestamps handed to the store are the absorbed keys' OWN
+        bookkeeping values, not the merged edge's: ``reinforce`` folds them into
+        the survivor's window with the same ``max``/``min_nonempty`` the edge
+        applied, and reading them from the keys keeps the credit independent of
+        transient graph state.  They are also the temporal-order evidence — a
+        retired key bearing the survivor's own ``last_seen`` came from the same
+        transcript and earns nothing.
+        """
+        _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
+        _absorbed: dict[str, list[str]] = {}
+        _reobserved: dict[str, bool] = {}
+        for _retired_key, _record in _ledger.items():
+            _survivor = _record.get("survivor_key")
+            if not _survivor:
+                continue
+            _absorbed.setdefault(_survivor, []).append(_retired_key)
+            if _record.get("reason") in self._REOBSERVED_REASONS:
+                _reobserved[_survivor] = True
+
+        for _survivor, _retired_keys in _absorbed.items():
+            _bks = [self.store.bookkeeping_for_key(k) or {} for k in _retired_keys]
+            _last_seen = max((bk.get("last_seen", "") for bk in _bks), default="")
+            _first_seen = ""
+            for bk in _bks:
+                _first_seen = min_nonempty(_first_seen, bk.get("first_seen", ""))
+            self.store.reinforce(
+                _survivor,
+                cycle=self.cycle_count,
+                timestamp=_last_seen,
+                first_seen=_first_seen,
+                absorbing=_retired_keys,
+                reobserved=_reobserved.get(_survivor, False),
+            )
+            logger.debug(
+                "_credit_reinforcement: key=%s absorbed %s (reobserved=%s)",
+                _survivor,
+                sorted(_retired_keys),
+                _reobserved.get(_survivor, False),
+            )
+
+        for _adopted_key, (_adopt_ls, _adopt_fs) in adopt_reinforcements.items():
+            if not _adopted_key:
+                continue
+            self.store.reinforce(
+                _adopted_key,
+                cycle=self.cycle_count,
+                timestamp=_adopt_ls,
+                first_seen=_adopt_fs,
+                reobserved=True,
+            )
+            logger.debug(
+                "_credit_reinforcement: key=%s credited (recital-dedup adopt)",
+                _adopted_key,
+            )
 
     def _run_recall_sanity_probe(
         self,

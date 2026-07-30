@@ -10,7 +10,7 @@ entry point :meth:`GraphTierRefiner.refine`.
 Boundary: a :class:`GraphTierRefiner` mutates exactly the ``GraphMerger`` it is
 constructed with and reaches nothing else — no memory store, no cycle counter,
 no :class:`~paramem.training.consolidation.ConsolidationLoop`. The caller owns
-scheduling, gating, the store's recurrence bumps, and any post-refine debug
+scheduling, gating, the store's reinforcement credit, and any post-refine debug
 snapshot of the whole graph; this module only ever sees the merger, a model
 handle, and the small set of scalars/callables listed on
 :class:`GraphTierRefiner`'s constructor.
@@ -39,15 +39,14 @@ class RefineResult:
     """Outcome of a single :meth:`GraphTierRefiner.refine` call.
 
     ``normalization`` and ``enrichment`` are the diagnostics dicts produced by
-    each pass, or ``None`` when that pass was not requested. ``reinforcements``
-    and ``adopt_reinforcements`` are copied off the merger (``dict(...)``) at
-    the moment ``refine()`` returns, so a later mutation to the merger's live
+    each pass, or ``None`` when that pass was not requested.
+    ``adopt_reinforcements`` is copied off the merger (``dict(...)``) at the
+    moment ``refine()`` returns, so a later mutation to the merger's live
     bookkeeping cannot retroactively change what the caller acts on.
     """
 
     normalization: "dict | None"
     enrichment: "dict | None"
-    reinforcements: "dict[str, tuple[str, str]]"
     adopt_reinforcements: "dict[str, tuple[str, str]]"
 
 
@@ -236,9 +235,24 @@ class GraphTierRefiner:
            (``rec``, then ``established``, then ``ls``); retire the rest.
 
            a. Union ``sessions``, sum ``reinforcement_count``, max ``confidence``,
-              max ``last_seen`` of all retired edges onto the survivor BEFORE removal.
-           b. Write ``removal_ledger[ik_key] = {"reason": "predicate_synonym_collapse",
-              "merged_into": <survivor_pred>}`` for each retired keyed edge.
+              max ``last_seen`` and ``min_nonempty`` ``first_seen`` of all
+              retired edges onto the survivor BEFORE removal.  These are EDGE
+              counters, live only for this graph epoch (every fold rebuilds the
+              graph from the registry, so each edge re-enters at 1); durable
+              per-key maturity is a separate concern, carried by ``survivor_key``
+              below.
+           b. When the survivor edge carries no ``ik_key``, it adopts the
+              best-ranked retired key (highest ``reinforcement_count``, then
+              ``last_seen``, then key string) so the fact keeps its identity
+              and its earned bookkeeping instead of being re-minted; that key
+              is NOT recorded as a removal.
+           c. Write ``removal_ledger[ik_key] = {"reason":
+              "predicate_synonym_collapse", "survivor_predicate":
+              <survivor_pred>, "survivor_key": <survivor ik_key>}`` for each
+              remaining retired keyed edge.  ``survivor_key`` is the fold's
+              reinforcement-credit input — the survivor inherits the retired
+              keys' maturity, which their staling would otherwise discard.  It
+              is omitted only when no edge in the group carried a key at all.
            c. Remove retired edges from the graph.
 
         4. Single-predicate ``(s, o)`` facts are NEVER retired.
@@ -433,16 +447,56 @@ class GraphTierRefiner:
                 _survivor_edata["last_seen"] = _surv_last_seen
                 _survivor_edata["first_seen"] = _surv_first_seen
 
+                # Keyless survivor: a pending-session or enrichment edge can
+                # outrank a keyed one on the three-term rule, which would retire
+                # the keyed edge and re-mint the same fact under a fresh key at
+                # reinforcement 1 — losing both the key identity and everything
+                # the fact had earned.  The survivor adopts the best-ranked
+                # retired key instead (the merger's Case-1-adopt move, applied
+                # here), so the fact keeps its registry row and its bookkeeping.
+                # Ranking mirrors _pred_sort_key and falls back to the key
+                # string so the choice is deterministic.
+                _adopted_ik: str | None = None
+                if not _survivor_edata.get(_IK_KEY_ATTR):
+                    _keyed_retired = [
+                        _ri for _rp in _retired_preds for _ri in pred_map[_rp] if _ri["ik_key"]
+                    ]
+                    if _keyed_retired:
+                        _best = max(
+                            _keyed_retired,
+                            key=lambda ri: (
+                                ri["edata"].get("reinforcement_count", 1),
+                                ri["edata"].get("last_seen", ""),
+                                ri["ik_key"],
+                            ),
+                        )
+                        _adopted_ik = _best["ik_key"]
+                        _survivor_edata[_IK_KEY_ATTR] = _adopted_ik
+                        logger.info(
+                            "graph_normalization: keyless survivor %r adopted key=%s"
+                            " from retired predicate %r",
+                            _survivor_pred,
+                            _adopted_ik,
+                            _best["can_pred"],
+                        )
+
+                _survivor_ik = _survivor_edata.get(_IK_KEY_ATTR)
+
                 # Retire each non-survivor edge.
                 group_retired = 0
                 for _ret_pred in _retired_preds:
                     for _ret_info in pred_map[_ret_pred]:
                         _ret_ik = _ret_info["ik_key"]
-                        if _ret_ik:
-                            self._merger.removal_ledger[_ret_ik] = {
+                        # The adopted key moved to the survivor edge — it is not
+                        # a removal and must not be staled.
+                        if _ret_ik and _ret_ik != _adopted_ik:
+                            _entry: dict = {
                                 "reason": "predicate_synonym_collapse",
-                                "merged_into": _survivor_pred,
+                                "survivor_predicate": _survivor_pred,
                             }
+                            if _survivor_ik:
+                                _entry["survivor_key"] = _survivor_ik
+                            self._merger.removal_ledger[_ret_ik] = _entry
                         # Fail-loud: the (u, v, eid) triple was built from
                         # graph.edges(keys=True) and each predicate is retired at most
                         # once (guaranteed by _retired_in_so_group tracking above),
@@ -548,9 +602,6 @@ class GraphTierRefiner:
                     normalization.get("edges_retired", 0),
                 )
 
-        reinforcements: "dict[str, tuple[str, str]]" = dict(
-            getattr(self._merger, "reinforcements", {})
-        )
         adopt_reinforcements: "dict[str, tuple[str, str]]" = dict(
             getattr(self._merger, "adopt_reinforcements", {})
         )
@@ -558,6 +609,5 @@ class GraphTierRefiner:
         return RefineResult(
             normalization=normalization,
             enrichment=enrichment,
-            reinforcements=reinforcements,
             adopt_reinforcements=adopt_reinforcements,
         )

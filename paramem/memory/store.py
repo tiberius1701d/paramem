@@ -45,7 +45,7 @@ the documented contract.
 
 The per-key bookkeeping fields live in :attr:`MemoryStore._bookkeeping` — a flat
 ``{key → {speaker_id, relation_type, reinforcement_count, last_reinforced_cycle,
-last_seen}}`` dict SEPARATE from ``_entries``.  Populated by
+last_seen, first_seen}}`` dict SEPARATE from ``_entries``.  Populated by
 :meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
 Never enters :meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash path.
 
@@ -128,7 +128,7 @@ from __future__ import annotations
 import copy
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 from paramem.graph.merger import min_nonempty
 from paramem.training.key_registry import KeyRegistry
@@ -169,7 +169,7 @@ class MemoryStore:
         # Per-key provenance bookkeeping — SEPARATE from _entries.
         # key -> {"speaker_id": str, "relation_type": str,
         #         "reinforcement_count": int, "last_reinforced_cycle": int,
-        #         "last_seen": str}
+        #         "last_seen": str, "first_seen": str}
         # Populated by load_bookkeeping_from_disk at boot.  Never enters
         # snapshot/restore or KeyRegistry.save_bytes — stays out of the
         # hash-frozen slot-identity path.
@@ -321,9 +321,11 @@ class MemoryStore:
         that contained this fact.  Paired with ``last_seen`` to give each fact
         its true assertion window ``[first_seen, last_seen]``.  Mandatory —
         no runtime fallback; callers must supply the real value.
-        ``reinforcement_count``: how many times the underlying fact has been
-        re-seen (via intra-fold duplicate-SPO collapse) since the key was
-        minted.  Default 1 (a new key has been seen once).
+        ``reinforcement_count``: the fact's durable maturity — how many
+        separately-timed sightings it has accumulated, plus whatever it
+        inherited from keys merged into it.  Only :meth:`reinforce` may change
+        it after minting; see there for the exact rule.  Default 1 (a new key
+        has been seen once).
         ``last_reinforced_cycle``: the most recent consolidation cycle at which
         this key's fact was reinforced (cycle counter; drives promotion/decay).
         Default 0 (unknown).
@@ -342,10 +344,9 @@ class MemoryStore:
                 is ``False`` — unattributed keys are not recallable by speaker.
 
         **Callers that need to update ONE field on an existing key must use
-        :meth:`bump_recurrence` (for reinforcement/last_seen/first_seen
-        updates) rather than calling this method, which overwrites ALL six
-        fields and would silently reset the counters the caller did not
-        supply.**
+        :meth:`reinforce` (for reinforcement/last_seen/first_seen updates)
+        rather than calling this method, which overwrites ALL six fields and
+        would silently reset the counters the caller did not supply.**
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit.
@@ -377,23 +378,52 @@ class MemoryStore:
                 "first_seen": first_seen,
             }
 
-    def bump_recurrence(
-        self, key: str, *, cycle: int, first_seen: str, timestamp: str = ""
+    def reinforce(
+        self,
+        key: str,
+        *,
+        cycle: int,
+        first_seen: str,
+        timestamp: str = "",
+        absorbing: "Iterable[str]" = (),
+        reobserved: bool = False,
     ) -> None:
-        """Increment ``reinforcement_count`` and refresh cycle/timestamp for *key*.
+        """Update *key*'s ``reinforcement_count`` and refresh cycle/timestamps.
 
         This is the ONLY correct way to update the reinforcement counter on an
         existing bookkeeping record without resetting unrelated fields.  Callers
         that use :meth:`set_bookkeeping` to update a single field would silently
         overwrite ``speaker_id`` / ``relation_type`` with defaults.
 
-        When *key* has no bookkeeping record yet the call creates a minimal
-        record (``reinforcement_count=1``) — this is a defensive no-op for
-        callers that may race with a first registration; normal flow is that
-        :meth:`set_bookkeeping` is called first.
+        The new count is::
+
+            max(own_count, *absorbed_counts) + (1 if an independent sighting)
+
+        **Inheritance** (``absorbing``) is how a fold-time collapse preserves
+        maturity.  When several keys carrying the same fact are merged into one
+        survivor, the survivor inherits the highest count of the group; the
+        keys left behind are staled and their counts would otherwise be
+        discarded, silently demoting a promoted fact back to episodic.  ``max``
+        rather than a sum: the counter persists in the registry across folds, so
+        summing would compound on every fold and manufacture promotions.
+        Under-counting only delays a promotion; over-counting corrupts the tier.
+
+        **Earning** (``reobserved``) is how a key's count grows at all.  It
+        adds exactly 1, and only when *timestamp* differs from the record's
+        stored ``last_seen``: two sightings bearing the same session timestamp
+        are the same transcript, and being mentioned twice in one conversation
+        is multiplicity, not reinforcement.  An empty *timestamp* is "unknown",
+        never evidence of a temporal gap, so it never earns.
+
+        When *key* has no bookkeeping record yet the call creates a minimal one
+        — a defensive no-op for callers that may race with a first
+        registration; normal flow is that :meth:`set_bookkeeping` is called
+        first.  An absent record counts as ``0`` prior sightings, so a plain
+        first ``reobserved`` credit lands at 1 and an inherited count lands
+        intact rather than being flattened to 1.
 
         Args:
-            key: The indexed-key string (e.g. ``"graph42"``).
+            key: The indexed-key string (e.g. ``"graph42"``) — the survivor.
             cycle: Current consolidation cycle number.  Written to
                 ``last_reinforced_cycle`` unconditionally (the fact was
                 re-seen this cycle).
@@ -403,31 +433,50 @@ class MemoryStore:
                 min_nonempty(existing_first_seen, first_seen)`` so the window
                 start never regresses forward; an empty string never wins a
                 ``min_nonempty`` (it means "unknown", not "earliest possible
-                time").  Pass the real value from the boundary that has it —
-                the merger's ``reinforcements`` dict already carries the
-                collapsed min.
+                time").  Pass the real value from the boundary that has it.
             timestamp: ISO 8601 wall-clock timestamp of the session that
-                triggered this reinforcement.  When non-empty, sets
-                ``last_seen = max(existing_last_seen, timestamp)`` — ISO-8601
-                strings sort lexicographically so ``max`` is chronological;
-                this never regresses an existing newer value.  When empty,
-                ``last_seen`` is preserved unchanged.  Pass the real session
-                timestamp from the boundary that has it; do NOT fabricate a
-                ``now()`` here.
+                triggered this credit.  When non-empty, sets ``last_seen =
+                max(existing_last_seen, timestamp)`` — ISO-8601 strings sort
+                lexicographically so ``max`` is chronological; this never
+                regresses an existing newer value.  When empty, ``last_seen``
+                is preserved unchanged.  Pass the real session timestamp from
+                the boundary that has it; do NOT fabricate a ``now()`` here.
+                Also the temporal-order evidence for ``reobserved``.
+            absorbing: Keys whose durable counts *key* inherits — the keys
+                being merged into it.  Read from this store, never passed in as
+                a number.  Unknown keys contribute nothing.
+            reobserved: ``True`` when this credit accompanies an independent
+                sighting of the fact (a duplicate-SPO collapse across sessions,
+                or a recited fact adopting an existing key).  ``False`` for a
+                normalization merge such as a predicate-synonym collapse, which
+                rewrites how a fact is spelled without observing it again.
         """
         with self._lock:
             existing = self._bookkeeping.get(key)
+            prior = 0 if existing is None else existing.get("reinforcement_count", 1)
+            inherited = max(
+                (
+                    self._bookkeeping[k].get("reinforcement_count", 1)
+                    for k in absorbing
+                    if k in self._bookkeeping
+                ),
+                default=0,
+            )
+            prior_last_seen = "" if existing is None else existing.get("last_seen", "")
+            earned = 1 if (reobserved and timestamp and timestamp != prior_last_seen) else 0
+            count = max(prior, inherited) + earned
+
             if existing is None:
                 self._bookkeeping[key] = {
                     "speaker_id": "",
                     "relation_type": "unknown",
-                    "reinforcement_count": 1,
+                    "reinforcement_count": count,
                     "last_reinforced_cycle": cycle,
                     "last_seen": timestamp,
                     "first_seen": first_seen,
                 }
                 return
-            existing["reinforcement_count"] = existing.get("reinforcement_count", 1) + 1
+            existing["reinforcement_count"] = count
             existing["last_reinforced_cycle"] = cycle
             if timestamp:
                 existing["last_seen"] = max(existing.get("last_seen", ""), timestamp)

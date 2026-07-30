@@ -155,9 +155,9 @@ class TestAttributeKeysBookkeeping:
         assert "attribute_keys" not in node or "email" not in node.get("attribute_keys", {})
 
     def test_attribute_keys_round_trips_through_node_link_serialization(self):
-        """Guards the Step-1 persistence verification: attribute_keys is an
-        unknown top-level node field to nx.node_link_data and must survive
-        a save/load round trip (cumulative-graph / backup-artifact venue)."""
+        """attribute_keys is an unknown top-level node field to
+        nx.node_link_data and must survive a save/load round trip
+        (cumulative-graph / backup-artifact venue)."""
         import networkx as nx
 
         merger = GraphMerger()
@@ -170,10 +170,9 @@ class TestAttributeKeysBookkeeping:
 class TestAttributeGateDoesNotReachUpsertRelation:
     def test_no_upsert_relation_side_effects(self):
         """An attribute relation must never touch the Case-1/2/3 machinery
-        (reinforcements/collapsed/removal_ledger stay empty)."""
+        (collapsed/removal_ledger stay empty)."""
         merger = GraphMerger()
         merger.merge(_session(_attr_relation()))
-        assert merger.reinforcements == {}
         assert merger.collapsed == []
         assert merger.removal_ledger == {}
 

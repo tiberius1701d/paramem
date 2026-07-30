@@ -302,9 +302,9 @@ class TestSimulateTrainParity:
     def test_speaker_id_default_applied_both_modes(self, loop_sim, loop_train, tmp_path):
         """speaker_id is resolved from edge then subject node; absent node attr → "".
 
-        C-1/C-3 semantics: speaker_id is resolved from the EDGE first, then
-        the SUBJECT NODE attribute, then terminal fallback to "".  The caller's
-        id is NOT injected — ``default_speaker_id`` was removed (C-3).
+        speaker_id is resolved from the EDGE first, then the SUBJECT NODE
+        attribute, then terminal fallback to "".  The caller's id is NOT
+        injected — there is no ``default_speaker_id`` parameter.
 
         Resolution ladder:
         - Edge carries speaker_id  → use it.
@@ -346,7 +346,8 @@ class TestSimulateTrainParity:
                     )
 
         # The relation with explicit speaker_id="" must keep the empty string.
-        # C-1 reads the node attr (stamped ""); it must not be replaced.
+        # The resolution ladder reads the node attr (stamped ""); it must not
+        # be replaced.
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("subject") == "Carol" and entry.get("object") == "London":
@@ -997,6 +998,7 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.output_dir = tmp_path
     loop.merger = GraphMerger(model=None)
+    loop._incidents_state_dir = None
     # model/tokenizer None: the whole-graph normalization pass reads self.model and
     # cleanly skips (skip_reason="no_model") — production-correct for simulate mode,
     # which has no local model resident.
@@ -1573,7 +1575,7 @@ class TestConsolidateSimulateFold:
 
         loop._materialize_consolidation_graph(source="disk")
 
-        # §0 invariant (Step 2): speaker node key is the lowercase speaker_id.
+        # Speaker node keys are the lowercase speaker_id.
         # Under the lowercase-uniform design entity.speaker_id == node key == "speaker0".
         node_key = "speaker0"
         assert node_key in loop.merger.graph.nodes, (
@@ -1647,7 +1649,7 @@ class TestBuildTierDelta:
 
         # Simulate a dedup collapse: graph2 is collapsed into graph1.
         loop.merger.removal_ledger = {
-            "graph2": {"reason": "dedup", "surviving_twin": "graph1", "pre_surfaces": {}}
+            "graph2": {"reason": "dedup", "survivor_key": "graph1", "pre_surfaces": {}}
         }
 
         td = loop._build_tier_delta(
@@ -1684,7 +1686,7 @@ class TestBuildTierDelta:
         )
 
         loop.merger.removal_ledger = {
-            "graph3": {"reason": "enrichment_same_as", "merged_into": "alice"}
+            "graph3": {"reason": "enrichment_same_as", "keep_node": "alice"}
         }
 
         td = loop._build_tier_delta(
@@ -1710,7 +1712,7 @@ class TestBuildTierDelta:
         # Deliberately do NOT put "ghost_key" into the store.
 
         loop.merger.removal_ledger = {
-            "ghost_key": {"reason": "dedup", "surviving_twin": "real_key", "pre_surfaces": {}}
+            "ghost_key": {"reason": "dedup", "survivor_key": "real_key", "pre_surfaces": {}}
         }
 
         td = loop._build_tier_delta(
@@ -1771,9 +1773,9 @@ class TestBuildTierDelta:
         loop.store.put("procedural", "proc_key", {"subject": "E", "predicate": "p", "object": "F"})
 
         loop.merger.removal_ledger = {
-            "ep_key": {"reason": "dedup", "surviving_twin": "other", "pre_surfaces": {}},
-            "sem_key": {"reason": "dedup", "surviving_twin": "other2", "pre_surfaces": {}},
-            "proc_key": {"reason": "dedup", "surviving_twin": "other3", "pre_surfaces": {}},
+            "ep_key": {"reason": "dedup", "survivor_key": "other", "pre_surfaces": {}},
+            "sem_key": {"reason": "dedup", "survivor_key": "other2", "pre_surfaces": {}},
+            "proc_key": {"reason": "dedup", "survivor_key": "other3", "pre_surfaces": {}},
         }
 
         td = loop._build_tier_delta(
@@ -2073,6 +2075,7 @@ class TestGraphTierSkipsAfterRelease:
         loop.graph_enrichment_neighborhood_hops = 2
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.merger = GraphMerger(model=None)
+        loop._incidents_state_dir = None
         # Post-release state: release() nulls these four together.
         loop.model = None
         loop.tokenizer = None

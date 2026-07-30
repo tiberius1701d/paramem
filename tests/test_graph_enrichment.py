@@ -255,7 +255,7 @@ def _populate_disjoint_clusters(
 
 
 class TestAnonymizeTokenEnvelopeFunnel:
-    """U3 — item 35: a ``ConsolidationLoop`` built with
+    """A ``ConsolidationLoop`` built with
     ``extraction_anonymize_token_envelope=`` yields that value at
     ``_current_extraction_config().anonymize_token_envelope`` — the exact
     field :func:`~paramem.training.graph_enrich.enrich_graph` reads as
@@ -739,7 +739,7 @@ class TestSameAsDedupAcrossChunks:
             if e.get("reason") == "enrichment_same_as"
         ]
         assert same_as_keys == ["key_yang_victim"]
-        assert loop.merger.removal_ledger["key_yang_victim"]["merged_into"] == "yang ming"
+        assert loop.merger.removal_ledger["key_yang_victim"]["keep_node"] == "yang ming"
 
     def test_duplicate_pair_applied_once(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
@@ -787,12 +787,13 @@ class TestSameAsDedupAcrossChunks:
 
 
 class TestSymmetricPredicateCanonicalized:
-    """Symmetric predicates collapse via Relation.symmetric + merger E-2 swap."""
+    """Symmetric predicates collapse via symmetric-direction canonicalization in the merger."""
 
     def test_both_directions_collapse_to_one_edge(self, tmp_path, monkeypatch):
         """When cloud emits (A,P,B) and (B,P,A) both with symmetric=true and
-        neither endpoint is a speaker, the merger E-2 swap canonicalizes to
-        subj < obj and the second insert is a Case-1 duplicate — only one edge lands.
+        neither endpoint is a speaker, the merger swaps the endpoints of the
+        subject > object direction so both land on one canonical subj < obj edge —
+        the second insert is a Case-1 duplicate.
         """
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
@@ -838,7 +839,8 @@ class TestSymmetricPredicateCanonicalized:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        # After merger E-2 swap: both become (xiaoxiu, colleague of, zhang).
+        # After the merger's symmetric-endpoint swap: both become
+        # (xiaoxiu, colleague of, zhang).
         # Second insert is Case-1 reinforce — only one edge with edge_source stamp.
         enriched = [
             (u, v, d)
@@ -1247,19 +1249,18 @@ class TestNoModelSkipsGracefully:
 
 class TestVramExhaustedDegradesGracefully:
     """A VramExhausted mid-pass degrades gracefully instead of aborting the
-    fold (U5) — supersedes ``TestVramExhaustedNotSwallowed``, which
-    asserted the CONTRACT U5 retires (``pytest.raises(VramExhausted)``
-    escaping ``run_enrichment()``, on the rationale "the per-cycle loop
-    retries"). There is no retry: the pass stops, keeps whatever it already
-    merged, and the caller (``ConsolidationLoop._refine_consolidation_graph``)
-    records an incident. Enrichment self-heals next cycle — the pass runs
-    over the cumulative graph every fold.
+    fold.  ``VramExhausted`` must NOT escape ``run_enrichment()``: there is
+    no retry that could help (a retry in the same VRAM state faults the same
+    way).  The pass stops, keeps whatever it already merged, and the caller
+    (``ConsolidationLoop._refine_consolidation_graph``) records an incident.
+    Enrichment self-heals next cycle — the pass runs over the cumulative
+    graph every fold.
 
-    The old test also raised from ``request_graph_enrichment`` (the cloud
-    leg, which does no GPU work and cannot raise ``VramExhausted`` in
-    production). This replacement raises from the ``anonymize`` leg — the
-    only leg in the chunk body that touches the GPU, where the fault
-    actually originates.
+    The fault is raised from the ``anonymize`` leg — the only leg in the
+    chunk body that touches the GPU, and so the only one where
+    ``VramExhausted`` can originate in production.  Raising it from
+    ``request_graph_enrichment`` instead would exercise a branch production
+    cannot reach: the cloud leg does no GPU work.
 
     Mutation: revert the ``except VramExhausted`` branch to ``raise`` ->
     this test's ``run_enrichment()`` call raises instead of returning a
@@ -1326,8 +1327,7 @@ class TestVramExhaustedDegradesGracefully:
         assert result["chunks"] == 1
         call_spy.assert_called_once()
         # Chunk 1's enrichment relation is still merged into the graph —
-        # completed chunks keep their work (degrade granularity is the
-        # CHUNK, per .agent/plan-anonymize-slicing.md §1.3).
+        # completed chunks keep their work (degrade granularity is the CHUNK).
         assert result["new_edges"] >= 1
 
 
@@ -1834,8 +1834,8 @@ class TestDroppedRelations:
 
 
 class TestSliceCounters:
-    """U2/§5.4 gap closure — ``anonymize_slices`` (total local ``anonymize()``
-    calls across all chunks, ``sum(payload.slices)``) and
+    """Fact-boundary slicing counters — ``anonymize_slices`` (total local
+    ``anonymize()`` calls across all chunks, ``sum(payload.slices)``) and
     ``privacy_skipped_slices`` (``sum(payload.slices_failed)``), plus the
     per-chunk partial-withholding WARNING (``0 < slices_failed < slices``).
     Parallel to :class:`TestDroppedRelations`'s pattern: patches
@@ -2577,7 +2577,7 @@ class TestRefineConsolidationGraph:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        # Register a key so bump_recurrence has a target.
+        # Register a key so the credit pass has a target.
         loop.store.put(
             "episodic",
             "graph42",
@@ -2589,13 +2589,25 @@ class TestRefineConsolidationGraph:
             relation_type="factual",
             reinforcement_count=1,
             last_reinforced_cycle=0,
+            last_seen="2025-12-01T00:00:00Z",
             allow_empty_speaker=True,
-            first_seen="",
+            first_seen="2025-12-01T00:00:00Z",
+        )
+        # The retired twin: a separate session, so the collapse is a genuine
+        # re-sighting and earns.
+        loop.store.set_bookkeeping(
+            "graph43",
+            speaker_id="",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            allow_empty_speaker=True,
+            first_seen="2026-01-01T00:00:00Z",
         )
 
-        # Simulate a Case-1 collision: merger.reinforcements contains the surviving
-        # key mapped to (last_seen, first_seen).
-        loop.merger.reinforcements = {"graph42": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
+        # Simulate a Case-1 collision: the ledger names the surviving key.
+        loop.merger.removal_ledger = {"graph43": {"reason": "dedup", "survivor_key": "graph42"}}
 
         from paramem.graph.schema import Relation
 
@@ -2634,10 +2646,21 @@ class TestRefineConsolidationGraph:
             relation_type="factual",
             reinforcement_count=3,
             last_reinforced_cycle=0,
+            last_seen="2025-12-01T00:00:00Z",
             allow_empty_speaker=True,
-            first_seen="",
+            first_seen="2025-12-01T00:00:00Z",
         )
-        loop.merger.reinforcements = {"graph7": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
+        loop.store.set_bookkeeping(
+            "graph8",
+            speaker_id="",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="2026-01-01T00:00:00Z",
+            allow_empty_speaker=True,
+            first_seen="2026-01-01T00:00:00Z",
+        )
+        loop.merger.removal_ledger = {"graph8": {"reason": "dedup", "survivor_key": "graph7"}}
 
         from paramem.graph.schema import Relation
 
@@ -2657,21 +2680,42 @@ class TestRefineConsolidationGraph:
             f"Recurrence should have been bumped to 4; got {bk['reinforcement_count']}"
         )
 
-    def test_empty_recon_relations_is_safe_noop_for_bump(self, tmp_path):
-        """Empty recon_relations → recurrence-bump loop does not run; no crash."""
-        loop = _make_loop(tmp_path)
-        # graph99 would be bumped if the empty-recon guard failed.
-        loop.merger.reinforcements = {"graph99": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
+    def test_no_removals_is_safe_noop_for_credit(self, tmp_path):
+        """A fold that removed nothing credits nothing — no store write, no crash.
 
-        bump_spy = MagicMock()
-        loop.store.bump_recurrence = bump_spy
+        The credit pass is driven by the removal ledger, and a ledger entry
+        exists only where an edge was actually removed, so an untouched fold has
+        nothing to credit and must not write to the store to discover that.
+        """
+        loop = _make_loop(tmp_path)
+        loop.merger.removal_ledger = {}
+
+        credit_spy = MagicMock()
+        loop.store.reinforce = credit_spy
 
         with patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}):
-            # Both enrich values must be safe no-ops when recon_relations is empty.
             loop._refine_consolidation_graph([], enrich=False)
             loop._refine_consolidation_graph([], enrich=True)
 
-        bump_spy.assert_not_called()
+        credit_spy.assert_not_called()
+
+    def test_reasons_without_a_survivor_credit_nothing(self, tmp_path):
+        """A contradiction supersedes with a DIFFERENT fact and an enrichment
+        same_as contracts nodes — neither names a survivor, so neither moves
+        maturity onto anything."""
+        loop = _make_loop(tmp_path)
+        loop.merger.removal_ledger = {
+            "graph1": {"reason": "contradiction_same_pred", "old_object": "a", "new_object": "b"},
+            "graph2": {"reason": "enrichment_same_as", "keep_node": "alice"},
+        }
+
+        credit_spy = MagicMock()
+        loop.store.reinforce = credit_spy
+
+        with patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}):
+            loop._refine_consolidation_graph([], enrich=False)
+
+        credit_spy.assert_not_called()
 
     def test_normalize_true_calls_run_normalization(self, tmp_path):
         """normalize=True runs the whole-graph normalization pass (light+, both scopes).
@@ -2696,7 +2740,7 @@ class TestRefineConsolidationGraph:
 
 
 class TestRefineOrderEnrichThenNormalize:
-    """U2 — ``GraphTierRefiner.refine`` runs enrichment BEFORE normalization.
+    """``GraphTierRefiner.refine`` runs enrichment BEFORE normalization.
 
     Unlike ``TestRefineConsolidationGraph`` (which mocks both passes away to
     test ``_refine_consolidation_graph``'s wiring), these tests exercise the
@@ -2715,7 +2759,7 @@ class TestRefineOrderEnrichThenNormalize:
     # duplicated here at the refiner level.
 
     def test_normalization_sees_enrichment_edges(self, tmp_path, monkeypatch):
-        """Defect regression pin (F2/F3): a cloud paraphrase minted by
+        """Defect regression pin: a cloud paraphrase minted by
         enrichment is visible to (and collapsed by) normalization in the
         SAME ``refine()`` call.  Before the flip, enrichment ran AFTER
         normalization, so a cloud-coined paraphrase reached the fold's key
@@ -2723,8 +2767,8 @@ class TestRefineOrderEnrichThenNormalize:
 
         The (s,o) pair already carries an established predicate ("works
         at", from ``_populate_graph``); enrichment mints a same-pair
-        paraphrase ("employed_by").  U3's survivor rule keeps the
-        established predicate as the survivor.
+        paraphrase ("employed_by").  ``_pred_sort_key``'s three-term survivor
+        rule keeps the established predicate as the survivor.
         """
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
@@ -2786,27 +2830,32 @@ class TestRefineOrderEnrichThenNormalize:
     # this suite; and the ledger surviving an intervening cross-pass merge
     # end-to-end is pinned by
     # TestDriftPartitioning.test_intervening_enrichment_merge_preserves_dedup_bucketing_and_bump
-    # (test_consolidation.py, the Q4 regression).  A test asserting both
+    # (test_consolidation.py), which pins the accumulator-lifetime rule:
+    # merger.collapsed / merger.removal_ledger are reset ONLY by
+    # reset_graph(), never at the top of merge(), so they survive an
+    # intervening cross-pass merge within one fold.  A test asserting both
     # reason codes coexist in one refine() call adds no further coverage
-    # (removal_ledger was never reset by merge() even before Q4 -- the fix
-    # only touched reinforcements/collapsed).
+    # (removal_ledger was never reset by merge() even before that rule was
+    # enforced -- the fix only touched reinforcements/collapsed).
 
 
 class TestSurvivorRuleEstablishedOutranksEnrichment:
-    """U3 — ``_pred_sort_key``'s three-term survivor key: ``(rec, established,
+    """``_pred_sort_key``'s three-term survivor key: ``(rec, established,
     last_seen)``.  Exercises ``GraphTierRefiner.run_normalization`` directly
     (no need to run enrichment for real; the enrichment-sourced edge is
-    built directly with the exact ``reinforcement_count``/``last_seen``
-    shape F3 describes, so the arithmetic is pinned precisely).
+    built directly with the exact ``reinforcement_count``/``last_seen`` shape
+    an enrichment edge carries in production, so the arithmetic is pinned
+    precisely).
     """
 
     def test_established_predicate_survives_enrichment_paraphrase_on_a_tie(self, tmp_path):
-        """F3 pin: a 1-vs-1 group -- one established edge
+        """An enrichment-sourced predicate must never retire an organically
+        extracted one on a recency tie: a 1-vs-1 group -- one established edge
         (reinforcement_count=1, OLDER last_seen) vs one enrichment edge
         (reinforcement_count=1, edge_source='graph_enrichment', NEWER
         last_seen -- the chunk-maximum an enrichment edge inherits).  Ties
-        on ``rec``; without U3 the tie-break falls straight to ``last_seen``
-        and hands the win to the paraphrase.  Fails without U3.
+        on ``rec``; without the ``established`` term the tie-break falls
+        straight to ``last_seen`` and hands the win to the paraphrase.
         """
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
@@ -2901,7 +2950,7 @@ class TestSurvivorRuleEstablishedOutranksEnrichment:
 
 
 class TestRefineConsolidationGraphRecordsVramIncident:
-    """U5 item 24: ``_refine_consolidation_graph`` records one
+    """``_refine_consolidation_graph`` records one
     ``enrichment_degraded`` incident (``key="graph_enrich_vram"``, severity
     ``"warning"``) via the same ``record_incident`` surface used elsewhere
     in ``ConsolidationLoop``, when ``run_enrichment()`` reports
@@ -3542,7 +3591,7 @@ class TestEnrichmentRemovalLedger:
     def test_same_as_contraction_writes_keyed_edge_to_ledger(self, tmp_path, monkeypatch):
         """A successful same_as contraction that drops a keyed edge writes the
         edge's ik_key to merger.removal_ledger with reason='enrichment_same_as'
-        and merged_into set to the keep node.
+        and keep_node set to the surviving node.
         """
         from paramem.memory.persistence import _IK_KEY_ATTR
 
@@ -3604,9 +3653,9 @@ class TestEnrichmentRemovalLedger:
         assert entry["reason"] == "enrichment_same_as", (
             f"Expected reason='enrichment_same_as'; got {entry['reason']!r}"
         )
-        # merged_into is the canonical keep node key
-        assert entry["merged_into"] == "alice", (
-            f"Expected merged_into='alice' (canonical keep node); got {entry['merged_into']!r}"
+        # keep_node is the canonical keep node key
+        assert entry["keep_node"] == "alice", (
+            f"Expected keep_node='alice' (canonical keep node); got {entry['keep_node']!r}"
         )
 
     def test_failed_contraction_does_not_write_to_ledger(self, tmp_path, monkeypatch):
@@ -3691,12 +3740,14 @@ class TestInterimKeyingSeams:
     """
 
     def test_speaker_id_from_node_attr_carried_through(self, tmp_path):
-        """C-1 invariant: speaker-attributed node → speaker_id carried through
-        edge (A-1 merger stamp) → deferred_writes record carries the correct value.
+        """Edge-then-node resolution order: a speaker-attributed node's
+        speaker_id is carried through the edge (the merger stamps it there) and
+        into the deferred_writes record with the correct value.
 
         Route a speaker-attributed Relation through the merger so the EDGE carries
-        speaker_id (A-1 Case-3 stamp).  The graph-walk reads edge → node → "" and
-        produces the correct speaker_id in the minted entry.
+        speaker_id (Case-3 stamps it from the Relation unconditionally).  The
+        graph-walk reads edge → subject node attr → "" and produces the correct
+        speaker_id in the minted entry.
         """
         from paramem.graph.schema import Relation, SessionGraph
         from paramem.training.key_registry import KeyRegistry
@@ -3705,8 +3756,8 @@ class TestInterimKeyingSeams:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        # Route a speaker Relation through the real merger path — this stamps
-        # speaker_id on the edge via A-1 (Case-3 net-new insert).
+        # Route a speaker Relation through the real merger path — the Case-3
+        # net-new insert stamps speaker_id onto the edge.
         alice_rel = Relation(
             subject="speaker0",
             predicate="lives_in",
@@ -3760,8 +3811,9 @@ class TestInterimKeyingSeams:
         assert speaker_entry is not None, "No tier_keyed entry for speaker0"
 
     def test_explicit_empty_speaker_id_not_overwritten_by_default(self, tmp_path):
-        """C-1 invariant: concept node with no speaker_id attr → "" terminal fallback.
-        The new edge→node→"" read has no default_speaker_id override.
+        """Edge-then-node resolution order: a concept node with no speaker_id
+        attr lands on the "" terminal fallback.  The edge → node → "" read has
+        no default_speaker_id override.
         """
         from paramem.training.key_registry import KeyRegistry
 
@@ -3939,7 +3991,7 @@ class TestInterimKeyingSeams:
 
 
 class TestSymmetricSessionTierNamesDeleted:
-    """E-3: SYMMETRIC_PREDICATES and _canonicalize_symmetric_predicates deleted."""
+    """SYMMETRIC_PREDICATES and _canonicalize_symmetric_predicates deleted."""
 
     def test_symmetric_predicates_not_importable(self):
         """SYMMETRIC_PREDICATES must not be importable from extractor."""
@@ -3966,12 +4018,13 @@ class TestSymmetricSessionTierNamesDeleted:
 
 
 class TestEnrichmentThroughMergerComposition:
-    """Enrichment routes through GraphMerger.merge_relations (B workstream).
+    """Enrichment routes through GraphMerger.merge_relations.
 
-    The old direct graph.add_edge path is deleted. Enrichment edges now go
-    through the merger, which:
-    - stamps _EDGE_SOURCE_ATTR="graph_enrichment" (B-4 Case-3),
-    - stamps speaker_id from Relation.speaker_id (A-1),
+    There is no direct graph.add_edge path. Enrichment edges go through the
+    merger, which:
+    - stamps _EDGE_SOURCE_ATTR="graph_enrichment" on the Case-3 net-new insert,
+      but only when Relation.edge_source is non-empty,
+    - stamps speaker_id from Relation.speaker_id unconditionally,
     - deduplicates via Case-1 when an extraction edge already exists.
     """
 
@@ -4014,7 +4067,8 @@ class TestEnrichmentThroughMergerComposition:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        # Edge must carry edge_source="graph_enrichment" (B-4).
+        # Edge must carry edge_source="graph_enrichment" (the merger stamps it
+        # because the Relation's edge_source is non-empty).
         enriched = [
             d
             for _, _, d in loop.merger.graph.edges(data=True)
@@ -4090,7 +4144,13 @@ class TestEnrichmentThroughMergerComposition:
 
 
 class TestDeferredFlushAllowEmpty:
-    """D-2 #2/#3: deferred-flush set_bookkeeping sites pass allow_empty_speaker."""
+    """Deferred-flush set_bookkeeping sites pass allow_empty_speaker.
+
+    A keyless concept-node edge carries no speaker attribution, so its
+    deferred write reaches set_bookkeeping with ``speaker_id=""``; the flush
+    must set ``allow_empty_speaker`` or the empty-speaker guard
+    (``MemoryStore.set_bookkeeping``) raises ValueError.
+    """
 
     def test_concept_edge_deferred_flush_allows_empty_speaker(self, tmp_path):
         """Concept-rooted keyless edge with no speaker_id flushes without ValueError
@@ -4147,9 +4207,10 @@ class TestDeferredFlushAllowEmpty:
 
 
 def _seed_speaker_node(loop, speaker_id: str, display: str) -> None:
-    """Seed a real speaker node via the merger (§0 invariant: node key is
-    the lowercase speaker_id, e.g. ``"speaker0"`` — same as entity.speaker_id
-    verbatim under the lowercase-uniform speaker-identity design).
+    """Seed a real speaker node via the merger (speaker-identity invariant:
+    the node key is the lowercase speaker_id, e.g. ``"speaker0"`` — same as
+    entity.speaker_id verbatim under the lowercase-uniform speaker-identity
+    design).
 
     Uses the real merger.merge path — no raw add_node shortcut — so the test
     exercises the same node-key convention as production.
@@ -4189,12 +4250,12 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             loop.store.load_registry(tier, KeyRegistry())
 
         # _seed_speaker_node creates the speaker node via the real merger, keyed
-        # by the canonical speaker_id (§0): "speaker0".
+        # by the canonical speaker_id: "speaker0".
         _seed_speaker_node(loop, "speaker0", "Alex")
         # A concept node the speaker relates to.
         loop.merger.graph.add_node("mentoring", attributes={"name": "Mentoring"})
 
-        # Confirm §0 key convention: canonical lowercase key only.
+        # Confirm the key convention: canonical lowercase key only.
         assert "speaker0" in loop.merger.graph.nodes
 
         # cloud emits lowercase speaker id "speaker0" as the subject.
@@ -4277,7 +4338,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         _seed_speaker_node(loop, "speaker0", "Alex")
         _seed_speaker_node(loop, "speaker1", "Robin")
 
-        # §0: speaker node keys are lowercase canonical.
+        # Speaker node keys are lowercase canonical.
         assert "speaker0" in loop.merger.graph.nodes
         assert "speaker1" in loop.merger.graph.nodes
 
@@ -4349,8 +4410,8 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         """same_as ['speaker0', 'alex'] contracts the unbound 'alex' concept node
         INTO the casefolded speaker node 'speaker0'.
 
-        §0 invariant: keep="speaker0" resolves via canonical fallback to "speaker0"
-        ("speaker0" is NOT a live node key — key is "speaker0").
+        Speaker-identity invariant: keep="speaker0" resolves via canonical
+        fallback to the lowercase ``speaker{N}`` node key "speaker0".
         drop="alex" resolves via membership shortcut (already in graph).  Contraction
         succeeds: "alex" is absorbed into "speaker0"."""
         from paramem.training.key_registry import KeyRegistry
@@ -4545,7 +4606,7 @@ class TestSpeakerPredecessorInheritance:
         )
 
         # Confirm the speaker node is a predecessor of "senior pm" (bridge edge present).
-        # §0: speaker node key is casefolded ("speaker0"), not "speaker0".
+        # The speaker node key is the casefolded lowercase form ("speaker0").
         preds = list(loop.merger.graph.predecessors("senior pm"))
         assert "speaker0" in preds, (
             f"Bridge edge speaker0 →held_role→ 'senior pm' must be in graph; predecessors={preds}"
@@ -5166,7 +5227,7 @@ class TestGraphTierAnonymizationContract:
         )
 
     def test_request_graph_enrichment_sends_exactly_payload_facts(self):
-        """Item 21: ``request_graph_enrichment`` sends exactly
+        """``request_graph_enrichment`` sends exactly
         ``payload.facts`` — a fail-closed slice's facts (never present in
         ``payload.facts`` per :func:`~paramem.cloud.anonymize.anonymize`'s
         own contract) never appear in the cloud prompt. Asserted directly
@@ -5208,10 +5269,10 @@ class TestGraphTierAnonymizationContract:
         # The rendered triples_json is EXACTLY the substituted
         # payload.facts entry — a fail-closed slice's dropped triple
         # (never present in payload.facts to begin with) leaves no trace.
-        # (extractor.py's cloud-facing render is indent=2 — out of scope
-        # for U2's compact-JSON change, see plan §3/U2 exclusions — so
-        # this compares against that same indent=2 rendering, not the
-        # compact local-KV form.)
+        # (extractor.py's cloud-facing render is indent=2, unlike the
+        # compact json.dumps the local anonymize payload uses — so this
+        # compares against that same indent=2 rendering, not the compact
+        # local-KV form.)
         from paramem.cloud.placeholders import insert_placeholders
 
         expected_triples_json = json.dumps(
@@ -6028,9 +6089,9 @@ class TestGraphEnrichmentFailureLoudness:
         handlers — so this test patches ``generate_answer``, the actual GPU
         call, rather than ``anonymize_transcript`` (which would bypass
         ``vram_scope`` entirely and exercise a branch production cannot
-        reach — the bug the old version of this test encoded, U5 item 25).
+        reach).
 
-        The pass degrades (U5): it stops, keeps whatever it already merged
+        The pass degrades: it stops, keeps whatever it already merged
         (nothing here — the fault is on the only chunk), and returns
         normally with ``aborted_reason == "vram"`` rather than raising or
         silently "skipping the chunk" and continuing.
@@ -6085,7 +6146,7 @@ class TestGraphEnrichmentFailureLoudness:
         (unlike the CUDA-driver-fault case above). It skips just this chunk
         and lets the pass finish normally, ``aborted_reason`` staying
         ``None`` — the "honestly scoped" counterpart to the driver-fault
-        test above (U5 item 25).
+        test above.
 
         Mutation: narrow the handler to nothing (delete the ``except
         RuntimeError``) -> the RuntimeError kills the whole fold -> this
@@ -6124,8 +6185,7 @@ class TestGraphEnrichmentFailureLoudness:
         """A sticky, process-fatal CUDA context fault (``vram_guard.
         is_fatal_cuda_fault``'s contract — recovery is ``os._exit`` + process
         restart, never an in-process release) must escape ``enrich_graph``
-        rather than being logged and swallowed as a skipped chunk (U5 item
-        26; also the pre-existing swallow findings §9.2).
+        rather than being logged and swallowed as a skipped chunk.
 
         Mutation: drop the ``if is_fatal_cuda_fault(exc): raise`` guard at
         the top of the ``except RuntimeError`` branch -> this test's
@@ -6247,3 +6307,94 @@ class TestChunkTelemetryLogging:
         triples_part = line.split("triples=")[1]
         assert int(nodes_part) > 0
         assert int(triples_part) > 0
+
+
+class TestNormalizationNamesTheSurvivorKey:
+    """A predicate-synonym collapse retires the loser's KEY, and that key's
+    durable maturity lives in the registry, not on the graph edge.  The ledger
+    entry therefore has to name the surviving key, or the fold's credit pass
+    has no target and a promoted fact is silently demoted to episodic while
+    the fold reports zero loss.
+    """
+
+    @staticmethod
+    def _two_predicate_graph(loop, *, survivor_key: str | None, retired_key: str):
+        """(person0 → acmecorp) carrying 'works at' and 'employed by'."""
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)  # clears the 10-node floor
+
+        established_eid = next(iter(graph["person0"]["acmecorp"]))
+        established = graph["person0"]["acmecorp"][established_eid]
+        established["reinforcement_count"] = 2  # outranks the paraphrase on rec
+        established["last_seen"] = "s001"
+        if survivor_key is not None:
+            established[_IK_KEY_ATTR] = survivor_key
+
+        graph.add_edge(
+            "person0",
+            "acmecorp",
+            predicate="employed by",
+            relation_type="factual",
+            confidence=0.9,
+            reinforcement_count=1,
+            last_seen="s999",
+            sessions=["s999"],
+            **{_IK_KEY_ATTR: retired_key},
+        )
+        return graph
+
+    @staticmethod
+    def _run(loop):
+        canned = (
+            {("person0", "acmecorp"): [["works at", "employed by"]]},
+            {"model_calls": 1, "raw_outputs": []},
+        )
+        with patch(
+            "paramem.training.graph_tier.normalize_predicates",
+            return_value=canned,
+        ):
+            return _refiner_for(loop).run_normalization()
+
+    def test_ledger_names_the_surviving_key_and_predicate(self, tmp_path):
+        loop = _make_loop(tmp_path)
+        self._two_predicate_graph(loop, survivor_key="graph_keep", retired_key="graph_drop")
+
+        assert self._run(loop)["edges_retired"] == 1
+
+        entry = loop.merger.removal_ledger["graph_drop"]
+        assert entry["reason"] == "predicate_synonym_collapse"
+        assert entry["survivor_key"] == "graph_keep", (
+            "the credit pass reads survivor_key; without it the retired key's "
+            f"maturity has nowhere to go; got {entry!r}"
+        )
+        assert entry["survivor_predicate"] == "works at"
+
+    def test_keyless_survivor_adopts_the_retired_key(self, tmp_path):
+        """A pending-session or enrichment edge can outrank a keyed one, which
+        would retire the keyed edge and re-mint the fact under a fresh key at
+        reinforcement 1.  The survivor adopts the key instead, so the fact keeps
+        its registry row — and there is no removal to record at all.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = _make_loop(tmp_path)
+        graph = self._two_predicate_graph(loop, survivor_key=None, retired_key="graph_mature")
+
+        assert self._run(loop)["edges_retired"] == 1
+
+        surviving = [
+            d
+            for _, _, d in graph.out_edges("person0", data=True)
+            if d.get("predicate") == "works at"
+        ]
+        assert len(surviving) == 1
+        assert surviving[0].get(_IK_KEY_ATTR) == "graph_mature", (
+            "the keyless survivor must adopt the retired key rather than let it "
+            f"be staled; got {surviving[0].get(_IK_KEY_ATTR)!r}"
+        )
+        assert "graph_mature" not in loop.merger.removal_ledger, (
+            "an adopted key moved to the survivor edge — it is not a removal and "
+            "must not be soft-staled"
+        )

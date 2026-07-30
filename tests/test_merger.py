@@ -692,7 +692,7 @@ class TestMultiUserNameCollision:
         ``"Alex"`` will never collide with a casefolded speaker-id node key.
         The third-party Alex becomes a separate node keyed by
         ``"alex"`` (canonical form); speaker0's node is keyed by
-        ``"speaker0"`` (casefolded §0 key) with its own attributes intact.
+        ``"speaker0"`` (its speaker-id node key) with its own attributes intact.
         """
         m = GraphMerger(similarity_threshold=85.0)
         m.merge(self._build_speaker_session("s001", "speaker0", "Walker", "Portland"))
@@ -1104,114 +1104,13 @@ class TestIkKeyProvenance:
         )
 
 
-class TestReinforcementTracking:
-    """Tests for merger.reinforcements (Case-1 duplicate-SPO collapse tracking)."""
-
-    def test_reinforcements_empty_after_merge_no_duplicate(self):
-        """A merge with no duplicate SPO produces an empty reinforcements dict."""
-        from paramem.graph.merger import GraphMerger
-        from paramem.graph.schema import Relation, SessionGraph
-
-        m = GraphMerger()
-        session = SessionGraph(
-            session_id="s1",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[],
-            relations=[
-                Relation(
-                    subject="Alice",
-                    predicate="lives in",
-                    object="Berlin",
-                    relation_type="factual",
-                    confidence=1.0,
-                    speaker_id="speaker0",
-                    indexed_key="graph1",
-                )
-            ],
-        )
-        m.merge(session, resolve_contradictions=False)
-        assert m.reinforcements == {}, "No duplicate → reinforcements must be empty"
-
-    def test_reinforcements_populated_on_duplicate_spo_collapse(self):
-        """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
-        the surviving key appears in reinforcements with its (last_seen, first_seen)
-        timestamps."""
-        from paramem.graph.merger import GraphMerger
-        from paramem.graph.schema import Relation, SessionGraph
-
-        m = GraphMerger()
-        # First merge: net-new edge, key graph1 stamped.
-        s1 = SessionGraph(
-            session_id="recon1",
-            timestamp="2026-01-01T00:00:00Z",
-            entities=[],
-            relations=[
-                Relation(
-                    subject="Alice",
-                    predicate="lives in",
-                    object="Berlin",
-                    relation_type="factual",
-                    confidence=1.0,
-                    speaker_id="speaker0",
-                    indexed_key="graph1",
-                )
-            ],
-        )
-        m.merge(s1, resolve_contradictions=False)
-        assert m.reinforcements == {}, "First merge is net-new — no reinforcement yet"
-
-        # Second merge: same (s,p,o), different ik_key → Case-1 → reinforcement.
-        s2 = SessionGraph(
-            session_id="recon2",
-            timestamp="2026-01-02T00:00:00Z",
-            entities=[],
-            relations=[
-                Relation(
-                    subject="Alice",
-                    predicate="lives in",
-                    object="Berlin",
-                    relation_type="factual",
-                    confidence=1.0,
-                    speaker_id="speaker0",
-                    indexed_key="graph2",
-                )
-            ],
-        )
-        m.merge(s2, resolve_contradictions=False)
-
-        assert len(m.reinforcements) == 1, (
-            f"Duplicate-SPO collapse must produce 1 reinforcement entry; got {m.reinforcements}"
-        )
-        # The survivor is the EXISTING edge's key (graph1), not the incoming (graph2).
-        assert "graph1" in m.reinforcements, (
-            f"Surviving key must be graph1 (existing edge); got keys={list(m.reinforcements)}"
-        )
-        # The carried last_seen is the freshest (max) of both edges' timestamps;
-        # the carried first_seen is the earliest (min) of both edges' timestamps.
-        assert m.reinforcements["graph1"] == (
-            "2026-01-02T00:00:00Z",
-            "2026-01-01T00:00:00Z",
-        ), (
-            "last_seen must be the freshest timestamp (s2.timestamp) and first_seen "
-            f"the earliest (s1.timestamp); got {m.reinforcements['graph1']!r}"
-        )
-
-    def test_reinforcements_reset_graph_clears_reinforcements(self):
-        """reset_graph() clears reinforcements from the prior fold."""
-        from paramem.graph.merger import GraphMerger
-
-        m = GraphMerger()
-        m.reinforcements = {"graph_stale": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
-        m.reset_graph()
-        assert m.reinforcements == {}, "reset_graph must clear reinforcements"
+class TestCollapsedTracking:
+    """Tests for merger.collapsed (Case-1 duplicate-SPO collapse tracking)."""
 
     def test_collapsed_populated_on_duplicate_spo_collapse(self):
         """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
         the INCOMING (drifting) key appears in collapsed, while the surviving key is
-        in reinforcements.
-
-        collapsed is the parallel to reinforcements — where reinforcements records
-        the key that survived, collapsed records the key that was deduplicated away.
+        named by the ledger entry written in the same branch.
         """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
@@ -1263,9 +1162,9 @@ class TestReinforcementTracking:
         assert m.collapsed[0] == "graph2", (
             f"Collapsed key must be graph2 (the incoming key); got {m.collapsed[0]!r}"
         )
-        # The surviving key must still be in reinforcements.
-        assert "graph1" in m.reinforcements, (
-            f"Surviving key must be graph1 (existing edge); got keys={list(m.reinforcements)}"
+        # The ledger entry written in the same branch names the survivor.
+        assert m.removal_ledger["graph2"]["survivor_key"] == "graph1", (
+            f"Surviving key must be graph1 (existing edge); got {m.removal_ledger['graph2']!r}"
         )
 
     def test_collapsed_reset_graph_clears_collapsed(self):
@@ -1278,8 +1177,8 @@ class TestReinforcementTracking:
         assert m.collapsed == [], "reset_graph must clear collapsed"
 
     def test_reset_graph_clears_all_per_fold_caches(self):
-        """reset_graph() clears graph, caches, reinforcements, collapsed, contradictions,
-        and removal_ledger."""
+        """reset_graph() clears graph, caches, collapsed, contradictions, and
+        removal_ledger."""
 
         from paramem.graph.merger import GraphMerger
 
@@ -1288,16 +1187,14 @@ class TestReinforcementTracking:
         m.graph.add_node("Alice")
         m._predicate_cardinality["foo"] = True
         m.contradictions_resolved.append({"method": "model"})
-        m.reinforcements["k2"] = ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
         m.collapsed.append("k3")
-        m.removal_ledger["k3"] = {"reason": "dedup", "surviving_twin": "k2"}
+        m.removal_ledger["k3"] = {"reason": "dedup", "survivor_key": "k2"}
 
         m.reset_graph()
 
         assert m.graph.number_of_nodes() == 0, "reset_graph must empty the graph"
         assert m._predicate_cardinality == {}, "reset_graph must clear cardinality cache"
         assert m.contradictions_resolved == [], "reset_graph must clear contradictions_resolved"
-        assert m.reinforcements == {}, "reset_graph must clear reinforcements"
         assert m.collapsed == [], "reset_graph must clear collapsed"
         assert m.removal_ledger == {}, "reset_graph must clear removal_ledger"
 
@@ -1340,9 +1237,9 @@ class TestReinforcementTracking:
         )
         m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
 
-        # Adopt path: no reinforcement (the existing edge had no key to preserve).
-        assert m.reinforcements == {}, (
-            "Case-1-adopt must NOT produce a reinforcement (existing was keyless)"
+        # Adopt path: no removal (the existing edge had no key to displace).
+        assert m.removal_ledger == {}, (
+            "Case-1-adopt must NOT produce a removal record (existing was keyless)"
         )
         # Key was adopted onto the existing edge.
         assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
@@ -1596,7 +1493,7 @@ class TestRemovalLedger:
 
     def test_dedup_collapse_writes_to_ledger(self):
         """Case-1 duplicate-SPO collapse writes the drifting key to removal_ledger
-        with reason='dedup' and surviving_twin set to the existing key.
+        with reason='dedup' and survivor_key set to the existing key.
 
         Regression guard: merged.collapsed assertion still holds alongside the
         new ledger assertion.
@@ -1652,9 +1549,9 @@ class TestRemovalLedger:
         assert m.removal_ledger["key_drifter"]["reason"] == "dedup", (
             f"Expected reason='dedup'; got {m.removal_ledger['key_drifter']['reason']!r}"
         )
-        assert m.removal_ledger["key_drifter"]["surviving_twin"] == "key_survivor", (
-            f"Expected surviving_twin='key_survivor'; "
-            f"got {m.removal_ledger['key_drifter']['surviving_twin']!r}"
+        assert m.removal_ledger["key_drifter"]["survivor_key"] == "key_survivor", (
+            f"Expected survivor_key='key_survivor'; "
+            f"got {m.removal_ledger['key_drifter']['survivor_key']!r}"
         )
         # Survivor must NOT appear in ledger.
         assert "key_survivor" not in m.removal_ledger, "Surviving key must not be in removal_ledger"
@@ -1826,11 +1723,11 @@ class TestRemovalLedger:
         assert "key_munich" not in m.removal_ledger, "Winner key must NOT be ledgered"
 
     def test_reset_graph_clears_removal_ledger(self):
-        """reset_graph() clears removal_ledger alongside collapsed and reinforcements."""
+        """reset_graph() clears removal_ledger alongside collapsed."""
         from paramem.graph.merger import GraphMerger
 
         m = GraphMerger()
-        m.removal_ledger["key_stale"] = {"reason": "dedup", "surviving_twin": "k2"}
+        m.removal_ledger["key_stale"] = {"reason": "dedup", "survivor_key": "k2"}
         assert "key_stale" in m.removal_ledger
 
         m.reset_graph()
@@ -1984,7 +1881,7 @@ class TestRecencyAnyEmpty:
 
     COEXIST only when EVERY candidate (incoming + all rivals) has last_seen="".
     As soon as any candidate is dated, freshest-wins applies and an empty
-    last_seen can never be the winner (A2 fix — "dated wins over undated").
+    last_seen can never be the winner — dated wins over undated.
 
     Covers:
     - dated rival vs undated incoming → REPLACE: rival survives, incoming dropped
@@ -2064,7 +1961,7 @@ class TestRecencyAnyEmpty:
         ]
 
     def test_incoming_empty_rival_dated_replace_rival_wins(self):
-        """A2: incoming last_seen="" vs a dated rival → REPLACE, rival wins.
+        """Undated incoming vs a dated rival → REPLACE, rival wins.
 
         An empty last_seen sorts as the oldest possible timestamp, so the dated
         rival is the unique freshest.  The undated incoming loses and is NOT
@@ -2082,7 +1979,7 @@ class TestRecencyAnyEmpty:
         assert "key_munich" not in m.removal_ledger, "Winner Munich key must NOT be ledgered"
 
     def test_rival_empty_incoming_dated_replace_incoming_wins(self):
-        """A2: dated incoming vs rival last_seen="" → REPLACE, incoming wins.
+        """Dated incoming vs an undated rival → REPLACE, incoming wins.
 
         An empty last_seen sorts as the oldest possible timestamp, so the dated
         incoming is the unique freshest.  The undated rival is retired
@@ -2352,10 +2249,10 @@ class TestSessionIdsProvenanceUnion:
     Case-3 (new-edge insertion) so the real contributing session ids
     accumulate on the edge across all extraction paths.
 
-    Locks SET semantics across both merge cases.  The dcf4189
-    speaker-attribution invariant is also verified: minted-key
-    speaker_id comes from the SUBJECT NODE attribute, not from the
-    scalar session_id param; the session_ids union must not touch it.
+    Locks SET semantics across both merge cases.  The speaker-attribution
+    invariant is also verified: minted-key speaker_id comes from the SUBJECT
+    NODE attribute, not from the scalar session_id param; the session_ids union
+    must not touch it.
     """
 
     @staticmethod
@@ -2465,11 +2362,11 @@ class TestSessionIdsProvenanceUnion:
         )
 
     def test_speaker_id_attribution_unchanged_by_session_ids_union(self):
-        """dcf4189 invariant: speaker_id on the SUBJECT NODE is unchanged by the session_ids union.
+        """speaker_id on the SUBJECT NODE is unchanged by the session_ids union.
 
         Multi-session edge: two merges under different scalar session_ids each
         carrying a real session_id.  The subject node must retain speaker_id
-        from the entity (dcf4189), not from any session_id field.
+        from the entity, not from any session_id field.
         """
         m = GraphMerger()
         entities = [
@@ -2508,15 +2405,19 @@ class TestSessionIdsProvenanceUnion:
 
 
 # ---------------------------------------------------------------------------
-# Merger edge-stamp tests — A-1/A-2/B-4 speaker_id and edge_source stamps
+# Merger edge-stamp tests — speaker_id and edge_source stamps on inserted edges
 # ---------------------------------------------------------------------------
 
 
 class TestMergerEdgeStamps:
-    """A-1/A-2/B-4: merger stamps speaker_id and edge_source on inserted edges."""
+    """The merger stamps speaker_id and edge_source on inserted edges."""
 
     def test_case3_stamps_speaker_id_unconditionally(self):
-        """A-1: Case-3 net-new insert stamps speaker_id from Relation unconditionally."""
+        """Case-3 net-new insert stamps speaker_id from the Relation unconditionally.
+
+        A net-new edge has no prior speaker_id to preserve, so the stamp is not
+        guarded by a first-non-empty-wins check.
+        """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2533,11 +2434,11 @@ class TestMergerEdgeStamps:
         edges = list(m.graph["spk-1"]["acme"].values())
         assert len(edges) == 1
         assert edges[0].get("speaker_id") == "spk-1", (
-            f"A-1: Case-3 must stamp speaker_id; got {edges[0].get('speaker_id')!r}"
+            f"Case-3 net-new insert must stamp speaker_id; got {edges[0].get('speaker_id')!r}"
         )
 
     def test_case3_stamps_edge_source_when_set(self):
-        """B-4: Case-3 stamps _EDGE_SOURCE_ATTR when Relation.edge_source is non-empty."""
+        """Case-3 stamps _EDGE_SOURCE_ATTR only when Relation.edge_source is non-empty."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
         from paramem.memory.persistence import _EDGE_SOURCE_ATTR
@@ -2555,11 +2456,11 @@ class TestMergerEdgeStamps:
 
         edges = list(m.graph["alice"]["bob"].values())
         assert edges[0].get(_EDGE_SOURCE_ATTR) == "graph_enrichment", (
-            f"B-4: Case-3 must stamp edge_source; got {edges[0].get(_EDGE_SOURCE_ATTR)!r}"
+            f"Case-3 must stamp a non-empty edge_source; got {edges[0].get(_EDGE_SOURCE_ATTR)!r}"
         )
 
     def test_case1_adopts_speaker_id_if_empty(self):
-        """A-2: Case-1 reinforce adopts speaker_id onto a keyless-speaker edge."""
+        """Case-1 reinforce adopts speaker_id onto an existing edge that has none."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2589,14 +2490,14 @@ class TestMergerEdgeStamps:
         )
         m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
 
-        # A-2: speaker_id adopted onto the existing edge.
+        # First-non-empty-wins: speaker_id adopted onto the existing edge.
         edge = m.graph["alice"]["berlin"][eid]
         assert edge.get("speaker_id") == "speaker0", (
-            f"A-2: Case-1 must adopt speaker_id; got {edge.get('speaker_id')!r}"
+            f"Case-1 must adopt the incoming speaker_id; got {edge.get('speaker_id')!r}"
         )
 
     def test_case1_does_not_overwrite_existing_speaker_id(self):
-        """A-2: no-overwrite — existing non-empty speaker_id is preserved."""
+        """Case-1 never overwrites: an existing non-empty speaker_id is preserved."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2627,11 +2528,13 @@ class TestMergerEdgeStamps:
 
         edge = m.graph["alice"]["berlin"][eid]
         assert edge.get("speaker_id") == "OriginalSpeaker", (
-            f"A-2: existing speaker_id must NOT be overwritten; got {edge.get('speaker_id')!r}"
+            f"Existing speaker_id must NOT be overwritten; got {edge.get('speaker_id')!r}"
         )
 
     def test_e2_symmetric_collapses_non_speaker_pair(self):
-        """E-2: symmetric=True, subject > obj, neither is a speaker → swap applied."""
+        """Symmetric-direction canonicalization: symmetric=True, subject > obj,
+        neither endpoint a speaker → endpoints swapped so (A,P,B) and (B,P,A)
+        collapse onto one edge."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
@@ -2649,18 +2552,19 @@ class TestMergerEdgeStamps:
 
         # After swap, edge must be (a_node, z_node).
         assert m.graph.has_edge("a_node", "z_node"), (
-            "E-2 swap must reorder to (a_node, z_node) because 'z_node' > 'a_node'"
+            "The symmetric swap must reorder to (a_node, z_node) because 'z_node' > 'a_node'"
         )
         assert not m.graph.has_edge("z_node", "a_node"), (
-            "Original direction (z_node, a_node) must not exist after E-2 swap"
+            "Original direction (z_node, a_node) must not exist after the symmetric swap"
         )
 
     def test_e2_symmetric_does_not_swap_speaker_speaker_pair(self):
-        """E-2 guard: both endpoints are speakers → no swap, both directions kept.
+        """Speaker guard on the symmetric swap: both endpoints are ``speaker{N}``
+        tokens → no swap, both directions kept.
 
         Uses real ``speaker{N}`` tokens (not contrived names) so the guard is
-        exercised through the structural ``is_speaker_id`` check the fix uses,
-        not merely a node-attribute lookup.
+        exercised through the merger's structural ``is_speaker_id`` check, not
+        merely a node-attribute lookup.
         """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
@@ -2691,10 +2595,10 @@ class TestMergerEdgeStamps:
 
         # Speaker↔speaker: both directions must survive.
         assert m.graph.has_edge("speaker9", "speaker1"), (
-            "Speaker→speaker edge must survive (no E-2 swap for speaker pairs)"
+            "Speaker→speaker edge must survive (no symmetric swap for speaker pairs)"
         )
         assert m.graph.has_edge("speaker1", "speaker9"), (
-            "Speaker←speaker edge must survive (no E-2 swap for speaker pairs)"
+            "Speaker←speaker edge must survive (no symmetric swap for speaker pairs)"
         )
 
     def test_e2_symmetric_speaker_owned_sibling_not_flipped(self):
@@ -2978,7 +2882,7 @@ class TestStampedSpeakerMergerIntegration:
     def test_both_speakers_guard_works_for_two_stamped_speakers(self):
         """Two speaker endpoints (both stamped) on a symmetric relation must
         produce two distinct directed edges — the both_speakers guard prevents
-        the E-2 canonical swap that would collapse them."""
+        the symmetric-direction canonical swap that would collapse them."""
         m = GraphMerger(similarity_threshold=85.0)
         m.merge(self._make_stamped_session("s001", "speaker0", "Berlin"))
         m.merge(self._make_stamped_session("s002", "speaker1", "Munich"))

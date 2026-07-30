@@ -1594,7 +1594,7 @@ class TestRecallGateRejectedVramCleanup:
             {"key": "graph_preexisting", "subject": "X", "predicate": "knows", "object": "Y"},
             simhash=123,
         )
-        loop.merger.removal_ledger = {"graph_preexisting": {"reason": "semantic_dedup"}}
+        loop.merger.removal_ledger = {"graph_preexisting": {"reason": "predicate_synonym_collapse"}}
 
         pending_session_id = "session-full-contract-001"
         episodic_rels = [
@@ -1734,8 +1734,7 @@ class TestSessionIdsProvenanceCarry:
     - rec["entry"] does NOT contain "session_ids" (the persisted dict schema
       stays unchanged).
     - speaker_id attribution is unchanged: the minted-key speaker_id comes from
-      the subject node's speaker_id attribute (dcf4189 invariant), not from any
-      session_ids field.
+      the subject node's speaker_id attribute, not from any session_ids field.
     """
 
     def _make_loop_with_sessions_in_graph(self, tmp_path: Path, *, session_ids: list[str]):
@@ -1810,7 +1809,7 @@ class TestSessionIdsProvenanceCarry:
         )
 
     def test_speaker_id_attribution_unchanged_by_session_ids(self, tmp_path: Path) -> None:
-        """dcf4189 invariant: minted-key speaker_id from subject node, not from session_ids.
+        """Minted-key speaker_id comes from the subject node, not from session_ids.
 
         Multi-session edge scenario: the edge carries real session ids from two
         sessions.  The minted entry's speaker_id must come from the subject node's

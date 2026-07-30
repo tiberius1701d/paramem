@@ -365,6 +365,16 @@ options. A short map of the top-level sections:
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
 
+#### Memory tiers
+
+Two knobs under `consolidation:` govern how a fact moves between the episodic
+and semantic adapters over its lifetime. Neither ever deletes anything.
+
+| Parameter | Default | Effect | When to adjust |
+|---|---|---|---|
+| `promotion_threshold` | `3` | How much standing a fact needs before it moves from the episodic adapter to the semantic one. Standing comes from being said again in a *later* conversation — repetition inside one conversation does not count — and a fact also keeps the standing of any duplicate merged into it, so consolidating two records of the same fact never costs it its place. | Raise to keep the semantic tier smaller and more selective, so only facts confirmed across several conversations settle there. Lower to promote sooner, at the cost of promoting things that turned out to be passing remarks. |
+| `decay_window` | `10` | How many consolidation cycles a fact may go unmentioned before it is logged as a decay candidate. Advisory only — nothing is deleted, and the fact stays recallable; unimportant facts fade on their own as the adapter is retrained around them. | Lower to see fading candidates sooner in the logs; raise to quieten them. Purely diagnostic — changing it does not change what the server keeps. |
+
 #### Graph refinement
 
 Two post-merge passes over the consolidation fold's cumulative graph, both under `consolidation:`. Both are **full-fold only** — an interim cycle never runs either, regardless of these settings; interim cycles still get session-tier cloud enrichment over each transcript (see `cloud` above).

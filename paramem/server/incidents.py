@@ -30,6 +30,15 @@ Lifecycle
 - AUTO-RESOLVE on the next successful op of that type (caller's
   responsibility; see ``resolve_incidents_by_type``).
 
+Recording without resolving leaves a warning riding on ``GET /status``
+forever, so every type MUST have a clear site.  Where the failure and the
+success are the same code path — a pass that either degraded or did not — put
+them in one branch at that site, using ``resolve_incident`` when the type
+carries several keys and only one sub-condition recovered.  Where they are
+different paths (a crash recorded in a handler, cleared by a later successful
+run) the clear site belongs on that op's success path.
+``tests/server/test_incident_wiring.py`` holds every type to this.
+
 Concurrency
 -----------
 All public write functions use ``flock_rmw`` (``fcntl.flock`` on
@@ -316,7 +325,8 @@ def resolve_incident(state_dir: Path, type: str, key: str) -> bool:
     """Resolve the incident matching ``(type, key)``.
 
     Idempotent: returns ``False`` if no matching incident is found (normal
-    when a success op has no prior failure).
+    when a success op has no prior failure).  Writes nothing in that case —
+    a success path must never be the thing that creates ``incidents.json``.
 
     Parameters
     ----------
@@ -333,6 +343,12 @@ def resolve_incident(state_dir: Path, type: str, key: str) -> bool:
         ``True`` if a matching incident was found and resolved; ``False``
         otherwise.
     """
+    # Nothing to resolve without a store, and a success path must not create
+    # one: every clean op calls a resolver, so writing here would materialise
+    # an empty incidents.json on a server that has never had an incident.
+    if read_json_or_none(Path(state_dir), INCIDENTS_FILENAME) is None:
+        return False
+
     incident_id = f"{type}:{key}"
     found_holder: list[bool] = [False]
 
@@ -366,7 +382,8 @@ def resolve_incidents_by_type(state_dir: Path, type: str) -> int:
     """Resolve every active incident of the given ``type``.
 
     Used by success-path auto-resolve (all incidents of a type clear when the
-    op succeeds).  Idempotent: resolving already-resolved incidents is a no-op.
+    op succeeds).  Idempotent: resolving already-resolved incidents is a no-op,
+    and a call against a state dir with no ``incidents.json`` writes nothing.
 
     Parameters
     ----------
@@ -380,6 +397,10 @@ def resolve_incidents_by_type(state_dir: Path, type: str) -> int:
     int
         The number of incidents whose status changed to ``"resolved"``.
     """
+    # See resolve_incident: a success path must not create an empty store.
+    if read_json_or_none(Path(state_dir), INCIDENTS_FILENAME) is None:
+        return 0
+
     count_holder: list[int] = [0]
 
     def _mutate(current: dict | None) -> dict:

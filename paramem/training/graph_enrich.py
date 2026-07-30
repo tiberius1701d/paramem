@@ -11,7 +11,7 @@ graph via :meth:`~paramem.graph.merger.GraphMerger.merge_relations`.
 Boundary: this module mutates exactly the ``GraphMerger`` it is handed
 and reaches nothing else — no consolidation loop, no memory store, no
 cycle counter. The caller owns scheduling, gating, and any
-post-enrichment bookkeeping (debug snapshots, recurrence bumps).
+post-enrichment bookkeeping (debug snapshots, reinforcement credit).
 """
 
 import logging
@@ -477,8 +477,8 @@ def enrich_graph(
     # ``anonymization.txt``): this tier has no transcript at all
     # (``transcript=""`` below), so the facts-only variant — same core
     # contract, no transcript-rewrite half, output contract
-    # ``{"mapping": {...}}`` only — is the correct template; the
-    # §1.4 validity rule is satisfied via the transcript-empty leg.
+    # ``{"mapping": {...}}`` only — is the correct template; the mapping-validity
+    # rule is satisfied via the transcript-empty leg.
     anon_prompt = _load_prompt("anonymization_facts.txt", required=True)
     anon_system = _load_prompt("anonymization_system.txt", required=True)
     max_entities = max(1, max_entities_per_pass)
@@ -523,7 +523,7 @@ def enrich_graph(
     privacy_skipped_chunks = 0
     mapping_rekey_dropped = 0
     dropped_relations = 0
-    # Slice-level counters (U2 fact-boundary slicing) — see the docstring's
+    # Slice-level counters (fact-boundary slicing) — see the docstring's
     # Returns section. Accumulated per chunk from payload.slices /
     # payload.slices_failed, whether that chunk's payload ends up "ok" or
     # "failed".
@@ -537,7 +537,7 @@ def enrich_graph(
     # so the classifier can distinguish intended enrichment-driven removals from
     # genuine reconstruction failures.
     _collapsed_ik: dict[str, str] = {}  # ik_key → keep node
-    # SF-2: accumulate Relation objects across all chunks; edge-count delta
+    # Accumulate Relation objects across all chunks; the edge-count delta is
     # computed after merger.merge_relations so merger deduplication is counted.
     enrichment_relations: list[Relation] = []
     _edges_before = graph.number_of_edges()
@@ -589,7 +589,7 @@ def enrich_graph(
             # domain-scoped fail-closed guard (step 6) is derived from
             # ``facts`` — the SLICE's own facts at evaluation time (fact
             # boundaries slice ``triples`` into token-envelope-bounded
-            # pieces, .agent/plan-anonymize-slicing.md U2/§5.2), NOT
+            # pieces), NOT
             # necessarily the whole ``triples`` list, and NOT the same as
             # what this chunk ultimately sends to cloud: under partial
             # withholding ``payload.facts`` is ``triples`` MINUS every
@@ -738,7 +738,7 @@ def enrich_graph(
             # throwaway graph is discarded.
             dropped_relations += dropped_relation_count
         except VramExhausted as exc:
-            # Fold-level degrade (U5), not a chunk-level skip: a VRAM
+            # Fold-level degrade, not a chunk-level skip: a VRAM
             # exhaustion here means the driver is under pressure, and
             # continuing the loop would very likely re-fault on the next
             # chunk and burn minutes re-faulting — so this stops the WHOLE
@@ -932,7 +932,7 @@ def enrich_graph(
             if confidence < 0.7:
                 continue
 
-            # B-3: derive speaker_id from the subject node's speaker_id attribute.
+            # Derive speaker_id from the subject node's speaker_id attribute.
             _subj_sid = graph.nodes.get(subj_canon, {}).get("speaker_id", "")
 
             enrichment_relations.append(
@@ -960,7 +960,7 @@ def enrich_graph(
             resolve_contradictions=False,
         )
 
-    # SF-2: edge-count delta (merger may absorb some via Case-1).
+    # Edge-count delta (the merger may absorb some via Case-1).
     total_new = max(0, graph.number_of_edges() - _edges_before)
 
     logger.info(
@@ -982,10 +982,14 @@ def enrich_graph(
     # drift classifier can route them to drift_intended_removal rather than
     # drift_genuine_loss.  Only keys from SUCCESSFUL contractions are written
     # (failures were discarded from _pending before _collapsed_ik was updated).
+    # No ``survivor_key``: a same_as contraction merges NODES, and the edges
+    # recorded here are the ones that became self-loops and were dropped —
+    # the fact does not carry forward under another indexed key, so there is
+    # no maturity to inherit.  ``keep_node`` is the surviving NODE.
     for _ik, _keep in _collapsed_ik.items():
         merger.removal_ledger[_ik] = {
             "reason": "enrichment_same_as",
-            "merged_into": _keep,
+            "keep_node": _keep,
         }
     return {
         "chunks": calls_made,

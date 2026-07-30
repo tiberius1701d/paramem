@@ -70,6 +70,7 @@ from paramem.server.incidents import (
     ack_incident,
     read_incidents,
     record_incident,
+    resolve_incident,
     resolve_incidents_by_type,
 )
 from paramem.server.inference import (
@@ -402,10 +403,7 @@ class StatusResponse(BaseModel):
     # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
     # Migrate footer.
     server_started_at: str = ""
-    # Document-ingest state (Phase 2+).
-    # preview: true while a POST /consolidate?preview=true call is mid-flight.
-    # Phase 2 always returns False; Phase 3 will toggle it.
-    preview: bool = False
+    # Document-ingest state.
     # Pending session counts split by source type. Populated from
     # session_buffer.get_summary()["per_source_type"].
     pending_documents: int = 0
@@ -4496,7 +4494,6 @@ async def status():
         hold=hold_block,
         encryption=_state.get("encryption", "off"),
         server_started_at=_state.get("server_started_at", ""),
-        preview=bool(_state.get("preview", False)),
         pending_documents=pending_documents,
         pending_transcripts=pending_transcripts,
         pending_rehydration=bool(_state.get("pending_rehydration", False)),
@@ -4747,8 +4744,7 @@ def _build_store_contents(
     if not config.inference.preload_cache:
         # Intentional opt-out: inference pays per-key latency on misses.
         # Clear boot_degraded so the cold-cache attention item is not raised on
-        # a preload-off deployment after an apply (correction #5 boot_degraded
-        # lifecycle).
+        # a preload-off deployment after an apply.
         stats["boot_degraded"] = None
         logger.info(
             "preload_cache: disabled — store stays entry-empty; inference pays source latency"
@@ -5100,8 +5096,8 @@ def _preload_memory_store(config, *, model, tokenizer):
     return memory_store
 
 
-def _record_intent_classifier_incident_if_needed(config, encoder_handle, exemplar_bank) -> None:
-    """Fail loud when the embeddings intent classifier failed to load.
+def _report_intent_classifier_health(config, encoder_handle, exemplar_bank) -> None:
+    """Report the embeddings intent classifier's load outcome as an incident.
 
     ``mode="embeddings"`` has no LLM fallback (unlike ``mode="llm"``, which
     slides to the encoder residual when no classifier model is registered),
@@ -5112,13 +5108,17 @@ def _record_intent_classifier_incident_if_needed(config, encoder_handle, exempla
     (``type="intent_classifier_unavailable"``) surfaced via ``GET /status``
     and the attention block.
 
-    No-op when ``config.intent.enabled`` is false, ``config.intent.mode``
-    is not ``"embeddings"``, or both ``encoder_handle`` and
-    ``exemplar_bank`` loaded successfully.
+    A clean load is the success this incident resolves on, and this is the
+    only site that observes it: both handles present clears the record rather
+    than leaving a repaired classifier flagged on ``GET /status`` forever.
+
+    No-op when ``config.intent.enabled`` is false or ``config.intent.mode``
+    is not ``"embeddings"`` — a disabled classifier is not a recovered one.
     """
     if not (config.intent.enabled and config.intent.mode == "embeddings"):
         return
     if encoder_handle is not None and exemplar_bank is not None:
+        resolve_incidents_by_type(config.paths.data / "state", "intent_classifier_unavailable")
         return
     missing = []
     if encoder_handle is None:
@@ -5281,9 +5281,9 @@ def _build_config_derived_state(
         # changes.  The apply must construct fresh instances from config B and
         # install them before flipping.
         #
-        # Correction N3: flush the allocator-pool before the GPU STT load so
-        # vram_measure reads accurate free-memory (mirrors
-        # _set_voice_pipeline_profile which calls safe_empty_cache before load).
+        # Flush the allocator-pool before the GPU STT load so vram_measure reads
+        # accurate free-memory (mirrors _set_voice_pipeline_profile which calls
+        # safe_empty_cache before load).
         _state["stt"] = None
         _state["wyoming_server"] = _state.get("wyoming_server")  # preserve existing listener ref
 
@@ -5311,7 +5311,7 @@ def _build_config_derived_state(
                 )
 
             if not cloud_only:
-                # N3: flush allocator-pool before GPU STT load so vram_measure
+                # Flush allocator-pool before GPU STT load so vram_measure
                 # reads accurate free-memory (mirrors _set_voice_pipeline_profile).
                 safe_empty_cache()
                 stt_gpu = WhisperSTT(
@@ -5490,7 +5490,7 @@ def _build_config_derived_state(
                 if encoder_handle is not None
                 else None
             )
-            _record_intent_classifier_incident_if_needed(config, encoder_handle, exemplar_bank)
+            _report_intent_classifier_health(config, encoder_handle, exemplar_bank)
 
         # Register the local LLM for intent.mode=llm classification.
         # BASE-MODEL HOLDER (function-local _classifier_model /
@@ -5698,8 +5698,8 @@ def _live_reload_base_model(
       ``_set_voice_pipeline_profile`` calls do not re-acquire the non-reentrant
       lock (deadlock).  ``_auto_reclaim_loop`` holds ``gpu_lock()`` across this
       call and likewise passes ``lock_held=True``.  Plain ``/gpu/acquire``
-      dispatches this WITHOUT holding ``gpu_lock`` (correction N-1, verified at
-      ``app.py:3196``) and keeps the default ``lock_held=False``.
+      dispatches this WITHOUT holding ``gpu_lock`` (verified at ``app.py:3196``)
+      and keeps the default ``lock_held=False``.
     - Must accept ~25-30 s of model-load latency. Mode is flipped to
       cloud-only for the duration so any concurrent /chat handler
       routes to cloud rather than crashing on a None model.
@@ -5744,7 +5744,7 @@ def _live_reload_base_model(
         The internal ``_set_voice_pipeline_profile`` calls forward this flag so
         they skip re-acquisition.  Must be ``True`` for ``_apply_config_live``
         and ``_auto_reclaim_loop`` callers (both hold the lock); must be
-        ``False`` (default) for ``/gpu/acquire`` and base-swap step-6 callers
+        ``False`` (default) for ``/gpu/acquire`` and base-swap Step 6 callers
         (neither holds the lock).
 
     Note on the synchronous maintenance guard:
@@ -6264,7 +6264,7 @@ def _apply_config_live() -> dict:
     for the event-loop / scheduler visibility window before the executor thread
     even starts.
 
-    **Lock contract (correction N-1):**
+    **Lock contract:**
     This function acquires ``gpu_lock_sync`` internally (bounded timeout).
     ``_live_reload_base_model`` must NOT acquire it again — double-acquire on
     the non-reentrant ``threading.Lock`` deadlocks.
@@ -6289,7 +6289,7 @@ def _apply_config_live() -> dict:
     from paramem.server.drift import compute_config_hash
     from paramem.server.gpu_lock import gpu_lock_sync
 
-    # ── acquire GPU lock with bounded timeout (N1) ───────────────────────────
+    # ── acquire GPU lock with bounded timeout ────────────────────────────────
     # Guard just the `__enter__` with try/except TimeoutError so the lock
     # cannot leak if entry raises.  The `with` form handles `__exit__` on
     # ALL exits from the body (normal, exception, return) without a
@@ -6886,9 +6886,10 @@ async def speaker_forget(request: SpeakerForgetRequest):
     # Locate keys for this speaker via the registry bookkeeping (source of
     # truth) rather than the resident merger.graph (which is cleared at
     # cycle-end and would be empty between cycles).
-    # NOTE: keys minted before dcf4189 carry speaker_id="" in bookkeeping
-    # (the fix was not retroactive).  Those keys are a silent-miss here by
-    # accepted design — the live setup is for debugging; legacy keys are not
+    # NOTE: keys minted before speaker_id attribution was introduced carry
+    # speaker_id="" in bookkeeping (it was not applied retroactively).  Those
+    # keys are a silent-miss here by accepted design — the live setup is for
+    # debugging; legacy keys are not
     # preserved (per OWNER DECISION 2026-06-18).
     keys: set[str] = {
         key
@@ -8162,7 +8163,7 @@ async def migration_confirm(request: ConfirmRequest):
 
     Each step's failure rolls back all previously-completed steps and returns
     an appropriate 5xx error.  The migration lock is unconditionally released
-    in a ``finally`` block (Correction 1).
+    in a ``finally`` block.
 
     Errors
     ------
@@ -8182,7 +8183,7 @@ async def migration_confirm(request: ConfirmRequest):
     500 ``backup_write_failed``
         Step 2 failed; no state change.
     500 ``marker_write_failed``
-        Step 3 failed; step-2 backups deleted.
+        Step 3 failed; Step 2 backups deleted.
     500 ``config_swap_failed``
         Step 4 failed; marker and backups deleted.
     """
@@ -8322,7 +8323,7 @@ async def migration_confirm(request: ConfirmRequest):
             ) from exc
 
         # Steps 2–4 are wrapped in try/finally so the lock is always released
-        # even on partial failure (Correction 1).
+        # even on partial failure.
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # --- Pure mode-switch fast path: skip the trial entirely ---
@@ -8602,7 +8603,7 @@ async def migration_confirm(request: ConfirmRequest):
         try:
             write_trial_marker(state_dir, marker)
         except Exception as exc:
-            # Step 3 failure: delete step-2 backups.
+            # Step 3 failure: delete Step 2 backups.
             for slot in written_slots:
                 try:
                     shutil.rmtree(slot)
@@ -8731,7 +8732,7 @@ async def _run_trial_consolidation() -> None:
         trial_adapter_dir_str = trial_data.get("trial_adapter_dir", "")
         trial_graph_dir_str = trial_data.get("trial_graph_dir", "")
 
-        # CRITICAL Fix 1 (2026-04-23): do NOT override trial_config.paths.data here.
+        # CRITICAL: do NOT override trial_config.paths.data here.
         # Previously this was set to trial_adapter_dir.parent.parent (= data/ha), causing
         # _save_registry / _save_key_metadata to resolve to the LIVE registry paths.
         # Registry path isolation is now handled entirely inside _build_trial_loop via
@@ -8888,7 +8889,7 @@ async def _run_trial_consolidation() -> None:
                 )
             # Use the canonical property — config.paths.key_metadata resolves to
             # config.paths.data / "registry" / "key_metadata.json", matching the
-            # path that the consolidation writer uses (Cleanup 1, 2026-04-22).
+            # path that the consolidation writer uses.
             live_registry_path: Path = live_config.paths.key_metadata
             trial_adapter_dir = (
                 Path(trial_adapter_dir_str)
@@ -9654,7 +9655,7 @@ async def _run_base_swap_orchestration(
             }
         )
         logger.exception("base-swap orchestration failed (phase=%s): %s", _phase, exc)
-        # Record the phase failure as a durable incident (N7).  The existing
+        # Record the phase failure as a durable incident.  The existing
         # bundle + POST /migration/rollback path is unchanged; this adds
         # durability + /status visibility alongside the trial-gates marker.
         record_incident(
@@ -9741,7 +9742,7 @@ def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
 def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_graph_dir):
     """Build a ConsolidationLoop for the trial, overriding output paths.
 
-    CRITICAL Fix 1 (2026-04-23) — registry isolation:
+    Registry isolation:
     ``loop.trial_registry_path`` and ``loop.trial_key_metadata_path`` are set
     to paths inside a ``trial_registry/`` sibling of ``trial_adapter/`` so that
     ``_save_registry`` / ``_save_key_metadata`` in consolidation.py write to
@@ -9780,7 +9781,7 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
         # can neither add to nor prune the live donor stores.
         loop.borrow_donor_cache(trial_config.adapter_dir)
 
-        # CRITICAL Fix 1: redirect registry writes to a trial-isolated directory
+        # Redirect registry writes to a trial-isolated directory
         # (sibling of trial_adapter/, e.g. data/ha/state/trial_registry/).
         # _save_registry / _save_key_metadata check these attributes and use them
         # instead of config.registry_path / config.key_metadata_path.
@@ -9794,13 +9795,13 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
 async def _update_trial_gates(gates: dict) -> None:
     """Update ``_state["migration"]["trial"]["gates"]`` under ``migration_lock``.
 
-    Fix 5 (2026-04-23): the trial coroutine ``_run_trial_consolidation`` has
-    ``await`` points (run_in_executor for both build_trial_loop and the
-    consolidation executor) before this function runs, so a concurrent
-    ``/migration/cancel`` may execute and clear ``_state["migration"]["trial"]``
-    between the trial coroutine starting and this update. ``/migration/cancel``
-    holds ``migration_lock`` while clearing trial state, so this writer must
-    hold the same lock to observe a consistent view.
+    The trial coroutine ``_run_trial_consolidation`` has ``await`` points
+    (run_in_executor for both build_trial_loop and the consolidation executor)
+    before this function runs, so a concurrent ``/migration/cancel`` may execute
+    and clear ``_state["migration"]["trial"]`` between the trial coroutine
+    starting and this update. ``/migration/cancel`` holds ``migration_lock``
+    while clearing trial state, so this writer must hold the same lock to
+    observe a consistent view.
 
     Without the lock, the coroutine could observe a half-cleared state — e.g.
     ``state == "LIVE"`` but ``trial`` still set transiently — and write gates
@@ -10015,7 +10016,7 @@ async def migration_accept():
 
     1. Re-verify preconditions inside lock (state, gates).
     2. Build rotation slot for trial adapter archive.
-    3. **Clear trial marker** (BEFORE adapter/graph move — IMPROVEMENT 7).
+    3. **Clear trial marker** (BEFORE adapter/graph move).
     4. Move trial adapter + graph into the rotation slot.
     5. Refresh drift state and set restart banner.
 
@@ -10180,7 +10181,7 @@ async def migration_accept():
                 },
             ) from exc
 
-        # --- Step 3: Clear trial marker BEFORE adapter/graph move (IMPROVEMENT 7) ---
+        # --- Step 3: Clear trial marker BEFORE adapter/graph move ---
         # Rationale: if marker-clear fails, nothing else has mutated yet.
         # If rotation below fails after marker-clear, state/trial_adapter/ is still
         # intact and state/trial.json is gone → startup recovery sees no marker +
@@ -10355,7 +10356,7 @@ async def migration_rollback():
 
     Valid from TRIAL at any time (no gate-status check required).
 
-    8-step atomic ordering (IMPROVEMENT 8 — marker cleared before rotation):
+    8-step atomic ordering (marker cleared before rotation):
 
     1. Re-verify inside lock (state=TRIAL).
     2. Snapshot B into rollback_pre_mortem backup.
@@ -10365,7 +10366,7 @@ async def migration_rollback():
        grown new load-time guards, so restoring it is a second door onto the same
        "unbootable config goes live" defect a candidate promotion closes.
     4. Atomic rename A artifact → live config path.
-    5. **Clear trial marker** (BEFORE rotation — IMPROVEMENT 8).
+    5. **Clear trial marker** (BEFORE rotation).
     6. Rotate trial adapter + graph (non-fatal; triggers 207 on failure).
     7. Append restart banner.
     8. Reset migration state to LIVE.
@@ -10460,7 +10461,7 @@ async def migration_rollback():
                 },
             )
 
-        # --- R2: In-flight guard — reject rollback while orchestration runs ---
+        # --- In-flight guard — reject rollback while orchestration runs ---
         # base_swap_active is True while _run_base_swap_orchestration is
         # actively executing.  It is False when the coroutine is not running
         # (success, failure, or deferred/stranded state).  Rollback while
@@ -10771,16 +10772,16 @@ async def migration_rollback():
                 },
             ) from exc
 
-        # Fix 3 (2026-04-23): initialize before the try block so the except
-        # cleanup guard never raises UnboundLocalError if the assignment itself
-        # (e.g. datetime.now) raises before pending_restore is set.
+        # Initialize before the try block so the except cleanup guard never
+        # raises UnboundLocalError if the assignment itself (e.g. datetime.now)
+        # raises before pending_restore is set.
         pending_restore: Path | None = None
         try:
             _ts_suffix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
             pending_restore = live_config_path.parent / f".pending-rollback-{_ts_suffix}.yaml"
-            # Fix 2 (2026-04-23): write the temp file at 0o600 to prevent a
-            # plaintext-exposure window under the default umask (0644).
-            # os.O_EXCL ensures the file is created atomically; write via fd.
+            # Write the temp file at 0o600 to prevent a plaintext-exposure
+            # window under the default umask (0644).  os.O_EXCL ensures the file
+            # is created atomically; write via fd.
             _fd = os.open(str(pending_restore), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 os.write(_fd, plaintext_bytes)
@@ -10796,7 +10797,7 @@ async def migration_rollback():
             finally:
                 os.close(_dir_fd)
         except Exception as exc:
-            # Clean up pending temp if it was created (Fix 3 guard).
+            # Clean up pending temp if it was created.
             if pending_restore is not None:
                 try:
                     pending_restore.unlink(missing_ok=True)
@@ -10814,7 +10815,7 @@ async def migration_rollback():
                 },
             ) from exc
 
-        # --- Step 5: Clear trial marker BEFORE rotation (IMPROVEMENT 8) ---
+        # --- Step 5: Clear trial marker BEFORE rotation ---
         # Rationale: if rotation fails, no stale marker misdirects recovery.
         # Config is already restored; marker-clear failure is a consistency issue.
         try:
@@ -11816,8 +11817,8 @@ async def backup_restore(req: BackupRestoreRequest):
     # --- Step 6: Atomic restore ---
     restore_pending = live_config_path.with_suffix(live_config_path.suffix + ".restore-pending")
     try:
-        # Fix 2 (2026-04-23): write at 0o600 to prevent plaintext exposure under
-        # the default umask (0644) during the rename window.
+        # Write at 0o600 to prevent plaintext exposure under the default umask
+        # (0644) during the rename window.
         _fd = os.open(str(restore_pending), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(_fd, plaintext_bytes)
@@ -13346,7 +13347,7 @@ def _run_extraction_phase(
 
     logger.info("Consolidating %d NAMED pending sessions", len(pending))
 
-    # --- Phase 1: Extract all sessions ---
+    # --- Extract all sessions ---
     all_episodic_rels = []
     all_procedural_rels = []
     session_ids = []
@@ -13482,7 +13483,7 @@ def _run_extraction_phase(
         logger.info("Simulation complete: %s", {k: v for k, v in summary.items() if k != "loop"})
         return summary
 
-    # --- Phase 2: Train once ---
+    # --- Train once ---
     logger.info(
         "Training on %d episodic + %d procedural relations",
         len(all_episodic_rels),
@@ -13596,9 +13597,10 @@ def _scheduled_extract_done_callback(future):
 def _get_or_create_consolidation_loop(config):
     """Return the process-lifetime ``ConsolidationLoop``, creating it on first use.
 
-    Shared get-or-create used by :func:`_run_stage_b_cycle` (all three
-    Stage-B entry points) and by the interim path's Phase-1 extraction, which
-    needs the loop before any BG-dispatch decision is made — earlier than
+    Shared get-or-create used by :func:`_run_stage_b_cycle` (all three Stage-B
+    entry points — interim-train, full-cycle, active-store migration) and by
+    the interim path's :func:`_extract_pending_sessions` call, which needs the
+    loop before any BG-dispatch decision is made — earlier than
     ``_run_stage_b_cycle`` is ever called for that path.  Idempotent: a
     second call finds the loop already in ``_state`` and returns it
     unchanged.
@@ -14089,9 +14091,9 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
 def _extract_and_start_training():
     """Extract pending sessions and submit a single interim-training job.
 
-    Runs in executor thread.  Phase 1 (extraction) holds the GPU lock and
-    produces the per-batch (episodic_rels, procedural_rels) tuple.  Phase 2
-    submits one callable to ``BackgroundTrainer`` that trains into the
+    Runs in executor thread.  Extraction runs first: it holds the GPU lock and
+    produces the per-batch (episodic_rels, procedural_rels) tuple.  Training
+    then submits one callable to ``BackgroundTrainer`` that trains into the
     ``episodic_interim_<stamp>`` slot for the CURRENT consolidation window
     (``stamp`` is the refresh-cadence window floor from
     ``current_interim_stamp`` — e.g. the 12:00 window stamps
@@ -14113,11 +14115,11 @@ def _extract_and_start_training():
     config = _state["config"]
     session_buffer = _state["session_buffer"]
 
-    # Create or reuse consolidation loop — needed here for Phase 1 extraction,
-    # earlier than _run_stage_b_cycle's own get-or-create (Phase 2, below).
+    # Create or reuse consolidation loop — needed here for the extraction pass,
+    # earlier than _run_stage_b_cycle's own get-or-create at training time below.
     loop = _get_or_create_consolidation_loop(config)
 
-    # --- Phase 1: Extract all sessions ---
+    # --- Extract all sessions ---
     # ``lock_held=False``: this runs in an executor thread that holds no GPU
     # lock, so the extraction stage acquires ``gpu_lock_sync()`` itself and
     # releases it before returning.  Every voice restore below therefore runs
@@ -14210,11 +14212,11 @@ def _extract_and_start_training():
             schedule=config.consolidation.refresh_cadence,
             max_interim_count=config.consolidation.max_interim_count,
         )
-        # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
-        # the combined SimHash registry at config.registry_path was not
-        # maintained by interim or full-cycle production paths post-Phase-3+5,
-        # and the temporal-query reader (filter_registry_by_date) — itself
-        # retired in Plan A.3 — needed fields the writer never emitted.
+        # _save_registry is retired: the combined SimHash registry at
+        # config.registry_path was maintained by no production path, interim or
+        # full-cycle, and its only reader (the temporal-query
+        # filter_registry_by_date, itself retired) needed fields the writer
+        # never emitted.
         # Per-adapter indexed_key_registry.json files carry the unified simhash
         # map; MemoryStore.read_simhash_registry_from_disk merges the "simhash"
         # key out of each one for the source factory.
@@ -14271,7 +14273,7 @@ def _extract_and_start_training():
         _dispatch_finalize(_finalize_simulate)
         return
 
-    # --- Phase 2 + 3: Train into the current-window interim slot via the BG trainer ---
+    # --- Train into the current-window interim slot via the BG trainer ---
     # The scheduled tick trains into ``episodic_interim_<stamp>``, where
     # ``stamp`` is the current consolidation window's floor
     # (current_interim_stamp).  An existing current-window slot is
@@ -14439,6 +14441,15 @@ def _extract_and_start_training():
                     )
                 # Hard stop: sessions stay pending, no release, no spin.
                 # Fall through to bookkeeping with _released_sids empty.
+            else:
+                # The write that raised the incident is the write that clears
+                # it — a persisted retry state IS the recovery, and this is the
+                # only site that observes it.
+                resolve_incident(
+                    _state["config"].paths.data / "state",
+                    "storage_capacity_reached",
+                    "consolidation_retry",
+                )
         if _released_sids:
             # Remove capped sessions from failed_session_ids so they retire
             # this cycle (un-pinned; the un-encodable fact is logged + incident).

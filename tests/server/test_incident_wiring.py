@@ -593,11 +593,10 @@ class TestInterimBookkeepingRegionCrash:
     def _drive_extract_and_start_training(self, state, tmp_path, *, bump_retry_error):
         """Run _extract_and_start_training end to end with a mocked BG trainer.
 
-        Phase 1 extraction and run_consolidation_cycle are mocked (no GPU);
+        The extraction pass and run_consolidation_cycle are mocked (no GPU);
         the crash is injected into session_buffer.bump_retry_and_release,
         which lives in the interim body's post-cycle bookkeeping region —
-        outside the narrow try/except that only wraps run_consolidation_cycle
-        pre-refactor.
+        outside any try/except that wraps run_consolidation_cycle alone.
         """
         cfg = state["config"]
         cfg.vram.cooldown_gate_threshold_c = 0
@@ -754,7 +753,7 @@ class TestResolveIncidentIdempotencyFix:
 # ---------------------------------------------------------------------------
 # Intent classifier fail-loud: load-time incident when the embeddings
 # residual (encoder/exemplars) fails to load — see
-# ``app_module._record_intent_classifier_incident_if_needed``.
+# ``app_module._report_intent_classifier_health``.
 # ---------------------------------------------------------------------------
 
 
@@ -770,7 +769,7 @@ class TestIntentClassifierUnavailableIncident:
         """encoder=None, mode=embeddings, enabled=True → incident recorded."""
         cfg = self._cfg(tmp_path)
 
-        app_module._record_intent_classifier_incident_if_needed(cfg, None, None)
+        app_module._report_intent_classifier_health(cfg, None, None)
 
         incidents = read_incidents(tmp_path / "state")
         assert len(incidents) == 1
@@ -786,7 +785,7 @@ class TestIntentClassifierUnavailableIncident:
         cfg = self._cfg(tmp_path)
         fake_encoder = MagicMock()
 
-        app_module._record_intent_classifier_incident_if_needed(cfg, fake_encoder, None)
+        app_module._report_intent_classifier_health(cfg, fake_encoder, None)
 
         incidents = read_incidents(tmp_path / "state")
         assert len(incidents) == 1
@@ -796,7 +795,7 @@ class TestIntentClassifierUnavailableIncident:
         """Both encoder and exemplar bank present → no incident."""
         cfg = self._cfg(tmp_path)
 
-        app_module._record_intent_classifier_incident_if_needed(cfg, MagicMock(), MagicMock())
+        app_module._report_intent_classifier_health(cfg, MagicMock(), MagicMock())
 
         assert not (tmp_path / "state" / "incidents.json").exists()
 
@@ -804,7 +803,7 @@ class TestIntentClassifierUnavailableIncident:
         """mode=llm has its own encoder-residual fallback — no incident on this path."""
         cfg = self._cfg(tmp_path, mode="llm")
 
-        app_module._record_intent_classifier_incident_if_needed(cfg, None, None)
+        app_module._report_intent_classifier_health(cfg, None, None)
 
         assert not (tmp_path / "state" / "incidents.json").exists()
 
@@ -812,6 +811,71 @@ class TestIntentClassifierUnavailableIncident:
         """intent.enabled=False → classifier is intentionally off, not degraded."""
         cfg = self._cfg(tmp_path, enabled=False)
 
-        app_module._record_intent_classifier_incident_if_needed(cfg, None, None)
+        app_module._report_intent_classifier_health(cfg, None, None)
 
         assert not (tmp_path / "state" / "incidents.json").exists()
+
+    def test_clean_load_resolves_a_standing_incident(self, tmp_path):
+        """A repaired classifier clears its own incident.
+
+        The record site is the only place that observes the load outcome, so
+        it owns both halves; without this the warning rides on GET /status
+        forever after the encoder is restored.
+        """
+        cfg = self._cfg(tmp_path)
+        app_module._report_intent_classifier_health(cfg, None, None)
+        assert read_incidents(tmp_path / "state")[0].status == "active"
+
+        app_module._report_intent_classifier_health(cfg, MagicMock(), MagicMock())
+
+        assert read_incidents(tmp_path / "state")[0].status == "resolved"
+
+
+class TestEveryRecordedTypeHasAClearSite:
+    """Every incident type recorded anywhere must also be resolved somewhere.
+
+    The lifecycle contract (``incidents`` module docstring) is that an incident
+    auto-resolves on the next success of the op it describes, and it is the
+    caller that has to honour it.  Nothing in the module can enforce that, so
+    this scan does: a type recorded with no clear site anywhere leaves a warning
+    riding on ``GET /status`` forever, however healthy the system becomes.
+    """
+
+    #: Types recorded through the crash-envelope helpers, which pass the type
+    #: as a ``kind=``/``_inc_type`` variable rather than a literal.  Grep cannot
+    #: see them at the record site, so they are named here; their clear sites
+    #: are asserted exactly like the literal ones.
+    INDIRECTLY_RECORDED = frozenset(
+        {
+            "training_crash",
+            "consolidation_crash",
+            "migration_error",
+            "interim_cap_reached",
+            "interim_overflow_pending",
+        }
+    )
+
+    @staticmethod
+    def _sources() -> str:
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[2] / "paramem"
+        return "\n".join(p.read_text() for p in sorted(root.rglob("*.py")))
+
+    def test_no_type_is_recorded_without_a_clear_site(self):
+        import re
+
+        sources = self._sources()
+        recorded = set(re.findall(r'record_incident\(\s*[^)]*?type="([a-z_]+)"', sources))
+        recorded |= self.INDIRECTLY_RECORDED
+        assert recorded, "scan found no record_incident call sites — the pattern has drifted"
+
+        cleared = set(re.findall(r'resolve_incidents_by_type\(\s*[^,]+,\s*"([a-z_]+)"', sources))
+        cleared |= set(re.findall(r'resolve_incident\(\s*[^,]+,\s*"([a-z_]+)"', sources))
+        cleared |= set(re.findall(r'resolve_incident\(\s*\n\s*[^,]+,\s*\n\s*"([a-z_]+)"', sources))
+
+        missing = sorted(recorded - cleared)
+        assert not missing, (
+            "these incident types are recorded but never resolved, so they stay on "
+            f"GET /status forever: {missing}"
+        )
