@@ -828,7 +828,7 @@ def test_preload_skips_registry_during_base_swap(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — _wait_for_gpu_drain unit tests
+# _wait_for_gpu_drain unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -955,7 +955,7 @@ def test_wait_for_gpu_drain_returns_false_on_timeout():
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — boot integration: drain-fail → cloud-only + auto-reclaim armed
+# Boot integration: drain-fail → cloud-only + auto-reclaim armed
 # ---------------------------------------------------------------------------
 
 

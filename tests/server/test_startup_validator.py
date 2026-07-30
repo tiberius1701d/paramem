@@ -558,34 +558,3 @@ class TestRevalidateMainAdapterManifests:
         state = {"config": config, "tokenizer": _make_tokenizer()}  # no "model" key
         _revalidate_main_adapter_manifests(state)  # must not raise
         assert state.get("adapter_manifest_status", {}) == {}
-
-
-# ---------------------------------------------------------------------------
-# adapter_formats boot map (Phase 3c)
-# ---------------------------------------------------------------------------
-
-
-def _write_slot_with_format(
-    adapter_kind_dir: Path,
-    adapter_name: str,
-    ts: str = "20260421-000000",
-) -> Path:
-    """Write a slot with a current-version ``meta.json``."""
-    slot = adapter_kind_dir / ts
-    slot.mkdir(parents=True, exist_ok=True)
-    (slot / "adapter_config.json").write_text(json.dumps({"base_model_name_or_path": "hf/model"}))
-    (slot / "adapter_model.safetensors").write_bytes(b"weights")
-    m = AdapterManifest(
-        schema_version=MANIFEST_SCHEMA_VERSION,
-        name=adapter_name,
-        trained_at="2026-04-21T00:00:00Z",
-        base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:dead"),
-        tokenizer=TokenizerFingerprint(
-            name_or_path="hf/model", vocab_size=32000, merges_hash="cafe"
-        ),
-        lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
-        registry_sha256="",
-        key_count=5,
-    )
-    write_manifest(slot, m)
-    return slot

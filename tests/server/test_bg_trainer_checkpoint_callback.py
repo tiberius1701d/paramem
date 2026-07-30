@@ -8,12 +8,10 @@ actually reads.
 Security ON is triggered by a loadable daily age identity
 (``PARAMEM_DAILY_PASSPHRASE`` set + daily key file on disk).
 
-Pre-2026-05-07 the callback was re-exported from
-``paramem.server.background_trainer`` under the ``EncryptCheckpointCallback``
-alias.  After the BG-trainer-delegates-to-train_adapter refactor the callback
-lives at its canonical home in
-``paramem.training.encrypted_checkpoint_callback`` and is installed by
-``train_adapter`` directly.
+The callback has exactly one home — ``paramem.training.encrypted_checkpoint_callback``
+— and exactly one installer: ``train_adapter`` seeds it into the HF Trainer's
+callback list.  ``paramem.server.background_trainer`` does not re-export it; the
+BG-trainer path picks it up by delegating to ``train_adapter``.
 """
 
 from __future__ import annotations

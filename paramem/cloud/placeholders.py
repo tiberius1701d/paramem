@@ -199,8 +199,8 @@ def _substitute_whole_words(
     would let a mapped person name silently consume its lowercase
     common-noun homograph (a person named "Bill" matching the electricity
     "bill"), and would let literal placeholder text resolve against a real
-    name, defeating the fail-closed residual-token drop (b14a880) before it
-    ever sees the token. Identity reconciliation — matching a mapping key
+    name, defeating the fail-closed residual-token drop before it ever
+    sees the token. Identity reconciliation — matching a mapping key
     to the fold graph's own canonical node-key text — is a separate step
     performed by the one caller that needs it, before this function ever
     sees the mapping — see

@@ -562,7 +562,7 @@ class PathsConfig:
         Raises
         ------
         ValueError
-            If ``data`` is ``None`` (Fix 7, 2026-04-23).
+            If ``data`` is ``None``.
         """
         if self.data is None:
             raise ValueError("paths.data must be set to derive registry_dir path")
@@ -580,7 +580,7 @@ class PathsConfig:
         Raises
         ------
         ValueError
-            If ``data`` is ``None`` (Fix 7, 2026-04-23).
+            If ``data`` is ``None``.
         """
         if self.data is None:
             raise ValueError("paths.data must be set to derive key_metadata path")
@@ -597,7 +597,7 @@ class PathsConfig:
         Raises
         ------
         ValueError
-            If ``data`` is ``None`` (Fix 7, 2026-04-23).
+            If ``data`` is ``None``.
         """
         if self.data is None:
             raise ValueError("paths.data must be set to derive registry path")

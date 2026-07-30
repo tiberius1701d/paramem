@@ -205,7 +205,7 @@ class TestNegatives:
 
 
 # ---------------------------------------------------------------------------
-# Speaker-identity primitive tests (§0 invariant)
+# Speaker-identity primitive tests (ONE canonical lowercase `speaker{N}` form)
 # ---------------------------------------------------------------------------
 
 

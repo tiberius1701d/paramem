@@ -1,7 +1,7 @@
 """Tests for paramem.server.config — specifically the security config wiring.
 
-Fix 2: ``load_server_config`` now reads ``security.backups.orphan_sweep``
-from YAML and populates ``SecurityConfig → ServerBackupsConfig →
+``load_server_config`` reads ``security.backups.orphan_sweep`` from YAML
+and populates ``SecurityConfig → ServerBackupsConfig →
 OrphanSweepConfig``.
 
 Covers:
@@ -34,7 +34,7 @@ def _write_yaml(tmp_path: Path, content: str) -> Path:
 
 
 class TestSecurityOrphanSweepConfig:
-    """Fix 2: security.backups.orphan_sweep.max_age_hours is wired in load_server_config."""
+    """``security.backups.orphan_sweep.max_age_hours`` is wired in load_server_config."""
 
     def test_security_orphan_sweep_loaded_from_yaml(self, tmp_path):
         """Nested YAML key security.backups.orphan_sweep.max_age_hours: 48 → config exposes 48."""
@@ -142,7 +142,7 @@ class TestSecurityOrphanSweepConfig:
 
 
 class TestPathsConfigKeyMetadata:
-    """Cleanup 1 — canonical Paths.key_metadata must match the on-disk layout.
+    """Canonical Paths.key_metadata must match the on-disk layout.
 
     Pins the path so the multi-site hardcoded-workaround pattern cannot recur.
     The consolidation writer uses config.key_metadata_path (→ paths.key_metadata),
@@ -177,12 +177,12 @@ class TestPathsConfigKeyMetadata:
 
 
 # ---------------------------------------------------------------------------
-# Fix 7 — PathsConfig.data=None raises ValueError on property access
+# PathsConfig.data=None raises ValueError on property access
 # ---------------------------------------------------------------------------
 
 
 class TestPathsConfigNoneGuard:
-    """Fix 7 (2026-04-23): PathsConfig properties raise ValueError when data is None.
+    """PathsConfig properties raise ValueError when data is None.
 
     Previously they would raise TypeError from Path(None) / str with an
     unhelpful message.  The guard provides an explicit error that names the
@@ -335,9 +335,7 @@ class TestRetiredConsolidationKeysRejected:
 
 
 class TestAnonymizeTokenEnvelopeAndRatioConfig:
-    """U3 — item 32: the envelope/ratio defaults and their ``<= 0``
-    load-time rejection.
-    """
+    """The envelope/ratio defaults and their ``<= 0`` load-time rejection."""
 
     def test_defaults(self):
         from paramem.server.config import ConsolidationScheduleConfig
@@ -372,7 +370,7 @@ class TestAnonymizeTokenEnvelopeAndRatioConfig:
 
 
 class TestRatioIsACheckedMirrorOfTheCodeConstant:
-    """M1 (code review): ``extraction_token_estimate_ratio`` governs
+    """``extraction_token_estimate_ratio`` governs
     nothing at runtime — every ``estimate_tokens()`` call site uses the
     module constant ``paramem.utils.tokens.MEASURED_TOKENS_PER_WORD``
     directly. This key is a CHECKED MIRROR of that constant:
@@ -874,6 +872,6 @@ class TestDefaultServerConfigPathIsCwdIndependent:
         # paths.telemetry must go through the same relative-path anchoring
         # loop as data/sessions/debug/prompts (config.py's ``for path_field
         # in (...)`` tuple). A relative path here means the loop was missed —
-        # a regression of the 8f173a4 cwd-independence fix.
+        # a regression of the cwd-independence behaviour.
         cfg = load_server_config(Path("tests/fixtures/server.yaml"))
         assert cfg.paths.telemetry.is_absolute()

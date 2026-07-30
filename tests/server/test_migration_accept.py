@@ -201,7 +201,7 @@ class TestAcceptHappyPath:
         assert resp.json()["pre_migration_backup_retained"] is True
 
     def test_accept_clears_trial_marker(self, client, state, tmp_path):
-        """Accept clears state/trial.json (step 3 before rotation — IMPROVEMENT 7)."""
+        """Accept clears state/trial.json at step 3, before the adapter/graph move."""
         client.post("/migration/accept")
         state_dir = state["config"].paths.data / "state"
         assert read_trial_marker(state_dir) is None
@@ -284,7 +284,7 @@ class TestAcceptHappyPath:
         )
 
     def test_accept_refreshes_drift_state_all_fields(self, client, state, tmp_path):
-        """Accept refreshes the full ConfigDriftState dict (REQUIRED FIX 3).
+        """Accept refreshes the full ConfigDriftState dict.
 
         All four fields (detected, loaded_hash, disk_hash, last_checked_at) must
         be present and detected=False.
@@ -448,8 +448,8 @@ class TestAcceptRotationFailure:
 
         The slot is created successfully (step 2).  The adapter move (step 4)
         fails.  Config + marker are already coherent (marker cleared at step 3
-        BEFORE the move — IMPROVEMENT 7).  State returns LIVE; recovery_required
-        contains the ARCHIVE INCOMPLETE banner.
+        BEFORE the move).  State returns LIVE; recovery_required contains the
+        ARCHIVE INCOMPLETE banner.
         """
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
@@ -476,7 +476,7 @@ class TestAcceptRotationFailure:
         assert any("ARCHIVE INCOMPLETE" in b for b in banners)
 
     def test_accept_rotation_failure_marker_already_cleared(self, tmp_path, monkeypatch):
-        """After step-4 move failure, trial marker is still cleared (IMPROVEMENT 7).
+        """After step-4 move failure, trial marker is still cleared.
 
         Marker-clear happens at step 3, BEFORE adapter/graph move at step 4.
         """

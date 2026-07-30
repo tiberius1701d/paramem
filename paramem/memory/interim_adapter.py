@@ -263,10 +263,9 @@ def current_full_consolidation_stamp(
     (anchored to local midnight) but applied to the FULL consolidation
     period (``refresh_cadence × max_interim_count``) instead of the interim
     cadence.  The stamp identifies which full-cycle window we are currently
-    in: two calls within the same window return the same stamp, which is
-    how the Phase-4 gate decides whether the current window has already
-    been consolidated (compared against the latest main slot's
-    ``meta.json.window_stamp``).
+    in: two calls within the same window return the same stamp.  Its only
+    consumer is the main-slot manifest's ``window_stamp`` field, which is
+    written as provenance and read back by no gate.
 
     Args:
         consolidation_period: Full-cycle period string from

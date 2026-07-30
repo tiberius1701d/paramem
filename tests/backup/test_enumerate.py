@@ -179,13 +179,13 @@ class TestPreTrialHash:
 
 
 # ---------------------------------------------------------------------------
-# Fix 9 — symlinks inside backup root are skipped
+# Symlinks inside backup root are skipped
 # ---------------------------------------------------------------------------
 
 
 class TestSymlinkSkip:
-    """Fix 9 (2026-04-23): enumerate_backups must skip symlinks to prevent
-    path-traversal reads outside the backup directory tree."""
+    """enumerate_backups must skip symlinks to prevent path-traversal reads
+    outside the backup directory tree."""
 
     def test_enumerate_skips_symlink_slot(self, tmp_path):
         """A symlink inside a kind directory is skipped (not returned as a record)."""
@@ -208,12 +208,9 @@ class TestSymlinkSkip:
 
         # Only the real slot should appear.
         assert len(records) == 1, (
-            f"Expected 1 record (real slot only), got {len(records)}. "
-            "Fix 9 regression: symlink slot was not skipped."
+            f"Expected 1 record (real slot only), got {len(records)}. Symlink slot was not skipped."
         )
-        assert all(not r.slot_dir.is_symlink() for r in records), (
-            "Returned record is a symlink — Fix 9 regression"
-        )
+        assert all(not r.slot_dir.is_symlink() for r in records), "Returned record is a symlink"
 
     def test_enumerate_logs_warn_for_symlink(self, tmp_path, caplog):
         """enumerate_backups logs a WARNING when skipping a symlink slot.

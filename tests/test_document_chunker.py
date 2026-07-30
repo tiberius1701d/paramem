@@ -39,11 +39,11 @@ from paramem.graph.document_chunker import (
 )
 from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
 
-# Document-shape ratio (U6.1) — the same value recorded as tokens.py's
+# Document-shape ratio — the same value recorded as tokens.py's
 # "document shape (CV)" row feeding MEASURED_TOKENS_PER_WORD, and the same
 # value document_chunker.py's _DOC_MAX_TOKENS derivation comment uses for
-# BOTH the cap conversion and the anon_template estimate (self-consistent,
-# one ratio throughout — review follow-up to finding M2).
+# BOTH the cap conversion and the anon_template estimate: one ratio
+# throughout, never a mix of an exact-tokenizer snapshot and an estimate.
 _R_PROSE = 1.9126
 _ANONYMIZATION_TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent / "configs" / "prompts" / "anonymization.txt"
@@ -65,15 +65,16 @@ def _live_anon_template_tokens() -> int:
     r_prose)``, the SAME formula ``document_chunker.py``'s
     ``_DOC_MAX_TOKENS`` derivation comment uses.
 
-    Review follow-up (to finding M2): a frozen tokenizer-measured constant
-    here, checked only against a wide word-count tolerance band, left a
-    real budget with only a few tokens of end-to-end slack that a small
-    template edit could silently overrun while the band check still
-    passed (the arithmetic test never actually consumed the live word
-    count). Recomputing THIS value directly — and using it in the
-    arithmetic checks below instead of a recorded literal — couples the
-    two: a template edit changes this return value on the next run, no
-    tolerance band needed (the computation is fully deterministic).
+    Why this is recomputed rather than recorded: a frozen
+    tokenizer-measured constant here, checked only against a wide
+    word-count tolerance band, left a real budget with only a few tokens
+    of end-to-end slack that a small template edit could silently overrun
+    while the band check still passed (the arithmetic test never actually
+    consumed the live word count). Recomputing THIS value directly — and
+    using it in the arithmetic checks below instead of a recorded literal
+    — couples the two: a template edit changes this return value on the
+    next run, no tolerance band needed (the computation is fully
+    deterministic).
     """
     return math.ceil(len(_render_anon_template_text().split()) * _R_PROSE)
 
@@ -552,9 +553,10 @@ class TestSplitIntoSentences:
 
 class TestCoalesceToMaxTokens:
     """max_tokens/overlap_tokens are estimated-token thresholds (routed
-    through estimate_tokens), not raw word counts — values below are
-    recomputed against the shared estimator, not loosened from the old
-    word-count expectations (.agent/plan-anonymize-slicing.md U6, item 36).
+    through estimate_tokens), not raw word counts — the expectations below
+    are recomputed against the shared estimator rather than loosened from
+    the raw word-count numbers they used before counting moved onto
+    estimate_tokens, so they still pin the boundary exactly.
     """
 
     def test_packs_under_cap_into_one_chunk(self):
@@ -606,10 +608,10 @@ class TestCoalesceToMaxTokens:
 class TestOverlapTokensToWords:
     """_overlap_tokens_to_words converts the token-denominated
     overlap_tokens budget into the word count _coalesce_to_max_tokens
-    slices — the unit-coherence fix at document_chunker.py's
-    _coalesce_to_max_tokens (U6, item 3 of the task: 'all counting routes
-    through estimate_tokens while the overlap-prefix construction stays
-    word-based where words are what it slices').
+    slices — the unit boundary in document_chunker.py's
+    _coalesce_to_max_tokens: all counting routes through estimate_tokens,
+    while the overlap-prefix construction stays word-based because words
+    are what it actually slices out of the emitted chunk's text.
     """
 
     def test_zero_or_negative_yields_zero_words(self):
@@ -628,7 +630,8 @@ class TestOverlapTokensToWords:
 class TestChunkerDefaultsMatchDerivedConstants:
     """The public chunker signatures' defaults are exactly the derived
     module constants, not a separately hand-typed copy of the same number
-    (a drift risk item 36 would otherwise miss)."""
+    (a hand-typed duplicate would keep passing every threshold test above
+    while silently diverging from the derived cap)."""
 
     def test_chunk_text_file_default_is_doc_max_tokens(self):
         assert inspect.signature(chunk_text_file).parameters["max_tokens"].default == (
@@ -647,21 +650,22 @@ class TestChunkerDefaultsMatchDerivedConstants:
 
 
 class TestDocMaxTokensDerivation:
-    """Items 37/37b: the derivation link between the shipped
-    _DOC_MAX_TOKENS and the anonymize-call token envelope, pinned as a
-    live test rather than a commit-message-only claim
-    (.agent/plan-anonymize-slicing.md finding #5, §7 items 37/37b).
+    """The derivation link between the shipped _DOC_MAX_TOKENS and the
+    anonymize-call token envelope, pinned as a live test rather than left
+    as a claim in a comment or commit message: the constant is a recorded
+    literal, so without these tests nothing would notice if the envelope,
+    the reserve constants, or the prompt template moved out from under it.
     """
 
     def test_derivation_link_holds_against_the_shipped_envelope(self):
-        """Item 37: 2 * cap_real + anon_template_tokens + reserve <=
-        envelope, computed from the real shipped envelope default, the
-        LIVE anonymize.py reserve constants (referenced symbolically via
-        import — review finding M2 — so a concurrent change to those
-        constants is picked up automatically rather than silently going
-        stale), and the LIVE anon_template recomputed from the current
-        prompt file (review follow-up: replaces a frozen tokenizer-measured
-        constant that was only loosely band-checked against the file — see
+        """2 * cap_real + anon_template_tokens + reserve <= envelope,
+        computed from the real shipped envelope default, the LIVE
+        anonymize.py reserve constants (imported symbolically rather than
+        copied in as numbers, so a concurrent change to those constants is
+        picked up automatically rather than silently going stale), and the
+        LIVE anon_template recomputed from the current prompt file
+        (replacing a frozen tokenizer-measured constant that was only
+        loosely band-checked against the file — see
         _live_anon_template_tokens's docstring). No tolerance band is
         needed anywhere in this test: every term is either an exact live
         import or a deterministic recomputation.  Fails if a future edit
@@ -682,7 +686,7 @@ class TestDocMaxTokensDerivation:
         )
 
     def test_ratio_cancellation_invariant(self):
-        """Item 37b: the chunk-boundary comparison
+        """The chunk-boundary comparison
         (``estimate_tokens(text) <= max_tokens``, where ``max_tokens`` is
         ``_DOC_MAX_TOKENS`` re-expressed as ``cap_words * ratio`` — the
         estimator's own unit) is invariant under a change to the shipped
@@ -708,23 +712,24 @@ class TestDocMaxTokensDerivation:
 
 
 class TestDocumentPathBudget:
-    """Missing test 3 (review finding, .agent/plan-anonymize-slicing.md
-    review): the full document-ingest budget — a chunk at the shipped cap,
+    """The full document-ingest budget — a chunk at the shipped cap,
     used as the anonymize call's transcript INPUT, PLUS its
     extracted-facts JSON, PLUS the chunk ECHOED BACK as the
     ``anonymized_transcript`` rewrite — checked against the shipped
     envelope with an EXPLICIT facts term.
 
-    This is the test that would have caught review finding B2:
+    This is the test that catches the facts term being folded away:
     ``TestDocMaxTokensDerivation``'s derivation-link test omits the facts
     term entirely (it only checks
     ``2 * cap_real + anon_template + reserve <= envelope``), so a
-    revision of ``_DOC_MAX_TOKENS`` that folds the facts term away again
-    (as an earlier revision of this derivation did — under-budgeting a
-    dense chunk's anonymize call by ~4x) would pass that test while still
-    regressing B2.  This test recomputes the facts contribution
-    explicitly at every run, so a future re-introduction of the folding
-    bug (an inflated ``_DOC_MAX_TOKENS``) fails HERE.
+    revision of ``_DOC_MAX_TOKENS`` that folds the facts term into the
+    template term (as an earlier revision of this derivation did —
+    under-budgeting a dense chunk's anonymize call by ~4x, so a dense
+    chunk at the cap could overrun the envelope at runtime) would pass
+    that test while the real budget was broken.  This test recomputes the
+    facts contribution explicitly at every run, so a future
+    re-introduction of the folding bug (an inflated ``_DOC_MAX_TOKENS``)
+    fails HERE.
     """
 
     # f: extracted-facts-JSON-to-chunk token ratio.  Derived (not

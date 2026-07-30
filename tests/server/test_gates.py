@@ -340,7 +340,7 @@ class TestGate2Training:
         assert g.status == "pass"
 
     def test_skipped_no_facts(self, tmp_path):
-        """no_facts status → SKIPPED (REQUIRED FIX 2 — not PASS)."""
+        """no_facts status → SKIPPED, not PASS."""
         trial_adapter_dir = tmp_path / "trial_adapter"
         g = _gate_2_training(
             session_buffer_empty=False,

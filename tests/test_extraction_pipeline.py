@@ -1007,8 +1007,8 @@ class TestPipelineMaxTokensThreading:
         (``_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE``) — deliberately not
         operator-tuned, matching ``extract_graph``'s own call to the
         module default ``_DEFAULT_FILTER_MAX_TOKENS`` at this same call
-        site. One envelope, no second cap (U2/U3): there is no longer a
-        flat 2048 chat-egress ceiling distinct from the envelope.
+        site. One envelope, no second cap: there is no flat 2048
+        chat-egress ceiling distinct from the envelope.
         """
         from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
         from paramem.graph.flows import anonymize_turn
@@ -1659,8 +1659,8 @@ class TestCloudEnrichmentProvider:
         misses a parseable delta it returns ``delta=None`` and the enrich
         stage fails OPEN — keeps the pre-enrichment facts, records
         ``cloud_enrichment_degraded``, and continues.  See
-        :class:`TestCloudEnrichmentFailureFailsOpen` for the full rationale
-        (d0913f6 had silently made this fatal).
+        :class:`TestCloudEnrichmentFailureModes` for the full rationale;
+        a mis-shaped delta must never be raised as fatal.
         """
         from tests._cloud_flow import run_cloud_stages
 
@@ -1978,8 +1978,8 @@ class TestCloudEnrichmentProvider:
 
 
 class TestContractCarriedFactsParity:
-    """U2 — item 20: ``stage_enrich``'s ``anon_facts`` under a session
-    flow equals the pre-change derivation
+    """``stage_enrich``'s ``anon_facts`` under a session flow equals the
+    direct derivation
     (``insert_placeholders(facts_from_relations(graph.relations),
     payload.forward)``) — pins the claim that nothing mutates
     ``graph.relations`` between the ``anonymize`` and ``enrich`` stages,
@@ -2041,9 +2041,9 @@ class TestContractCarriedFactsParity:
         assert captured[0] == expected_anon_facts
 
     def test_session_tier_opt_out_anon_facts_is_non_empty(self):
-        """Item 49 (session-tier counterpart): with ``scrub=set()``
+        """Session-tier counterpart: with ``scrub=set()``
         (operator opt-out), ``anonymize()``'s opt-out branch carries the
-        input facts verbatim in ``payload.facts`` (BLOCKING-2 regression
+        input facts verbatim in ``payload.facts`` (regression
         guard: a ``facts=[]`` opt-out would silently withhold every fact
         from a payload the operator asked to egress unmasked) — so
         ``stage_enrich``'s ``anon_facts`` derivation is non-empty, not
@@ -2090,17 +2090,17 @@ class TestContractCarriedFactsParity:
 
 
 class TestValidityRuleSessionFlowEndToEnd:
-    """U2/D1 — item 46: the two callers whose behaviour changes under the
-    §1.4 validity rule, exercised end-to-end (case 43: non-empty
-    transcript + ``mapping == {}`` + missing rewrite -> legitimate, not
+    """The two callers whose behaviour depends on the empty-rewrite
+    validity rule, exercised end-to-end (non-empty transcript +
+    ``mapping == {}`` + missing rewrite -> legitimate, not
     fail-closed)."""
 
     def test_stage_anonymize_proceeds_with_original_transcript_not_fallback(self):
         """``_stage_anonymize`` does NOT divert to
         ``_fallback_plausibility_on_raw`` on the legitimate-empty verdict
-        — the pre-D1 parser would have fail-closed here (empty
-        ``anonymized_transcript`` treated as failure regardless of
-        ``mapping``), triggering the raw-plausibility fallback instead of
+        — a parser that treated an empty ``anonymized_transcript`` as
+        failure regardless of ``mapping`` would fail closed here,
+        triggering the raw-plausibility fallback instead of
         letting the chain proceed with the original transcript."""
         from tests._cloud_flow import run_cloud_stages
 
@@ -2561,8 +2561,8 @@ class TestAnonymizerTranscriptArrayContract:
         assert anon_transcript == "[user] Person_1 lives in Millfield."
 
     def test_empty_array_over_a_real_transcript_fails_closed(self):
-        """The empty-rewrite validity rule (.agent/plan-anonymize-slicing.md
-        §1.4): an empty array is legitimate ONLY when there was nothing to
+        """The empty-rewrite validity rule: an empty array is
+        legitimate ONLY when there was nothing to
         rewrite (empty input transcript, or empty model mapping). Here the
         model named something (non-empty ``mapping``) over a NON-EMPTY
         input ``transcript`` but returned an empty rewrite — the
@@ -2641,7 +2641,7 @@ class TestAnonymizerTranscriptArrayContract:
         assert raw_output == raw
 
     def test_missing_anonymized_transcript_key_over_a_real_transcript_fails_closed(self):
-        """Same §1.4 validity rule as the empty-array case above, missing
+        """Same empty-rewrite validity rule as the empty-array case above, missing
         key instead of an empty array: over a NON-EMPTY input transcript
         with a non-empty mapping, a missing rewrite is the inconsistent
         shape and stays fail-closed."""
@@ -4227,8 +4227,8 @@ class TestCloudEnrichmentFailureModes:
       attempt.  Raise ``ExtractionFailed`` so the batch aborts and its sessions
       stay pending for a clean retry once cloud recovers.
 
-    (d0913f6 silently flipped BOTH to a fatal raise when it carved the tail
-    into declarative stages; only the outage case belongs there.)
+    Only the outage case belongs on the raising side: making BOTH fatal
+    aborts a whole batch over a single mis-shaped provider response.
     """
 
     def test_cloud_enrich_hiccup_fails_open(self):

@@ -474,7 +474,7 @@ class TestScope:
         assert scope == "chat"
 
     def test_missing_scope_on_disk_defaults_to_chat(self, tmp_path, monkeypatch, store_path):
-        """A Phase-1 record without a 'scope' field reads as 'chat' (secure default)."""
+        """A record without a 'scope' field reads as 'chat' (secure default)."""
         import json
 
         _setup_daily(tmp_path, monkeypatch)
@@ -482,7 +482,7 @@ class TestScope:
         token = store.mint("speaker0", "OldDevice")
 
         # Directly strip the scope field from the on-disk JSON to simulate a
-        # Phase-1 record minted before the scope field existed.
+        # record minted before the scope field existed.
         from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 
         raw = json.loads(read_maybe_encrypted(store_path).decode("utf-8"))
@@ -495,7 +495,7 @@ class TestScope:
         result = store2.resolve(token)
         assert result is not None
         _auth, _sid, scope = result
-        assert scope == "chat", f"Expected 'chat' for Phase-1 record, got {scope!r}"
+        assert scope == "chat", f"Expected 'chat' for a pre-scope-field record, got {scope!r}"
 
     def test_unattributed_token_resolve_returns_none_speaker(
         self, tmp_path, monkeypatch, store_path
@@ -544,8 +544,8 @@ class TestScope:
         scopes = {e["scope"] for e in entries}
         assert scopes == {"admin", "chat"}
 
-    def test_list_phase1_record_surfaces_chat(self, tmp_path, monkeypatch, store_path):
-        """list() surfaces 'chat' scope for Phase-1 records without a scope field."""
+    def test_list_record_without_scope_surfaces_chat(self, tmp_path, monkeypatch, store_path):
+        """list() surfaces 'chat' scope for records without a scope field."""
         import json
 
         _setup_daily(tmp_path, monkeypatch)

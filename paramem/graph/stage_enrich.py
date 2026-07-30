@@ -248,8 +248,8 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
             # (``graph_enrich``) and both plausibility judges: keep the
             # pre-enrichment facts, warn loudly, and record the degradation in
             # diagnostics so the server layer can surface it on ``pstatus``.
-            # (d0913f6 silently flipped BOTH cases to a fatal raise when it
-            # carved the stage out; only the outage case belongs there.)
+            # Only the outage case above may raise: routing a shape hiccup to
+            # the fatal path would abort a whole run over one malformed reply.
             # ``enriched_anon`` is the local facts unchanged;
             # ``updated_anon_transcript`` stays the anonymizer's transcript —
             # no cloud rewrite happened.

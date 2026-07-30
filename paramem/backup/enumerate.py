@@ -226,8 +226,8 @@ def enumerate_backups(
                 continue
             if not slot.is_dir():
                 continue
-            # Fix 9 (2026-04-23): skip symlinks — a symlink in the backup root
-            # could allow a restore to read files outside the backup directory tree.
+            # Skip symlinks — a symlink in the backup root could allow a restore
+            # to read files outside the backup directory tree.
             if slot.is_symlink():
                 logger.warning("enumerate_backups: skipping symlink %s", slot)
                 continue

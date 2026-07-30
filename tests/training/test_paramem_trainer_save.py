@@ -216,7 +216,7 @@ class TestSaveSelectsOnlyTrainedAdapter:
 
 
 # ---------------------------------------------------------------------------
-# save_adapter_name threading through train_adapter (guards §3 of the plan)
+# save_adapter_name threading through train_adapter
 # ---------------------------------------------------------------------------
 
 

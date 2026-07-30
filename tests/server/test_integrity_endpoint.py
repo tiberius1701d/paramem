@@ -6,7 +6,7 @@ Covers:
 - Boot degraded: real corrupt registry on disk → _preload_memory_store sets
   store_load_degraded=True via the production infrastructure integrity check.
 - Base-swap 409: corrupt store + base-swap candidate → 409 with integrity_failure.
-- Pure mode-switch 409 (Fix-1 path): corrupt store + mode-only candidate → 409,
+- Pure mode-switch 409: corrupt store + mode-only candidate → 409,
   AND live config file is NOT renamed on failure.
 - _arm_active_store_migration with corrupt registry → returns False, does not arm.
 
@@ -521,7 +521,7 @@ class TestMigrationConfirmModeSwitchIntegrityGate:
     def test_mode_switch_corrupt_store_returns_409(self, tmp_path, monkeypatch):
         """POST /migration/confirm on a mode-switch candidate with corrupt store → 409.
 
-        This is the Fix-1 path: the integrity gate must fire BEFORE the config promotion.
+        The integrity gate must fire BEFORE the config promotion.
         """
         cfg = _make_config(tmp_path, mode="train")
 
@@ -548,7 +548,7 @@ class TestMigrationConfirmModeSwitchIntegrityGate:
     def test_mode_switch_corrupt_store_live_config_not_renamed(self, tmp_path, monkeypatch):
         """Corrupt store + mode-switch → 409 AND the live config is NOT renamed.
 
-        Proves Fix-1 ordering: the integrity gate fires before any mutation.
+        Proves the ordering: the integrity gate fires before any mutation.
         """
         cfg = _make_config(tmp_path, mode="train")
 

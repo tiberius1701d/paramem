@@ -414,8 +414,8 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
 
     When ``loop.trial_key_metadata_path`` is set (trial consolidation path),
     writes to that isolated path instead of the live ``config.key_metadata_path``.
-    This ensures trial runs never touch the live ``data/ha/registry/key_metadata.json``
-    (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
+    This ensures trial runs never touch the live
+    ``data/ha/registry/key_metadata.json``.
     """
     keys_payload: dict = {}
     # Persist bookkeeping for BOTH active and stale keys so that stale-echo
@@ -435,7 +435,7 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
         "promoted_keys": sorted(loop.promoted_keys),
         "keys": keys_payload,
     }
-    # CRITICAL Fix 1: honor loop-level override set by _build_trial_loop so the
-    # trial never writes to the live registry paths.
+    # Honor the loop-level override set by _build_trial_loop so the trial never
+    # writes to the live registry paths.
     dest = getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path
     _atomic_json_write(metadata, dest)

@@ -301,11 +301,11 @@ def compute_simhash(
     ``mode="full"`` is the diacritic/NFC distinction — ``"café"`` and
     ``"cafe"`` still hash differently, while only a ``_``/space difference
     (always the same fact) is merged. This is NOT the full ``canonical()`` fold
-    removed in commit 2e2bc84 (which also folded diacritics/whitespace and
-    desynced the fingerprint against a raw registry); it is narrower and
-    applied identically by both callers, so a fingerprint
-    computed at registration still matches the one recomputed from a correct
-    recall.
+    that once ran here and was removed — that one also folded
+    diacritics/whitespace, which desynced the fingerprint against a raw
+    registry; the spaces-only fold is narrower and applied identically by both
+    callers, so a fingerprint computed at registration still matches the one
+    recomputed from a correct recall.
 
     Uses unigram+bigram feature tokenization and a bit-vote algorithm. The key is
     included so that identical triple content under different keys produces

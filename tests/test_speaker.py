@@ -831,7 +831,7 @@ class TestIsAnonymous:
 
 
 # ---------------------------------------------------------------------------
-# enroll() upgrade-in-place for anonymous profiles (Fix 1)
+# enroll() upgrade-in-place for anonymous profiles
 # ---------------------------------------------------------------------------
 
 
@@ -874,7 +874,7 @@ class TestEnrollUpgradesAnonymous:
 
 
 # ---------------------------------------------------------------------------
-# register_anonymous tentative-match semantics (Fix 2)
+# register_anonymous tentative-match semantics
 # ---------------------------------------------------------------------------
 
 

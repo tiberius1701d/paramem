@@ -82,8 +82,7 @@ class ExtractionFailed(RuntimeError):
 #
 # 8192 is sized for Mistral 7B against document chunks up to
 # ``paramem.graph.document_chunker._DOC_MAX_TOKENS``, the local chunker's
-# max — currently ~934 words (revisited jointly, .agent/plan-anonymize-
-# slicing.md U6/review finding B2: _DOC_MAX_TOKENS is now DERIVED from the
+# max — currently ~934 words (_DOC_MAX_TOKENS is DERIVED from the
 # anonymize-call token envelope rather than an independent ~1500-word
 # heuristic, and that derivation itself consumes the empirical figure
 # below). Empirical worst-case observed output for a dense resume chunk was

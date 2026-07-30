@@ -1,5 +1,5 @@
 """Unit tests for paramem.utils.tokens — the shared token-estimation
-primitive (U1 of .agent/plan-anonymize-slicing.md).
+primitive.
 
 Covers:
 - Exact path: a tokenizer supplied returns its precise id count.
@@ -44,7 +44,7 @@ class _StubTokenizer:
 
 
 class TestEstimateTokensExactPath:
-    """Item 1: a stub tokenizer returning k ids -> estimate_tokens returns k."""
+    """A stub tokenizer returning k ids -> estimate_tokens returns k."""
 
     def test_stub_tokenizer_returns_exact_count(self):
         tok = _StubTokenizer(n_ids=17)
@@ -62,7 +62,7 @@ class TestEstimateTokensExactPath:
 
 
 class TestEstimateTokensFallbackPath:
-    """Item 2: no tokenizer -> ceil(words * ratio); 0 for empty; >=1 for non-empty."""
+    """No tokenizer -> ceil(words * ratio); 0 for empty; >=1 for non-empty."""
 
     def test_empty_text_returns_zero(self):
         assert estimate_tokens("") == 0
@@ -88,8 +88,9 @@ class TestEstimateTokensFallbackPath:
 
 
 class TestEstimateTokensRaisingTokenizer:
-    """Item 3: a raising tokenizer falls back, never returns -1 or 0 for
-    non-empty text (item 47's estimator-level guarantee)."""
+    """A raising tokenizer falls back, never returns -1 or 0 for non-empty
+    text: the estimator itself guarantees a usable cost, because a -1 or 0
+    would make every payload "fit" a downstream budget check."""
 
     def test_raising_tokenizer_falls_back_to_estimate(self):
         tok = _StubTokenizer(raises=True)
@@ -112,13 +113,14 @@ class TestEstimateTokensRaisingTokenizer:
 
 
 class TestEstimateTokensBoundingClaim:
-    """Item 4: the fallback (MAX-of-three-shapes ratio) must bound the
-    exact count for every shape the system ingests, not just prose.
+    """The fallback (MAX-of-three-shapes ratio) must bound the exact count
+    for every shape the system ingests, not just prose.
 
-    Per-shape ratios below are the U6.1 measurement (production Mistral
-    tokenizer over transcript / document / fact-JSON payloads) — this test
-    fails if a future edit "tunes" MEASURED_TOKENS_PER_WORD down to a
-    prose average that no longer bounds the fact-JSON shape.
+    Per-shape ratios below are the shipped measurement recorded on
+    MEASURED_TOKENS_PER_WORD (production Mistral tokenizer over transcript /
+    document / fact-JSON payloads) — this test fails if a future edit "tunes"
+    MEASURED_TOKENS_PER_WORD down to a prose average that no longer bounds
+    the fact-JSON shape.
     """
 
     _PER_SHAPE_RATIOS = {
@@ -144,7 +146,7 @@ class TestEstimateTokensBoundingClaim:
 
 
 class TestCheckRatioDrift:
-    """Item 4b: None when observed max <= configured; observed max otherwise."""
+    """None when observed max <= configured; observed max otherwise."""
 
     def test_returns_none_when_observed_at_or_below_configured(self):
         tok = _StubTokenizer(n_ids=1)

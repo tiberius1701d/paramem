@@ -1,6 +1,6 @@
 """Tests for paramem.backup.retention — DiskUsage, collect_immune_paths, prune.
 
-Covers all 5 spec rules and Fix 1 (TTL cache).
+Covers all 5 spec rules and the disk-usage TTL cache.
 """
 
 from __future__ import annotations
@@ -164,7 +164,7 @@ class TestComputeDiskUsage:
         usage = compute_disk_usage(tmp_path, config, bypass_cache=True)
         assert "_unknown" in usage.by_tier
 
-    # Fix 1 cache tests
+    # TTL cache tests
     def test_cache_returns_same_result_within_ttl(self, tmp_path):
         """Second call within 5s returns cached result (iterdir called once)."""
         config = _make_config()
@@ -475,7 +475,7 @@ class TestPruneMiscellaneous:
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — keep=0 disables tier (does not raise)
+# keep=0 disables tier (does not raise)
 # ---------------------------------------------------------------------------
 
 
@@ -507,7 +507,7 @@ class TestKeepZeroDisablesTier:
 
 
 # ---------------------------------------------------------------------------
-# Cleanup 1 invariant — every enumerated BackupRecord has a non-empty tier
+# Invariant — every enumerated BackupRecord has a non-empty tier
 # ---------------------------------------------------------------------------
 
 
@@ -561,7 +561,7 @@ class TestEnumeratedRecordTierInvariant:
 
 
 class TestPruneRule4PreBaseSwap:
-    """Rule-4 window immunity for the pre_base_swap tier.
+    """Rule 4 window immunity for the pre_base_swap tier.
 
     Mirrors TestPruneRule4PreMigrationWindow but exercises the pre_base_swap
     tier path, including the acceptance-regression case: a slot within the

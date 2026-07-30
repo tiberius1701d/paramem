@@ -1,11 +1,11 @@
 """Tests for Tier-1 CUDA fail-fast containment.
 
-Covers Steps 2-4 of the fail-fast plan:
+Covers:
 
-- Step 2: probe re-raise vs benign-swallow in _build_store_contents.
-- Step 3: _fail_fast_cuda patches os._exit; the "ready" log is NOT emitted
+- probe re-raise vs benign-swallow in _build_store_contents.
+- _fail_fast_cuda patches os._exit; the "ready" log is NOT emitted
   on the fatal path; _release_base_model_in_process is never called.
-- Step 4: crash-loop counter (_record_cuda_fatal_exit / _cuda_crashloop_exhausted);
+- crash-loop counter (_record_cuda_fatal_exit / _cuda_crashloop_exhausted);
   exhausted counter → _degrade_to_cloud_only, NOT os._exit;
   _degrade_to_cloud_only("cuda_fault_persistent") sets state correctly and
   is in permanent_cloud_only.
@@ -69,7 +69,7 @@ def _inject_config(config, *, model=None, tokenizer=None):
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — probe re-raise vs benign-swallow
+# Probe re-raise vs benign-swallow
 # ---------------------------------------------------------------------------
 
 
@@ -156,7 +156,7 @@ class TestProbeReraise:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — _fail_fast_cuda / _cuda_liveness_canary
+# _fail_fast_cuda / _cuda_liveness_canary
 # ---------------------------------------------------------------------------
 
 
@@ -167,7 +167,7 @@ class TestFailFastCuda:
         """_fail_fast_cuda → os._exit(1) when crash-loop is not exhausted.
 
         Also asserts that the 'ParaMem server ready' log is NOT emitted on
-        the fatal fail-fast path (plan §7): the fail-fast handler must exit
+        the fatal fail-fast path: the fail-fast handler must exit
         the process before the 'ready' advertisement is ever logged.
         """
         import logging
@@ -269,7 +269,7 @@ class TestFailFastCuda:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — crash-loop counter + _degrade_to_cloud_only
+# Crash-loop counter + _degrade_to_cloud_only
 # ---------------------------------------------------------------------------
 
 

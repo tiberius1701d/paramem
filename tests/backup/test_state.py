@@ -178,7 +178,7 @@ class TestUpdateBackupState:
 
 
 # ---------------------------------------------------------------------------
-# Fix 3 — fcntl concurrent-write serialisation
+# fcntl concurrent-write serialisation
 # ---------------------------------------------------------------------------
 
 

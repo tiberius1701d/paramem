@@ -84,9 +84,9 @@ def canonical(s: str, mode: str = "full") -> str:
 
     Two modes, selecting how much folding is applied:
 
-    * ``mode="full"`` (default) — lower-cases (Unicode full case folding,
-      §3.13), folds diacritics, and collapses ``_``/whitespace runs to a
-      single space.  ``-`` is preserved verbatim — it is NOT a blank.
+    * ``mode="full"`` (default) — lower-cases (Unicode full case folding, via
+      ``str.casefold``), folds diacritics, and collapses ``_``/whitespace
+      runs to a single space.  ``-`` is preserved verbatim — it is NOT a blank.
       ``"has hobby"`` and ``"has_hobby"`` are one value, ``"has hobby"``.
       This is the **identity key** — what is stored, compared, keyed and
       trained (node keys, predicates, the SimHash/dedup key).  It is also the
@@ -135,10 +135,10 @@ def canonical(s: str, mode: str = "full") -> str:
         >>> canonical("New_York", mode="spaces")
         'New York'
 
-    Order rationale (Unicode §3.13, ``mode="full"``): NFC before casefold
-    handles the U+0345 family that casefolds correctly only after
-    decomposition; re-NFC after casefold + combining-strip restores a stable
-    form so ``f(f(x)) == f(x)``.  Whitespace/underscore folding is last — it
+    Order rationale (``mode="full"``): NFC before casefold handles the U+0345
+    family that casefolds correctly only after decomposition; re-NFC after
+    casefold + combining-strip restores a stable form so
+    ``f(f(x)) == f(x)``.  Whitespace/underscore folding is last — it
     only consumes ``_`` and Unicode blanks and emits a single space, which
     ``str.split()`` treats as a separator, so re-running is a no-op.
     Idempotent and stable across runs for a fixed CPython build, in both
@@ -182,7 +182,9 @@ def prose_fold(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Speaker-identity primitives — §0 invariant
+# Speaker-identity primitives — ONE canonical lowercase ``speaker{N}`` form
+# everywhere (node key, ``speaker_id`` attribute/field, profile key), decided
+# and returned by the single gate below; no second case rule for speaker ids.
 # ---------------------------------------------------------------------------
 
 

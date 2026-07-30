@@ -442,7 +442,7 @@ class TestMigrateCancelSubcommand:
     def test_migrate_cancel_409_not_staging_exits_0_with_friendly_message(
         self, monkeypatch, capsys
     ):
-        """409 not_staging → friendly message to stdout and exit 0 (Fix 5).
+        """409 not_staging → friendly message to stdout and exit 0.
 
         When no candidate is staged the operator's intent is already
         satisfied — cancel is idempotent, so exit 0.

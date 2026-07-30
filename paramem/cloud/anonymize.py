@@ -30,10 +30,10 @@ rendered template strings in as ``user_prompt_template``/``system_prompt``
 — this is data, not a loader capability, so the layering holds without an
 injected callable.
 
-Fact-boundary slicing (.agent/plan-anonymize-slicing.md U2): a single
-``anonymize()`` call may cost more than one local ``generate()`` — see
-:func:`_slice_facts_to_envelope` and the per-slice loop inside
-:func:`anonymize`. A transcript is atomic (it is never split), so slicing
+Fact-boundary slicing: a single ``anonymize()`` call may cost more than
+one local ``generate()`` — see :func:`_slice_facts_to_envelope` and the
+per-slice loop inside :func:`anonymize`.
+A transcript is atomic (it is never split), so slicing
 applies only when ``transcript`` is empty (the graph tier); the session
 tier and chat egress always make exactly one local call.
 
@@ -76,10 +76,9 @@ logger = logging.getLogger(__name__)
 # Total tokens (prompt + output) one local anonymize call may occupy. 8192 is
 # the sequence length vram.vram_cache_headroom_gib: 1.5 was booked against
 # (configs/server.yaml.example — "single-sequence 8192-token Mistral KV cache
-# is ~1 GiB; 0.5 GiB margin for activations"). One envelope, no second cap
-# (owner-accepted, .agent/plan-anonymize-slicing.md §5.2/D2): every caller
-# derives its output allowance from this single budget — never a separate
-# max_tokens knob.
+# is ~1 GiB; 0.5 GiB margin for activations"). One envelope, no second cap:
+# every caller derives its output allowance from this single budget (output =
+# envelope − prompt) — never a separate max_tokens knob.
 _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE: int = 8192
 # Structural floor: below this no well-formed
 # {"mapping": ..., "anonymized_transcript": ...} envelope can complete, so a
@@ -467,10 +466,10 @@ def anonymize_transcript(
     try:
         json_str = _extract_json_block(raw)
         data = json.loads(json_str)
-        # Envelope + mapping-type checks move ABOVE the rewrite check
-        # (.agent/plan-anonymize-slicing.md §1.4/§5.2): validity of an
-        # empty/missing rewrite now depends on whether `mapping` is
-        # itself empty, so `mapping` must be read and type-checked first.
+        # Envelope + mapping-type checks come BEFORE the rewrite check:
+        # validity of an empty/missing rewrite depends on whether
+        # `mapping` is itself empty (the legitimate-empty rule below), so
+        # `mapping` must be read and type-checked first.
         if not isinstance(data, dict) or "mapping" not in data:
             logger.warning("Anonymization returned unexpected format")
             return None, "", raw

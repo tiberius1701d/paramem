@@ -263,8 +263,8 @@ class TestPreviewErrors:
     def test_preview_409_when_trial_active(self, client, state, tmp_path):
         """TRIAL state → 409 trial_active.
 
-        Fix 4: the ``# pragma: no cover`` was removed because this branch is
-        now reachable in production (3b.2 wires TRIAL state).
+        The ``# pragma: no cover`` was removed because this branch is reachable
+        in production: confirm sets migration state to TRIAL.
         """
         state["migration"]["state"] = "TRIAL"
         state["migration"]["trial"] = {
@@ -468,7 +468,7 @@ class TestTierDiffClassification:
 
 
 # ---------------------------------------------------------------------------
-# Fix 4 — registry_path graceful degradation when paths.data is None
+# registry_path graceful degradation when paths.data is None
 # ---------------------------------------------------------------------------
 
 

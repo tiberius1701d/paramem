@@ -92,7 +92,7 @@ class TestRelationTypes:
 
 
 class TestEmptyAndMalformedYaml:
-    """Tests for Fix 2: empty/partial/malformed YAML falls back with a logged error."""
+    """Empty/partial/malformed YAML falls back to the hardcoded schema with a logged error."""
 
     def test_empty_yaml_returns_fallback(self, tmp_path, caplog, monkeypatch):
         """An empty YAML file (missing all required keys) must return the hardcoded fallback."""

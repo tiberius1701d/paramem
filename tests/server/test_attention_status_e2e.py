@@ -147,7 +147,7 @@ class TestAttentionEmptyWhenLiveClean:
         assert body["migration"]["comparison"] is None
 
     def test_status_server_started_at_exposed(self, client, state):
-        """server_started_at is exposed on /status (Fix 2)."""
+        """server_started_at is exposed on /status."""
         state["server_started_at"] = "2026-04-22T08:00:00+00:00"
         body = _get_status(client)
         assert body["server_started_at"] == "2026-04-22T08:00:00+00:00"

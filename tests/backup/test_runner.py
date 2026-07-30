@@ -375,7 +375,7 @@ class TestRunnerCallsPrune:
 
 
 # ---------------------------------------------------------------------------
-# Cleanup 2 — keep=0 short-circuit skips emission
+# keep=0 short-circuit skips emission
 # ---------------------------------------------------------------------------
 
 

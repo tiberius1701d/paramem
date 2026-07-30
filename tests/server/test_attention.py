@@ -349,7 +349,7 @@ def test_base_swap_model_mismatch_emits_failed():
 
 
 # ---------------------------------------------------------------------------
-# _collect_consolidation_items (Fix 1)
+# _collect_consolidation_items
 # ---------------------------------------------------------------------------
 
 
@@ -385,7 +385,7 @@ def test_consolidation_blocked_during_trial_none_status():
 
 
 def test_consolidation_normal_run_no_item():
-    """consolidating=True + migration_state=LIVE → 0 items (Fix 1 verified)."""
+    """consolidating=True + migration_state=LIVE → 0 items."""
     state = _live_state(consolidating=True)
     items = _collect_consolidation_items(state)
     assert items == []

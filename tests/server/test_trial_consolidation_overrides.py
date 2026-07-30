@@ -234,7 +234,7 @@ class TestRunTrialConsolidation:
 
 
 class TestTrialDoesNotMarkConsolidated:
-    """Fix 1 regression: trial cycle must never call session_buffer.mark_consolidated."""
+    """Regression guard: trial cycle must never call session_buffer.mark_consolidated."""
 
     def test_trial_cycle_does_not_mark_consolidated(self, tmp_path, monkeypatch):
         """_run_extraction_phase called from trial path must not invoke mark_consolidated.
@@ -721,7 +721,7 @@ class TestTrialGateExtensions:
 
 
 # ---------------------------------------------------------------------------
-# Fix 4 — loud failure when _state["config"] is missing
+# Loud failure when _state["config"] is missing
 # ---------------------------------------------------------------------------
 
 
@@ -729,9 +729,10 @@ class TestRunTrialConsolidationMissingConfig:
     """Verify that _run_trial_consolidation raises loudly when config is absent.
 
     Production always has _state["config"] set at lifespan startup.  If it is
-    somehow missing the silent Path("state/registry.json") fallback masks the
-    bug.  Fix 4 replaces that fallback with a RuntimeError that is caught by
-    the outer ``except Exception`` block and surfaces as
+    somehow missing, a silent Path("state/registry.json") fallback would mask
+    the bug, so the handler raises a RuntimeError instead
+    (``paramem/server/app.py``, the ``live_config is None`` guard).  The outer
+    ``except Exception`` block catches it and surfaces it as
     ``gates["status"] == "trial_exception"``.
     """
 
@@ -772,13 +773,12 @@ class TestRunTrialConsolidationMissingConfig:
 class TestRunTrialConsolidationRegistryPath:
     """Verify _run_trial_consolidation passes the correct registry path to evaluate_gates.
 
-    (2026-04-22 E2E baseline): the handler derived registry path from
-    ``live_config.registry_path`` which resolves to
-    ``config.paths.data / "registry.json"`` (missing the ``registry/`` sub-
-    directory and ``key_metadata.json`` filename).  Gate 4 emitted a false FAIL
-    on every real trial because the path didn't exist.
-
-    Fix (Cleanup 1, 2026-04-22): use ``live_config.paths.key_metadata`` (canonical property).
+    The handler must use ``live_config.paths.key_metadata`` — the canonical
+    property resolving to ``config.paths.data / "registry" /
+    "key_metadata.json"``.  ``live_config.registry_path`` resolves instead to
+    ``config.paths.data / "registry.json"``, missing both the ``registry/``
+    subdirectory and the filename, so gate 4 would FAIL on every real trial
+    because that path never exists.
     """
 
     def test_gate4_receives_canonical_registry_path(self, tmp_path, monkeypatch):
@@ -794,9 +794,9 @@ class TestRunTrialConsolidationRegistryPath:
         data_dir = tmp_path / "data" / "ha"
         data_dir.mkdir(parents=True, exist_ok=True)
         state["config"].paths.data = data_dir
-        # Cleanup 1 (2026-04-22): app.py uses live_config.paths.key_metadata
-        # (canonical property) to derive live_registry_path for evaluate_gates.
-        # MagicMock does not evaluate PathsConfig properties, so set explicitly.
+        # app.py derives live_registry_path for evaluate_gates from
+        # live_config.paths.key_metadata (the canonical property).  MagicMock does
+        # not evaluate PathsConfig properties, so set it explicitly.
         state["config"].paths.key_metadata = data_dir / "registry" / "key_metadata.json"
 
         monkeypatch.setattr(app_module, "_state", state)
@@ -819,9 +819,10 @@ class TestRunTrialConsolidationRegistryPath:
                 cfg.consolidation.mode = "simulate"
                 # Make sure paths.data is consistent with the outer config mock.
                 cfg.paths.data = data_dir
-                # Cleanup 1 (2026-04-22): app.py now uses cfg.paths.key_metadata
-                # (canonical property) instead of paths.data / "registry" / "key_metadata.json".
-                # MagicMock does not evaluate PathsConfig properties, so set explicitly.
+                # app.py uses cfg.paths.key_metadata (the canonical property)
+                # rather than hand-building paths.data / "registry" /
+                # "key_metadata.json".  MagicMock does not evaluate PathsConfig
+                # properties, so set it explicitly.
                 cfg.paths.key_metadata = data_dir / "registry" / "key_metadata.json"
                 mock_load.return_value = cfg
 

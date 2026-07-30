@@ -897,9 +897,10 @@ class TestEnrichmentPromptContract:
         'speaker0' anchor present must not use ``Person_1`` as the fact
         subject — that is exactly how 'Person_1 (the speaker' and its
         reworded cousin 'Person_1 — the speaker' both re-teach the
-        positional guess this plan retires.  A test that only checked
-        the literal substring passed for months while three few-shots
-        taught the opposite; this one cannot pass while any block does."""
+        positional guess that ``Person_1`` names the speaker.  A test
+        that only checked the literal substring passed for months while
+        three few-shots taught the opposite; this one cannot pass while
+        any block does."""
         tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         blocks = re.split(r"\n\s*\n", tmpl)
         for block in blocks:
@@ -1321,8 +1322,7 @@ class TestAnonymizationPrompt:
 
 class TestAnonymizationFactsPrompt:
     """Contract tests for ``anonymization_facts.txt`` — the graph-tier,
-    facts-only anonymization variant (U4,
-    .agent/plan-anonymize-slicing.md). Shares the session-tier
+    facts-only anonymization variant. Shares the session-tier
     ``anonymization.txt``'s core contract (shape, uniqueness, totality,
     direction, the ``speaker{N}``-verbatim rule) but drops the
     transcript-rewrite half entirely: no ``{transcript}`` slot, no
@@ -1337,7 +1337,7 @@ class TestAnonymizationFactsPrompt:
         )
 
     def test_renders_with_scrub_categories_and_facts_json_no_transcript_slot(self):
-        """Item 27: renders with {scrub_categories} and {facts_json} and
+        """Renders with {scrub_categories} and {facts_json} and
         declares no {transcript} slot; no stray unrendered {word} after
         formatting."""
         tmpl = _load_prompt("anonymization_facts.txt", required=True)
@@ -1352,7 +1352,7 @@ class TestAnonymizationFactsPrompt:
         assert not stray, f"Stray unrendered placeholder(s) found: {stray!r}"
 
     def test_shares_core_contract_shape_uniqueness_totality_direction(self):
-        """Item 28: carries the shared core contract — shape (PascalCase
+        """Carries the shared core contract — shape (PascalCase
         + `_<N>`), uniqueness, totality, direction, and the
         `speaker{N}`-verbatim rule, with no example mapping a `speaker{N}`
         token."""
@@ -1373,7 +1373,7 @@ class TestAnonymizationFactsPrompt:
         )
 
     def test_examples_use_fictional_entities_no_city_org_product_positive_example(self):
-        """Item 29: examples use fictional entities only and contain no
+        """Examples use fictional entities only and contain no
         city/org/product positive scrub example (City_1/Org_1/Product_1
         absent)."""
         tmpl = _load_prompt("anonymization_facts.txt", required=True)
@@ -1383,7 +1383,7 @@ class TestAnonymizationFactsPrompt:
             )
 
     def test_output_contract_is_mapping_only(self):
-        """Item 30: the facts template requests `mapping` and ONLY
+        """The facts template requests `mapping` and ONLY
         `mapping` — no `anonymized_transcript` key, no `{transcript}`
         slot — and renders correctly through the shared
         `_render_anonymize_prompt` despite the unused `transcript=`
@@ -1421,7 +1421,7 @@ class TestAnonymizationFactsPrompt:
         assert "{transcript}" not in rendered
 
     def test_graph_enrich_loads_the_facts_variant_session_tier_loads_transcript_variant(self):
-        """Item 31: ``graph_enrich`` loads ``anonymization_facts.txt``
+        """``graph_enrich`` loads ``anonymization_facts.txt``
         (and the session tier still loads ``anonymization.txt``) — a
         direct source-level assertion at the chokepoint, so a copy-paste
         regression to the transcript variant is caught.
@@ -1788,8 +1788,8 @@ class TestSpeakerDirectiveFile:
         """cloud_graph_enrichment.txt must instruct the model to reuse an
         existing predicate surface from the input graph rather than coin a
         synonym for a relation the graph already names between the same two
-        nodes (U4) — a same-fold occurrence-reduction measure that
-        complements the U2/U3 ordering-and-survivor-rule guarantee (a
+        nodes — a same-fold occurrence-reduction measure that complements
+        the ordering-and-survivor-rule guarantee (a
         prompt instruction alone is not a guarantee, which is why this is a
         `SHOULD`-strength nudge, not the enforcement mechanism)."""
         tmpl = _load_prompt("cloud_graph_enrichment.txt", "")

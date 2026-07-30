@@ -1,13 +1,15 @@
-"""Regression guard: speaker_id must be a required argument everywhere.
+"""Regression guard: ``speaker_id`` must never default to the empty string.
 
-Phase 2a removed every ``speaker_id: str = ""`` default from:
+No ``speaker_id`` parameter in
   - ``paramem/graph/extractor.py``
   - ``paramem/training/consolidation.py``
+carries a ``speaker_id: str = ""`` default; each one is either required or
+explicitly optional (``str | None``, handled as absent by the callee).
 
-This test scans both files and fails if any default is re-introduced, closing the
-silent-omission hole that Phase 2a was designed to close.  Re-introduce a default
-and the test fails immediately — callers that forget to supply a speaker_id get a
-TypeError at import time rather than propagating ``""`` into the graph silently.
+This test scans both files and fails if such a default is re-introduced.  A
+caller that omits ``speaker_id`` must therefore fail loudly at the call site
+rather than silently propagate ``""`` into the graph, where an empty scope is
+indistinguishable from a real speaker.
 
 Verification protocol:
   To confirm the test actually catches a regression, temporarily add
@@ -28,11 +30,12 @@ _FORBIDDEN_PATTERN = 'speaker_id: str = ""'
 
 
 def test_no_speaker_id_empty_string_default_in_extractor_or_consolidation():
-    """Every ``speaker_id`` parameter in the extraction and consolidation modules
-    must be a required keyword-only argument (no ``= ""`` default).
+    """No ``speaker_id`` parameter in the extraction and consolidation modules
+    may carry an empty-string default (``= ""``).
 
-    A caller that omits ``speaker_id`` must receive a ``TypeError`` at the call
-    site — not silently propagate an empty string into the knowledge graph.
+    A caller that omits a required ``speaker_id`` must receive a ``TypeError``
+    at the call site — not silently propagate an empty string into the
+    knowledge graph.
     """
     repo_root = Path(__file__).resolve().parent.parent
     offenders: list[tuple[str, int, str]] = []

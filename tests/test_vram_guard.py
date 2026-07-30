@@ -276,8 +276,7 @@ class TestVramScopeTelemetry:
 
 class TestEffectiveTokenEnvelope:
     """``effective_token_envelope`` — the dynamic VRAM clamp for the
-    anonymize token envelope (owner-approved 2026-07-28,
-    .agent/plan-anonymize-slicing.md §5.2/§5.3 background).
+    anonymize token envelope (owner-approved 2026-07-28).
 
     ``effective = min(configured_envelope, free_mib /
     MIB_PER_TOKEN_TRANSIENT)`` — the configured value is a CEILING,

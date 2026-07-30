@@ -210,7 +210,7 @@ def test_metrics_returns_copy_of_distinct():
 def test_capture_wraps_consolidation_executor_errors():
     """Errors logged by the consolidation executor are captured.
 
-    Regression guard for the Fix 1 scope bug: the ``with TrialLogCapture()``
+    Regression guard for the capture-scope bug: the ``with TrialLogCapture()``
     block in ``_run_trial_consolidation`` (``app.py``) must open BEFORE the
     consolidation executor call, not after it.  This test pins that behaviour
     by simulating what the executor block does — logging an error and raising
@@ -235,7 +235,7 @@ def test_capture_wraps_consolidation_executor_errors():
     assert cap.metrics["trial_log_errors"] >= 1, (
         "Consolidation-executor errors must be captured inside the with block; "
         "trial_log_errors was 0 — the with TrialLogCapture() is likely placed "
-        "AFTER the executor call (pre-Fix-1 scope bug)."
+        "AFTER the executor call (the pre-fix placement)."
     )
     assert "RuntimeError" in cap.metrics["distinct_classes"], (
         "RuntimeError class must appear in distinct_classes when the exception "

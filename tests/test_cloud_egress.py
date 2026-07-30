@@ -95,7 +95,7 @@ def _anonymize(graph: SessionGraph, **kwargs):
 
 class TestAnonymizeForCloudTokenEnvelopeDefault:
     """``anonymize`` and ``anonymize_transcript`` share ONE envelope
-    default (U2/U3 — the flat ``max_tokens``/``_DEFAULT_ANONYMIZER_MAX_TOKENS``
+    default (the flat ``max_tokens``/``_DEFAULT_ANONYMIZER_MAX_TOKENS``
     cap is retired). ``max_new_tokens`` is derived from this single
     ``token_envelope``, never a second, independently-configured knob.
     """
@@ -745,7 +745,7 @@ class TestUnbypassableRawReverseMap:
 
 
 # ---------------------------------------------------------------------------
-# U2 — fact-boundary slicing (.agent/plan-anonymize-slicing.md §7 items 5-11)
+# Fact-boundary slicing
 # ---------------------------------------------------------------------------
 
 # A fixed 3-fact fixture used across the slicing tests below. Real packing
@@ -761,13 +761,13 @@ _SLICE_TEMPLATE = "T{facts_json}"
 
 
 class TestFactBoundarySlicing:
-    """``_slice_facts_to_envelope`` — items 5-8, 11."""
+    """``_slice_facts_to_envelope`` — how facts pack into slices."""
 
     def test_facts_fitting_envelope_yield_one_slice(self):
-        """Item 5: facts fitting the envelope -> exactly one slice, slice
+        """Facts fitting the envelope -> exactly one slice, slice
         == all facts. Hand-derived: at envelope=500 the packer's reserve
         term is dominated by the ``_MIN_ANONYMIZER_OUTPUT_TOKENS`` (256)
-        floor (m5 fix), and ``base + all-three-fragments + 256 <= 500``
+        floor, and ``base + all-three-fragments + 256 <= 500``
         under ``_CountingTokenizer``'s exact char-per-token measure."""
         slices = _slice_facts_to_envelope(
             _SLICE_FACTS,
@@ -780,11 +780,11 @@ class TestFactBoundarySlicing:
         assert slices == [_SLICE_FACTS]
 
     def test_facts_exceeding_envelope_split_preserving_order_no_split_fact(self):
-        """Item 6: N > 1 slices; every fact appears in exactly one slice,
+        """N > 1 slices; every fact appears in exactly one slice,
         order preserved, no fact split. Hand-derived boundary: at
         envelope=200, even a SINGLE fact's own cost — dominated by the
         ``_MIN_ANONYMIZER_OUTPUT_TOKENS`` (256) floor the packer reserves
-        per slice (m5 fix) — already exceeds 200 on its own, so each fact
+        per slice — already exceeds 200 on its own, so each fact
         lands in its own slice: exactly 3."""
         slices = _slice_facts_to_envelope(
             _SLICE_FACTS,
@@ -800,7 +800,7 @@ class TestFactBoundarySlicing:
         assert flattened == _SLICE_FACTS
 
     def test_single_oversized_fact_gets_its_own_slice_no_crash(self):
-        """Item 7: a single fact larger than the envelope is still
+        """A single fact larger than the envelope is still
         emitted as its own slice — no crash, no infinite loop."""
         big_fact = {"subject": "Alice", "predicate": "knows", "object": "Bob"}
         slices = _slice_facts_to_envelope(
@@ -814,7 +814,7 @@ class TestFactBoundarySlicing:
         assert slices == [[big_fact]]
 
     def test_empty_facts_returns_one_empty_slice(self):
-        """Item 8: empty facts -> exactly one (empty) slice — the
+        """Empty facts -> exactly one (empty) slice — the
         chat-egress shape, where the call must still run."""
         slices = _slice_facts_to_envelope(
             [],
@@ -827,7 +827,7 @@ class TestFactBoundarySlicing:
         assert slices == [[]]
 
     def test_compact_rendering_byte_identical_to_json_dumps_no_indent(self):
-        """Item 11: the rendered facts JSON is byte-identical to
+        """The rendered facts JSON is byte-identical to
         ``json.dumps(facts)`` (compact, no ``indent=2`` artefact — no
         ``'\\n  "subject"'`` in the rendered prompt)."""
         rendered = _render_anonymize_prompt(
@@ -843,7 +843,7 @@ class TestFactBoundarySlicing:
         assert "  " not in rendered  # no indent whitespace anywhere
 
     def test_real_packer_slice_never_overruns_the_envelope(self):
-        """m5 missing test 2: for a slice produced by the REAL packer,
+        """For a slice produced by the REAL packer,
         ``prompt_tokens + max_new_tokens <= token_envelope`` — the
         property the whole packing change exists to enforce. Verified
         for EVERY slice a larger, more realistic fact set packs into,
@@ -902,7 +902,7 @@ class TestFactBoundarySlicing:
 
 
 class TestMaxNewTokensDerivation:
-    """``anonymize_transcript`` — item 10: ``max_new_tokens`` handed to
+    """``anonymize_transcript`` — ``max_new_tokens`` handed to
     ``generate_answer`` equals ``envelope - measured prompt tokens``, and
     equals ``_MIN_ANONYMIZER_OUTPUT_TOKENS`` in the clamped case."""
 
@@ -956,7 +956,7 @@ class TestMaxNewTokensDerivation:
 
 
 class TestAtomicTranscriptSlicing:
-    """``anonymize`` — item 9: a non-empty transcript is atomic (never
+    """``anonymize`` — a non-empty transcript is atomic (never
     sliced) regardless of how large ``facts`` is, plus the clamp WARNING
     when the prompt alone overruns the envelope."""
 
@@ -1253,13 +1253,13 @@ class TestWithinSliceCanonCollisionSurvives:
 
 
 # ---------------------------------------------------------------------------
-# U2 — cross-slice mapping merge (§7 items 12-15)
+# Cross-slice mapping merge
 # ---------------------------------------------------------------------------
 
 
 class TestCrossSliceMappingMerge:
     def test_same_entity_two_slices_first_wins_on_canonical_key(self):
-        """Item 12: the same entity named in two slices with different
+        """The same entity named in two slices with different
         placeholders -> first-wins on the canonical key; one entry in
         ``forward``."""
         facts = [
@@ -1301,7 +1301,7 @@ class TestCrossSliceMappingMerge:
         assert len(payload.forward) == 1
 
     def test_two_distinct_entities_same_placeholder_renumbered(self):
-        """Item 13: two DIFFERENT entities assigned ``Person_1`` in their
+        """Two DIFFERENT entities assigned ``Person_1`` in their
         respective slices -> the second is renumbered (``Person_2``);
         every value in the merged ``forward`` map is unique."""
         facts = [
@@ -1346,7 +1346,7 @@ class TestCrossSliceMappingMerge:
         assert len(set(payload.forward.values())) == len(payload.forward)
 
     def test_renumber_preserves_multi_segment_prefix(self):
-        """Item 14: the renumber picks the smallest free index per prefix
+        """The renumber picks the smallest free index per prefix
         and preserves a multi-segment prefix
         (``Home_Address_1`` -> ``Home_Address_2``)."""
         facts = [
@@ -1382,7 +1382,7 @@ class TestCrossSliceMappingMerge:
         assert set(payload.forward.values()) == {"Home_Address_1", "Home_Address_2"}
 
     def test_placeholder_prefix_none_falls_back_without_raising(self):
-        """Item 15: ``placeholder_prefix`` returns ``None`` for an
+        """``placeholder_prefix`` returns ``None`` for an
         unshaped token, and the exact fallback expression the per-slice
         merge loop uses (``placeholder_prefix(placeholder) or "Thing"``)
         substitutes ``"Thing"`` and ``mint_placeholder`` still mints a
@@ -1406,13 +1406,13 @@ class TestCrossSliceMappingMerge:
 
 
 # ---------------------------------------------------------------------------
-# U2 — per-slice fail-closed (§7 items 16-19)
+# Per-slice fail-closed
 # ---------------------------------------------------------------------------
 
 
 class TestPerSliceFailClosed:
     def test_one_of_three_slices_parse_fails_others_survive(self):
-        """Item 16: slice 2 of 3 parse-fails -> status="ok",
+        """Slice 2 of 3 parse-fails -> status="ok",
         slices_failed == 1, contract.facts excludes exactly slice 2's
         facts, includes slices 1 and 3."""
         facts = [
@@ -1450,7 +1450,7 @@ class TestPerSliceFailClosed:
         assert payload.facts == [facts[0], facts[2]]
 
     def test_all_slices_fail_yields_failed_status(self):
-        """Item 17: all slices fail -> status="failed", facts == [],
+        """All slices fail -> status="failed", facts == [],
         failure is "guard" when any guard fired, else "parse"."""
         facts = [
             {"subject": "Alex", "predicate": "knows", "object": "Riley"},
@@ -1482,7 +1482,7 @@ class TestPerSliceFailClosed:
         assert payload.failure == "parse"
 
     def test_all_slices_fail_via_guard_reports_guard_failure(self):
-        """Item 17 (guard variant): every slice fails via the
+        """Guard variant of the all-slices-fail case: every slice fails via the
         domain-scoped guard -> failure == "guard"."""
         facts = [
             {"subject": "Someone Unmatched", "predicate": "knows", "object": "Nobody Else"},
@@ -1514,10 +1514,10 @@ class TestPerSliceFailClosed:
         assert payload.facts == []
 
     def test_guard_does_not_fire_on_speaker_only_slice(self):
-        """Item 18: a slice whose facts are all speaker-only endpoints
+        """A slice whose facts are all speaker-only endpoints
         does NOT fire the guard even when the model named something that
-        failed reconciliation — the regression test for amendment point
-        3, now at the per-slice level."""
+        failed reconciliation — the same rule as for a whole call, now
+        enforced per slice."""
         facts = [{"subject": "speaker0", "predicate": "likes", "object": "speaker1"}]
 
         with (
@@ -1545,7 +1545,7 @@ class TestPerSliceFailClosed:
         assert payload.slices_failed == 0
 
     def test_rekey_dropped_sums_across_slices_stays_per_entry(self):
-        """Item 19: ``rekey_dropped`` sums across slices and stays
+        """``rekey_dropped`` sums across slices and stays
         per-entry (not per-slice)."""
         facts = [
             {"subject": "Alex", "predicate": "knows", "object": "known_node"},
@@ -1586,12 +1586,14 @@ class TestPerSliceFailClosed:
 
 
 # ---------------------------------------------------------------------------
-# D1 — anonymized_transcript validity rule matrix (§7 items 42-45)
+# anonymized_transcript validity rule matrix
 # ---------------------------------------------------------------------------
 
 
 class TestAnonymizedTranscriptValidityRuleMatrix:
-    """The four-cell matrix of plan §5.2 / §1.4, directly against
+    """The validity rule for an empty/missing ``anonymized_transcript``,
+    cell by cell — empty vs non-empty input transcript × empty vs
+    non-empty mapping, plus the malformed-array shape — directly against
     ``anonymize_transcript``."""
 
     _TEMPLATE_KWARGS = {

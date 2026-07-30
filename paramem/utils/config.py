@@ -1,8 +1,8 @@
 """Configuration loading and validation — archived training-pipeline loader,
 plus a live per-fold training-budget derivation.
 
-This module is the YAML loader for the archived Phase 1-4 research scripts
-under ``archive/experiments/`` and their reference YAML at
+This module is the YAML loader for the archived research scripts under
+``archive/experiments/`` and their reference YAML at
 ``archive/configs/default.yaml``. All active runtime, server, test, and
 example code was migrated off ``load_config`` during the default.yaml
 retirement arc (2026-04-28); the lint guard
@@ -301,9 +301,11 @@ def load_config(
 
     Archived loader: ``configs/default.yaml`` was retired during the
     default.yaml retirement arc (2026-04-28). The yaml lives at
-    ``archive/configs/default.yaml`` alongside the archived Phase 1-4
-    research scripts that depend on it. Active code does not call this
-    function -- enforced by ``tests/test_test_config_loader_usage.py``.
+    ``archive/configs/default.yaml`` alongside the archived research scripts
+    that depend on it; when that file is absent this returns
+    ``ParaMemConfig()`` defaults rather than raising. Active code does not
+    call this function -- enforced by
+    ``tests/test_test_config_loader_usage.py``.
     """
     if config_path is None:
         config_path = (

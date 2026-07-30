@@ -650,7 +650,7 @@ class TestE2ECrashRecovery:
     def test_e2e_crash_during_accept_marker_cleared(self, tmp_path, monkeypatch):
         """After a crash mid-accept (after marker clear, before adapter move):
 
-        - Marker is cleared → no stale marker misdirects recovery (IMPROVEMENT 7).
+        - Marker is cleared → no stale marker misdirects recovery.
         - Config B remains live (accept was progressing).
         - Recovery on restart: no marker + B config → LIVE on B.
 
@@ -678,7 +678,8 @@ class TestE2ECrashRecovery:
 
         # Accept should still return 200 (rotation failure is non-fatal).
         assert resp.status_code == 200
-        # Marker is cleared — IMPROVEMENT 7 ensures this even on move failure.
+        # Marker is cleared before the move, so it stays cleared even when the
+        # move fails.
         state_dir = fresh["config"].paths.data / "state"
         assert read_trial_marker(state_dir) is None
         # State is LIVE.

@@ -11,7 +11,7 @@ from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.server.systemd_timer import TimerSpec
 
 # ---------------------------------------------------------------------------
-# parse_schedule reuse (Fix 4 verification)
+# parse_schedule reuse
 # ---------------------------------------------------------------------------
 
 
@@ -22,7 +22,7 @@ class TestParseScheduleReuse:
 
 
 # ---------------------------------------------------------------------------
-# render_service_unit — parameterised tier (Fix 4)
+# render_service_unit — parameterised tier
 # ---------------------------------------------------------------------------
 
 

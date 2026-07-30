@@ -45,8 +45,8 @@ DEFAULT_PROCESS_FRACTION = 0.85
 # Measured VRAM cost per token of a transient local generate() call's
 # KV-cache + activation growth (prefill + decode combined) — the constant
 # behind the dynamic anonymize-envelope clamp
-# (paramem.cloud.anonymize.anonymize; .agent/plan-anonymize-slicing.md
-# §5.2/§5.3 background, owner-approved live-VRAM amendment 2026-07-28).
+# (paramem.cloud.anonymize.anonymize; clamping the configured envelope to
+# live free VRAM was owner-approved 2026-07-28).
 #
 # Derivation (live-fold fault, journal 2026-07-28 06:48): an 8,192-token
 # call (prompt 7,257 + max_new 935 — the packer sized it exactly to the

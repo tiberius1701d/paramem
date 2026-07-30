@@ -2163,12 +2163,12 @@ async def _noop_gates(payload):
 
 
 # ---------------------------------------------------------------------------
-# Step-3 resume: in-process reload and phaseA_done resume semantics
+# Step 3 resume: in-process reload and phaseA_done resume semantics
 # ---------------------------------------------------------------------------
 
 
 class TestBaseSwapStep3ResumeReload:
-    """Tests for Step-3 reload behavior in _run_base_swap_orchestration.
+    """Tests for Step 3 reload behavior in _run_base_swap_orchestration.
 
     Fresh start (resume_phase=""): calls gpu_release then gpu_acquire;
     on success proceeds to Phase B; on VRAM defer returns with reload_deferred.
@@ -2180,7 +2180,7 @@ class TestBaseSwapStep3ResumeReload:
     """
 
     def _make_state(self, tmp_path: Path, *, model_name: str, mode: str = "local") -> dict:
-        """Minimal _state for Step-3 tests."""
+        """Minimal _state for Step 3 tests."""
         config = MagicMock()
         config.paths.data = tmp_path / "data"
         config.paths.data.mkdir(parents=True, exist_ok=True)

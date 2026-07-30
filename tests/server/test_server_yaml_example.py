@@ -173,7 +173,7 @@ def test_procedural_adapter_targets_mlp_layers(example_config):
 
 
 def test_training_config_uses_validated_constants(example_config):
-    """training_config property must return the Test-1-8 validated values.
+    """training_config property must return the validated production training values.
 
     Epochs and gradient accumulation are NOT asserted here: the training
     funnel derives both per fold from the key-triple count via

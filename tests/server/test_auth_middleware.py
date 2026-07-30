@@ -615,7 +615,7 @@ class TestLogStartupPosture:
 
 
 # ---------------------------------------------------------------------------
-# _build_user_token_store helper — regression guard for Fix 1
+# _build_user_token_store helper — per-user auth gated on mobile_pwa.enabled
 # ---------------------------------------------------------------------------
 
 
@@ -657,7 +657,7 @@ class TestBuildUserTokenStore:
 
 
 # ---------------------------------------------------------------------------
-# cookie_name_getter path — Fix 4
+# cookie_name_getter path
 # ---------------------------------------------------------------------------
 
 

@@ -6,7 +6,7 @@ Covers:
 - fail/trial_exception → rollback-only prompt.
 - pass/no_new_sessions → 3-way prompt (accept/rollback/cancel).
 - Deferred cancel exits 0.
-- Case-insensitive accept/rollback matching (IMPROVEMENT 6).
+- Case-insensitive accept/rollback matching.
 - Drift check before accept/rollback POSTs.
 - Comparison report rendering.
 """
@@ -407,14 +407,14 @@ class TestPassGates3WayPrompt:
 
 
 # ---------------------------------------------------------------------------
-# Case-insensitive matching (IMPROVEMENT 6)
+# Case-insensitive accept/rollback matching at the interactive prompt
 # ---------------------------------------------------------------------------
 
 
 class TestCaseInsensitiveMatching:
     @pytest.mark.parametrize("answer", ["A", "Accept", "ACCEPT"])
     def test_accept_case_insensitive(self, answer, monkeypatch, capsys):
-        """'A', 'Accept', 'ACCEPT' all route to accept (IMPROVEMENT 6)."""
+        """'A', 'Accept', 'ACCEPT' all route to accept."""
         get_sequence = [_STATUS_STAGING, _STATUS_TRIAL_PASS, _STATUS_TRIAL_PASS]
         monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_sequence))
         monkeypatch.setattr(
@@ -437,7 +437,7 @@ class TestCaseInsensitiveMatching:
 
     @pytest.mark.parametrize("answer", ["R", "Rollback", "ROLLBACK"])
     def test_rollback_case_insensitive(self, answer, monkeypatch, capsys):
-        """'R', 'Rollback', 'ROLLBACK' all route to rollback (IMPROVEMENT 6)."""
+        """'R', 'Rollback', 'ROLLBACK' all route to rollback."""
         get_sequence = [_STATUS_STAGING, _STATUS_TRIAL_PASS, _STATUS_TRIAL_PASS]
         monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_sequence))
         monkeypatch.setattr(

@@ -1205,12 +1205,12 @@ class TestDiscardKeys:
 
 
 # ---------------------------------------------------------------------------
-# Thread-safety concurrency contract — Phase 1
+# Thread-safety concurrency contract
 # ---------------------------------------------------------------------------
 
 
 class TestConcurrencyContract:
-    """Verify the RLock concurrency contract added in Phase 1.
+    """Verify the RLock concurrency contract.
 
     These tests do NOT test for race conditions (that would require a stress
     harness with tight timing).  Instead they verify the observable contract:
@@ -1396,7 +1396,13 @@ class TestReadRegistriesFromDisk:
 
 
 class TestSetBookkeepingGuard:
-    """D-1: set_bookkeeping raises on empty speaker_id without allow_empty_speaker."""
+    """set_bookkeeping raises on an empty speaker_id unless the caller opts out.
+
+    ``MemoryStore.set_bookkeeping`` rejects ``speaker_id=""`` with ValueError
+    (no-unattributed-keys invariant) unless ``allow_empty_speaker=True`` is
+    passed — the carve-out reserved for reload paths and keyless concept-node
+    edges that genuinely have no speaker.
+    """
 
     def test_empty_speaker_id_raises_without_allow_flag(self):
         """set_bookkeeping(speaker_id='') raises ValueError by default."""

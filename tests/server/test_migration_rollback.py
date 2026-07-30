@@ -317,7 +317,7 @@ class TestRollbackHappyPath:
         assert meta["source"] == "rollback"
 
     def test_rollback_clears_trial_marker(self, client, state, tmp_path):
-        """Rollback clears state/trial.json (IMPROVEMENT 8 — step 5 before rotation)."""
+        """Rollback clears state/trial.json at step 5, before rotation."""
         client.post("/migration/rollback")
         state_dir = state["config"].paths.data / "state"
         assert read_trial_marker(state_dir) is None
@@ -345,7 +345,7 @@ class TestRollbackHappyPath:
 
         In-memory config matches A after restore; drift stays coherent.
         Per spec: rollback handler must NOT call compute_config_hash /
-        update config_drift (unlike accept which does — REQUIRED FIX 3).
+        update config_drift (unlike accept, which does).
         The drift loop stays coherent because rollback restores the original
         config that was hashed at startup.
         """
@@ -441,7 +441,7 @@ class TestRollbackRejectsUnbootableBackup:
 
 
 # ---------------------------------------------------------------------------
-# Step-2 failure: pre-mortem backup failed → 500, state=TRIAL
+# Step 2 failure: pre-mortem backup failed → 500, state=TRIAL
 # ---------------------------------------------------------------------------
 
 
@@ -462,7 +462,7 @@ class TestRollbackStep2Failure:
 
 
 # ---------------------------------------------------------------------------
-# Step-3 failure: missing A config artifact → 500, pre-mortem deleted
+# Step 3 failure: missing A config artifact → 500, pre-mortem deleted
 # ---------------------------------------------------------------------------
 
 
@@ -500,7 +500,7 @@ class TestRollbackStep3Failure:
 
 
 # ---------------------------------------------------------------------------
-# Step-4 failure: config rename failed → 500, pre-mortem deleted
+# Step 4 failure: config rename failed → 500, pre-mortem deleted
 # ---------------------------------------------------------------------------
 
 
@@ -536,7 +536,7 @@ class TestRollbackStep4Failure:
 
 
 # ---------------------------------------------------------------------------
-# Step-6 failure: rotation failed → 207 Multi-Status (REQUIRED FIX 2)
+# Step 6 failure: rotation failed → 207 Multi-Status
 # ---------------------------------------------------------------------------
 
 
@@ -586,7 +586,7 @@ class TestRollbackStep6Failure:
         assert live_yaml.read_bytes() == _A_YAML
 
     def test_rollback_207_marker_is_cleared(self, tmp_path, monkeypatch):
-        """When 207 is returned, trial marker is still cleared (IMPROVEMENT 8)."""
+        """When 207 is returned, trial marker is still cleared."""
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
 
@@ -929,17 +929,17 @@ class TestRollbackDecryptsEncryptedArtifact:
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — pending restore temp file must be written at 0o600
+# Pending restore temp file must be written at 0o600
 # ---------------------------------------------------------------------------
 
 
 class TestRollbackPendingRestoreFileMode:
-    """Fix 2 (2026-04-23): the .pending-rollback-*.yaml temp file must be created
-    at 0o600 so that plaintext config bytes are not exposed to other users during
-    the rename window."""
+    """The .pending-rollback-*.yaml temp file must be created at 0o600 so that
+    plaintext config bytes are not exposed to other users during the rename
+    window."""
 
     def test_pending_rollback_temp_file_has_mode_0o600(self, tmp_path, monkeypatch):
-        """Rollback temp file is created with mode 0o600 (Fix 2 regression test).
+        """Rollback temp file is created with mode 0o600.
 
         Intercepts os.open at the point where _build_trial_loop writes the
         pending temp and asserts the mode argument is 0o600.
@@ -963,12 +963,12 @@ class TestRollbackPendingRestoreFileMode:
         assert resp.status_code == 200, f"rollback failed: {resp.text}"
         assert len(captured_modes) >= 1, (
             "os.open was not called for the .pending-rollback temp file — "
-            "Fix 2 may have been reverted"
+            "the 0o600 temp-file write may have been reverted"
         )
         for mode in captured_modes:
             assert mode == 0o600, (
                 f"pending-rollback temp file created with mode {oct(mode)}, expected 0o600 "
-                "(Fix 2 regression: plaintext exposed during rename window)"
+                "(regression: plaintext exposed during rename window)"
             )
 
 

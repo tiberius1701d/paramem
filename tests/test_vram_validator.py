@@ -983,7 +983,11 @@ def test_assess_topology_slack_overflows_baseline():
 
 
 def test_breakdown_slack_zero_unchanged():
-    """_format_breakdown with slack=0 must produce the same interim row as before FIX-4."""
+    """_format_breakdown at slack=0 itemizes max_interim_count adapters and their exact bytes.
+
+    With no overflow slack reserved, the interim row carries the plain
+    max_interim_count label and max_interim_count * adapter_bytes.
+    """
     from paramem.server.vram_validator import _format_breakdown
 
     adapter_bytes = _adapter_bytes()
@@ -1022,8 +1026,10 @@ def test_breakdown_slack_nonzero_shows_expanded_count():
     """_format_breakdown with slack=2 must show (max_interim + slack) adapters
     in the interim row and the correct MiB total for that expanded count.
 
-    Guards FIX-4: at slack>0 the itemization previously under-summed the total
-    by slack*adapter_bytes.
+    The itemized interim row must equal the interim term the budget total
+    reserves ((max_interim_count + slack) * adapter_bytes); itemizing only
+    max_interim_count adapters makes the printed rows under-sum the reported
+    total by slack * adapter_bytes.
     """
     from paramem.server.vram_validator import _format_breakdown
 

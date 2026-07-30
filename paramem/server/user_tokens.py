@@ -21,9 +21,9 @@ On-disk schema (one mandatory tier, no optional buckets):
         }
     }
 
-The ``scope`` field is optional for backward compatibility with Phase-1 records.
-Missing ``scope`` is read as ``"chat"`` at runtime (secure default).  New tokens
-are always minted with an explicit scope.
+The ``scope`` field is optional for backward compatibility with records minted
+before the field existed.  Missing ``scope`` is read as ``"chat"`` at runtime
+(secure default).  New tokens are always minted with an explicit scope.
 
 The store is written via :func:`paramem.backup.encryption.write_infra_bytes`
 (age-encrypted when a daily identity is loaded) and read via
@@ -352,8 +352,8 @@ class UserTokenStore:
         tuple[bool, str | None, str] | None
             ``(True, speaker_id_or_None, scope)`` for a valid, non-revoked
             token, where ``scope`` defaults to :data:`_DEFAULT_SCOPE` for
-            records minted before the scope field existed (Phase-1 records).
-            ``None`` when the token is unknown or revoked.
+            records minted before the scope field existed.  ``None`` when the
+            token is unknown or revoked.
         """
         self._maybe_reload()
         key = _sha256hex(token)
@@ -470,8 +470,8 @@ class UserTokenStore:
 
         Each dict contains ``speaker_id``, ``label``, ``created``, ``revoked``,
         and ``scope``.  The SHA-256 hash and any plaintext token are never
-        included.  Pre-scope-field records (Phase-1) surface ``scope="chat"``
-        (secure read-time default).
+        included.  Records minted before the scope field existed surface
+        ``scope="chat"`` (secure read-time default).
 
         Returns
         -------

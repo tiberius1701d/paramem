@@ -1096,7 +1096,7 @@ def test_on_session_extracted_short_circuits_when_debug_off(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2a regression: no speaker_id empty-string defaults
+# Regression guard: no speaker_id empty-string defaults
 # ---------------------------------------------------------------------------
 
 
@@ -1122,8 +1122,11 @@ def test_no_speaker_id_empty_string_defaults():
     one of the listed files, run this test, and confirm it fails.  Then
     revert.
 
-    Phase 1 (commit 1b7eba2) left the defaults intentionally as a deferred
-    cleanup; Phase 2a removes them (this test is the gating CI assertion).
+    These defaults were once carried deliberately, as an accepted deferred
+    cleanup rather than an oversight — so their absence is not self-evident
+    from the code and nothing but this guard keeps them out. They are now
+    removed everywhere, and this test is the gating CI assertion that they
+    stay removed.
     """
     repo_root = Path(__file__).resolve().parent.parent
     offenders: list[tuple[str, int, str]] = []
@@ -1143,7 +1146,7 @@ def test_no_speaker_id_empty_string_defaults():
                 offenders.append((rel, lineno, line.strip()))
 
     assert not offenders, (
-        "speaker_id empty-string default found — Phase 2a regression.\n"
+        "speaker_id empty-string default found.\n"
         "Every caller must supply a non-empty speaker_id; the SpeakerStore\n"
         "anonymous-group ID covers the no-named-speaker case.\n"
         "Offending lines:\n"

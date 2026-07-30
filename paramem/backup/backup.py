@@ -767,7 +767,7 @@ def write_bundle(
         files_inventory.append(entry)
 
     # --- capture server.yaml.candidate (base-swap only) ---
-    # Top-level placement is load-bearing: restore_bundle's Step-5c filter
+    # Top-level placement is load-bearing: restore_bundle's Step 5c filter
     # matches startswith("config/") for the live config.  This sidecar lives
     # at the bundle root so it is hash-verified (Step 2 integrity check) but
     # never restored — the operator pulls it manually after a rollback.
@@ -1659,7 +1659,7 @@ def restore_bundle(
             # the per-tier registries / weights / speaker_profiles stay encrypted
             # produces a mixed infra state that assert_mode_consistency refuses to
             # boot, and leaks speaker_id at rest.  Decryptability was already
-            # validated by the Step-3 decrypt-probe; the live reader
+            # validated by the Step 3 decrypt-probe; the live reader
             # (_load_key_metadata) uses read_maybe_encrypted so an encrypted file
             # loads fine.
             registry_bytes = registry_src.read_bytes()

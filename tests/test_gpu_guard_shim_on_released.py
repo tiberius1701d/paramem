@@ -1,11 +1,11 @@
 """Tests verifying that on_released() fires for the paramem consumer on
-a free-GPU acquire-release cycle (Fix 3 regression guard).
+a free-GPU acquire-release cycle.
 
-Before Fix 3, on_released() was only called for consumers involved in the
-GPU-deferral path (i.e. when the paramem server was actively using the GPU
-and we asked it to release).  A normal training run that acquired a free
-GPU would call on_acquired (stamping PARAMEM_HOLD_PID) but never on_released,
-leaving PARAMEM_HOLD_PID stale in the systemd environment across runs.
+on_released() must fire on every acquire path, not only the GPU-deferral one
+(where the paramem server was actively using the GPU and was asked to release).
+A normal training run that acquires a free GPU calls on_acquired (stamping
+PARAMEM_HOLD_PID); without the paired on_released, PARAMEM_HOLD_PID is left
+stale in the systemd environment across runs.
 
 This test uses a recording stub for subprocess.run that captures the
 ``systemctl --user unset-environment`` call.

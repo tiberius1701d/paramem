@@ -264,7 +264,7 @@ def post_chunks(
 _UNREACHABLE_HINT = (
     "Run `pstatus` to diagnose — if startup was refused by the encryption "
     "gate, pstatus prints the Reason / Cause / Remedy block. "
-    "See SECURITY.md §4 for recovery."
+    "See SECURITY.md for recovery."
 )
 
 

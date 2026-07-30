@@ -73,9 +73,9 @@ class ScannedPdfRejectedError(ValueError):
 # Derived from the single per-call token envelope
 # (``consolidation.extraction_anonymize_token_envelope``, default 8192 —
 # ``paramem/cloud/anonymize.py``'s ``_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE``),
-# NOT an independent heuristic (.agent/plan-anonymize-slicing.md U6/§5.5). A
-# document chunk is consumed by two local calls, in order: session-tier
-# extraction (``configs/prompts/extraction.txt``, the chunk fills its
+# NOT an independent heuristic. A document chunk is consumed by two local
+# calls, in order: session-tier extraction
+# (``configs/prompts/extraction.txt``, the chunk fills its
 # ``{transcript}`` slot — ``paramem/graph/flows.py``'s ``extract_graph``
 # docstring: "document chunks land in the {transcript} slot of the same
 # prompt"), then anonymize on the extracted facts AND the chunk itself
@@ -91,12 +91,14 @@ class ScannedPdfRejectedError(ValueError):
 #
 # ``f`` is the extracted-facts-JSON-to-chunk token ratio — NOT folded into
 # the template term (a prior revision of this derivation approximated it
-# that way and under-budgeted the facts term by ~4x; see review finding
-# B2). ``f`` is derived from a repo-recorded measurement, not re-measured
-# here: ``paramem/graph/extractor.py``'s ``_DEFAULT_FILTER_MAX_TOKENS``
-# comment records "Empirical worst-case observed output for a dense resume
-# chunk was ~2200 tokens" for the local extraction call over the chunker's
-# then-1500-word max. That 2200-token figure is local EXTRACTION's raw
+# that way and under-budgeted the facts term by ~4x, which let a dense
+# chunk's anonymize call overrun the envelope; carrying ``f`` as its own
+# term is the fix). ``f`` is derived from a repo-recorded measurement, not
+# re-measured here: ``paramem/graph/extractor.py``'s
+# ``_DEFAULT_FILTER_MAX_TOKENS`` comment records "Empirical worst-case
+# observed output for a dense resume chunk was ~2200 tokens" for the local
+# extraction call over the chunker's then-1500-word max. That 2200-token
+# figure is local EXTRACTION's raw
 # output (the triples JSON an extraction call emits for a dense chunk),
 # used here as the anonymize call's "facts" term proxy — the extracted
 # facts an anonymize call renders into ``facts_json`` derive from that same
@@ -130,22 +132,38 @@ class ScannedPdfRejectedError(ValueError):
 # (``pyproject.toml``'s ``[tool.setuptools.package-data]`` ships only
 # ``web/static/*`` and ``training/donor_fixture.json``) and this module's
 # own docstring above states the CLI must stay portable to a host that
-# does not have the operator's server-side config/prompts checked out
-# (the plan's own §5.5 "Option (a) rejected" reasoning for why the ratio
-# itself is a compiled-in constant, not a live yaml/file read) — an
+# does not have the operator's server-side config/prompts checked out — an
 # import-time file read here would make `import
 # paramem.graph.document_chunker` (and therefore the CLI) fail outside a
-# full repo checkout. The exact-equality test is what keeps this literal
-# honest instead.
+# full repo checkout.
 #
-# Measured with the production tokenizer (Mistral 7B, U6.1, 2026-07-28)
-# for ``f`` only, counts only — see ``.agent/plan-anonymize-slicing.md``
-# §5.5's privacy rule, plus the repo-recorded extractor.py figure below;
-# ``anon_template`` and ``r_prose`` need no tokenizer, per above:
+# The rejected alternative was to compute this constant (and, upstream,
+# the words->tokens ratio itself) at import time from the live
+# yaml/prompt files, so that no recorded number could ever go stale. It
+# was rejected for the reason just given: a config-free, tokenizer-free
+# import is what makes both this module and
+# ``paramem/utils/tokens.py`` usable from a CLI that has no server-side
+# checkout and no model in memory, and an import-time read trades that
+# property away for staleness protection that a test can provide instead.
+# Hence both are compiled-in literals whose honesty is enforced from the
+# outside: the ratio by a boot-time drift check against its
+# ``consolidation.extraction_token_estimate_ratio`` yaml mirror (config
+# load fails on mismatch), and this cap by the exact-equality derivation
+# test described above, which recomputes the same formula from the live
+# prompt file on every run.
+#
+# Measured with the production tokenizer (Mistral 7B, 2026-07-28) for
+# ``f`` only, and COUNTS ONLY: that measurement runs over real personal
+# records, so nothing but the resulting integers may be written down here
+# or anywhere else tracked — never the measured text, and never the script
+# that reads it (the same rule that keeps ``paramem/utils/tokens.py``'s
+# ratio-measurement script out of this repository). ``f``'s numerator is
+# the repo-recorded extractor.py figure; ``anon_template`` and ``r_prose``
+# need no tokenizer at all, per above:
 #   envelope               = 8192 tok  (the single anonymize-call budget)
 #   anon_template words    = 1555 words (configs/prompts/anonymization.txt,
 #               rendered empty, current file — recomputed live by tests)
-#   r_prose   = 1.9126 tokens/word  (document shape, U6.1 — the same
+#   r_prose   = 1.9126 tokens/word  (document shape — the same
 #               measurement recorded as tokens.py's "document shape (CV)"
 #               row feeding ``MEASURED_TOKENS_PER_WORD``)
 #   anon_template = ceil(1555 * 1.9126)                          =  2975 tok
@@ -157,16 +175,22 @@ class ScannedPdfRejectedError(ValueError):
 #   cap_words = floor(chunk_real_tokens / r_prose)
 #             = floor(1865 / 1.9126)                              =   974 words
 #
-# The MAX ratio does NOT shrink this cap: the boundary check
-# (``chunk_words <= cap_words``) is expressed in the ESTIMATOR'S OWN UNIT so
-# the shipped ratio cancels out of every runtime comparison (§5.5) —
+# ``cap_words`` above is a REAL-token derivation, but the shipped constant
+# is deliberately NOT stored in real tokens — it is re-expressed in the
+# estimator's own unit:
 #     _DOC_MAX_TOKENS = cap_words * MEASURED_TOKENS_PER_WORD = 974 * 3.4 = 3311 tok
-# 974 words is 64.9% of today's 1500-word cap — above the 60% notify
-# threshold (.agent/plan-anonymize-slicing.md §11); no owner escalation
-# required. This is a real reduction in per-chunk ingest density (more
-# extraction/anonymize calls per document) relative to the pre-B2-fix
-# figure, not the near-zero shrink the original (incorrect) derivation
-# reported — see R9.
+# That is why the MAX ratio (3.4, calibrated on fact JSON) does not shrink
+# the cap even though it over-counts prose by ~1.8x. Every runtime boundary
+# check is ``estimate_tokens(text) <= max_tokens``, i.e.
+# ``words * ratio <= cap_words * ratio``: the ratio appears on BOTH sides
+# and cancels, so the decision reduces to ``chunk_words <= cap_words``
+# whatever the ratio happens to be. Store the cap in real tokens instead
+# and the cancellation is lost — the same 3.4 estimator would then measure
+# a 974-word prose chunk as 3311 "tokens" against an 1865-real-token
+# ceiling and cut documents to roughly half the derived length, and any
+# base-model swap that shifts the ratio would silently move the cap.
+# Pinned by ``tests/test_document_chunker.py``'s
+# ``TestDocMaxTokensDerivation::test_ratio_cancellation_invariant``.
 _DOC_MAX_TOKENS: int = 3311
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not
 # derived from the envelope). Real threshold is unchanged from before this
@@ -445,7 +469,8 @@ def _overlap_tokens_to_words(overlap_tokens: int) -> int:
     ``r_prose`` here would mix units within one comparison (correct against
     a real-token target, inconsistent against every other quantity in the
     same accumulator) — the opposite of the unit coherence this module's
-    counting was migrated to (.agent/plan-anonymize-slicing.md U6). The
+    counting is built on, where every threshold and every running total is
+    denominated in the one estimator unit. The
     practical effect: a caller's ``overlap_tokens=N`` request resolves to
     fewer WORDS than ``N`` divided by the document's true prose ratio would
     give (``r_prose / MEASURED_TOKENS_PER_WORD`` ≈ 56% of that), i.e. this

@@ -184,7 +184,7 @@ def update_backup_state(
     """Read-modify-write the state file with the result of a new backup run.
 
     Acquires an exclusive ``fcntl.flock`` on ``state_dir/backup.lock`` before
-    the read-modify-write to serialise concurrent callers (Fix 3).
+    the read-modify-write to serialise concurrent callers.
 
     Delegates locking and atomic-write mechanics to
     :func:`paramem.server.atomic_json.flock_rmw`.

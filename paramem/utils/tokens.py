@@ -35,9 +35,10 @@ them — a single ratio calibrated on prose badly underestimates fact JSON,
 which carries many tokens per whitespace-delimited word (punctuation,
 quoting, and key names are each their own token(s) but not their own
 "word"). The measurement script is intentionally not part of this
-repository (it reads real personal records for counts only — see
-``.agent/plan-anonymize-slicing.md`` §5.5/U6.1); only the resulting
-integers are recorded in the comment on :data:`MEASURED_TOKENS_PER_WORD`.
+repository: it reads real personal records (for counts only), and neither
+those records nor a script pointed at them may be committed. Only the
+resulting integers are recorded in the comment on
+:data:`MEASURED_TOKENS_PER_WORD`.
 
 ``paramem/server/config.py``'s ``consolidation.extraction_token_estimate_ratio``
 carries the operator-facing copy of this same measurement, and
@@ -56,18 +57,20 @@ logger = logging.getLogger(__name__)
 # Fallback words->tokens ratio. MEASURED ONCE with the production tokenizer
 # (Mistral 7B, mistralai/Mistral-7B-Instruct-v0.3, pinned by
 # tests/fixtures/server.yaml) over the three payload shapes the system
-# actually ingests (U6.1, .agent/plan-anonymize-slicing.md §5.5). Value is
-# the MAX of the three per-shape ratios, rounded up to 1 decimal: the
-# fallback must bound, not average.
+# actually ingests. Value is the MAX of the three per-shape ratios, rounded
+# up to 1 decimal: the fallback must bound, not average.
 #   transcript shape    : 188 words   / 270 tokens  = 1.44 tokens/word
 #   document shape (CV) : 1534 words  / 2934 tokens = 1.91 tokens/word
 #   fact-JSON shape      : 2415 words / 8191 tokens = 3.39 tokens/word  <- MAX
 # PUBLIC (no leading underscore): paramem.graph.document_chunker imports
 # this cross-module to keep its own offline-derived _DOC_MAX_TOKENS
-# constant in the SAME estimator unit as this module's runtime fallback
-# (the ratio-cancellation property, .agent/plan-anonymize-slicing.md
-# §5.5/item 37b) — a private name masked that as an implementation detail
-# when it is in fact a supported cross-module read surface.
+# constant in the SAME estimator unit as this module's runtime fallback:
+# _DOC_MAX_TOKENS is a word cap MULTIPLIED by this ratio, and the chunker
+# compares it against tokenizer-free estimate_tokens() output built from
+# the same ratio, so the ratio cancels out of that comparison — but only
+# while both sides read THIS constant. A private name masked that as an
+# implementation detail when it is in fact a supported cross-module read
+# surface.
 MEASURED_TOKENS_PER_WORD: float = 3.4
 
 
@@ -124,7 +127,7 @@ def estimate_tokens(
 
 # Synthetic fixture samples for check_ratio_drift — one per payload shape
 # that can dominate the ratio (transcript / document prose / fact-JSON).
-# NEVER real ingested data (see the module docstring's U6.1 privacy rule):
+# NEVER real ingested data (see the module docstring's privacy rule):
 # a fictional transcript fragment, a fictional document-prose fragment, and
 # a compact fact-JSON fragment using fictional entities, each sized enough
 # to make the per-word ratio a meaningful re-measurement.

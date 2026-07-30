@@ -747,7 +747,7 @@ class TestPruneDryRun:
 
 
 # ---------------------------------------------------------------------------
-# Fix 11 — decrypt error code distinction
+# Decrypt error code distinction
 # ---------------------------------------------------------------------------
 
 

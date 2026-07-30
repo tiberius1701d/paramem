@@ -392,16 +392,16 @@ def test_unload_failure_does_not_block_profile_update():
 
 
 # ---------------------------------------------------------------------------
-# Fix 1: CPU pair storage gated on load success
+# CPU pair storage gated on load success
 # ---------------------------------------------------------------------------
 
 
 def test_stt_cpu_pair_not_stored_when_load_fails(caplog):
     """When stt_cpu.load() returns False, _state['stt_cpu'] must stay None and a WARNING is logged.
 
-    Exercises the production code path added by Fix 1: the CPU-pair boot
-    block in the lifespan function now captures the return value of
-    ``stt_cpu.load()`` and guards ``_state["stt_cpu"]`` assignment on it.
+    Exercises the production code path where the CPU-pair boot block in the
+    lifespan function captures the return value of ``stt_cpu.load()`` and
+    guards the ``_state["stt_cpu"]`` assignment on it.
     This mirrors the existing GPU-branch gate.
 
     Because the STT CPU init is embedded in the long lifespan function, we
@@ -456,7 +456,7 @@ def test_stt_cpu_pair_not_stored_when_load_fails(caplog):
 def test_tts_cpu_pair_not_stored_when_load_fails(caplog):
     """When tts_cpu.is_loaded is False, _state['tts_cpu'] must stay None and a WARNING is logged.
 
-    Exercises the production code path added by Fix 1 for the TTS CPU pair:
+    Exercises the production code path for the TTS CPU pair:
     ``is_loaded`` is checked after ``load_all()`` completes; the instance is
     only stored on success.
     """
