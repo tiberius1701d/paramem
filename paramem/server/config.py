@@ -426,7 +426,6 @@ class VramConfig:
     cooldown_gate_poll_s: int = 5
     cooldown_gate_max_wait_boot_s: int = 60
     cooldown_gate_max_wait_fold_s: int = 300
-    cooldown_gate_max_wait_inference_s: int = 30
 
     def __post_init__(self) -> None:
         if not (0.0 < self.process_cap_fraction <= 1.0):
@@ -485,11 +484,6 @@ class VramConfig:
             raise ValueError(
                 f"vram.cooldown_gate_max_wait_fold_s must be >= 0; "
                 f"got {self.cooldown_gate_max_wait_fold_s!r}"
-            )
-        if self.cooldown_gate_max_wait_inference_s < 0:
-            raise ValueError(
-                f"vram.cooldown_gate_max_wait_inference_s must be >= 0; "
-                f"got {self.cooldown_gate_max_wait_inference_s!r}"
             )
 
 

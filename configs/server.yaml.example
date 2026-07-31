@@ -925,15 +925,16 @@ vram:
   cuda_crashloop_burst: 2
   cuda_fault_history_window_s: 600
   # Pre-task GPU cooldown gate (Tier-2 TDR-prevention). Waits until GPU temp
-  # <= cooldown_gate_threshold_c before each GPU-intense burst (boot preload,
-  # training fold, inference generate). 52 °C matches the gpu-cooldown.sh
-  # everyday-working threshold; the device idles ~48–50 °C so the gate is
-  # instant in steady state. Set cooldown_gate_threshold_c=0 to disable.
+  # <= cooldown_gate_threshold_c before each sustained GPU burst (boot preload,
+  # training fold). Inference is NOT gated: STT pre-heats the GPU past any
+  # near-idle threshold, and a per-request stall breaks voice-pipeline client
+  # timeouts. 52 °C matches the gpu-cooldown.sh everyday-working threshold;
+  # the device idles ~48–50 °C so the gate is instant in steady state.
+  # Set cooldown_gate_threshold_c=0 to disable.
   cooldown_gate_threshold_c: 52
   cooldown_gate_poll_s: 5
   cooldown_gate_max_wait_boot_s: 60    # < systemd TimeoutStartSec=120
   cooldown_gate_max_wait_fold_s: 300
-  cooldown_gate_max_wait_inference_s: 30
 
 # ============================================================================
 # SECURITY

@@ -701,7 +701,6 @@ vram:
   cooldown_gate_poll_s: 5
   cooldown_gate_max_wait_boot_s: 60
   cooldown_gate_max_wait_fold_s: 300
-  cooldown_gate_max_wait_inference_s: 30
 
 # ============================================================================
 # SECURITY
