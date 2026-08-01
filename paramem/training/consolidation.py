@@ -35,6 +35,7 @@ from paramem.memory.entry import (
 )
 from paramem.models.loader import atomic_save_adapter, measured_adapter_init_state, switch_adapter
 from paramem.server.fold_telemetry import record_fold_telemetry
+from paramem.server.trial_state import trial_active
 from paramem.training import graph_tier
 from paramem.training.donor import DONOR_BUILD_ADAPTER_NAME, DONOR_KEY_FLOOR
 from paramem.training.key_registry import KeyRegistry
@@ -834,6 +835,11 @@ class ConsolidationLoop:
         /consolidate handlers to block new consolidation cycles while the
         operator reviews trial results.
 
+        Delegates the "is a TRIAL active" predicate to
+        :func:`paramem.server.trial_state.trial_active`, shared with
+        ``paramem.server.app._trial_active`` so the two refusals never drift
+        apart.
+
         Parameters
         ----------
         state:
@@ -846,12 +852,7 @@ class ConsolidationLoop:
         TrialActiveError
             When ``state["migration"]["state"] == "TRIAL"``.
         """
-        if state is None:
-            return
-        migration = state.get("migration")
-        if migration is None:
-            return
-        if migration.get("state") == "TRIAL":
+        if trial_active(state):
             raise TrialActiveError(
                 "consolidation blocked: a migration TRIAL is active. "
                 "Use POST /migration/accept or POST /migration/rollback to proceed."

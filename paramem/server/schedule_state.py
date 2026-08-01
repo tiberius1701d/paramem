@@ -1,10 +1,13 @@
 """Durable last-attempt stamp for the consolidation suspend/power-off catch-up gate.
 
 Boundary: this module owns ONLY the on-disk representation of "when did the
-scheduled-tick dispatcher last actually attempt a run" for non-calendar-exact
-cadences (see ``systemd_timer`` module docstring — a heartbeat schedule needs
-a durable stamp because the rendered ``OnCalendar`` timer is a wakeup source
-only, not the schedule itself).
+scheduled-tick dispatcher last actually attempt a run" — for EVERY cadence
+kind, not only non-calendar-exact ones (see ``schedule_grammar.scheduled_run_due``
+/ ``server/app.py::_dispatch_consolidation``). A non-exact cadence needs the
+stamp because its rendered ``OnCalendar`` timer is a wakeup source only, not
+the schedule itself; an exact cadence needs it too, to keep a duplicate or
+manual-adjacent tick inside the same calendar mark's window from being read
+as due twice.
 
 Deliberately NOT in ``systemd_timer.py``: the consumer is the runtime
 dispatcher in ``app.py`` (``scheduled_tick`` →
@@ -55,9 +58,11 @@ def read_last_scheduled_run(state_dir: Path) -> float | None:
 def write_last_scheduled_run(state_dir: Path, epoch: float) -> None:
     """Atomically stamp *epoch* as the last scheduled-tick attempt.
 
-    *epoch* must already be floored to the heartbeat grid
-    (``systemd_timer.floor_to_heartbeat``) — this function does not floor;
-    it writes exactly what it is given.
+    *epoch* must already be the value produced by
+    ``schedule_grammar.scheduled_run_stamp_value`` (a calendar mark for
+    anchored/exact-divisor cadences, a heartbeat-floored stamp for non-exact
+    intervals) — this function does not floor or otherwise transform it; it
+    writes exactly what it is given.
 
     Parameters
     ----------

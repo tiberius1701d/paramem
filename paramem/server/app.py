@@ -87,6 +87,7 @@ from paramem.server.trial_state import (
     TrialMarker,
     clear_trial_marker,
     read_trial_marker,
+    trial_active,
     write_trial_marker,
 )
 from paramem.server.voice_pipeline import process_utterance
@@ -158,6 +159,20 @@ _state = {
     "reclaim_task": None,
     "config_path": None,
     "config_drift_task": None,
+    # Base-swap orchestration task handle, shared by every launch site (the
+    # lifespan's own crash-recovery resume, the /gpu/acquire deferred
+    # Phase-B re-launch, and /migration/confirm's fresh Phase-A launch —
+    # every ``asyncio.create_task(_run_base_swap_orchestration(...))`` call
+    # site stores its handle here). Cleared by its own done callback once it
+    # completes; awaited by the boot-completion task before any catch-up
+    # work runs, and cancelled at shutdown alongside its task siblings. Reset
+    # to None at every lifespan start (see the lifespan slot-hygiene block)
+    # so a second lifespan in one process never awaits a stale handle.
+    "base_swap_task": None,
+    # Boot-completion catch-up task (timer reconcile + backup/consolidation
+    # catch-up dispatch) — see _run_boot_completion_tasks. Cancelled at
+    # shutdown and cleared so a repeated lifespan (TestClient) starts clean.
+    "boot_completion_task": None,
     "mode": "local",  # "local" or "cloud-only"
     # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
     "cloud_only_reason": None,
@@ -471,9 +486,11 @@ class ConsolidateResponse(BaseModel):
         absorbed into a new interim slot), ``"reconcile"`` (main memory rebuilt
         from its own stored knowledge, interim slots left alone), or ``"auto"``
         when the dispatch was refused before the schedule could resolve it.
-        ``POST /scheduled-tick`` is the only door that requests ``AUTO``, so
-        this is how its caller learns which of the two the deadline math
-        resolved to; every other door (``/consolidate``, ``/consolidate/interim``,
+        ``POST /scheduled-tick`` is the only REST door that requests
+        ``AUTO`` (the boot-completion catch-up task also requests it, but
+        in-process rather than through this response schema), so this is
+        how its caller learns which of the two the deadline math resolved
+        to; every other door (``/consolidate``, ``/consolidate/interim``,
         ``/reconsolidate``) echoes the action it asked for directly.
     """
 
@@ -1944,6 +1961,22 @@ async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
     config = _state["config"]
 
+    # Slot hygiene: a second lifespan in the same process (TestClient reuse,
+    # or an in-process restart across separate event loops) must never await
+    # a task handle left behind by a previous lifespan's shutdown.
+    # Shutdown's ``.cancel()`` calls are not awaited (see the shutdown block
+    # below), so the done-callback that clears these slots may not have run
+    # yet when a new lifespan begins — and a task created on one event loop
+    # cannot even be awaited from another. ``base_swap_task`` is the one
+    # actually awaited by ``_run_boot_completion_tasks``, so a stale handle
+    # there would raise ``CancelledError``/``RuntimeError`` outside that
+    # function's own ``except Exception`` isolation; ``boot_completion_task``
+    # is unconditionally overwritten later in this same lifespan and is
+    # never awaited elsewhere, so it carries no such hazard, but is reset
+    # here too for the same clean-slate guarantee.
+    _state["base_swap_task"] = None
+    _state["boot_completion_task"] = None
+
     # Deployment-integrity gate: fail loudly if the shared prompt assets are
     # missing (broken checkout / non-editable pip install). Prompts are not
     # packaged; a repo checkout always has them. Runs before anything expensive.
@@ -2409,15 +2442,19 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Wyoming TTS server listening on port %d", config.tts.port)
 
-    # Reconcile the systemd user timer with the INTERIM cadence
-    # (= refresh_cadence, e.g. "12h").  The timer fires POST /scheduled-tick
-    # at every interim boundary; the tick handler decides whether this tick
-    # is an interim train or a full fold via _is_full_cycle_due.  The full
-    # period (refresh_cadence × max_interim_count, e.g. 84h) is still derived
-    # for logging and for the deadline backstop in _is_full_cycle_due.
-    # Timer survives server restart.
-    from paramem.server import systemd_timer
-
+    # Log the configured cadence for correlation with early boot logs.  The
+    # INTERIM cadence (= refresh_cadence, e.g. "12h") drives POST
+    # /scheduled-tick at every interim boundary; the tick handler decides
+    # whether a given tick is an interim train or a full fold via
+    # _is_full_cycle_due.  The full period (refresh_cadence ×
+    # max_interim_count, e.g. 84h) is derived for logging and for the
+    # deadline backstop in _is_full_cycle_due.
+    #
+    # Actual systemd timer reconciliation (both the consolidation and backup
+    # timers) happens off the event loop in the boot-completion task
+    # (_run_boot_completion_tasks, scheduled below) rather than here — a
+    # blocking subprocess.run in this pre-yield path would stall uvicorn's
+    # bind and the Wyoming STT/TTS listeners behind it.
     interim_cadence = config.consolidation.refresh_cadence or ""
     full_period = config.consolidation.consolidation_period_string
     logger.info(
@@ -2427,24 +2464,6 @@ async def lifespan(app: FastAPI):
         config.consolidation.max_interim_count,
         full_period or "<manual only>",
     )
-    try:
-        msg = systemd_timer.reconcile(interim_cadence)
-        logger.info("%s", msg)
-    except Exception:
-        logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
-
-    # Reconcile the scheduled-backup timer.
-    from paramem.backup import timer as backup_timer
-
-    backup_schedule = config.security.backups.schedule or ""
-    try:
-        backup_msg = backup_timer.reconcile(
-            backup_schedule,
-            python_path=sys.executable,
-        )
-        logger.info("%s", backup_msg)
-    except Exception:
-        logger.exception("Failed to reconcile backup timer — continuing without scheduled backups")
 
     _state["mode"] = "cloud-only" if cloud_only else "local"
     _state["event_loop"] = asyncio.get_running_loop()
@@ -2507,7 +2526,14 @@ async def lifespan(app: FastAPI):
         )
         _bs_state_dir = (config.paths.data / "state").resolve()
         _bs_backups_root = (config.paths.data / "backups").resolve()
-        asyncio.create_task(
+        # Handle stored in _state (mirroring reclaim_task/config_drift_task
+        # above) so it is awaitable (the boot-completion task awaits it
+        # before running its own catch-up work) and cancellable at shutdown;
+        # an unstored asyncio.create_task(...) result is a GC hazard (the
+        # event loop only holds a weak reference). Cleared by its own
+        # done-callback once the orchestration finishes, guarded so a newer
+        # launch that already replaced the slot is never clobbered.
+        _state["base_swap_task"] = asyncio.create_task(
             _run_base_swap_orchestration(
                 candidate_path_str=str(_bs_live_cfg),  # config already renamed in Phase A
                 live_config_path=_bs_live_cfg,
@@ -2519,6 +2545,9 @@ async def lifespan(app: FastAPI):
                 candidate_hash=_bs_resume.candidate_config_sha256,
                 resume_phase=_bs_resume.base_swap_phase,
             )
+        )
+        _state["base_swap_task"].add_done_callback(
+            functools.partial(_clear_state_task, "base_swap_task")
         )
         logger.info(
             "base-swap resume launched: base_swap_phase=%s old=%s new=%s",
@@ -2581,6 +2610,21 @@ async def lifespan(app: FastAPI):
         per_user_active=_posture_store is not None,
     )
 
+    # Boot-completion catch-up: timer reconciliation + missed-schedule
+    # backup/consolidation dispatch. Scheduled here (still pre-yield) but
+    # deliberately NOT awaited — uvicorn only binds the port after this
+    # generator's yield, and a Persistent=true systemd tick that fires
+    # during reconcile has nowhere to land until then, so this work runs in
+    # the background rather than delaying server-ready. Runs from a
+    # module-level coroutine (_run_boot_completion_tasks), not a closure
+    # over this frame's locals, so it holds no reference to the base model,
+    # the tokenizer, or any other lifespan-frame local (see the
+    # BASE-MODEL HOLDER invariant in _release_base_model_in_process).
+    _state["boot_completion_task"] = asyncio.create_task(_run_boot_completion_tasks())
+    _state["boot_completion_task"].add_done_callback(
+        functools.partial(_clear_state_task, "boot_completion_task")
+    )
+
     yield
 
     # Shutdown — data-safety-first order:
@@ -2624,10 +2668,14 @@ async def lifespan(app: FastAPI):
         _state["reclaim_task"].cancel()
     if _state.get("config_drift_task"):
         _state["config_drift_task"].cancel()
+    if _state.get("base_swap_task"):
+        _state["base_swap_task"].cancel()
+    if _state.get("boot_completion_task"):
+        _state["boot_completion_task"].cancel()
 
     # Release the base model — single owner for base-model + bt/loop + intent-handle
-    # release. Replaces the former if _state["model"]: unload_model(...) branch,
-    # which was dead once _release_base_model_in_process ran from the signal handler.
+    # release. Shutdown does not separately call unload_model on _state["model"];
+    # _release_base_model_in_process is the only release path here.
     _t = time.perf_counter()
     _release_base_model_in_process()
     logger.info("shutdown timing: _release_base_model_in_process %.2fs", time.perf_counter() - _t)
@@ -2668,6 +2716,214 @@ async def lifespan(app: FastAPI):
     logger.info("shutdown timing: safe_empty_cache %.2fs", time.perf_counter() - _t)
     _total = time.perf_counter() - _shutdown_t0
     logger.info("shutdown timing: total lifespan teardown %.2fs", _total)
+
+
+def _clear_state_task(key: str, task: "asyncio.Task") -> None:
+    """``asyncio.Task`` done-callback: clear ``_state[key]`` when it still holds *task*.
+
+    Shared by every one-shot background task this module stores a handle
+    for (``base_swap_task``, ``boot_completion_task``) so a finished task's
+    slot does not keep pointing at a dead ``Task`` object forever. Guards on
+    identity (``_state.get(key) is task``) rather than unconditionally
+    clearing, so a done-callback firing after a newer task has already
+    replaced the slot never clobbers that newer task's handle.
+    """
+    if _state.get(key) is task:
+        _state[key] = None
+
+
+def _reconcile_scheduling_timers(config) -> None:
+    """Reconcile both systemd user timers (consolidation tick, scheduled backup) against *config*.
+
+    Single call site for timer reconciliation, shared by the boot-completion
+    task (:func:`_run_boot_completion_tasks`, dispatched off the event loop
+    via ``asyncio.to_thread``) and a live config apply (``_apply_config_live``,
+    which already runs in an executor thread) — a schedule edit to either
+    ``consolidation.refresh_cadence`` or ``security.backups.schedule`` reaches
+    systemd from every call site that applies config, not only server boot.
+
+    Each timer's reconcile is independently guarded — a failure in one (a
+    malformed schedule string, a ``systemctl`` error) is logged and does not
+    block the other.
+
+    Blocking under the hood: both ``systemd_timer.reconcile`` and
+    ``backup_timer.reconcile`` share ``systemd_timer._reconcile_timer``,
+    which shells out via ``subprocess.run``. Callers on the event loop must
+    dispatch this through ``asyncio.to_thread``/an executor — never call it
+    directly from an ``async def``.
+
+    Args:
+        config: The ``ServerConfig`` to read ``consolidation.refresh_cadence``
+            and ``security.backups.schedule`` from.
+    """
+    from paramem.backup import timer as backup_timer
+    from paramem.server import systemd_timer
+
+    interim_cadence = config.consolidation.refresh_cadence or ""
+    try:
+        msg = systemd_timer.reconcile(interim_cadence)
+        logger.info("%s", msg)
+    except Exception:
+        logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
+
+    backup_schedule = config.security.backups.schedule or ""
+    try:
+        backup_msg = backup_timer.reconcile(backup_schedule, python_path=sys.executable)
+        logger.info("%s", backup_msg)
+    except Exception:
+        logger.exception("Failed to reconcile backup timer — continuing without scheduled backups")
+
+
+async def _run_boot_completion_tasks() -> None:
+    """Run boot-completion catch-up work once the lifespan has finished setting up server state.
+
+    Runs as a background task created in ``lifespan`` (handle in
+    ``_state["boot_completion_task"]``, cancelled at shutdown alongside its
+    task siblings). A module-level coroutine, not a closure over the
+    lifespan frame — it reads ``_state`` fresh at execution time and holds
+    no reference to the base model, the tokenizer, or any lifespan-frame
+    local (the BASE-MODEL HOLDER invariant — see
+    ``_release_base_model_in_process``).
+
+    Exists because ``systemd``'s ``Persistent=true`` catch-up ticks fire into
+    the boot window before uvicorn binds the port (bind happens only after
+    this lifespan's ``yield``) and are lost — the timer's own curl has no
+    retry, and systemd stamps the catch-up as delivered on trigger, not on
+    HTTP success. The server owns catch-up itself instead: at boot
+    completion it evaluates dueness directly and dispatches through the
+    existing doors (the extracted backup seam, and the same in-process
+    consolidation dispatch ``POST /scheduled-tick`` uses).
+
+    In order — each step isolated in its own ``try/except``, so a failure in
+    one (logged via ``logger.exception``) never prevents the remaining,
+    independent steps from running:
+
+    1. Await ``_state["base_swap_task"]`` (a base-swap crash-recovery
+       orchestration launched earlier in this same lifespan, if any) so the
+       catch-up work below never races an in-flight config/model swap.
+    2. Backup catch-up, evaluated and — when due — run to completion BEFORE
+       the consolidation catch-up: a fold rewrites the tier adapter
+       directories the snapshot bundle reads, so running the backup after a
+       fold would capture the fold's own output as though it predated the
+       fold.
+    3. Consolidation catch-up via the identical in-process ``AUTO`` dispatch
+       ``POST /scheduled-tick`` uses, dispatched only when a read-only peek
+       at the durable cadence stamp (:func:`~paramem.server.schedule_grammar.scheduled_run_due`
+       against :func:`~paramem.server.schedule_state.read_last_scheduled_run`
+       — the identical predicate and stamp the arbitrator itself reads, not
+       a second dueness implementation) says ``DUE``. ``_dispatch_consolidation``
+       owns every dueness/guard/trial decision below that point; this task
+       duplicates none of them. A ``NO_STAMP`` peek is left for the
+       arbitrator's own seed-and-noop on the next real tick rather than
+       seeded here, so there is exactly one seeding owner. Dispatching
+       unconditionally would run the arbitrator's side-effecting pre-stages —
+       retroactive orphan-session claim, ``_triage_pending_sessions``
+       retiring unattributable pending sessions regardless of TTL, and the
+       ``pending_rehydration`` migration branch seizing the GPU — on every
+       boot with a real cadence configured, whether or not a tick was
+       actually missed.
+    4. Reconcile both systemd user timers off the event loop, LAST —
+       :func:`_reconcile_scheduling_timers` shells out via
+       ``subprocess.run`` per timer, dispatched through ``asyncio.to_thread``
+       so neither it nor a ``Persistent`` catch-up tick systemd fires as a
+       side effect of enabling the unit ever stalls the Wyoming STT/TTS
+       listeners. Running this last (rather than first) means both catch-ups
+       above have already stamped/completed by the time a reconcile-triggered
+       ``Persistent=true`` tick could land — that tick then curls a live
+       server and reads not-due, rather than racing the boot task's own
+       catch-up work into a double run.
+
+    Because step 1 blocks every later step on the base-swap task, an
+    in-flight base-swap resume at boot delays step 4's timer reconcile (and
+    steps 2-3) for the resume's full duration. This is deliberate: ``config``
+    is read fresh from ``_state`` immediately after step 1 completes, and a
+    base-swap resume replaces that config — reconciling (or dispatching
+    catch-up) before the swap finishes would act on the pre-swap config.
+    """
+    _bst = _state.get("base_swap_task")
+    if _bst is not None:
+        try:
+            await _bst
+        except Exception:
+            logger.exception("Boot catch-up: base-swap task failed — continuing with catch-up")
+
+    config = _state.get("config")
+    if config is None:
+        return
+
+    from paramem.server.schedule_grammar import (
+        ScheduleDueStatus,
+        parse_schedule_atom,
+        scheduled_run_due,
+    )
+
+    # --- Backup catch-up (must run BEFORE the consolidation catch-up). ---
+    try:
+        backup_schedule = config.security.backups.schedule or ""
+        _backup_atom = parse_schedule_atom(backup_schedule)
+        if _backup_atom is not None and _backup_atom.kind != "off":
+            from paramem.backup.state import last_attempt_epoch as _last_attempt_epoch
+
+            state_dir = (config.paths.data / "state").resolve()
+            _last_stamp = _last_attempt_epoch(state_dir)
+            # NO_STAMP -> RUN here (the opposite of consolidation's seed-and-noop
+            # below): a first backup is cheap and welcome, so its absence must
+            # not be faked into looking already-run — mirrors the same policy
+            # in backup/__main__.py's own standalone catch-up gate.
+            _due_status = scheduled_run_due(backup_schedule, _last_stamp)
+            if _due_status in (ScheduleDueStatus.DUE, ScheduleDueStatus.NO_STAMP):
+                logger.info(
+                    "Boot catch-up: scheduled backup is due (status=%s, schedule=%r) — "
+                    "running tier=daily",
+                    _due_status.value,
+                    backup_schedule,
+                )
+                # kinds mirrors what the paramem-backup systemd timer's runner
+                # itself delegates with (paramem/backup/__main__.py) — the
+                # operator's configured artifact list, not a hardcoded default.
+                _kinds = list(config.security.backups.artifacts)
+                await asyncio.to_thread(_create_backup, _kinds, "daily", None)
+            else:
+                logger.info(
+                    "Boot catch-up: scheduled backup not due (schedule=%r)", backup_schedule
+                )
+    except Exception:
+        logger.exception("Boot catch-up: backup step failed — continuing with remaining steps")
+
+    # --- Consolidation catch-up. ---
+    # Only when refresh_cadence is a real schedule, AND only when a read-only
+    # peek at the durable cadence stamp says DUE — see the docstring's step 3.
+    try:
+        cadence = config.consolidation.refresh_cadence or ""
+        _cadence_atom = parse_schedule_atom(cadence)
+        if _cadence_atom is not None and _cadence_atom.kind != "off":
+            from paramem.server import schedule_state as _schedule_state
+
+            _last_scheduled = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
+            _cadence_due = scheduled_run_due(cadence, _last_scheduled)
+            if _cadence_due is ScheduleDueStatus.DUE:
+                status, action = _dispatch_consolidation(ConsolidationAction.AUTO)
+                logger.info(
+                    "Boot catch-up: consolidation AUTO dispatch — status=%s action=%s",
+                    status,
+                    action.value,
+                )
+            else:
+                logger.info(
+                    "Boot catch-up: consolidation not due (status=%s, cadence=%r) — skipping",
+                    _cadence_due.value,
+                    cadence,
+                )
+    except Exception:
+        logger.exception(
+            "Boot catch-up: consolidation dispatch step failed — continuing with remaining steps"
+        )
+
+    # --- Timer reconcile — LAST (see docstring step 4). ---
+    try:
+        await asyncio.to_thread(_reconcile_scheduling_timers, config)
+    except Exception:
+        logger.exception("Boot catch-up: timer reconcile step failed")
 
 
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
@@ -4609,24 +4865,47 @@ async def gpu_acquire():
                             if _state.get("config_path")
                             else DEFAULT_SERVER_CONFIG_PATH
                         )
-                        asyncio.create_task(
-                            _run_base_swap_orchestration(
-                                candidate_path_str=str(_live_cfg_resume),
-                                live_config_path=_live_cfg_resume,
-                                state_dir=_sd_resume,
-                                backups_root=_br_resume,
-                                old_model=_deferred_marker.old_model,
-                                new_model=_deferred_marker.new_model,
-                                started_at=_deferred_marker.started_at,
-                                candidate_hash=_deferred_marker.candidate_config_sha256,
-                                resume_phase="phaseA_done",
+                        # Store the handle in the same slot _run_boot_completion_tasks
+                        # awaits and shutdown cancels — an unstored
+                        # asyncio.create_task(...) result is a GC hazard (the
+                        # event loop only holds a weak reference).
+                        # base_swap_active=False (checked above) means no
+                        # orchestration is currently running, but guard the
+                        # slot explicitly rather than silently overwriting: a
+                        # non-None handle here would mean a just-completed
+                        # orchestration's done-callback has not yet cleared
+                        # it, and launching a second one while that race is
+                        # open is not safe to assume away.
+                        if _state.get("base_swap_task") is not None:
+                            logger.warning(
+                                "/gpu/acquire: base_swap_task slot already occupied — "
+                                "skipping deferred Phase B re-launch this cycle "
+                                "(base_swap_active=False but a task handle is still "
+                                "present; retry once it clears)"
                             )
-                        )
-                        logger.info(
-                            "/gpu/acquire: re-launching deferred base-swap Phase B (old=%s new=%s)",
-                            _deferred_marker.old_model,
-                            _deferred_marker.new_model,
-                        )
+                        else:
+                            _state["base_swap_task"] = asyncio.create_task(
+                                _run_base_swap_orchestration(
+                                    candidate_path_str=str(_live_cfg_resume),
+                                    live_config_path=_live_cfg_resume,
+                                    state_dir=_sd_resume,
+                                    backups_root=_br_resume,
+                                    old_model=_deferred_marker.old_model,
+                                    new_model=_deferred_marker.new_model,
+                                    started_at=_deferred_marker.started_at,
+                                    candidate_hash=_deferred_marker.candidate_config_sha256,
+                                    resume_phase="phaseA_done",
+                                )
+                            )
+                            _state["base_swap_task"].add_done_callback(
+                                functools.partial(_clear_state_task, "base_swap_task")
+                            )
+                            logger.info(
+                                "/gpu/acquire: re-launching deferred base-swap Phase B "
+                                "(old=%s new=%s)",
+                                _deferred_marker.old_model,
+                                _deferred_marker.new_model,
+                            )
         elif _state.get("cloud_only_reason") == "insufficient_vram":
             # Free device memory cannot hold the model (an external GPU
             # consumer holds it). A restart would only re-hit the lifespan
@@ -6231,14 +6510,17 @@ def _apply_config_live() -> dict:
          first, then signal the carve.  A ``paths.*`` mix is always
          manual-restart regardless of other fields.
 
-    3b. Reconciles the consolidation systemd timer against config B's
-        ``consolidation.refresh_cadence`` (:func:`paramem.server.systemd_timer.reconcile`),
-        unconditionally and independent of the R-PORT/R-PATHS carve outcome.
-        This is stateless: it re-reads the PRESENT cadence and acts on it —
-        it never diffs against config A's former cadence, so a cadence-only
-        edit applies live (drift clears) without a restart. Skipped only when
-        config B failed to load. Never raises — logged and swallowed like
-        the other systemd reconcile call sites (see ``lifespan``).
+    3b. Reconciles both systemd timers — consolidation against config B's
+        ``consolidation.refresh_cadence`` and scheduled backup against
+        config B's ``security.backups.schedule`` — via
+        :func:`_reconcile_scheduling_timers`, unconditionally and
+        independent of the R-PORT/R-PATHS carve outcome. This is stateless:
+        it re-reads the PRESENT values and acts on them — it never diffs
+        against config A's former values, so a cadence-only or
+        backup-schedule-only edit applies live (drift clears) without a
+        restart. Skipped only when config B failed to load. Never raises —
+        each timer's reconcile is independently logged and swallowed inside
+        :func:`_reconcile_scheduling_timers`.
     4. Calls ``_live_reload_base_model(refresh_config_from_disk=True)`` for
        non-carve fields.
     5. On ``mode==local`` after the rebuild, calls
@@ -6375,32 +6657,25 @@ def _apply_config_live() -> dict:
                 )
 
         # ── scheduler reconcile: stateless re-read of the PRESENT cadence ──
-        # The systemd timer joins the live-apply mechanism like every other
-        # concern below: it re-reads consolidation.refresh_cadence straight
-        # from config B (the on-disk config being applied) and reconciles the
-        # timer to it. It never diffs against config A's former cadence — a
-        # cadence-only edit must apply live without a restart, so drift can
-        # clear on its own instead of only clearing via a restart that would
-        # then re-arm the very timer that fired the alert (self-prophecy).
-        # This runs even when the reload below carves off into a
-        # manual-restart path (R-PATHS / R-PORT) — the schedule is an
-        # independent concern from the base-model reload, and the operator
-        # still gets a live-applied cadence while the carve is pending a
-        # restart. TRIAL/migration semantics are preserved for free: this
-        # function (and therefore this reconcile) is only reached from
-        # accept/rollback, never from migration_confirm's disk-only candidate
-        # write, so a TRIAL candidate's cadence never arms the live timer.
+        # Both systemd timers join the live-apply mechanism like every other
+        # concern below: _reconcile_scheduling_timers re-reads
+        # consolidation.refresh_cadence AND security.backups.schedule
+        # straight from config B (the on-disk config being applied) and
+        # reconciles each timer to it. Neither diffs against config A's
+        # former values — a cadence-only or backup-schedule-only edit must
+        # apply live without a restart, so drift can clear on its own
+        # instead of only clearing via a restart that would then re-arm the
+        # very timer that fired the alert (self-prophecy). This runs even
+        # when the reload below carves off into a manual-restart path
+        # (R-PATHS / R-PORT) — the schedules are independent concerns from
+        # the base-model reload, and the operator still gets live-applied
+        # cadences while the carve is pending a restart. TRIAL/migration
+        # semantics are preserved for free: this function (and therefore
+        # this reconcile) is only reached from accept/rollback, never from
+        # migration_confirm's disk-only candidate write, so a TRIAL
+        # candidate's schedules never arm the live timers.
         if config_b is not None:
-            from paramem.server import systemd_timer
-
-            try:
-                sched_msg = systemd_timer.reconcile(config_b.consolidation.refresh_cadence or "")
-                logger.info("_apply_config_live: %s", sched_msg)
-            except Exception:
-                logger.exception(
-                    "_apply_config_live: failed to reconcile consolidation timer — "
-                    "continuing; cadence change may require a restart to apply"
-                )
+            _reconcile_scheduling_timers(config_b)
 
         restart_required_reason: str | None = None
         restart_eligible: bool = False
@@ -7459,13 +7734,34 @@ async def calibrate_name_route(req: calibrate_module.CalibrateNameRequest):
     return calibrate_module.calibrate_name(_state, req)
 
 
-async def require_no_trial() -> None:
-    """FastAPI dependency: refuse consolidation while a migration TRIAL is active.
+def _trial_active() -> bool:
+    """True when a migration TRIAL is in progress and consolidation must refuse.
+
+    Thin wrapper around :func:`paramem.server.trial_state.trial_active` bound
+    to this module's own ``_state`` — the single predicate shared by every
+    refusal that must never drift apart: :func:`require_no_trial` (the
+    FastAPI dependency — HTTP 409 on every consolidation route and on
+    ``/ingest-sessions``' in-handler gate), :func:`_consolidation_dispatch_guards`
+    (the arbitrator's own guard, ``"deferred_trial_active"``, for in-process
+    callers that never go through FastAPI's dependency resolution), and
+    ``ConsolidationLoop.guard_trial_state`` (the training-layer refusal for
+    callers, including experiment scripts, that carry the server ``_state``
+    dict).
 
     During a TRIAL the candidate store is live but unaccepted; starting a
     consolidation run would train against a store the operator may still roll
-    back.  Every consolidation door carries this guard, so the refusal is
-    identical whoever knocks.
+    back.
+    """
+    return trial_active(_state)
+
+
+async def require_no_trial() -> None:
+    """FastAPI dependency: refuse consolidation while a migration TRIAL is active.
+
+    Thin wrapper around :func:`_trial_active` — see its docstring for what
+    "trial active" means and why the predicate is shared with the
+    arbitrator's own guard. Every consolidation door carries this guard, so
+    the refusal is identical whoever knocks.
 
     Applied to the four consolidation routes only.  It is deliberately NOT a
     router-wide dependency: FastAPI resolves dependencies BEFORE request-body
@@ -7476,8 +7772,7 @@ async def require_no_trial() -> None:
     Raises:
         HTTPException 409 ``trial_active``: A migration TRIAL is in progress.
     """
-    migration = _state.get("migration") or {}
-    if migration.get("state") == "TRIAL":
+    if _trial_active():
         raise HTTPException(
             status_code=409,
             detail={
@@ -7498,9 +7793,13 @@ async def require_no_trial() -> None:
 async def scheduled_tick():
     """Systemd user-timer entrypoint (paramem-consolidate.timer).
 
-    Requests ``AUTO`` — the ONLY caller that does.  ``AUTO`` carries the
-    schedule's own bookkeeping: the suspend/power-off catch-up gate (a
-    heartbeat wakeup that is not yet due fires no cycle), the deadline
+    Requests ``AUTO``. The only other ``AUTO`` requester is the boot-completion
+    catch-up task (:func:`_run_boot_completion_tasks`), which dispatches
+    in-process rather than through this route — this is the only REST door
+    that does. ``AUTO`` carries the schedule's own bookkeeping: the
+    suspend/power-off catch-up gate (a tick that is not yet due against its
+    own cadence mark fires no cycle — the same universal gate applies whether
+    the request reaches here or the boot-completion task), the deadline
     resolution (:func:`_is_full_cycle_due` picking a full fold or an interim
     cycle), and the cadence stamp (:func:`_stamp_scheduled_run`) on dispatch.
     ``action`` in the response reports which of the two was resolved.  The
@@ -7754,8 +8053,7 @@ async def ingest_sessions(request: IngestSessionsRequest):
         )
 
     # Gate 4: migration TRIAL in progress
-    migration = _state.get("migration") or {}
-    if migration.get("state") == "TRIAL":
+    if _trial_active():
         from fastapi import HTTPException
 
         raise HTTPException(
@@ -8509,6 +8807,30 @@ async def migration_confirm(request: ConfirmRequest):
             live_config = _state.get("config")
             old_model_alias = getattr(live_config, "model_name", "") if live_config else ""
 
+            # Guard the base_swap_task slot BEFORE mutating any migration
+            # state below: the pre-checks earlier in this handler
+            # (current_state != "TRIAL", migration_lock held for this whole
+            # confirm) mean no other base-swap orchestration can be running
+            # here, but a non-None handle would mean a just-completed
+            # orchestration's done-callback has not yet cleared it — refuse
+            # rather than silently overwrite a handle
+            # _run_boot_completion_tasks/shutdown still expect to find.
+            if _state.get("base_swap_task") is not None:
+                logger.warning(
+                    "/migration/confirm: base_swap_task slot already occupied — "
+                    "refusing to launch a second base-swap orchestration"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "base_swap_active",
+                        "message": (
+                            "A base-swap orchestration task handle is still present. "
+                            "Retry once it clears."
+                        ),
+                    },
+                )
+
             # Set state to TRIAL immediately (async task updates it further).
             _state["migration"]["state"] = "TRIAL"
             _state["migration"]["trial"] = TrialStash(
@@ -8522,8 +8844,11 @@ async def migration_confirm(request: ConfirmRequest):
             )
             _state["migration"]["recovery_required"] = []
 
-            # Kick off Phase A as a background task.
-            asyncio.create_task(
+            # Kick off Phase A as a background task.  Stored in the same slot
+            # _run_boot_completion_tasks awaits and shutdown cancels — an
+            # unstored asyncio.create_task(...) result is a GC hazard (the
+            # event loop only holds a weak reference).
+            _state["base_swap_task"] = asyncio.create_task(
                 _run_base_swap_orchestration(
                     candidate_path_str=candidate_path_str,
                     live_config_path=live_config_path,
@@ -8534,6 +8859,9 @@ async def migration_confirm(request: ConfirmRequest):
                     started_at=now_iso,
                     candidate_hash=candidate_hash,
                 )
+            )
+            _state["base_swap_task"].add_done_callback(
+                functools.partial(_clear_state_task, "base_swap_task")
             )
 
             return ConfirmResponse(
@@ -11305,37 +11633,54 @@ async def backup_list(kind: str | None = None):
     )
 
 
-@app.post(
-    "/backup/create",
-    response_model=BackupCreateResponse,
-    dependencies=[Depends(require_admin)],
-)
-async def backup_create(req: BackupCreateRequest):
-    """Take an immediate backup of the requested artifacts.
+def _create_backup(
+    kinds: list[str] | None,
+    tier: str,
+    label: str | None,
+) -> BackupCreateResponse:
+    """Validate a backup request, run the scheduled-backup pipeline, and persist the result.
 
-    Delegates to ``run_scheduled_backup`` with the request's ``tier``
-    (default ``"manual"``) and a per-call shallow-cloned config with
-    ``.artifacts`` replaced by the request's ``kinds`` list (defaults to
-    ``["snapshot_bundle"]``).  The scheduled systemd timer posts here with
-    ``tier="daily"`` so the self-contained recovery bundle is captured under
-    daily retention.
+    The callable core shared by ``POST /backup/create`` (the route supplies
+    ``kinds``/``tier``/``label`` straight from ``BackupCreateRequest`` — see
+    that route's docstring, ``tier`` defaulting to ``"manual"``) and the
+    boot-completion catch-up task (:func:`_run_boot_completion_tasks`, which
+    calls this off the event loop via ``asyncio.to_thread`` with
+    ``kinds=list(config.security.backups.artifacts)`` — the same artifact
+    list the ``paramem-backup`` systemd timer's standalone runner delegates
+    with, see ``paramem/backup/__main__.py``, ``tier="daily"`` — the tier
+    that same runner always posts with, and ``label=None``).
 
+    Delegates to ``run_scheduled_backup`` with a per-call shallow-cloned
+    config (``.security.backups.artifacts`` replaced by *kinds*, defaulting
+    to ``["snapshot_bundle"]`` when *kinds* is ``None``/empty).
     ``snapshot_bundle`` produces a single self-contained bundle slot under
     ``backups_root/snapshot/`` containing the full recovery set (config,
-    registry, adapter weights, speaker profiles).  The server holds the
+    registry, adapter weights, speaker profiles); the server holds the
     ``PARAMEM_DAILY_PASSPHRASE`` needed to decrypt registries for per-tier
-    hash resolution, which is why scheduled backups are server-mediated.
-
-    The deprecated per-artifact kinds ``"config"``, ``"graph"``, and
+    hash resolution, which is why scheduled backups are server-mediated. The
+    deprecated per-artifact kinds ``"config"``, ``"graph"``, and
     ``"registry"`` are still accepted for backward compatibility.
 
     Persists the result via ``update_backup_state`` so the next ``/status``
     reflects the freshly-updated ``last_success_at``.
 
-    Errors
-    ------
-    400 ``kind_invalid``
-        When any entry in ``kinds`` is not a recognised artifact kind.
+    Reads the live config, the consolidation loop, and the config path from
+    module state (``_state``) at call time.
+
+    Args:
+        kinds: Artifact kinds to back up. ``None``/``[]`` -> default
+            ``["snapshot_bundle"]``.
+        tier: Retention tier the slot is filed under.
+        label: Optional operator-supplied annotation.
+
+    Returns:
+        The ``BackupCreateResponse`` describing what was written/skipped.
+
+    Raises:
+        HTTPException: 400 ``kind_invalid`` / ``tier_invalid`` on bad input
+            (surfaced as an HTTP response by the route; the boot-completion
+            task never triggers this branch since it always calls with a
+            valid tier and the operator's own configured artifact list).
     """
     import dataclasses
 
@@ -11347,7 +11692,6 @@ async def backup_create(req: BackupCreateRequest):
     _VALID_KINDS = {"config", "graph", "registry", "snapshot_bundle"}
 
     # Validate kinds.
-    kinds = req.kinds
     if not kinds:
         kinds = ["snapshot_bundle"]
 
@@ -11370,12 +11714,12 @@ async def backup_create(req: BackupCreateRequest):
         "pre_migration",
         "trial_adapter",
     }
-    if req.tier not in _VALID_TIERS:
+    if tier not in _VALID_TIERS:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "tier_invalid",
-                "message": f"tier must be one of {sorted(_VALID_TIERS)}; got {req.tier!r}",
+                "message": f"tier must be one of {sorted(_VALID_TIERS)}; got {tier!r}",
             },
         )
 
@@ -11426,8 +11770,8 @@ async def backup_create(req: BackupCreateRequest):
         state_dir=state_dir,
         backups_root=backups_root,
         live_config_path=live_config_path,
-        tier=req.tier,
-        label=req.label,
+        tier=tier,
+        label=label,
     )
 
     # Persist state so /status shows updated last_success_at.
@@ -11445,6 +11789,31 @@ async def backup_create(req: BackupCreateRequest):
         skipped_artifacts=skipped,
         error=result.error,
     )
+
+
+@app.post(
+    "/backup/create",
+    response_model=BackupCreateResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def backup_create(req: BackupCreateRequest):
+    """Take an immediate backup of the requested artifacts.
+
+    Delegates to :func:`_create_backup` with the request's ``kinds``,
+    ``tier`` (default ``"manual"``), and ``label``.  The scheduled systemd
+    timer posts here with ``tier="daily"`` so the self-contained recovery
+    bundle is captured under daily retention; the boot-completion catch-up
+    task calls :func:`_create_backup` directly (in-process, off the event
+    loop) instead of looping back through this HTTP route.
+
+    Errors
+    ------
+    400 ``kind_invalid``
+        When any entry in ``kinds`` is not a recognised artifact kind.
+    400 ``tier_invalid``
+        When ``tier`` is not a recognised retention tier.
+    """
+    return _create_backup(req.kinds, req.tier, req.label)
 
 
 @app.post(
@@ -12333,13 +12702,17 @@ def _full_consolidation_overdue_key(config) -> "str | None":
 class ConsolidationAction(str, Enum):
     """What a consolidation dispatch is asked to do — the internal vocabulary.
 
-    ``AUTO`` is requested ONLY by ``/scheduled-tick`` — the timer's own
-    door: it becomes ``FULL`` or ``INTERIM`` in :func:`_dispatch_consolidation`
-    according to :func:`_is_full_cycle_due`'s deadline math, and it alone
-    carries the suspend/power-off catch-up gate and the cadence stamp.  That
-    deadline math is the SCHEDULE's business — a manual door never consults
-    it and never falls back between ``FULL``/``INTERIM``: it requests the one
-    it means.
+    ``AUTO`` is requested by ``/scheduled-tick`` (the timer's own door) and by
+    the boot-completion catch-up task (:func:`_run_boot_completion_tasks`,
+    dispatching in-process rather than through a REST call) — nothing else
+    requests it. It becomes ``FULL`` or ``INTERIM`` in
+    :func:`_dispatch_consolidation` according to :func:`_is_full_cycle_due`'s
+    deadline math, and it alone carries the suspend/power-off catch-up gate
+    and the cadence stamp — universal across both ``AUTO`` requesters, so a
+    redundant tick inside the same schedule window no-ops regardless of which
+    one triggers it.  That deadline math is the SCHEDULE's business — a
+    manual door never consults it and never falls back between
+    ``FULL``/``INTERIM``: it requests the one it means.
 
     ``FULL`` and ``INTERIM`` are each requestable two ways — resolved from
     ``AUTO`` (the schedule's decision), or requested directly by
@@ -12381,12 +12754,16 @@ class ConsolidationAction(str, Enum):
 def _consolidation_dispatch_guards() -> "str | None":
     """Shared pre-dispatch guard for consolidation dispatch.
 
-    Checks the three cross-cutting block conditions that prevent any
-    consolidation fold from starting, for every action:
+    Checks the cross-cutting block conditions that prevent any consolidation
+    fold from starting, for every action:
 
     - ``_state["consolidating"]`` — another fold is already running.
     - ``_state["mode"] != "local"`` — cloud-only mode (no model loaded).
     - Background trainer is actively training (GPU lock contention risk).
+    - A migration TRIAL is active (:func:`_trial_active`) — the same refusal
+      ``require_no_trial`` enforces at the REST boundary (HTTP 409 on every
+      consolidation route), mirrored here for in-process callers that never
+      go through FastAPI's dependency resolution.
 
     Returns:
         A non-None ``"deferred_*"`` reason string when a block is in effect,
@@ -12400,17 +12777,29 @@ def _consolidation_dispatch_guards() -> "str | None":
     bg = _state.get("background_trainer")
     if bg is not None and bg.is_training:
         return "deferred_bg_training"
+    if _trial_active():
+        return "deferred_trial_active"
     return None
 
 
 def _stamp_scheduled_run(config) -> None:
-    """Record this dispatch's floored heartbeat boundary as the last attempt.
+    """Record this dispatch's schedule mark as the last scheduled-run attempt.
 
-    No-op when the cadence is calendar-exact (``heartbeat_seconds`` is ``None``)
-    — the timer alone is the schedule and no durable stamp is needed.  Flooring
-    (not raw ``time.time()``) is mandatory here — see
-    ``systemd_timer.floor_to_heartbeat``'s docstring for why an un-floored stamp
-    silently inflates the effective period every cycle.
+    Stamps every real cadence kind — anchored (daily/weekly/HH:MM),
+    exact-divisor intervals, and non-exact intervals alike — via
+    :func:`~paramem.server.schedule_grammar.scheduled_run_stamp_value`, which
+    writes the cadence's own calendar mark (or, for a non-exact interval, its
+    heartbeat-floored stamp) rather than raw ``time.time()``: a
+    second dispatch inside the same mark's window must read
+    :attr:`~paramem.server.schedule_grammar.ScheduleDueStatus.NOT_DUE`, and an
+    un-floored stamp would silently inflate a non-exact interval's effective
+    period every cycle (see that function's docstring).
+
+    No-op when the cadence is off or unparseable — there is no cadence to
+    stamp a dispatch against, and
+    :func:`~paramem.server.schedule_grammar.scheduled_run_stamp_value` raises
+    ``ValueError`` for those inputs; this guards ahead of that call rather
+    than catching the exception.
 
     Fires only on a SCHEDULED dispatch (the ``AUTO`` tick), on both the full and
     the interim path.  A manual run does not reset the cadence window: the
@@ -12419,14 +12808,15 @@ def _stamp_scheduled_run(config) -> None:
     run having to predict that.
     """
     from paramem.server import schedule_state as _schedule_state
-    from paramem.server import systemd_timer as _systemd_timer
+    from paramem.server.schedule_grammar import parse_schedule_atom, scheduled_run_stamp_value
 
-    heartbeat_s = _systemd_timer.heartbeat_seconds(config.consolidation.refresh_cadence or "")
-    if heartbeat_s is None:
+    cadence = config.consolidation.refresh_cadence or ""
+    atom = parse_schedule_atom(cadence)
+    if atom is None or atom.kind == "off":
         return
     _schedule_state.write_last_scheduled_run(
         config.paths.data / "state",
-        _systemd_timer.floor_to_heartbeat(time.time(), heartbeat_s),
+        scheduled_run_stamp_value(cadence, time.time()),
     )
 
 
@@ -12642,11 +13032,11 @@ def _dispatch_consolidation(
     comes through here.  Nothing below this function knows who asked, beyond
     what *action* says.
 
-    ``AUTO`` is requested ONLY by ``/scheduled-tick`` — ``action is
-    ConsolidationAction.AUTO`` IS "this is the scheduled tick", not a separate
-    flag threaded alongside it (a raise-if-mismatched guard would duplicate
-    that identity; the four call sites are pinned structurally instead, see
-    ``TestConsolidationRoutes`` in ``tests/server/test_consolidate_dispatch.py``).
+    ``AUTO`` is requested by ``/scheduled-tick`` and by the boot-completion
+    catch-up task (:func:`_run_boot_completion_tasks`, which dispatches
+    in-process rather than through a REST call) — no other caller resolves
+    it, so ``action is ConsolidationAction.AUTO`` IS "this is a scheduled or
+    boot-catch-up tick", not a separate flag threaded alongside it.
     ``/consolidate`` requests ``FULL`` directly, ``/consolidate/interim``
     requests ``INTERIM`` directly, ``/reconsolidate`` requests ``RECONCILE``
     directly — none of them ever resolves ``AUTO``, so none of them consults
@@ -12659,7 +13049,7 @@ def _dispatch_consolidation(
     safety property):
 
     1. ``_consolidation_dispatch_guards()`` — already-running / cloud-only /
-       bg-training.  All actions.
+       bg-training / migration TRIAL active.  All actions.
     2. **Idle debounce** — all actions.  This protects a live chat turn from a
        long GPU seizure; it is a safety property, not a schedule, so an explicit
        request defers on it too.
@@ -12713,6 +13103,10 @@ def _dispatch_consolidation(
         elif _guard == "deferred_bg_training":
             logger.info(
                 "Consolidation dispatch (%s): background training active — deferred", action.value
+            )
+        elif _guard == "deferred_trial_active":
+            logger.info(
+                "Consolidation dispatch (%s): migration TRIAL active — deferred", action.value
             )
         else:
             logger.info(
@@ -12771,39 +13165,42 @@ def _dispatch_consolidation(
         logger.info("Consolidation dispatch: active-store migration pending — running migration")
         return _dispatch_to_executor(_run_active_store_migration_sync, "started_migration"), action
 
-    # AUTO is requested only by /scheduled-tick, so "action is AUTO" already
-    # identifies the scheduled tick -- no separate flag alongside it (see this
-    # function's docstring).  A direct FULL/INTERIM/RECONCILE request skips
-    # this whole block: the catch-up gate and the deadline resolution are the
-    # SCHEDULE's business, never a manual door's.
+    # AUTO is requested only by /scheduled-tick and the boot-completion
+    # catch-up task, so "action is AUTO" already identifies one of those two
+    # -- no separate flag alongside it (see this function's docstring).  A
+    # direct FULL/INTERIM/RECONCILE request skips this whole block: the
+    # catch-up gate and the deadline resolution are the SCHEDULE's business,
+    # never a manual door's.
     _scheduled = action is ConsolidationAction.AUTO
 
     if _scheduled:
-        # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
-        # rendered OnCalendar timer is a heartbeat wakeup only (see
-        # paramem.server.systemd_timer module docstring) — the durable
-        # last-ATTEMPT stamp (schedule_state.py) decides whether THIS tick
-        # actually dispatches. Calendar-exact cadences (the default "12h", and
-        # any anchored/exact-divisor cadence) get heartbeat_s=None and this
-        # entire block is a no-op — the timer alone remains the schedule.
+        # Suspend/power-off catch-up gate, universal across every real cadence
+        # kind (anchored daily/weekly/HH:MM and exact-divisor intervals, not
+        # just non-exact "heartbeat" intervals): the durable last-ATTEMPT
+        # stamp (schedule_state.py) decides whether THIS tick actually
+        # dispatches, via schedule_grammar's own dueness math
+        # (scheduled_run_due). A cadence with no real schedule (off or
+        # unparseable) has no mark to be due against and is never stamped —
+        # it falls straight through to the deadline resolution below.
         from paramem.server import schedule_state as _schedule_state
-        from paramem.server import systemd_timer as _systemd_timer
-        from paramem.server.schedule_grammar import compute_schedule_period_seconds as _sched_period
-        from paramem.server.schedule_grammar import is_due as _sched_is_due
+        from paramem.server.schedule_grammar import ScheduleDueStatus as _ScheduleDueStatus
+        from paramem.server.schedule_grammar import parse_schedule_atom as _parse_schedule_atom
+        from paramem.server.schedule_grammar import scheduled_run_due as _scheduled_run_due
 
         cadence = config.consolidation.refresh_cadence or ""
-        heartbeat_s = _systemd_timer.heartbeat_seconds(cadence)
-        if heartbeat_s is not None:
+        _cadence_atom = _parse_schedule_atom(cadence)
+        if _cadence_atom is not None and _cadence_atom.kind != "off":
             last_attempt = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
-            if last_attempt is None:
+            _due_status = _scheduled_run_due(cadence, last_attempt)
+            if _due_status is _ScheduleDueStatus.NO_STAMP:
                 _stamp_scheduled_run(config)
                 logger.info(
-                    "Scheduler tick: seeding catch-up stamp for non-calendar-exact "
-                    "cadence %r — not dispatching this tick",
+                    "Scheduler tick: seeding catch-up stamp for cadence %r — "
+                    "not dispatching this tick",
                     cadence,
                 )
                 return "noop_scheduler_seeded", action
-            if not _sched_is_due(last_attempt, _sched_period(cadence)):
+            if _due_status is _ScheduleDueStatus.NOT_DUE:
                 return "noop_not_due", action
 
         action = (

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -175,6 +176,79 @@ def read_backup_state(state_dir: Path) -> BackupStateRecord | None:
     if raw is None:
         return None
     return BackupStateRecord.from_dict(raw)
+
+
+def last_attempt_epoch(state_dir: Path) -> float | None:
+    """Return the epoch timestamp of the most recent backup ATTEMPT, or ``None``.
+
+    Reads ``backup.json``'s ``last_run.completed_at`` (stamped on both success
+    and failure — never ``last_success_at``, which would let a persistently
+    failing backup pass the schedule's dueness gate on every heartbeat). The
+    single implementation shared by ``backup/__main__.py``'s standalone catch-up
+    gate and ``server/app.py``'s boot-completion catch-up, so both read the
+    exact same policy for an unreadable state file.
+
+    Treats an unreadable or malformed state file the same as an absent one —
+    returns ``None`` and logs a warning naming the file and error — rather
+    than raising: a corrupt ``backup.json`` must not stop scheduled backups
+    from running.  A redundant backup is cheap; a silently stopped backup
+    pipeline is not.  This includes a file that parses and passes schema-
+    version validation but whose ``last_run`` is a structurally wrong shape
+    (e.g. a string or list instead of a dict, or a non-string
+    ``completed_at``) — ``BackupStateRecord.from_dict`` does not type-check
+    ``last_run``'s contents, so those shapes are caught here.
+
+    Parameters
+    ----------
+    state_dir:
+        Directory containing ``backup.json``.
+    """
+    try:
+        record = read_backup_state(state_dir)
+    except BackupStateSchemaError as exc:
+        logger.warning(
+            "Unreadable backup state at %s/%s (%s) — treating as no prior attempt",
+            state_dir,
+            BACKUP_STATE_FILENAME,
+            exc,
+        )
+        return None
+    if record is None:
+        return None
+    last_run = record.last_run
+    if last_run is None:
+        return None
+    if not isinstance(last_run, dict):
+        logger.warning(
+            "Malformed last_run %r in %s/%s (expected object) — treating as no prior attempt",
+            last_run,
+            state_dir,
+            BACKUP_STATE_FILENAME,
+        )
+        return None
+    completed_at = last_run.get("completed_at")
+    if completed_at is None:
+        return None
+    if not isinstance(completed_at, str):
+        logger.warning(
+            "Malformed completed_at %r in %s/%s (expected ISO-8601 string) — "
+            "treating as no prior attempt",
+            completed_at,
+            state_dir,
+            BACKUP_STATE_FILENAME,
+        )
+        return None
+    try:
+        return datetime.fromisoformat(completed_at).timestamp()
+    except ValueError as exc:
+        logger.warning(
+            "Malformed completed_at %r in %s/%s (%s) — treating as no prior attempt",
+            completed_at,
+            state_dir,
+            BACKUP_STATE_FILENAME,
+            exc,
+        )
+        return None
 
 
 def update_backup_state(

@@ -161,6 +161,20 @@ class TestConsolidationDispatchGuards:
         monkeypatch.setattr(app_module, "_state", state)
         assert app_module._consolidation_dispatch_guards() == "deferred_bg_training"
 
+    def test_deferred_trial_active(self, monkeypatch) -> None:
+        """migration.state == 'TRIAL' → deferred_trial_active.
+
+        The same predicate (``_trial_active``) that makes ``require_no_trial``
+        409 the REST routes — mirrored here so an in-process caller (never
+        resolving FastAPI dependencies) is refused too.
+        """
+        import paramem.server.app as app_module
+
+        state = _make_dispatch_state()
+        state["migration"] = {"state": "TRIAL"}
+        monkeypatch.setattr(app_module, "_state", state)
+        assert app_module._consolidation_dispatch_guards() == "deferred_trial_active"
+
 
 # ---------------------------------------------------------------------------
 # TestConsolidationArbitrator — action resolution + the ONE content gate
@@ -191,15 +205,19 @@ def _make_arbitrator_state(
         named_sessions: Number of pending NAMED sessions to seed.
         anon_sessions: Number of pending UNIDENTIFIABLE sessions to seed (no
             speaker id, no voice embedding).
-        refresh_cadence: ``config.consolidation.refresh_cadence``.  The
-            default ("12h") is calendar-exact — ``heartbeat_seconds()`` is
-            ``None``, so ``_stamp_scheduled_run`` no-ops and these tests
-            exercise the arbitrator, not the scheduler.  Tests that need to
-            observe the PERSISTED stamp (rather than just whether
-            ``_stamp_scheduled_run`` was called) must pass a non-calendar-exact
-            value (e.g. ``"every 5h"``).  ``""`` is manual-only (no timer at
-            all) — used by the manual-only-posture tests, where ``FULL``/
-            ``INTERIM`` requested directly are the only doors that ever fire.
+        refresh_cadence: ``config.consolidation.refresh_cadence``.  For any
+            real cadence (default ``"12h"``) this fixture pre-seeds a durable
+            last-scheduled-run stamp well before the current mark, so an
+            ``AUTO`` tick reads DUE and reaches the arbitrator's own gates
+            instead of seed-and-noop on a virgin stamp file (the universal
+            catch-up gate — ``schedule_grammar.scheduled_run_due`` — applies
+            to every cadence kind, not only non-calendar-exact ones).  Tests
+            that specifically exercise catch-up-gate semantics build their
+            own stamp state directly (see ``TestSchedulerCatchUpGate`` in
+            ``tests/test_consolidation.py``).  ``""`` is manual-only (no
+            cadence, no stamp seeded) — used by the manual-only-posture
+            tests, where ``FULL``/``INTERIM`` requested directly are the
+            only doors that ever fire.
         period_seconds: ``config.consolidation.consolidation_period_seconds`` —
             the full-fold period ``_is_full_cycle_due`` measures against, read
             ONLY by the ``AUTO`` (scheduled-tick) path.  ``None`` (the
@@ -207,6 +225,8 @@ def _make_arbitrator_state(
             ``_is_full_cycle_due`` is False for any interim ring.  A directly
             requested ``FULL`` never reads this at all.
     """
+    from paramem.server.schedule_grammar import parse_schedule_atom
+    from paramem.server.schedule_state import write_last_scheduled_run
     from paramem.server.session_buffer import SessionBuffer
 
     cfg = MagicMock()
@@ -221,6 +241,14 @@ def _make_arbitrator_state(
     cfg.paths.data = tmp_path
     cfg.adapter_dir = tmp_path / "adapters"
     cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+    # Universal catch-up gate: pre-seed a DUE stamp (well before the current
+    # mark) for any real cadence so an AUTO tick reaches the arbitrator
+    # instead of seed-and-noop on a virgin stamp file — see the
+    # refresh_cadence docstring above.
+    _atom = parse_schedule_atom(refresh_cadence)
+    if _atom is not None and _atom.kind != "off":
+        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
 
     buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
     for i in range(named_sessions):
@@ -939,6 +967,177 @@ class TestStampPredicate:
         assert status == "started"
         assert resolved is ConsolidationAction.INTERIM
         assert stamp_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# TestUniversalCatchUpGate — the durable-stamp catch-up gate
+# (schedule_grammar.scheduled_run_due) applies to EVERY cadence kind, not
+# only non-calendar-exact ("heartbeat") ones. TestSchedulerCatchUpGate in
+# tests/test_consolidation.py covers the same contract for non-exact
+# cadences ("every 5h"); this class exercises it for a calendar-exact
+# cadence ("12h", the server.yaml default) to prove the gate is now
+# universal rather than a heartbeat-only special case.
+# ---------------------------------------------------------------------------
+
+
+class TestUniversalCatchUpGate:
+    def _virgin_stamp_state(self, tmp_path, *, refresh_cadence: str, **kwargs) -> dict:
+        """An arbitrator state for *refresh_cadence* with NO durable stamp on disk.
+
+        Constructed with ``refresh_cadence=""`` first so ``_make_arbitrator_state``'s
+        own auto-seed (see its docstring) never fires, then the cadence is set
+        to the real value the test wants to exercise — giving a virgin stamp
+        file under a real (non-off) cadence without touching the shared
+        fixture's default behaviour for every other test in this module.
+        """
+        state = _make_arbitrator_state(tmp_path, refresh_cadence="", **kwargs)
+        state["config"].consolidation.refresh_cadence = refresh_cadence
+        return state
+
+    def test_first_auto_tick_on_an_exact_cadence_seeds_without_dispatching(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Calendar-exact '12h' with no stamp on disk → noop_scheduler_seeded,
+        the stamp file is created, and nothing is submitted — the same
+        seed-and-noop contract non-exact cadences have always had, now
+        applying to an exact cadence too.
+        """
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import read_last_scheduled_run
+
+        state = self._virgin_stamp_state(tmp_path, refresh_cadence="12h", max_interim_count=7)
+        state_dir = state["config"].paths.data / "state"
+        assert read_last_scheduled_run(state_dir) is None
+
+        status, _resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_scheduler_seeded"
+        assert read_last_scheduled_run(state_dir) is not None
+        assert spy.call_count == 0
+        assert due_calls == [], "_is_full_cycle_due must not be reached on a virgin stamp"
+
+    def test_second_tick_inside_the_same_mark_window_is_not_due(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A stamp written at the current 12h mark reads NOT_DUE for a second
+        tick still inside that mark's window."""
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_grammar import scheduled_run_stamp_value
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        state = self._virgin_stamp_state(tmp_path, refresh_cadence="12h", max_interim_count=7)
+        state_dir = state["config"].paths.data / "state"
+        write_last_scheduled_run(state_dir, scheduled_run_stamp_value("12h", time.time()))
+
+        status, _resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_not_due"
+        assert spy.call_count == 0
+        assert due_calls == []
+
+    def test_tick_after_a_mark_crossing_reaches_the_arbitrator(self, tmp_path, monkeypatch) -> None:
+        """A stamp from a previous 12h mark reads DUE and reaches the content
+        gate (a real ``noop_no_pending`` outcome, not a seed/not-due
+        short-circuit) — proven by ``_is_full_cycle_due`` actually being
+        consulted.
+        """
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        state = self._virgin_stamp_state(tmp_path, refresh_cadence="12h", max_interim_count=7)
+        state_dir = state["config"].paths.data / "state"
+        write_last_scheduled_run(state_dir, time.time() - 86400)  # a full day back
+
+        status, _resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_no_pending"
+        assert due_calls == [False]
+        assert spy.call_count == 0
+
+    def test_deferred_tick_does_not_advance_the_stamp(self, tmp_path, monkeypatch) -> None:
+        """A tick blocked by ``_consolidation_dispatch_guards`` (already
+        running) must not stamp — the next tick is still DUE."""
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = self._virgin_stamp_state(tmp_path, refresh_cadence="12h", max_interim_count=7)
+        state_dir = state["config"].paths.data / "state"
+        old_stamp = time.time() - 86400
+        write_last_scheduled_run(state_dir, old_stamp)
+        state["consolidating"] = True  # -> _consolidation_dispatch_guards() blocks
+
+        status, _resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "deferred_already_running"
+        assert read_last_scheduled_run(state_dir) == old_stamp, (
+            "a deferred tick must not consume the cadence window"
+        )
+        assert due_calls == []
+        assert spy.call_count == 0
+
+    def test_calendar_exact_12h_tick_exactly_at_the_period_boundary_is_due(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A stamp at the 00:00 mark, evaluated exactly at the following
+        12:00:00 mark, must read DUE via mark-crossing — not via a
+        period-elapsed-seconds comparison that a few seconds of dispatch
+        delay around the boundary could throw off into a false 'not due'.
+        """
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_grammar import previous_mark
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        state = self._virgin_stamp_state(tmp_path, refresh_cadence="12h", max_interim_count=7)
+        state_dir = state["config"].paths.data / "state"
+
+        midnight_mark = previous_mark("12h", time.time())
+        write_last_scheduled_run(state_dir, midnight_mark)
+        tick_time = midnight_mark + 12 * 3600  # the very next 12h mark, to the second
+
+        with patch("paramem.server.schedule_grammar.time.time", return_value=tick_time):
+            status, _resolved, spy, due_calls = _dispatch(
+                state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+            )
+
+        assert status == "noop_no_pending", (
+            "the tick must reach the content gate (DUE) exactly at the mark boundary"
+        )
+        assert due_calls == [False]
+        assert spy.call_count == 0
+
+    def test_trial_active_defers_in_process_but_rest_route_still_409s(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A migration TRIAL: the in-process arbitrator defers
+        (``deferred_trial_active``); the REST route never reaches the
+        arbitrator at all — ``require_no_trial`` 409s first.  Same predicate
+        (``_trial_active``), two consumers.
+        """
+        from fastapi.testclient import TestClient
+
+        import paramem.server.app as app_module
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["migration"] = {"state": "TRIAL"}
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(app_module, "_retro_claim_orphan_sessions", lambda: 0)
+
+        result, _action = app_module._dispatch_consolidation(ConsolidationAction.AUTO)
+        assert result == "deferred_trial_active"
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/scheduled-tick")
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "trial_active"
 
 
 # ---------------------------------------------------------------------------

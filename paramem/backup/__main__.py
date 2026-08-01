@@ -147,45 +147,37 @@ def main(argv=None) -> int:
         logger.info("Scheduled backups disabled (schedule=%r); nothing to do.", schedule_str)
         return 0
 
-    # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
-    # rendered OnCalendar timer is a heartbeat wakeup only (see
-    # paramem.server.systemd_timer module docstring) — the durable
-    # last-ATTEMPT stamp (backup.json::last_run.completed_at, written on
-    # BOTH success and failure) decides whether THIS wakeup actually runs.
-    # Gating on last_success_at instead would let a persistently failing
-    # backup pass the gate on every heartbeat (a retry storm). Anchored /
-    # exact-divisor cadences (the common case, e.g. the "daily 04:00"
-    # default) are ungated — the timer alone is the schedule.
-    from paramem.server.schedule_grammar import (
-        compute_schedule_period_seconds,
-        is_calendar_exact,
-        is_due,
-    )
+    # Suspend/power-off catch-up gate: the durable last-ATTEMPT stamp
+    # (backup.json::last_run.completed_at, written on BOTH success and
+    # failure) decides whether THIS wakeup actually runs — via the same
+    # dueness math the server's scheduled-tick arbitrator uses
+    # (schedule_grammar.scheduled_run_due), covering every cadence kind
+    # (anchored daily/weekly/HH:MM, exact-divisor intervals, and non-exact
+    # intervals on their heartbeat-floored stamp) rather than only the
+    # non-exact ones. Gating on last_success_at instead would let a
+    # persistently failing backup pass the gate on every heartbeat (a retry
+    # storm). An unreadable/malformed backup.json is treated as no prior
+    # attempt (see last_attempt_epoch) rather than crashing this process —
+    # a corrupt state file must not stop scheduled backups from running.
+    from paramem.backup.state import last_attempt_epoch as _last_attempt_epoch
+    from paramem.server.schedule_grammar import ScheduleDueStatus, scheduled_run_due
 
-    if not is_calendar_exact(schedule_str):
-        from datetime import datetime
-
-        from paramem.backup.state import read_backup_state
-
-        record = read_backup_state(state_dir)
-        last_run = record.last_run if record is not None else None
-        completed_at = last_run.get("completed_at") if last_run else None
-        if completed_at is not None:
-            last_attempt_epoch = datetime.fromisoformat(completed_at).timestamp()
-            period_s = compute_schedule_period_seconds(schedule_str) or 0
-            if not is_due(last_attempt_epoch, period_s):
-                logger.info(
-                    "Scheduled backups: last attempt %s is within the %ds cadence "
-                    "period — skipping this heartbeat (catch-up gate; the next "
-                    "heartbeat retries).",
-                    completed_at,
-                    period_s,
-                )
-                return 0
-        # Absent last_run → RUN. A first backup is desirable and its stamp must
-        # not be faked — unlike consolidation's seed-and-noop (a surprise
-        # GPU-expensive consolidation on upgrade is worse than a surprise
-        # first backup), a surprise first backup here is cheap and welcome.
+    last_attempt = _last_attempt_epoch(state_dir)
+    due_status = scheduled_run_due(schedule_str, last_attempt)
+    if due_status is ScheduleDueStatus.NOT_DUE:
+        logger.info(
+            "Scheduled backups: last attempt %s is within the current mark's window for "
+            "schedule %r — skipping this heartbeat (catch-up gate; the next heartbeat "
+            "retries).",
+            last_attempt,
+            schedule_str,
+        )
+        return 0
+    # DUE, or NO_STAMP (no backup.json yet) → RUN. A first backup is
+    # desirable and its stamp must not be faked — unlike consolidation's
+    # seed-and-noop (a surprise GPU-expensive consolidation on upgrade is
+    # worse than a surprise first backup), a surprise first backup here is
+    # cheap and welcome.
 
     # Delegate to the running server when reachable: the graph exists only in
     # its in-memory consolidation loop, so a server-mediated backup is the only

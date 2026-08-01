@@ -11,6 +11,7 @@ from paramem.backup.state import (
     BACKUP_STATE_SCHEMA_VERSION,
     BackupStateRecord,
     BackupStateSchemaError,
+    last_attempt_epoch,
     read_backup_state,
     update_backup_state,
     write_backup_state,
@@ -175,6 +176,120 @@ class TestUpdateBackupState:
         # Failure fields preserved for operator visibility.
         assert record.last_failure_at == "2026-04-21T04:00:00Z"
         assert record.last_failure_reason == "write error"
+
+
+# ---------------------------------------------------------------------------
+# last_attempt_epoch — the shared last-ATTEMPT reader used by both
+# backup/__main__.py's runner gate and server/app.py's boot-completion
+# catch-up gate.
+# ---------------------------------------------------------------------------
+
+
+class TestLastAttemptEpoch:
+    def test_absent_state_returns_none(self, tmp_path):
+        """No backup.json at all -> None (NO_STAMP)."""
+        assert last_attempt_epoch(tmp_path) is None
+
+    def test_valid_completed_at_returns_epoch(self, tmp_path):
+        """A valid completed_at is parsed into its epoch timestamp."""
+        from datetime import datetime
+
+        completed_at = "2026-04-22T04:00:42+00:00"
+        record = _make_record(last_run={"completed_at": completed_at, "success": True})
+        write_backup_state(tmp_path, record)
+
+        result = last_attempt_epoch(tmp_path)
+        assert result == datetime.fromisoformat(completed_at).timestamp()
+
+    def test_last_run_without_completed_at_returns_none(self, tmp_path):
+        """last_run present but missing completed_at -> None."""
+        record = _make_record(last_run={"success": True})
+        write_backup_state(tmp_path, record)
+        assert last_attempt_epoch(tmp_path) is None
+
+    def test_no_last_run_yet_returns_none(self, tmp_path):
+        """A record with last_run=None (freshly seeded, never run) -> None."""
+        record = _make_record(last_run=None)
+        write_backup_state(tmp_path, record)
+        assert last_attempt_epoch(tmp_path) is None
+
+    def test_corrupt_json_treated_as_no_prior_attempt(self, tmp_path, caplog):
+        """Bad JSON -> None (NO_STAMP), not a raised BackupStateSchemaError —
+        a corrupt state file must not stop scheduled backups from running."""
+        state_file = tmp_path / "backup.json"
+        state_file.write_text("NOT JSON {{{{", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            result = last_attempt_epoch(tmp_path)
+
+        assert result is None
+        assert any("Unreadable backup state" in r.message for r in caplog.records)
+
+    def test_schema_version_mismatch_treated_as_no_prior_attempt(self, tmp_path, caplog):
+        """Foreign schema_version -> None (NO_STAMP), not a raised error."""
+        state_file = tmp_path / "backup.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 99,
+                    "last_run": None,
+                    "last_success_at": None,
+                    "last_failure_at": None,
+                    "last_failure_reason": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level("WARNING"):
+            result = last_attempt_epoch(tmp_path)
+
+        assert result is None
+        assert any("Unreadable backup state" in r.message for r in caplog.records)
+
+    def test_malformed_completed_at_treated_as_no_prior_attempt(self, tmp_path, caplog):
+        """A non-ISO-8601 completed_at -> None (NO_STAMP), not a raised ValueError."""
+        record = _make_record(last_run={"completed_at": "not-a-timestamp", "success": True})
+        write_backup_state(tmp_path, record)
+
+        with caplog.at_level("WARNING"):
+            result = last_attempt_epoch(tmp_path)
+
+        assert result is None
+        assert any("Malformed completed_at" in r.message for r in caplog.records)
+
+    def test_non_dict_last_run_treated_as_no_prior_attempt(self, tmp_path, caplog):
+        """last_run is a bare string, not an object -> None, not a raised AttributeError."""
+        record = _make_record(last_run="garbage")
+        write_backup_state(tmp_path, record)
+
+        with caplog.at_level("WARNING"):
+            result = last_attempt_epoch(tmp_path)
+
+        assert result is None
+        assert any("Malformed last_run" in r.message for r in caplog.records)
+
+    def test_list_last_run_treated_as_no_prior_attempt(self, tmp_path, caplog):
+        """last_run is a list, not an object -> None, not a raised AttributeError."""
+        record = _make_record(last_run=["a"])
+        write_backup_state(tmp_path, record)
+
+        with caplog.at_level("WARNING"):
+            result = last_attempt_epoch(tmp_path)
+
+        assert result is None
+        assert any("Malformed last_run" in r.message for r in caplog.records)
+
+    def test_non_str_completed_at_treated_as_no_prior_attempt(self, tmp_path, caplog):
+        """completed_at is an int, not a string -> None, not a raised TypeError."""
+        record = _make_record(last_run={"completed_at": 1234567, "success": True})
+        write_backup_state(tmp_path, record)
+
+        with caplog.at_level("WARNING"):
+            result = last_attempt_epoch(tmp_path)
+
+        assert result is None
+        assert any("Malformed completed_at" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

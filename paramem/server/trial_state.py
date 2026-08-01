@@ -357,3 +357,32 @@ def clear_trial_marker(state_dir: Path) -> None:
         os.close(dir_fd)
 
     logger.info("clear_trial_marker: removed %s", path)
+
+
+def trial_active(state: dict | None) -> bool:
+    """Return True when a migration TRIAL is in progress, per the live server state.
+
+    Distinct from the ``trial.json`` marker this module otherwise reads/writes:
+    *state* here is the in-process server ``_state`` mapping (or ``None`` for
+    callers that carry no server state), and this checks its ephemeral
+    ``state["migration"]["state"] == "TRIAL"`` field — not anything on disk.
+
+    The single predicate shared by every consolidation refusal that must
+    never drift apart: ``paramem.server.app._trial_active`` (the REST-boundary
+    dependency and the arbitrator's own in-process guard) and
+    ``paramem.training.consolidation.ConsolidationLoop.guard_trial_state``
+    (the training-layer refusal for callers, including experiment scripts,
+    that carry the server ``_state`` dict).
+
+    Parameters
+    ----------
+    state:
+        The server ``_state`` mapping, or ``None`` for callers that carry no
+        server state (never active in that case).
+    """
+    if state is None:
+        return False
+    migration = state.get("migration")
+    if migration is None:
+        return False
+    return migration.get("state") == "TRIAL"

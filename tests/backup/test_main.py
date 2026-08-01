@@ -316,12 +316,19 @@ class TestBackupCatchUpGate:
         assert rc == 0
         assert calls.get("called") is True
 
-    def test_anchor_schedule_never_gated(self, tmp_path, monkeypatch):
-        """Anchored schedule ('daily 04:00', the server.yaml default) is never
-        gated — even with a very recent last-attempt stamp, calendar-exact
-        cadences proceed unconditionally (the timer alone is the schedule).
+    def test_anchor_schedule_second_trigger_in_same_mark_window_skips(self, tmp_path, monkeypatch):
+        """'daily 04:00' + a stamp already inside the current mark's window ->
+        NOT_DUE (skip).
+
+        The runner shares the arbitrator's per-mark dueness math
+        (schedule_grammar.scheduled_run_due) rather than exempting
+        anchored/exact-divisor cadences from gating, so a duplicate/Persistent
+        resume trigger inside the same 04:00-to-04:00 window does not
+        double-delegate.
         """
         from datetime import datetime, timezone
+
+        from paramem.server.schedule_grammar import previous_mark
 
         cfg_path = tmp_path / "server.yaml"
         cfg_path.write_text("model: mistral\n")
@@ -329,7 +336,31 @@ class TestBackupCatchUpGate:
         monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
 
         state_dir = (fake.paths.data / "state").resolve()
-        self._write_last_run(state_dir, completed_at=datetime.now(timezone.utc).isoformat())
+        # Stamp the mark itself (mirrors scheduled_run_stamp_value's "stamp
+        # the mark, not raw now") so a trigger anywhere later in the same
+        # window reads NOT_DUE.
+        now = datetime.now(timezone.utc).timestamp()
+        mark = previous_mark("daily 04:00", now)
+        self._write_last_run(
+            state_dir,
+            completed_at=datetime.fromtimestamp(mark, tz=timezone.utc).isoformat(),
+        )
+
+        def _boom(*a, **k):
+            raise AssertionError("must not delegate a second time inside the same mark window")
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", _boom)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+
+    def test_anchor_schedule_no_stamp_runs(self, tmp_path, monkeypatch):
+        """'daily 04:00' + no backup.json yet -> NO_STAMP -> RUN (same
+        NO_STAMP-runs policy as the non-exact-interval case)."""
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="daily 04:00")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
 
         calls = {}
 
@@ -377,6 +408,80 @@ class TestBackupCatchUpGate:
 
         rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
         assert rc == 0
+
+    def test_corrupt_backup_json_treated_as_no_stamp_and_runs(self, tmp_path, monkeypatch):
+        """Corrupt backup.json (bad JSON) -> treated as NO_STAMP -> RUN, no
+        traceback exit — a corrupt state file must not stop scheduled
+        backups from running."""
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="every 5h")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        state_dir = (fake.paths.data / "state").resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "backup.json").write_text("NOT JSON {{{{", encoding="utf-8")
+
+        calls = {}
+
+        def fake_post(url, body, *, timeout, token=None):
+            calls["called"] = True
+            return {
+                "success": True,
+                "tier": "daily",
+                "written_slots": {},
+                "skipped_artifacts": [],
+                "error": None,
+            }
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+        assert calls.get("called") is True
+
+    def test_foreign_schema_version_treated_as_no_stamp_and_runs(self, tmp_path, monkeypatch):
+        """backup.json with a foreign schema_version -> treated as NO_STAMP ->
+        RUN, no traceback exit."""
+        import json
+
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="every 5h")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        state_dir = (fake.paths.data / "state").resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "backup.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 99,
+                    "last_run": None,
+                    "last_success_at": None,
+                    "last_failure_at": None,
+                    "last_failure_reason": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        calls = {}
+
+        def fake_post(url, body, *, timeout, token=None):
+            calls["called"] = True
+            return {
+                "success": True,
+                "tier": "daily",
+                "written_slots": {},
+                "skipped_artifacts": [],
+                "error": None,
+            }
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+        assert calls.get("called") is True
 
 
 # ---------------------------------------------------------------------------

@@ -1340,14 +1340,29 @@ class TestTickGateNoNamed:
     """_dispatch_consolidation returns noop_no_named when no NAMED sessions."""
 
     def _make_minimal_state(self, tmp_path, buffer, store=None):
-        """Inject minimal _state overrides for the tick function."""
-        from paramem.server.config import ConsolidationScheduleConfig, ServerConfig
+        """Inject minimal _state overrides for the tick function.
 
-        config = MagicMock(spec=ServerConfig)
+        Uses a plain MagicMock (no spec) for config: ``ServerConfig.paths``
+        is a dataclass field with a factory default, so it is never a real
+        class-level attribute and ``MagicMock(spec=ServerConfig)`` cannot see
+        it — setting ``config.paths.data`` below needs an unrestricted mock.
+        """
+        from paramem.server.config import ConsolidationScheduleConfig
+        from paramem.server.schedule_state import write_last_scheduled_run
+
+        config = MagicMock()
         sched = ConsolidationScheduleConfig()
+        # A real cadence backed by a real tmp_path-rooted config.paths.data,
+        # with the catch-up stamp pre-seeded stale so the universal catch-up
+        # gate (schedule_grammar.scheduled_run_due) reads DUE and falls
+        # through to the session-triage/content-gate outcomes these tests
+        # exercise, instead of seed-and-noop on a virgin stamp file.
+        sched.refresh_cadence = "every 12h"
         config.consolidation = sched
         config.debug = False
         config.debug_dir = tmp_path / "debug"
+        config.paths.data = tmp_path
+        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
 
         return {
             "config": config,
@@ -14803,11 +14818,10 @@ class TestFullCycleDispatcherOverdueIncident:
         passes and these tests exercise the overdue-incident wiring in
         isolation.
         """
+        from paramem.server.schedule_state import write_last_scheduled_run
+
         cfg = MagicMock()
         cfg.consolidation.training_idle_debounce_s = 0
-        # Calendar-exact cadence — keeps the suspend/power-off catch-up gate
-        # (systemd_timer.heartbeat_seconds) a no-op so these tests exercise
-        # only the overdue-incident wiring, not the catch-up gate.
         cfg.consolidation.refresh_cadence = "12h"
         cfg.consolidation.mode = "train"
         # N > 0: the content gate's FULL branch reads this to decide whether a
@@ -14817,6 +14831,12 @@ class TestFullCycleDispatcherOverdueIncident:
         cfg.paths.data = tmp_path
         cfg.adapter_dir = tmp_path / "adapters"
         cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+        # Pre-seed the durable catch-up stamp well before the current "12h"
+        # mark so the scheduled tick reads DUE and reaches _is_full_cycle_due
+        # (patched per-test) instead of seed-and-noop on a virgin stamp file —
+        # these tests exercise the overdue-incident wiring, not the catch-up
+        # gate itself.
+        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
         self._make_interim_dir(cfg.adapter_dir, "20260101T0000")
         return {
             "config": cfg,
@@ -16962,15 +16982,24 @@ class TestDispatchCountZeroRoutesToFull:
         Uses a plain MagicMock (no spec) for config so attribute assignment
         works without triggering spec-gating on the nested consolidation field.
         """
+        from paramem.server.schedule_state import write_last_scheduled_run
+
         config = MagicMock()
         config.consolidation.max_interim_count = 0
-        config.consolidation.refresh_cadence = "12h"
+        # A real cadence backed by a real tmp_path-rooted config.paths.data,
+        # with the catch-up stamp pre-seeded stale so the universal catch-up
+        # gate reads DUE and falls through to the real _is_full_cycle_due
+        # (True unconditionally at count==0 regardless of cadence) these
+        # tests exercise, instead of seed-and-noop on a virgin stamp file.
+        config.consolidation.refresh_cadence = "every 12h"
         config.consolidation.mode = "train"
         config.consolidation.training_idle_debounce_s = 0
         config.consolidation.orphan_retirement_seconds = None
         config.consolidation.retain_sessions = False
         config.debug = False
         config.debug_dir = tmp_path / "debug"
+        config.paths.data = tmp_path
+        write_last_scheduled_run(tmp_path / "state", time.time() - 86400)
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
 
@@ -17491,8 +17520,8 @@ class TestSchedulerCatchUpGate:
         and the new stamp is floored-now — NOT last_stamp + period (which
         would still be days in the past and immediately due again).
         """
+        from paramem.server.schedule_grammar import scheduled_run_stamp_value
         from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
-        from paramem.server.systemd_timer import floor_to_heartbeat, heartbeat_seconds
 
         state = self._make_state(tmp_path, refresh_cadence="every 720m")
         state_dir = self._state_dir(tmp_path)
@@ -17510,8 +17539,7 @@ class TestSchedulerCatchUpGate:
         assert new_stamp != old_stamp + period_s, (
             "stamp must be floored-now, not last_stamp + period"
         )
-        hb = heartbeat_seconds("every 720m")
-        expected = floor_to_heartbeat(time.time(), hb)
+        expected = scheduled_run_stamp_value("every 720m", time.time())
         assert abs(new_stamp - expected) < 5, f"expected ~{expected}, got {new_stamp}"
 
 

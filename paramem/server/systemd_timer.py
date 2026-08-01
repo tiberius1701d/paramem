@@ -9,9 +9,18 @@ This module does not receive the derived full-consolidation period
 ``ConsolidationScheduleConfig`` and is consumed by ``_is_full_cycle_due``,
 not by the timer renderer.
 
-THE PRINCIPLE — the systemd timer IS the schedule when the cadence is
-exactly calendar-expressible; otherwise it degrades to a pure wakeup source
-and a durable last-attempt stamp becomes the schedule.
+THE PRINCIPLE — the rendered ``OnCalendar`` timer decides WHEN the process
+wakes: exact-divisor cadences wake at their own period, non-exact cadences
+wake at a coarser grid (see below). WHETHER a given wakeup actually
+dispatches is decided one level up, by the arbitrator
+(``app.py::_dispatch_consolidation``), which checks a durable last-attempt
+stamp (``schedule_state.py``) against
+``schedule_grammar.scheduled_run_due`` for EVERY cadence kind, not only the
+non-exact ones. For an exact cadence the wakeup and the mark coincide, so
+the stamp check ordinarily passes straight through; it still guards against
+a duplicate/manual tick landing inside the same mark's window and against a
+missed exact-cadence tick after a suspend where systemd's own coalesced
+catch-up fires only once for however many marks were missed.
 
 ``systemd``'s ``Persistent=true`` only affects ``OnCalendar=`` timers —
 monotonic ``OnBootSec``/``OnUnitActiveSec`` timers run on ``CLOCK_MONOTONIC``,
@@ -30,19 +39,23 @@ no more monotonic ``TimerSpec`` kind:
   period. The rendered timer alone is the schedule; systemd's catch-up
   fires the (single, coalesced) missed run on resume.
 * Non-exact cadences (``every 5h``, ``every 90m``, ``every 48h``, ...)
-  render at a coarser HEARTBEAT grid (see :func:`heartbeat_seconds`) —
-  the timer is a wakeup source only. Each heartbeat, the dispatcher
-  (``app.py::_dispatch_consolidation``) checks a durable
-  last-attempt stamp (``schedule_state.py``) against the real cadence
-  period and no-ops until it is actually due. This is the same answer the
-  full fold already gives for its own due-ness (``_is_full_cycle_due``
-  reads durable on-disk state and wall clock, never timer identity) —
-  applied one level up, to the timer that drives the tick itself.
+  render at a coarser HEARTBEAT grid (the ``gcd`` grid computed by
+  :func:`~paramem.server.schedule_grammar.non_exact_interval_grid`, imported
+  from ``schedule_grammar`` rather than recomputed here — see
+  :func:`_period_heartbeat_calendar`) — the timer is a wakeup source only.
+  Each heartbeat, the dispatcher (``app.py::_dispatch_consolidation``) checks
+  a durable last-attempt stamp (``schedule_state.py``) against the real
+  cadence period (via ``schedule_grammar.scheduled_run_due``) and no-ops
+  until it is actually due. This is the same answer the full fold already
+  gives for its own due-ness (``_is_full_cycle_due`` reads durable on-disk
+  state and wall clock, never timer identity) — applied one level up, to the
+  timer that drives the tick itself.
 
 Accepted schedule strings (same parser as before, plus "off"):
     ""  / "off" / "disabled"  → no timer (manual /consolidate only)
     "every Nh" (24 % N == 0)  → OnCalendar=*-*-* HH,...:00:00 + Persistent=true
-    "every Nh" (24 % N != 0)  → OnCalendar heartbeat (see heartbeat_seconds) + Persistent=true
+    "every Nh" (24 % N != 0)  → OnCalendar heartbeat grid (see
+                                 _period_heartbeat_calendar) + Persistent=true
     "every Nm" (60 % N == 0)  → OnCalendar=*:MM,...:00 + Persistent=true
     "every Nm" (60 % N != 0)  → OnCalendar heartbeat + Persistent=true
     "weekly"                  → OnCalendar=Mon *-*-* 00:00:00 + Persistent=true
@@ -53,13 +66,12 @@ Accepted schedule strings (same parser as before, plus "off"):
 from __future__ import annotations
 
 import logging
-import math
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
 
-from paramem.server.schedule_grammar import is_calendar_exact, parse_schedule_atom
+from paramem.server import schedule_grammar
+from paramem.server.schedule_grammar import parse_schedule_atom
 from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
@@ -141,70 +153,21 @@ def _period_heartbeat_calendar(count: int, unit: str) -> str:
     Non-exact cadences render at the ``gcd(count, modulus)`` grid — the
     coarsest grid on which every period boundary still lands, since
     ``count`` is by construction a multiple of ``gcd(count, modulus)``.
-    The timer is a pure wakeup source here; ``heartbeat_seconds`` +
-    ``schedule_state.py`` decide which wakeups actually dispatch.
+    The gcd itself is computed by ``schedule_grammar.non_exact_interval_grid``
+    (imported rather than recomputed here) so this rendered grid and
+    ``schedule_grammar.scheduled_run_stamp_value``'s heartbeat-floored stamp
+    for the same cadence can never disagree. The timer is a pure wakeup
+    source here; the dispatcher's durable stamp decides which wakeups
+    actually dispatch.
     """
-    modulus = 24 if unit == "h" else 60
-    if modulus % count == 0:
+    if schedule_grammar.interval_is_exact(count, unit):
         cal = _hours_to_calendar(count) if unit == "h" else _minutes_to_calendar(count)
-        assert cal is not None  # modulus % count == 0 guarantees this
+        assert cal is not None  # interval_is_exact(count, unit) guarantees this
         return cal
-    grid = math.gcd(count, modulus)
+    grid = schedule_grammar.non_exact_interval_grid(count, unit)
     cal = _hours_to_calendar(grid) if unit == "h" else _minutes_to_calendar(grid)
     assert cal is not None  # gcd(count, modulus) always divides modulus
     return cal
-
-
-def heartbeat_seconds(schedule: str) -> int | None:
-    """Return the heartbeat grid, in seconds, for a non-calendar-exact cadence.
-
-    ``None`` when *schedule* is calendar-exact (anchored, an exact-divisor
-    interval, off, or unparseable — see
-    :func:`~paramem.server.schedule_grammar.is_calendar_exact`) — meaning
-    the rendered ``OnCalendar`` timer IS the schedule and no durable
-    last-attempt gate is needed.
-
-    For a non-exact interval cadence the grid is ``gcd(count, modulus)`` in
-    the cadence's own unit (modulus = 24 for hours, 60 for minutes), i.e.
-    the same grid :func:`_period_heartbeat_calendar` renders.
-    """
-    if is_calendar_exact(schedule):
-        return None
-    atom = parse_schedule_atom(schedule)
-    modulus = 24 if atom.unit == "h" else 60
-    grid = math.gcd(atom.count, modulus)
-    return grid * 3600 if atom.unit == "h" else grid * 60
-
-
-def floor_to_heartbeat(now: float, grid_seconds: int) -> float:
-    """Floor an epoch timestamp DOWN to the current heartbeat grid boundary.
-
-    ``grid_seconds`` is the value returned by :func:`heartbeat_seconds`.
-
-    Grid boundaries are computed in LOCAL time from local midnight —
-    matching ``interim_adapter.current_interim_stamp``'s flooring
-    convention and the LOCAL time base of rendered ``OnCalendar``
-    expressions. A UTC-epoch floor would only coincide with those LOCAL
-    grid marks when the local UTC offset is a whole number of hours (it
-    would misalign for e.g. UTC+05:30); flooring in local time is correct
-    for every offset.
-
-    Flooring (never rounding to nearest, never stamping raw wall-clock) is
-    mandatory: the dispatch stamp is written strictly AFTER the heartbeat
-    fires (guards, debounce, orphan-session claim, migration branch all run
-    first), so an un-floored stamp lands one instant past a grid mark —
-    pushing the next due-check to the FOLLOWING heartbeat and silently
-    inflating the effective period every cycle (``every 5h`` converges to a
-    real 6h, ``every 48h`` to 49h). A tolerance window would only narrow
-    that error, not eliminate it; flooring is exact.
-    """
-    if grid_seconds <= 0:
-        raise ValueError(f"grid_seconds must be positive, got {grid_seconds}")
-    dt = datetime.fromtimestamp(now)
-    midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    since_midnight = int((dt - midnight).total_seconds())
-    floored_since_midnight = (since_midnight // grid_seconds) * grid_seconds
-    return (midnight + timedelta(seconds=floored_since_midnight)).timestamp()
 
 
 def parse_schedule(schedule: str) -> TimerSpec | None:
@@ -217,8 +180,8 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     - ``"daily"`` → OnCalendar daily at 03:00 (same as ``"03:00"``).
     - ``"every Nh"`` where ``24 % N == 0`` → calendar timer at each N-hour mark.
     - ``"every Nh"`` where ``24 % N != 0`` → calendar HEARTBEAT timer (see
-      :func:`heartbeat_seconds`); the dispatcher's durable stamp decides
-      whether a given wakeup actually runs.
+      :func:`_period_heartbeat_calendar`); the dispatcher's durable stamp
+      decides whether a given wakeup actually runs.
     - ``"every Nm"`` where ``60 % N == 0`` → calendar timer at each N-minute mark.
     - ``"every Nm"`` where ``60 % N != 0`` → calendar HEARTBEAT timer.
     - ``"HH:MM"`` → daily OnCalendar timer at the given time.
@@ -235,9 +198,22 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     if atom.kind == "off":
         return TimerSpec(kind="off")
     if atom.kind == "weekly":
-        return TimerSpec(kind="calendar", on_calendar="Mon *-*-* 00:00:00")
+        return TimerSpec(
+            kind="calendar",
+            on_calendar=(
+                f"{schedule_grammar.WEEKLY_ANCHOR_LABEL} *-*-* "
+                f"{schedule_grammar.WEEKLY_ANCHOR_HOUR:02d}:"
+                f"{schedule_grammar.WEEKLY_ANCHOR_MINUTE:02d}:00"
+            ),
+        )
     if atom.kind == "daily":
-        return TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
+        return TimerSpec(
+            kind="daily",
+            on_calendar=(
+                f"*-*-* {schedule_grammar.DAILY_ANCHOR_HOUR:02d}:"
+                f"{schedule_grammar.DAILY_ANCHOR_MINUTE:02d}:00"
+            ),
+        )
     if atom.kind == "interval":
         cal = _period_heartbeat_calendar(atom.count, atom.unit)
         return TimerSpec(kind="calendar", on_calendar=cal)

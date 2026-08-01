@@ -223,47 +223,20 @@ class TestRenderTimerUnitCalendar:
 
 
 # ---------------------------------------------------------------------------
-# heartbeat_seconds
-# ---------------------------------------------------------------------------
-
-
-class TestHeartbeatSeconds:
-    @pytest.mark.parametrize("schedule", ["", "off", "disabled", "none"])
-    def test_off_returns_none(self, schedule):
-        assert systemd_timer.heartbeat_seconds(schedule) is None
-
-    @pytest.mark.parametrize("schedule", ["daily", "weekly", "04:00", "daily 04:00"])
-    def test_anchored_returns_none(self, schedule):
-        assert systemd_timer.heartbeat_seconds(schedule) is None
-
-    @pytest.mark.parametrize("schedule", ["every 12h", "every 30m"])
-    def test_calendar_exact_period_returns_none(self, schedule):
-        assert systemd_timer.heartbeat_seconds(schedule) is None
-
-    def test_every_5h_returns_3600(self):
-        """gcd(5, 24) == 1 → hourly grid."""
-        assert systemd_timer.heartbeat_seconds("every 5h") == 3600
-
-    def test_every_90m_returns_1800(self):
-        """gcd(90, 60) == 30 → half-hour grid (48 ticks/day, not 1440)."""
-        assert systemd_timer.heartbeat_seconds("every 90m") == 1800
-
-    def test_every_48h_returns_86400(self):
-        """gcd(48, 24) == 24 → daily grid (1 tick/day, not 24)."""
-        assert systemd_timer.heartbeat_seconds("every 48h") == 86400
-
-    def test_every_7m_returns_60(self):
-        """gcd(7, 60) == 1 → per-minute grid."""
-        assert systemd_timer.heartbeat_seconds("every 7m") == 60
-
-
-# ---------------------------------------------------------------------------
-# floor_to_heartbeat — drift regression
+# schedule_grammar._floor_from_local_midnight — drift regression
+#
+# server/app.py's arbitrator calls schedule_grammar.scheduled_run_due /
+# scheduled_run_stamp_value directly, so nothing outside schedule_grammar
+# needs a heartbeat-specific re-export. This class exercises the
+# grammar-owned flooring function directly. Grid-value coverage (which gcd
+# each odd cadence lands on) lives in
+# tests/server/test_schedule_grammar.py::TestScheduledRunStampValueGrid,
+# alongside the rest of the grammar's own test suite.
 # ---------------------------------------------------------------------------
 
 
 class TestFloorToHeartbeatDriftRegression:
-    """The highest-value regression in the catch-up-gate change.
+    """The highest-value regression test in this suite for the heartbeat-floored stamp.
 
     Without flooring, stamping raw ``time.time()`` after a non-zero dispatch
     delay pushes every subsequent due-check one heartbeat late, silently
@@ -282,8 +255,9 @@ class TestFloorToHeartbeatDriftRegression:
         varying dispatch delay between heartbeat-fire and stamp-write.
         Flooring must keep every dispatch exactly ``period`` (18000s) apart.
         """
-        heartbeat_s = systemd_timer.heartbeat_seconds("every 5h")
-        assert heartbeat_s == 3600
+        from paramem.server import schedule_grammar
+
+        heartbeat_s = 3600  # gcd(5, 24) == 1 -> hourly grid for "every 5h"
         period_s = 5 * 3600
 
         # Heartbeat fires exactly on the grid; each cycle's dispatch happens
@@ -301,7 +275,9 @@ class TestFloorToHeartbeatDriftRegression:
         stamps: list[float] = []
         for fire_t, delay in zip(heartbeat_fire_times, dispatch_delays):
             dispatch_t = fire_t + delay
-            stamps.append(systemd_timer.floor_to_heartbeat(dispatch_t, heartbeat_s))
+            stamps.append(
+                schedule_grammar._floor_from_local_midnight(dispatch_t, heartbeat_s)  # noqa: SLF001
+            )
 
         gaps = [stamps[i + 1] - stamps[i] for i in range(len(stamps) - 1)]
         assert gaps == [period_s, period_s], (
@@ -330,14 +306,18 @@ class TestFloorToHeartbeatDriftRegression:
         )
 
     def test_floor_is_idempotent_on_an_already_floored_stamp(self):
+        from paramem.server import schedule_grammar
+
         heartbeat_s = 3600
-        once = systemd_timer.floor_to_heartbeat(12345.0, heartbeat_s)
-        twice = systemd_timer.floor_to_heartbeat(once, heartbeat_s)
+        once = schedule_grammar._floor_from_local_midnight(12345.0, heartbeat_s)  # noqa: SLF001
+        twice = schedule_grammar._floor_from_local_midnight(once, heartbeat_s)  # noqa: SLF001
         assert once == twice
 
     def test_non_positive_grid_raises(self):
+        from paramem.server import schedule_grammar
+
         with pytest.raises(ValueError):
-            systemd_timer.floor_to_heartbeat(100.0, 0)
+            schedule_grammar._floor_from_local_midnight(100.0, 0)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
@@ -804,3 +784,68 @@ class TestCurrentTimerStateJsonParser:
         # Default consolidation timer (not created) must still return not-installed.
         default_state = systemd_timer.current_timer_state()
         assert default_state == {"installed": False}
+
+
+# ---------------------------------------------------------------------------
+# Anchor consistency — the rendered OnCalendar string and
+# schedule_grammar.previous_mark() must be built from the SAME anchor
+# constants (schedule_grammar.DAILY_ANCHOR_*/WEEKLY_ANCHOR_*), never a
+# second hardcoded literal in the renderer. This is the "no anchor stated
+# twice" invariant the mark-computation move exists to guarantee.
+# ---------------------------------------------------------------------------
+
+
+class TestRendererAnchorMatchesGrammarMarks:
+    def test_daily_oncalendar_uses_grammar_daily_anchor(self):
+        from paramem.server import schedule_grammar
+
+        spec = parse_schedule("daily")
+        assert spec == TimerSpec(
+            kind="daily",
+            on_calendar=(
+                f"*-*-* {schedule_grammar.DAILY_ANCHOR_HOUR:02d}:"
+                f"{schedule_grammar.DAILY_ANCHOR_MINUTE:02d}:00"
+            ),
+        )
+        # Locks the current rendered value too — a silent anchor change
+        # would otherwise only be caught by the (derived) assertion above.
+        assert spec.on_calendar == "*-*-* 03:00:00"
+
+        mark = schedule_grammar.previous_mark("daily", datetime(2024, 1, 15, 10, 0).timestamp())
+        assert (
+            mark
+            == datetime(
+                2024,
+                1,
+                15,
+                schedule_grammar.DAILY_ANCHOR_HOUR,
+                schedule_grammar.DAILY_ANCHOR_MINUTE,
+            ).timestamp()
+        )
+
+    def test_weekly_oncalendar_uses_grammar_weekly_anchor(self):
+        from paramem.server import schedule_grammar
+
+        spec = parse_schedule("weekly")
+        assert spec == TimerSpec(
+            kind="calendar",
+            on_calendar=(
+                f"{schedule_grammar.WEEKLY_ANCHOR_LABEL} *-*-* "
+                f"{schedule_grammar.WEEKLY_ANCHOR_HOUR:02d}:"
+                f"{schedule_grammar.WEEKLY_ANCHOR_MINUTE:02d}:00"
+            ),
+        )
+        assert spec.on_calendar == "Mon *-*-* 00:00:00"
+
+        # 2024-01-15 is the Monday matching WEEKLY_ANCHOR_WEEKDAY.
+        mark = schedule_grammar.previous_mark("weekly", datetime(2024, 1, 17, 15, 0).timestamp())
+        assert (
+            mark
+            == datetime(
+                2024,
+                1,
+                15,
+                schedule_grammar.WEEKLY_ANCHOR_HOUR,
+                schedule_grammar.WEEKLY_ANCHOR_MINUTE,
+            ).timestamp()
+        )
