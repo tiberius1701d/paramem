@@ -10083,8 +10083,12 @@ class TestMaterializeInterimExtraRelations:
           adopt writes ik_key to the new keyless edge on a same-SPO collision
           (recurrence bump).
         - The edge with ik_key='graph1' must be present.
-        - ``merger.adopt_reinforcements`` records the adopted main key and the
-          merged timestamps the credit pass advances bookkeeping with.
+        - This is the keyless-incoming/keyed-existing shape: the extra
+          relation carries no indexed_key while the registry-true edge
+          already carries 'graph1', so it is the keyless-onto-keyed
+          re-observation arm (not the adopt-onto-keyless arm).
+          ``merger.adopt_reinforcements`` records 'graph1' with the merged
+          (last_seen, first_seen) the credit pass advances bookkeeping with.
         """
         from unittest.mock import patch
 
@@ -10153,6 +10157,16 @@ class TestMaterializeInterimExtraRelations:
             f"Edge with ik_key='graph1' must be present in merged graph; "
             f"found ik_keys: {all_ik_keys}"
         )
+
+        # The extra_relations merge runs credit_adopt_reinforcement=True
+        # unconditionally, so the keyless pending relation re-observing the
+        # already-keyed 'graph1' edge must record it in adopt_reinforcements.
+        assert "graph1" in loop.merger.adopt_reinforcements, (
+            f"Expected 'graph1' in merger.adopt_reinforcements; "
+            f"got {loop.merger.adopt_reinforcements}"
+        )
+        _adopt_ls, _adopt_fs = loop.merger.adopt_reinforcements["graph1"]
+        assert isinstance(_adopt_ls, str) and isinstance(_adopt_fs, str)
 
     # ------------------------------------------------------------------
     # 3. Pending unregistered relation does NOT enter recall_miss_keys
@@ -10383,7 +10397,7 @@ class TestInterimRecitalDedup:
     """
 
     @staticmethod
-    def _make_loop(tmp_path):
+    def _make_loop(tmp_path, *, cycle_count: int = 0):
         """Minimal ConsolidationLoop with a real GraphMerger for dedup tests.
 
         Copied from TestMaterializeInterimExtraRelations._make_loop (same
@@ -10391,6 +10405,10 @@ class TestInterimRecitalDedup:
         needed; real GraphMerger(model=None) so merge/reset_graph execute
         correctly; real MemoryStore with replay_enabled=True).
         reconstruct_graph must be mocked by each test via _fake_reconstruct.
+
+        Also delegated to by TestConsumePendingReinforcementCredit, which
+        needs a non-zero cycle_count to assert on
+        bookkeeping["last_reinforced_cycle"].
         """
         from peft import PeftModel
 
@@ -10431,7 +10449,7 @@ class TestInterimRecitalDedup:
         loop._early_stop_callback = None
         loop.fingerprint_cache = None
         loop._keep_prior_slots = 2
-        loop.cycle_count = 0
+        loop.cycle_count = cycle_count
         loop._indexed_next_index = 1
         loop._procedural_next_index = 1
         loop._procedural_tentative_next_index = 1
@@ -10533,6 +10551,81 @@ class TestInterimRecitalDedup:
         )
         assert tier_keyed == {"episodic": [], "procedural": [], "semantic": []}, (
             "main key must be excluded — no interim key emitted for the recited fact"
+        )
+
+    # ------------------------------------------------------------------
+    # 1a. Attribute-typed dedup target excluded from the node-attribute walk
+    #     (attribute relations never become edges, so exclude_keys needs its
+    #     own check there, mirroring the edge walk's).
+    # ------------------------------------------------------------------
+
+    def test_attribute_typed_dedup_target_excluded_from_node_attribute_walk(self, tmp_path):
+        """An attribute-typed dedup target (e.g. a speaker's phone/email fact)
+        must be excluded from the node-attribute walk exactly like an
+        edge-typed dedup target is excluded from the edge walk.
+
+        Attribute relations never become edges — GraphMerger diverts them
+        onto the subject node's ``attributes``/``attribute_keys`` dicts (see
+        ``merger.py``'s ``relation_type == "attribute"`` branch) — so the
+        node-attribute walk needs its own ``exclude_keys`` check.  Without
+        it, a dedup target matched via an attribute fact (a speaker entity
+        touched by the session) would be keyed-replayed into the interim
+        slot's training set, violating the same tier/slot separation
+        invariant the edge walk enforces.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+        _adapter = "episodic_interim_20260101T0000"
+
+        loop.store.put(
+            "episodic",
+            "graph_phone",
+            {
+                "key": "graph_phone",
+                "subject": "alice",
+                "predicate": "has phone",
+                "object": "+491234567",
+                "speaker_id": "spk-a",
+            },
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph_phone", speaker_id="spk-a", relation_type="attribute", first_seen=""
+        )
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],
+                extra_relations=None,
+                dedup_target_keys=["graph_phone"],
+            )
+
+        # Setup precondition: attribute facts never become edges — the merge
+        # must have diverted onto the subject node's attributes, not an edge.
+        assert loop.merger.graph.number_of_edges() == 0, (
+            "an attribute-typed relation must never create an edge"
+        )
+        _alice_node = loop.merger.graph.nodes.get("alice", {})
+        assert _alice_node.get("attribute_keys", {}).get("phone") == "graph_phone", (
+            f"setup precondition: graph_phone must be stamped on alice's attribute_keys; "
+            f"got {_alice_node}"
+        )
+
+        tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
+        minted, _ = loop._build_all_edge_entries_into(
+            tier_keyed, defer=True, tag_new=True, exclude_keys={"graph_phone"}
+        )
+        assert minted == {"episodic": 0, "procedural": 0}, (
+            f"an excluded attribute-typed dedup target must not be minted; got {minted}"
+        )
+        assert tier_keyed == {"episodic": [], "procedural": [], "semantic": []}, (
+            "an attribute-typed dedup target must be excluded from the node-attribute "
+            f"walk exactly like an edge-typed target; got {tier_keyed}"
         )
 
     # ------------------------------------------------------------------
@@ -11616,6 +11709,505 @@ class TestInterimRecitalDedup:
         assert main_after == main_before + 1, (
             "the recital-dedup credit must be applied exactly once across the "
             f"crash->resume pair (N+1, not N+2); before={main_before} after={main_after}"
+        )
+
+    # ------------------------------------------------------------------
+    # 10. Sibling-interim scan scope: a fact already keyed in an EARLIER
+    #     interim slot (not yet folded into main) must be a dedup target
+    #     too — the main-tier-only scan misses it, minting a duplicate key
+    #     for the same fact observed again before the next full fold.
+    # ------------------------------------------------------------------
+
+    def test_sibling_interim_key_included_in_dedup_scope(self, tmp_path):
+        """A key registered in an earlier (sibling) interim slot, touching this
+        cycle's session entity, must be included in dedup_target_keys — and an
+        out-of-session main-tier key must still be excluded.
+        """
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_loop(tmp_path)
+
+        # Sibling interim slot from an earlier cycle, already holding a key
+        # for the fact this cycle re-observes.
+        _sibling = "episodic_interim_20260101T0000"
+        loop.store.load_registry(_sibling, KeyRegistry())
+        loop.store.put(
+            _sibling,
+            "graph_sibling",
+            {
+                "key": "graph_sibling",
+                "subject": "alice",
+                "predicate": "likes",
+                "object": "tea",
+                "speaker_id": "spk-a",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_sibling", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        # Out-of-session main-tier key: never touched by this cycle's content.
+        loop.store.put(
+            "episodic",
+            "graph_out_of_session",
+            {
+                "key": "graph_out_of_session",
+                "subject": "carol",
+                "predicate": "works at",
+                "object": "acme",
+                "speaker_id": "spk-c",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_out_of_session", speaker_id="spk-c", relation_type="factual", first_seen=""
+        )
+
+        # Pre-populate merger.graph with THIS cycle's pending-session content
+        # (mentions "alice") so _capture_pending_relations sees it.
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s2",
+                timestamp="",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        materialize_calls: list[dict] = []
+
+        def _spy_materialize(**kw):
+            materialize_calls.append(kw)
+            return (set(), [])
+
+        loop._materialize_consolidation_graph = _spy_materialize  # type: ignore[method-assign]
+
+        stamp = "20260102T0000"
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "alice",
+                    "predicate": "likes",
+                    "object": "tea",
+                    "relation_type": "factual",
+                    "speaker_id": "spk-a",
+                }
+            ],
+            [],
+            speaker_id="spk-a",
+            mode="simulate",
+            run_label="sibling-interim-dedup-scope-test",
+            stamp=stamp,
+        )
+
+        assert len(materialize_calls) == 1
+        dedup_keys = materialize_calls[0].get("dedup_target_keys")
+        assert dedup_keys is not None
+        assert "graph_sibling" in dedup_keys, (
+            f"sibling-interim key touching the session must be in scope; got {dedup_keys}"
+        )
+        assert "graph_out_of_session" not in dedup_keys, (
+            f"out-of-session main-tier key must NOT be in scope; got {dedup_keys}"
+        )
+
+    def test_current_slot_own_keys_never_self_target_dedup(self, tmp_path):
+        """A key already registered in the slot being folded (same stamp/tier,
+        e.g. a second batch landing in the same sub-interval) must never
+        appear as its own dedup target — proving ``adapter_name or
+        scope.tier`` names the current slot correctly so both the sibling-tier
+        exclusion and the ``_slot_keys_set`` filter hold for the real
+        ``_run_fold`` interim branch, not just for a re-implementation of the
+        check.
+        """
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_loop(tmp_path)
+        _adapter = "episodic_interim_20260101T0000"
+
+        # A key already registered in THIS SAME slot (simulates a second
+        # batch landing within the same sub-interval, before the next full
+        # fold retires the slot).
+        loop.store.load_registry(_adapter, KeyRegistry())
+        loop.store.put(
+            _adapter,
+            "graph_self",
+            {
+                "key": "graph_self",
+                "subject": "alice",
+                "predicate": "likes",
+                "object": "tea",
+                "speaker_id": "spk-a",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_self", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        # A NEW pending observation of a DIFFERENT fact about the same entity
+        # ("alice"), so the session-scoping filter alone would not exclude
+        # graph_self — only the current-slot exclusion does.
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s1",
+                timestamp="",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="works at",
+                        object="acme",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        materialize_calls: list[dict] = []
+
+        def _spy_materialize(**kw):
+            materialize_calls.append(kw)
+            return (set(), [])
+
+        loop._materialize_consolidation_graph = _spy_materialize  # type: ignore[method-assign]
+
+        # Same stamp as the pre-existing registry: this cycle folds the SAME
+        # slot again.
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "alice",
+                    "predicate": "works at",
+                    "object": "acme",
+                    "relation_type": "factual",
+                    "speaker_id": "spk-a",
+                }
+            ],
+            [],
+            speaker_id="spk-a",
+            mode="simulate",
+            run_label="current-slot-self-exclusion-test",
+            stamp="20260101T0000",
+        )
+
+        assert len(materialize_calls) == 1
+        dedup_keys = materialize_calls[0].get("dedup_target_keys")
+        assert dedup_keys is not None
+        assert "graph_self" not in dedup_keys, (
+            f"the slot's own pre-existing key must never be its own dedup target; got {dedup_keys}"
+        )
+
+    # ------------------------------------------------------------------
+    # 11. End-to-end: two successive interim folds observing the same fact.
+    #     The second fold must mint NO new key and must credit the FIRST
+    #     fold's (sibling-interim) key instead.
+    # ------------------------------------------------------------------
+
+    def test_two_successive_interim_folds_same_fact_mints_one_key(self, tmp_path):
+        """Cycle 1 mints a key for a fact in interim slot A.  Cycle 2, in a
+        DIFFERENT interim slot B, re-observes the identical fact.  Before the
+        sibling-interim widening, slot A's key was invisible to slot B's
+        dedup scan (main tiers only), so the same fact minted a SECOND key —
+        collapsed only at the next full fold.  With the widened scan, slot B
+        must mint no new key and must credit slot A's key instead.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation, SessionGraph
+
+        loop = self._make_loop(tmp_path)
+
+        # --- Cycle 1: mint the first key for (alice, likes, tea) ---
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s1",
+                timestamp="2026-01-01T00:00:00",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                        last_seen="2026-01-01T00:00:00",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        _slot_a = "episodic_interim_20260101T0000"
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            result_1 = loop.run_consolidation_cycle(
+                [
+                    {
+                        "subject": "alice",
+                        "predicate": "likes",
+                        "object": "tea",
+                        "relation_type": "factual",
+                        "speaker_id": "spk-a",
+                    }
+                ],
+                [],
+                speaker_id="spk-a",
+                mode="simulate",
+                run_label="two-interim-folds-cycle-1",
+                stamp="20260101T0000",
+            )
+
+        assert result_1.get("mode") == "simulated", f"cycle 1 must complete; got {result_1!r}"
+        _slot_a_keys = list(loop.store.active_keys_in_tier(_slot_a))
+        assert len(_slot_a_keys) == 1, (
+            f"cycle 1 must mint exactly one key for the recited fact; got {_slot_a_keys}"
+        )
+        _minted_key = _slot_a_keys[0]
+        _before_count = loop.store.bookkeeping_for_key(_minted_key)["reinforcement_count"]
+
+        # --- Cycle 2: a DIFFERENT interim slot re-observes the IDENTICAL fact ---
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s2",
+                timestamp="2026-01-02T00:00:00",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                        last_seen="2026-01-02T00:00:00",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        _slot_b = "episodic_interim_20260102T0000"
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            result_2 = loop.run_consolidation_cycle(
+                [
+                    {
+                        "subject": "alice",
+                        "predicate": "likes",
+                        "object": "tea",
+                        "relation_type": "factual",
+                        "speaker_id": "spk-a",
+                    }
+                ],
+                [],
+                speaker_id="spk-a",
+                mode="simulate",
+                run_label="two-interim-folds-cycle-2",
+                stamp="20260102T0000",
+            )
+
+        assert result_2.get("mode") == "simulated", f"cycle 2 must complete; got {result_2!r}"
+
+        _slot_b_keys = list(loop.store.active_keys_in_tier(_slot_b))
+        assert _slot_b_keys == [], (
+            "the second interim fold must mint NO new key for a fact already "
+            f"keyed in a sibling interim slot; got {_slot_b_keys}"
+        )
+
+        after = loop.store.bookkeeping_for_key(_minted_key)
+        assert after["reinforcement_count"] == _before_count + 1, (
+            f"the sibling-interim key must be credited by the second fold's "
+            f"re-observation; before={_before_count} after={after}"
+        )
+        assert after["last_seen"] == "2026-01-02T00:00:00", (
+            "last_seen must advance to the second fold's session timestamp"
+        )
+
+    # ------------------------------------------------------------------
+    # 12. Same-stamp interim re-fold: the RESIDENT-SLOT warm branch (the
+    #     slot already exists in model.peft_config for this stamp).  A new
+    #     session lands in the same cadence window and re-observes a fact
+    #     the earlier cycle in this SAME slot already keyed -- a genuine
+    #     re-observation, correctly earning credit (pins the comment at the
+    #     extra_relations credit_adopt_reinforcement call site naming this
+    #     as one of the three safe shapes reaching the keyless-onto-keyed
+    #     arm).
+    # ------------------------------------------------------------------
+
+    def test_same_stamp_resident_slot_refold_credits_current_slot_key(self, tmp_path):
+        """Two run_consolidation_cycle(mode="train") calls at the SAME stamp:
+        cycle 1 mints a key in a fresh slot; cycle 2 re-enters that SAME slot
+        (the "Resident slot (re-fold within the cadence window)" branch,
+        consolidation.py's interim PEFT-mint check) with a NEW session
+        re-observing the identical fact at a LATER timestamp.  The key must
+        not be re-minted, and its reinforcement count must grow by exactly 1.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+        loop = self._make_loop(tmp_path)
+        stamp = "20260301T0000"
+        _adapter = f"{INTERIM_NAME_PREFIX}{stamp}"
+
+        def _mock_create_interim_adapter(m, cfg, _stamp):
+            # Real create_interim_adapter mints the PEFT slot and registers it
+            # in model.peft_config; mirror only the registration side effect
+            # so the SECOND cycle's mint-check (`adapter_name in
+            # self.model.peft_config`) sees a resident slot, without any real
+            # PEFT/torch work.
+            m.peft_config[f"{INTERIM_NAME_PREFIX}{_stamp}"] = cfg
+            return m
+
+        def _stub_train_success(_self, entries, *, adapter_name, **kwargs):
+            return {"aborted": False, "train_loss": 0.1}, None
+
+        episodic_rels = [
+            {
+                "subject": "alice",
+                "predicate": "likes",
+                "object": "tea",
+                "relation_type": "factual",
+                "speaker_id": "spk-a",
+            }
+        ]
+
+        # --- Cycle 1: fresh mint (adapter_name not yet in peft_config) ---
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s1",
+                timestamp="2026-03-01T00:00:00Z",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        with (
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                side_effect=self._fake_reconstruct,
+            ),
+            patch("paramem.training.consolidation.switch_adapter"),
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=_mock_create_interim_adapter,
+            ),
+            patch.object(ConsolidationLoop, "_train_tier_adapter", _stub_train_success),
+            patch.object(ConsolidationLoop, "_persist_fold"),
+        ):
+            result_1 = loop.run_consolidation_cycle(
+                list(episodic_rels),
+                [],
+                speaker_id="spk-a",
+                mode="train",
+                run_label="same-stamp-refold-cycle-1",
+                stamp=stamp,
+            )
+
+        assert result_1.get("mode") == "trained", f"cycle 1 must complete; got {result_1!r}"
+        assert _adapter in loop.model.peft_config, (
+            "setup precondition: cycle 1 must register the slot in peft_config"
+        )
+        _slot_keys = list(loop.store.active_keys_in_tier(_adapter))
+        assert len(_slot_keys) == 1, f"cycle 1 must mint exactly one key; got {_slot_keys}"
+        _minted_key = _slot_keys[0]
+        _before = loop.store.bookkeeping_for_key(_minted_key)
+        _before_count = _before["reinforcement_count"]
+
+        # --- Cycle 2: SAME stamp -> resident-slot warm branch.  A NEW
+        # session re-observes the identical fact at a LATER timestamp. ---
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s2",
+                timestamp="2026-03-15T00:00:00Z",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        with (
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                side_effect=self._fake_reconstruct,
+            ),
+            patch("paramem.training.consolidation.switch_adapter"),
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=_mock_create_interim_adapter,
+            ),
+            patch(
+                "paramem.models.loader.ensure_adapter_matching",
+                side_effect=lambda m, cfg, name: m,
+            ),
+            patch.object(ConsolidationLoop, "_train_tier_adapter", _stub_train_success),
+            patch.object(ConsolidationLoop, "_persist_fold"),
+        ):
+            result_2 = loop.run_consolidation_cycle(
+                list(episodic_rels),
+                [],
+                speaker_id="spk-a",
+                mode="train",
+                run_label="same-stamp-refold-cycle-2",
+                stamp=stamp,
+            )
+
+        assert result_2.get("mode") == "trained", f"cycle 2 must complete; got {result_2!r}"
+
+        _slot_keys_after = list(loop.store.active_keys_in_tier(_adapter))
+        assert _slot_keys_after == [_minted_key], (
+            "the resident slot's own re-observed fact must not mint a second key; "
+            f"got {_slot_keys_after}"
+        )
+
+        after = loop.store.bookkeeping_for_key(_minted_key)
+        assert after["reinforcement_count"] == _before_count + 1, (
+            f"the resident-slot key must be credited by cycle 2's re-observation "
+            f"(a real re-observation at a later timestamp); before={_before_count} after={after}"
+        )
+        assert after["last_seen"] == "2026-03-15T00:00:00Z", (
+            "last_seen must advance to cycle 2's session timestamp"
         )
 
 
@@ -16958,6 +17550,266 @@ class TestConsumePendingFullFold:
         extra = materialize_call.get("extra_relations")
         # Helper returns [] on empty graph; the full fold passes it through.
         assert extra == [] or extra is None  # both are valid no-ops for materialize
+
+
+# =============================================================================
+# TestConsumePendingReinforcementCredit — the consume-pending full fold's
+# keyless-onto-keyed re-observation must reach store.reinforce, not just be
+# passed through kwargs.  TestConsumePendingFullFold above patches
+# _materialize_consolidation_graph with a spy, so it never exercises the real
+# merge/credit path; this class drives the real GraphMerger and MemoryStore
+# end to end.
+# =============================================================================
+
+
+class TestConsumePendingReinforcementCredit:
+    """A pending re-observation of an already-keyed main-tier fact, folded
+    through the consume-pending full fold's extra_relations channel, must
+    credit that key's reinforcement — not silently drop the observation.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Minimal ConsolidationLoop with a real GraphMerger and MemoryStore.
+
+        Delegates to TestInterimRecitalDedup._make_loop (identical shape:
+        object.__new__ so no GPU model or extraction pipeline is needed; real
+        GraphMerger(model=None) so merge/reset_graph execute correctly; real
+        MemoryStore with replay_enabled=True) — this class's tests assert on
+        bookkeeping["last_reinforced_cycle"], so cycle_count=3 (non-zero,
+        distinguishable from the field's zero-value default).
+        reconstruct_graph must be mocked by each test via _fake_reconstruct.
+        """
+        return TestInterimRecitalDedup._make_loop(tmp_path, cycle_count=3)
+
+    @staticmethod
+    def _fake_reconstruct(loop, *, tier=None, strict=False):
+        """Reconstruct stub: returns empty graph + no failures (no GPU).
+
+        Delegates to TestInterimRecitalDedup._fake_reconstruct (identical body).
+        """
+        return TestInterimRecitalDedup._fake_reconstruct(loop, tier=tier, strict=strict)
+
+    def test_consume_pending_reobservation_credits_main_key(self, tmp_path):
+        """A keyless pending re-observation of a registered main-tier key,
+        driven through the consume-pending full fold's exact call shape
+        (source="weights", extra_relations=<pending>, no dedup_target_keys),
+        must earn a reinforcement on that key via store.reinforce.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            relation_type="factual",
+            first_seen="2020-01-01T00:00:00",
+            last_seen="2020-01-01T00:00:00",
+        )
+        before = loop.store.bookkeeping_for_key("graph1")
+        before_count = before["reinforcement_count"]
+
+        # A pending re-observation of the identical SPO, keyless (as every
+        # relation captured off merger.graph is), with a fresh session
+        # timestamp.
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+                last_seen="2026-02-01T00:00:00",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            _miss, recon_relations = loop._materialize_consolidation_graph(
+                source="weights",
+                keys=["graph1"],
+                extra_relations=extra,
+            )
+
+        assert "graph1" in loop.merger.adopt_reinforcements, (
+            "the extra_relations merge's keyless-onto-keyed arm must record graph1"
+        )
+
+        loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
+
+        after = loop.store.bookkeeping_for_key("graph1")
+        assert after["reinforcement_count"] == before_count + 1, (
+            f"main key reinforcement must bump by exactly 1; before={before_count} after={after}"
+        )
+        assert after["last_reinforced_cycle"] == 3
+        assert after["last_seen"] == "2026-02-01T00:00:00", (
+            "last_seen must advance to the pending relation's session timestamp"
+        )
+
+    def test_consume_pending_reobservation_via_real_capture_hop_credits_main_key(self, tmp_path):
+        """Same credit outcome as test_consume_pending_reobservation_credits_main_key,
+        but the pending relation is produced by the REAL
+        ConsolidationLoop._capture_pending_relations hop from a
+        session-extracted-shaped merger.graph edge — never a hand-built
+        Relation.
+
+        merger.graph is populated the way live ingest (GraphMerger.merge,
+        called from extract_session at session-append time) leaves it: a
+        subject node carrying speaker_id, and an edge carrying predicate /
+        relation_type / sessions / a real ISO last_seen (the value that
+        flows from SessionBuffer's started_at/event_time through
+        GraphMerger._upsert_relation at live ingest — this test's edge
+        stands in for that write, not for the extraction call that precedes
+        it).  _capture_pending_relations is called directly (the same call
+        _materialize_consolidation_graph's caller makes before the graph
+        reset) so the Relation object reaching the credit path is the
+        production one, with its last_seen read off the edge rather than
+        set by the test.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            relation_type="factual",
+            first_seen="2020-01-01T00:00:00",
+            last_seen="2020-01-01T00:00:00",
+        )
+        before = loop.store.bookkeeping_for_key("graph1")
+        before_count = before["reinforcement_count"]
+
+        loop.merger.graph.add_node("alice", speaker_id="spk-a", attributes={"name": "Alice"})
+        loop.merger.graph.add_node("berlin", attributes={"name": "Berlin"})
+        loop.merger.graph.add_edge(
+            "alice",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            sessions=["sess_2"],
+            last_seen="2026-02-01T00:00:00",
+            first_seen="2026-02-01T00:00:00",
+        )
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            _pending = loop._capture_pending_relations()
+            assert len(_pending) == 1, (
+                f"expected exactly one captured pending relation; got {_pending}"
+            )
+            assert _pending[0].last_seen == "2026-02-01T00:00:00", (
+                "the captured relation's last_seen must be read off the edge — "
+                f"pins the SessionBuffer -> event_time -> edge last_seen -> capture "
+                f"flow; got {_pending[0].last_seen!r}"
+            )
+            assert _pending[0].speaker_id == "spk-a", (
+                "the captured relation's speaker_id must fall back to the subject "
+                f"node's speaker_id; got {_pending[0].speaker_id!r}"
+            )
+
+            _miss, recon_relations = loop._materialize_consolidation_graph(
+                source="weights",
+                keys=["graph1"],
+                extra_relations=_pending,
+            )
+
+        assert "graph1" in loop.merger.adopt_reinforcements, (
+            "the real-capture-hop pending relation must still reach the "
+            "keyless-onto-keyed credit arm"
+        )
+
+        loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
+
+        after = loop.store.bookkeeping_for_key("graph1")
+        assert after["reinforcement_count"] == before_count + 1, (
+            f"main key reinforcement must bump by exactly 1; before={before_count} after={after}"
+        )
+        assert after["last_seen"] == "2026-02-01T00:00:00", (
+            "last_seen must advance to the captured relation's real edge timestamp"
+        )
+
+    def test_consume_pending_no_reobservation_leaves_credit_unchanged(self, tmp_path):
+        """A pending relation touching a DIFFERENT fact must not credit an
+        unrelated main-tier key — the credit is scoped to the exact SPO that
+        collides with the keyed edge, not a blanket bump on every fold.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            relation_type="factual",
+            first_seen="2020-01-01T00:00:00",
+            last_seen="2020-01-01T00:00:00",
+        )
+        before = loop.store.bookkeeping_for_key("graph1")
+        before_count = before["reinforcement_count"]
+
+        extra = [
+            Relation(
+                subject="bob",
+                predicate="works at",
+                object="acme corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-b",
+                last_seen="2026-02-01T00:00:00",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            _miss, recon_relations = loop._materialize_consolidation_graph(
+                source="weights",
+                keys=["graph1"],
+                extra_relations=extra,
+            )
+
+        assert loop.merger.adopt_reinforcements == {}, (
+            f"unrelated fact must not populate adopt_reinforcements; "
+            f"got {loop.merger.adopt_reinforcements}"
+        )
+
+        loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
+
+        after = loop.store.bookkeeping_for_key("graph1")
+        assert after["reinforcement_count"] == before_count, (
+            "an unrelated pending fact must not bump graph1's reinforcement count"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -36,7 +36,12 @@ success are the same code path — a pass that either degraded or did not — pu
 them in one branch at that site, using ``resolve_incident`` when the type
 carries several keys and only one sub-condition recovered.  Where they are
 different paths (a crash recorded in a handler, cleared by a later successful
-run) the clear site belongs on that op's success path.
+run) the clear site belongs on that op's success path.  When a whole class of
+incidents can never reach its normal success path in some operator-chosen
+state (e.g. cloud egress disabled), a caller may resolve every open incident
+of a type via ``resolve_incidents_by_type(..., reason=...)`` instead — the
+persisted ``reason`` marks it as that kind of resolution rather than a clean
+run.
 ``tests/server/test_incident_wiring.py`` holds every type to this.
 
 Concurrency
@@ -111,6 +116,18 @@ class Incident:
     detail:
         Arbitrary JSON-serialisable dict for structured context.  Shape is
         per-``type``; callers own the schema.
+    resolved_reason:
+        Optional human-readable reason a resolve site gave for closing this
+        incident (e.g. "cloud egress disabled — enrichment cannot run"),
+        distinct from ``summary``/``detail`` which describe the FAILURE, not
+        the resolution.  ``None`` for the common case (a success op resolved
+        it, or the row was never resolved) and for every row written before
+        this field existed — old store files without it still deserialise
+        (see ``from_dict``'s ``.get`` default).  Cleared back to ``None`` on
+        every ``record_incident`` bump — reopen or a live
+        active/acknowledged row alike — since a bump means the row is live
+        again regardless of the status it bumped from, and a stale reason
+        from a prior resolution must not survive onto it.
     """
 
     id: str
@@ -122,12 +139,15 @@ class Incident:
     status: str
     summary: str
     detail: dict
+    resolved_reason: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Incident":
         """Deserialise from a JSON dict.
 
         Raises ``IncidentStoreSchemaError`` on missing required fields.
+        ``resolved_reason`` is optional — absent in every row written before
+        that field existed, so a pre-existing store file still reads.
         """
         if not isinstance(d, dict):
             raise IncidentStoreSchemaError("incident entry is not a JSON object")
@@ -155,6 +175,7 @@ class Incident:
             status=d["status"],
             summary=d["summary"],
             detail=d["detail"],
+            resolved_reason=d.get("resolved_reason"),
         )
 
     def to_dict(self) -> dict:
@@ -267,6 +288,15 @@ def record_incident(
                 new_row["severity"] = severity
                 if row.get("status") == "resolved":
                     new_row["status"] = "active"
+                # A bump means the row is live again regardless of the
+                # status it bumped from (reopen from resolved, or a second
+                # occurrence of an already-active/acknowledged row) — a
+                # reason a PRIOR resolve gave (e.g. "cloud egress disabled")
+                # no longer applies, so it must not linger.  Gating this on
+                # ``status == "resolved"`` alone missed the
+                # resolve-with-reason -> ack -> re-record path: an
+                # acknowledged row bumped here kept the stale reason.
+                new_row["resolved_reason"] = None
                 new_rows.append(new_row)
             else:
                 new_rows.append(row)
@@ -321,7 +351,7 @@ def read_incidents(state_dir: Path) -> list[Incident]:
     return [Incident.from_dict(r) for r in rows]
 
 
-def resolve_incident(state_dir: Path, type: str, key: str) -> bool:
+def resolve_incident(state_dir: Path, type: str, key: str, *, reason: str | None = None) -> bool:
     """Resolve the incident matching ``(type, key)``.
 
     Idempotent: returns ``False`` if no matching incident is found (normal
@@ -336,6 +366,11 @@ def resolve_incident(state_dir: Path, type: str, key: str) -> bool:
         Failure-type discriminator string.
     key:
         Per-type dedup key.
+    reason:
+        Optional human-readable reason for this resolution, persisted onto
+        the row as ``resolved_reason``.  ``None`` (default) leaves the field
+        untouched — a success-path resolve never needs one, and every
+        existing call site keeps its exact prior behaviour by omitting it.
 
     Returns
     -------
@@ -364,6 +399,8 @@ def resolve_incident(state_dir: Path, type: str, key: str) -> bool:
                     new_row = dict(row)
                     new_row["status"] = "resolved"
                     new_row["last_seen"] = now
+                    if reason is not None:
+                        new_row["resolved_reason"] = reason
                     new_rows.append(new_row)
                 else:
                     # Already resolved — idempotent no-op; return False to signal
@@ -378,7 +415,7 @@ def resolve_incident(state_dir: Path, type: str, key: str) -> bool:
     return found_holder[0]
 
 
-def resolve_incidents_by_type(state_dir: Path, type: str) -> int:
+def resolve_incidents_by_type(state_dir: Path, type: str, *, reason: str | None = None) -> int:
     """Resolve every active incident of the given ``type``.
 
     Used by success-path auto-resolve (all incidents of a type clear when the
@@ -391,6 +428,11 @@ def resolve_incidents_by_type(state_dir: Path, type: str) -> int:
         Directory containing ``incidents.json``.
     type:
         Failure-type discriminator string.
+    reason:
+        Optional human-readable reason for this resolution, persisted onto
+        every resolved row as ``resolved_reason``.  ``None`` (default)
+        leaves the field untouched, matching every existing caller's prior
+        behaviour exactly.
 
     Returns
     -------
@@ -413,6 +455,8 @@ def resolve_incidents_by_type(state_dir: Path, type: str) -> int:
                 new_row = dict(row)
                 new_row["status"] = "resolved"
                 new_row["last_seen"] = now
+                if reason is not None:
+                    new_row["resolved_reason"] = reason
                 new_rows.append(new_row)
             else:
                 new_rows.append(row)

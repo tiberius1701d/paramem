@@ -289,15 +289,16 @@ class GraphMerger:
         # designates a surviving key and neither carries a ``survivor_key``.
         self.removal_ledger: dict[str, dict] = {}
         # adopt_reinforcements: main-tier ik_key -> (last_seen, first_seen) recorded
-        # when the interim recital-dedup merge's Case-1-adopt branch (relation
-        # carries an indexed_key, existing edge is keyless) stamps that key onto a
-        # recited pending fact's edge.  Populated ONLY in the dedup merge's
-        # Case-1-adopt (interim scope only — the full fold never passes
-        # dedup_target_keys).  No edge is removed, so there is no ledger entry
-        # to carry it: this is the credit pass's second input, and its own
-        # accumulator for that reason.  Consumed EXACTLY ONCE per fold at the
-        # reinforcement-credit site in _refine_consolidation_graph — a second
-        # _refine invocation would double-credit (do not add one).
+        # by any merge called with credit_adopt_reinforcement=True, from either
+        # Case-1 arm: the adopt branch (relation carries an indexed_key, existing
+        # edge is keyless — the interim recital-dedup merge) or the
+        # keyless-onto-keyed arm (relation carries no indexed_key, existing edge
+        # already does — the extra_relations/pending-session merge, both scopes).
+        # No edge is removed by either arm, so there is no ledger entry to carry
+        # it: this is the credit pass's second input, and its own accumulator for
+        # that reason.  Consumed EXACTLY ONCE per fold at the reinforcement-credit
+        # site in _refine_consolidation_graph — a second _refine invocation would
+        # double-credit (do not add one).
         self.adopt_reinforcements: dict[str, tuple[str, str]] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
@@ -341,12 +342,13 @@ class GraphMerger:
                 ) coexist rather than fabricating a NOW recency value.
                 When ``False``, Case-2 is short-circuited: no model call, no
                 edge removal.
-            credit_adopt_reinforcement: When ``True``, the Case-1-adopt branch
-                (an incoming keyed relation adopts its ``indexed_key`` onto a
-                pre-existing keyless edge) also records the adopted key in
-                ``self.adopt_reinforcements`` for the fold's
-                reinforcement-credit pass.  Default ``False`` for every caller
-                except the interim recital-dedup merge.
+            credit_adopt_reinforcement: When ``True``, two Case-1 arms record
+                the adopted key in ``self.adopt_reinforcements`` for the
+                fold's reinforcement-credit pass: the adopt branch (an
+                incoming keyed relation adopts its ``indexed_key`` onto a
+                pre-existing keyless edge) and the keyless-onto-keyed arm (an
+                incoming keyless relation re-observes an already-keyed edge).
+                Default ``False``.
 
         Returns the updated cumulative graph.
 
@@ -562,9 +564,11 @@ class GraphMerger:
                 ``False`` (no cardinality resolution).  Set ``True`` when the
                 config ``refinement_contradiction == "on"``.
             credit_adopt_reinforcement: Forwarded to :meth:`merge`.  Default
-                ``False`` for every caller except the interim recital-dedup
-                merge, where ``True`` credits a recited fact's Case-1-adopt
-                onto a main-tier key to that key's reinforcement.
+                ``False``.  ``True`` for the interim recital-dedup merge
+                (credits a recited fact's Case-1-adopt onto a main-tier key)
+                and for the extra-relations (pending-session) merge (credits a
+                keyless pending re-observation that lands on an
+                already-keyed edge).
         """
         if not relations:
             return
@@ -763,10 +767,13 @@ class GraphMerger:
         1. Identical triple already exists — exact-duplicate reinforcement: bump
            recurrence.  Case-1-adopt: if the existing edge has no ``ik_key`` and
            the incoming ``relation.indexed_key`` is set, adopt the key onto the
-           existing edge (fold-only provenance carry-through).  When
-           ``credit_adopt_reinforcement`` is ``True``, the adopted key is also
+           existing edge (fold-only provenance carry-through).  When the
+           existing edge already carries an ``ik_key`` and the incoming
+           relation carries none, this is a keyless re-observation of an
+           already-keyed fact rather than an adopt.  In both cases, when
+           ``credit_adopt_reinforcement`` is ``True``, the surviving key is
            recorded in ``self.adopt_reinforcements`` for the fold's
-           reinforcement-credit pass (interim recital-dedup only).
+           reinforcement-credit pass.
         2. Same (subject, predicate) but different object — cardinality resolution
            when a model is present and ``resolve_contradictions=True``:
 
@@ -903,6 +910,21 @@ class GraphMerger:
                         },
                     },
                 }
+            # Keyless-onto-keyed re-sighting: the incoming relation carries no
+            # ik_key (a pending re-observation, never stamped at capture) but
+            # the existing edge already carries one — the fact was already
+            # keyed by an earlier merge in this fold (e.g. the recon merge).
+            # Neither adopt (Branch A needs an incoming key) nor dedup
+            # (Branch B needs both sides keyed) fires, so without this arm the
+            # re-observation is silently dropped and the key's reinforcement
+            # count never grows.  Gated on credit_adopt_reinforcement so an
+            # enrichment-time merge (which restates a fact, not re-observes
+            # it) never earns credit here.
+            elif not relation.indexed_key and edge.get(_IK_KEY_ATTR) and credit_adopt_reinforcement:
+                self.adopt_reinforcements[edge[_IK_KEY_ATTR]] = (
+                    edge.get("last_seen", ""),
+                    edge.get("first_seen", ""),
+                )
             # First-non-empty-wins adopts for speaker_id and edge_source.
             # Run unconditionally after the ik_key if/elif chain so they never
             # disturb the elif's adopt-vs-reinforce accounting.

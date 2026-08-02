@@ -1244,6 +1244,107 @@ class TestCollapsedTracking:
         # Key was adopted onto the existing edge.
         assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
 
+    def test_keyless_onto_keyed_credits_when_flag_set(self):
+        """Keyless incoming onto an already-keyed existing edge (a pending
+        re-observation of an already-keyed fact): with
+        credit_adopt_reinforcement=True, the surviving key is recorded in
+        adopt_reinforcements and no edge is removed.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()
+        m.graph.add_node("alice", attributes={"name": "Alice"})
+        m.graph.add_node("berlin", attributes={"name": "Berlin"})
+        existing_eid = m.graph.add_edge(
+            "alice",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="2020-01-01T00:00:00Z",
+            last_seen="2020-01-01T00:00:00Z",
+            reinforcement_count=1,
+            sessions=["s0"],
+        )
+        m.graph["alice"]["berlin"][existing_eid][_IK_KEY_ATTR] = "graph5"
+
+        incoming = Relation(
+            subject="alice",
+            predicate="lives in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            last_seen="2026-03-01T00:00:00Z",
+        )
+        m._upsert_relation(
+            "alice",
+            "berlin",
+            incoming,
+            "s1",
+            "2026-01-01T00:00:00Z",
+            credit_adopt_reinforcement=True,
+        )
+
+        assert m.removal_ledger == {}, (
+            "the keyless-onto-keyed arm must not remove or displace the existing edge"
+        )
+        assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5", (
+            "the existing key must be untouched (no drift, no adoption)"
+        )
+        assert "graph5" in m.adopt_reinforcements, (
+            f"expected graph5 in adopt_reinforcements; got {m.adopt_reinforcements}"
+        )
+        _last_seen, _first_seen = m.adopt_reinforcements["graph5"]
+        assert _last_seen == "2026-03-01T00:00:00Z", (
+            "recorded last_seen must be the merged edge value (max of existing/incoming)"
+        )
+
+    def test_keyless_onto_keyed_does_not_credit_without_flag(self):
+        """The same keyless-onto-keyed collision, WITHOUT
+        credit_adopt_reinforcement, must not populate adopt_reinforcements —
+        this is what keeps an enrichment-time merge (which restates a fact
+        rather than re-observing it) from earning credit.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()
+        m.graph.add_node("alice", attributes={"name": "Alice"})
+        m.graph.add_node("berlin", attributes={"name": "Berlin"})
+        existing_eid = m.graph.add_edge(
+            "alice",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s0",
+            last_seen="s0",
+            reinforcement_count=1,
+            sessions=["s0"],
+        )
+        m.graph["alice"]["berlin"][existing_eid][_IK_KEY_ATTR] = "graph5"
+
+        incoming = Relation(
+            subject="alice",
+            predicate="lives in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            last_seen="2026-03-01T00:00:00Z",
+        )
+        m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
+
+        assert m.adopt_reinforcements == {}, (
+            f"without credit_adopt_reinforcement, nothing must be credited; "
+            f"got {m.adopt_reinforcements}"
+        )
+        assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
+
     def test_resolve_contradictions_false_short_circuits_both_edges_survive(self):
         """resolve_contradictions=False short-circuits Case-2: no model call and both edges survive,
         regardless of distinct last_seen timestamps.

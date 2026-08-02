@@ -8,6 +8,10 @@ Covers:
 - Reopen: record → resolve → record same key → active again, count bumped
 - Ack: flips status→acknowledged; False for unknown id
 - resolve_incidents_by_type: resolves all of one type, leaves other untouched
+- resolved_reason: persisted when given to resolve_incident /
+  resolve_incidents_by_type, untouched by the default (no-reason) call,
+  cleared on every record_incident bump (reopen AND a bump off an
+  acknowledged row), and tolerated absent on a pre-existing store file
 - Restart-survival: write then fresh read from same state_dir
 - Schema-version guard: version:2 → IncidentStoreSchemaError
 - Malformed JSON → IncidentStoreSchemaError
@@ -154,6 +158,113 @@ class TestResolve:
         resolve_incident(tmp_path, "vram_exhausted", "phase1")
         inc = read_incidents(tmp_path)[0]
         assert inc.status == "resolved"
+
+
+# ---------------------------------------------------------------------------
+# resolved_reason
+# ---------------------------------------------------------------------------
+
+
+class TestResolvedReason:
+    def test_resolve_with_reason_persists_it(self, tmp_path):
+        """resolve_incident(..., reason=...) writes resolved_reason onto the row."""
+        _record(tmp_path)
+        ok = resolve_incident(tmp_path, "vram_exhausted", "phase1", reason="cloud egress disabled")
+        assert ok is True
+        inc = read_incidents(tmp_path)[0]
+        assert inc.status == "resolved"
+        assert inc.resolved_reason == "cloud egress disabled"
+
+    def test_default_resolve_leaves_reason_none(self, tmp_path):
+        """A resolve call with no reason keeps resolved_reason unset — byte-identical
+        to pre-``reason`` behaviour."""
+        _record(tmp_path)
+        resolve_incident(tmp_path, "vram_exhausted", "phase1")
+        inc = read_incidents(tmp_path)[0]
+        assert inc.status == "resolved"
+        assert inc.resolved_reason is None
+
+    def test_resolve_incidents_by_type_with_reason_persists_it_on_every_row(self, tmp_path):
+        """resolve_incidents_by_type(..., reason=...) stamps the reason on every
+        row it resolves."""
+        _record(tmp_path, type="vram_exhausted", key="phase1")
+        _record(tmp_path, type="vram_exhausted", key="phase2")
+
+        count = resolve_incidents_by_type(tmp_path, "vram_exhausted", reason="cloud disabled")
+        assert count == 2
+
+        for inc in read_incidents(tmp_path):
+            assert inc.status == "resolved"
+            assert inc.resolved_reason == "cloud disabled"
+
+    def test_resolve_incidents_by_type_default_leaves_reason_none(self, tmp_path):
+        """Default resolve_incidents_by_type call is unchanged — no reason persisted."""
+        _record(tmp_path, type="vram_exhausted", key="phase1")
+        resolve_incidents_by_type(tmp_path, "vram_exhausted")
+        inc = read_incidents(tmp_path)[0]
+        assert inc.resolved_reason is None
+
+    def test_reopen_clears_stale_reason(self, tmp_path):
+        """A reason from a prior resolution must not survive a reopen."""
+        _record(tmp_path)
+        resolve_incident(tmp_path, "vram_exhausted", "phase1", reason="cloud egress disabled")
+        assert read_incidents(tmp_path)[0].resolved_reason == "cloud egress disabled"
+
+        _record(tmp_path)  # reopen — same (type, key)
+        inc = read_incidents(tmp_path)[0]
+        assert inc.status == "active"
+        assert inc.resolved_reason is None
+
+    def test_ack_after_resolve_then_rerecord_clears_stale_reason(self, tmp_path):
+        """resolve(reason=...) -> ack -> record_incident (bump, not reopen —
+        status was ``acknowledged``, not ``resolved``) must still clear the
+        stale ``resolved_reason``.  Gating the clear on
+        ``status == "resolved"`` alone misses this path: the row is
+        ``acknowledged`` when the bump happens, so that guard never fires
+        and the reason survives — the bug this test pins."""
+        _record(tmp_path)
+        resolve_incident(tmp_path, "vram_exhausted", "phase1", reason="cloud egress disabled")
+        ack_incident(tmp_path, "vram_exhausted:phase1")
+        assert read_incidents(tmp_path)[0].status == "acknowledged"
+        assert read_incidents(tmp_path)[0].resolved_reason == "cloud egress disabled"
+
+        _record(tmp_path)  # bump — the row was "acknowledged", not "resolved"
+
+        inc = read_incidents(tmp_path)[0]
+        # An acknowledged row's status is untouched by a plain bump (only a
+        # "resolved" row flips back to "active" — existing dedup-bump
+        # semantics, unchanged by this fix); the stale reason must still go.
+        assert inc.status == "acknowledged"
+        assert inc.resolved_reason is None
+
+    def test_old_store_file_without_the_field_still_reads(self, tmp_path):
+        """A pre-existing store row with no ``resolved_reason`` key deserialises
+        with the field defaulting to ``None`` — schema-tolerant, no version bump
+        needed."""
+        (tmp_path / "incidents.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "incidents": [
+                        {
+                            "id": "vram_exhausted:phase1",
+                            "type": "vram_exhausted",
+                            "severity": "failed",
+                            "first_seen": "2026-06-01T00:00:00+00:00",
+                            "last_seen": "2026-06-01T00:00:00+00:00",
+                            "count": 1,
+                            "status": "resolved",
+                            "summary": "VRAM exhausted at phase1",
+                            "detail": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        incidents = read_incidents(tmp_path)
+        assert len(incidents) == 1
+        assert incidents[0].resolved_reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +483,7 @@ class TestIncidentToDict:
             "status": "active",
             "summary": "VRAM exhausted at phase1",
             "detail": {"phase": "phase1", "free_bytes": 12345},
+            "resolved_reason": None,
         }
 
     def test_to_dict_from_dict_roundtrip(self):

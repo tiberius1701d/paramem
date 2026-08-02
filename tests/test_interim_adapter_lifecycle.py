@@ -29,6 +29,7 @@ from paramem.memory.interim_adapter import (
     current_interim_stamp,
     interim_dir_for_name,
     interim_stamp_from_name,
+    interim_tiers_newest_first,
     unload_interim_adapters,
 )
 from paramem.models.loader import main_tier_backup_scope
@@ -134,6 +135,40 @@ class TestInterimStampFromName:
         """Path construction must not silently produce ``interim_today/``."""
         with pytest.raises(ValueError, match="Not an interim adapter name"):
             interim_dir_for_name(tmp_path, "episodic_interim_today")
+
+
+# ---------------------------------------------------------------------------
+# Test 0c — interim_tiers_newest_first: THE interim-tier enumeration for
+# probe ordering (router) and dedup scope (interim consolidation fold).
+# Moved from tests/test_router.py — the function moved from
+# paramem.server.router to this module (its natural home, alongside
+# interim_stamp_from_name).  Newest-first ordering and main-tier filtering
+# over a REAL store are covered more strongly by
+# tests/test_router.py::TestPersonalTierOrder::test_interim_adapters_sort_newest_first,
+# which drives the real router; only the two branches that harness cannot
+# reach live here.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStore:
+    def __init__(self, tiers):
+        self._tiers = tiers
+
+    def tiers_with_registry(self):
+        return list(self._tiers)
+
+
+class TestInterimTiersNewestFirst:
+    def test_none_store_yields_empty(self) -> None:
+        """Replay-disabled store — the branch that makes interim slots
+        silently unreachable."""
+        assert interim_tiers_newest_first(None) == []
+
+    def test_malformed_interim_names_are_filtered_out(self) -> None:
+        """A slot name that carries the prefix but no valid stamp is dropped
+        rather than sorted as ``""``."""
+        store = _FakeStore(["episodic_interim_today", "episodic_interim_99999999T9999"])
+        assert interim_tiers_newest_first(store) == []
 
 
 # ---------------------------------------------------------------------------

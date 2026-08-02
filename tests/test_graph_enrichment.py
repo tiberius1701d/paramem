@@ -1,4 +1,7 @@
-"""Tests for graph-level cloud enrichment (Task #10).
+"""Tests for graph-level cloud enrichment (Task #10), plus the session-tier
+enrichment incident-arbitration unit tests
+(``TestArbitrateSessionEnrichmentIncidents``) — co-located here rather than
+duplicated because both reuse the same ``_make_loop`` fixture.
 
 All tests are pure-Python — no GPU required. Cloud calls are mocked so
 the test suite does not make any network requests.
@@ -15,6 +18,7 @@ import pytest
 from peft import PeftModel
 
 from paramem.cloud.anonymize import anonymize_transcript as _real_anonymize_transcript
+from paramem.graph.schema import SessionGraph
 from paramem.memory.persistence import _EDGE_SOURCE_ATTR
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.graph_enrich import serialize_subgraph_triples
@@ -3012,6 +3016,271 @@ class TestRefineConsolidationGraphRecordsVramIncident:
             patch("paramem.server.incidents.record_incident") as record_mock,
         ):
             loop._refine_consolidation_graph([], enrich=True)
+
+        record_mock.assert_not_called()
+
+
+class TestArbitrateSessionEnrichmentIncidents:
+    """``ConsolidationLoop._arbitrate_session_enrichment_incidents`` — the
+    session-tier reconciliation extracted from ``extract_session``.
+
+    Uses the same ``record_incident``/``resolve_incident`` surface (and the
+    same ``incidents_state_dir`` fixture pattern) as
+    ``TestRefineConsolidationGraphRecordsVramIncident`` above.  Calls the
+    method directly with a hand-built ``SessionGraph`` rather than driving
+    ``extract_session`` end to end, so no GPU/model call is needed.
+    """
+
+    def _graph(self, **diagnostics) -> SessionGraph:
+        return SessionGraph(
+            session_id="s1", timestamp="2026-08-02T00:00:00+00:00", diagnostics=diagnostics
+        )
+
+    def test_ok_and_clean_resolves_both_keys(self, tmp_path):
+        """``anonymize == "ok"`` and no ``cloud_enrichment_degraded`` resolves
+        both the ``anonymize`` and ``cloud_enrich`` sub-incidents."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents")
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="anonymize",
+            severity="warning",
+            summary="prior failure",
+            detail={},
+        )
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="prior failure",
+            detail={},
+        )
+
+        loop._arbitrate_session_enrichment_incidents(self._graph(anonymize="ok"), "s1")
+
+        by_id = {i.id: i.status for i in read_incidents(loop._incidents_state_dir)}
+        assert by_id["enrichment_degraded:anonymize"] == "resolved"
+        assert by_id["enrichment_degraded:cloud_enrich"] == "resolved"
+
+    def test_ok_and_degraded_records_cloud_enrich(self, tmp_path):
+        """``anonymize == "ok"`` with a populated ``cloud_enrichment_degraded``
+        dict records the ``cloud_enrich`` incident and resolves ``anonymize``
+        (a prior standing ``anonymize`` incident really does flip to
+        resolved, not merely "was never recorded so nothing to check")."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents")
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="anonymize",
+            severity="warning",
+            summary="prior anonymize failure",
+            detail={},
+        )
+
+        graph = self._graph(anonymize="ok", cloud_enrichment_degraded={"reason": "unparseable"})
+        loop._arbitrate_session_enrichment_incidents(graph, "s1")
+
+        by_id = {i.id: i for i in read_incidents(loop._incidents_state_dir)}
+        assert by_id["enrichment_degraded:anonymize"].status == "resolved"
+        assert by_id["enrichment_degraded:cloud_enrich"].status == "active"
+        assert by_id["enrichment_degraded:cloud_enrich"].detail["session_id"] == "s1"
+        assert by_id["enrichment_degraded:cloud_enrich"].detail["reason"] == "unparseable"
+
+    def test_opted_out_behaves_like_ok(self, tmp_path):
+        """``anonymize == "opted_out"`` follows the exact same branch as
+        ``"ok"`` — mirrors ``test_ok_and_clean_resolves_both_keys`` exactly
+        so the assertion actually discriminates this branch from every
+        other (a bare ``read_incidents == []`` would pass on an untouched
+        store regardless of which branch ran)."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents")
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="anonymize",
+            severity="warning",
+            summary="prior failure",
+            detail={},
+        )
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="prior failure",
+            detail={},
+        )
+
+        loop._arbitrate_session_enrichment_incidents(self._graph(anonymize="opted_out"), "s1")
+
+        by_id = {i.id: i.status for i in read_incidents(loop._incidents_state_dir)}
+        assert by_id["enrichment_degraded:anonymize"] == "resolved"
+        assert by_id["enrichment_degraded:cloud_enrich"] == "resolved"
+
+    def test_failed_records_anonymize_key_and_leaves_cloud_enrich_untouched(self, tmp_path):
+        """``anonymize == "failed"`` records the ``anonymize`` incident and does
+        not touch any standing ``cloud_enrich`` incident.  ``detail`` carries
+        no ``fallback_path`` key — on this branch it is always
+        ``"anon_failed"`` (the stage is terminal), so the key would carry no
+        information the branch itself doesn't already state."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents")
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="prior degrade, must survive untouched",
+            detail={},
+        )
+
+        graph = self._graph(anonymize="failed", fallback_path="anon_failed")
+        loop._arbitrate_session_enrichment_incidents(graph, "s1")
+
+        by_id = {i.id: i for i in read_incidents(loop._incidents_state_dir)}
+        assert by_id["enrichment_degraded:anonymize"].status == "active"
+        assert by_id["enrichment_degraded:anonymize"].detail["session_id"] == "s1"
+        assert "fallback_path" not in by_id["enrichment_degraded:anonymize"].detail
+        # Untouched — status AND summary/detail from the earlier record stand.
+        assert by_id["enrichment_degraded:cloud_enrich"].status == "active"
+        assert by_id["enrichment_degraded:cloud_enrich"].summary == (
+            "prior degrade, must survive untouched"
+        )
+
+    def test_failed_on_already_active_anonymize_row_bumps_count(self, tmp_path):
+        """A second ``"failed"`` session bumps the existing ``anonymize``
+        incident's count rather than minting a duplicate row; a previously
+        RESOLVED ``anonymize`` incident reopens exactly like any other
+        ``record_incident`` call."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents")
+        from paramem.server.incidents import read_incidents, resolve_incident
+
+        graph = self._graph(anonymize="failed")
+        loop._arbitrate_session_enrichment_incidents(graph, "s1")
+        loop._arbitrate_session_enrichment_incidents(graph, "s2")
+
+        incidents = read_incidents(loop._incidents_state_dir)
+        assert len(incidents) == 1
+        assert incidents[0].count == 2
+        assert incidents[0].status == "active"
+
+        resolve_incident(loop._incidents_state_dir, "enrichment_degraded", "anonymize")
+        loop._arbitrate_session_enrichment_incidents(graph, "s3")
+
+        incidents = read_incidents(loop._incidents_state_dir)
+        assert incidents[0].status == "active"
+        assert incidents[0].count == 3
+
+    def test_absent_and_cloud_enabled_touches_nothing(self, tmp_path, monkeypatch):
+        """No ``anonymize`` diagnostic (op never ran) and cloud egress IS
+        permitted for this run's effective terms: no incident is created or
+        resolved — there is genuinely no evidence either way."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents")
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="must survive untouched",
+            detail={},
+        )
+
+        loop._arbitrate_session_enrichment_incidents(self._graph(), "s1")
+
+        by_id = {i.id: i for i in read_incidents(loop._incidents_state_dir)}
+        assert by_id["enrichment_degraded:cloud_enrich"].status == "active"
+        assert by_id["enrichment_degraded:cloud_enrich"].summary == "must survive untouched"
+
+    def test_absent_and_cloud_disabled_resolves_by_type_with_reason(self, tmp_path):
+        """No ``anonymize`` diagnostic and cloud egress is OFF (``cloud_enabled``
+        false): every open ``enrichment_degraded`` incident resolves with a
+        persisted reason, regardless of key."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents", cloud_enabled=False)
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="anonymize",
+            severity="warning",
+            summary="stale",
+            detail={},
+        )
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="stale",
+            detail={},
+        )
+
+        loop._arbitrate_session_enrichment_incidents(self._graph(), "s1")
+
+        for inc in read_incidents(loop._incidents_state_dir):
+            assert inc.status == "resolved"
+            assert inc.resolved_reason == "cloud egress disabled — enrichment cannot run"
+
+    def test_absent_and_cloud_disabled_with_nothing_standing_writes_no_store(self, tmp_path):
+        """The cloud-disabled sweep must not materialise an empty
+        ``incidents.json`` when nothing was ever recorded (matches
+        ``resolve_incidents_by_type``'s own success-path invariant)."""
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents", cloud_enabled=False)
+
+        loop._arbitrate_session_enrichment_incidents(self._graph(), "s1")
+
+        assert not (loop._incidents_state_dir / "incidents.json").exists()
+
+    def test_unknown_diagnostic_value_with_cloud_off_touches_nothing(self, tmp_path):
+        """An unrecognized ``anonymize`` value (neither ``"ok"``,
+        ``"opted_out"``, ``"failed"``, nor absent) must NOT be conflated with
+        "the op never ran" — even with cloud egress off, a standing incident
+        is left exactly as it was, and the by-type sweep never fires.
+
+        Mutation: dropping the explicit ``anonymize_outcome is None`` check
+        (falling back to ``else: # absent`` for any non-matched value) makes
+        this test fail, since the cloud-disabled sweep would then wrongly
+        resolve the standing incident below.
+        """
+        loop = _make_loop(tmp_path, incidents_state_dir=tmp_path / "incidents", cloud_enabled=False)
+        from paramem.server.incidents import read_incidents, record_incident
+
+        record_incident(
+            loop._incidents_state_dir,
+            type="enrichment_degraded",
+            key="cloud_enrich",
+            severity="warning",
+            summary="must survive untouched",
+            detail={},
+        )
+
+        loop._arbitrate_session_enrichment_incidents(
+            self._graph(anonymize="not_a_real_outcome"), "s1"
+        )
+
+        inc = read_incidents(loop._incidents_state_dir)[0]
+        assert inc.status == "active"
+        assert inc.resolved_reason is None
+        assert inc.summary == "must survive untouched"
+
+    def test_incidents_state_dir_none_is_a_safe_noop(self, tmp_path):
+        """No ``incidents_state_dir`` configured -> the guard returns
+        immediately regardless of diagnostics content."""
+        loop = _make_loop(tmp_path)
+        assert loop._incidents_state_dir is None
+
+        with patch("paramem.server.incidents.record_incident") as record_mock:
+            loop._arbitrate_session_enrichment_incidents(self._graph(anonymize="failed"), "s1")
 
         record_mock.assert_not_called()
 

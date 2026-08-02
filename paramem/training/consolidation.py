@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 import torch
 from torch.utils.data import Dataset
 
+from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.merger import GraphMerger, min_nonempty
@@ -1475,44 +1476,10 @@ class ConsolidationLoop:
 
         self.last_session_graph = session_graph
 
-        # Surface a non-fatal cloud-enrichment degradation (the hiccup fail-open
-        # in ``stage_enrich``) as an operator-visible incident — the SAME
-        # ``record_incident`` surface the outage path uses, called directly here
-        # the way this method already calls ``on_session_extracted`` and
-        # ``_save_adapters`` calls ``save_adapter``.  ``session_graph`` is this
-        # method's own local, not a side-channel read.  Severity ``"warning"``
-        # (the run succeeded); keyed ``cloud_enrich`` so repeated hiccups bump
-        # one incident rather than flooding the store.
-        #
-        # The clean run is the other half of the same report: an incident
-        # auto-resolves on the next success of the op it describes
-        # (``incidents`` module docstring), and this is the only site that
-        # observes whether session-tier cloud enrichment degraded.  Resolving by
-        # (type, key) leaves the graph-tier sub-condition alone — it has its own
-        # record/resolve site at the end of the fold's Refine stage.
-        degraded = session_graph.diagnostics.get("cloud_enrichment_degraded")
-        if self._incidents_state_dir is not None:
-            from paramem.server.incidents import record_incident, resolve_incident
-
-            if degraded is None:
-                resolve_incident(self._incidents_state_dir, "enrichment_degraded", "cloud_enrich")
-            else:
-                record_incident(
-                    self._incidents_state_dir,
-                    type="enrichment_degraded",
-                    key="cloud_enrich",
-                    severity="warning",
-                    summary=(
-                        "Session-tier cloud enrichment degraded (per transcript, at "
-                        "extraction) — unparseable response; kept pre-enrichment facts"
-                    ),
-                    detail={
-                        "type": "enrichment_degraded",
-                        "session_id": session_id,
-                        **degraded,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
+        # Surface session-tier enrichment health as an operator-visible
+        # incident.  Factored out so extract_session stays readable and the
+        # arbitration itself is unit-testable without a GPU.
+        self._arbitrate_session_enrichment_incidents(session_graph, session_id)
 
         # Release reclaimable device memory back to the WSL2 dxg layer at every
         # session boundary.  PyTorch's caching allocator retains freed blocks
@@ -1534,6 +1501,110 @@ class ConsolidationLoop:
             pass
 
         return episodic_rels, procedural_rels
+
+    def _arbitrate_session_enrichment_incidents(
+        self, session_graph: SessionGraph, session_id: str
+    ) -> None:
+        """Reconcile the ``enrichment_degraded`` incident state for one
+        session against ``session_graph.diagnostics["anonymize"]`` (the same
+        graph object ``stage_anonymize`` wrote it onto).
+        ``cloud_enrichment_degraded`` alone can't tell "ran cleanly" apart
+        from "never ran" (empty relations, a calibration stop, cloud egress
+        refused), so reading it alone would silently resolve a standing
+        incident with no evidence of recovery; ``anonymize`` gates ``enrich``
+        with the same admission check and separates the two cases.
+
+        - ``"ok"`` / ``"opted_out"`` (opted-out still reaches ``enrich``):
+          resolve ``anonymize``, then arbitrate ``cloud_enrich`` by
+          ``cloud_enrichment_degraded`` as before this method existed.
+        - ``"failed"``: record a distinct incident keyed ``anonymize``
+          (same-type-different-key, like ``graph_enrich_vram``);
+          ``cloud_enrich`` is left untouched.
+        - absent (``None``): no signal, EXCEPT when cloud egress is refused —
+          neither sub-incident can ever self-heal there, so resolve every
+          open ``enrichment_degraded`` incident with a persisted reason.
+        - any other value: not a real writer output — log a warning and
+          touch nothing, rather than conflating it with "absent".
+
+        A safe no-op when ``self._incidents_state_dir is None``.
+        """
+        if self._incidents_state_dir is None:
+            return
+
+        from paramem.server.incidents import (
+            record_incident,
+            resolve_incident,
+            resolve_incidents_by_type,
+        )
+
+        anonymize_outcome = session_graph.diagnostics.get("anonymize")
+
+        if anonymize_outcome in ("ok", "opted_out"):
+            resolve_incident(self._incidents_state_dir, "enrichment_degraded", "anonymize")
+
+            degraded = session_graph.diagnostics.get("cloud_enrichment_degraded")
+            if degraded is None:
+                resolve_incident(self._incidents_state_dir, "enrichment_degraded", "cloud_enrich")
+            else:
+                record_incident(
+                    self._incidents_state_dir,
+                    type="enrichment_degraded",
+                    key="cloud_enrich",
+                    severity="warning",
+                    summary=(
+                        "Session-tier cloud enrichment degraded (per transcript, at "
+                        "extraction) — unparseable response; kept pre-enrichment facts"
+                    ),
+                    detail={
+                        "type": "enrichment_degraded",
+                        "session_id": session_id,
+                        **degraded,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+        elif anonymize_outcome == "failed":
+            record_incident(
+                self._incidents_state_dir,
+                type="enrichment_degraded",
+                key="anonymize",
+                severity="warning",
+                summary=(
+                    "Session-tier anonymization failed — cloud enrichment skipped this session"
+                ),
+                detail={
+                    "type": "enrichment_degraded",
+                    "session_id": session_id,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        elif anonymize_outcome is None:
+            # anonymize never ran this session — only actionable when cloud
+            # egress is off, the same admission check that gated
+            # anonymize/enrich in the first place (graph_tier.py's
+            # normalization gate uses the identical no-override shape).
+            cfg = self.extraction.config
+            verdict = evaluate_cloud_egress(
+                cloud_enabled=self.cloud_enabled,
+                provider=cfg.enrichment_provider,
+                model=cfg.enrichment_provider_model,
+                endpoint=cfg.enrichment_provider_endpoint,
+            )
+            if not verdict.permitted:
+                reason = "cloud egress disabled — enrichment cannot run"
+                resolved = resolve_incidents_by_type(
+                    self._incidents_state_dir, "enrichment_degraded", reason=reason
+                )
+                logger.info("Resolved %d enrichment_degraded incident(s) — %s", resolved, reason)
+        else:
+            # A value neither of the three writers ("ok"/"opted_out"/"failed")
+            # ever produces — do not conflate it with "the op never ran"
+            # (the case above): touch nothing, surface it so the drift gets
+            # noticed rather than silently resolving on a guess.
+            logger.warning(
+                "Unrecognized session_graph.diagnostics['anonymize'] value %r — "
+                "enrichment_degraded incidents left untouched",
+                anonymize_outcome,
+            )
 
     def train_adapters(
         self,
@@ -3317,20 +3388,34 @@ class ConsolidationLoop:
                     )
 
                     # --- Interim recital dedup (unconditional) ---
-                    # Scope the dedup targets to main-tier keys whose SPO touches
-                    # an entity present in THIS cycle's pending-session relations
-                    # (_extra) — no entity-to-key index exists, so this reads
-                    # registry SPO directly rather than rebuilding a graph.  A
-                    # recited fact IS in _extra, so its entities are in
-                    # _session_entities, so its main-tier twin is always in scope
-                    # (Case-1 can never miss a legitimate target).  A recital's
-                    # reinforcement is credited to the surviving main key via the
+                    # Scope the dedup targets to main-tier keys AND every sibling
+                    # interim slot's keys whose SPO touches an entity present in
+                    # THIS cycle's pending-session relations (_extra) — no
+                    # entity-to-key index exists, so this reads registry SPO
+                    # directly rather than rebuilding a graph.  A recited fact IS
+                    # in _extra, so its entities are in _session_entities, so its
+                    # main-tier OR sibling-interim twin is always in scope
+                    # (Case-1 can never miss a legitimate target).  Without the
+                    # sibling-interim tiers, a fact keyed in an earlier interim
+                    # cycle (registry live until the next full fold) was never a
+                    # dedup target, so the same fact observed in two interim
+                    # cycles minted two keys instead of one — collapsed only at
+                    # the next full fold.  A recital's reinforcement is credited
+                    # to the surviving key (main-tier or sibling-interim) via the
                     # merger's adopt_reinforcements accumulator, consumed by
                     # _refine_consolidation_graph's reinforcement-credit pass.
+                    from paramem.memory.interim_adapter import interim_tiers_newest_first
+
                     _session_entities = {r.subject for r in (_extra or [])} | {
                         r.object for r in (_extra or [])
                     }
                     _slot_keys_set = set(_slot_keys)
+                    _current_slot_tier = adapter_name or scope.tier
+                    _sibling_interim_tiers = [
+                        _t
+                        for _t in interim_tiers_newest_first(self.store)
+                        if _t != _current_slot_tier
+                    ]
 
                     def _dedup_touches_session(_dk: str) -> bool:
                         # _hydrate_store_for_fold ran above, so a miss here means
@@ -3346,7 +3431,12 @@ class ConsolidationLoop:
 
                     _dedup_keys: "list[str]" = [
                         _dk
-                        for _dk_tier in ("episodic", "semantic", "procedural")
+                        for _dk_tier in (
+                            "episodic",
+                            "semantic",
+                            "procedural",
+                            *_sibling_interim_tiers,
+                        )
                         for _dk in self.store.active_keys_in_tier(_dk_tier)
                         if _dk not in _slot_keys_set and _dedup_touches_session(_dk)
                     ]
@@ -5153,17 +5243,19 @@ class ConsolidationLoop:
                 True`` so the caller can identify newly-minted entries in
                 ``tier_keyed``.  Default ``False``.
             exclude_keys: Optional set of ``ik_key`` strings to skip entirely
-                during the edge walk — neither minted (N/A; these edges always
-                already carry a key) nor keyed-replayed into ``tier_keyed``.
+                during the edge walk AND the node-attribute walk — neither
+                minted (N/A; these facts always already carry a key) nor
+                keyed-replayed into ``tier_keyed``.
                 Used by the (unconditional) interim recital-dedup feature to
-                exclude main-tier facts that :meth:`_materialize_consolidation_graph`
-                merged in as
+                exclude main-tier AND sibling-interim-slot facts that
+                :meth:`_materialize_consolidation_graph` merged in as
                 ``dedup_target_keys``: those facts participate in the merge's
                 Case-1 identity (so a recited pending fact collapses onto
-                them) but must never acquire interim-adapter weight residence
-                (the main-tier/interim separation invariant) or be retrained
-                wholesale into every interim slot.  Default ``None`` — today's behaviour,
-                unaffected for every other caller.
+                them) but must never acquire THIS slot's interim-adapter
+                weight residence (the tier/slot separation invariant) or be
+                retrained wholesale into every interim slot.  Default
+                ``None`` — today's behaviour, unaffected for every other
+                caller.
 
         Returns:
             A 2-tuple ``(minted_by_tier, deferred_writes)`` where:
@@ -5358,12 +5450,13 @@ class ConsolidationLoop:
                 continue
 
             if key and exclude_keys and key in exclude_keys:
-                # Interim recital-dedup target (main-tier fact merged in by
-                # _materialize_consolidation_graph's dedup_target_keys
-                # channel) — skip unconditionally.  Neither minted (already
-                # keyed) nor keyed-replayed into tier_keyed: excluding it here
-                # is what keeps main-tier facts out of the interim adapter's
-                # training set (the main-tier/interim separation invariant).
+                # Interim recital-dedup target (a main-tier OR sibling-interim
+                # fact merged in by _materialize_consolidation_graph's
+                # dedup_target_keys channel) — skip unconditionally.  Neither
+                # minted (already keyed) nor keyed-replayed into tier_keyed:
+                # excluding it here is what keeps a fact already resident in
+                # another tier/slot's adapter weights out of THIS slot's
+                # training set (the tier/slot separation invariant).
                 continue
 
             if not key:
@@ -5529,6 +5622,20 @@ class ConsolidationLoop:
                     continue
 
                 attr_key_id = _n_attr_keys.get(attr_key)
+                if attr_key_id and exclude_keys and attr_key_id in exclude_keys:
+                    # Interim recital-dedup target (an attribute-typed fact —
+                    # e.g. a speaker's phone/email — merged in by
+                    # _materialize_consolidation_graph's dedup_target_keys
+                    # channel) — skip unconditionally, mirroring the edge
+                    # walk's exclude_keys check above.  Attribute-typed
+                    # relations never become edges (see the node-attribute
+                    # walk's own header comment), so without this check here
+                    # too, a dedup target matched via an attribute fact would
+                    # be keyed-replayed into THIS slot's training set despite
+                    # already residing in another tier/slot's adapter weights
+                    # — the same tier/slot separation invariant the edge walk
+                    # enforces.
+                    continue
                 if attr_key_id:
                     # ---- Keyed branch: existing key, anti-forgetting replay ----
                     entry = self.store.get(attr_key_id)
@@ -5827,11 +5934,16 @@ class ConsolidationLoop:
            :meth:`_build_registry_true_relations` and re-merge them into the fresh
            keying graph inside a gradient-checkpointing guard.
         5. If ``extra_relations`` is supplied and non-empty, re-merge those relations
-           into the fresh keying graph (see *resolve_contradictions_extra*).  This
-           allows the interim mini-fold to inject the current cycle's pending-session
-           relations alongside the slot's recalled registry-true keys.  At interim,
-           merge order (slot first, pending second) encodes recency: the NEW pending
-           supersedes the OLD slot when ``resolve_contradictions_extra=True``.
+           into the fresh keying graph (see *resolve_contradictions_extra*), with
+           ``credit_adopt_reinforcement=True`` unconditionally.  This allows the
+           interim mini-fold, and the consume-pending full fold, to inject the
+           current cycle's pending-session relations alongside the recalled
+           registry-true keys.  At interim, merge order (slot first, pending
+           second) encodes recency: the NEW pending supersedes the OLD slot when
+           ``resolve_contradictions_extra=True``.  A keyless pending relation that
+           lands on a fact the registry-true merge already keyed is a genuine
+           re-observation, not an adopt — see the keyless-onto-keyed arm in
+           :meth:`~paramem.graph.merger.GraphMerger._upsert_relation`.
         6. If ``dedup_target_keys`` is not ``None`` (interim recital dedup, always
            computed by the interim caller), build registry-true relations for
            that key subset and re-merge them LAST — AFTER the ``extra_relations``
@@ -5840,8 +5952,9 @@ class ConsolidationLoop:
         7. Emit debug snapshots ("reconstructed" before re-merge, "merged" after).
 
         **INVARIANT — extra_relations and the recall-miss set:**
-        ``extra_relations`` participate in the MERGE / Case-1-adopt step ONLY.
-        They MUST NOT enter the ``recall_miss_keys`` set.  That set is computed
+        ``extra_relations`` participate in the MERGE / Case-1-adopt /
+        keyless-onto-keyed-credit step ONLY.  They MUST NOT enter the
+        ``recall_miss_keys`` set.  That set is computed
         over the resolved *keys* in step 2, BEFORE the reset — pending
         unregistered relations (not yet in the registry) therefore cannot distort it.
         Both ``extra_relations=None`` and ``extra_relations=[]`` are valid no-ops for
@@ -5851,24 +5964,25 @@ class ConsolidationLoop:
         ``dedup_target_keys`` relations participate in the MERGE / Case-1 step
         ONLY, exactly like ``extra_relations`` — they are excluded from keying
         by the CALLER, which must pass the same key set as ``exclude_keys`` to
-        :meth:`_build_all_edge_entries_into` so the dedup-target (main-tier)
-        keyed edges are neither minted nor keyed-replayed into the training
-        set.  The merge fires ONLY when ``dedup_target_keys is not None`` —
-        ``None`` is a true no-op (the full-fold callers never
-        pass this param, so their behavior is byte-identical to before this
-        change).  Never pass ``None`` to :meth:`_build_registry_true_relations`
-        as the resolved ``keys=`` argument here — that means "all active
-        keys" and would silently pull the entire store into the merge; an
-        empty *dedup_target_keys* list (feature enabled but no dedup targets
-        found) is the correct "nothing to dedup" signal and resolves to ``[]``.
-        The merge is placed LAST (after ``extra_relations``, not before) so
-        that when ``refinement_contradiction == "on"``, the contradiction-
-        enabled recon/extra merges complete before the dedup-target edges
-        exist — a session fact contradicting a main-tier dedup target cannot
-        retire the main-tier edge via Case-2 REPLACE, because there is no
-        main-tier edge present yet at that point.  ``resolve_contradictions``
-        is hardcoded ``False`` for this merge (not driven by config) — it must
-        never run cardinality resolution over main-tier facts.
+        :meth:`_build_all_edge_entries_into` so the dedup-target (main-tier OR
+        sibling-interim-slot) keyed edges are neither minted nor
+        keyed-replayed into the training set.  The merge fires ONLY when
+        ``dedup_target_keys is not None`` — ``None`` is a true no-op (the
+        full-fold callers never pass this param, so their behavior is
+        byte-identical to before this change).  Never pass ``None`` to
+        :meth:`_build_registry_true_relations` as the resolved ``keys=``
+        argument here — that means "all active keys" and would silently pull
+        the entire store into the merge; an empty *dedup_target_keys* list
+        (feature enabled but no dedup targets found) is the correct "nothing
+        to dedup" signal and resolves to ``[]``.  The merge is placed LAST
+        (after ``extra_relations``, not before) so that when
+        ``refinement_contradiction == "on"``, the contradiction-enabled
+        recon/extra merges complete before the dedup-target edges exist — a
+        session fact contradicting a dedup target cannot retire that target's
+        edge via Case-2 REPLACE, because there is no such edge present yet at
+        that point.  ``resolve_contradictions`` is hardcoded ``False`` for
+        this merge (not driven by config) — it must never run cardinality
+        resolution over a dedup target's facts.
 
         **Speaker-ID note (unified path):** Both the recon path and the
         ``extra_relations`` path call
@@ -6101,12 +6215,36 @@ class ConsolidationLoop:
                 self._enable_gradient_checkpointing()
 
         # --- Re-merge extra_relations (interim mini-fold pending-session content) ---
-        # INVARIANT: extra_relations participate in MERGE / Case-1-adopt ONLY.
-        # They are NOT included in recall_miss_keys (computed above, before the reset).
-        # extra_relations=None and extra_relations=[] are both valid no-ops (fold caller
-        # passes None; interim passes the pending-session relations from merger.graph).
+        # INVARIANT: extra_relations participate in MERGE / Case-1-adopt/keyless-
+        # onto-keyed-credit ONLY. They are NOT included in recall_miss_keys
+        # (computed above, before the reset).  extra_relations=None and
+        # extra_relations=[] are both valid no-ops (fold caller passes None;
+        # interim passes the pending-session relations from merger.graph).
         # resolve_contradictions_extra: driven by config.refinement_contradiction.
         # At fold extra_relations=None so this merge is a no-op.
+        # credit_adopt_reinforcement=True unconditionally: extra_relations are
+        # always keyless (captured straight off merger.graph, never stamped
+        # with an indexed_key), so when one lands on an edge the recon merge
+        # above already keyed, that is a genuine re-observation of the fact —
+        # credit it via merger.adopt_reinforcements regardless of scope.  Three
+        # shapes reach this collision, all safe:
+        #   - Consume-pending full fold: the pending-session recital lands on
+        #     its own already-keyed registry twin (the gap this arm closes).
+        #   - Interim RESIDENT-SLOT warm re-fold (the slot already exists in
+        #     model.peft_config for this stamp, so its recon merge reconstructs
+        #     keys minted by an earlier cycle in the SAME slot): a genuinely
+        #     NEW session lands in the same cadence window and re-observes a
+        #     fact already keyed by that earlier cycle — a real re-observation,
+        #     correctly earning credit (store.reinforce's timestamp-vs-prior-
+        #     last_seen rule gates the earn on the new session's real
+        #     last_seen differing from what the key already carries).
+        #   - Interim FRESH-SLOT crash-resume re-processing of the same
+        #     sessions: the recon merge has no pre-existing keys to collide
+        #     with the first time a slot is minted, so this shape only arises
+        #     on a resume replaying the same pending content — the same
+        #     timestamp-vs-prior-last_seen rule earns zero for it, since the
+        #     replayed session's last_seen is identical to what was already
+        #     credited.
         _extra_needs_guard = (
             getattr(self, "model", None) is not None and resolve_contradictions_extra
         )
@@ -6118,6 +6256,7 @@ class ConsolidationLoop:
                 session_id="__interim_pending_sessions__",
                 log_label="extra (pending-session) relations",
                 resolve_contradictions=resolve_contradictions_extra,
+                credit_adopt_reinforcement=True,
             )
         finally:
             if _extra_needs_guard:
@@ -6218,10 +6357,15 @@ class ConsolidationLoop:
            records ``enrichment_degraded`` at severity ``"warning"``; a pass that
            ran to completion resolves it.  This is the only site that observes
            that outcome, so it owns both halves — a resolve wired anywhere else
-           would be guessing.  ``result.enrichment is None`` means the pass never
-           ran (enrichment off, or an interim scope), which is not evidence of
-           recovery and clears nothing.  Never raises: the fold always proceeds
-           past this step, training on the merged-but-unenriched graph —
+           would be guessing, with one sanctioned exception:
+           ``_arbitrate_session_enrichment_incidents``'s cloud-disabled sweep
+           resolves every ``enrichment_degraded`` incident by type (including
+           this ``graph_enrich_vram`` key) when cloud egress is refused, since
+           that state can never produce the completed pass this site's own
+           resolve depends on.  ``result.enrichment is None`` means the pass
+           never ran (enrichment off, or an interim scope), which is not
+           evidence of recovery and clears nothing.  Never raises: the fold
+           always proceeds past this step, training on the merged-but-unenriched graph —
            enrichment self-heals at the next FULL fold (the pass is full-fold
            only; an intervening interim cycle never runs it, so recovery does
            not happen there).
@@ -6232,8 +6376,11 @@ class ConsolidationLoop:
         4. :meth:`_credit_reinforcement`, the fold's single reinforcement-credit
            pass, over the two channels a merge produces: the merger's
            ``removal_ledger`` (every collapse that named a ``survivor_key``) and
-           ``result.adopt_reinforcements`` (the interim recital-dedup
-           Case-1-adopt, which removes no edge and so has no ledger entry).
+           ``result.adopt_reinforcements`` (every re-sighting of an
+           already-keyed fact that adopted or landed onto a key without
+           displacing it — the interim recital-dedup adopt, and the
+           extra-relations keyless-onto-keyed arm at both scopes — none of
+           which remove an edge, so none has a ledger entry).
            Its position is load-bearing in both directions: the ledger is
            complete only once enrichment and normalization have run, and the
            promotion gate that consumes the credited counts runs immediately
@@ -6275,7 +6422,10 @@ class ConsolidationLoop:
         # retry here.
         #
         # A pass that ran to completion is the success this incident resolves
-        # on, and this is the only site that observes it.  ``result.enrichment
+        # on, and this is the only site that observes it — with one sanctioned
+        # exception: _arbitrate_session_enrichment_incidents's cloud-disabled
+        # sweep resolves this key too (by type), since a completed pass can
+        # never happen while cloud egress is refused.  ``result.enrichment
         # is None`` means the pass never ran (enrichment off, or an interim
         # scope), which is not evidence of recovery and must not clear a
         # standing incident.
@@ -6334,10 +6484,15 @@ class ConsolidationLoop:
           skipped: a contradiction superseded the fact with a DIFFERENT one and
           an enrichment same_as contracted nodes, so neither has a survivor to
           credit.
-        - ``adopt_reinforcements`` — the interim recital-dedup Case-1-adopt,
-          where a recited pending fact adopts an existing main-tier key onto its
-          keyless edge.  No edge is removed, so it has no ledger entry and
-          nothing to inherit; it is a re-sighting and only earns.
+        - ``adopt_reinforcements`` — every merge run with
+          ``credit_adopt_reinforcement=True`` re-sighting an already-keyed
+          fact: the interim recital-dedup Case-1-adopt (a recited pending
+          fact adopts an existing main-tier OR sibling-interim key onto its
+          keyless edge) and the extra-relations keyless-onto-keyed arm at
+          both scopes (a pending relation lands on a fact the recon merge
+          already keyed).  No edge is removed in either case, so neither has
+          a ledger entry and neither has anything to inherit; it is a
+          re-sighting and only earns.
 
         The timestamps handed to the store are the absorbed keys' OWN
         bookkeeping values, not the merged edge's: ``reinforce`` folds them into
@@ -6390,7 +6545,7 @@ class ConsolidationLoop:
                 reobserved=True,
             )
             logger.debug(
-                "_credit_reinforcement: key=%s credited (recital-dedup adopt)",
+                "_credit_reinforcement: key=%s credited (adopt_reinforcements re-sighting)",
                 _adopted_key,
             )
 

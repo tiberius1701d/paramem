@@ -100,38 +100,6 @@ _PERSONAL_TIERS_PRE_INTERIM = ("procedural",)
 _PERSONAL_TIERS_POST_INTERIM = ("episodic", "semantic")
 
 
-def _interim_tiers_newest_first(store) -> list[str]:
-    """Interim slot names carried by *store*, newest stamp first.
-
-    THE only enumeration of interim tiers for probe ordering — both
-    :meth:`Router._personal_tier_order` and
-    :meth:`Router._command_interim_tiers` compose it rather than repeating
-    the filter-then-sort.  Name parsing is
-    :func:`~paramem.memory.interim_adapter.interim_stamp_from_name`; this
-    module does not re-declare the name shape.
-
-    A ``None`` *store* (no registry — replay-disabled) yields an empty
-    list, which is what makes interim slots silently unreachable in that
-    configuration (see :meth:`Router._personal_tier_order`).
-    """
-    # Function-local: interim_adapter's lifecycle half pulls in PEFT/torch,
-    # and router is otherwise import-light.  Same reason app.py and
-    # consolidation.py import this module inside their call sites.
-    from paramem.memory.interim_adapter import interim_stamp_from_name
-
-    if store is None:
-        return []
-    stamped = [
-        (stamp, tier)
-        for tier in store.tiers_with_registry()
-        if (stamp := interim_stamp_from_name(tier)) is not None
-    ]
-    # Sort on the stamp alone: Python's stable sort then preserves the
-    # store's enumeration order for any two slots sharing a stamp.
-    stamped.sort(key=lambda pair: pair[0], reverse=True)
-    return [tier for _, tier in stamped]
-
-
 # ``_is_interrogative`` + ``_INTERROGATIVE_*`` are NOT consumed by routing
 # any more — intent classification is the routing signal.  They remain in
 # this module solely to support the abstention gate in
@@ -383,9 +351,14 @@ class QueryRouter:
         replay-disabled stores (no lifecycle tracking → no interim
         rotation), but worth noting because the degradation is silent.
         """
+        # Function-local: interim_adapter's lifecycle half pulls in PEFT/torch,
+        # and router is otherwise import-light.  Same reason app.py and
+        # consolidation.py import this module inside their call sites.
+        from paramem.memory.interim_adapter import interim_tiers_newest_first
+
         return [
             *_PERSONAL_TIERS_PRE_INTERIM,
-            *_interim_tiers_newest_first(self._memory_store),
+            *interim_tiers_newest_first(self._memory_store),
             *_PERSONAL_TIERS_POST_INTERIM,
         ]
 
@@ -397,7 +370,9 @@ class QueryRouter:
         slots are returned; ``procedural`` MAIN is handled separately in
         :meth:`_steps_for_intent`.
         """
-        return _interim_tiers_newest_first(self._memory_store)
+        from paramem.memory.interim_adapter import interim_tiers_newest_first
+
+        return interim_tiers_newest_first(self._memory_store)
 
     def _tier_keys(self, tier: str, *, preference_only: bool = False) -> set[str]:
         """Active key set for *tier*.

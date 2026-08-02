@@ -108,6 +108,36 @@ def interim_stamp_from_name(name: str) -> str | None:
     return stamp if parsed.strftime(INTERIM_STAMP_FORMAT) == stamp else None
 
 
+def interim_tiers_newest_first(store) -> list[str]:
+    """Interim slot names carried by *store*, newest stamp first.
+
+    THE only enumeration of interim tiers for probe ordering AND for dedup
+    scope — every caller composes this rather than repeating the
+    filter-then-sort: :meth:`~paramem.server.router.QueryRouter._personal_tier_order`
+    and :meth:`~paramem.server.router.QueryRouter._command_interim_tiers`
+    order probes with it, and the interim consolidation fold's recital-dedup
+    scan widens its candidate scan with it (main tiers alone miss a fact
+    keyed in a sibling interim slot).  Name parsing is
+    :func:`interim_stamp_from_name`; this function does not re-declare the
+    name shape.
+
+    A ``None`` *store* (no registry — replay-disabled) yields an empty list,
+    which is what makes interim slots silently unreachable in that
+    configuration.
+    """
+    if store is None:
+        return []
+    stamped = [
+        (stamp, tier)
+        for tier in store.tiers_with_registry()
+        if (stamp := interim_stamp_from_name(tier)) is not None
+    ]
+    # Sort on the stamp alone: Python's stable sort then preserves the
+    # store's enumeration order for any two slots sharing a stamp.
+    stamped.sort(key=lambda pair: pair[0], reverse=True)
+    return [tier for _, tier in stamped]
+
+
 def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
     """Return the on-disk directory for a PEFT interim adapter name.
 
