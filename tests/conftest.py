@@ -325,7 +325,7 @@ def _admin_scope_default():
 
     Auth behavior itself is independently covered by
     ``tests/server/test_require_admin.py`` and
-    ``tests/server/test_auth_middleware.py`` — both build their OWN
+    ``tests/server/test_auth.py`` — both build their OWN
     ``FastAPI()`` instance (never ``app_module.app``), so overriding the
     dependency on the shared singleton cannot mask those.
 
