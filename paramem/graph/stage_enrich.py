@@ -217,6 +217,7 @@ def _stage_enrich(ctx: StageContext, state: StageState) -> StageState:
             endpoint=endpoint,
             max_tokens=ctx.max_tokens,
             prompts_dir=ctx.prompts_dir,
+            speaker_id=ctx.speaker_id,
         )
         t.set_raw(_cloud_raw or "")
         if _cloud_info:

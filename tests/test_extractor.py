@@ -10,6 +10,7 @@ from paramem.graph.extractor import (
     _extract_json_block,
     _fallback_plausibility_on_raw,
     _normalize_extraction,
+    _parse_extraction,
     _stamp_speaker_entity,
     extract_procedural_graph,
 )
@@ -145,6 +146,59 @@ class TestExtractJsonBlock:
         parsed = json.loads(result)
         assert parsed[0]["subject"] == "Alex"
 
+    def test_accepts_envelope_wrapped_in_one_element_list(self):
+        """A model that wraps the WHOLE envelope dict in a one-element
+        list — ``[{"entities": [...], "relations": [...]}]``, correct
+        content inside — must be accepted AND unwrapped to the inner
+        envelope dict here, at the one primitive boundary every caller
+        shares (observed live; see the module docstring's mode 4 and the
+        deleted caller-side duplicate this replaced in
+        ``paramem.graph.extractor._parse_extraction``)."""
+        text = (
+            '[{"entities": [{"name": "Alex", "entity_type": "person"}], '
+            '"relations": [{"subject": "Alex", "predicate": "lives_in", '
+            '"object": "Berlin"}]}]'
+        )
+        result = _extract_json_block(text)
+        parsed = json.loads(result)
+        assert isinstance(parsed, dict)
+        assert parsed["entities"][0]["name"] == "Alex"
+        assert parsed["relations"][0]["subject"] == "Alex"
+
+    def test_prose_index_references_do_not_beat_the_delta_envelope(self):
+        """Live regression (3/3 at temperature 0): the cloud model prefixes
+        its delta envelope with reasoning prose that refers to input facts
+        by bracketed index — ``[9]``, ``[0] and [5]`` — the notation the
+        enrichment prompt's own few-shots teach.  Each such reference is a
+        structurally valid bare-int JSON array at a candidate position
+        EARLIER than the envelope, so first-match acceptance returned
+        ``[9]`` and the enrichment parser logged "enrichment delta
+        unexpected shape: list", failing enrichment open on every attempt.
+
+        A content-free candidate (bare ints / ``[]`` / ``{}``) carries no
+        envelope evidence, so it must never outrank a real envelope that
+        appears later in the same response."""
+        text = (
+            "I need to analyze the extracted facts and apply splitting.\n"
+            "Key issues to fix:\n"
+            "1. Fact [9] is a compound — split specializations\n"
+            "2. Facts [0] and [5] are symmetric duplicates — drop [5]\n"
+            "3. Fact [13] needs a graduation date added\n\n"
+            '{"add": [], "drop": [], "modify": [], "bindings": {}}'
+        )
+        parsed = json.loads(_extract_json_block(text))
+        assert isinstance(parsed, dict)
+        assert set(parsed) == {"add", "bindings", "drop", "modify"}
+
+    def test_multi_element_list_of_envelope_dicts_not_treated_as_envelope(self):
+        """The one-element-list-wrapped-envelope acceptance is scoped to
+        length 1 — a multi-element list whose elements are NOT fact-shaped
+        (no subject/predicate/object) must still be rejected rather than
+        silently accepting the first element as the envelope."""
+        text = '[{"entities": [], "relations": []}, {"entities": [], "relations": []}]'
+        with pytest.raises(ValueError, match="(?i)envelope keys|no parseable JSON"):
+            _extract_json_block(text)
+
 
 class TestSessionGraphFromJson:
     def test_parse_extraction_output(self):
@@ -172,6 +226,71 @@ class TestSessionGraphFromJson:
         assert len(graph.entities) == 2
         assert len(graph.relations) == 1
         assert graph.entities[0].attributes["age"] == "29"
+
+
+class TestParseExtractionListWrapping:
+    """``_parse_extraction`` tolerates two distinct model-output shapes
+    for a JSON array at the top level: a BARE list of fact dicts (each
+    element has ``subject``/``predicate``/``object``), and a
+    single-element list WRAPPING the envelope dict itself (``[{"entities":
+    [...], "relations": [...]}]``) — observed live, with correct content
+    inside. The two shapes must not be confused: treating the wrapped
+    envelope as one bare fact silently fails schema validation (an
+    envelope dict has no ``subject``/``predicate``/``object``), which
+    ``_run_local_extraction`` reports as ``outcome="failed"`` and an empty
+    graph rather than the parsed content.
+    """
+
+    def test_bare_fact_list_unwraps_as_relations(self):
+        """A bare list of fact dicts (pre-existing tolerance) still wraps
+        as ``{"relations": [...], "entities": []}``."""
+        raw = json.dumps([{"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}])
+        graph = _parse_extraction(raw, session_id="s001", speaker_id="speaker0")
+        assert len(graph.relations) == 1
+        assert graph.relations[0].subject == "Alex"
+        assert graph.relations[0].object == "Berlin"
+
+    def test_single_element_envelope_list_unwraps_to_envelope(self):
+        """A single-element list whose element IS the envelope dict
+        unwraps to that dict — entities AND relations both survive,
+        rather than being discarded as one malformed bare fact."""
+        raw = json.dumps(
+            [
+                {
+                    "entities": [{"name": "Alex", "entity_type": "person"}],
+                    "relations": [
+                        {
+                            "subject": "Alex",
+                            "predicate": "lives_in",
+                            "object": "Berlin",
+                            "relation_type": "factual",
+                            "confidence": 1.0,
+                        }
+                    ],
+                    "summary": "Alex lives in Berlin.",
+                }
+            ]
+        )
+        graph = _parse_extraction(raw, session_id="s001", speaker_id="speaker0")
+        assert len(graph.entities) == 1
+        assert graph.entities[0].name == "Alex"
+        assert len(graph.relations) == 1
+        assert graph.relations[0].subject == "Alex"
+        assert graph.relations[0].object == "Berlin"
+
+    def test_multi_element_list_of_non_envelope_dicts_still_bare_facts(self):
+        """A multi-element list of fact dicts is NOT mistaken for an
+        envelope wrapper (the envelope-unwrap path only fires for a
+        length-1 list) — normal multi-fact bare-list parsing is
+        unaffected."""
+        raw = json.dumps(
+            [
+                {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
+                {"subject": "Alex", "predicate": "works_at", "object": "Acme"},
+            ]
+        )
+        graph = _parse_extraction(raw, session_id="s001", speaker_id="speaker0")
+        assert len(graph.relations) == 2
 
 
 class TestNormalizeExtraction:
@@ -938,6 +1057,293 @@ class TestSecondOrderExtractPhase:
         phase_names = [p.name for p in get_phases(graph)]
         assert phase_names == ["local_extract", "second_order_extract"]
         assert any(r.subject == "Nadeem" and r.object == "Porto" for r in graph.relations)
+
+    def test_named_people_slot_threaded_from_gate_derived_set(self):
+        """The gate-derived closed target set (pass-1's named non-speaker
+        person entities) is threaded into the second-order
+        ``_generate_extraction`` call as ``extra_slots={"named_people":
+        ...}`` — the structural fix for the double-derivation defect
+        (computing the set for the gate, then asking the LLM to re-derive
+        it from raw prose)."""
+        captured = {}
+
+        def _capturing_generate(*args, **kwargs):
+            if kwargs.get("user_prompt_filename") == "extraction_second_order.txt":
+                captured["extra_slots"] = kwargs.get("extra_slots")
+                return self._second_order_output()
+            return self._pass1_with_named_person()
+
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=_capturing_generate,
+        ):
+            extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="My brother Nadeem lives in Porto.",
+                session_id="s001",
+                speaker_id="speaker0",
+                scrub={"person name"},
+            )
+        assert captured["extra_slots"] == {"named_people": "Nadeem"}
+
+    def _pass1_with_two_named_people(self) -> str:
+        """Pass-1 output with two named non-speaker people: 'Nadeem_Ali'
+        (a name carrying an underscore, exercising the canonical-form
+        comparison) and 'Priya'."""
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "speaker0", "entity_type": "person"},
+                    {"name": "Nadeem_Ali", "entity_type": "person"},
+                    {"name": "Priya", "entity_type": "person"},
+                ],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "has_brother",
+                        "object": "Nadeem_Ali",
+                        "relation_type": "social",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _second_order_output_with_overflow(self) -> str:
+        """Second-order output with one relation whose subject is IN the
+        gate set but rendered as a case/underscore-folded canonical
+        variant ('nadeem ali' vs the gate entity 'Nadeem_Ali'), and one
+        relation whose subject ('Someone Else') is entirely OUTSIDE the
+        gate set — the residual-overflow failure mode closed-set
+        threading alone does not eliminate (measured), which the
+        deterministic post-phase enforcement exists to close."""
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "nadeem ali", "entity_type": "person"},
+                    {"name": "Someone Else", "entity_type": "person"},
+                ],
+                "relations": [
+                    {
+                        "subject": "nadeem ali",
+                        "predicate": "lives_in",
+                        "object": "Porto",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    },
+                    {
+                        "subject": "Someone Else",
+                        "predicate": "lives_in",
+                        "object": "Berlin",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    },
+                ],
+            }
+        )
+
+    def test_enforcement_keeps_canonical_variant_drops_out_of_set_subject(self):
+        """Post-phase enforcement: STRICT ``canonical()`` equality keeps a
+        relation whose subject is a case/underscore-folded variant of a
+        gate-set entity ('nadeem ali' <-> 'Nadeem_Ali'), and drops a
+        relation whose subject is entirely outside the gate set ('Someone
+        Else' was never a pass-1 entity)."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=self._fake_generate(
+                self._pass1_with_two_named_people(),
+                self._second_order_output_with_overflow(),
+            ),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="My brother Nadeem_Ali lives somewhere. Priya too.",
+                session_id="s001",
+                speaker_id="speaker0",
+                scrub={"person name"},
+            )
+        assert any(r.subject == "nadeem ali" and r.object == "Porto" for r in graph.relations), (
+            "canonical-variant subject of a gate-set entity must be kept"
+        )
+        assert not any(r.object == "Berlin" for r in graph.relations), (
+            "relation with subject outside the gate set must be dropped"
+        )
+
+    def _pass1_with_priya_and_speaker(self) -> str:
+        """Pass-1 graph naming one non-speaker person (Priya) — the
+        remap-vs-drop fixtures below add a second-order relation whose
+        subject is the SPEAKER's own display name ('Alex') instead."""
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "speaker0", "entity_type": "person"},
+                    {"name": "Priya", "entity_type": "person"},
+                ],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "has_colleague",
+                        "object": "Priya",
+                        "relation_type": "social",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _second_order_output_with_addressee_and_off_target(self) -> str:
+        """Second-order output with three relations exercising all three
+        enforcement branches: in-set (Priya), addressee display-name
+        ('Alex', remap target), and off-target ('Random Person', drop).
+        Entities mirror the relation subjects/objects plus one entity with
+        no relation at all ('Random Person' as an entity, distinct from
+        the relation's own subject — both must be dropped)."""
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "Alex", "entity_type": "person"},
+                    {"name": "Priya", "entity_type": "person"},
+                    {"name": "Berlin", "entity_type": "place"},
+                    {"name": "Random Person", "entity_type": "person"},
+                ],
+                "relations": [
+                    {
+                        "subject": "Alex",
+                        "predicate": "lives_in",
+                        "object": "Berlin",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    },
+                    {
+                        "subject": "Priya",
+                        "predicate": "works_at",
+                        "object": "Acme",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    },
+                    {
+                        "subject": "Random Person",
+                        "predicate": "likes",
+                        "object": "Coffee",
+                        "relation_type": "preference",
+                        "confidence": 1.0,
+                    },
+                ],
+            }
+        )
+
+    def _extract_with_addressee_fixture(self, *, speaker_name: str | None):
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=self._fake_generate(
+                self._pass1_with_priya_and_speaker(),
+                self._second_order_output_with_addressee_and_off_target(),
+            ),
+        ):
+            return extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="Priya works at Acme. You (Alex) live in Berlin now.",
+                session_id="s001",
+                speaker_id="speaker0",
+                speaker_name=speaker_name,
+                scrub={"person name"},
+            )
+
+    def test_addressee_display_name_subject_is_remapped_not_dropped(self):
+        """A relation whose subject canonically equals the speaker's
+        display name ('Alex') is REMAPPED to ``speaker_id`` and kept —
+        the directive's own declared semantics
+        (configs/prompts/speaker_directive.txt) — rather than dropped
+        alongside a genuinely out-of-set subject."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert any(
+            r.subject == "speaker0" and r.predicate == "lives_in" and r.object == "Berlin"
+            for r in graph.relations
+        ), "addressee-display-name relation must survive remapped onto speaker_id"
+        assert not any(r.subject == "Alex" for r in graph.relations), (
+            "the raw display-name subject must not survive verbatim"
+        )
+
+    def test_in_set_subject_still_kept_unmodified_alongside_remap(self):
+        """The in-set relation (Priya) is unaffected by the addressee
+        remap branch firing on a different relation in the same pass."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert any(
+            r.subject == "Priya" and r.predicate == "works_at" and r.object == "Acme"
+            for r in graph.relations
+        )
+
+    def test_off_target_subject_still_dropped_alongside_remap(self):
+        """A relation whose subject is neither in the closed set nor the
+        speaker's display name is dropped, the deterministic complement —
+        unaffected by the remap branch firing on a different relation."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert not any(r.object == "Coffee" for r in graph.relations)
+
+    def test_remapped_subject_entity_does_not_survive_via_its_own_relation(self):
+        """The display-name entity ('Alex') the second-order pass also
+        emitted must NOT survive into ``graph.entities`` — its own
+        relation's subject was remapped away, so it is not an endpoint of
+        any KEPT relation, and it was never in the closed named-people
+        set to begin with."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert not any(e.name == "Alex" for e in graph.entities)
+
+    def test_object_entity_of_a_kept_relation_survives(self):
+        """A place entity that is the OBJECT of a kept (post-remap)
+        relation survives — the endpoint check runs against post-remap
+        relations, and the remapped relation's object ('Berlin') is
+        unchanged by the subject remap."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert any(e.name == "Berlin" for e in graph.entities)
+
+    def test_out_of_set_entity_with_no_kept_relation_is_gone(self):
+        """An entity with no kept relation at all ('Random Person') is
+        dropped from ``graph.entities`` — neither in the closed set nor
+        an endpoint of any surviving relation."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert not any(e.name == "Random Person" for e in graph.entities)
+
+    def test_diagnostics_record_both_remapped_and_dropped_counts(self):
+        """Both enforcement outcomes are recorded on ``graph.diagnostics``
+        under their own keys, matching this module's existing drop-site
+        naming style (``predicate_placeholder_dropped`` et al.)."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        assert graph.diagnostics.get("second_order_subject_remapped") == 1
+        assert graph.diagnostics.get("second_order_subject_dropped") == 1
+
+    def test_no_speaker_name_disables_remap_branch_entirely(self):
+        """``speaker_name=None`` (e.g. an anonymous speaker) disables the
+        remap branch: the would-be-remapped relation is dropped like any
+        other out-of-set subject, and no ``second_order_subject_remapped``
+        diagnostic is recorded."""
+        graph = self._extract_with_addressee_fixture(speaker_name=None)
+        assert not any(r.subject == "speaker0" and r.object == "Berlin" for r in graph.relations)
+        assert not any(r.subject == "Alex" for r in graph.relations)
+        assert "second_order_subject_remapped" not in graph.diagnostics
+        assert graph.diagnostics.get("second_order_subject_dropped") == 2
+
+    def test_second_order_extract_phase_trace_reflects_post_enforcement_graph(self):
+        """The ``second_order_extract`` phase trace's ``parsed`` summary
+        must reflect the ENFORCED graph (post remap/drop) — not the raw
+        parse, which had 4 entities / 3 relations before enforcement
+        dropped the off-target relation+entity (``Random Person``) and
+        the addressee entity (``Alex``, remapped away from its own
+        relation), leaving 2 entities (Priya, Berlin) / 2 relations
+        (the remapped Alex->speaker0 relation and the in-set Priya
+        relation)."""
+        graph = self._extract_with_addressee_fixture(speaker_name="Alex")
+        phase = next(p for p in get_phases(graph) if p.name == "second_order_extract")
+        assert phase.parsed is not None
+        assert phase.parsed["relation_count"] == 2, (
+            f"trace relation_count must reflect post-enforcement relations, got {phase.parsed}"
+        )
+        assert phase.parsed["entity_count"] == 2, (
+            f"trace entity_count must reflect post-enforcement entities, got {phase.parsed}"
+        )
 
 
 class TestExtractGraphTimestampPropagation:

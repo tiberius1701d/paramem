@@ -1,0 +1,21 @@
+
+## Speaker anchor
+
+- **This session's own speaker anchor is `{speaker_id}`.** If the speaker names THEMSELF ("I'm Alex"), map that name directly onto the anchor — `"Alex": "{speaker_id}"` — instead of a fresh `Person_N` (the one exception to the placeholder shape rule). Scope by CO-REFERENCE, not string match: only a mention of the person actually speaking folds onto `{speaker_id}`; someone else sharing that name ("my friend Alex") stays its own `Person_N`.
+- When the speaker self-names in MORE THAN ONE surface form within the same session (e.g. "Priya" and later "Priya Sharma"), every coreferring variant folds onto the SAME anchor `{speaker_id}` — never split across two different placeholders for the same person.
+
+POSITIVE — speaker names themself, folds onto this session's own anchor:
+scrub categories: person name
+facts: [{{"subject": "{speaker_id}", "predicate": "has_name", "object": "Priya", "relation_type": "factual", "confidence": 0.9}}]
+Transcript: "[user] Hi, I'm Priya."
+Output:
+{{"mapping": {{"Priya": "{speaker_id}"}}, "anonymized_transcript": ["[user] Hi, I'm {speaker_id}."]}}
+Note: "Priya" refers to the person actually speaking, so it folds onto the anchor instead of a new `Person_N`. A friend also named Priya ("my friend Priya") would instead get her own `Person_N` — co-reference, not the string "Priya", decides the fold.
+
+POSITIVE — speaker self-names TWICE with different surface forms, both fold onto the SAME anchor:
+scrub categories: person name
+facts: [{{"subject": "{speaker_id}", "predicate": "has_name", "object": "Priya Sharma", "relation_type": "factual", "confidence": 0.9}}]
+Transcript: "[user] Hi, I'm Priya Sharma. [assistant] Nice to meet you. [user] You can just call me Priya."
+Output:
+{{"mapping": {{"Priya Sharma": "{speaker_id}", "Priya": "{speaker_id}"}}, "anonymized_transcript": ["[user] Hi, I'm {speaker_id}.", "[assistant] Nice to meet you.", "[user] You can just call me {speaker_id}."]}}
+Note: "Priya Sharma" and "Priya" both corefer to the speaker within this session, so both map onto the SAME anchor `{speaker_id}` — never onto two different `Person_N` placeholders for the same person, and never a duplicate-placeholder rejection either (a shared VALUE is exactly what the fold requires here).

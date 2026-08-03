@@ -27,6 +27,7 @@ from wyoming.tts import (
 )
 
 from paramem.server.config import ISO_LANGUAGE_NAMES
+from paramem.server.speaker import resolve_speaker_tokens
 from paramem.server.voice_pipeline import process_utterance
 
 if TYPE_CHECKING:
@@ -50,7 +51,7 @@ class SpeakerSTTHandler(AsyncEventHandler):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         stt,
-        speaker_store=None,
+        speaker_store_provider: Callable[[], object] | None = None,
         chat_callback=None,
         embedding_callback=None,
         language_callback=None,
@@ -58,7 +59,14 @@ class SpeakerSTTHandler(AsyncEventHandler):
     ):
         super().__init__(reader, writer)
         self._stt = stt
-        self._speaker_store = speaker_store
+        # Re-resolved on every _process_audio call (not just once at
+        # connection-open) — mirrors TTSHandler's speaker_store_provider
+        # pattern: a live Wyoming connection can outlive a config-apply
+        # that rebinds ``_state["speaker_store"]`` from ``None`` to a real
+        # store (or back), and an eagerly-captured reference would keep
+        # gating embedding computation on the stale value indefinitely.
+        # ``None`` is a valid provider (no speaker store configured).
+        self._speaker_store_provider = speaker_store_provider
         self._chat_callback = chat_callback
         self._embedding_callback = embedding_callback
         self._language_callback = language_callback
@@ -107,8 +115,16 @@ class SpeakerSTTHandler(AsyncEventHandler):
           2. Embedding callback (store latest embedding in server state).
           3. ``Transcript`` write (send result back via Wyoming protocol).
           4. Chat callback (forward transcript + embedding to ParaMem /chat).
+
+        The speaker store is re-resolved via ``self._speaker_store_provider``
+        on THIS call (not cached at connection-open) so a config-apply that
+        rebinds ``_state["speaker_store"]`` mid-connection is picked up by
+        the very next utterance's ``compute_embedding`` gate.
         """
         audio_bytes = bytes(self._audio_buffer)
+        speaker_store = (
+            self._speaker_store_provider() if self._speaker_store_provider is not None else None
+        )
 
         utterance = await process_utterance(
             audio_bytes,
@@ -116,7 +132,7 @@ class SpeakerSTTHandler(AsyncEventHandler):
             self._sample_width,
             self._channels,
             self._stt,
-            compute_embedding=self._speaker_store is not None,
+            compute_embedding=speaker_store is not None,
             min_embedding_duration_seconds=self._min_embedding_duration_seconds,
         )
 
@@ -178,7 +194,7 @@ async def start_wyoming_server(
     host: str,
     port: int,
     stt=None,
-    speaker_store=None,
+    speaker_store_provider: Callable[[], object] | None = None,
     chat_callback=None,
     embedding_callback=None,
     language_callback=None,
@@ -191,7 +207,19 @@ async def start_wyoming_server(
         host: TCP host to bind.
         port: TCP port to listen on.
         stt: Loaded STT model instance. Used when ``stt_provider`` is None.
-        speaker_store: Optional SpeakerStore for embedding enrichment.
+        speaker_store_provider: Callable returning the active
+            :class:`~paramem.server.speaker.SpeakerStore` (or ``None`` when
+            no store is configured), used to gate speaker-embedding
+            computation. Threaded straight through to
+            :class:`SpeakerSTTHandler`, which re-resolves it on every
+            utterance (not just once per connection) — the lifespan boot
+            path's only production caller, mirroring
+            :func:`start_wyoming_tts_server`'s ``speaker_store_provider``,
+            so a live config-apply that rebinds ``_state["speaker_store"]``
+            takes effect without restarting the socket listener or
+            dropping an in-flight connection. There is no static
+            ``speaker_store=`` alternative — no production caller ever
+            needed one.
         chat_callback: Async callable forwarding (text, embedding) to /chat.
         embedding_callback: Callable storing the latest embedding in server state.
         language_callback: Callable storing the detected language in server state.
@@ -211,7 +239,7 @@ async def start_wyoming_server(
             reader,
             writer,
             active_stt,
-            speaker_store,
+            speaker_store_provider,
             chat_callback,
             embedding_callback,
             language_callback,
@@ -256,12 +284,22 @@ class TTSHandler(AsyncEventHandler):
         language_resolver=None,
         audio_chunk_bytes: int = 4096,
         language_source: str = "auto",
+        speaker_store_provider: Callable[[], object] | None = None,
     ):
         super().__init__(reader, writer)
         self._tts = tts_manager
         self._language_resolver = language_resolver
         self._audio_chunk_bytes = audio_chunk_bytes
         self._language_source = language_source
+        # Re-resolved on every _synthesize_and_send call (not just once at
+        # connection-open) — mirrors the tts_manager_provider pattern but at
+        # call granularity: a live Wyoming connection can outlive a
+        # config-apply that rebinds ``_state["speaker_store"]`` to a fresh
+        # SpeakerStore instance, and an eagerly-captured reference would keep
+        # resolving against the stale (possibly-None) one indefinitely.
+        # ``None`` is a valid provider (no speaker store configured) —
+        # resolve_speaker_tokens already accepts a ``None`` store.
+        self._speaker_store_provider = speaker_store_provider
         # Accumulated state for streaming synthesis (SynthesizeStart/Chunk/Stop).
         # ``_streaming`` is True between a SynthesizeStart and the terminal event
         # that completes the stream — so the response can be finalized with a
@@ -354,10 +392,48 @@ class TTSHandler(AsyncEventHandler):
         """Synthesize ``text`` and stream the audio back via the Wyoming
         protocol. Shared by the one-shot Synthesize path and the streaming
         SynthesizeStart/Chunk/Stop path; ``voice`` is the caller's
-        SynthesizeVoice (or None)."""
+        SynthesizeVoice (or None).
+
+        Defensive SECOND application of :func:`~paramem.server.speaker.
+        resolve_speaker_tokens` — text reaching this method should already
+        have its ``speaker{N}`` tokens resolved to display names by the
+        reply-boundary resolver at the app layer, but a caller could in
+        principle route unresolved text straight to TTS (a satellite/HA
+        integration path that bypasses ``/chat``/``/voice`` entirely, or a
+        future contract violation).  Unlike the app-layer resolver, this
+        call uses ``unresolvable_fallback="verbatim"``, NOT the default
+        ``"descriptor"`` collapse: anything still carrying a raw
+        ``speaker{N}`` token by the time it reaches TTS synthesis is either
+        (a) the caller's own self-token (deliberately left verbatim by the
+        app-layer resolver, harmless to repeat here) or (b) a genuine
+        contract violation — unresolved text that skipped the app-layer
+        resolver.  Collapsing case (b) to :data:`~paramem.server.speaker.
+        THIRD_PARTY_DESCRIPTOR` would silently narrate a real self-reference
+        as "another speaker" IN SPEECH — worse than the honest fail-safe of
+        leaving the raw token audible, which is what ``"verbatim"``
+        produces.  ``current_speaker_id`` is still omitted here — the
+        Wyoming protocol carries no notion of "the current speaker" at this
+        layer, and the app-layer resolution that already ran is the one
+        call site that knows it — but it is no longer needed for the
+        self-token case: ``"verbatim"`` already leaves ANY unresolvable
+        token untouched, self-token or not.
+
+        The speaker store is re-resolved via ``self._speaker_store_provider``
+        on every call (``None`` provider resolves to no store, matching
+        ``resolve_speaker_tokens``'s own ``None``-store contract) so a
+        config-apply that rebinds ``_state["speaker_store"]`` mid-connection
+        is picked up on the very next synthesize, including the
+        streaming-join path (``SynthesizeStop`` rendering the accumulated
+        chunk text).
+        """
         if not text:
             logger.warning("Empty TTS request")
             return
+
+        speaker_store = (
+            self._speaker_store_provider() if self._speaker_store_provider is not None else None
+        )
+        text = resolve_speaker_tokens(text, speaker_store, unresolvable_fallback="verbatim")
 
         # Resolve language per tts.language_source. Detection-first ("auto"/
         # "detection") prefers ParaMem's detected language over the caller's
@@ -455,6 +531,7 @@ async def start_wyoming_tts_server(
     audio_chunk_bytes: int = 4096,
     tts_manager_provider: Callable[[], TTSManager] | None = None,
     language_source: str = "auto",
+    speaker_store_provider: Callable[[], object] | None = None,
 ) -> AsyncServer:
     """Start the Wyoming TTS server (non-blocking).
 
@@ -469,12 +546,30 @@ async def start_wyoming_tts_server(
             socket listener. Supersedes ``tts_manager`` when not None.
         language_source: ``tts.language_source`` — "auto"/"detection" prefer the
             detected language over the caller's voice hint; "hint" reverses it.
+        speaker_store_provider: Callable returning the active
+            :class:`~paramem.server.speaker.SpeakerStore` (or ``None`` when
+            no store is configured), used for the defensive reply-boundary
+            resolve in :meth:`TTSHandler._synthesize_and_send`.  Threaded
+            straight through to :class:`TTSHandler`, which re-resolves it on
+            every ``_synthesize_and_send`` call (not just once per
+            connection) — the lifespan boot path's only production caller
+            (mirrors ``tts_manager_provider``) so a live config-apply that
+            rebinds ``_state["speaker_store"]`` takes effect without
+            restarting the socket listener or dropping an in-flight
+            connection.  There is no static ``speaker_store=`` alternative —
+            no production caller ever needed one.
     """
 
     def handler_factory(reader, writer):
         active_tts = tts_manager_provider() if tts_manager_provider is not None else tts_manager
         return TTSHandler(
-            reader, writer, active_tts, language_resolver, audio_chunk_bytes, language_source
+            reader,
+            writer,
+            active_tts,
+            language_resolver,
+            audio_chunk_bytes,
+            language_source,
+            speaker_store_provider,
         )
 
     server = AsyncServer.from_uri(f"tcp://{host}:{port}")

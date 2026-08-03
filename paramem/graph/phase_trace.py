@@ -679,16 +679,15 @@ def record_prompt(*, path: str | None, content: str) -> None:
 
     * ``_load_prompt`` (transitively, via :func:`paramem.graph.prompts.
       _load_speaker_directive_section`) is called at MODULE IMPORT TIME to
-      build ``paramem.server.inference.THIRD_PARTY_DESCRIPTOR``
-      (``inference.py:52``) — long before any :func:`extraction_trace`/
-      :func:`phase_trace` scope can exist.  A raise here would break
-      ``import paramem.server.inference`` outright; this is the decisive
-      reason a raise is not an option, independent of any call-time
-      scoping question.
+      build ``paramem.server.speaker.THIRD_PARTY_DESCRIPTOR`` — long before
+      any :func:`extraction_trace`/:func:`phase_trace` scope can exist.  A
+      raise here would break ``import paramem.server.speaker`` outright;
+      this is the decisive reason a raise is not an option, independent of
+      any call-time scoping question.
     * Two real production call paths also run it with no phase scope
       open at CALL time — ``anonymize_transcript`` from
       ``anonymize_turn`` (reached from the live chat
-      egress, ``paramem/server/inference.py:639``,
+      egress, ``paramem/server/inference.py``'s ``answer_via_cloud``,
       ``extractor.py:1108``) and from
       ``paramem.training.consolidation`` (``consolidation.py:2739``).
 

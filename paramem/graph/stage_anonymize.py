@@ -103,6 +103,7 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
             transcript=ctx.transcript,
             scrub=ctx.scrub,
             speaker_name=ctx.speaker_name,
+            speaker_id=ctx.speaker_id,
             user_prompt_template="",
             system_prompt="",
         )
@@ -122,6 +123,9 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
             anon_system = _load_prompt(
                 "anonymization_system.txt", prompts_dir=ctx.prompts_dir, required=True
             )
+            anon_anchor_prompt = _load_prompt(
+                "anonymization_speaker_anchor.txt", prompts_dir=ctx.prompts_dir, required=True
+            )
             payload = anonymize(
                 facts_from_relations(graph.relations),
                 ctx.model,
@@ -129,6 +133,13 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                 transcript=ctx.transcript,
                 scrub=ctx.scrub,
                 speaker_name=ctx.speaker_name,
+                # Session-tier egress feeds the graph, never the reply
+                # boundary — ctx.speaker_id is required/non-empty
+                # (StageContext) and threaded unconditionally, unlike
+                # chat egress's reply-boundary-gated anchor (see
+                # paramem.graph.flows.anonymize_turn).
+                speaker_id=ctx.speaker_id,
+                speaker_anchor_template=anon_anchor_prompt,
                 token_envelope=ctx.anonymize_token_envelope,
                 seed=ctx.seed,
                 user_prompt_template=anon_prompt,
@@ -166,7 +177,6 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
                     ctx.model,
                     ctx.tokenizer,
                     "anon_failed",
-                    speaker_name=ctx.speaker_name,
                     speaker_id=ctx.speaker_id,
                     max_tokens=ctx.max_tokens,
                     plausibility_max_tokens=ctx.plausibility_max_tokens,

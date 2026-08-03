@@ -52,11 +52,21 @@ _ANONYMIZATION_TEMPLATE_PATH = (
 
 def _render_anon_template_text() -> str:
     """Load and format the real anonymization.txt skeleton (empty
-    facts/scrub/transcript) — the same shape ``_render_anonymize_prompt``
-    produces before chat-template wrapping (``paramem/cloud/anonymize.py``).
+    facts/scrub/transcript, no speaker anchor) — the same shape
+    ``_render_anonymize_prompt`` produces before chat-template wrapping
+    (``paramem/cloud/anonymize.py``) when no speaker id is threaded (the
+    document-ingest path has no speaker anchor at all, so the anchor-less
+    render is this derivation's correct budget basis — see
+    ``_render_anonymize_prompt``'s ``speaker_anchor_section`` slot).
     """
     template = _ANONYMIZATION_TEMPLATE_PATH.read_text(encoding="utf-8")
-    return template.format(scrub_categories="", facts_json="[]", transcript="")
+    return template.format(
+        scrub_categories="",
+        facts_json="[]",
+        transcript="",
+        speaker_id="",
+        speaker_anchor_section="",
+    )
 
 
 def _live_anon_template_tokens() -> int:

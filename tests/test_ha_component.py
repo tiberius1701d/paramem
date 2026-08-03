@@ -37,7 +37,6 @@ sys.modules["homeassistant.const"].Platform.CONVERSATION = "conversation"
 
 # Now it's safe to import (must be after HA module mocking above)
 from custom_components.paramem.const import DEFAULT_SERVER_URL, DEFAULT_TIMEOUT, DOMAIN  # noqa: E402, I001
-from custom_components.paramem.conversation import _extract_history  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -85,75 +84,24 @@ class TestConstants:
         assert DEFAULT_TIMEOUT == 30
 
 
-class TestHistoryExtraction:
-    """Tests for _extract_history which infers role from class name.
-
-    HA ChatLog entries are typed (UserContent, AssistantContent).
-    _extract_history reads type(entry).__name__ to determine role.
-    """
-
-    def _make_entry(self, role, content):
-        # Create mock with class name matching HA content types
-        if role == "user":
-            cls_name = "UserContent"
-        elif role == "assistant":
-            cls_name = "AssistantContent"
-        else:
-            cls_name = "UnknownContent"
-        entry = type(cls_name, (), {"content": content})()
-        return entry
-
-    def test_extracts_roles_and_text(self):
-        chat_log = MagicMock()
-        chat_log.content = [
-            self._make_entry("user", "Hello"),
-            self._make_entry("assistant", "Hi there"),
-        ]
-        history = _extract_history(chat_log)
-
-        assert len(history) == 2
-        assert history[0] == {"role": "user", "text": "Hello"}
-        assert history[1] == {"role": "assistant", "text": "Hi there"}
-
-    def test_skips_entries_with_unknown_type(self):
-        chat_log = MagicMock()
-        chat_log.content = [self._make_entry(None, "orphan text")]
-
-        history = _extract_history(chat_log)
-        assert len(history) == 0
-
-    def test_empty_chat_log(self):
-        chat_log = MagicMock()
-        chat_log.content = []
-
-        history = _extract_history(chat_log)
-        assert history == []
-
-    def test_skips_entries_with_no_content(self):
-        entry = self._make_entry("user", None)
-
-        chat_log = MagicMock()
-        chat_log.content = [entry]
-
-        history = _extract_history(chat_log)
-        assert len(history) == 0
-
-
 class TestPayloadConstruction:
     def test_payload_roundtrips_as_json(self):
+        """The component's actual ``/chat`` payload shape: ``text``,
+        ``conversation_id``, ``speaker`` — no ``history`` key. The server
+        is history-authoritative (``SessionBuffer``); the component
+        assembling and sending its own ``ChatLog``-derived history was dead
+        work (the server drops any such key) and has been removed."""
         payload = {
             "text": "What's my favorite restaurant?",
             "conversation_id": "abc123",
-            "history": [
-                {"role": "user", "text": "Previous question"},
-                {"role": "assistant", "text": "Previous answer"},
-            ],
+            "speaker": "Alex",
         }
         deserialized = json.loads(json.dumps(payload))
 
         assert deserialized["text"] == "What's my favorite restaurant?"
         assert deserialized["conversation_id"] == "abc123"
-        assert len(deserialized["history"]) == 2
+        assert deserialized["speaker"] == "Alex"
+        assert "history" not in deserialized
 
     def test_server_url_trailing_slash_stripped(self):
         assert "http://localhost:8420/".rstrip("/") == "http://localhost:8420"

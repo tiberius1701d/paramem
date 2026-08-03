@@ -1535,21 +1535,20 @@ class TestSetBookkeepingGuard:
 
 
 # ---------------------------------------------------------------------------
-# Phase B — speaker_resolver kwarg (B2)
+# probe renders speaker{N} tokens verbatim — no resolver in probe
 # ---------------------------------------------------------------------------
 
 
-class TestProbeSpeakerResolver:
-    """MemoryStore.probe(speaker_resolver=...) applies the resolver in both
-    render paths: cache-HIT and cache-MISS / source passthrough.
+class TestProbeRendersTokensVerbatim:
+    """MemoryStore.probe renders ``fact_text`` with raw ``speaker{N}`` tokens
+    on both the cache-hit and cache-miss/source-passthrough paths.  There is
+    no resolver parameter on ``probe`` — display-name resolution happens
+    exactly once, at the reply boundary, via
+    :func:`paramem.server.speaker.resolve_speaker_tokens`, never inside probe.
     """
 
-    def _resolve(self, tok: str) -> str:
-        mapping = {"speaker0": "Alex", "speaker9": "Dana"}
-        return mapping.get(tok, "another speaker" if tok.startswith("speaker") else tok)
-
-    def test_cache_hit_resolves_subject(self) -> None:
-        """Cache-hit path: resolver applied to subject via entry_fact_text."""
+    def test_cache_hit_subject_token_verbatim(self) -> None:
+        """Cache-hit path: fact_text carries the raw subject token as-is."""
         s = MemoryStore()
         s.put(
             "episodic",
@@ -1557,13 +1556,11 @@ class TestProbeSpeakerResolver:
             {"key": "graph1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
         )
         s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graph1"]}, speaker_resolver=self._resolve)
-        ft = results["graph1"]["fact_text"]
-        assert "Alex" in ft
-        assert "speaker0" not in ft
+        results = s.probe({"episodic": ["graph1"]})
+        assert results["graph1"]["fact_text"] == "speaker0 lives_in Berlin"
 
-    def test_cache_hit_resolves_object(self) -> None:
-        """Cache-hit path: resolver applied to object via entry_fact_text."""
+    def test_cache_hit_object_token_verbatim(self) -> None:
+        """Cache-hit path: fact_text carries the raw object token as-is."""
         s = MemoryStore()
         s.put(
             "episodic",
@@ -1571,26 +1568,13 @@ class TestProbeSpeakerResolver:
             {"key": "graph2", "subject": "speaker0", "predicate": "knows", "object": "speaker9"},
         )
         s.set_bookkeeping("graph2", speaker_id="speaker0", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graph2"]}, speaker_resolver=self._resolve)
-        ft = results["graph2"]["fact_text"]
-        assert "Dana" in ft
-        assert "speaker9" not in ft
+        results = s.probe({"episodic": ["graph2"]})
+        assert results["graph2"]["fact_text"] == "speaker0 knows speaker9"
 
-    def test_cache_hit_no_resolver_verbatim(self) -> None:
-        """Without resolver, fact_text contains the raw token (byte-identical behaviour)."""
-        s = MemoryStore()
-        s.put(
-            "episodic",
-            "graph3",
-            {"key": "graph3", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
-        )
-        s.set_bookkeeping("graph3", speaker_id="speaker0", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graph3"]})
-        ft = results["graph3"]["fact_text"]
-        assert "speaker0" in ft
-
-    def test_source_miss_path_resolves(self) -> None:
-        """Cache-MISS / source passthrough: resolver applied before storing result."""
+    def test_source_miss_path_verbatim(self) -> None:
+        """Cache-MISS / source passthrough: the source's own fact_text (already
+        rendered verbatim by the source layer) passes through unmodified —
+        probe does not re-render or resolve it."""
 
         class _FakeSource:
             def probe(self, keys_by_tier):
@@ -1600,6 +1584,7 @@ class TestProbeSpeakerResolver:
                         "subject": "speaker9",
                         "predicate": "lives_in",
                         "object": "Paris",
+                        "fact_text": "speaker9 lives_in Paris",
                     }
                 }
 
@@ -1608,30 +1593,14 @@ class TestProbeSpeakerResolver:
         results = s.probe(
             {"episodic": ["graph9"]},
             source=_FakeSource(),
-            speaker_resolver=self._resolve,
             memoize=False,
         )
-        ft = results["graph9"]["fact_text"]
-        assert "Dana" in ft
-        assert "speaker9" not in ft
+        assert results["graph9"]["fact_text"] == "speaker9 lives_in Paris"
 
-    def test_anon_renders_descriptor(self) -> None:
-        """Resolver returning THIRD_PARTY_DESCRIPTOR for unknown speakers yields descriptor."""
-        descriptor = "another speaker"
-        s = MemoryStore()
-        s.put(
-            "episodic",
-            "graphX",
-            {"key": "graphX", "subject": "speaker5", "predicate": "visited", "object": "Rome"},
-        )
-        s.set_bookkeeping("graphX", speaker_id="speaker5", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graphX"]}, speaker_resolver=self._resolve)
-        ft = results["graphX"]["fact_text"]
-        assert descriptor in ft
-        assert "speaker5" not in ft
-
-    def test_memoized_stash_is_spo_only(self) -> None:
-        """After a source miss is memoized, a second probe re-renders from SPO (no stale name)."""
+    def test_memoized_stash_reconstructs_from_spo(self) -> None:
+        """A source-miss result, once memoized, is re-rendered from its raw SPO
+        fields on the next cache hit — the stash holds SPO, not a frozen
+        fact_text string."""
 
         class _FakeSource:
             def probe(self, keys_by_tier):
@@ -1641,26 +1610,24 @@ class TestProbeSpeakerResolver:
                         "subject": "speaker9",
                         "predicate": "works_at",
                         "object": "Acme",
+                        "fact_text": "speaker9 works_at Acme",
                     }
                 }
 
         s = MemoryStore()
-        # First probe with resolver "Dana"
-        s.probe(
-            {"episodic": ["graphM"]},
-            source=_FakeSource(),
-            speaker_resolver=self._resolve,
-            memoize=True,
-        )
+        s.probe({"episodic": ["graphM"]}, source=_FakeSource(), memoize=True)
 
-        # Second probe with a different resolver (renamed to "Zoe") — must NOT return stale "Dana".
-        def _renamed(tok: str) -> str:
-            return "Zoe" if tok == "speaker9" else tok
+        # Second probe is a cache hit — re-rendered from the memoized SPO.
+        results2 = s.probe({"episodic": ["graphM"]})
+        assert results2["graphM"]["fact_text"] == "speaker9 works_at Acme"
 
-        results2 = s.probe({"episodic": ["graphM"]}, speaker_resolver=_renamed)
-        ft2 = results2["graphM"]["fact_text"]
-        assert "Zoe" in ft2
-        assert "Dana" not in ft2
+    def test_probe_has_no_resolver_parameter(self) -> None:
+        """MemoryStore.probe takes no speaker_resolver kwarg — passing one raises."""
+        import pytest
+
+        s = MemoryStore()
+        with pytest.raises(TypeError):
+            s.probe({"episodic": []}, speaker_resolver=lambda t: t)
 
 
 # ---------------------------------------------------------------------------

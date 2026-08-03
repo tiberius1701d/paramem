@@ -79,7 +79,7 @@ from paramem.graph.stage_anonymize import _stage_anonymize
 from paramem.graph.stage_enrich import _stage_enrich
 from paramem.models.loader import base_model_inference
 from paramem.server.session_buffer import SessionBuffer
-from paramem.utils.identity import is_speaker_id
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,23 @@ def _stage_local_extract(ctx: StageContext, state: StageState) -> StageState:
     return StageState(graph=graph)
 
 
+def _named_non_speaker_people(graph: SessionGraph) -> list[str]:
+    """Named (proper-name) person entities in *graph* other than a speaker id.
+
+    Single source of truth for the ``second_order_extract`` target set:
+    :func:`_has_named_non_speaker_person` (the flow gate) asks the
+    membership question, and :func:`_stage_second_order_extract` threads
+    this SAME list into the prompt's ``{named_people}`` slot and enforces
+    it post-parse. Deriving the set once here — instead of computing it
+    for the gate and then asking the LLM to re-derive it from raw prose
+    (which includes the addressee by construction) — is what closes the
+    second-order phase's double-derivation defect.
+    """
+    return [
+        e.name for e in graph.entities if e.entity_type == "person" and not is_speaker_id(e.name)
+    ]
+
+
 def _has_named_non_speaker_person(graph: SessionGraph) -> bool:
     """Gate for the ``second_order_extract`` phase: does the pass-1 graph
     contain a named (proper-name) person entity other than a speaker id?
@@ -135,7 +152,7 @@ def _has_named_non_speaker_person(graph: SessionGraph) -> bool:
     gate: no such entity means nothing to recover, and the caller skips
     the phase entirely (no LLM call, no phase_trace record).
     """
-    return any(e.entity_type == "person" and not is_speaker_id(e.name) for e in graph.entities)
+    return bool(_named_non_speaker_people(graph))
 
 
 def _stage_second_order_extract(ctx: StageContext, state: StageState) -> StageState:
@@ -147,8 +164,89 @@ def _stage_second_order_extract(ctx: StageContext, state: StageState) -> StageSt
     trait) when local_extract collapsed a single-relative clause ("my
     brother Nadeem lives in Porto") into ONE relation instead of two
     (measured Mistral 7B failure mode).
+
+    The closed target set — :func:`_named_non_speaker_people`, the exact
+    entities the gate matched — is threaded into
+    ``extraction_second_order.txt``'s ``{named_people}`` slot (via
+    ``extra_slots``) rather than asking the LLM to re-derive it from raw
+    prose, which includes the addressee by construction. Threading the set
+    narrows what the model reaches for but does not guarantee it, so every
+    relation the second-order pass emits is enforced against it
+    (:func:`_enforce_second_order_targets`, run as the
+    :func:`~paramem.graph.extractor._run_local_extraction` ``postprocess``
+    hook — INSIDE that primitive's ``phase_trace`` scope, so the
+    ``second_order_extract`` trace record's ``parsed`` summary reflects
+    the post-enforcement graph, not the raw parse):
+
+    * Subject already in the closed set (STRICT
+      :func:`~paramem.utils.identity.canonical` equality — no fuzzy
+      matching) — kept unmodified. A genuine namesake is unaffected: it
+      arrives as its own pass-1 entity and is therefore already in the
+      set.
+    * Subject canonically equal to ``ctx.speaker_name`` (the display name)
+      but NOT in the closed set — REMAPPED to ``ctx.speaker_id`` and kept,
+      per ``configs/prompts/speaker_directive.txt``'s own declared
+      semantics (its ``EXTRACTION-DIRECTIVE`` section: "when the assistant
+      names its addressee ... that name refers to this same speaker").
+      ``ctx.speaker_name`` is the run-constant field
+      :func:`extract_graph` seeds onto :class:`~paramem.graph.flow.
+      StageContext` from its own ``speaker_name`` parameter
+      (``paramem.graph.flow.StageContext.speaker_name``); ``None`` (no
+      display name resolved, e.g. an anonymous speaker) disables this
+      branch entirely — every relation then goes through the plain
+      in-set/drop split below.
+    * Anything else — dropped, the deterministic complement.
+
+    Both counts are recorded on ``graph.diagnostics`` (this module's
+    existing drop-site naming style — see ``predicate_placeholder_dropped``
+    in :func:`_stage_deanonymize`): ``second_order_subject_remapped`` and
+    ``second_order_subject_dropped``.
+
+    The entity surface follows the same enforcement: an entity from the
+    second-order pass survives only if its canonical name is in the closed
+    set OR it is an endpoint (subject or object) of a KEPT, POST-REMAP
+    relation — so the remapped subject's own former display-name entity
+    does not survive via its own relation (that relation's subject is now
+    ``ctx.speaker_id``, not the display name) or get minted as a fresh
+    node downstream (every session entity mints/updates a graph node —
+    ``GraphMerger.merge``, ``paramem/graph/merger.py:384-388``).
     """
     graph = state.graph
+    named_people = _named_non_speaker_people(graph)
+    allowed = {canonical(name) for name in named_people}
+    speaker_name_canonical = canonical(ctx.speaker_name) if ctx.speaker_name else None
+    enforcement_counts = {"remapped": 0, "dropped": 0}
+
+    def _enforce_second_order_targets(second_order_graph: SessionGraph) -> SessionGraph:
+        """Restrict ``second_order_graph`` to the closed named-people
+        target set, remapping the addressee's display name onto
+        ``ctx.speaker_id`` rather than dropping it (see the enclosing
+        function's docstring). Mutates and returns ``second_order_graph``
+        in place; run as ``_run_local_extraction``'s ``postprocess`` hook
+        so the phase trace records the enforced result.
+        """
+        kept_relations = []
+        for rel in second_order_graph.relations:
+            subject_canonical = canonical(rel.subject)
+            if subject_canonical in allowed:
+                kept_relations.append(rel)
+            elif speaker_name_canonical is not None and subject_canonical == speaker_name_canonical:
+                rel.subject = ctx.speaker_id
+                kept_relations.append(rel)
+                enforcement_counts["remapped"] += 1
+            else:
+                enforcement_counts["dropped"] += 1
+        second_order_graph.relations = kept_relations
+        kept_endpoints = {canonical(r.subject) for r in kept_relations} | {
+            canonical(r.object) for r in kept_relations
+        }
+        second_order_graph.entities = [
+            ent
+            for ent in second_order_graph.entities
+            if canonical(ent.name) in allowed or canonical(ent.name) in kept_endpoints
+        ]
+        return second_order_graph
+
     second_order_graph = _run_local_extraction(
         ctx.model,
         ctx.tokenizer,
@@ -166,7 +264,28 @@ def _stage_second_order_extract(ctx: StageContext, state: StageState) -> StageSt
         ctx.timestamp,
         ctx.source_type,
         phase_name="second_order_extract",
+        extra_slots={"named_people": ", ".join(named_people)},
+        postprocess=_enforce_second_order_targets,
     )
+    remapped = enforcement_counts["remapped"]
+    dropped = enforcement_counts["dropped"]
+    if remapped or dropped:
+        logger.debug(
+            "second_order_extract: remapped %d relation(s) with subject == the "
+            "speaker's display name onto %s; dropped %d relation(s) with subject "
+            "outside the closed named-people set",
+            remapped,
+            ctx.speaker_id,
+            dropped,
+        )
+    if remapped:
+        graph.diagnostics["second_order_subject_remapped"] = (
+            graph.diagnostics.get("second_order_subject_remapped", 0) + remapped
+        )
+    if dropped:
+        graph.diagnostics["second_order_subject_dropped"] = (
+            graph.diagnostics.get("second_order_subject_dropped", 0) + dropped
+        )
     # Plain union: the second-order pass contributes recovered facts
     # (recall) — it is not a dedup boundary. Predicate-surface drift for a
     # fact both passes capture (e.g. "picked_up" vs "picks_up") is a
@@ -414,7 +533,6 @@ def _stage_rebuild(ctx: StageContext, state: StageState) -> StageState:
                 ctx.model,
                 ctx.tokenizer,
                 "all_dropped",
-                speaker_name=ctx.speaker_name,
                 speaker_id=ctx.speaker_id,
                 max_tokens=ctx.max_tokens,
                 plausibility_max_tokens=ctx.plausibility_max_tokens,
@@ -768,7 +886,15 @@ def anonymize_turn(
     1. ``extract_graph(validate=False)`` — local extraction only,
        produces a SessionGraph whose relations anchor the anonymizer
        (rendered to facts via :func:`~paramem.graph.schema.facts_from_relations`
-       — see step 2).
+       — see step 2).  An EMPTY relation set is a legitimate outcome, not
+       a failure: it is the ordinary shape of a non-personal question
+       ("What is the capital of France?"), and ``anonymize`` serves the
+       resulting ``facts=[]`` + transcript shape by contract — the same
+       signature, no flag, no branch.  The anonymizer LLM, not the
+       extractor's relation count, is the scope authority for what may
+       egress (``SECURITY.md``: single-model classification, no second
+       code-side detector); the anchor narrows its search, it does not
+       authorize the call.
     2. :func:`~paramem.cloud.anonymize.anonymize` — THE one anonymize
        chain, shared with every other cloud-egress path (identical to
        what the session flow's ``anonymize`` stage
@@ -804,8 +930,29 @@ def anonymize_turn(
     ephemeral graph's relations as provenance.  That graph exists only
     to anchor anonymization and is discarded immediately, so the value
     is never persisted.  Text-only ``/chat`` requests with no enrolled
-    speaker pass ``None``; the helper falls back to the
-    ``"cloud_egress"`` sentinel rather than failing extraction.
+    speaker pass ``None``; the helper falls back to the ``"cloud_egress"``
+    sentinel for THIS call only, so extraction's required, non-empty
+    ``speaker_id`` parameter is always satisfied.
+
+    That ``extract_graph`` fallback is deliberately NOT reused for the
+    anonymizer's own speaker-anchor slot.  The anonymizer's
+    ``{speaker_anchor_section}`` may only carry a value that satisfies
+    :func:`~paramem.utils.identity.is_speaker_id` — every other case (no
+    speaker, or an unrecognised/non-token-shaped id) renders anchor-less.
+    ``"cloud_egress"`` itself fails that test: it is a session label, not
+    a speaker id, so it would teach the local anonymizer model to fold
+    the caller's real name onto a token :func:`~paramem.cloud.placeholders.
+    _normalize_anonymization_mapping` then drops as neither
+    placeholder-shaped nor speaker-id-shaped — emptying the forward map
+    and letting the real name egress unscrubbed.  Anonymous-enrolled
+    speakers KEEP the anchor (owner ruling): a well-shaped
+    ``speaker_id`` is sufficient regardless of whether ``speaker_name``
+    resolves to a display name — their session facts and cloud payloads
+    stay in token space exactly like a named speaker's; what the reply
+    boundary later renders for that token is a separate concern from
+    this gate.  See :func:`~paramem.cloud.anonymize.anonymize`'s
+    ``speaker_id`` docstring for the render-time contract this gate
+    feeds (fold-onto-token anonymization).
 
     ``AnonymizedContract.status``:
 
@@ -817,12 +964,11 @@ def anonymize_turn(
       egress PROCEEDS.
     * ``"opted_out"`` — operator opted out (``scrub`` empty).
     * ``"failed"`` — block.  Every other early exit lands here:
-      empty/whitespace-only input, local extraction raising, zero
-      relations extracted (``not graph.relations``), the anonymizer
-      raising, an anonymizer parse failure, or the model's rewritten
-      transcript coming back empty after the marker strip.  Callers must
-      NEVER fall back to the original real-name transcript on this
-      status.
+      empty/whitespace-only input, local extraction raising, the
+      anonymizer raising, an anonymizer parse failure, or the model's
+      rewritten transcript coming back empty after the marker strip.
+      Callers must NEVER fall back to the original real-name transcript
+      on this status.
 
     The companion :func:`~paramem.cloud.deanonymize.deanonymize_text`
     is the caller's exit gate for the cloud's response text.
@@ -830,8 +976,8 @@ def anonymize_turn(
     # ``failure`` left unset (``None``) on this sentinel: it belongs to
     # ``anonymize``'s own "parse"/"guard" vocabulary (see
     # :class:`~paramem.cloud.anonymize.AnonymizedContract`), and none of
-    # this helper's own early exits below (extraction exception, zero
-    # relations, anonymizer exception) are that call's parse/guard
+    # this helper's own early exits below (empty input, extraction
+    # exception, anonymizer exception) are that call's parse/guard
     # distinction — they're this helper's own failure modes, and no
     # caller here branches on cause.
     _failed = AnonymizedContract(
@@ -916,12 +1062,23 @@ def anonymize_turn(
             logger.exception("Cloud egress: local extraction failed; treating as block")
             return _failed
 
-        if not graph.relations:
-            return _failed
-
         try:
             anon_prompt = _load_prompt("anonymization.txt", prompts_dir=prompts_dir, required=True)
             anon_system = _load_prompt("anonymization_system.txt", required=True)
+            anon_anchor_prompt = _load_prompt(
+                "anonymization_speaker_anchor.txt", prompts_dir=prompts_dir, required=True
+            )
+            # The anonymizer's speaker-anchor slot may only carry a value
+            # that satisfies is_speaker_id — every other case (no speaker,
+            # or an unrecognised/non-token-shaped id) renders anchor-less.
+            # Anonymous-enrolled speakers are full speakers and KEEP the
+            # anchor (owner ruling): their session facts and cloud
+            # payloads stay in token space exactly like named speakers;
+            # what the reply boundary renders for their token is a
+            # separate concern.  See this function's docstring for why
+            # the extract_graph call above keeps its own unconditional
+            # "cloud_egress" fallback while this one does not.
+            anchor_speaker_id = speaker_id if is_speaker_id(speaker_id) else None
             payload = anonymize(
                 facts_from_relations(graph.relations),
                 model,
@@ -929,6 +1086,8 @@ def anonymize_turn(
                 transcript=model_facing_transcript,
                 scrub=scrub,
                 speaker_name=speaker_name,
+                speaker_id=anchor_speaker_id,
+                speaker_anchor_template=anon_anchor_prompt,
                 token_envelope=_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
                 user_prompt_template=anon_prompt,
                 system_prompt=anon_system,

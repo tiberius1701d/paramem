@@ -311,7 +311,7 @@ consolidation:
                                     # in production conditions. Drop to 1 if VRAM
                                     # under training-residual pressure forces a
                                     # downgrade.
-  extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, cloud enrich, deanon; 8192 sized for ~934-word document chunks (paramem.graph.document_chunker._DOC_MAX_TOKENS, derived from the anonymize-call token envelope — see that constant's derivation comment)
+  extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, cloud enrich, deanon; 8192 sized for ~982-word document chunks (paramem.graph.document_chunker._DOC_MAX_TOKENS, derived from the anonymize-call token envelope — see that constant's derivation comment)
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   extraction_anonymize_token_envelope: 8192  # total (prompt + output) token budget one local anonymize() call may occupy; max_new_tokens is DERIVED (envelope - actual prompt tokens), never a second cap. 8192 is the sequence length vram.vram_cache_headroom_gib: 1.5 is booked against (see that key's comment below). This is a ceiling; each call additionally clamps to live free VRAM (paramem.utils.vram_guard.effective_token_envelope)
   extraction_token_estimate_ratio: 3.4  # fallback words->tokens ratio for paramem.utils.tokens.estimate_tokens when no live tokenizer is available (CLI document chunker; a raising in-process tokenizer). Measured once with the production tokenizer (Mistral 7B) over three payload shapes and shipped as their MAX so the fallback bounds rather than averages: transcript 1.44, document prose 1.91, compact fact-JSON 3.39 (MAX). Per-tokenizer — re-measure after a base-model swap; the boot-time drift check (paramem.utils.tokens.check_ratio_drift, run at server lifespan startup) warns via /status.attention when the live tokenizer's observed ratio exceeds this value
@@ -658,8 +658,13 @@ abstention:
   # paramem/server/config.py.
   response_file: configs/prompts/abstention_response.txt
   cold_start_response_file: configs/prompts/abstention_cold_start.txt
+  # Fired by the relay path (no speaker resolved at all) for a personal
+  # interrogative — distinct from cold_start_response (an identified but
+  # fresh speaker); see AbstentionConfig in paramem/server/config.py.
+  no_identity_response_file: configs/prompts/abstention_no_identity.txt
   # response_override: "..."             # uncomment to pin inline
   # cold_start_response_override: "..."  # uncomment to pin inline
+  # no_identity_response_override: "..."  # uncomment to pin inline
 
 # Intent classifier — residual classifier for routing decisions.  State
 # signals (graph match, HA match) decide cleanly when present; the

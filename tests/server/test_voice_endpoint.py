@@ -20,10 +20,10 @@ All heavy callables are mocked:
 - ``handle_chat``          — avoid needing a real LLM.
 
 Auth note: ``app_module.app`` has ``BearerTokenMiddleware`` wired at module-load
-time with the ``PARAMEM_API_TOKEN`` env token (empty in CI → auth OFF).  Tests
-that exercise the 404/503/400 gates do NOT need auth; the 401 test builds a
-separate minimal app with a known shared token (matching the pattern in
-``tests/server/test_auth_middleware.py``).
+time against ``_state["user_token_store"]`` — ``None`` in these tests (no store
+configured) means auth OFF.  Tests that exercise the 404/503/400 gates do NOT
+need auth; the 401 test builds a separate minimal app with a real
+``UserTokenStore`` (matching the pattern in ``tests/server/test_auth.py``).
 """
 
 from __future__ import annotations
@@ -165,6 +165,10 @@ def _make_state(
         "unknown_speakers": {},
         "pending_enrollments": set(),
         "user_token_store": None,
+        # Required by _run_chat_turn's relay leg (_notice_once) whenever
+        # serving is RELAY — which now includes local-mode requests with no
+        # resolved speaker, not just server-wide cloud-only mode.
+        "relay_notice_conversations": set(),
     }
 
 
@@ -183,21 +187,13 @@ def state(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def client(state):
-    """TestClient against app_module.app with auth headers auto-injected.
+    """TestClient against app_module.app.
 
-    ``app_module.app`` has BearerTokenMiddleware wired at module-load time
-    with the token read from ``.env`` / ``PARAMEM_API_TOKEN``.  When the env
-    token is non-empty the client must include it; when it is empty the
-    middleware is a pass-through.  We read ``app_module._api_token`` at
-    fixture construction time so the same test file works in both cases.
+    ``app_module.app`` has ``BearerTokenMiddleware`` wired at module-load
+    time against ``_state["user_token_store"]``.  ``state`` (this fixture's
+    dependency) sets ``user_token_store: None``, so auth is OFF and no
+    header is needed.
     """
-    token = getattr(app_module, "_api_token", "")
-    if token:
-        return TestClient(
-            app_module.app,
-            raise_server_exceptions=True,
-            headers={"Authorization": f"Bearer {token}"},
-        )
     return TestClient(app_module.app, raise_server_exceptions=True)
 
 
@@ -218,22 +214,47 @@ def _post_voice(
     return client.post("/voice", content=audio, headers=_headers)
 
 
+def _resolved_speaker_patch(speaker_id: str = "speaker0", speaker: str = "Alex"):
+    """Patch ``_resolve_and_enroll_speaker`` to return a resolved
+    (``serving=PERSONAL``) speaker.
+
+    Several ``/voice`` tests are about LOCAL-mode dispatch specifics
+    (training abort, TTS synthesis) that require ``handle_chat`` to be
+    reached — which now only happens for a resolved speaker (a speakerless
+    caller is served by the relay path instead, see
+    ``test_voice_relay_route``).  The default ``state``/``client`` fixtures
+    carry no speaker_store and the mocked STT result carries no embedding,
+    so nothing resolves a speaker without this patch.
+    """
+    from paramem.server.app import ResolvedSpeaker
+
+    return patch(
+        "paramem.server.app._resolve_and_enroll_speaker",
+        new=AsyncMock(
+            return_value=ResolvedSpeaker(
+                speaker_id=speaker_id,
+                speaker=speaker,
+                follow_up=None,
+                greeting_prefix=None,
+                effective_language="en",
+            )
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests: gating
 # ---------------------------------------------------------------------------
 
 
 def _authed_client(monkeypatch, tmp_path, pwa_enabled=True, stt_loaded=True):
-    """Helper: build a TestClient against app_module.app with auto-injected auth."""
+    """Helper: build a TestClient against app_module.app.
+
+    Auth is OFF: ``_make_state`` sets ``user_token_store: None`` and no
+    header is needed.
+    """
     fresh = _make_state(tmp_path, pwa_enabled=pwa_enabled, stt_loaded=stt_loaded)
     monkeypatch.setattr(app_module, "_state", fresh)
-    token = getattr(app_module, "_api_token", "")
-    if token:
-        return TestClient(
-            app_module.app,
-            raise_server_exceptions=True,
-            headers={"Authorization": f"Bearer {token}"},
-        ), fresh
     return TestClient(app_module.app, raise_server_exceptions=True), fresh
 
 
@@ -260,15 +281,19 @@ def test_voice_503_when_stt_none(tmp_path, monkeypatch):
     assert resp.status_code == 503
 
 
-def test_voice_401_without_token():
+def test_voice_401_without_token(tmp_path):
     """/voice returns 401 when a bearer token is required but not sent.
 
-    Uses a minimal app with BearerTokenMiddleware wired with a known shared
-    token — same pattern as test_auth_middleware.py — rather than trying to
-    mutate the module-level middleware instance in app_module.app.
+    Uses a minimal app with BearerTokenMiddleware wired against a real
+    UserTokenStore with an active token — same pattern as test_auth.py —
+    rather than trying to mutate the module-level middleware instance in
+    app_module.app.
     """
+    store = UserTokenStore(tmp_path / "user_tokens.json")
+    store.mint("speaker0", "Device", scope="chat")
+
     mini = FastAPI()
-    mini.add_middleware(BearerTokenMiddleware, token="secret-voice-test")
+    mini.add_middleware(BearerTokenMiddleware, user_token_getter=lambda: store)
 
     @mini.post("/voice")
     async def _stub_voice(req: Request) -> dict:
@@ -294,6 +319,7 @@ def test_voice_happy_path(client, state):
     fake_chat.escalated = False
 
     with (
+        _resolved_speaker_patch(),
         patch(
             "paramem.server.app._decode_audio_to_pcm",
             return_value=fake_pcm,
@@ -409,13 +435,12 @@ def test_voice_413_when_body_exceeds_cap_no_header(client, state, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_voice_cloud_only_route(tmp_path, monkeypatch):
-    """POST /voice in cloud-only mode routes through _cloud_only_route."""
+def test_voice_relay_route(tmp_path, monkeypatch):
+    """POST /voice in cloud-only mode routes through _relay_route."""
     fresh = _make_state(tmp_path, mode="cloud-only")
     monkeypatch.setattr(app_module, "_state", fresh)
 
-    token = getattr(app_module, "_api_token", "")
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = {}
 
     fake_pcm = b"\x00\x00" * 800
     fake_result = UtteranceResult(text="turn off the lights", language="en")
@@ -426,7 +451,7 @@ def test_voice_cloud_only_route(tmp_path, monkeypatch):
     with (
         patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm),
         patch("paramem.server.app.process_utterance", new=AsyncMock(return_value=fake_result)),
-        patch("paramem.server.app._cloud_only_route", return_value=fake_cloud_result) as mock_cloud,
+        patch("paramem.server.app._relay_route", return_value=fake_cloud_result) as mock_cloud,
         patch("paramem.server.app.handle_chat") as mock_local,
     ):
         from fastapi.testclient import TestClient
@@ -445,7 +470,10 @@ def test_voice_cloud_only_route(tmp_path, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["transcript"] == "turn off the lights"
-    assert body["reply"] == "Lights turned off."
+    # No speaker resolves for this call (no store, no embedding match) —
+    # serving is RELAY, so the once-per-conversation speakerless notice
+    # prepends the answer, same mechanism as the degraded-serving notice.
+    assert body["reply"] == f"{app_module._SPEAKERLESS_RELAY_NOTICE}Lights turned off."
     mock_cloud.assert_called_once()
     mock_local.assert_not_called()
 
@@ -469,6 +497,7 @@ def test_voice_aborts_training_before_inference(client, state):
     state["background_trainer"] = bg_trainer
 
     with (
+        _resolved_speaker_patch(),
         patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm),
         patch("paramem.server.app.process_utterance", new=AsyncMock(return_value=fake_result)),
         patch("paramem.server.app.handle_chat", return_value=fake_chat),
@@ -493,6 +522,7 @@ def test_voice_forces_trainer_stop_when_abort_times_out(client, state):
     state["background_trainer"] = bg_trainer
 
     with (
+        _resolved_speaker_patch(),
         patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm),
         patch("paramem.server.app.process_utterance", new=AsyncMock(return_value=fake_result)),
         patch("paramem.server.app.handle_chat", return_value=fake_chat),
@@ -538,12 +568,12 @@ def _is_valid_wav(wav_bytes: bytes) -> bool:
 def test_voice_tts_happy_path(client, state):
     """tts_manager.synthesize returns PCM → audio field is base64 WAV, format="wav".
 
-    High-confidence language probability (0.95 > threshold 0.85) ensures
-    effective_language resolves to "en" and is forwarded to TTS.
+    Speaker resolution is stubbed to PERSONAL (a resolved speaker_id is now
+    required to reach ``handle_chat``/the local dispatch this test targets
+    — a speakerless caller is served by the relay path instead) with
+    ``effective_language="en"`` forwarded to TTS.
     """
     fake_pcm_input = b"\x00\x00" * 800
-    # High probability so effective_language resolves to "en" via the
-    # language_confidence_threshold path in _resolve_and_enroll_speaker.
     fake_result = UtteranceResult(text="hello", language="en", language_probability=0.95)
     fake_chat = MagicMock()
     fake_chat.text = "Hi there."
@@ -555,6 +585,7 @@ def test_voice_tts_happy_path(client, state):
     state["tts_manager"] = tts_mgr
 
     with (
+        _resolved_speaker_patch(),
         patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm_input),
         patch("paramem.server.app.process_utterance", new=AsyncMock(return_value=fake_result)),
         patch("paramem.server.app.handle_chat", return_value=fake_chat),
@@ -583,11 +614,10 @@ def test_voice_tts_unavailable_returns_text_only(tmp_path, monkeypatch):
     fresh["tts_manager"] = None
     monkeypatch.setattr(app_module, "_state", fresh)
 
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     fake_pcm = b"\x00\x00" * 800
@@ -597,6 +627,7 @@ def test_voice_tts_unavailable_returns_text_only(tmp_path, monkeypatch):
     fake_chat.escalated = False
 
     with (
+        _resolved_speaker_patch(),
         patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm),
         patch("paramem.server.app.process_utterance", new=AsyncMock(return_value=fake_result)),
         patch("paramem.server.app.handle_chat", return_value=fake_chat),
@@ -625,6 +656,7 @@ def test_voice_tts_raises_returns_text_only(client, state):
     state["tts_manager"] = tts_mgr
 
     with (
+        _resolved_speaker_patch(),
         patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm),
         patch("paramem.server.app.process_utterance", new=AsyncMock(return_value=fake_result)),
         patch("paramem.server.app.handle_chat", return_value=fake_chat),
@@ -698,7 +730,6 @@ def test_voice_personal_token_skips_embedding(tmp_path, monkeypatch):
     resolved = ResolvedSpeaker(
         speaker_id="speaker0",
         speaker="Alice",
-        display_speaker="Alice",
         follow_up=None,
         greeting_prefix=None,
         effective_language="en",
@@ -748,11 +779,10 @@ def test_voice_shared_token_computes_embedding(tmp_path, monkeypatch):
     )
     fresh = _make_state(tmp_path, speaker_store=store)
     monkeypatch.setattr(app_module, "_state", fresh)
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     fake_pcm = b"\x00\x00" * 800
@@ -803,11 +833,10 @@ def test_voice_shared_token_unknown_voice_enrolls(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_state", fresh)
     fresh["config"].speaker.enrollment_prompt = "What's your name?"
     fresh["config"].speaker.enrollment_reprompt_interval = 3600
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     fake_pcm = b"\x00\x00" * 800
@@ -861,11 +890,10 @@ def test_voice_name_disclosure_binds(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_state", fresh)
     fresh["config"].speaker.enrollment_prompt = "What's your name?"
     fresh["config"].speaker.enrollment_reprompt_interval = 3600
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     fake_pcm = b"\x00\x00" * 800
@@ -907,6 +935,51 @@ def test_voice_name_disclosure_binds(tmp_path, monkeypatch):
     assert body.get("follow_up") is None
 
 
+def test_run_enrollment_turns_chronological_order(tmp_path, monkeypatch):
+    """Regression: prior session turns come BEFORE the live turn.
+
+    ``all_turns`` previously prepended ``extra_turns`` (the live turn) ahead
+    of ``buffer.get_session_turns()``'s output, inverting chronological order
+    for the LLM name-extractor.  Pins: buffer turns first, the live turn
+    last.
+    """
+    import asyncio
+
+    fresh = _make_state(tmp_path)
+    fresh["speaker_store"] = MagicMock()
+    fresh["model"] = MagicMock()
+    fresh["tokenizer"] = MagicMock()
+    buffer = MagicMock()
+    prior_turns = [
+        {"role": "user", "text": "Hi there"},
+        {"role": "assistant", "text": "Hello! How can I help?"},
+    ]
+    buffer.get_session_turns.return_value = list(prior_turns)
+    fresh["session_buffer"] = buffer
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    captured = {}
+
+    def fake_extract(turns, model, tokenizer):
+        captured["turns"] = list(turns)
+        return None, "raw"
+
+    monkeypatch.setattr(app_module, "extract_name_via_llm", fake_extract)
+
+    live_turn = {"role": "user", "text": "My name is Priya"}
+    result = asyncio.run(
+        app_module._run_enrollment_for_speaker(
+            "speaker3",
+            "conv-order-test",
+            [0.1, 0.2],
+            extra_turns=[live_turn],
+        )
+    )
+
+    assert result is None  # extractor returned None → no side effects
+    assert captured["turns"] == prior_turns + [live_turn]
+
+
 def test_voice_shared_token_fresh_conversation_id(tmp_path, monkeypatch):
     """Two shared-token /voice requests get distinct conversation_ids.
 
@@ -916,11 +989,10 @@ def test_voice_shared_token_fresh_conversation_id(tmp_path, monkeypatch):
     """
     fresh = _make_state(tmp_path)
     monkeypatch.setattr(app_module, "_state", fresh)
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     fake_pcm = b"\x00\x00" * 800
@@ -974,11 +1046,10 @@ def test_voice_shared_token_resolved_speaker_does_not_leak_open_entries(tmp_path
     fresh = _make_state(tmp_path, speaker_store=store)
     monkeypatch.setattr(app_module, "_state", fresh)
     buffer: SessionBuffer = fresh["session_buffer"]
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     fake_chat_result = MagicMock()
@@ -1014,25 +1085,32 @@ def test_voice_shared_token_resolved_speaker_does_not_leak_open_entries(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Tests: /chat speaker vs display_speaker distinction
+# Tests: /chat speaker vs ServingPath distinction
 # ---------------------------------------------------------------------------
 
 
-def test_chat_anonymous_speaker_raw_vs_display(tmp_path, monkeypatch):
-    """POST /chat for an anonymous speaker: raw name in ChatResponse, display_speaker=None.
+def test_chat_anonymous_speaker_raw_id_and_personal_serving(tmp_path, monkeypatch):
+    """POST /chat for an anonymous-promoted speaker: raw canonical id in
+    ChatResponse, and the resolved ``speaker_id`` reaches ``_run_chat_turn``
+    unchanged (a speaker_id resolved, even though the display name has not
+    been disclosed yet, is full speaker treatment — ``_run_chat_turn``
+    derives ``ServingPath.PERSONAL`` from it via ``ServingPath.for_speaker``,
+    see ``TestRunChatTurnServingFork`` for that derivation's own coverage).
 
-    Locks the invariant that ChatResponse.speaker carries the raw canonical
-    Speaker{N} label while _run_chat_turn receives display_speaker=None so the
-    robotic label is suppressed from the system prompt until disclosure.
+    Re-spec: the former ``display_speaker`` suppression is gone.  An
+    anonymous-promoted speaker still has a resolved speaker_id, so this is
+    full speaker treatment (B). Suppression of the raw token from
+    HUMAN-facing text is now the reply-boundary resolver's job
+    (``resolve_speaker_tokens``), not a pre-emptive None field threaded
+    through the whole call chain.
     """
     from paramem.server.app import ResolvedSpeaker
 
     # An anonymous speaker: store.is_anonymous returns True, speaker is the
-    # canonical "speaker3" ID, display_speaker is suppressed (None).
+    # canonical "speaker3" ID (the store's convention pre-disclosure).
     anon_resolved = ResolvedSpeaker(
         speaker_id="speaker3",
         speaker="speaker3",
-        display_speaker=None,  # suppressed until disclosure
         follow_up="What's your name?",
         greeting_prefix=None,
         effective_language=None,
@@ -1048,11 +1126,10 @@ def test_chat_anonymous_speaker_raw_vs_display(tmp_path, monkeypatch):
     fresh["config"].text_lang_detection.enabled = False
     monkeypatch.setattr(app_module, "_state", fresh)
 
-    token = getattr(app_module, "_api_token", "")
     tc = TestClient(
         app_module.app,
         raise_server_exceptions=True,
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={},
     )
 
     mock_run_turn = AsyncMock(return_value=(fake_chat_result, "Hello."))
@@ -1073,9 +1150,134 @@ def test_chat_anonymous_speaker_raw_vs_display(tmp_path, monkeypatch):
     body = resp.json()
     # Raw canonical ID propagates to ChatResponse.speaker (attribution)
     assert body["speaker"] == "speaker3"
-    # _run_chat_turn must receive display_speaker=None (suppression intact)
+    # _run_chat_turn must receive the resolved speaker_id (even undisclosed)
+    # unchanged — it derives ServingPath.PERSONAL from it internally, not a
+    # relay turn.
     call_kwargs = mock_run_turn.call_args.kwargs
-    assert call_kwargs["display_speaker"] is None
+    assert call_kwargs["speaker_id"] == "speaker3"
+
+
+# ---------------------------------------------------------------------------
+# Tests: ChatRequest.history retirement — legacy key accepted and ignored
+# ---------------------------------------------------------------------------
+
+
+def test_chat_legacy_history_key_accepted_and_ignored(tmp_path, monkeypatch):
+    """A /chat body carrying a legacy ``history`` key (old HA client, or any
+    caller unaware of the field's retirement) is accepted — Pydantic's
+    ``extra="ignore"`` model default silently drops it — and the turn is
+    served normally rather than rejected with a 422.
+
+    Uses a resolved speaker (derives ``ServingPath.PERSONAL`` inside
+    ``_run_chat_turn``) so the turn reaches ``handle_chat`` — this test is
+    about the legacy body field being dropped, not about the speakerless
+    relay fork (covered separately)."""
+    from paramem.server.app import ResolvedSpeaker
+
+    resolved = ResolvedSpeaker(
+        speaker_id="speaker0",
+        speaker="Alex",
+        follow_up=None,
+        greeting_prefix=None,
+        effective_language=None,
+    )
+    fake_chat_result = MagicMock()
+    fake_chat_result.text = "OK."
+    fake_chat_result.escalated = False
+
+    fresh = _make_state(tmp_path)
+    fresh["config"].text_lang_detection.enabled = False
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    tc = TestClient(
+        app_module.app,
+        raise_server_exceptions=True,
+        headers={},
+    )
+
+    with (
+        patch(
+            "paramem.server.app._resolve_and_enroll_speaker",
+            new=AsyncMock(return_value=resolved),
+        ),
+        patch("paramem.server.app.handle_chat", return_value=fake_chat_result) as mock_handle_chat,
+    ):
+        resp = tc.post(
+            "/chat",
+            json={
+                "text": "hi",
+                "conversation_id": "legacy-history-conv",
+                "history": [{"role": "user", "text": "an old client would have sent this"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["text"] == "OK."
+    # Discriminating assertion: history threaded to handle_chat comes from
+    # SessionBuffer.get_session_turns (empty for a brand-new conversation
+    # id), never from the legacy request body — the dropped field's content
+    # must never reach the dispatcher.
+    mock_handle_chat.assert_called_once()
+    call_kwargs = mock_handle_chat.call_args.kwargs
+    assert call_kwargs["history"] == []
+    assert "an old client would have sent this" not in str(call_kwargs["history"])
+
+
+# ---------------------------------------------------------------------------
+# Tests: persist-before-resolve — token-space persist, resolved reply
+# ---------------------------------------------------------------------------
+
+
+def test_persist_before_resolve_reply_boundary(tmp_path, monkeypatch):
+    """Order is load-bearing: the persisted assistant turn keeps the raw
+    ``speaker{N}`` token (token-space, as generated); only the text returned
+    to the caller has it resolved to a display name.  Resolution happens
+    strictly after ``SessionBuffer.append``, never before."""
+    from paramem.server.app import ResolvedSpeaker
+
+    store = _make_speaker_store(known_ids={"speaker0": "Alice"}, is_anonymous=False)
+    fresh = _make_state(tmp_path, speaker_store=store)
+    fresh["config"].text_lang_detection.enabled = False
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    resolved = ResolvedSpeaker(
+        speaker_id="speaker0",
+        speaker="Alice",
+        follow_up=None,
+        greeting_prefix=None,
+        effective_language=None,
+    )
+    fake_chat_result = MagicMock()
+    fake_chat_result.text = "speaker0 likes hiking."
+    fake_chat_result.escalated = False
+
+    tc = TestClient(
+        app_module.app,
+        raise_server_exceptions=True,
+        headers={},
+    )
+
+    with (
+        patch(
+            "paramem.server.app._resolve_and_enroll_speaker",
+            new=AsyncMock(return_value=resolved),
+        ),
+        patch("paramem.server.app.handle_chat", return_value=fake_chat_result),
+    ):
+        resp = tc.post(
+            "/chat",
+            json={"text": "what do I like", "conversation_id": "persist-test-conv"},
+        )
+
+    assert resp.status_code == 200
+    # Reply boundary: the display name, not the token, reaches the caller.
+    assert resp.json()["text"] == "Alice likes hiking."
+
+    # Persisted turn: token-space, unresolved — the buffer never sees the name.
+    turns = fresh["session_buffer"].get_session_turns("persist-test-conv")
+    assistant_turns = [t for t in turns if t["role"] == "assistant"]
+    assert len(assistant_turns) == 1
+    assert assistant_turns[0]["text"] == "speaker0 likes hiking."
 
 
 # ---------------------------------------------------------------------------
@@ -1199,3 +1401,120 @@ class TestResolvedSpeakerSeam:
 
         assert result.speaker == "Alex"
         assert result.follow_up is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: /debug/probe — reply-boundary resolve on both exits
+# ---------------------------------------------------------------------------
+
+
+def test_debug_probe_cloud_only_exit_resolves_speaker_tokens(tmp_path, monkeypatch):
+    """Cloud-only branch of ``debug_probe`` (app.py, the
+    ``resolve_speaker_tokens(cloud_result.text, store)`` call): the funnel's
+    raw answer is resolved to a display name before the response is built —
+    same reply-boundary contract as every other exit, previously untested
+    for this endpoint."""
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = _make_speaker_store(
+        known_ids={"speaker0": "Alex", "speaker1": "Bob"}, is_anonymous=False
+    )
+    fresh = _make_state(tmp_path, speaker_store=store, mode="cloud-only")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    fresh["config"].cloud.allow_degraded_serving = False
+    fresh["cloud_only_reason"] = None
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    with patch.object(
+        app_module,
+        "_relay_route",
+        return_value=MagicMock(text="speaker1 asked that too.", escalated=True),
+    ):
+        resp = asyncio.run(
+            app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0"))
+        )
+
+    assert resp.text == "Bob asked that too."
+
+
+def test_debug_probe_local_mode_exit_resolves_speaker_tokens(tmp_path, monkeypatch):
+    """Local-mode branch of ``debug_probe`` (app.py, the
+    ``resolve_speaker_tokens(result.text, store)`` call): ``handle_chat``'s
+    raw answer is resolved to a display name before the response is built."""
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = _make_speaker_store(
+        known_ids={"speaker0": "Alex", "speaker1": "Bob"}, is_anonymous=False
+    )
+    fresh = _make_state(tmp_path, speaker_store=store, mode="local")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    fake_result = MagicMock()
+    fake_result.text = "speaker1 asked that too."
+    fake_result.escalated = False
+
+    with patch("paramem.server.app.handle_chat", return_value=fake_result):
+        resp = asyncio.run(
+            app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker0"))
+        )
+
+    assert resp.text == "Bob asked that too."
+
+
+def test_debug_probe_anonymous_speaker_display_name_stays_none(tmp_path, monkeypatch):
+    """An anonymous-enrolled profile's ``get_name`` returns the RAW
+    ``speaker{N}`` token (proving the id exists) while
+    ``resolve_speaker_name`` returns ``None`` (anonymous suppression —
+    ``SpeakerStore.resolve_speaker_name``'s documented contract).
+    ``debug_probe`` must thread ``resolve_speaker_name``'s display name
+    (``None`` pre-disclosure) as the ``speaker=`` argument to
+    ``handle_chat`` and the response's ``speaker`` field — never
+    ``get_name``'s raw token, which exists only for the 404 existence
+    check.
+
+    Re-spec note: the local system-prompt identity line
+    (:func:`~paramem.server.inference._build_system_prompt`) no longer
+    gates on ``speaker`` at all — it is driven by ``speaker_id`` presence
+    directly (B-form prefix, anonymous included), so this test is scoped
+    to the ``speaker=`` display-name plumbing only, not to whether an
+    identity line is emitted.
+    """
+    import asyncio
+
+    from paramem.server.app import DebugProbeRequest
+
+    store = MagicMock()
+    store.get_name.side_effect = lambda sid: sid if sid == "speaker3" else None
+    store.resolve_speaker_name.side_effect = lambda sid: None
+    fresh = _make_state(tmp_path, speaker_store=store, mode="local")
+    fresh["config"].debug = True
+    fresh["config"].text_lang_detection.enabled = False
+    monkeypatch.setattr(app_module, "_state", fresh)
+
+    fake_result = MagicMock()
+    fake_result.text = "hi there"
+    fake_result.escalated = False
+
+    captured = {}
+
+    def fake_handle_chat(**kwargs):
+        captured["speaker"] = kwargs.get("speaker")
+        return fake_result
+
+    with patch("paramem.server.app.handle_chat", side_effect=fake_handle_chat):
+        resp = asyncio.run(
+            app_module.debug_probe(DebugProbeRequest(text="hi", speaker_id="speaker3"))
+        )
+
+    assert captured["speaker"] is None, (
+        "debug_probe must thread resolve_speaker_name's anonymous-suppressed "
+        "None into handle_chat's speaker= argument, never get_name's raw token"
+    )
+    assert resp.speaker is None

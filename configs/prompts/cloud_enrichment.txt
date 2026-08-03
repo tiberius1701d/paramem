@@ -17,15 +17,15 @@ POSITIVE — transcript: `"...Person_1 led the agile transformation initiative a
 → add: `[{{"subject": "Person_1", "predicate": "led", "object": "{{Event_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}]`
 → bindings: `{{"Event_1": "the agile transformation initiative"}}`
 
-POSITIVE (role-instance — bind co-temporal attributes to ONE entity, not flat triples on speaker0) — transcript: `"...I was Senior Engineer at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
-→ add: `[{{"subject": "speaker0", "predicate": "held_role", "object": "{{Role_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "at_company", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "in_location", "object": "City_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "start_date", "object": "Jan 2014", "relation_type": "temporal", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "end_date", "object": "Sep 2017", "relation_type": "temporal", "confidence": 0.9}}]`
+POSITIVE (role-instance — bind co-temporal attributes to ONE entity, not flat triples on {speaker_id}) — transcript: `"...I was Senior Engineer at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
+→ add: `[{{"subject": "{speaker_id}", "predicate": "held_role", "object": "{{Role_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "at_company", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "in_location", "object": "City_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "start_date", "object": "Jan 2014", "relation_type": "temporal", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "end_date", "object": "Sep 2017", "relation_type": "temporal", "confidence": 0.9}}]`
 → bindings: `{{"Role_1": "Senior Engineer"}}`
 
 NEGATIVE — same transcript:
 - WRONG: `add: [{{"subject":"Person_1","predicate":"led","object":"Project_1",...}}]` — bare `Project_1` looks like an anonymizer placeholder but isn't in the input mapping → this fact alone is silently dropped, never reaching memory.
 - WRONG: `add: [{{"subject":"Person_1","predicate":"led","object":"{{Event_1}}",...}}]` with `Event_1` missing from `bindings` → no binding to substitute → this fact alone is dropped.
 - WRONG: `bindings: {{"{{Event_1}}": "..."}}` — key includes braces → lookup misses → every fact naming `Event_1` is dropped (a `modify` reverts to its pre-enrichment original instead).
-- WRONG (role flattened onto speaker0): `add: [{{"subject":"speaker0","predicate":"held_role","object":"Senior Engineer",...}}, {{"subject":"speaker0","predicate":"worked_at","object":"Org_1",...}}, {{"subject":"speaker0","predicate":"start_date","object":"Jan 2014",...}}, {{"subject":"speaker0","predicate":"end_date","object":"Sep 2017",...}}]` — co-temporal attributes orphan from the role. With multiple roles in one transcript the dates cannot be paired back to a title; downstream reasoning over "what title did speaker0 hold in 2015?" fails.
+- WRONG (role flattened onto {speaker_id}): `add: [{{"subject":"{speaker_id}","predicate":"held_role","object":"Senior Engineer",...}}, {{"subject":"{speaker_id}","predicate":"worked_at","object":"Org_1",...}}, {{"subject":"{speaker_id}","predicate":"start_date","object":"Jan 2014",...}}, {{"subject":"{speaker_id}","predicate":"end_date","object":"Sep 2017",...}}]` — co-temporal attributes orphan from the role. With multiple roles in one transcript the dates cannot be paired back to a title; downstream reasoning over "what title did {speaker_id} hold in 2015?" fails.
 
 Existing bare anonymizer placeholders (`Person_1`, `City_1`, `Org_1`, etc.) stay bare. Do NOT re-brace them. Leave them exactly as the extractor emitted them.
 
@@ -34,31 +34,31 @@ Before returning: every `{{Prefix_N}}` you wrote in `add`/`modify` MUST have a m
 
 ## Speaker identity
 
-`speaker0` is the `[user]` of the transcript below — the anonymizer's own already-anonymous handle for the person talking, not a placeholder you assign. Never replace it with a `Person_N`, never re-brace it, never mint a new placeholder for it. `"I"` / `"me"` / `"my"` in the transcript always resolve to `speaker0`, in every session, regardless of who else in that same session happens to be `Person_1`.
+`{speaker_id}` is filled in below with THIS session's own speaker anchor (e.g. `speaker0` for one household member, `speaker1` for another — whichever one is the `[user]` of the transcript you were sent this time). It is the `[user]` of the transcript below — the anonymizer's own already-anonymous handle for the person talking, not a placeholder you assign. Never replace it with a `Person_N`, never re-brace it, never mint a new placeholder for it. `"I"` / `"me"` / `"my"` in the transcript always resolve to `{speaker_id}`, in every session, regardless of who else in that same session happens to be `Person_1`.
 
 
 ## Coreference resolution
 
 Few-shot — "my wife is also a teacher"
-→ add: `[{{"subject":"speaker0","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_1}}","predicate":"profession","object":"teacher","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
+→ add: `[{{"subject":"{speaker_id}","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_1}}","predicate":"profession","object":"teacher","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
 → bindings: `{{"Person_1": "my wife"}}`
 
-Few-shot — "we went there last summer" (context: speaker0 + Person_1 + Location_1 — `Person_1` here is already an anonymizer placeholder for a named third party, not something you mint)
-→ add: `[{{"subject":"speaker0","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}, {{"subject":"Person_1","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}]`.
+Few-shot — "we went there last summer" (context: {speaker_id} + Person_1 + Location_1 — `Person_1` here is already an anonymizer placeholder for a named third party, not something you mint)
+→ add: `[{{"subject":"{speaker_id}","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}, {{"subject":"Person_1","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}]`.
 
 Few-shot — "my sister's husband"
-→ add: `[{{"subject":"speaker0","predicate":"sister_of","object":"{{Person_2}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_2}}","predicate":"married_to","object":"{{Person_3}}","relation_type":"social","confidence":0.9,"symmetric":true}}]`
+→ add: `[{{"subject":"{speaker_id}","predicate":"sister_of","object":"{{Person_2}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_2}}","predicate":"married_to","object":"{{Person_3}}","relation_type":"social","confidence":0.9,"symmetric":true}}]`
 → bindings: `{{"Person_2": "my sister", "Person_3": "my sister's husband"}}`
 
 Few-shot — "my father is also an engineer" (descriptor, no name given — a binding span may be a descriptor, not only a name)
-→ add: `[{{"subject":"speaker0","predicate":"child_of","object":"{{Person_4}}","relation_type":"social","confidence":0.9,"symmetric":false}}, {{"subject":"{{Person_4}}","predicate":"profession","object":"engineer","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
+→ add: `[{{"subject":"{speaker_id}","predicate":"child_of","object":"{{Person_4}}","relation_type":"social","confidence":0.9,"symmetric":false}}, {{"subject":"{{Person_4}}","predicate":"profession","object":"engineer","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
 → bindings: `{{"Person_4": "my father"}}`
 
 
 ## Compound fact splitting
 
-Few-shot — input: `[3] {{"subject":"speaker0","predicate":"likes","object":"hiking and cooking"}}`
-→ drop: `[3]`, add: `[{{"subject":"speaker0","predicate":"likes","object":"hiking",...,"symmetric":false}}, {{"subject":"speaker0","predicate":"likes","object":"cooking",...,"symmetric":false}}]`.
+Few-shot — input: `[3] {{"subject":"{speaker_id}","predicate":"likes","object":"hiking and cooking"}}`
+→ drop: `[3]`, add: `[{{"subject":"{speaker_id}","predicate":"likes","object":"hiking",...,"symmetric":false}}, {{"subject":"{speaker_id}","predicate":"likes","object":"cooking",...,"symmetric":false}}]`.
 
 Few-shot — input: `[5] {{"subject":"Person_1","predicate":"grew_up_in","object":"City_1 and studied in City_2"}}`
 → drop: `[5]`, add: `[{{"subject":"Person_1","predicate":"grew_up_in","object":"City_1",...,"symmetric":false}}, {{"subject":"Person_1","predicate":"studied_at","object":"City_2",...,"symmetric":false}}]`.
@@ -113,6 +113,6 @@ Confidence: 0.9 for coreference-resolved facts, 0.8 for inferred facts. Do not e
 
 Example clean input where you have nothing to do: `{{}}`
 Example with one synonym dedup: `{{"drop": [7]}}`
-Example with coreference resolution and a new entity: `{{"add": [{{"subject":"speaker0","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"speaker0","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9,"symmetric":false}}], "bindings": {{"Person_1": "my wife", "Event_1": "the agile transformation initiative"}}}}`
+Example with coreference resolution and a new entity: `{{"add": [{{"subject":"{speaker_id}","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{speaker_id}","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9,"symmetric":false}}], "bindings": {{"Person_1": "my wife", "Event_1": "the agile transformation initiative"}}}}`
 
 Do NOT wrap the output in backticks, code fences, or any other prose.

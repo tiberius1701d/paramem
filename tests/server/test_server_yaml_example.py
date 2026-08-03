@@ -288,12 +288,17 @@ def test_voice_prompt_loads(example_config):
 
 
 def test_abstention_messages_load(example_config):
-    """Both abstention prompt files referenced by the example must exist and be non-empty."""
+    """All three abstention prompt files referenced by the example must exist and be non-empty."""
     response = example_config.abstention.load_response()
     cold = example_config.abstention.load_cold_start_response()
+    no_identity = example_config.abstention.load_no_identity_response()
     assert response, "abstention.load_response() empty — check abstention_response.txt"
     assert cold, "abstention.load_cold_start_response() empty — check abstention_cold_start.txt"
+    assert no_identity, (
+        "abstention.load_no_identity_response() empty — check abstention_no_identity.txt"
+    )
     assert response != cold, "cold-start and standard abstention messages should differ"
+    assert response != no_identity, "no-identity and standard abstention messages should differ"
 
 
 def test_intent_exemplars_dir_populated(example_config):

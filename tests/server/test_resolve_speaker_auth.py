@@ -208,3 +208,39 @@ class TestNoAuthSpeakerIdFallthrough:
 
         assert sid is None
         assert name is None
+
+
+# ---------------------------------------------------------------------------
+# ServingPath — the typed boundary decision derived from _resolve_speaker's
+# tokenless terminal (speaker_id=None) and its resolved counterpart
+# ---------------------------------------------------------------------------
+
+
+class TestServingPathFromResolvedSpeaker:
+    def test_tokenless_terminal_yields_relay(self):
+        """A tokenless _resolve_speaker terminal (None, None) — no auth
+        token, no voice match, no session — derives ServingPath.RELAY."""
+        from paramem.server.app import ServingPath
+
+        store = _make_store()
+        buf = _make_buffer(speaker_id=None, speaker_name=None)
+        req = _make_request(embedding=None)
+
+        sid, _name = _resolve_speaker(req, buf, store, auth_speaker_id=None)
+
+        assert sid is None
+        assert ServingPath.for_speaker(sid) is ServingPath.RELAY
+
+    def test_resolved_speaker_yields_personal(self):
+        """Any resolved speaker_id — attributed token, voice match, or
+        session continuity — derives ServingPath.PERSONAL."""
+        from paramem.server.app import ServingPath
+
+        store = _make_store({"speaker0": "Mara"})
+        buf = _make_buffer()
+        req = _make_request()
+
+        sid, _name = _resolve_speaker(req, buf, store, auth_speaker_id="speaker0")
+
+        assert sid == "speaker0"
+        assert ServingPath.for_speaker(sid) is ServingPath.PERSONAL

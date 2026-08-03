@@ -972,13 +972,13 @@ class TestCloudModePolicy:
         sent = cloud_agent.call.call_args.kwargs["query"]
         assert sent == "What's the population of Berlin?"
 
-    def test_block_mode_general_query_threads_speaker_id_to_history_sanitizer(self):
-        """The ``cloud_mode=block`` + non-PERSONAL branch of
-        ``answer_via_cloud`` must pass ``speaker_id`` through to
-        ``_sanitize_history`` — without it the first-person detector is dead
-        on this channel, unlike the other three ``_sanitize_history`` call
-        sites (the anonymizing branch here, and both ``app.py`` sites).
-        """
+    def test_block_mode_general_query_calls_history_sanitizer(self):
+        """Re-spec (speaker-present contract): ``_sanitize_history`` is
+        content-only now — it takes no ``speaker_id`` (the parameter was
+        removed along with ``is_self_referential``'s null-target gate; see
+        ``paramem.server.inference._sanitize_history``).  The ``cloud_mode=
+        block`` + non-PERSONAL branch of ``answer_via_cloud`` still calls it
+        with the history, just without threading a speaker_id kwarg through."""
         cloud_agent = self._make_cloud_agent()
         cloud_agent.call.return_value = CloudResponse(text="Berlin has 3.7M people.")
         with patch("paramem.server.inference._sanitize_history", return_value=[]) as mock_sanitize:
@@ -989,7 +989,8 @@ class TestCloudModePolicy:
                 history=[{"role": "user", "text": "hi"}],
             )
         mock_sanitize.assert_called_once()
-        assert mock_sanitize.call_args.kwargs["speaker_id"] == "spk-test"
+        assert mock_sanitize.call_args.kwargs == {}
+        assert mock_sanitize.call_args.args[0] == [{"role": "user", "text": "hi"}]
 
     # ---- anonymize mode ----
 
@@ -1243,7 +1244,7 @@ class TestCannotAnonymizeEgress:
 
 
 class TestCloudOnlyRouteSpeakerId:
-    """``_cloud_only_route``'s ``speaker_id``/``text`` parameters
+    """``_relay_route``'s ``speaker_id``/``text`` parameters
     must reach ``answer_via_cloud`` — the sole cloud-egress funnel, called
     here with ``model``/``tokenizer`` left ``None`` so it selects the
     cannot-anonymize branch (verbatim iff ``cloud_permitted``; history
@@ -1251,7 +1252,7 @@ class TestCloudOnlyRouteSpeakerId:
     """
 
     def test_speaker_id_reaches_the_funnel(self):
-        from paramem.server.app import _cloud_only_route
+        from paramem.server.app import _relay_route
         from paramem.server.inference import ChatResult
 
         config = MagicMock()
@@ -1261,9 +1262,8 @@ class TestCloudOnlyRouteSpeakerId:
             "paramem.server.app.answer_via_cloud",
             return_value=ChatResult(text="Berlin has 3.7M people."),
         ) as mock_funnel:
-            _cloud_only_route(
+            _relay_route(
                 text="What's the population of Berlin?",
-                speaker="Alex",
                 history=[{"role": "user", "text": "hi"}],
                 config=config,
                 cloud_permitted=True,
@@ -1284,7 +1284,7 @@ class TestCloudOnlyRouteSpeakerId:
         a path that holds no ParaMem knowledge; it is deleted.  The turn
         itself must arrive at ``answer_via_cloud`` unmodified.
         """
-        from paramem.server.app import _cloud_only_route
+        from paramem.server.app import _relay_route
         from paramem.server.inference import ChatResult
 
         config = MagicMock()
@@ -1293,9 +1293,8 @@ class TestCloudOnlyRouteSpeakerId:
             "paramem.server.app.answer_via_cloud",
             return_value=ChatResult(text="answer"),
         ) as mock_funnel:
-            _cloud_only_route(
+            _relay_route(
                 text="Where does Alex live?",
-                speaker="Alex",
                 history=None,
                 config=config,
                 cloud_permitted=True,
@@ -1314,7 +1313,7 @@ class TestDegradedServingGate:
     """
 
     def _run(self, *, cloud_permitted, ha_answers):
-        from paramem.server.app import _cloud_only_route
+        from paramem.server.app import _relay_route
         from paramem.server.inference import ChatResult
 
         ha_client = MagicMock()
@@ -1324,9 +1323,8 @@ class TestDegradedServingGate:
             "paramem.server.app.answer_via_cloud",
             return_value=ChatResult(text="cloud answer"),
         ) as mock_funnel:
-            result = _cloud_only_route(
+            result = _relay_route(
                 text="What's the population of Berlin?",
-                speaker="Alex",
                 history=None,
                 config=MagicMock(),
                 cloud_permitted=cloud_permitted,
@@ -1338,7 +1336,7 @@ class TestDegradedServingGate:
     def test_gated_closes_cloud_leg(self):
         result, mock_funnel, _ = self._run(cloud_permitted=False, ha_answers=False)
         mock_funnel.assert_not_called()
-        assert "limited mode" in result.text
+        assert "can't answer" in result.text
 
     def test_gated_keeps_ha_leg(self):
         result, mock_funnel, ha_client = self._run(cloud_permitted=False, ha_answers=True)

@@ -231,15 +231,21 @@ class TestAnonymizeForCloudOk:
 
 class TestAnonymizeForCloudSpeakerValueGuard:
     def test_hostile_hint_never_creates_speaker_keyed_reverse_entry(self):
-        """Speaker-value guard in ``_build_anonymization_mapping``
+        """The reverse-map guard in ``_build_anonymization_mapping``
         (paramem/cloud/placeholders.py) is unbypassable — the ONLY route
         to ``reverse`` is that function.
 
-        ``{"RealName": "speaker0"}`` never survives to
-        ``_build_anonymization_mapping`` in the full chain — the shape
-        normalizer (step 4) drops it first, since ``"speaker0"`` never
-        matches the placeholder shape.  Belt-and-suspenders: two
-        independent guards, neither reachable around.
+        ``{"RealName": "speaker0"}`` is a LEGITIMATE fold-onto-token entry
+        (a speaker self-naming — ``configs/prompts/
+        anonymization_speaker_anchor.txt``): the shape normalizer's
+        ``is_speaker_id`` carve-in (step 4,
+        :func:`~paramem.cloud.placeholders._normalize_anonymization_mapping`)
+        keeps it, so it SURVIVES into ``payload.forward`` (still useful —
+        it is what keeps "RealName" out of ``anon_transcript``). Only the
+        REVERSE write is guarded: a ``reverse["speaker0"]`` entry would
+        restore a real name onto every speaker-subject fact at deanon
+        time, so ``_build_anonymization_mapping`` drops any entry whose
+        VALUE is speaker-id-shaped before inverting.
         """
         graph = _graph([_rel("speaker0", "prefers", "coffee")])
         with patch(
@@ -249,6 +255,12 @@ class TestAnonymizeForCloudSpeakerValueGuard:
             payload = _anonymize(
                 graph, model=object(), tokenizer=object(), transcript="hi", scrub={"person name"}
             )
+        assert payload.forward == {"RealName": "speaker0"}, (
+            "the fold-onto-token entry must SURVIVE normalization into forward "
+            "— a regression that re-drops it (treating it as ambiguous again) "
+            "would pass the reverse-side assertions below while silently "
+            "breaking the fold-onto-token scrub itself"
+        )
         assert "speaker0" not in payload.reverse
         assert "speaker0" not in payload.reverse.values()
 
@@ -268,6 +280,128 @@ class TestAnonymizeForCloudSpeakerValueGuard:
             )
         assert "speaker0" not in payload.forward
         assert "Person_1" not in payload.reverse
+
+
+class TestSpeakerAnchorSectionRendering:
+    """CPU-side threading pin for the anonymizer's ``{speaker_anchor_section}``
+    slot (:func:`_render_anonymize_prompt`): ``speaker_id`` +
+    ``speaker_anchor_template`` reach the rendered prompt when both are
+    given, and the slot renders empty when ``speaker_id`` is ``None`` —
+    the render-time half of the "anchor-only-when-resolvable" invariant
+    (the caller-side gate lives in
+    :func:`~paramem.graph.flows.anonymize_turn`).
+    """
+
+    _TEMPLATE = (
+        "scrub={scrub_categories} facts={facts_json} transcript={transcript} "
+        "id={speaker_id}\n{speaker_anchor_section}\nEND"
+    )
+    _ANCHOR_TEMPLATE = "ANCHOR-FOR-{speaker_id}"
+
+    def test_speaker_id_and_template_both_given_renders_anchor_section(self):
+        tok = MagicMock()
+        captured = {}
+
+        def _capture_chat_template(messages, tokenize=False, add_generation_prompt=True):
+            captured["prompt"] = messages[-1]["content"]
+            return "rendered"
+
+        tok.apply_chat_template = _capture_chat_template
+        _render_anonymize_prompt(
+            [],
+            tok,
+            scrub={"person name"},
+            transcript="hi",
+            user_prompt_template=self._TEMPLATE,
+            system_prompt="sys",
+            speaker_id="speaker0",
+            speaker_anchor_template=self._ANCHOR_TEMPLATE,
+        )
+        assert "ANCHOR-FOR-speaker0" in captured["prompt"]
+
+    def test_none_speaker_id_renders_anchor_section_empty(self):
+        tok = MagicMock()
+        captured = {}
+
+        def _capture_chat_template(messages, tokenize=False, add_generation_prompt=True):
+            captured["prompt"] = messages[-1]["content"]
+            return "rendered"
+
+        tok.apply_chat_template = _capture_chat_template
+        _render_anonymize_prompt(
+            [],
+            tok,
+            scrub={"person name"},
+            transcript="hi",
+            user_prompt_template=self._TEMPLATE,
+            system_prompt="sys",
+            speaker_id=None,
+            speaker_anchor_template=self._ANCHOR_TEMPLATE,
+        )
+        assert "ANCHOR-FOR-" not in captured["prompt"]
+        assert "id=\n" in captured["prompt"] or "id=" in captured["prompt"]
+
+    def test_speaker_id_given_but_no_anchor_template_renders_empty(self):
+        """A caller that threads ``speaker_id`` but omits
+        ``speaker_anchor_template`` (default ``""``) still renders an
+        empty slot — the section requires BOTH signals, not either alone."""
+        tok = MagicMock()
+        captured = {}
+
+        def _capture_chat_template(messages, tokenize=False, add_generation_prompt=True):
+            captured["prompt"] = messages[-1]["content"]
+            return "rendered"
+
+        tok.apply_chat_template = _capture_chat_template
+        _render_anonymize_prompt(
+            [],
+            tok,
+            scrub={"person name"},
+            transcript="hi",
+            user_prompt_template=self._TEMPLATE,
+            system_prompt="sys",
+            speaker_id="speaker0",
+        )
+        assert "ANCHOR-FOR-" not in captured["prompt"]
+
+
+class TestFoldOntoTokenMultipleSelfNamingVariants:
+    """Multiple coreferring self-naming variants (e.g. "Priya" and "Priya
+    Sharma", both folding onto the same session's speaker anchor) must
+    BOTH survive into ``forward`` — the duplicate-VALUE uniqueness
+    enforcement in ``anonymize``'s merge loop is exempt for a
+    speaker-id-shaped placeholder (the fold IS the point; re-minting the
+    second variant onto ``Thing_N`` would leave it unresolved to the
+    anchor).
+    """
+
+    def test_two_distinct_keys_folding_onto_same_speaker_anchor_both_survive(self):
+        graph = _graph([_rel("speaker0", "has_name", "Priya Sharma")])
+        with patch(
+            "paramem.cloud.anonymize.anonymize_transcript",
+            return_value=(
+                {"Priya Sharma": "speaker0", "Priya": "speaker0"},
+                "anon transcript",
+                "raw",
+            ),
+        ):
+            payload = _anonymize(
+                graph,
+                model=object(),
+                tokenizer=_stub_tokenizer(),
+                transcript="Hi, I'm Priya Sharma. You can call me Priya.",
+                scrub={"person name"},
+            )
+        assert payload.status == "ok"
+        assert payload.forward == {"Priya Sharma": "speaker0", "Priya": "speaker0"}, (
+            "both self-naming variants must fold onto the SAME anchor — neither "
+            "may be re-minted onto a fresh Thing_N/Person_N placeholder"
+        )
+        # Neither placeholder-uniqueness re-mint fired: the ONLY value in
+        # the merged table is the shared anchor.
+        assert set(payload.forward.values()) == {"speaker0"}
+        # The reverse-map speaker-value guard still applies unconditionally.
+        assert "speaker0" not in payload.reverse
 
 
 class TestAnonymizeForCloudIdentityReconciliation:
@@ -1004,6 +1138,35 @@ class TestAtomicTranscriptSlicing:
         assert any("clamped allowance" in r.getMessage() for r in warnings)
 
 
+class TestAnonymizeTranscriptListWrappedEnvelope:
+    """``anonymize_transcript`` recovers a ``{"mapping": ...}`` envelope
+    even when the model wraps the whole thing in a one-element list
+    (``[{"mapping": ..., "anonymized_transcript": ...}]``) — the shared
+    primitive (``paramem.cloud.deanonymize._extract_json_block``) unwraps
+    that shape to the inner envelope dict, so this caller's own
+    ``"mapping" not in data`` guard never fires against the WRAPPING list
+    instead of the envelope itself."""
+
+    def test_list_wrapped_mapping_envelope_parses_successfully(self):
+        raw = json.dumps(
+            [{"mapping": {"Alice": "Person_1"}, "anonymized_transcript": "hi Person_1"}]
+        )
+        tokenizer = _CountingTokenizer()
+        with patch("paramem.cloud.anonymize.generate_answer", return_value=raw):
+            mapping, anon_transcript, raw_out = anonymize_transcript(
+                [],
+                model=object(),
+                tokenizer=tokenizer,
+                scrub={"person name"},
+                transcript="hi Alice",
+                user_prompt_template="T{transcript}",
+                system_prompt="",
+            )
+        assert mapping == {"Alice": "Person_1"}
+        assert anon_transcript == "hi Person_1"
+        assert raw_out == raw
+
+
 class TestDynamicVramClamp:
     """The dynamic VRAM clamp threaded through ``anonymize()`` (owner-
     approved 2026-07-28, live-fold evidence: a packer-correct 8,192-token
@@ -1198,8 +1361,8 @@ class TestDynamicVramClamp:
 
 
 class TestWithinSliceCanonCollisionSurvives:
-    """B1 regression guard (code review): the cross-KEY canon dedup in
-    ``anonymize``'s merge loop must be scoped to entries carried over
+    """Regression guard: the cross-KEY canon dedup in ``anonymize``'s
+    merge loop must be scoped to entries carried over
     from a PRIOR slice only — never to two literal real-value keys that
     canonicalize identically but both arrive within the SAME call.
 

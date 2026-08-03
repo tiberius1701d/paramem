@@ -300,6 +300,21 @@ def _normalize_anonymization_mapping(
     as-is, not dropped. Only NEITHER side matching is genuinely
     ambiguous and dropped (logging).
 
+    ``placeholder_side="value"`` ALSO accepts a speaker-id-shaped VALUE
+    (:func:`~paramem.utils.identity.is_speaker_id`) as placeholder-shaped,
+    even though a speaker id never matches :data:`PLACEHOLDER_SHAPE_RE`
+    (no PascalCase prefix, no underscore before the digit) — the
+    fold-onto-token carve-in: the anonymizer LLM is
+    authorized to scrub a coreferring real-name mention directly onto the
+    user's own ``speaker{N}`` token (e.g. ``{"RealName": "speaker0"}``),
+    and this entry must survive normalization for
+    :func:`~paramem.cloud.anonymize._build_anonymization_mapping`'s
+    documented speaker-value handling to ever run. This carve-in is
+    deliberately NOT extended to ``placeholder_side="key"`` — the cloud
+    ``bindings`` table — where a speaker-id-shaped KEY stays genuinely
+    ambiguous (a cloud model has no authority to bind new content onto
+    the identity anchor).
+
     Returns ``(canonical_mapping, stats)`` where ``stats`` has
     ``{inverted, dropped}`` counts — surfaces the mapping-quality signal
     to callers so they can persist it in diagnostics (ambiguous-drop can
@@ -326,6 +341,25 @@ def _normalize_anonymization_mapping(
     for k, v in mapping.items():
         k_match = bool(PLACEHOLDER_SHAPE_RE.match(str(k)))
         v_match = bool(PLACEHOLDER_SHAPE_RE.match(str(v)))
+        if placeholder_side == "value" and not v_match and is_speaker_id(str(v)):
+            # A speaker id (e.g. "speaker0") never matches
+            # PLACEHOLDER_SHAPE_RE (no PascalCase prefix, no underscore
+            # before the digit) but IS a legitimate placeholder-shaped
+            # VALUE under fold-onto-token anonymization: the
+            # anonymizer LLM is authorized to emit {"RealName": "speaker0"}
+            # when a coreferring real-name mention folds onto the user's
+            # own token. Without this carve-in the entry has neither side
+            # placeholder-shaped and is dropped as ambiguous below, so
+            # :func:`~paramem.cloud.anonymize._build_anonymization_mapping`'s
+            # documented handling of a speaker-id-shaped VALUE never runs —
+            # this is the fix that lets it actually receive the entry.
+            # Guarded to ``placeholder_side="value"`` only: the cloud
+            # ``bindings`` table (``placeholder_side="key"``) must never
+            # treat a speaker id as a valid KEY placeholder — a cloud model
+            # is not authorized to bind new content onto the identity
+            # anchor, so a binding shaped that way stays genuinely
+            # ambiguous/rejected, not silently accepted.
+            v_match = True
         if placeholder_side == "key":
             wants_invert = v_match and not k_match
             # Both sides matching the shape (e.g. a binding onto a
@@ -662,7 +696,10 @@ def _build_anonymization_mapping(
             from :func:`_normalize_anonymization_mapping` — the model's
             own ``scrub``-scoped decision, trusted as-is.
         speaker_name: Runtime-known display name of the session's
-            speaker.  When set, this name is guaranteed to be covered.
+            speaker.  When set AND not itself speaker-id-shaped, this name
+            is guaranteed to be covered.  A speaker-id-shaped value here
+            (:func:`~paramem.utils.identity.is_speaker_id`) is never seeded
+            — see the reinstatement-bug comment at the seeding site.
 
     Returns:
         ``(forward, reverse)`` — ``forward`` is the ``{real_name:
@@ -687,7 +724,18 @@ def _build_anonymization_mapping(
     # covered, reusing the model's own hint when it named the speaker
     # (exact or full-name match) and minting a fresh Person_N only when
     # it did not.
-    if speaker_name and speaker_name not in mapping:
+    #
+    # ``not is_speaker_id(speaker_name)`` guards a reinstatement bug: a
+    # profile display name that is itself literally speaker-id-shaped
+    # (e.g. a caller passing the raw id through as the "name") would
+    # otherwise pass the ``speaker_name not in mapping`` test purely
+    # because invariant 1 above already dropped that same string as a
+    # KEY (``is_speaker_id(k): continue``), then this block's own
+    # ``llm_mapping`` scan below re-finds the ORIGINAL (undropped)
+    # entry and seeds ``mapping[speaker_name] = reused`` — silently
+    # reinstating the exact speaker-id forward-map key invariant 1 was
+    # written to remove. No test covered this before the fix.
+    if speaker_name and not is_speaker_id(speaker_name) and speaker_name not in mapping:
         speaker_lower = speaker_name.lower()
         reused: str | None = None
         for key, placeholder in llm_mapping.items():

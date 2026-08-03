@@ -16,9 +16,19 @@ trained adapter to verify three contracts end-to-end:
 This is the live-GPU counterpart of tests/test_voice_prompt_contract.py
 (which is string-level only). It mirrors production exactly:
   probe_keys_grouped_by_adapter → layered_context
-  → _personalize_prompt(voice.load_prompt(), speaker)
+  → _build_system_prompt(speaker, speaker_id, language, config)
   → model.disable_adapter() generate
   → detect_escalation
+
+Identity note: production feeds the LOCAL reasoning leg the raw
+``speaker{N}`` token (never the display name — see
+``paramem.server.inference._build_speaker_prefix``); a display name is
+substituted only at the reply boundary
+(``paramem.server.speaker.resolve_speaker_tokens``).  This probe has no real
+enrolled speaker — ``SUBJECT`` ("Xiaoyu") is the training-data entity name,
+not a ``speaker{N}`` id — so it is passed as both ``speaker`` and
+``speaker_id`` to ``_build_system_prompt`` to reproduce the "identity line
+present" shape production exercises, without fabricating a fake token.
 
 Subject: Test 8 cycle_001 Mistral adapter, speaker "Xiaoyu"
 (8 predicates covering interests/entertainment — small enough to
@@ -48,7 +58,7 @@ from paramem.memory.probe import probe_keys_grouped_by_adapter  # noqa: E402
 from paramem.models.loader import load_adapter, load_base_model  # noqa: E402
 from paramem.server.config import load_server_config  # noqa: E402
 from paramem.server.escalation import detect_escalation  # noqa: E402
-from paramem.server.inference import _personalize_prompt  # noqa: E402
+from paramem.server.inference import _build_system_prompt  # noqa: E402
 
 CYCLE_DIR = (
     PROJECT_ROOT / "outputs" / "test8_large_scale" / "mistral" / "20260323_161747" / "cycle_001"
@@ -56,7 +66,7 @@ CYCLE_DIR = (
 SUBJECT = "Xiaoyu"
 ADAPTER_NAME = "episodic"
 
-# First-person — speaker=Xiaoyu via _personalize_prompt (production HA /chat path)
+# First-person — speaker=Xiaoyu via _build_system_prompt (production HA /chat path)
 IN_DOMAIN_QUERIES = [
     "What movie did I watch recently?",
     "What am I interested in?",
@@ -99,8 +109,7 @@ def main() -> int:
 
     # Load server config to get the voice prompt template.
     server_config = load_server_config()
-    voice_prompt_raw = server_config.voice.load_prompt()
-    system_prompt = _personalize_prompt(voice_prompt_raw, SUBJECT, None, server_config)
+    system_prompt = _build_system_prompt(SUBJECT, SUBJECT, None, server_config)
     print(f"\nSystem prompt (len={len(system_prompt)}):\n---\n{system_prompt}\n---")
 
     # Load base + adapter

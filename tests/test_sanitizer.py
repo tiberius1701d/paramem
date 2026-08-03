@@ -1,11 +1,17 @@
 """Unit tests for the self-reference sanitizer gate.
 
 ``is_self_referential`` decides whether a piece of text refers to / asks
-about the identified speaker.  Detection is two-tier: an encoder-based
+about the speaker themselves.  Detection is two-tier: an encoder-based
 classifier when ``personal_referent_config`` is supplied, falling back to
 an explicit first-person token set.  There is no static keyword list for
 personal *content* — that arm was removed; self-reference is the only
 signal this module contributes to the ``is_personal`` verdict.
+
+Re-spec (speakerless-serving boundary decision): the predicate is
+content-only now — it takes no ``speaker_id`` and has no null-target gate.
+The former ``bool(speaker_id) and ...`` gate is deleted; a caller decides
+separately whether a resolved speaker exists to apply the verdict to (see
+``paramem.server.inference.handle_chat``'s speaker-present contract).
 """
 
 from pathlib import Path
@@ -15,12 +21,12 @@ import pytest
 from paramem.server.sanitizer import is_self_referential
 
 # ---------------------------------------------------------------------------
-# First-person + speaker_id resolution
+# First-person resolution — content-only, no speaker_id parameter
 # ---------------------------------------------------------------------------
 
 
 class TestFirstPersonResolution:
-    """First-person pronouns resolve against the identified speaker.
+    """First-person pronouns are classified from content alone.
 
     The interrogative-vs-declarative split that used to live here was
     removed once ``Intent`` + ``_is_interrogative`` in inference.py
@@ -28,18 +34,22 @@ class TestFirstPersonResolution:
     boolean verdict for both shapes.
     """
 
-    def test_question_with_speaker_is_self_referential(self):
-        assert is_self_referential("Where do I live?", speaker_id="speaker0") is True
+    def test_question_is_self_referential(self):
+        assert is_self_referential("Where do I live?") is True
 
-    def test_statement_with_speaker_is_self_referential(self):
-        assert is_self_referential("I live in Kelkham.", speaker_id="speaker0") is True
+    def test_statement_is_self_referential(self):
+        assert is_self_referential("I live in Kelkham.") is True
 
-    def test_first_person_without_speaker_is_false(self):
-        # No identified speaker → no resolution target for "I" → False.
-        assert is_self_referential("Where do I live?") is False
+    def test_first_person_is_self_referential_with_no_speaker_known(self):
+        # Content-only: classification does not depend on — and cannot be
+        # passed — a speaker_id.  A speakerless caller's personal-shaped
+        # text still classifies as self-referential in content; whether
+        # anything downstream ACTS on that verdict is a separate decision
+        # made by the caller (e.g. the relay path's identity_absent gate).
+        assert is_self_referential("Where do I live?") is True
 
     def test_no_first_person_is_false(self):
-        assert is_self_referential("What's the capital of France?", speaker_id="speaker0") is False
+        assert is_self_referential("What's the capital of France?") is False
 
     def test_encoder_path_overrides_token_set_for_german(self):
         """Encoder-based classification fires when ``personal_referent_config``
@@ -60,11 +70,7 @@ class TestFirstPersonResolution:
             "paramem.server.personal_referent.classify_personal_referent",
             return_value=PersonalReferent.ABOUT_SPEAKER,
         ):
-            result = is_self_referential(
-                "Wo wohne ich?",
-                speaker_id="speaker0",
-                personal_referent_config=cfg,
-            )
+            result = is_self_referential("Wo wohne ich?", personal_referent_config=cfg)
         assert result is True
 
     def test_encoder_returning_not_about_speaker_clears_verdict(self):
@@ -84,7 +90,6 @@ class TestFirstPersonResolution:
         ):
             result = is_self_referential(
                 "I read that the Eiffel Tower was built in 1889.",
-                speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
         assert result is False
@@ -103,19 +108,12 @@ class TestFirstPersonResolution:
             "paramem.server.personal_referent.classify_personal_referent",
             return_value=None,
         ):
-            result = is_self_referential(
-                "Where do I live?",
-                speaker_id="speaker0",
-                personal_referent_config=cfg,
-            )
+            result = is_self_referential("Where do I live?", personal_referent_config=cfg)
         assert result is True
 
     def test_first_person_anywhere_in_text_matches(self):
         # "my" appears mid-sentence, not first word.
-        assert (
-            is_self_referential("Tell me what's on my schedule today.", speaker_id="speaker0")
-            is True
-        )
+        assert is_self_referential("Tell me what's on my schedule today.") is True
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +129,13 @@ class TestSelfReferentialPredicateIsUnconditional:
     """
 
     def test_first_person_is_personal(self):
-        assert is_self_referential("Where do I live?", speaker_id="speaker0") is True
+        assert is_self_referential("Where do I live?") is True
 
     def test_clean_query_is_not_personal(self):
-        assert is_self_referential("What's the weather today?", speaker_id="speaker0") is False
+        assert is_self_referential("What's the weather today?") is False
 
     def test_imperative_without_first_person_is_not_personal(self):
-        assert is_self_referential("Turn on the kitchen light", speaker_id="speaker0") is False
+        assert is_self_referential("Turn on the kitchen light") is False
 
     def test_no_mode_parameter_survives(self):
         """Regression guard: the deleted knob must not come back as a kwarg."""
@@ -150,6 +148,13 @@ class TestSelfReferentialPredicateIsUnconditional:
         import inspect
 
         assert "known_entities" not in inspect.signature(is_self_referential).parameters
+
+    def test_no_speaker_id_parameter_survives(self):
+        """Regression guard: the deleted null-target gate must not come
+        back as a kwarg — classification is content-only now."""
+        import inspect
+
+        assert "speaker_id" not in inspect.signature(is_self_referential).parameters
 
 
 # ---------------------------------------------------------------------------

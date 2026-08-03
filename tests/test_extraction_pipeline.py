@@ -463,6 +463,21 @@ class TestPlausibilityDropSet:
         assert out is not None
         assert [f["subject"] for f in out] == ["S0", "S2"]
 
+    def test_envelope_wrapped_in_one_element_list_is_unwrapped(self):
+        """A judge that wraps the whole ``{"drop": [...]}`` envelope in a
+        one-element list is recovered correctly — the shared primitive
+        (``_extract_json_block``) unwraps that shape to the inner
+        envelope dict, so this caller's own dict-shaped ``"drop"`` branch
+        runs rather than silently treating the wrapped dict as one
+        non-integer drop candidate."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(5)
+        raw = '[{"drop": [1, 3]}]'
+        out = _apply_drop_set(facts, raw)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2", "S4"]
+
 
 class TestRenderIndexedFacts:
     """``_render_indexed_facts`` produces ``[N] <json>`` lines that the
@@ -806,6 +821,25 @@ class TestEnrichmentDelta:
         assert out[0]["predicate"] == "worked_for"
         assert "evidence" not in out[0]
 
+    def test_prose_index_references_before_envelope_still_parse(self):
+        """Live regression (3/3 at temperature 0): reasoning prose that
+        names input facts by bracketed index (``[2]``, ``[0] and [1]``)
+        precedes the delta envelope.  Those references are valid bare-int
+        JSON arrays, so the shared envelope finder used to return ``[2]``
+        and this parser logged "enrichment delta unexpected shape: list" —
+        enrichment failed open on every attempt despite a complete,
+        well-formed envelope sitting further down the same response."""
+        facts = self._facts(3)
+        raw = (
+            "I need to analyze the extracted facts.\n"
+            "1. Fact [2] is a compound — split it\n"
+            "2. Facts [0] and [1] are symmetric duplicates — drop [1]\n\n"
+            '{"add": [], "modify": [], "drop": [1], "bindings": {}}'
+        )
+        out, _, _ = self._apply(facts, raw, None)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2"]
+
     def test_malformed_envelope_returns_none(self):
         """Caller fail-opens — the PARSER (not the applier, which is never
         even called) returns ``None`` so the caller (the ``enrich`` stage)
@@ -1052,6 +1086,168 @@ class TestPipelineMaxTokensThreading:
         assert captured.get("token_envelope") == _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
 
 
+class TestAnonymizeTurnSpeakerAnchorGate:
+    """The anchor ``anonymize_turn`` forwards into ``anonymize()``'s
+    ``speaker_id`` must ALWAYS either be ``None`` or satisfy
+    :func:`~paramem.utils.identity.is_speaker_id` — never the
+    ``"cloud_egress"`` session-label sentinel.
+
+    Owner ruling: the gate is ``is_speaker_id`` ONLY — it does NOT also
+    require a resolvable display name.  Anonymous-enrolled speakers are
+    full speakers and KEEP the anonymizer anchor; their session facts and
+    cloud payloads stay in token space exactly like a named speaker's.
+    What the reply boundary later renders for an anonymous speaker's
+    token is a separate concern from this gate.
+    """
+
+    def _run(self, *, speaker_id, speaker_name):
+        from paramem.cloud.anonymize import AnonymizedContract
+        from paramem.graph.flows import anonymize_turn
+
+        graph = _make_graph([("Alex", "lives_in", "Millfield")])
+        captured = {}
+
+        def fake_anonymize(*args, **kwargs):
+            captured.update(kwargs)
+            return AnonymizedContract(
+                status="ok",
+                forward={},
+                reverse={},
+                anon_transcript="anon",
+                declared=frozenset(),
+                norm_stats={"inverted": 0, "dropped": 0},
+                rekey_dropped=0,
+                raw="",
+            )
+
+        model = MagicMock()
+        model.is_gradient_checkpointing = False
+        tokenizer = MagicMock()
+
+        with (
+            patch("paramem.graph.flows.extract_graph", return_value=graph),
+            patch("paramem.graph.flows.anonymize", side_effect=fake_anonymize),
+        ):
+            anonymize_turn(
+                "Alex lives in Millfield.",
+                model,
+                tokenizer,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+                scrub={"person name"},
+            )
+        return captured
+
+    def test_no_speaker_id_forwards_none_not_cloud_egress_sentinel(self):
+        """Text-only /chat with no enrolled speaker (speaker_id=None,
+        speaker_name=None) must NOT forward the "cloud_egress" session
+        label as the anchor — it never satisfies is_speaker_id, and
+        rendering it teaches the local model to fold the caller's real
+        name onto a token the normalizer then drops, emptying forward."""
+        captured = self._run(speaker_id=None, speaker_name=None)
+        assert captured.get("speaker_id") is None
+
+    def test_anonymous_enrolled_speaker_well_shaped_id_keeps_the_anchor(self):
+        """An anonymous-enrolled profile: speaker_id is a well-shaped
+        speaker{N} token, speaker_name is the SAME raw token (the
+        forced-route/debug-probe shape — an anonymous profile's display
+        name equals its id) or None. is_speaker_id(speaker_id) alone is
+        sufficient — the anchor is forwarded regardless of speaker_name
+        (owner ruling)."""
+        captured = self._run(speaker_id="speaker0", speaker_name="speaker0")
+        assert captured.get("speaker_id") == "speaker0"
+
+        captured_none_name = self._run(speaker_id="speaker0", speaker_name=None)
+        assert captured_none_name.get("speaker_id") == "speaker0"
+
+    def test_named_speaker_with_well_shaped_id_forwards_the_real_speaker_id(self):
+        """A well-shaped speaker_id with a resolvable display name —
+        the anchor forwards through unchanged."""
+        captured = self._run(speaker_id="speaker0", speaker_name="Alex")
+        assert captured.get("speaker_id") == "speaker0"
+
+    def test_unshaped_speaker_id_forwards_none(self):
+        """A caller-supplied speaker_id that is not is_speaker_id-shaped
+        (defensive — should never happen in production, but the gate
+        must not trust it) never reaches the anonymizer."""
+        captured = self._run(speaker_id="not-a-speaker-token", speaker_name="Alex")
+        assert captured.get("speaker_id") is None
+
+
+class TestAnonymizeTurnRelationFreeTurn:
+    """A turn whose local extraction yields NO relations still reaches the
+    one anonymize chain.
+
+    ``anonymize`` serves the "transcript but no facts" shape (``facts=[]``)
+    by contract — the same signature, no flag, no branch — and the
+    anonymizer LLM, not the extractor's relation count, is the scope
+    authority for what may egress (``SECURITY.md``'s single-classifier
+    posture; the one fail-closed shape is a named mapping over a
+    non-empty transcript with a missing rewrite).
+
+    A relation-free turn is the ordinary shape of a non-personal question
+    ("What is the capital of France?"): treating it as an anonymizer
+    failure closes cloud egress for exactly the class of query
+    ``cloud_mode=anonymize`` exists to forward.
+    """
+
+    @staticmethod
+    def _run(text: str):
+        from paramem.cloud.anonymize import AnonymizedContract
+        from paramem.graph.flows import anonymize_turn
+
+        captured = {}
+
+        def fake_anonymize(*args, **kwargs):
+            captured["facts"] = args[0]
+            captured.update(kwargs)
+            return AnonymizedContract(
+                status="ok",
+                forward={},
+                reverse={},
+                # `anonymize`'s argument-sourced fallback: the model
+                # returned no rewrite, so the ORIGINAL (turn-marked)
+                # transcript comes back.
+                anon_transcript=kwargs["transcript"],
+                declared=frozenset(),
+                norm_stats={"inverted": 0, "dropped": 0},
+                rekey_dropped=0,
+                raw="",
+            )
+
+        model = MagicMock()
+        model.is_gradient_checkpointing = False
+        tokenizer = MagicMock()
+
+        with (
+            patch("paramem.graph.flows.extract_graph", return_value=_make_graph([])),
+            patch("paramem.graph.flows.anonymize", side_effect=fake_anonymize) as mock_anonymize,
+        ):
+            payload = anonymize_turn(text, model, tokenizer, scrub={"person name"})
+        return payload, captured, mock_anonymize
+
+    def test_zero_relations_reaches_the_anonymize_chain_with_empty_facts(self):
+        """The chain is entered — with ``facts=[]``, the shape ``anonymize``
+        documents for chat egress — instead of being short-circuited by a
+        relation-count gate."""
+        _, captured, mock_anonymize = self._run("What is the capital of France?")
+
+        mock_anonymize.assert_called_once()
+        assert captured["facts"] == []
+        assert "What is the capital of France?" in captured["transcript"]
+
+    def test_zero_relations_is_not_a_block(self):
+        """``status`` must not be the ``"failed"`` block sentinel — callers
+        (``answer_via_cloud``) suppress the cloud call entirely on it, which
+        surfaces as ``Route 'cloud' unavailable.`` on the forced route and as
+        a silent base-model fallback everywhere else."""
+        payload, _, _ = self._run("What is the capital of France?")
+
+        assert payload.status == "ok"
+        # Turn marker stripped back off — callers get bare text.
+        assert payload.anon_transcript == "What is the capital of France?"
+
+
 class TestPipelinePromptsDirThreading:
     """A ``prompts_dir`` override passed to ``extract_graph`` must reach
     every prompt load the ``anonymize``/``enrich`` stages perform, not
@@ -1126,9 +1322,10 @@ class TestPipelinePromptsDirThreading:
                 prompts_dir=tmp_path,
             )
 
-        assert captured == [tmp_path, tmp_path], (
-            f"_load_prompt must receive the caller's prompts_dir for both anonymization "
-            f"prompts, got {captured!r}"
+        assert captured == [tmp_path, tmp_path, tmp_path], (
+            f"_load_prompt must receive the caller's prompts_dir for all three "
+            f"anonymization prompts (template, system, speaker-anchor companion), "
+            f"got {captured!r}"
         )
 
     def test_cloud_enrich_receives_prompts_dir(self, tmp_path):
@@ -3400,6 +3597,7 @@ class TestFilterWithCloudPromptsDir:
                 provider="anthropic",
                 anon_transcript="A knows B.",
                 prompts_dir=tmp_path,
+                speaker_id="speaker0",
             )
 
         assert captured_prompts, "_cloud_call was never invoked"
@@ -3425,10 +3623,60 @@ class TestFilterWithCloudPromptsDir:
                 api_key="k",
                 provider="anthropic",
                 anon_transcript="A knows B.",
+                speaker_id="speaker0",
             )
 
         assert captured_prompts
         assert "SENTINEL" not in captured_prompts[0]
+
+
+class TestStageEnrichSuppliesSpeakerIdToRequestEnrichment:
+    """``paramem.graph.stage_enrich._stage_enrich``'s ``request_enrichment``
+    call always supplies ``ctx.speaker_id`` — now that ``speaker_id`` is
+    keyword-required with no default (a silently degraded prompt is a
+    security-relevant regression), this drives the REAL
+    ``request_enrichment`` through the ``enrich`` stage (only its cloud
+    transport, ``_cloud_call``, is mocked — no GPU needed since the
+    ``anonymize`` stage's local model call, ``anonymize_transcript``, is
+    also mocked) and inspects the actual rendered prompt for the
+    supplied speaker id.
+    """
+
+    def test_ctx_speaker_id_reaches_the_rendered_enrichment_prompt(self):
+        from tests._cloud_flow import run_cloud_stages
+
+        graph = _make_graph([("Alex", "lives_in", "Millfield")])
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        captured_prompts = []
+
+        def fake_cloud_call(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.cloud.anonymize.anonymize_transcript",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch("paramem.graph.extractor._cloud_call", side_effect=fake_cloud_call),
+        ):
+            run_cloud_stages(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker7",
+                plausibility_judge="off",
+                scrub={"person name"},
+            )
+
+        assert captured_prompts, "request_enrichment must have reached _cloud_call"
+        assert "speaker7" in captured_prompts[0], (
+            "stage_enrich must thread ctx.speaker_id into request_enrichment's "
+            "rendered prompt — a missing/degraded anchor would silently drop "
+            f"'speaker7' from: {captured_prompts[0]!r}"
+        )
 
 
 class TestPlausibilityFilterWithCloudPromptsDir:
@@ -3524,6 +3772,7 @@ class TestCloudSystemPromptCallTimeOverride:
                             api_key="k",
                             provider="anthropic",
                             anon_transcript="A knows B.",
+                            speaker_id="speaker0",
                         )
                 record = trace.records[-1]
 

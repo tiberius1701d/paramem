@@ -743,6 +743,7 @@ _ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."
 _ABSTENTION_COLD_START_FALLBACK = (
     "I'm still getting to know you, but I don't have that information yet."
 )
+_ABSTENTION_NO_IDENTITY_FALLBACK = "I don't know who I'm talking to, so I can't answer that."
 
 
 @dataclass
@@ -765,7 +766,14 @@ class AbstentionConfig:
       confused in this state because the system *can't* know anything
       about a freshly enrolled speaker.
 
-    Both messages are externalised to files under ``configs/prompts/`` so
+    A third message covers the speakerless-relay case: a personal
+    interrogative arriving with no identity resolved at all (the
+    ``ServingPath.RELAY`` boundary in ``paramem.server.app``) — distinct
+    from ``cold_start_response`` (an identified-but-fresh speaker) because
+    there is no speaker to be cold-starting for; the relay path never
+    consults parametric memory for these turns.
+
+    All messages are externalised to files under ``configs/prompts/`` so
     they can be tuned without code changes — same pattern as
     :class:`VoiceConfig`. ``*_override`` fields let an operator pin a
     specific string in the YAML when the file path is not desired; an empty
@@ -776,8 +784,10 @@ class AbstentionConfig:
     enabled: bool = True
     response_file: str = "configs/prompts/abstention_response.txt"
     cold_start_response_file: str = "configs/prompts/abstention_cold_start.txt"
+    no_identity_response_file: str = "configs/prompts/abstention_no_identity.txt"
     response_override: str = ""
     cold_start_response_override: str = ""
+    no_identity_response_override: str = ""
 
     def load_response(self) -> str:
         """Resolve the standard abstention message: override → file → fallback."""
@@ -798,6 +808,21 @@ class AbstentionConfig:
             if path.exists():
                 return path.read_text().strip()
         return _ABSTENTION_COLD_START_FALLBACK
+
+    def load_no_identity_response(self) -> str:
+        """Resolve the no-identity message: override → file → fallback.
+
+        Fired by the relay path (``paramem.server.app._relay_route``) for a
+        personal interrogative with no resolved speaker at all — see the
+        class docstring.
+        """
+        if self.no_identity_response_override:
+            return self.no_identity_response_override
+        if self.no_identity_response_file:
+            path = Path(self.no_identity_response_file)
+            if path.exists():
+                return path.read_text().strip()
+        return _ABSTENTION_NO_IDENTITY_FALLBACK
 
 
 @dataclass
@@ -1692,8 +1717,8 @@ class MobilePwaConfig:
     """Progressive Web App (PWA) configuration for the mobile client.
 
     ``enabled``: serve the static PWA bundle and activate cookie-based
-    authentication for the mobile web client.  False by default so existing
-    API-key deployments are unaffected until the mobile client is wired in.
+    authentication for the mobile web client.  False by default so an
+    existing deployment is unaffected until the mobile client is wired in.
 
     ``static_dir``: filesystem path to the compiled static bundle.  Empty
     string defers resolution to the mount point (``paramem/web/static``),
@@ -1707,9 +1732,9 @@ class MobilePwaConfig:
     auto-generates a VAPID EC P-256 keypair on first startup (persisted as
     ``vapid_keys.json`` in the data directory, age-encrypted when a daily key
     is loaded) and activates the ``/push/vapid-public-key`` and
-    ``/push/subscribe`` endpoints.  Requires per-user bearer tokens (the
-    subscribe endpoint returns 403 for shared-token or unauthenticated
-    requests).  False by default (opt-in).
+    ``/push/subscribe`` endpoints.  Requires an ATTRIBUTED per-user bearer
+    token (the subscribe endpoint returns 403 for an unattributed token or
+    an unauthenticated request).  False by default (opt-in).
 
     ``vapid_contact``: the ``sub`` claim in the VAPID JWT.  Must be a
     ``mailto:`` URI identifying the server operator; sent to push relays for

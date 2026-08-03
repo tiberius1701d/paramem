@@ -10,6 +10,9 @@ leftover-placeholder check.
 from __future__ import annotations
 
 import re
+from pathlib import Path
+
+import pytest
 
 from paramem.config.taxonomy import (
     entity_types,
@@ -20,7 +23,7 @@ from paramem.graph.extractor import (
     DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     load_extraction_prompts,
 )
-from paramem.graph.prompts import _load_prompt  # was load_anonymization_prompt
+from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt  # was load_anonymization_prompt
 
 # Matches single-brace placeholders like {transcript} that are NOT part of
 # a double-brace escape ({{ or }}).  After a successful .format() call all
@@ -146,6 +149,120 @@ class TestProceduralPromptRender:
         assert "preference" in rendered
 
 
+class TestSecondOrderExtractionPromptRender:
+    """Render-with-slots guard for ``extraction_second_order.txt`` — the
+    ``second_order_extract`` phase's user template.
+
+    ``{named_people}`` is the gate-derived closed target set threaded via
+    ``extra_slots`` (:func:`paramem.graph.flows._stage_second_order_extract`).
+    An un-threaded ``{named_people}`` slot is a runtime ``KeyError`` CI
+    cannot otherwise see, so this mirrors the ``{speaker_id}`` render-with-
+    slots guard already established for ``cloud_enrichment.txt``
+    (``TestEnrichmentPromptContract.test_omitted_speaker_id_slot_raises_key_error``).
+    The phase's SYSTEM prompt is the shared, slot-free
+    ``extraction_second_order.txt``'s
+    ``DEFAULT_SYSTEM_PROMPT_FILENAME`` (``extraction_system.txt`` — no
+    dedicated second-order system prompt); its no-braces contract is
+    already covered by ``test_extraction_system_txt_no_braces`` in
+    ``tests/test_prompts_present.py``.
+    """
+
+    def _load(self):
+        return _load_prompt("extraction_second_order.txt", required=True)
+
+    def _render(self):
+        tmpl = self._load()
+        return tmpl.format(
+            transcript="sample",
+            speaker_context="",
+            named_people="Dana, Riley",
+        )
+
+    def test_renders_without_exception(self):
+        rendered = self._render()
+        assert isinstance(rendered, str)
+        assert "Dana, Riley" in rendered
+
+    def test_no_leftover_placeholders(self):
+        rendered = self._render()
+        leftover = [
+            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
+        ]
+        assert leftover == [], f"Leftover placeholders after render: {leftover}"
+
+    def test_omitted_named_people_slot_raises_key_error(self):
+        """An un-threaded ``{named_people}`` slot must fail loudly at
+        ``.format()`` time, not silently leak the literal ``{named_people}``
+        into the model prompt."""
+        tmpl = self._load()
+        with pytest.raises(KeyError):
+            tmpl.format(transcript="sample", speaker_context="")
+
+
+class TestSecondOrderExtractionPromptRenderAllVariants:
+    """Render-with-slots guard for EVERY ``extraction_second_order.txt`` —
+    the shared base file plus every per-model override directory under
+    ``configs/prompts/``, discovered by glob so a future model alias is
+    covered automatically without a test edit.
+
+    ``_load_prompt`` falls through to the base file when a model's
+    override omits ``extraction_second_order.txt`` entirely (see its
+    per-file, per-model resolution docstring), so a missing override is
+    not a gap — only an override that PROVIDES the file but drops the
+    ``{named_people}`` slot is: ``str.format`` silently ignores surplus
+    kwargs, so that override would revert the phase to raw-prose target
+    re-derivation under its model alias while the flow's post-parse
+    enforcement (:func:`paramem.graph.flows._stage_second_order_extract`)
+    keeps filtering against the correctly-derived closed set — a
+    prompt/enforcement mismatch this test catches at CI time instead of
+    at model-swap runtime.
+    """
+
+    def _variant_paths(self) -> list[Path]:
+        base = _DEFAULT_PROMPT_DIR / "extraction_second_order.txt"
+        overrides = sorted(_DEFAULT_PROMPT_DIR.glob("*/extraction_second_order.txt"))
+        assert base.is_file(), f"base second-order prompt missing: {base}"
+        return [base, *overrides]
+
+    def test_at_least_the_base_and_one_override_are_covered(self):
+        paths = self._variant_paths()
+        assert len(paths) >= 2, (
+            f"expected the base file plus at least one model-alias override, got {paths!r}"
+        )
+
+    def test_every_variant_renders_with_named_people_threaded(self):
+        for path in self._variant_paths():
+            tmpl = path.read_text(encoding="utf-8")
+            rendered = tmpl.format(
+                transcript="sample",
+                speaker_context="",
+                named_people="Dana, Riley",
+            )
+            assert "Dana, Riley" in rendered, (
+                f"{path}: {{named_people}} slot did not reach the rendered prompt "
+                "— override dropped the slot, reverting to prose re-derivation."
+            )
+
+    def test_every_variant_has_no_leftover_placeholders(self):
+        for path in self._variant_paths():
+            tmpl = path.read_text(encoding="utf-8")
+            rendered = tmpl.format(
+                transcript="sample",
+                speaker_context="",
+                named_people="Dana, Riley",
+            )
+            leftover = [
+                m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
+            ]
+            assert leftover == [], f"{path}: leftover placeholders after render: {leftover}"
+
+    def test_every_variant_omitted_named_people_slot_raises_key_error(self):
+        for path in self._variant_paths():
+            tmpl = path.read_text(encoding="utf-8")
+            with pytest.raises(KeyError):
+                tmpl.format(transcript="sample", speaker_context="")
+
+
 class TestAnonymizationPromptRender:
     """anonymization.txt renders with a rendered {scrub_categories} slot —
     the config-driven ``sanitization.scrub`` scope authority."""
@@ -156,6 +273,8 @@ class TestAnonymizationPromptRender:
             scrub_categories="person name, email address, phone number",
             facts_json="[]",
             transcript="sample",
+            speaker_id="speaker0",
+            speaker_anchor_section="",
         )
 
     def test_renders_without_exception(self):

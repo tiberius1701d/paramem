@@ -71,8 +71,6 @@ class ParaMemConversationEntity(ConversationEntity):
         chat_log: ChatLog,
     ) -> ConversationResult:
         """Forward the user message to the ParaMem server."""
-        history = _extract_history(chat_log)
-
         # Pass HA user display name as speaker identity
         speaker = None
         if user_input.context and user_input.context.user_id:
@@ -84,12 +82,9 @@ class ParaMemConversationEntity(ConversationEntity):
             "text": user_input.text,
             "conversation_id": user_input.conversation_id or "default",
             "speaker": speaker,
-            "history": history,
         }
 
-        headers = (
-            {"Authorization": f"Bearer {self._api_token}"} if self._api_token else {}
-        )
+        headers = {"Authorization": f"Bearer {self._api_token}"} if self._api_token else {}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -155,26 +150,3 @@ class ParaMemConversationEntity(ConversationEntity):
         except Exception:
             logger.exception("HA conversation fallback also failed")
         return "I'm having trouble connecting to my services right now."
-
-
-def _extract_history(chat_log: ChatLog) -> list[dict]:
-    """Extract conversation history from the HA ChatLog.
-
-    ChatLog entries are typed objects (UserContent, AssistantContent).
-    We infer role from the type name and extract the content field.
-    """
-    history = []
-    for entry in chat_log.content:
-        content = getattr(entry, "content", None)
-        if not content:
-            continue
-        # Infer role from class name: UserContent → user, AssistantContent → assistant
-        type_name = type(entry).__name__.lower()
-        if "user" in type_name:
-            role = "user"
-        elif "assistant" in type_name:
-            role = "assistant"
-        else:
-            continue
-        history.append({"role": role, "text": str(content)})
-    return history

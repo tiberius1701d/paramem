@@ -205,7 +205,8 @@ class SessionBuffer:
         (``voice-{speaker_id}``). That transport-id entry never gets a
         ``session_id`` (no turn is ever appended under it), so
         :meth:`_prune_open_for_retired_sessions` can never evict it and it
-        would otherwise accumulate one orphan per shared-token utterance.
+        would otherwise accumulate one orphan per unattributed-caller
+        utterance.
         Callers discard it once the resolved buffer key is known and its
         speaker state has been re-recorded there via :meth:`set_speaker`.
         Silent no-op when the key is absent.
@@ -1103,14 +1104,35 @@ class SessionBuffer:
             self._sessions[session_id].pop("recall_retry_count", None)
 
     def get_session_turns(self, conversation_id: str) -> list[dict]:
-        """Read all turns from a session."""
+        """Read all turns from a conversation's currently open session.
+
+        *conversation_id* is the caller's routing handle — the same key
+        :meth:`append` resolves through ``_open`` before writing (see
+        :meth:`_resolve_session_id`).  This accessor mirrors that
+        resolution: it looks up ``_open[conversation_id]["session_id"]``
+        for the concrete session id turns are actually stored under, then
+        reads ``_turns``/disk keyed by THAT id.  A direct
+        ``_turns[conversation_id]`` lookup (the previous implementation)
+        was silently dead for every conversational caller — ``append``
+        always mints a session id of the form
+        ``f"{conversation_id}-{timestamp}-{rand}"`` (:func:`_mint_session_id`),
+        which never equals the raw ``conversation_id``, so the direct
+        lookup never found anything once a session had rotated.
+
+        Falls back to treating *conversation_id* as the session id directly
+        when there is no open-routing entry for it — this keeps the
+        document-chunk path working, where ``session_id`` IS the caller's
+        routing handle (:meth:`append_document_chunk` never rotates).
+        """
+        session_id = self._open.get(conversation_id, {}).get("session_id") or conversation_id
+
         # In-memory first
-        if conversation_id in self._turns:
-            return list(self._turns[conversation_id])
+        if session_id in self._turns:
+            return list(self._turns[session_id])
 
         # Fall back to disk
         if self.debug:
-            path = self.session_dir / f"{conversation_id}.jsonl"
+            path = self.session_dir / f"{session_id}.jsonl"
             if path.exists():
                 return self._read_jsonl(path)
 

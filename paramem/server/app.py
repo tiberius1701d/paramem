@@ -82,6 +82,7 @@ from paramem.server.router import QueryRouter
 from paramem.server.run_status import read_last_runs, record_last_run
 from paramem.server.sanitizer import is_self_referential
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
+from paramem.server.speaker import resolve_speaker_tokens
 from paramem.server.tools.ha_client import HAClient
 from paramem.server.trial_state import (
     TrialMarker,
@@ -177,9 +178,13 @@ _state = {
     # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
     "cloud_only_reason": None,
     "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
-    # conversation_ids already told they are being served over the degraded
-    # cloud path (see _DEGRADED_SERVING_NOTICE) — the notice fires once each.
-    "degraded_notice_conversations": set(),
+    # (conversation_id, notice_kind) pairs already announced over the relay
+    # path — notice_kind is "degraded" (_DEGRADED_SERVING_NOTICE) or
+    # "speakerless" (_SPEAKERLESS_RELAY_NOTICE), see _notice_once.  Keyed by
+    # the pair (not conversation_id alone) so a conversation that already
+    # announced one kind still announces the OTHER kind once, the first
+    # time it applies.
+    "relay_notice_conversations": set(),
     "defer_model": False,  # set by --defer-model CLI flag before app start
     "ha_graph": None,  # HAEntityGraph built from HA states/services at startup
     "event_loop": None,  # asyncio event loop reference for cross-thread scheduling
@@ -236,7 +241,6 @@ class ChatRequest(BaseModel):
     text: str
     conversation_id: str = "default"
     speaker_embedding: list[float] | None = None  # Voice embedding from STT
-    history: list[dict] | None = None
     route: str | None = None  # Force routing: "ha", "cloud", or None (auto)
 
 
@@ -1749,10 +1753,30 @@ def _build_user_token_store(config) -> "UserTokenStore | None":
     """Return a :class:`~paramem.server.user_tokens.UserTokenStore` when per-user
     auth is opted in, or ``None`` when it is not.
 
-    The store is constructed only when ``config.mobile_pwa.enabled`` is
-    ``True``.  Leaving it ``None`` keeps the middleware in OFF mode for
-    default deployments that have neither a shared token nor the PWA enabled —
-    restoring the original open-by-default behavior.
+    Store presence is the ONLY auth-enablement signal — the shared
+    ``PARAMEM_API_TOKEN`` validation branch is retired; every credential now
+    lives exclusively in ``UserTokenStore``.  The store is built when
+    EITHER of two things is true:
+
+    * ``config.mobile_pwa.enabled`` — the operator has opted in explicitly, or
+    * the store's on-disk file (``config.paths.data / "user_tokens.json"``)
+      already exists — a prior ``paramem mint-user-token`` run wrote it, so
+      the server must pick up those credentials even if
+      ``mobile_pwa.enabled`` is ``False`` in this config.
+
+    A fresh install with neither condition true stays auth-OFF (store is
+    ``None``) until the operator's first mint; minting creates the file, and
+    ONLY the NEXT boot turns the server ON — the live mtime-reload inside
+    :class:`~paramem.server.user_tokens.UserTokenStore` (see its
+    ``_maybe_reload``) refreshes an ALREADY-wired store's token set from
+    disk, but cannot conjure a store into existence: with no store object
+    assigned in ``_state["user_token_store"]`` there is nothing for
+    ``_maybe_reload`` to be called on, so a live mint against a from-scratch
+    (auth-OFF) deployment does not flip it ON without a restart. This still
+    keeps a from-scratch deployment usable immediately, without a
+    chicken-and-egg "enable auth to mint a token, mint a token to enable
+    auth" step — the cost is a restart after the first mint, not an
+    unreachable state.
 
     The decision logic is extracted here so it can be unit-tested without
     starting the full app lifespan.
@@ -1765,14 +1789,15 @@ def _build_user_token_store(config) -> "UserTokenStore | None":
     Returns
     -------
     UserTokenStore | None
-        A wired store (potentially empty) when ``mobile_pwa.enabled``, else
-        ``None``.
+        A wired store (potentially empty) when either condition above holds,
+        else ``None``.
     """
-    if not config.mobile_pwa.enabled:
+    store_path = config.paths.data / "user_tokens.json"
+    if not (config.mobile_pwa.enabled or store_path.exists()):
         return None
     from paramem.server.user_tokens import UserTokenStore as _UserTokenStore
 
-    return _UserTokenStore(config.paths.data / "user_tokens.json")
+    return _UserTokenStore(store_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2060,8 +2085,9 @@ async def lifespan(app: FastAPI):
     _state["daily_loadable"] = _daily_ok
 
     # Per-user token store — opt-in via mobile_pwa.enabled.  Only constructed
-    # when the PWA slice is active so a default deployment (no shared token,
-    # mobile_pwa.enabled=false) leaves the store None and the middleware OFF.
+    # when the PWA slice is active (or a prior mint already wrote the store
+    # file) so a default deployment (mobile_pwa.enabled=false, no prior
+    # mint) leaves the store None and the middleware OFF.
     _state["user_token_store"] = _build_user_token_store(config)
     if _state["user_token_store"] is not None:
         logger.info(
@@ -2408,7 +2434,14 @@ async def lifespan(app: FastAPI):
             _state["wyoming_server"] = await start_wyoming_server(
                 host=config.server.host,
                 port=config.stt.port,
-                speaker_store=_state.get("speaker_store"),
+                # Provider, not an eager snapshot: _build_config_derived_state
+                # rebinds _state["speaker_store"] on every full config-apply
+                # (app.py step 2), and this Wyoming socket is bound once here
+                # at lifespan boot — an eager _state.get("speaker_store") would
+                # keep gating embedding computation on the pre-apply (possibly
+                # stale) store for the life of the process. Mirrors the TTS
+                # socket's speaker_store_provider below.
+                speaker_store_provider=lambda: _state.get("speaker_store"),
                 embedding_callback=_on_stt_embedding,
                 language_callback=_on_stt_language,
                 min_embedding_duration_seconds=config.speaker.min_embedding_duration_seconds,
@@ -2439,6 +2472,13 @@ async def lifespan(app: FastAPI):
                 audio_chunk_bytes=config.tts.audio_chunk_bytes,
                 tts_manager_provider=lambda: _state["voice_box"]["tts_manager"],
                 language_source=config.tts.language_source,
+                # Provider, not an eager snapshot: _build_config_derived_state
+                # rebinds _state["speaker_store"] on every full config-apply
+                # (app.py step 2), and this Wyoming socket is bound once here
+                # at lifespan boot — an eager _state.get("speaker_store") would
+                # keep resolving against the pre-apply (possibly stale) store
+                # for the life of the process. Mirrors tts_manager_provider.
+                speaker_store_provider=lambda: _state.get("speaker_store"),
             )
             logger.info("Wyoming TTS server listening on port %d", config.tts.port)
 
@@ -2605,7 +2645,6 @@ async def lifespan(app: FastAPI):
     _posture_store = _state.get("user_token_store")
     _n_user_tokens = _posture_store.count_active() if _posture_store is not None else 0
     log_startup_posture(
-        _api_token,
         n_user_tokens=_n_user_tokens,
         per_user_active=_posture_store is not None,
     )
@@ -2928,18 +2967,22 @@ async def _run_boot_completion_tasks() -> None:
 
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 
-# Bearer-token auth on all REST endpoints when PARAMEM_API_TOKEN is set.
-# No-op when unset (loud WARN emitted from lifespan after store is wired).
+# Bearer-token auth on all REST endpoints whenever a UserTokenStore is
+# wired (see _build_user_token_store).  No-op when no store is wired (loud
+# WARN emitted from lifespan after the store decision is made).  There is
+# no separate shared-token credential any more — every accepted token is a
+# UserTokenStore entry, attributed or not.  PARAMEM_API_TOKEN survives only
+# as the carrier env var infra consumers (the systemd scheduling timer, the
+# HA custom component) read to source the Authorization header value for a
+# token that must itself be minted into the store (see DEPLOYMENT.md — Per-
+# user token management).
 from paramem.server.auth import (  # noqa: E402
     BearerTokenMiddleware,
-    load_token_from_env,
     log_startup_posture,
 )
 
-_api_token = load_token_from_env()
 app.add_middleware(
     BearerTokenMiddleware,
-    token=_api_token,
     user_token_getter=lambda: _state.get("user_token_store"),
     cookie_name_getter=lambda: (
         _state["config"].mobile_pwa.cookie_name if _state.get("config") else None
@@ -2965,12 +3008,12 @@ def require_admin(request: Request) -> None:
 
     Accept condition: ``request.state.scope == "admin"`` — default-deny.
     Fail-closed: a chat-scope per-user token has ``scope == "chat"`` and is
-    denied.  In auth-OFF mode (no shared token AND no user-token store) the
-    server is open for use — ``BearerTokenMiddleware`` stamps the same
-    non-admin ``scope == "chat"`` on every pass-through request (see
-    ``auth.py`` OFF branch), so admin endpoints 403 here until a shared token
-    or a per-user store is configured (fail-closed admin), while unguarded
-    endpoints (chat/voice) remain reachable without a credential.
+    denied.  In auth-OFF mode (no user-token store wired) the server is
+    open for use — ``BearerTokenMiddleware`` stamps the same non-admin
+    ``scope == "chat"`` on every pass-through request (see ``auth.py`` OFF
+    branch), so admin endpoints 403 here until a per-user store is
+    configured (fail-closed admin), while unguarded endpoints (chat/voice)
+    remain reachable without a credential.
 
     Raising ``HTTPException`` is FastAPI-idiomatic boundary rejection — NOT a
     suppressing try/except.
@@ -3069,9 +3112,10 @@ async def chat(request: ChatRequest, http_request: Request):
     _state["last_chat_monotonic"] = time.monotonic()
     buffer = _state["session_buffer"]
 
-    # Authenticated speaker from per-user bearer token (set by
-    # BearerTokenMiddleware on ON-per-user requests).  None for legacy shared
-    # token calls (no speaker attribution) and unauthenticated mode.
+    # Authenticated speaker from an ATTRIBUTED per-user bearer token (set by
+    # BearerTokenMiddleware on ON-per-user requests).  None for an
+    # unattributed per-user token (no speaker attribution) and unauthenticated
+    # mode.
     auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
 
     # Forced routing — bypass normal routing for direct provider testing.
@@ -3079,6 +3123,16 @@ async def chat(request: ChatRequest, http_request: Request):
     if request.route and request.route.startswith(("ha", "cloud")):
         _speaker_id, speaker = _resolve_speaker(
             request, buffer, _state.get("speaker_store"), auth_speaker_id=auth_speaker_id
+        )
+        # Same typed boundary decision as the normal /chat path — forced
+        # routing selects the PROVIDER, it does not buy a history-egress
+        # bypass: a speakerless caller gets no history on the forced route
+        # either.
+        _serving = ServingPath.for_speaker(_speaker_id)
+        _forced_history = (
+            []
+            if _serving is ServingPath.RELAY
+            else buffer.get_session_turns(request.conversation_id)
         )
         loop = asyncio.get_running_loop()
 
@@ -3102,7 +3156,7 @@ async def chat(request: ChatRequest, http_request: Request):
             if agent is not None and _state["mode"] == "cloud-only":
                 # Cloud-only: no local model, so no ParaMem-held knowledge and
                 # no anonymizer — the same plain-cloud-agent posture as
-                # _cloud_only_route.  Routed through the one egress funnel
+                # _relay_route.  Routed through the one egress funnel
                 # (model/tokenizer=None selects its cannot-anonymize branch);
                 # history is still drop-gated there.
                 _forced_cloud_permitted = (
@@ -3119,7 +3173,7 @@ async def chat(request: ChatRequest, http_request: Request):
                         tokenizer=None,
                         speaker=speaker,
                         speaker_id=_speaker_id,
-                        history=request.history,
+                        history=_forced_history,
                         cloud_permitted=_forced_cloud_permitted,
                     ),
                 )
@@ -3130,7 +3184,6 @@ async def chat(request: ChatRequest, http_request: Request):
                 # as they do on the routed path.
                 _forced_is_personal = is_self_referential(
                     request.text,
-                    speaker_id=_speaker_id,
                     personal_referent_config=_state["config"].personal_referent,
                 )
                 result = await loop.run_in_executor(
@@ -3144,11 +3197,14 @@ async def chat(request: ChatRequest, http_request: Request):
                         tokenizer=_state.get("tokenizer"),
                         speaker=speaker,
                         speaker_id=_speaker_id,
-                        history=request.history,
+                        history=_forced_history,
                     ),
                 )
         if result and result.text:
-            return ChatResponse(text=result.text, escalated=True, speaker=speaker)
+            resolved_text = resolve_speaker_tokens(
+                result.text, _state.get("speaker_store"), current_speaker_id=_speaker_id
+            )
+            return ChatResponse(text=resolved_text, escalated=True, speaker=speaker)
         return ChatResponse(
             text=f"Route '{request.route}' unavailable.",
             escalated=False,
@@ -3199,10 +3255,9 @@ async def chat(request: ChatRequest, http_request: Request):
         detected_language=detected_language,
         detected_language_prob=detected_language_prob,
     )
-    speaker_id, speaker, display_speaker = (
+    speaker_id, speaker = (
         _resolved.speaker_id,
         _resolved.speaker,
-        _resolved.display_speaker,
     )
     follow_up, greeting_prefix, detected_language = (
         _resolved.follow_up,
@@ -3215,8 +3270,6 @@ async def chat(request: ChatRequest, http_request: Request):
         conversation_id=request.conversation_id,
         speaker_id=speaker_id,
         speaker=speaker,
-        display_speaker=display_speaker,
-        history=request.history,
         speaker_embedding=request.speaker_embedding,
         language=detected_language,
         greeting_prefix=greeting_prefix,
@@ -3227,6 +3280,42 @@ async def chat(request: ChatRequest, http_request: Request):
         speaker=speaker,
         follow_up=follow_up,
     )
+
+
+class ServingPath(Enum):
+    """Typed boundary decision stamped by speaker resolution.
+
+    ``PERSONAL`` — a speaker_id resolved (named or anonymous-promoted); the
+    turn is eligible for the full local dispatch (``handle_chat``):
+    parametric-memory probing, cloud escalation under the ``is_personal``
+    privacy gate, abstention, etc.
+
+    ``RELAY`` — no speaker_id resolved at all.  The turn is served by the
+    relay path (``_relay_route``) regardless of server mode: HA / cloud
+    only, no conversation history egresses, personal interrogatives get the
+    canned no-identity response, and the session is appended with
+    ``speaker_id=None`` — consolidation's existing 3-way triage
+    (``paramem.server.consolidation.classify_session``) then decides its
+    fate with no consolidation-side change needed: a text-only ``/chat``
+    RELAY turn carries no voice embedding either, so it classifies
+    ``UNIDENTIFIABLE`` (dropped, no TTL); a ``/voice`` RELAY turn DOES carry
+    the STT voice embedding even with no resolved speaker, so it classifies
+    ``HOLDABLE`` instead (retained pending retro-claim, not dropped) — the
+    same embedding-presence rule every other holdable session uses.
+
+    The one constructor, :meth:`for_speaker`, is the sole place this
+    decision is made — every caller (the normal ``/chat`` / ``/voice`` path
+    and forced routing) derives ``ServingPath`` from it rather than
+    re-deriving the ``speaker_id is None`` check locally.
+    """
+
+    PERSONAL = "personal"
+    RELAY = "relay"
+
+    @classmethod
+    def for_speaker(cls, speaker_id: str | None) -> "ServingPath":
+        """Return ``PERSONAL`` when *speaker_id* resolved, else ``RELAY``."""
+        return cls.PERSONAL if speaker_id is not None else cls.RELAY
 
 
 @dataclass(frozen=True)
@@ -3240,10 +3329,20 @@ class ResolvedSpeaker:
         when resolution failed or the caller is fully anonymous.
     speaker:
         Display name returned by the speaker store (used in ChatResponse).
-    display_speaker:
-        Anonymization-safe name for system-prompt injection and greeting.
-        ``None`` when the speaker is anonymous (``is_anonymous`` is true)
-        so the internal ``speaker{N}`` token is suppressed until disclosure.
+        For an anonymous-promoted speaker this is the raw ``speaker{N}``
+        token itself (the store's convention until disclosure) — callers
+        that need a human-safe salutation use
+        ``store.resolve_speaker_name(speaker_id)`` directly (see the
+        greeting-prefix assembly below), not this field.
+
+        There is deliberately no ``serving`` field here: the
+        :class:`ServingPath` boundary decision is fully derived from
+        ``speaker_id`` (:meth:`ServingPath.for_speaker`), so storing it
+        alongside ``speaker_id`` would let the two drift out of sync if a
+        caller ever mutated one without the other.  ``_run_chat_turn``
+        (the sole consumer) calls ``ServingPath.for_speaker(speaker_id)``
+        itself; forced routing (the ``/chat`` handler's ``request.route``
+        branch) does the same at its own fork.
     follow_up:
         Server-initiated follow-up prompt (e.g. "What's your name?") when
         the voice is unknown.  ``None`` after successful disclosure or for
@@ -3258,7 +3357,6 @@ class ResolvedSpeaker:
 
     speaker_id: str | None
     speaker: str | None
-    display_speaker: str | None
     follow_up: str | None
     greeting_prefix: str | None
     effective_language: str | None
@@ -3277,7 +3375,8 @@ async def _resolve_and_enroll_speaker(
 
     Extracted verbatim from the POST /chat inline block so POST /voice can
     share the same enrollment/greeting/language-resolution path when the
-    device carries a shared token (``auth_speaker_id is None``).
+    caller carries no per-user speaker attribution (``auth_speaker_id is
+    None`` — an unattributed per-user token, or auth-OFF).
 
     Parameters
     ----------
@@ -3286,7 +3385,8 @@ async def _resolve_and_enroll_speaker(
         used for embedding-based resolution and enrollment when present.
     auth_speaker_id:
         Speaker ID attached by :class:`~paramem.server.auth.BearerTokenMiddleware`
-        for per-user tokens.  ``None`` on the shared-token path.
+        for an ATTRIBUTED per-user token.  ``None`` for an unattributed
+        per-user token or auth-OFF (no store wired).
     buffer:
         Active :class:`~paramem.server.session_buffer.SessionBuffer`.
     store:
@@ -3299,7 +3399,7 @@ async def _resolve_and_enroll_speaker(
     Returns
     -------
     ResolvedSpeaker
-        All six resolution outputs; callers destructure as needed.
+        All resolution outputs; callers destructure as needed.
     """
     # Speaker resolution: auth token → embedding → session history → anonymous.
     # Never let speaker ID failure kill the request — proceed as anonymous.
@@ -3415,16 +3515,12 @@ async def _resolve_and_enroll_speaker(
     else:
         effective_language = None
 
-    # User-facing salutation: suppress the internal speaker{N} token for
-    # voice-promoted but undisclosed profiles. Internal speaker_id is kept
-    # for attribution; only the display name is dropped so the greeting
-    # prefix and the system-prompt "You are speaking with X" string skip the
-    # internal token until the user introduces themselves.
-    display_speaker: str | None = speaker
-    if speaker_id and store and store.is_anonymous(speaker_id):
-        display_speaker = None
-
-    # Check greeting before routing (applies to all paths)
+    # Check greeting before routing (applies to all paths).  The salutation
+    # is looked up directly via ``resolve_speaker_name`` — it returns
+    # ``None`` for an anonymous/undisclosed profile (the store's own
+    # suppression), which naturally yields a nameless greeting ("Good
+    # morning.") without a separate display-name field.  ``speaker_id``
+    # itself is never used as a salutation.
     greeting_prefix = None
     greeting_interval = _state["config"].voice.greeting_interval_hours
     if speaker_id and store and greeting_interval > 0:
@@ -3435,8 +3531,9 @@ async def _resolve_and_enroll_speaker(
             language=effective_language or "en",
         )
         if greeting:
-            if display_speaker:
-                greeting_prefix = f"{greeting}, {display_speaker}. "
+            greeting_name = store.resolve_speaker_name(speaker_id)
+            if greeting_name:
+                greeting_prefix = f"{greeting}, {greeting_name}. "
             else:
                 greeting_prefix = f"{greeting}. "
             store.confirm_greeting(speaker_id)
@@ -3444,7 +3541,6 @@ async def _resolve_and_enroll_speaker(
     return ResolvedSpeaker(
         speaker_id=speaker_id,
         speaker=speaker,
-        display_speaker=display_speaker,
         follow_up=follow_up,
         greeting_prefix=greeting_prefix,
         effective_language=effective_language,
@@ -3471,6 +3567,83 @@ _INVOLUNTARY_CLOUD_ONLY_REASONS: frozenset[str] = frozenset(
 #: written to the session buffer, so it can never reach a training transcript.
 _DEGRADED_SERVING_NOTICE = "My local memory is offline right now, so a cloud model is answering. "
 
+#: Prepended once per conversation when a turn is served over the relay path
+#: because no speaker could be resolved at all (``ServingPath.RELAY`` with no
+#: server-wide cloud-only condition).  Same app-layer-only, never-persisted
+#: mechanism as :data:`_DEGRADED_SERVING_NOTICE` — see :func:`_notice_once`.
+_SPEAKERLESS_RELAY_NOTICE = (
+    "I don't recognize who's speaking, so I'm answering without your personal memory. "
+)
+
+
+def _notice_once(conversation_id: str, notice_kind: str, notice: str) -> str:
+    """Return *notice* the first time requested for (*conversation_id*, *notice_kind*), else "".
+
+    Shared registry backing both :data:`_DEGRADED_SERVING_NOTICE`
+    (``notice_kind="degraded"``) and :data:`_SPEAKERLESS_RELAY_NOTICE`
+    (``notice_kind="speakerless"``) — one mechanism, one registry
+    (``_state["relay_notice_conversations"]``), keyed by the
+    ``(conversation_id, notice_kind)`` pair.  Keying on the pair — not on
+    *conversation_id* alone — means a conversation that already announced
+    one notice kind still announces the OTHER kind once, the first time it
+    applies; only a REPEAT of the same kind in the same conversation is
+    suppressed.
+
+    Parameters
+    ----------
+    conversation_id:
+        The conversation this notice would be attached to.
+    notice_kind:
+        Short discriminator for which notice this is (``"degraded"`` or
+        ``"speakerless"``) — part of the registry key alongside
+        *conversation_id*.
+    notice:
+        The notice text to gate, or ``""`` when no notice applies this turn
+        (returned unchanged without touching the registry).
+
+    Returns
+    -------
+    str
+        *notice* on the first call for this (*conversation_id*,
+        *notice_kind*) pair; ``""`` on every later call for the same pair
+        (or when *notice* was already empty).
+    """
+    if not notice:
+        return ""
+    announced: set[tuple[str, str]] = _state["relay_notice_conversations"]
+    key = (conversation_id, notice_kind)
+    if key in announced:
+        return ""
+    announced.add(key)
+    return notice
+
+
+def _abort_background_training_for_inference() -> None:
+    """Abort in-flight background training so an inference turn can acquire the GPU.
+
+    ``abort_for_inference()`` sets the per-job abort flag and waits up to
+    ``consolidation.abort_quiesce_timeout_s`` for training to stop at the
+    next step boundary and release the GPU lock; force-stops the trainer
+    (bypassing the graceful wait) if it does not abort in time.  No-op when
+    no training is running.  Called OUTSIDE ``async with gpu_lock()`` so the
+    caller's subsequent lock acquisition succeeds without contention.
+
+    Shared by every inference call site in this module that follows with
+    ``async with gpu_lock()``: the local ``handle_chat`` dispatch and the
+    relay leg (``_relay_route``) in :func:`_run_chat_turn`.
+    """
+    bg_trainer = _state.get("background_trainer")
+    if bg_trainer is not None and bg_trainer.is_training:
+        _abort_timeout = _state["config"].consolidation.abort_quiesce_timeout_s
+        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
+        if not aborted:
+            logger.warning(
+                "Training did not abort within %.1f s — forcing trainer stop before inference",
+                _abort_timeout,
+            )
+            bg_trainer._shutdown_requested = True
+            bg_trainer._is_training = False
+
 
 async def _run_chat_turn(
     *,
@@ -3478,8 +3651,6 @@ async def _run_chat_turn(
     conversation_id: str,
     speaker_id: str | None,
     speaker: str | None,
-    display_speaker: str | None,
-    history: list[dict] | None,
     speaker_embedding: list[float] | None,
     language: str | None,
     greeting_prefix: str | None,
@@ -3488,12 +3659,22 @@ async def _run_chat_turn(
 
     Encapsulates the post-speaker-resolution orchestration that is identical
     for text and voice turns: the scheduler debounce stamps, training-abort,
-    cloud-only vs local routing, session buffer appends, scheduled-training
+    relay vs local routing, session buffer appends, scheduled-training
     enqueue, and greeting prefix application.
 
     Both ``/chat`` and ``/voice`` callers are responsible for resolving
-    *display_speaker* (anonymization check) and *greeting_prefix* before
-    calling this function.
+    *greeting_prefix* before calling this function.  The relay-vs-local
+    ``ServingPath`` decision is made HERE, from *speaker_id*, via the one
+    constructor (:meth:`ServingPath.for_speaker`) — it is not threaded in
+    by the caller, so it can never drift from the ``speaker_id`` actually
+    passed (the same constructor forced routing calls independently at its
+    own fork, in the ``/chat`` handler).
+
+    Conversation history is server-authoritative: it is read from
+    ``SessionBuffer.get_session_turns(conversation_id)`` BEFORE this turn's
+    own ``buffer.append`` calls run, so it never doubles-up the current user
+    utterance — the read always happens first, and it is the only read of
+    history in this function.
 
     Parameters
     ----------
@@ -3502,15 +3683,12 @@ async def _run_chat_turn(
     conversation_id:
         Conversation / session identifier.
     speaker_id:
-        Resolved canonical speaker ID, or ``None`` for anonymous turns.
+        Resolved canonical speaker ID, or ``None`` for a speaker who could
+        not be resolved at all — drives the ``ServingPath.for_speaker``
+        decision below (``None`` → ``RELAY``).
     speaker:
         Display name of the speaker (resolved by ``_resolve_speaker``), or
         ``None``.
-    display_speaker:
-        User-facing salutation: ``None`` when the speaker is anonymous (suppress
-        the internal ``speaker{N}`` token); otherwise same as *speaker*.
-    history:
-        Prior conversation turns to pass to ``handle_chat``, or ``None``.
     speaker_embedding:
         Float embedding to attach to the user buffer entry, or ``None``.
     language:
@@ -3523,10 +3701,25 @@ async def _run_chat_turn(
     -------
     tuple[ChatResult, str]
         ``(result, spoken_text)`` where *result* is the raw
-        :class:`~paramem.server.inference.ChatResult` and *spoken_text* is
-        ``result.text`` with *greeting_prefix* prepended when applicable.
+        :class:`~paramem.server.inference.ChatResult` (token-space, as
+        persisted) and *spoken_text* is *result.text* with every
+        ``speaker{N}`` token resolved to a display name (or the third-party
+        descriptor) via :func:`~paramem.server.speaker.resolve_speaker_tokens`,
+        with *greeting_prefix* prepended AFTER that resolution.
     """
     buffer = _state["session_buffer"]
+    speaker_store = _state.get("speaker_store")
+
+    # THE typed boundary decision, derived from speaker_id alone — see the
+    # docstring above.  ``PERSONAL`` dispatches to the local ``handle_chat``
+    # path (speaker_id guaranteed non-None there).  ``RELAY`` dispatches to
+    # ``_relay_route`` with no history egress and ``identity_absent=True``,
+    # regardless of server mode.
+    serving = ServingPath.for_speaker(speaker_id)
+
+    # Read BEFORE any append below — the current turn is not yet in the
+    # buffer, so this can never include it.
+    history = buffer.get_session_turns(conversation_id)
 
     # Debounce stamps — monotonic for scheduler, wall-clock for /status display.
     # Both writes run on the asyncio event-loop thread (cooperative scheduling),
@@ -3534,26 +3727,71 @@ async def _run_chat_turn(
     _state["last_chat_time"] = datetime.now(timezone.utc)
     _state["last_chat_monotonic"] = time.monotonic()
 
-    # Cloud-only mode — route via HA graph + cloud, no local model.
-    if _state["mode"] == "cloud-only":
+    # Relay fork: the EXISTING cloud-only chain serves two distinct
+    # conditions through the one leg —
+    #   1. server-wide cloud-only mode (no local model loaded at all), or
+    #   2. this particular request carries no resolved speaker at all
+    #      (``serving is ServingPath.RELAY``), regardless of server mode.
+    # Condition 2 never egresses history and never touches parametric
+    # memory; condition 1 is the pre-existing degraded-serving behavior.
+    # A request can be both at once — the degraded notice takes priority
+    # over the speakerless notice in that case (see the notice selection
+    # below), but either alone routes here.
+    server_cloud_only = _state["mode"] == "cloud-only"
+    identity_absent = serving is ServingPath.RELAY
+    if server_cloud_only or identity_absent:
         # Degraded serving: the local model is gone for a reason the operator
         # did not choose.  The CLOUD leg is closed unless they opted in; the
         # HA leg stays open either way — HA carries no ParaMem-held knowledge
         # and runs on the user's own network, so breaking it during a GPU
-        # conflict buys no privacy.
-        degraded = _state.get("cloud_only_reason") in _INVOLUNTARY_CLOUD_ONLY_REASONS
-        cloud_permitted = not degraded or _state["config"].cloud.allow_degraded_serving
-        result = _cloud_only_route(
-            text=text,
-            speaker=display_speaker,
-            history=history,
-            config=_state["config"],
-            cloud_permitted=cloud_permitted,
-            ha_client=_state.get("ha_client"),
-            cloud_agent=_state.get("cloud_agent"),
-            language=language,
-            speaker_id=speaker_id,
+        # conflict buys no privacy.  Speakerless-only (server otherwise
+        # healthy) is not degraded — the cloud leg is fully open.
+        degraded = server_cloud_only and (
+            _state.get("cloud_only_reason") in _INVOLUNTARY_CLOUD_ONLY_REASONS
         )
+        cloud_permitted = (not degraded) or _state["config"].cloud.allow_degraded_serving
+
+        # The relay leg now runs classifier/encoder calls
+        # (``_is_personal_interrogative`` / ``is_self_referential``) and, in
+        # local mode, live-model calls (anonymize + base-model fallback) —
+        # the same GPU-touching work the local ``handle_chat`` dispatch
+        # below does.  Abort background training and hold the GPU lock for
+        # the duration, mirroring the local leg exactly (see
+        # ``_abort_background_training_for_inference``'s docstring); a
+        # cloud-only server (model is None) still takes the lock, which is
+        # cheap and harmless with no GPU work behind it.
+        _abort_background_training_for_inference()
+
+        from paramem.server.gpu_lock import gpu_lock
+
+        async with gpu_lock():
+            loop = asyncio.get_running_loop()
+            result: ChatResult = await loop.run_in_executor(
+                None,
+                lambda: _relay_route(
+                    text=text,
+                    # No history egress for a speakerless request, even when the
+                    # server is ALSO cloud-only — identity_absent is the stronger
+                    # privacy condition.  Full history (still drop-gated inside
+                    # answer_via_cloud) for a server-wide cloud-only turn from a
+                    # resolved speaker.
+                    history=([] if identity_absent else history),
+                    config=_state["config"],
+                    cloud_permitted=cloud_permitted,
+                    ha_client=_state.get("ha_client"),
+                    cloud_agent=_state.get("cloud_agent"),
+                    language=language,
+                    speaker_id=speaker_id,
+                    identity_absent=identity_absent,
+                    # Live model/tokenizer in local mode (identity_absent
+                    # turn on an otherwise-healthy server) so the relay's
+                    # cloud leg can sanitize via the local anonymizer and
+                    # the final fallback can reach the local base model;
+                    # genuinely None in server-wide cloud-only mode.
+                    model=_state.get("model"),
+                    tokenizer=_state.get("tokenizer"),
+                ),
+            )
         buffer.append(
             conversation_id,
             "user",
@@ -3570,15 +3808,22 @@ async def _run_chat_turn(
             speaker_id=speaker_id,
             speaker=speaker,
         )
-        # Degradation notice — once per conversation, first degraded turn only.
-        # Prefix order: greeting, then notice, then the answer.
-        notice = ""
+        # Notice selection — once per conversation via the shared
+        # ``_notice_once`` registry.  Degraded-serving takes priority when
+        # both conditions apply (server-wide state is the stronger signal).
+        # Prefix order: greeting, then notice, then the resolved answer —
+        # resolution happens AFTER persist (cloud_text above is what was
+        # written to the buffer), the greeting stays an app-layer prepend.
         if degraded and cloud_permitted:
-            announced: set[str] = _state["degraded_notice_conversations"]
-            if conversation_id not in announced:
-                announced.add(conversation_id)
-                notice = _DEGRADED_SERVING_NOTICE
-        spoken_text = f"{greeting_prefix or ''}{notice}{cloud_text}"
+            notice = _notice_once(conversation_id, "degraded", _DEGRADED_SERVING_NOTICE)
+        elif identity_absent:
+            notice = _notice_once(conversation_id, "speakerless", _SPEAKERLESS_RELAY_NOTICE)
+        else:
+            notice = ""
+        resolved_text = resolve_speaker_tokens(
+            cloud_text, speaker_store, current_speaker_id=speaker_id
+        )
+        spoken_text = f"{greeting_prefix or ''}{notice}{resolved_text}"
         return result, spoken_text
 
     # Local mode — normal inference with entity routing.
@@ -3587,17 +3832,7 @@ async def _run_chat_turn(
     # for training to stop at the next step boundary and release the GPU lock.
     # _active_quiesced is set OUTSIDE gpu_lock_sync so the caller's
     # async with gpu_lock() below succeeds without lock contention.
-    bg_trainer = _state.get("background_trainer")
-    if bg_trainer is not None and bg_trainer.is_training:
-        _abort_timeout = _state["config"].consolidation.abort_quiesce_timeout_s
-        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
-        if not aborted:
-            logger.warning(
-                "Training did not abort within %.1f s — forcing trainer stop before inference",
-                _abort_timeout,
-            )
-            bg_trainer._shutdown_requested = True
-            bg_trainer._is_training = False
+    _abort_background_training_for_inference()
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -3608,7 +3843,7 @@ async def _run_chat_turn(
             lambda: handle_chat(
                 text=text,
                 conversation_id=conversation_id,
-                speaker=display_speaker,
+                speaker=speaker,
                 speaker_id=speaker_id,
                 history=history,
                 model=_state["model"],
@@ -3623,10 +3858,12 @@ async def _run_chat_turn(
                 # the source mode's store. None == use config.consolidation.mode.
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
-                speaker_store=_state.get("speaker_store"),
             ),
         )
 
+    # Persist BEFORE resolving — the buffer keeps the token-space turn
+    # (speaker{N}), never the display name.  Resolution happens only at the
+    # spoken_text boundary below, after this append.
     buffer.append(
         conversation_id,
         "user",
@@ -3647,7 +3884,10 @@ async def _run_chat_turn(
     # Training was aborted (not paused) — the next job submission will resume
     # from the checkpoint automatically via the staging_resume.json path.
 
-    spoken_text = f"{greeting_prefix}{response_text}" if greeting_prefix else response_text
+    resolved_text = resolve_speaker_tokens(
+        response_text, speaker_store, current_speaker_id=speaker_id
+    )
+    spoken_text = f"{greeting_prefix}{resolved_text}" if greeting_prefix else resolved_text
     return result, spoken_text
 
 
@@ -3676,8 +3916,9 @@ class VoiceResponse(BaseModel):
         non-empty, empty string otherwise.
     follow_up:
         Server-initiated follow-up prompt sent after the reply (e.g. an
-        enrollment "What's your name?" message on the shared-token path).
-        ``None`` when no follow-up is needed.
+        enrollment "What's your name?" message on the unattributed-caller
+        path — an unattributed per-user token, or auth-OFF).  ``None``
+        when no follow-up is needed.
     """
 
     transcript: str
@@ -3841,13 +4082,15 @@ async def voice(http_request: Request):
       path).  A stable per-conversation-id from the ``x-conversation-id``
       header (or ``"voice-default"``) is used.
 
-    - **Shared token / no attributed identity** (``auth_speaker_id is None``):
-      the voice embedding IS computed and passed through
-      :func:`_resolve_and_enroll_speaker` — the same enrollment/greeting/
-      name-disclosure path as ``POST /chat``.  A fresh per-utterance
-      ``conversation_id`` is generated on each request (one POST = one
-      push-to-talk press).  The session-buffer retro-claim propagates identity
-      across conversation_ids by embedding so two-turn enrollment still works.
+    - **Unattributed token / no attributed identity** (``auth_speaker_id is
+      None`` — an unattributed per-user token minted via ``mint-user-token
+      --unattributed``, or auth-OFF mode): the voice embedding IS computed
+      and passed through :func:`_resolve_and_enroll_speaker` — the same
+      enrollment/greeting/name-disclosure path as ``POST /chat``.  A fresh
+      per-utterance ``conversation_id`` is generated on each request (one
+      POST = one push-to-talk press).  The session-buffer retro-claim
+      propagates identity across conversation_ids by embedding so two-turn
+      enrollment still works.
 
     Returns ``{"transcript": "", "reply": ""}`` when the audio is silent or
     the STT returned no text.
@@ -3897,13 +4140,15 @@ async def voice(http_request: Request):
         )
 
     # Resolve speaker from bearer token before transcription: when the device
-    # carries a per-user token, identity is authoritative and no embedding is
-    # needed (cheap path).  On the shared-token path (auth_speaker_id is None)
-    # the voice embedding is required for identification and enrollment.
+    # carries an attributed per-user token, identity is authoritative and no
+    # embedding is needed (cheap path).  An unattributed token (or auth-OFF
+    # mode) stamps no speaker_id (``auth_speaker_id is None`` either way),
+    # so the voice embedding is required for identification and enrollment.
     auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
 
-    # Compute embedding only on the shared-token path; skip on per-user token
-    # (saves CPU cost and avoids unnecessary WeSpeaker inference).
+    # Compute embedding only when no speaker was attributed by the token;
+    # skip when an attributed per-user token already gives identity (saves
+    # CPU cost and avoids unnecessary WeSpeaker inference).
     compute_embedding = auth_speaker_id is None
 
     # Transcribe and optionally compute voice embedding.
@@ -3920,15 +4165,16 @@ async def voice(http_request: Request):
     if not text:
         return VoiceResponse(transcript="", reply="")
 
-    # Per-utterance transport/enrollment id on the shared-token path: each
-    # push-to-talk press is an independent POST /voice call, so a fresh id
-    # feeds _resolve_and_enroll_speaker's unknown-speaker grouping (keyed by
-    # this id) and the LLM enrollment trigger. The retro-claim in
+    # Per-utterance transport/enrollment id on the unattributed-caller path
+    # (unattributed per-user token, or auth-OFF): each push-to-talk press
+    # is an independent POST /voice call, so a fresh id feeds
+    # _resolve_and_enroll_speaker's unknown-speaker grouping (keyed by this
+    # id) and the LLM enrollment trigger. The retro-claim in
     # session_buffer.claim_sessions_for_speaker works across these ids by
     # embedding, so two-turn enrollment still works. This id is NOT the
     # session-buffer conversation_key used below — that is derived from the
-    # RESOLVED speaker after enrollment runs. On the per-user path, a stable
-    # id allows multi-turn context.
+    # RESOLVED speaker after enrollment runs. On the ATTRIBUTED per-user
+    # path, a stable id allows multi-turn context.
     if auth_speaker_id is None:
         conversation_id = f"voice-{uuid.uuid4().hex[:12]}"
     else:
@@ -3970,7 +4216,7 @@ async def voice(http_request: Request):
     # buffer_conversation_key. Re-record the resolved speaker under the real
     # buffer key and drop the now-redundant transport-id entry so it can't
     # orphan (it never gets a session_id, so retirement-based pruning can't
-    # reach it — one leaked entry per shared-token utterance otherwise).
+    # reach it — one leaked entry per unattributed-caller utterance otherwise).
     if buffer_conversation_key != conversation_id:
         buffer.set_speaker(buffer_conversation_key, _resolved.speaker_id, _resolved.speaker or "")
         buffer.discard_open_routing_key(conversation_id)
@@ -3982,8 +4228,6 @@ async def voice(http_request: Request):
         conversation_id=buffer_conversation_key,
         speaker_id=_resolved.speaker_id,
         speaker=_resolved.speaker,
-        display_speaker=_resolved.display_speaker,
-        history=None,
         speaker_embedding=utterance.embedding,
         language=_resolved.effective_language,
         greeting_prefix=_resolved.greeting_prefix,
@@ -4078,11 +4322,12 @@ async def push_vapid_public_key():
 async def push_subscribe(body: PushSubscribeRequest, http_request: Request):
     """Register a push subscription for the authenticated speaker.
 
-    The subscription is persisted under the speaker_id bound to the
-    per-user bearer token (set by
-    :class:`~paramem.server.auth.BearerTokenMiddleware`).  Shared-token or
-    unauthenticated requests are rejected with HTTP 403.  The endpoint is
-    deduplicated per speaker — re-subscribing the same endpoint is a no-op.
+    The subscription is persisted under the speaker_id bound to an
+    ATTRIBUTED per-user bearer token (set by
+    :class:`~paramem.server.auth.BearerTokenMiddleware`).  An unattributed
+    per-user token or an unauthenticated request is rejected with HTTP 403.
+    The endpoint is deduplicated per speaker — re-subscribing the same
+    endpoint is a no-op.
 
     Request body (``application/json``) must be the browser
     ``PushSubscription.toJSON()`` shape::
@@ -4097,8 +4342,8 @@ async def push_subscribe(body: PushSubscribeRequest, http_request: Request):
     JSON
         ``{"status": "subscribed"}`` on success (new or duplicate).
     HTTP 403
-        When no per-user speaker_id is attached to the request (shared token
-        or unauthenticated).
+        When no per-user speaker_id is attached to the request (an
+        unattributed per-user token, or unauthenticated).
     HTTP 503
         When ``push_enabled`` is false or the push store is not initialised.
     """
@@ -4111,7 +4356,8 @@ async def push_subscribe(body: PushSubscribeRequest, http_request: Request):
             content={"error": "push_not_enabled"},
         )
 
-    # Require a per-user token — shared tokens do not bind to a speaker_id.
+    # Require an ATTRIBUTED per-user token — an unattributed token does not
+    # bind to a speaker_id.
     auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
     if auth_speaker_id is None:
         return JSONResponse(
@@ -7028,12 +7274,11 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     ``/debug/probe`` instead.
 
     **Auth:** gated by the ``require_admin`` dependency — requires an
-    admin-scope token (either the shared ``PARAMEM_API_TOKEN`` or a per-user
-    token minted with ``--scope admin``).  The endpoint is unreachable in
-    auth-OFF mode (no token configured) and with chat-scope tokens, so admin
-    actions are never reachable anonymously regardless of ``config.debug``.
-    A per-user admin token is accepted, allowing it to be reached without the
-    shared env token when ``mobile_pwa.enabled: true``.
+    admin-scope token minted with ``mint-user-token --scope admin`` (see
+    DEPLOYMENT.md — Per-user token management).  The endpoint is
+    unreachable in auth-OFF mode (no store configured) and with chat-scope
+    tokens, so admin actions are never reachable anonymously regardless of
+    ``config.debug``.
 
     Body: optional ``speaker_id`` query parameter — defaults to the first
     enrolled profile when omitted.  When ``buffer.debug=True`` the on-disk
@@ -7321,7 +7566,6 @@ class DebugProbeRequest(BaseModel):
     text: str
     speaker_id: str  # explicit; bypasses _resolve_speaker
     conversation_id: str = "debug-probe"
-    history: list[dict] | None = None
 
 
 @app.post("/debug/probe", response_model=ChatResponse, dependencies=[Depends(require_admin)])
@@ -7352,12 +7596,24 @@ async def debug_probe(request: DebugProbeRequest):
     if store is None:
         return JSONResponse({"status": "not_ready"}, status_code=503)
 
-    speaker_name = store.get_name(request.speaker_id)
-    if speaker_name is None:
+    # get_name is used ONLY for the existence check — it returns the RAW
+    # speaker{N} token for an anonymous-enrolled profile (name == id).  That
+    # token is no longer a suppression concern for the LOCAL system-prompt
+    # identity line: _build_system_prompt keys the "You are speaking with X"
+    # line off speaker_id presence directly (anonymous included, per the
+    # B-form prefix design), so the raw token IS the identity line for an
+    # undisclosed speaker — this is intentional, not a leak, since the
+    # speaker is talking to themselves. resolve_speaker_name stays the
+    # accessor for the two remaining name-presence-gated surfaces —
+    # ChatResponse.speaker below and the greeting salutation elsewhere in
+    # this module — both of which return None (not the raw token) for an
+    # anonymous profile until it is disclosed.
+    if store.get_name(request.speaker_id) is None:
         return JSONResponse(
             {"status": "speaker_not_found", "speaker_id": request.speaker_id},
             status_code=404,
         )
+    speaker_name = store.resolve_speaker_name(request.speaker_id)
 
     # Side-effect-free text-side language detection.  STT detection and
     # tracker.record are /chat-only side-effects and are intentionally omitted.
@@ -7365,12 +7621,19 @@ async def debug_probe(request: DebugProbeRequest):
 
     detected_language, _ = _lang_id.resolve_text_language(request.text, config.text_lang_detection)
 
+    # Server-authoritative history — same SessionBuffer read _run_chat_turn
+    # uses.  This endpoint never appends (see docstring), so a conversation_id
+    # unique to this probe call (the default) always reads back empty; that
+    # loss of ad-hoc multi-turn testing is an accepted cost of retiring the
+    # client-supplied history field.
+    buffer = _state["session_buffer"]
+    history = buffer.get_session_turns(request.conversation_id)
+
     # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
     if _state["mode"] == "cloud-only":
-        cloud_result = _cloud_only_route(
+        cloud_result = _relay_route(
             text=request.text,
-            speaker=speaker_name,
-            history=request.history,
+            history=history,
             config=config,
             cloud_permitted=(
                 _state.get("cloud_only_reason") not in _INVOLUNTARY_CLOUD_ONLY_REASONS
@@ -7381,7 +7644,10 @@ async def debug_probe(request: DebugProbeRequest):
             language=detected_language,
             speaker_id=request.speaker_id,
         )
-        return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
+        resolved_text = resolve_speaker_tokens(
+            cloud_result.text, store, current_speaker_id=request.speaker_id
+        )
+        return ChatResponse(text=resolved_text, escalated=True, speaker=speaker_name)
 
     # Local mode — abort BG trainer + acquire gpu_lock, mirroring /chat.
     bg_trainer = _state.get("background_trainer")
@@ -7403,7 +7669,7 @@ async def debug_probe(request: DebugProbeRequest):
                 conversation_id=request.conversation_id,
                 speaker=speaker_name,
                 speaker_id=request.speaker_id,
-                history=request.history,
+                history=history,
                 model=_state["model"],
                 tokenizer=_state["tokenizer"],
                 config=config,
@@ -7413,12 +7679,11 @@ async def debug_probe(request: DebugProbeRequest):
                 language=detected_language,
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
-                speaker_store=_state.get("speaker_store"),
             ),
         )
 
     return ChatResponse(
-        text=result.text,
+        text=resolve_speaker_tokens(result.text, store, current_speaker_id=request.speaker_id),
         escalated=result.escalated,
         speaker=speaker_name,
     )
@@ -12306,9 +12571,8 @@ async def backup_prune(req: BackupPruneRequest):
     )
 
 
-def _cloud_only_route(
+def _relay_route(
     text: str,
-    speaker: str | None,
     history: list[dict] | None,
     config,
     *,
@@ -12317,25 +12581,69 @@ def _cloud_only_route(
     cloud_agent=None,
     language: str | None = None,
     speaker_id: str | None = None,
+    identity_absent: bool = False,
+    model=None,
+    tokenizer=None,
 ) -> ChatResult:
-    """Route queries when the local model is unavailable (cloud-only mode).
+    """Route queries served by the relay path: HA / cloud / local base model, no PA memory.
+
+    Serves two distinct callers through the one leg: (1) server-wide
+    cloud-only mode (no local model loaded at all — the original condition
+    this function was written for, formerly named ``_cloud_only_route``),
+    and (2) a per-request speakerless turn (``ServingPath.RELAY``) served
+    this way regardless of server mode (``identity_absent=True``).  In
+    server-wide cloud-only mode ``model``/``tokenizer`` are genuinely
+    ``None`` (no local model exists — callers pass ``_state["model"]``
+    verbatim); in local mode with ``identity_absent=True`` they are the
+    live base model/tokenizer, per the owner ruling that a speakerless
+    caller's cloud egress must still go through local sanitization rather
+    than skip it entirely.
 
     HA first (has tools for weather, time, devices), cloud as fallback for
-    reasoning.  The cloud leg goes through :func:`~paramem.server.inference.
-    answer_via_cloud` — the sole cloud-egress funnel — with
-    ``model``/``tokenizer`` left ``None`` so it selects the cannot-anonymize
-    branch: with no local model there is no ParaMem-held knowledge to
-    protect on this path (``_state["model"]`` and ``["memory_store"]`` are
-    absent and ``history`` is client-supplied), so the current turn egresses
-    verbatim and history is still drop-gated.  No intent classification, no
-    personal-referent gate, no ``cloud_mode`` policy.
+    reasoning, the local base model (adapter-off, no history, no facts, no
+    speaker context) as the final fallback when a local model is loaded and
+    both hops fail or are unavailable — mirroring the documented
+    HA → cloud → local-base-model fallback chain
+    (:mod:`paramem.server.inference` module docstring).  In server-wide
+    cloud-only mode there is no local model, so the final fallback is the
+    canned limited-mode response instead.
+
+    The cloud leg goes through :func:`~paramem.server.inference.
+    answer_via_cloud` — the sole cloud-egress funnel.  With ``model``/
+    ``tokenizer`` both ``None`` (cloud-only mode) it selects the
+    cannot-anonymize branch: no local model means no ParaMem-held knowledge
+    to protect on this path, so the current turn egresses verbatim and
+    history is still drop-gated.  With a live ``model``/``tokenizer``
+    (local mode, ``identity_absent=True``) it selects the normal
+    ``sanitization.cloud_mode`` policy — the SAME anonymize/block/both
+    policy every other leg applies — keyed off ``is_personal`` computed
+    below from :func:`~paramem.server.sanitizer.is_self_referential`.  No
+    intent classification (routing requires a resolved ``speaker_id``, so
+    there is no ``RoutingPlan`` to consult here), and — same as every
+    other leg — no speaker name or id reaches the cloud system prompt.
+
+    When ``identity_absent`` is True and the turn is itself a personal
+    interrogative (:func:`~paramem.server.inference._is_personal_interrogative`
+    — the SAME shared predicate the abstention gate uses, over the
+    ``is_self_referential`` verdict computed here), this returns the
+    canned no-identity response BEFORE the HA leg is even tried — there is
+    no speaker for a personal question to be about, and asking HA does not
+    change that.  This short-circuit is NEVER gated on
+    ``config.abstention.enabled`` (see
+    :func:`~paramem.server.inference._is_personal_interrogative`'s
+    docstring): refusing here is a structural impossibility (no identity,
+    no store), not a feature toggle.  Non-personal and declarative turns
+    fall through to the normal HA → cloud → base-model dispatch below,
+    unaffected by ``identity_absent`` beyond the ``is_personal`` verdict
+    threaded into the cloud leg.
 
     Args:
         text: The user's turn, verbatim.
-        speaker: Display name of the resolved speaker, or ``None``.
         history: Prior conversation turns, or ``None``.  Drop-gated by
             :func:`~paramem.server.inference._sanitize_history` (inside
-            ``answer_via_cloud``) before it egresses.
+            ``answer_via_cloud``) before it egresses.  Callers pass ``[]``
+            for a speakerless turn — no history egress at all, per the
+            ``ServingPath.RELAY`` contract.
         config: The live :class:`~paramem.server.config.ServerConfig`.
         cloud_permitted: Whether the CLOUD leg may be used.  Computed by the
             caller (``_run_chat_turn``) from ``_state["cloud_only_reason"]``
@@ -12346,18 +12654,40 @@ def _cloud_only_route(
         ha_client: HA client, or ``None`` when HA is not configured.
         cloud_agent: Cloud agent, or ``None`` when cloud is not configured.
         language: Resolved BCP-47 code for this turn, or ``None``.
-        speaker_id: Resolved canonical speaker ID, or ``None`` for anonymous
-            turns; threaded through to the first-person detector on the
-            history channel.
+        speaker_id: Resolved canonical speaker ID, or ``None`` for a
+            speakerless turn.  Live production consumer:
+            :func:`~paramem.graph.flows.anonymize_turn` (via
+            ``answer_via_cloud``'s anonymize branch) when ``model``/
+            ``tokenizer`` are live — always ``None`` on this path since
+            ``identity_absent`` is what selects that branch.
+        identity_absent: ``True`` when this turn carries no resolved speaker
+            at all (``ServingPath.RELAY``) — gates the no-identity
+            short-circuit described above.  ``False`` (default) preserves
+            the original server-wide-cloud-only behavior unchanged.
+        model: The live base model for the local-mode relay leg (anonymize
+            branch + base-model fallback), or ``None`` in server-wide
+            cloud-only mode (no local model exists).
+        tokenizer: Paired with *model*; ``None`` under the same condition.
 
     Returns:
         The answering leg's :class:`~paramem.server.inference.ChatResult`, or
-        the canned limited-mode result when neither leg served the turn.
+        the canned limited-mode result when no leg served the turn.
     """
+    is_personal_turn = False
+    if identity_absent:
+        from paramem.server.inference import _is_personal_interrogative
+
+        is_personal_turn = is_self_referential(
+            text, personal_referent_config=config.personal_referent
+        )
+        if _is_personal_interrogative(text, config, is_personal=is_personal_turn):
+            logger.info("Relay route: no-identity short-circuit (personal interrogative)")
+            return ChatResult(text=config.abstention.load_no_identity_response())
+
     # Try HA conversation agent — it has tools and real-time data
     # Language passed via HA's native conversation API parameter
     if ha_client is not None:
-        logger.debug("Cloud-only route: trying HA agent for: %s", text[:100])
+        logger.debug("Relay route: trying HA agent for: %s", text[:100])
         ha_languages = config.tools.ha.supported_languages
         response_text = ha_client.conversation_process(
             text,
@@ -12366,37 +12696,66 @@ def _cloud_only_route(
             supported_languages=ha_languages,
         )
         if response_text is not None:
-            logger.info("Cloud-only route: HA agent responded")
+            logger.info("Relay route: HA agent responded")
             return ChatResult(text=response_text, escalated=True)
-        logger.info("Cloud-only route: HA agent failed, trying cloud")
+        logger.info("Relay route: HA agent failed, trying cloud")
 
     # HA failed or unavailable → try cloud for reasoning
     if cloud_agent is not None and not cloud_permitted:
         logger.warning(
-            "Cloud-only route: cloud leg closed (degraded serving; "
+            "Relay route: cloud leg closed (degraded serving; "
             "set cloud.allow_degraded_serving: true to open it)"
         )
     elif cloud_agent is not None:
-        logger.info("Cloud-only route: escalating to cloud")
+        logger.info("Relay route: escalating to cloud")
         result = answer_via_cloud(
             text,
             cloud_agent,
             config,
-            model=None,
-            tokenizer=None,
-            speaker=speaker,
+            is_personal=is_personal_turn,
+            model=model,
+            tokenizer=tokenizer,
             speaker_id=speaker_id,
             history=history,
             language=language,
             cloud_permitted=cloud_permitted,
         )
         if result is not None and result.text:
-            logger.info("Cloud-only route: Cloud responded")
+            logger.info("Relay route: cloud responded")
             return result
 
-    logger.warning("Cloud-only route: all services failed")
+    if model is not None and tokenizer is not None:
+        # Final link of the documented fallback chain: the local base
+        # model, adapter-off (inside ``_base_model_answer``), no history,
+        # no recalled facts, no speaker context (``history=None``,
+        # ``speaker_id=None``).  ``cloud_agent``/``ha_client`` are passed
+        # as ``None`` so a base-model [ESCALATE] cannot re-open a hop that
+        # already failed or was closed above (and cannot bypass the
+        # ``cloud_permitted`` gate, which ``_maybe_escalate``'s internal
+        # cloud call does not itself receive).
+        logger.info("Relay route: HA and cloud unavailable — falling back to local base model")
+        from paramem.server.inference import _base_model_answer
+
+        return _base_model_answer(
+            text,
+            None,
+            model,
+            tokenizer,
+            config,
+            cloud_agent=None,
+            ha_client=None,
+            speaker=None,
+            speaker_id=None,
+            language=language,
+            is_personal=False,
+        )
+
+    logger.warning("Relay route: all services failed")
     return ChatResult(
-        text="I'm running in limited mode right now. Please try again later.",
+        # Caller-centric: describes what happened to THIS request (nothing
+        # answered it), not the server's internal operating mode — the
+        # caller has no use for the "limited mode" label.
+        text="I can't answer that right now. Please try again shortly.",
         escalated=True,
     )
 
@@ -15591,8 +15950,10 @@ async def _run_enrollment_for_speaker(
     if not store or not model or not tokenizer:
         return None
 
-    all_turns: list[dict] = list(extra_turns) if extra_turns else []
-    all_turns.extend(buffer.get_session_turns(conv_id))
+    # Chronological order: prior session turns first, then the live turn
+    # (extra_turns) last — get_session_turns returns turns in append order,
+    # so the live turn (not yet appended to the buffer) belongs after them.
+    all_turns: list[dict] = buffer.get_session_turns(conv_id) + list(extra_turns or [])
 
     if not all_turns:
         return None

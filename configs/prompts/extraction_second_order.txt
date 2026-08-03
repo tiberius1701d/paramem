@@ -1,4 +1,4 @@
-For each person NAMED in the transcript other than the speaker, extract the facts the transcript states ABOUT THEM — the facts where THAT PERSON is the subject.{speaker_context}
+The named non-speaker people in this transcript are exactly: {named_people}. Extract the facts the transcript states ABOUT each of these people — the facts where THAT PERSON is the subject. Do not extract facts about anyone else: not the speaker, and not the addressee of [assistant] turns ("you"/"your"/"You are ...").{speaker_context}
 
 Emit each such fact as a relation whose SUBJECT is the named person: their location (Name → lives_in → City), job (Name → works_at → Org), possessions, and traits are EACH a separate relation on that person's own node. Do NOT emit the speaker's relationship to them (e.g. speaker0 → has_brother → Name) — that is already recorded elsewhere. Do NOT put the speaker in the subject slot. Never drop a stated location, job, or trait of a named person.
 

@@ -17,17 +17,143 @@ this module only stores and matches pre-computed embeddings.
 import json
 import logging
 import math
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
-from paramem.utils.identity import SPEAKER_ID_PREFIX
+from paramem.graph.prompts import _load_speaker_directive_section
+from paramem.utils.identity import (
+    SPEAKER_ID_PREFIX,
+    SPEAKER_NEAR_MISS_RE,
+    SPEAKER_TOKEN_RE,
+    canonical,
+)
 
 logger = logging.getLogger(__name__)
 
 _PROFILE_VERSION = 6
+
+# Loaded once at module import time; fails loud if speaker_directive.txt is
+# missing.  This is the fallback label substituted at the reply boundary
+# (:func:`resolve_speaker_tokens`) for a ``speaker{N}`` token that cannot be
+# resolved to a display name (unknown id, or an anonymous-enrolled profile).
+THIRD_PARTY_DESCRIPTOR: str = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+
+
+def resolve_speaker_tokens(
+    text: str,
+    speaker_store: "SpeakerStore | None",
+    *,
+    current_speaker_id: str | None = None,
+    unresolvable_fallback: Literal["descriptor", "verbatim"] = "descriptor",
+) -> str:
+    """Substitute every ``speaker{N}`` token in *text* with its display name.
+
+    THE single reply-boundary resolver.  Every model-facing surface — recalled
+    facts, reasoning context, generated replies, persisted transcripts,
+    cloud-bound system prompts — keeps the raw ``speaker{N}`` token throughout;
+    this is the one place a token is ever swapped for a human-readable name,
+    and it is applied only to text about to be shown or spoken to a human,
+    never to text a model will read.
+
+    Matching is case-insensitive (so a model-authored sentence-initial
+    "Speaker0" still resolves); each match is canonicalized to the stored
+    lowercase form before the lookup.  When *speaker_store* is ``None``, or
+    :meth:`SpeakerStore.resolve_speaker_name` returns ``None`` for a token
+    (unknown id, or an anonymous-enrolled profile whose name has not been
+    disclosed), the token is resolved as follows:
+
+    * If the token names the CURRENT speaker (``canonical(token) ==
+      canonical(current_speaker_id)``) — i.e. an anonymous/undisclosed
+      speaker's own token referring to themselves — it is left verbatim
+      (unresolved) regardless of *unresolvable_fallback*.  Rendering an
+      undisclosed speaker as a third party to themselves would be a wrong
+      statement about identity; leaving the internal token visible is the
+      honest fail-safe until the name is disclosed.
+    * Otherwise (a genuinely unresolvable id, or a token naming someone
+      other than *current_speaker_id*), *unresolvable_fallback* decides:
+      ``"descriptor"`` (default) substitutes :data:`THIRD_PARTY_DESCRIPTOR`;
+      ``"verbatim"`` leaves the raw token untouched, same as the self-token
+      case above.
+
+    Substitution matches :data:`~paramem.utils.identity.SPEAKER_TOKEN_RE`
+    strictly — it does not widen to catch a near-miss re-rendering (e.g. a
+    model writing "Speaker 0" or "speaker_0" instead of "speaker0").
+    Widening substitution is an open owner decision, not a default made
+    here.  After substitution, any
+    :data:`~paramem.utils.identity.SPEAKER_NEAR_MISS_RE` survivor in the
+    output is logged at WARNING — the internal id would otherwise reach the
+    user with no trace.  Only the matched shape is logged, never the
+    surrounding text, which is personal content.
+
+    Idempotent by construction under the default ``"descriptor"`` fallback:
+    the output contains no ``speaker{N}`` tokens (other than a surviving
+    self-token fail-safe, which is already the caller's own id and
+    therefore not a leak), so re-running this function on its own output is
+    a no-op.  Under ``"verbatim"`` a genuinely-unresolvable token instead
+    survives into the output verbatim (by design — see the Wyoming TTS
+    second-application call site), so a THIRD re-run under the default mode
+    would still resolve it there; ``"verbatim"`` is intended for a call
+    site's own idempotent second application, not for chaining two
+    ``"verbatim"`` calls.
+
+    Args:
+        text: Model-facing or human-facing text that may contain raw
+            ``speaker{N}`` tokens.
+        speaker_store: Store used to resolve tokens to display names, or
+            ``None`` (every token falls back per *unresolvable_fallback*,
+            subject to the self-token fail-safe above).
+        current_speaker_id: The speaker this reply is being generated for,
+            or ``None`` when unknown (e.g. the cloud-only route, or a
+            caller — such as the Wyoming TTS handler's idempotent
+            second-application — that has no notion of "the current
+            speaker").  Drives the self-token fail-safe only; has no effect
+            on tokens naming anyone else.
+        unresolvable_fallback: How to render a token that resolves to
+            neither a display name nor the current speaker's own id.
+            ``"descriptor"`` (default) — the app-layer reply-boundary
+            behavior: collapse to :data:`THIRD_PARTY_DESCRIPTOR`.  Every
+            app-layer exit (``/chat``, ``/voice``, ``/debug/probe``) uses
+            this, always paired with a real ``current_speaker_id``.
+            ``"verbatim"`` — used ONLY by the Wyoming TTS handler's
+            defensive second application (``wyoming_handler.py``, which has
+            no ``current_speaker_id`` to pass): anything unresolvable that
+            reaches TTS synthesis is either a self-token (already handled,
+            deliberately verbatim) or a contract violation (text that
+            skipped the app-layer resolver) — verbatim is the fail-safe for
+            the latter, since silently rendering it as "another speaker"
+            would be a worse failure than leaving the raw token audible.
+
+    Returns:
+        *text* with every ``speaker{N}`` token replaced.
+    """
+
+    def _sub(match: re.Match) -> str:
+        token = canonical(match.group(0))
+        name = speaker_store.resolve_speaker_name(token) if speaker_store else None
+        if name:
+            return name
+        if current_speaker_id is not None and token == canonical(current_speaker_id):
+            return match.group(0)
+        if unresolvable_fallback == "verbatim":
+            return match.group(0)
+        return THIRD_PARTY_DESCRIPTOR
+
+    result = SPEAKER_TOKEN_RE.sub(_sub, text)
+
+    for near_miss in SPEAKER_NEAR_MISS_RE.finditer(result):
+        logger.warning(
+            "speaker-id near-miss shape survived reply-boundary resolution "
+            "(left unsubstituted — matched shape only, never the surrounding "
+            "text): %r",
+            near_miss.group(0),
+        )
+
+    return result
 
 
 @dataclass

@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from paramem.cloud.admission import OPENAI_COMPAT_ENDPOINTS, OPENAI_COMPAT_PROVIDERS
 from paramem.cloud.anonymize import AnonymizedContract
@@ -82,7 +83,7 @@ class ExtractionFailed(RuntimeError):
 #
 # 8192 is sized for Mistral 7B against document chunks up to
 # ``paramem.graph.document_chunker._DOC_MAX_TOKENS``, the local chunker's
-# max — currently ~934 words (_DOC_MAX_TOKENS is DERIVED from the
+# max — currently ~982 words (_DOC_MAX_TOKENS is DERIVED from the
 # anonymize-call token envelope rather than an independent ~1500-word
 # heuristic, and that derivation itself consumes the empirical figure
 # below). Empirical worst-case observed output for a dense resume chunk was
@@ -516,15 +517,6 @@ def extract_procedural_graph(
     return graph
 
 
-# Filename of the second-order extraction pass — it extracts facts ABOUT
-# the named entities local_extract (first-order) surfaced, recovering a
-# named relative's own attribute (location, job, trait) when Mistral 7B
-# collapses a single-relative clause ("my brother Nadeem lives in Porto")
-# into ONE relation instead of two. Reuses DEFAULT_SYSTEM_PROMPT_FILENAME —
-# no second-order-specific system prompt.
-DEFAULT_SECOND_ORDER_USER_PROMPT_FILENAME = "extraction_second_order.txt"
-
-
 def _run_local_extraction(
     model,
     tokenizer,
@@ -544,6 +536,8 @@ def _run_local_extraction(
     *,
     phase_name: str,
     vram_label: str = "extract_main",
+    extra_slots: dict[str, str] | None = None,
+    postprocess: Callable[[SessionGraph], SessionGraph] | None = None,
 ) -> SessionGraph:
     """Shared generate→parse→summarise→trace primitive for a local-model
     extraction phase.
@@ -565,6 +559,28 @@ def _run_local_extraction(
     — mirrors pre-carve-out ``local_extract`` behaviour. The caller decides
     what an empty result means (``local_extract``'s caller returns
     immediately; ``second_order_extract``'s caller has nothing to union).
+
+    Args:
+        extra_slots: Additional ``.format()`` kwargs for the user prompt
+            template, beyond the always-supplied ``transcript`` and
+            ``speaker_context``. ``None`` (default) supplies none — every
+            existing caller is unaffected. ``second_order_extract`` passes
+            ``{"named_people": ...}`` to thread its gate-derived closed
+            target set into ``extraction_second_order.txt``'s
+            ``{named_people}`` slot.
+        postprocess: Optional caller-supplied enforcement hook, applied to
+            the freshly-parsed graph BEFORE :func:`_summarise_graph` runs
+            for the phase trace — so the trace's ``parsed`` snapshot
+            reflects the graph the caller actually keeps, not the raw
+            parse. ``None`` (default) applies no enforcement; every
+            existing caller is unaffected.
+            ``second_order_extract`` (:func:`~paramem.graph.flows.
+            _stage_second_order_extract`) is the one caller that supplies
+            one — its off-target-subject remap/drop enforcement — so the
+            ``second_order_extract`` phase's trace counts match what
+            actually reaches ``graph.relations``/``graph.entities``. Never
+            called on the parse-failure path (the caller has nothing to
+            enforce over an empty graph).
     """
     with phase_trace(phase_name) as t:
         raw_output = _generate_extraction(
@@ -581,6 +597,7 @@ def _run_local_extraction(
             model_alias=model_alias,
             seed=seed,
             vram_label=vram_label,
+            extra_slots=extra_slots,
         )
         t.set_raw(raw_output)
         logger.debug("Raw extraction output (%s): %s", phase_name, raw_output[:500])
@@ -605,6 +622,8 @@ def _run_local_extraction(
                 session_id=session_id,
                 timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
             )
+        if postprocess is not None:
+            graph = postprocess(graph)
         t.set_parsed(_summarise_graph(graph))
     return graph
 
@@ -624,6 +643,7 @@ def _generate_extraction(
     model_alias: str | None = None,
     seed: int | None = None,
     vram_label: str = "extract_main",
+    extra_slots: dict[str, str] | None = None,
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
@@ -650,6 +670,18 @@ def _generate_extraction(
     (``local_extract``/``second_order_extract``); callers with a distinct
     VRAM-telemetry identity (e.g. ``extract_procedural_graph`` using
     ``"procedural"``) override it.
+
+    ``extra_slots`` supplies additional **user**-template ``.format()``
+    kwargs alongside ``transcript``/``speaker_context`` — e.g.
+    ``second_order_extract`` supplies ``{"named_people": ...}`` for
+    ``extraction_second_order.txt``'s ``{named_people}`` slot. ``None``
+    (default) adds nothing; a caller whose template references a slot not
+    supplied here or by ``extra_slots`` raises ``KeyError`` at
+    ``.format()`` time. A key in ``extra_slots`` that collides with
+    ``transcript``/``speaker_context`` raises ``TypeError`` (``dict()``'s
+    own "got multiple values for keyword argument" — the kwargs dict is
+    built as ``dict(transcript=..., speaker_context=..., **extra_slots)``)
+    rather than silently overwriting either always-supplied slot.
     """
     system, prompt = load_extraction_prompts(
         prompts_dir,
@@ -661,6 +693,7 @@ def _generate_extraction(
     format_kwargs = dict(
         transcript=transcript,
         speaker_context=speaker_context,
+        **(extra_slots or {}),
     )
     messages = [
         {"role": "system", "content": system},
@@ -705,7 +738,13 @@ def _parse_extraction(
     model output quirks via _normalize_extraction. Local models occasionally
     emit a bare JSON array of fact dicts instead of the expected
     ``{"entities": [...], "relations": [...]}`` envelope; that case is
-    rewrapped here so downstream normalization can proceed.
+    rewrapped here so downstream normalization can proceed. A model that
+    wraps the whole envelope dict in a one-element list (``[{"entities":
+    [...], "relations": [...]}]``, observed live) never reaches this
+    function as a list at all — :func:`~paramem.cloud.deanonymize.
+    _extract_json_block` unwraps that shape to the inner envelope dict's
+    JSON at the shared parsing primitive, the one boundary every
+    structured-output parser in this module shares.
 
     After schema validation, :func:`_stamp_speaker_entity` is called to stamp
     ``speaker_id`` on every entity whose name is a speaker id (``speaker{N}``
@@ -735,8 +774,11 @@ def _parse_extraction(
     data = json.loads(json_str)
 
     if isinstance(data, list):
-        # Bare list of facts — wrap as a relations payload. _normalize_extraction
-        # walks ``relations`` and infers the entity set from subject/object.
+        # A list here is always a bare fact list — _extract_json_block
+        # already unwrapped the "whole envelope wrapped in a one-element
+        # list" shape to the inner dict, so `data` is a dict in that case.
+        # Wrap as a relations payload; _normalize_extraction walks
+        # ``relations`` and infers the entity set from subject/object.
         data = {"relations": data, "entities": []}
     elif not isinstance(data, dict):
         raise ValueError(f"Unexpected extraction payload type: {type(data).__name__}")
@@ -1100,7 +1142,6 @@ def _fallback_plausibility_on_raw(
     tokenizer,
     reason: str,
     *,
-    speaker_name: str | None = None,
     speaker_id: str,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
@@ -1534,6 +1575,8 @@ def request_enrichment(
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
     prompts_dir: str | Path | None = None,
     prompt_filename: str = "cloud_enrichment.txt",
+    *,
+    speaker_id: str,
 ) -> tuple["EnrichmentDelta | None", str | None, dict]:
     """Cloud enrichment call — coreference + compound splitting + safe
     reification.
@@ -1597,11 +1640,25 @@ def request_enrichment(
     ``prompt_filename`` parameter on
     :func:`~paramem.cloud.anonymize.anonymize_transcript` and
     :func:`judge_plausibility`.
+
+    ``speaker_id`` fills the prompt's ``{speaker_id}`` slot — THIS
+    session's own speaker anchor (e.g. ``"speaker0"``, ``"speaker1"``),
+    so the "Speaker identity" binding in ``cloud_enrichment.txt`` names
+    the correct household member as the transcript's ``[user]`` instead
+    of hardcoding ``speaker0`` for every session (the multi-speaker
+    session binding fix). Keyword-required, no default — a silently
+    degraded prompt (a blank speaker anchor) is worse than a loud
+    ``TypeError`` at the one production call site. The production caller
+    (the ``enrich`` stage, :func:`~paramem.graph.stage_enrich._stage_enrich`)
+    always threads ``ctx.speaker_id``, itself a required, non-empty field
+    (:class:`~paramem.graph.flow.StageContext`).
     """
     enrichment_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
     system_prompt = _load_prompt("cloud_enrichment_system.txt", required=True)
     facts_json, transcript_text = _cloud_facing_payload(anon_facts, anon_transcript)
-    prompt = enrichment_prompt.format(facts_json=facts_json, transcript=transcript_text)
+    prompt = enrichment_prompt.format(
+        facts_json=facts_json, transcript=transcript_text, speaker_id=speaker_id
+    )
     last_raw: str | None = None
     responded = False
     for attempt in range(1, _ENRICHMENT_MAX_ATTEMPTS + 1):
@@ -2083,11 +2140,19 @@ class EnrichmentDelta:
 def _parse_enrichment_delta(raw: str | None, n_facts: int) -> EnrichmentDelta | None:
     """Parse the cloud enrichment judge's delta-envelope output.
 
-    Returns an :class:`EnrichmentDelta` on success; ``None`` on parse
-    failure, which propagates through :func:`request_enrichment` to a
-    raised :class:`ExtractionFailed` at the ``cloud_enrich`` call site —
-    an unparseable enrichment response fails the cycle, it does not fall
-    back to the pre-enrichment facts.
+    Returns an :class:`EnrichmentDelta` on success; ``None`` when every
+    retry attempt inside :func:`request_enrichment` either got no
+    response at all or never returned the delta-envelope shape — the two
+    causes :func:`request_enrichment`'s ``info["parse_path"]`` distinguishes
+    (``"no_response"`` vs. ``"failed"``). The ``cloud_enrich`` call site
+    (:func:`~paramem.graph.stage_enrich._stage_enrich`) branches on that
+    distinction, NOT on this function's return value alone: ``"no_response"``
+    (the provider was unreachable on every attempt) raises
+    :class:`ExtractionFailed` so the batch aborts and its sessions stay
+    pending for a clean retry; ``"failed"`` (the provider answered but never
+    in the expected shape) fails OPEN — it keeps the pre-enrichment facts,
+    records a ``cloud_enrichment_degraded`` diagnostic, and the cycle
+    completes. A parse failure does NOT unconditionally abort the cycle.
 
     * ``add``      — list of new fact dicts to append.
     * ``modify``   — list of ``(index, fields_dict)`` tuples; each entry
@@ -2303,12 +2368,18 @@ def _apply_enrichment_delta(
     Returns ``(facts, updated_transcript, report)``.  Unlike the retired
     whole-delta gate, this function ALWAYS returns a fact list — there is
     no parse-failure branch here: ``delta`` is already a parsed
-    :class:`EnrichmentDelta`, and a parse failure is handled one level up
-    by :func:`request_enrichment` (returning ``delta=None`` before this
-    function is ever called; the caller — the ``enrich`` stage,
-    :func:`~paramem.graph.stage_enrich._stage_enrich` — raises
-    :class:`ExtractionFailed` on that ``None``, never calling this
-    function at all).
+    :class:`EnrichmentDelta`, and a parse failure (``delta=None`` from
+    :func:`request_enrichment`) is handled one level up, BEFORE this
+    function is ever called, by the caller — the ``enrich`` stage,
+    :func:`~paramem.graph.stage_enrich._stage_enrich`. That caller does
+    NOT unconditionally raise on ``None``: it branches on
+    ``info["parse_path"]`` — ``"no_response"`` (provider unreachable on
+    every attempt) raises :class:`ExtractionFailed` so the batch aborts;
+    ``"failed"`` (provider answered but never in the expected shape) fails
+    OPEN, keeping the pre-enrichment facts and recording a
+    ``cloud_enrichment_degraded`` diagnostic — this function is not called
+    either way, since both branches already know their fact list without
+    an ``EnrichmentDelta`` to apply.
 
     ``scope`` supplies the resolvability domain — ``set(scope.resolution)``
     when given.  ``scope is None`` is a deliberate sentinel (the

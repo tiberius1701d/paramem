@@ -602,7 +602,8 @@ class GraphMerger:
         fallback path produce the same node key, preventing casing-collision dups.
         The display name lives at ``node_data["attributes"]["name"]``; for speakers
         this is the same lowercase ``speaker{N}`` string — resolved to a human
-        name at render time by the Phase-B resolver.
+        name only at the reply boundary, by
+        :func:`~paramem.server.speaker.resolve_speaker_tokens`.
 
         Two enrolled speakers who share a display name (e.g. both ``"Alex"``)
         keep separate graph nodes because their ``speaker_id`` values differ by
@@ -691,9 +692,11 @@ class GraphMerger:
         e.g. ``"speaker0"`` — see :meth:`_resolve_entity`).  The node's
         ``speaker_id`` attribute carries the same lowercase id.
         ``attributes["name"]`` stores the same lowercase ``speaker{N}`` id
-        and IS refreshed on update.  Display-name resolution happens at the
-        fact-render boundary via ``resolve_speaker_name``, not at graph-write time.
-        For non-speaker entities ``attributes["name"]`` is first-seen-wins only.
+        and IS refreshed on update.  Display-name resolution happens only at
+        the reply boundary via
+        :func:`~paramem.server.speaker.resolve_speaker_tokens`, not at
+        graph-write time.  For non-speaker entities ``attributes["name"]``
+        is first-seen-wins only.
         """
         is_speaker = entity.speaker_id is not None
 

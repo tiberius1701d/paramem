@@ -1,34 +1,44 @@
 """Bearer-token authentication middleware for the ParaMem REST server.
 
-Opt-in via the ``PARAMEM_API_TOKEN`` environment variable (shared legacy token)
-and/or a populated :class:`~paramem.server.user_tokens.UserTokenStore` (per-user
-tokens, wired by the app lifespan).
+Opt-in via a populated :class:`~paramem.server.user_tokens.UserTokenStore`
+(per-user tokens, wired by the app lifespan — see
+``paramem.server.app._build_user_token_store``).  There is no separate
+shared-token credential: every accepted token is a ``UserTokenStore`` entry,
+attributed to a speaker or not.  ``PARAMEM_API_TOKEN`` survives only as the
+CARRIER env var infra consumers (the systemd scheduling timer, the HA custom
+component) read to source their own ``Authorization`` header value — the
+value itself must be a token minted into the store (typically an
+unattributed admin token, ``mint-user-token --unattributed --scope admin
+--force-admin``).  This module does not use that env var as a credential —
+its ONE read of it, in :func:`log_startup_posture`, is a fail-open migration
+guard: a pre-migration deployment that set it as the old shared-token
+credential and never minted a per-user token would otherwise land OPEN
+silently on upgrade, with the operator's old token ignored and no signal
+that anything changed.
 
 Behavior:
-- Token **unset** and no user-token store wired → no token check is performed
-  (any request passes through), but the request is stamped with the non-admin
-  ``"chat"`` scope, so administrative endpoints (gated by ``require_admin``)
-  stay locked until a credential is configured — fail-closed admin.  A single
-  WARN is emitted at startup ("auth disabled").
-- Token **set** or a user-token store is wired → every REST request must carry
-  a valid token in ``Authorization: Bearer <token>`` or the configured cookie.
-  Missing or invalid tokens return HTTP 401 with a JSON error.  A wired store
-  with zero active tokens stays **fail-closed** (all requests 401) so that
-  revoking the last token does not silently re-open every endpoint.
+- No user-token store wired (getter is ``None`` or returns ``None``) → no
+  token check is performed (any request passes through), but the request is
+  stamped with the non-admin ``"chat"`` scope, so administrative endpoints
+  (gated by ``require_admin``) stay locked until a store is configured —
+  fail-closed admin.  A single WARN is emitted at startup ("auth disabled").
+- A user-token store is wired → every REST request must carry a valid token
+  in ``Authorization: Bearer <token>`` or the configured cookie.  Missing or
+  invalid tokens return HTTP 401 with a JSON error.  A wired store with zero
+  active tokens stays **fail-closed** (all requests 401) so that revoking the
+  last token does not silently re-open every endpoint.
 
 Two-mode (Security OFF/ON) model:
 
-- **OFF** — ``_enabled`` (static shared-token check) is ``False`` AND no
-  user-token store is wired (getter is ``None`` or returns ``None``).  Chat/
-  voice endpoints (unguarded by any scope check) remain reachable; admin
-  endpoints 403 via ``require_admin`` until a token/store is configured.
-- **ON-shared** — ``PARAMEM_API_TOKEN`` is set.  All requests validated via
-  constant-time comparison.  No ``speaker_id`` attached (legacy = unattributed).
-- **ON-per-user** — a :class:`~paramem.server.user_tokens.UserTokenStore` is
-  wired via ``user_token_getter`` and has active tokens.  Authorized requests
-  have ``scope["state"]["speaker_id"]`` set to the matched speaker.
-- **ON-both** — both shared token and per-user store active.  Shared token
-  checked first; per-user store is the fallback.
+- **OFF** — no user-token store is wired.  Chat/voice endpoints (unguarded by
+  any scope check) remain reachable; admin endpoints 403 via
+  ``require_admin`` until a store is configured (i.e. until the first
+  ``mint-user-token``).
+- **ON** — a :class:`~paramem.server.user_tokens.UserTokenStore` is wired via
+  ``user_token_getter``.  Every accepted token carries a capability scope
+  (``chat`` / ``admin``) and, for an attributed token, a ``speaker_id`` —
+  authorized requests have ``scope["state"]["speaker_id"]`` set to the
+  matched speaker; an unattributed token leaves it unset.
 
 Token extraction order (per request):
 1. ``Authorization: Bearer <token>`` header.
@@ -38,9 +48,8 @@ Path exemption:
 - Paths in ``exempt_paths`` or starting with any prefix in ``exempt_prefixes``
   pass through without token checks (e.g. PWA shell, manifest).
 
-Constant-time comparison (``hmac.compare_digest``) applies to the legacy shared
-token.  Per-user tokens use a dict lookup keyed by ``sha256(token)`` — no
-iteration required.
+Per-user tokens use a dict lookup keyed by ``sha256(token)`` — no iteration,
+no timing exposure from a linear scan.
 
 Implemented as pure ASGI middleware — Starlette's ``BaseHTTPMiddleware``
 wraps every request/response in a task-group and memory-object-stream which
@@ -55,7 +64,6 @@ layer by the Windows Firewall rule scoping (``PARAMEM_NAS_IP``).
 
 from __future__ import annotations
 
-import hmac
 import http.cookies
 import json
 import logging
@@ -68,7 +76,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-TOKEN_ENV_VAR = "PARAMEM_API_TOKEN"
 AUTH_HEADER = "authorization"
 BEARER_PREFIX = "Bearer "
 
@@ -82,23 +89,20 @@ class BearerTokenMiddleware:
     Accepts tokens via ``Authorization: Bearer <token>`` header or a cookie
     named by *cookie_name*.  Header takes precedence over cookie.
 
-    Two authentication paths:
-    - **Shared (legacy)**: constant-time comparison against *token*.
-    - **Per-user**: dict lookup on ``sha256(presented)`` against the
-      :class:`~paramem.server.user_tokens.UserTokenStore` returned by
-      *user_token_getter*.  Authorized requests carry
-      ``scope["state"]["speaker_id"]``.
+    Single authentication path — **per-user**: dict lookup on
+    ``sha256(presented)`` against the
+    :class:`~paramem.server.user_tokens.UserTokenStore` returned by
+    *user_token_getter*.  Authorized requests carry
+    ``scope["state"]["scope"]`` (``"chat"`` / ``"admin"``) and, for an
+    attributed token, ``scope["state"]["speaker_id"]``.
 
-    When *token* is empty and *user_token_getter* is ``None`` (or returns
-    ``None``), no token is required (Security OFF), but the request is
-    stamped with the non-admin ``"chat"`` scope rather than ``"admin"`` —
-    fail-closed admin: chat/voice endpoints stay reachable, administrative
-    endpoints 403 via ``require_admin`` until a credential is configured.  A
-    wired store with zero active tokens is **fail-closed** (401) so that
-    revoking the last token does not silently open every endpoint.
-
-    The ``enabled`` property reflects the *static* shared-token part only.
-    Dynamic per-user enablement is computed per request from the store.
+    When *user_token_getter* is ``None`` (or returns ``None``), no token is
+    required (Security OFF), but the request is stamped with the non-admin
+    ``"chat"`` scope rather than ``"admin"`` — fail-closed admin: chat/voice
+    endpoints stay reachable, administrative endpoints 403 via
+    ``require_admin`` until a store is configured.  A wired store with zero
+    active tokens is **fail-closed** (401) so that revoking the last token
+    does not silently open every endpoint.
 
     *cookie_name_getter* is an optional zero-arg callable that returns the
     effective cookie name at request time.  When provided and it returns a
@@ -110,7 +114,6 @@ class BearerTokenMiddleware:
     def __init__(
         self,
         app,
-        token: str,
         user_token_getter: Callable[[], "UserTokenStore | None"] | None = None,
         cookie_name: str = _DEFAULT_COOKIE_NAME,
         cookie_name_getter: Callable[[], str | None] | None = None,
@@ -120,22 +123,11 @@ class BearerTokenMiddleware:
         # Note: exempt_prefixes entries should end with "/" (e.g. "/app/") to
         # avoid "/app" inadvertently matching "/application/secret".
         self.app = app
-        self._token = token
         self._user_token_getter = user_token_getter
         self._cookie_name = cookie_name
         self._cookie_name_getter = cookie_name_getter
         self._exempt_paths = set(exempt_paths)
         self._exempt_prefixes = tuple(exempt_prefixes)
-
-    @property
-    def enabled(self) -> bool:
-        """``True`` when the static shared token is configured.
-
-        Note: dynamic per-user enablement is computed per request from the
-        :class:`~paramem.server.user_tokens.UserTokenStore`.  This property
-        does not reflect per-user state.
-        """
-        return bool(self._token)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -150,18 +142,16 @@ class BearerTokenMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Dynamic enablement: ON when shared token set OR a user-token store is
-        # wired.  A wired store with zero active tokens stays fail-closed (401)
-        # so that revoking the last token does not silently open every endpoint.
-        # has_active_tokens() is used only for the startup posture log.
+        # Dynamic enablement: ON iff a user-token store is wired.  A wired
+        # store with zero active tokens stays fail-closed (401) so that
+        # revoking the last token does not silently open every endpoint.
         store: UserTokenStore | None = (
             self._user_token_getter() if self._user_token_getter else None
         )
-        enabled = bool(self._token) or (store is not None)
-        if not enabled:
+        if store is None:
             # Security OFF — fail-closed admin: the server is usable (chat/voice
             # endpoints reachable, no scope gate on them) but administrative
-            # endpoints stay locked until a credential is configured.  Stamp the
+            # endpoints stay locked until a store is configured.  Stamp the
             # same non-admin sentinel used for a per-user "chat" token (see
             # ``user_tokens._DEFAULT_SCOPE``) so ``require_admin`` 403s exactly
             # as it does for a real chat-scope token — no separate sentinel.
@@ -182,24 +172,15 @@ class BearerTokenMiddleware:
             await _send_unauthorized(send, "missing or malformed Authorization header")
             return
 
-        # Shared (legacy) token — constant-time comparison.
-        if self._token and hmac.compare_digest(presented, self._token):
-            # Shared token always has admin scope.  No speaker_id is attached
-            # (legacy unattributed semantics).
-            scope.setdefault("state", {})["scope"] = "admin"
+        # Per-user token — sha256 dict lookup (no iteration).
+        record = store.resolve(presented)
+        if record is not None:
+            _authenticated, sid, scope_val = record
+            scope.setdefault("state", {})["scope"] = scope_val
+            if sid is not None:
+                scope["state"]["speaker_id"] = sid
             await self.app(scope, receive, send)
             return
-
-        # Per-user token — sha256 dict lookup (no iteration).
-        if store is not None:
-            record = store.resolve(presented)
-            if record is not None:
-                _authenticated, sid, scope_val = record
-                scope.setdefault("state", {})["scope"] = scope_val
-                if sid is not None:
-                    scope["state"]["speaker_id"] = sid
-                await self.app(scope, receive, send)
-                return
 
         await _send_unauthorized(send, "invalid bearer token")
 
@@ -271,77 +252,69 @@ async def _send_unauthorized(send, detail: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-def load_token_from_env() -> str:
-    """Return the configured token, or an empty string if unset."""
-    return os.environ.get(TOKEN_ENV_VAR, "").strip()
-
-
-def log_startup_posture(token: str, n_user_tokens: int = 0, per_user_active: bool = False) -> None:
+def log_startup_posture(n_user_tokens: int = 0, per_user_active: bool = False) -> None:
     """Emit a single startup line describing the auth posture.
 
-    Four states, keyed on *store presence* (matching the middleware enablement
-    rule ``enabled = bool(shared_token) or (store is not None)``):
+    Two states, keyed on *store presence* — the same condition the
+    middleware's ``__call__`` checks per-request (``store is None`` → OFF):
 
-    - **OFF** — no shared token and per-user store is not wired.
-    - **ON-shared** — shared token set, per-user store not wired.
-    - **ON-per-user** — per-user store is wired (fail-closed), no shared token.
-    - **ON-both** — shared token set *and* per-user store is wired.
+    - **OFF** — no per-user store is wired.
+    - **ON** — a per-user store is wired.  Sub-variant on whether it has any
+      active tokens yet (fail-closed either way).
 
     Call once during app lifespan-startup after the
     :class:`~paramem.server.user_tokens.UserTokenStore` is assigned.  The
-    *n_user_tokens* count is informational only — a wired store with zero active
-    tokens stays **fail-closed** (401) until a token is minted; the posture is
-    still ON-per-user.
+    *n_user_tokens* count is informational only — a wired store with zero
+    active tokens stays **fail-closed** (401) until a token is minted; the
+    posture is still ON.
 
-    Backward-compatible: callers that pass only *token* (and omit both
-    *n_user_tokens* and *per_user_active*) retain the prior two-state OFF /
-    ON-shared behavior.
+    Fail-open migration guard (this module's ONE read of
+    ``PARAMEM_API_TOKEN`` — see the module docstring): when the OFF branch
+    fires AND the env var is set, an additional LOUD warning fires.  A
+    deployment that ran under the old shared-token model has the env var
+    set, PWA off, and never minted a per-user token — on upgrade it lands
+    OPEN (the OFF branch above already logs that), with the operator's old
+    token now silently inert.  The env var's value is never read as a
+    credential here, only checked for presence.
 
     Parameters
     ----------
-    token:
-        The static shared token string (empty when not configured).
     n_user_tokens:
         Number of active (non-revoked) per-user tokens currently in the store.
         Used only as informational text in the log message.
     per_user_active:
         ``True`` when a :class:`~paramem.server.user_tokens.UserTokenStore` is
         wired into the middleware (i.e. the store object is not ``None``).
-        Drives the ON-per-user / ON-both branches regardless of token count so
-        that a wired-but-empty store logs ON-per-user (fail-closed), not OFF.
+        Drives the ON branch regardless of token count so that a
+        wired-but-empty store logs ON (fail-closed), not OFF.
     """
-    has_shared = bool(token)
-
-    if has_shared and per_user_active:
-        logger.info(
-            "AUTH: ON-both (%s set + %d active per-user token(s)) — "
-            "all REST endpoints require a bearer token",
-            TOKEN_ENV_VAR,
-            n_user_tokens,
-        )
-    elif has_shared:
-        logger.info(
-            "AUTH: ON-shared (%s set) — all REST endpoints require bearer token",
-            TOKEN_ENV_VAR,
-        )
-    elif per_user_active:
+    if per_user_active:
         if n_user_tokens == 0:
             logger.info(
-                "AUTH: ON-per-user (store wired, 0 active per-user tokens — "
+                "AUTH: ON (store wired, 0 active token(s) — "
                 "fail-closed, mint one to grant access) — "
                 "all REST endpoints require a bearer token",
             )
         else:
             logger.info(
-                "AUTH: ON-per-user (%d active per-user token(s)) — "
-                "all REST endpoints require a bearer token",
+                "AUTH: ON (%d active token(s)) — all REST endpoints require a bearer token",
                 n_user_tokens,
             )
     else:
         logger.warning(
-            "AUTH: OFF (%s unset, no per-user token store wired) — "
+            "AUTH: OFF (no per-user token store wired) — "
             "all REST endpoints are reachable without credentials. "
-            "Set %s to enable. See SECURITY.md for the authentication model.",
-            TOKEN_ENV_VAR,
-            TOKEN_ENV_VAR,
+            "Run `paramem mint-user-token` to enable. "
+            "See SECURITY.md for the authentication model.",
         )
+        if os.environ.get("PARAMEM_API_TOKEN"):
+            logger.warning(
+                "PARAMEM_API_TOKEN is set but is NO LONGER a credential — "
+                "the server does not check it. This deployment appears to be "
+                "upgrading from the old shared-token model: the token above "
+                "is silently ignored and every REST endpoint is open (see the "
+                "AUTH: OFF warning above). Run `paramem mint-user-token` to "
+                "mint a real per-user token, then set PARAMEM_API_TOKEN to "
+                "that value to protect this server again. See SECURITY.md "
+                "for the migration.",
+            )

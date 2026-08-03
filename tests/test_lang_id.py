@@ -189,16 +189,21 @@ def _make_probe_state(*, mode: str = "cloud-only") -> dict:
     """Minimal _state for debug_probe tests; no GPU required."""
     store = MagicMock()
     store.get_name.return_value = "TestUser"
+    store.resolve_speaker_name.return_value = "TestUser"
 
     cfg = MagicMock()
     cfg.debug = True
     cfg.text_lang_detection = TextLangDetectionConfig(enabled=False)
     cfg.consolidation.abort_quiesce_timeout_s = 1.0
 
+    session_buffer = MagicMock()
+    session_buffer.get_session_turns.return_value = []
+
     return {
         "config": cfg,
         "mode": mode,
         "speaker_store": store,
+        "session_buffer": session_buffer,
         "router": MagicMock(),
         "ha_client": None,
         "cloud_agent": None,
@@ -213,7 +218,7 @@ def _make_probe_state(*, mode: str = "cloud-only") -> dict:
 
 
 def test_debug_probe_cloud_only_threads_detected_language(monkeypatch):
-    """resolve_text_language result is forwarded to _cloud_only_route."""
+    """resolve_text_language result is forwarded to _relay_route."""
     from fastapi.testclient import TestClient
 
     import paramem.server.app as app_module
@@ -228,7 +233,7 @@ def test_debug_probe_cloud_only_threads_detected_language(monkeypatch):
         patch(
             "paramem.server.lang_id.resolve_text_language", return_value=("de", 0.99)
         ) as mock_resolve,
-        patch("paramem.server.app._cloud_only_route", return_value=cloud_result) as mock_route,
+        patch("paramem.server.app._relay_route", return_value=cloud_result) as mock_route,
     ):
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post(
@@ -274,7 +279,7 @@ def test_debug_probe_local_threads_detected_language(monkeypatch):
 
 
 def test_debug_probe_disabled_detection_passes_none(monkeypatch):
-    """When text_lang_detection.enabled=False, language=None reaches _cloud_only_route."""
+    """When text_lang_detection.enabled=False, language=None reaches _relay_route."""
     from fastapi.testclient import TestClient
 
     import paramem.server.app as app_module
@@ -286,7 +291,7 @@ def test_debug_probe_disabled_detection_passes_none(monkeypatch):
     cloud_result = MagicMock()
     cloud_result.text = "Hello!"
 
-    with patch("paramem.server.app._cloud_only_route", return_value=cloud_result) as mock_route:
+    with patch("paramem.server.app._relay_route", return_value=cloud_result) as mock_route:
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post(
             "/debug/probe",

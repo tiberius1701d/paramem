@@ -71,7 +71,6 @@ def _make_store(tmp_path: Path) -> UserTokenStore:
 
 
 def _make_app(
-    shared_token: str = "",
     user_token_getter=None,
 ) -> FastAPI:
     """Minimal FastAPI app with BearerTokenMiddleware + require_admin."""
@@ -80,7 +79,6 @@ def _make_app(
     app = FastAPI()
     app.add_middleware(
         BearerTokenMiddleware,
-        token=shared_token,
         user_token_getter=user_token_getter,
     )
 
@@ -133,15 +131,15 @@ class TestChatScopeOnAdminRoute:
         assert resp.status_code == 403
 
     def test_off_mode_denies_admin_endpoint(self, tmp_path, monkeypatch):
-        """Auth OFF (no token, no store) → admin endpoint 403s (fail-closed admin).
+        """Auth OFF (no store wired) → admin endpoint 403s (fail-closed admin).
 
         OFF mode is open for use — no credential is required to reach the
         server at all — but the middleware stamps the non-admin ``"chat"``
         scope on every pass-through request, so ``require_admin`` denies admin
-        endpoints until a shared token or per-user store is configured.
+        endpoints until a per-user store is configured.
         """
-        # Build an app with no shared token and no store → OFF mode.
-        app = _make_app(shared_token="", user_token_getter=None)
+        # Build an app with no store wired → OFF mode.
+        app = _make_app(user_token_getter=None)
         client = TestClient(app)
 
         # OFF mode: middleware stamps chat scope; require_admin denies.
@@ -149,13 +147,13 @@ class TestChatScopeOnAdminRoute:
         assert resp.status_code == 403
 
     def test_off_mode_allows_chat_endpoint(self, tmp_path, monkeypatch):
-        """Auth OFF (no token, no store) → non-admin endpoint stays reachable.
+        """Auth OFF (no store wired) → non-admin endpoint stays reachable.
 
         Fail-closed admin only locks the admin surface; endpoints with no
         scope gate (e.g. /chat) remain open by design when no credential is
         configured.
         """
-        app = _make_app(shared_token="", user_token_getter=None)
+        app = _make_app(user_token_getter=None)
         client = TestClient(app)
 
         resp = client.post("/chat")
@@ -182,12 +180,21 @@ class TestAdminScopeOnAdminRoute:
         assert resp.status_code == 200
         assert resp.json()["admin"] is True
 
-    def test_shared_token_200_on_admin_get(self):
-        """The shared env token (always admin) → 200 on admin GET endpoint."""
-        app = _make_app(shared_token="shared-secret")
+    def test_unattributed_admin_token_200_on_admin_get(self, tmp_path, monkeypatch):
+        """Re-spec (shared-token retirement, C): the former shared-env-token
+        row is replaced by its store-token equivalent — an UNATTRIBUTED
+        admin-scope token (the infrastructure-carrier pattern:
+        ``mint-user-token --unattributed --scope admin --force-admin``) →
+        200 on admin GET endpoint.  There is no separate shared-secret path
+        any more; every admin credential is a store entry."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = _make_store(tmp_path)
+        token = store.mint(None, "Infra carrier", scope="admin")
+
+        app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
 
-        resp = client.get("/admin-only", headers={"Authorization": "Bearer shared-secret"})
+        resp = client.get("/admin-only", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200
 
 
@@ -313,11 +320,11 @@ class TestRouteTableIntrospection:
 
 
 class TestAssignOrphansPerUserAdmin:
-    """Verify /admin/assign-orphans is reachable with a per-user admin token
-    when the shared env token (PARAMEM_API_TOKEN) is unset.
+    """Verify /admin/assign-orphans is reachable with a per-user admin token.
 
-    This tests the intended loosening: per-user admin tokens can reach
-    admin endpoints without requiring the shared token to be set.
+    There is no shared-secret credential any more — every admin credential
+    (attributed or unattributed) is a ``UserTokenStore`` entry minted via
+    ``mint-user-token --scope admin``.
 
     Uses route-table introspection only (no model load / TestClient against
     the full app) — the dependency presence guarantees the auth path.
@@ -326,8 +333,9 @@ class TestAssignOrphansPerUserAdmin:
     def test_assign_orphans_has_require_admin_not_inline_check(self):
         """POST /admin/assign-orphans must have require_admin dependency.
 
-        Verifies the inline _api_token check was removed and replaced by the
-        dependency, so a per-user admin token can also reach it.
+        Verifies the inline token check that used to gate this endpoint was
+        removed and replaced by the dependency, so any admin-scope store
+        token can reach it.
         """
         from paramem.server.app import app
 
@@ -350,20 +358,23 @@ class TestAssignOrphansPerUserAdmin:
 class TestHealthEndpoint:
     """/health must return 200 + {"status": "ok"} without any Authorization header.
 
-    Uses the minimal test app wired with BearerTokenMiddleware in ON-shared
-    mode (a shared token is set) so that any path NOT in exempt_paths would
-    ordinarily be rejected with 401.  Verifying 200 on /health confirms the
-    exemption is in effect.
+    Uses the minimal test app wired with BearerTokenMiddleware against a
+    real, wired UserTokenStore (ON mode) so that any path NOT in
+    exempt_paths would ordinarily be rejected with 401.  Verifying 200 on
+    /health confirms the exemption is in effect.
     """
 
-    def _make_guarded_app(self) -> FastAPI:
-        """Minimal FastAPI app with BearerTokenMiddleware in ON-shared mode."""
+    def _make_guarded_app(self, tmp_path) -> FastAPI:
+        """Minimal FastAPI app with BearerTokenMiddleware in ON mode."""
         from fastapi import FastAPI
+
+        store = UserTokenStore(tmp_path / "user_tokens.json")
+        store.mint(None, "Test", scope="admin")
 
         mini_app = FastAPI()
         mini_app.add_middleware(
             BearerTokenMiddleware,
-            token="secret-token",
+            user_token_getter=lambda: store,
             exempt_paths=("/health",),
         )
 
@@ -377,18 +388,18 @@ class TestHealthEndpoint:
 
         return mini_app
 
-    def test_health_200_without_token(self):
+    def test_health_200_without_token(self, tmp_path):
         """/health returns 200 + {"status": "ok"} with no Authorization header."""
-        app = self._make_guarded_app()
+        app = self._make_guarded_app(tmp_path)
         client = TestClient(app)
 
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
 
-    def test_health_200_even_when_token_configured(self):
-        """/health is reachable even when a shared token is set (auth ON mode)."""
-        app = self._make_guarded_app()
+    def test_health_200_even_when_token_configured(self, tmp_path):
+        """/health is reachable even when a token store is wired (auth ON mode)."""
+        app = self._make_guarded_app(tmp_path)
         client = TestClient(app)
 
         # Confirm auth IS active by verifying protected endpoint requires token.

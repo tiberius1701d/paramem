@@ -215,10 +215,10 @@ class TestNormalizeAndValidateTableBothDirections:
         assert stats["dropped"] == 1
 
     def test_bindings_table_both_sides_shaped_ties_to_declared_key_side(self):
-        """FIX 3: a binding where both sides happen to be placeholder-
-        shaped (e.g. `GPT_4`, a real model name) is not ambiguous — the
-        declared `placeholder_side` breaks the tie rather than the
-        entry being dropped and the whole delta rejected."""
+        """A binding where both sides happen to be placeholder-shaped
+        (e.g. `GPT_4`, a real model name) is not ambiguous — the declared
+        `placeholder_side` breaks the tie rather than the entry being
+        dropped and the whole delta rejected."""
         mapping, stats = _normalize_anonymization_mapping(
             {"Model_1": "GPT_4"}, placeholder_side="key"
         )
@@ -233,8 +233,38 @@ class TestNormalizeAndValidateTableBothDirections:
         assert stats == {"inverted": 0, "dropped": 0}
 
 
+class TestSpeakerIdValueCarveIn:
+    """Fold-onto-token anonymization's normalizer carve-in: a
+    speaker-id-shaped VALUE is accepted as placeholder-shaped on the CORE
+    table (``placeholder_side="value"``) even though it never matches
+    :data:`PLACEHOLDER_SHAPE_RE` — but the carve-in is deliberately NOT
+    extended to the ``bindings`` table direction (``placeholder_side="key"``),
+    where a speaker-id-shaped KEY stays genuinely ambiguous (a cloud model
+    has no authority to bind new content onto the identity anchor).
+    """
+
+    def test_value_direction_keeps_speaker_id_shaped_value(self):
+        mapping, stats = _normalize_anonymization_mapping(
+            {"Real": "speaker0"}, placeholder_side="value"
+        )
+        assert mapping == {"Real": "speaker0"}
+        assert stats["dropped"] == 0
+
+    def test_key_direction_still_drops_the_same_pair(self):
+        """The SAME mapping, ``placeholder_side="key"`` (the deanonymize
+        ``bindings`` direction) — the carve-in must NEVER extend there:
+        neither side is genuinely placeholder-shaped under that
+        direction's own test ("speaker0" is not KEY-shaped either), so
+        the entry stays dropped."""
+        mapping, stats = _normalize_anonymization_mapping(
+            {"Real": "speaker0"}, placeholder_side="key"
+        )
+        assert mapping == {}
+        assert stats["dropped"] == 1
+
+
 class TestSubstituteWholeWordsLongestFirst:
-    """FIX 7.1 — the longest-first hazard.  ``Person_10`` and ``Person_1``
+    """The longest-first hazard.  ``Person_10`` and ``Person_1``
     share a prefix; without length-descending ordering at each position,
     a naive scan matching ``Person_1`` first would leave the ``0`` of
     ``Person_10`` dangling in the output.  Pinned in BOTH dict insertion
@@ -401,7 +431,7 @@ class TestSubstituteWholeWordsExactMatchRegression:
 
 
 class TestPlaceholderShapeRegex:
-    """FIX 7.2 — re-homed from ``tests/test_schema_config.py`` (deleted
+    """Re-homed from ``tests/test_schema_config.py`` (deleted
     there when ``anonymizer_placeholder_pattern()`` was retired in favour
     of the single module-level :data:`PLACEHOLDER_SHAPE_RE`). This is the
     ONE regex a future bare -> braced format flip must change — direct
@@ -617,8 +647,8 @@ class TestFactOrphans:
 
 
 class TestSpeakerAnchorReverseSkip:
-    """FIX 7.3 — pins the most dangerous half of invariant 5 (currently
-    asserted only implicitly by the module docstring): ``reverse`` must
+    """Pins the most dangerous half of invariant 5 (currently asserted
+    only implicitly by the module docstring): ``reverse`` must
     NEVER gain a ``speaker{N}``-keyed entry, even from a hostile LLM hint
     that scrubs a real name onto the anchor.
 
@@ -768,6 +798,30 @@ class TestSpeakerNameSeeding:
         )
         assert forward["Alex"] == "Person_5"
         assert reverse["Person_5"] == "Alex"
+
+
+class TestSpeakerNameSeedingReinstatementGuard:
+    """Regression guard for the reinstatement bug ``not
+    is_speaker_id(speaker_name)`` fixes (see the comment above the
+    seeding site in ``_build_anonymization_mapping``): a caller passing
+    a profile display name that is ITSELF speaker-id-shaped (anonymous
+    profiles have ``name == speaker_id`` — production-reachable via the
+    forced-route path and the pre-fix ``/debug/probe``) must never have
+    that value seeded back into ``forward``/``reverse``.
+
+    Mutation: remove the ``not is_speaker_id(speaker_name)`` clause from
+    the seeding gate -> this test fails (the dropped KEY from invariant 1
+    is silently reinstated by the seeding block's own unfiltered
+    ``llm_mapping`` scan).
+    """
+
+    def test_speaker_id_shaped_display_name_never_seeded(self):
+        forward, reverse = _build_anonymization_mapping(
+            {"speaker3": "Person_1"},
+            speaker_name="speaker3",
+        )
+        assert forward == {}
+        assert reverse == {}
 
 
 class TestReverseMapInversionAgreement:

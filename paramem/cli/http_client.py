@@ -38,12 +38,21 @@ def _repo_env_path(start: Path) -> Path | None:
 def resolve_token(*, allow_files: bool | None = None) -> str | None:
     """Resolve the CLI bearer token for server authentication.
 
-    Resolution order mirrors the server's own load order
-    (``paramem/server/secret_store.py`` + ``app.py``):
+    This is a CLIENT-side resolution order for the CLI's own outbound
+    ``Authorization`` header — not a mirror of any server-side token
+    resolution.  The server has no such thing: ``PARAMEM_API_TOKEN`` is no
+    longer a credential the server validates at all (every credential lives
+    in a :class:`~paramem.server.user_tokens.UserTokenStore`; see
+    ``paramem/server/auth.py``'s module docstring).  The value this function
+    returns must itself be a token minted via ``paramem mint-user-token`` —
+    these three locations are just where an operator may have PUT that
+    minted value, layered as fallbacks so the CLI keeps working across
+    ``.env``/secret-file/env-var placement:
 
     1. Ambient environment variable ``PARAMEM_API_TOKEN``.
     2. Per-secret file ``~/.config/paramem/secrets/PARAMEM_API_TOKEN``
-       (the server's migration target; the ``.env`` line may be deleted).
+       (populated by ``paramem/server/secret_store.py`` on the server side;
+       the ``.env`` line may be deleted once this file exists).
     3. Repo ``.env`` file beside ``pyproject.toml`` (walk up from this file).
 
     Returns ``None`` when no token is present — auth-OFF servers keep working

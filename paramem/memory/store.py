@@ -1017,7 +1017,6 @@ class MemoryStore:
         source=None,
         speaker_id: str | None = None,
         memoize: bool = True,
-        speaker_resolver=None,
     ) -> dict[str, dict | None]:
         """Resolve *keys_by_adapter* to flat ``{key → result | None}``.
 
@@ -1049,13 +1048,12 @@ class MemoryStore:
         source-failure dicts carrying ``failure_reason``) pass through
         unrendered.
 
-        *speaker_resolver* is an optional callable ``(str) -> str`` that maps
-        raw subject/object tokens to display names at the fact-render boundary.
-        Applied in BOTH render paths (cache-hit via ``entry_fact_text`` +
-        source passthrough via re-render before storing the result).  The
-        memoized stash is SPO-only (no ``fact_text``) so a later cache hit
-        always re-renders with the then-current resolver — no stale-name
-        caching.  ``None`` (default) → byte-identical behaviour.
+        ``fact_text`` renders raw ``speaker{N}`` tokens verbatim in both
+        render paths (cache-hit via ``entry_fact_text`` + source passthrough).
+        There is no resolver here — every model-facing surface stays in
+        token space; a token is substituted for a display name exactly once,
+        at the reply boundary, by
+        :func:`~paramem.server.speaker.resolve_speaker_tokens`.
 
         **speaker_id asymmetry (do not remove this comment):**
         The CACHE-HIT branch reads ``speaker_id`` from ``_bookkeeping`` (the
@@ -1153,7 +1151,7 @@ class MemoryStore:
                 **base,
                 "speaker_id": spk,
                 "confidence": rendered_confidence,
-                "fact_text": entry_fact_text({**base, "speaker_id": spk}, resolve=speaker_resolver),
+                "fact_text": entry_fact_text({**base, "speaker_id": spk}),
                 "raw_output": _json.dumps(base),
             }
 
@@ -1238,14 +1236,6 @@ class MemoryStore:
                         if src_confidence is not None:
                             src = dict(src)
                             src["confidence"] = src_confidence
-                    # SOURCE-RESULT speaker resolver — when speaker_resolver is set,
-                    # re-render fact_text from SPO through entry_fact_text so
-                    # display names replace raw speaker{N} tokens.  The memoized
-                    # stash below is SPO-only (no fact_text) so a later cache hit
-                    # re-renders with the then-current resolver — no stale caching.
-                    if speaker_resolver is not None and isinstance(src, dict):
-                        src = dict(src)
-                        src["fact_text"] = entry_fact_text(src, resolve=speaker_resolver)
                     results[key] = src
                     if memoize and isinstance(src, dict):
                         # Stash the raw SPO entry back into the cache (content only).

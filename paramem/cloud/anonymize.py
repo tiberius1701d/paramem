@@ -108,6 +108,8 @@ def _render_anonymize_prompt(
     transcript: str,
     user_prompt_template: str,
     system_prompt: str,
+    speaker_id: str | None = None,
+    speaker_anchor_template: str = "",
 ) -> str:
     """THE prompt renderer: ``template.format(...)`` +
     ``tokenizer.apply_chat_template(...)``.
@@ -123,11 +125,38 @@ def _render_anonymize_prompt(
     ``transcript=`` as a keyword argument to ``str.format`` is safe
     either way, since ``str.format`` ignores unused keyword arguments
     when the template has no matching ``{transcript}`` placeholder.
+
+    ``speaker_id``/``speaker_anchor_template`` together fill
+    ``anonymization.txt``'s ``{speaker_anchor_section}`` slot — the
+    fold-onto-token speaker-anchor rule and its worked example, THIS
+    session's own ``speaker{{N}}`` token telling the anonymizer LLM which
+    placeholder a user's own real-name mention may fold onto. The section
+    renders ONLY when ``speaker_id`` is given (truthy): a caller-loaded
+    ``speaker_anchor_template`` (``configs/prompts/
+    anonymization_speaker_anchor.txt``, itself formatted with
+    ``speaker_id=speaker_id``) is inserted; otherwise the slot renders as
+    ``""`` — no anchor rule, no worked example, and the surrounding prose
+    reads cleanly either way (pinned by
+    ``tests/test_prompts_contract.py``). ``speaker_id`` alone (with no
+    template) also renders empty, matching every other caller that omits
+    ``speaker_anchor_template`` (the graph tier, which never has a
+    single-session speaker to name at all, and any calibration caller
+    that omits both). Safe against a template with no matching slot
+    either way, since ``str.format`` ignores unused keyword arguments
+    (``anonymization_facts.txt`` has neither ``{speaker_id}`` nor
+    ``{speaker_anchor_section}``).
     """
+    speaker_anchor_section = (
+        speaker_anchor_template.format(speaker_id=speaker_id)
+        if speaker_id and speaker_anchor_template
+        else ""
+    )
     prompt = user_prompt_template.format(
         scrub_categories=", ".join(sorted(scrub)),
         facts_json=json.dumps(facts),
         transcript=transcript or "(no transcript provided)",
+        speaker_id=speaker_id or "",
+        speaker_anchor_section=speaker_anchor_section,
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -272,6 +301,8 @@ def anonymize_transcript(
     seed: int | None = None,
     user_prompt_template: str,
     system_prompt: str,
+    speaker_id: str | None = None,
+    speaker_anchor_template: str = "",
 ) -> tuple[dict | None, str, str]:
     """Identify the ``real_name -> placeholder`` mapping AND the
     model-authored anonymized transcript using the local model.
@@ -383,6 +414,11 @@ def anonymize_transcript(
     THE only production caller of this function is :func:`anonymize`'s
     per-slice loop — every path that anonymizes for cloud egress reaches
     the model through the one chain, never this function directly.
+
+    ``speaker_id``/``speaker_anchor_template`` are forwarded verbatim to
+    :func:`_render_anonymize_prompt` — see that function's docstring for
+    the ``{speaker_anchor_section}`` slot contract and the
+    ``speaker_id``-gated rendering rule.
     """
     formatted = _render_anonymize_prompt(
         facts,
@@ -390,6 +426,8 @@ def anonymize_transcript(
         scrub=scrub,
         transcript=transcript,
         user_prompt_template=user_prompt_template,
+        speaker_id=speaker_id,
+        speaker_anchor_template=speaker_anchor_template,
         system_prompt=system_prompt,
     )
 
@@ -746,6 +784,8 @@ def anonymize(
     transcript: str,
     scrub: set[str] | frozenset[str],
     speaker_name: str | None = None,
+    speaker_id: str | None = None,
+    speaker_anchor_template: str = "",
     identity_domain: Iterable[str] | None = None,
     token_envelope: int = _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE,
     seed: int | None = None,
@@ -763,6 +803,31 @@ def anonymize(
     own :func:`~paramem.cloud.placeholders.insert_placeholders` call then
     gets ``[]``); ``transcript`` may be empty (``anon_transcript`` comes
     back ``""`` on the opt-out path, sourced from the argument).
+
+    ``speaker_id`` — THIS session's own ``speaker{{N}}`` token — fills the
+    anonymizer prompt's ``{speaker_anchor_section}`` slot (fold-onto-token
+    anonymization) together with ``speaker_anchor_template`` (the
+    caller-loaded ``configs/prompts/anonymization_speaker_anchor.txt``
+    contents): it tells the anonymizer LLM which placeholder a coreferring
+    real-name mention of the user may fold onto, so the mapping it returns
+    can bind directly onto the session's own token instead of minting a
+    separate ``Person_N`` for the user. Threaded verbatim into every
+    slice's :func:`anonymize_transcript` call; ``speaker_id=None`` (the
+    graph tier, which has no single-session speaker, and any calibration
+    caller that omits it) renders the slot as ``""`` regardless of
+    ``speaker_anchor_template`` — see :func:`_render_anonymize_prompt`'s
+    docstring. Every caller of THIS function is responsible for its own
+    anchor-validity gate before passing ``speaker_id`` in: the chat-egress
+    caller (:func:`~paramem.graph.flows.anonymize_turn`) forwards it only
+    when the value satisfies :func:`~paramem.utils.identity.is_speaker_id`
+    (a well-shaped id is sufficient — an anonymous-enrolled speaker with
+    no resolvable display name still KEEPS the anchor, owner ruling: their
+    session facts and cloud payloads stay in token space exactly like a
+    named speaker's) — this function does not re-validate that invariant,
+    it only renders whatever ``speaker_id`` it is given. Orthogonal to
+    ``speaker_name`` (step 8 below): that seeds the DISPLAY name's own
+    forward-map coverage; this tells the model which TOKEN the display name
+    (if mentioned) should fold onto.
 
     **Slicing decision (no flag, derived from the arguments): slice iff
     ``transcript`` is empty.**  A transcript is atomic — repeating it in
@@ -804,8 +869,10 @@ def anonymize(
        ``anon_transcript=transcript`` verbatim, ``facts`` verbatim.  A
        caller deriving the anonymized fact array gets the identity
        (empty-mapping) substitution.
-    2. Per slice, :func:`anonymize_transcript` -> ``(llm_mapping,
-       model_anon_transcript, raw)``.
+    2. Per slice, :func:`anonymize_transcript` (``speaker_id=speaker_id``,
+       forwarded verbatim to that call's own :func:`_render_anonymize_prompt`
+       — see its docstring for the ``{speaker_id}`` slot contract) ->
+       ``(llm_mapping, model_anon_transcript, raw)``.
     3. ``llm_mapping is None`` -> that slice's facts are dropped
        (``slices_failed`` += 1, ``failure`` candidate ``"parse"``) and the
        loop continues to the next slice.  Never falls back to the
@@ -944,6 +1011,8 @@ def anonymize(
             seed=seed,
             user_prompt_template=user_prompt_template,
             system_prompt=system_prompt,
+            speaker_id=speaker_id,
+            speaker_anchor_template=speaker_anchor_template,
         )
         if raw:
             raw_parts.append(raw)
@@ -983,7 +1052,7 @@ def anonymize(
                 # First-wins: an entity seen in an EARLIER slice keeps
                 # that slice's placeholder decision.
                 continue
-            if placeholder in used_placeholders:
+            if placeholder in used_placeholders and not is_speaker_id(placeholder):
                 # Placeholder-VALUE collisions are NOT scoped to prior
                 # slices — used_placeholders is checked and updated LIVE,
                 # catching a collision against a prior slice OR an entry
@@ -995,6 +1064,17 @@ def anonymize(
                 # either ever reaches _build_anonymization_mapping).
                 # Re-mint onto the same prefix so the merged table's
                 # placeholders stay unique either way.
+                #
+                # Carve-out: a speaker-id-shaped placeholder is EXEMPT from
+                # this uniqueness enforcement. Fold-onto-token anonymization
+                # (configs/prompts/anonymization_speaker_anchor.txt)
+                # deliberately authorizes MULTIPLE distinct real-value keys
+                # (e.g. "Priya" and "Priya Sharma", both self-naming
+                # variants the speaker used in the same session) to map
+                # onto the SAME speaker{N} anchor — that is the fold, not a
+                # collision, and re-minting the second one onto a fresh
+                # Thing_N would leave it unresolved to the anchor and
+                # scrubbed as an unrelated entity instead.
                 placeholder = mint_placeholder(
                     used_placeholders, placeholder_prefix(placeholder) or "Thing"
                 )

@@ -205,106 +205,62 @@ def test_tts_config_language_name_method():
     assert config.language_name("xx") == "xx"  # unknown code returned as-is
 
 
-def test_personalize_prompt_with_language():
-    from paramem.server.inference import _personalize_prompt
-
-    base = "You are a helpful assistant."
+def test_build_speaker_prefix_with_language():
+    """_build_speaker_prefix combines the token line + language instruction."""
+    from paramem.server.inference import _build_speaker_prefix
 
     # English — no language instruction
-    result = _personalize_prompt(base, "Alice", "en")
+    result = _build_speaker_prefix("speaker0", "en", None)
     assert "Respond in" not in result
-    assert "Alice" in result
+    assert "speaker0" in result
 
     # German — language instruction added
-    result = _personalize_prompt(base, "Alice", "de")
+    result = _build_speaker_prefix("speaker0", "de", None)
     assert "Respond in German" in result
-    assert "Alice" in result
+    assert "speaker0" in result
 
-    # No speaker, with language — no "You are speaking with" salutation,
-    # which is what the chat handler relies on when it suppresses the
-    # canonical "Speaker{N}" token for voice-promoted but undisclosed
-    # profiles. Otherwise the LLM would echo "Speaker0" / "speaker store"
-    # in its response.
-    result = _personalize_prompt(base, None, "fr")
+    # No token, with language — no "You are speaking with" salutation, which
+    # is what the LOCAL reasoning leg relies on to suppress the token for
+    # anonymous/undisclosed profiles (see _probe_and_reason /
+    # _base_model_answer's identity_token derivation).
+    result = _build_speaker_prefix(None, "fr", None)
     assert "Respond in French" in result
     assert "You are speaking with" not in result
 
 
-def test_personalize_prompt_with_speaker():
-    """_personalize_prompt includes "You are speaking with X" when speaker is given."""
-    from paramem.server.inference import _personalize_prompt
-
-    base = "You are a helpful assistant."
-    result = _personalize_prompt(base, "Alice", "en")
-    # Display name present via the "You are speaking with" part.
-    assert "Alice" in result
-    # Base prompt text is still present.
-    assert base in result
-    # No raw speaker{N} token: id mapping is resolved at the fact-render boundary,
-    # not injected into the prompt.
-    assert "speaker0" not in result
-    assert "Speaker0" not in result
-
-
-def test_personalize_prompt_no_id_in_prompt():
-    """_personalize_prompt never injects a speaker{N} id — resolution is at render time."""
-    from paramem.server.inference import _personalize_prompt
-
-    base = "You are a helpful assistant."
-    # Even passing speaker, no id token should appear.
-    result = _personalize_prompt(base, "Alice", "en")
-    assert "Alice" in result
-    assert "speaker" not in result.lower().split("you are speaking with alice.")[1]
-
-
-def test_personalize_prompt_cloud_has_no_id():
-    """Cloud escalation path must NEVER contain a raw speaker{N} id.
-
-    Privacy invariant: resolved display names are used in the prefix;
-    speaker id tokens never reach the cloud.  _build_speaker_prefix (shared
-    by both paths) emits only "You are speaking with <display_name>." plus
-    optional language instruction — no id mapping.
-    """
-    from paramem.server.inference import _build_speaker_prefix
-
-    # Both local and cloud paths use the same _build_speaker_prefix; neither
-    # contains a raw speaker id.
-    prefix = _build_speaker_prefix("Alice", "en", None)
-    assert "speaker0" not in prefix.lower()
-    assert "Alice" in prefix
-
-
 # ---------------------------------------------------------------------------
-# P6 — _build_speaker_prefix shared helper + cloud safety invariant
+# _build_speaker_prefix — LOCAL-leg-only, fed the speaker{N} token verbatim.
+# Cloud never calls this function at all (see _escalate_to_cloud, which
+# carries no identity line whatsoever) — resolution to a display name
+# happens only at the reply boundary via
+# paramem.server.speaker.resolve_speaker_tokens.
 # ---------------------------------------------------------------------------
 
 
 class TestBuildSpeakerPrefix:
     """``_build_speaker_prefix`` assembles the "You are speaking with X" +
-    language block.  Speaker-id-to-name resolution is handled at the
-    fact-render boundary (``entry_fact_text`` + ``speaker_resolver``), so
-    no id-mapping sentence is emitted here — and therefore nothing leaks to
-    the cloud either.
+    language block for the LOCAL reasoning prompt only.  ``X`` is the raw
+    ``speaker{N}`` token — that is the intended, new contract, not a leak.
     """
 
-    def test_speaker_and_language(self):
+    def test_token_and_language(self):
         from paramem.server.inference import _build_speaker_prefix
 
-        result = _build_speaker_prefix("Alice", "de", None)
-        assert "Alice" in result
+        result = _build_speaker_prefix("speaker0", "de", None)
+        assert "speaker0" in result
         assert "German" in result
 
-    def test_no_speaker_no_language(self):
+    def test_no_token_no_language(self):
         from paramem.server.inference import _build_speaker_prefix
 
         result = _build_speaker_prefix(None, None, None)
         assert result == ""
 
-    def test_speaker_only(self):
+    def test_token_only(self):
         from paramem.server.inference import _build_speaker_prefix
 
-        result = _build_speaker_prefix("Bob", None, None)
-        assert "Bob" in result
+        result = _build_speaker_prefix("speaker3", None, None)
+        assert "speaker3" in result
         assert "Respond in" not in result
 
     def test_language_only(self):
@@ -314,18 +270,73 @@ class TestBuildSpeakerPrefix:
         assert "French" in result
         assert "You are speaking with" not in result
 
-    def test_no_speaker_id_emitted(self):
-        """No raw speaker{N} id token must appear in the prefix (cloud safety).
+    def test_token_emitted_verbatim(self):
+        """The speaker{N} token IS emitted verbatim — the intended new contract.
 
-        Resolution is handled at the fact-render boundary; this helper
-        receives only the display name.
+        This function is only ever called on the LOCAL reasoning leg; the
+        cloud leg (`_escalate_to_cloud`) never calls it and carries no
+        identity line at all.  A human-readable name is substituted only at
+        the reply boundary, never here.
         """
         from paramem.server.inference import _build_speaker_prefix
 
-        prefix = _build_speaker_prefix("Alice", "en", None)
-        # Only display name, no id token.
-        assert "speaker0" not in prefix.lower()
-        assert "speaker9" not in prefix.lower()
+        prefix = _build_speaker_prefix("speaker0", "en", None)
+        assert "speaker0" in prefix
+
+
+# ---------------------------------------------------------------------------
+# _build_system_prompt — THE single assembly point for the LOCAL reasoning
+# leg's system prompt, collapsing what were two byte-identical blocks in
+# _probe_and_reason and _base_model_answer.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSystemPrompt:
+    def _config(self, tmp_path, base_text="You are an assistant."):
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text(base_text)
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+        return config
+
+    def test_speaker_id_gates_prefix(self, tmp_path):
+        """speaker_id present → prefix included, regardless of display name."""
+        from paramem.server.inference import _build_system_prompt
+
+        config = self._config(tmp_path)
+        result = _build_system_prompt("speaker0", None, config)
+        assert "speaker0" in result
+        assert "You are an assistant." in result
+
+    def test_speaker_id_gates_prefix_even_with_no_display_name(self, tmp_path):
+        """Re-spec (B-form prefix from speaker_id presence): the display
+        name is gone as a parameter entirely — an anonymous/undisclosed
+        speaker's raw speaker_id still produces the identity line.  Only
+        ``speaker_id is None`` suppresses it now."""
+        from paramem.server.inference import _build_system_prompt
+
+        config = self._config(tmp_path)
+        result = _build_system_prompt("speaker0", None, config)
+        assert "speaker0" in result
+        assert "You are an assistant." in result
+
+    def test_no_prefix_returns_bare_base_prompt(self, tmp_path):
+        from paramem.server.inference import _build_system_prompt
+
+        config = self._config(tmp_path)
+        result = _build_system_prompt(None, None, config)
+        assert result == "You are an assistant."
+
+    def test_language_instruction_included(self, tmp_path):
+        from paramem.server.inference import _build_system_prompt
+
+        config = self._config(tmp_path)
+        result = _build_system_prompt("speaker0", "de", config)
+        assert "speaker0" in result
+        assert "Respond in German" in result
+        assert "You are an assistant." in result
 
 
 # --- Speaker language preference ---
@@ -389,6 +400,225 @@ def test_speaker_v3_load_raises(tmp_path):
 
     with pytest.raises(ValueError, match="Unsupported speaker store version"):
         SpeakerStore(path)
+
+
+# ---------------------------------------------------------------------------
+# resolve_speaker_tokens — THE single reply-boundary resolver
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSpeakerTokens:
+    """``resolve_speaker_tokens`` is the one place a ``speaker{N}`` token is
+    ever substituted for a display name — every model-facing surface keeps
+    the raw token, and this function is applied only at the human-visible
+    reply boundary."""
+
+    def _store(self, tmp_path, *, name="Alice"):
+        from paramem.server.speaker import SpeakerStore
+
+        store = SpeakerStore(tmp_path / "profiles.json")
+        speaker_id = store.enroll(name, [0.1] * 192)
+        assert speaker_id == "speaker0"
+        return store
+
+    def test_resolves_known_speaker(self, tmp_path):
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        result = resolve_speaker_tokens("speaker0 likes hiking.", store)
+        assert result == "Alice likes hiking."
+
+    def test_case_insensitive_sentence_initial(self, tmp_path):
+        """A model-authored, sentence-capitalized "Speaker0" still resolves."""
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        result = resolve_speaker_tokens("Speaker0 likes hiking.", store)
+        assert result == "Alice likes hiking."
+
+    def test_unknown_token_falls_back_to_descriptor(self, tmp_path):
+        from paramem.server.speaker import THIRD_PARTY_DESCRIPTOR, resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        result = resolve_speaker_tokens("speaker9 called yesterday.", store)
+        assert THIRD_PARTY_DESCRIPTOR in result
+        assert "speaker9" not in result
+
+    def test_anonymous_enrolled_falls_back_to_descriptor(self, tmp_path):
+        """An anonymous-enrolled profile's own id is its 'name' — must still
+        fall back to the descriptor (third-party case: no current_speaker_id
+        supplied, or the token names someone other than the current
+        speaker), never leak the raw token as a name."""
+        from paramem.server.speaker import THIRD_PARTY_DESCRIPTOR, resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        # A direction distinct from the enrolled Alice profile's uniform
+        # embedding — otherwise cosine similarity is 1.0 and register_anonymous
+        # reuses Alice's speaker_id instead of minting a fresh anonymous one.
+        distinct_embedding = ([0.1] * 96) + ([-0.1] * 96)
+        anon_id = store.register_anonymous(distinct_embedding)
+        assert anon_id != "speaker0"
+        result = resolve_speaker_tokens(f"{anon_id} asked a question.", store)
+        assert THIRD_PARTY_DESCRIPTOR in result
+        assert anon_id not in result
+
+    def test_no_store_falls_back_to_descriptor(self):
+        from paramem.server.speaker import THIRD_PARTY_DESCRIPTOR, resolve_speaker_tokens
+
+        result = resolve_speaker_tokens("speaker0 likes hiking.", None)
+        assert THIRD_PARTY_DESCRIPTOR in result
+
+    def test_self_token_survives_verbatim_when_current_speaker(self, tmp_path):
+        """B — self-token fail-safe: an anonymous/undisclosed speaker's OWN
+        token, unresolvable to a name, is left verbatim rather than
+        collapsed to the third-party descriptor — rendering an undisclosed
+        speaker as "someone else" to themselves would be a wrong statement
+        about identity, not a privacy improvement."""
+        from paramem.server.speaker import THIRD_PARTY_DESCRIPTOR, resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        distinct_embedding = ([0.1] * 96) + ([-0.1] * 96)
+        anon_id = store.register_anonymous(distinct_embedding)
+
+        result = resolve_speaker_tokens(
+            f"{anon_id} asked a question.",
+            store,
+            current_speaker_id=anon_id,
+        )
+        assert anon_id in result
+        assert THIRD_PARTY_DESCRIPTOR not in result
+
+    def test_self_token_case_insensitive_match(self, tmp_path):
+        """The self-token comparison canonicalizes both sides — a
+        model-authored capitalized rendering still matches."""
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        distinct_embedding = ([0.1] * 96) + ([-0.1] * 96)
+        anon_id = store.register_anonymous(distinct_embedding)
+
+        result = resolve_speaker_tokens(
+            f"{anon_id.capitalize()} asked a question.",
+            store,
+            current_speaker_id=anon_id,
+        )
+        assert anon_id.capitalize() in result
+
+    def test_other_persons_token_still_falls_back_with_current_speaker_set(self, tmp_path):
+        """current_speaker_id only protects the CURRENT speaker's own
+        token — a different, unresolvable token still falls back to the
+        descriptor even when current_speaker_id is supplied."""
+        from paramem.server.speaker import THIRD_PARTY_DESCRIPTOR, resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        distinct_embedding = ([0.1] * 96) + ([-0.1] * 96)
+        anon_id = store.register_anonymous(distinct_embedding)
+
+        result = resolve_speaker_tokens(
+            "speaker9 called yesterday.",
+            store,
+            current_speaker_id=anon_id,
+        )
+        assert THIRD_PARTY_DESCRIPTOR in result
+        assert "speaker9" not in result
+
+    def test_no_tokens_is_a_no_op(self, tmp_path):
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        text = "No identity tokens in this sentence at all."
+        assert resolve_speaker_tokens(text, store) == text
+
+    def test_idempotent_on_its_own_output(self, tmp_path):
+        """Output contains no speaker{N} tokens, so re-running is a no-op."""
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._store(tmp_path)
+        once = resolve_speaker_tokens("speaker0 likes hiking.", store)
+        twice = resolve_speaker_tokens(once, store)
+        assert once == twice
+
+    @staticmethod
+    def _fake_store(mapping: dict[str, str | None]):
+        """A minimal resolve_speaker_name-only stand-in — avoids minting N
+        real profiles just to exercise the token regex's own boundary
+        behavior (SUBSTITUTION strictness is a property of the regex, not
+        of SpeakerStore)."""
+        store = MagicMock()
+        store.resolve_speaker_name.side_effect = lambda token: mapping.get(token)
+        return store
+
+    def test_speaker10_and_speaker1_are_distinct(self):
+        """The greedy \\d+ + \\b in the strict regex means speaker10 is one
+        token, never mistaken for speaker1 plus a trailing '0'."""
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._fake_store({"speaker1": "Bob", "speaker10": "Carla"})
+        result = resolve_speaker_tokens("speaker1 met speaker10 today.", store)
+        assert result == "Bob met Carla today."
+
+    def test_sub_word_non_match(self):
+        """A 'speaker' embedded mid-word (no left word boundary) is left
+        alone — SUBSTITUTION only matches standalone speaker{N} tokens."""
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._fake_store({"speaker0": "Alice"})
+        text = "The loudspeaker0 crackled."
+        assert resolve_speaker_tokens(text, store) == text
+
+    def test_possessive_substitution(self):
+        """A trailing possessive 's stays attached to the substituted name —
+        \\b after the digits allows the token to end at the apostrophe."""
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._fake_store({"speaker0": "Alice"})
+        result = resolve_speaker_tokens("speaker0's dog is friendly.", store)
+        assert result == "Alice's dog is friendly."
+
+    def test_multiple_distinct_tokens_resolve_independently(self):
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._fake_store({"speaker0": "Alice", "speaker1": "Bob"})
+        result = resolve_speaker_tokens("speaker0 called speaker1 yesterday.", store)
+        assert result == "Alice called Bob yesterday."
+
+    def test_near_miss_survivor_logs_warning_and_is_left_unsubstituted(self, caplog):
+        """A model re-rendering as 'Speaker 0' (space instead of no
+        separator) does not match the strict SUBSTITUTION regex — it must
+        survive unsubstituted AND be logged at WARNING with only the
+        matched shape, never the surrounding personal-content text."""
+        import logging
+
+        from paramem.server.speaker import resolve_speaker_tokens
+
+        store = self._fake_store({"speaker0": "Alice"})
+        text = "Please welcome Speaker 0 to the stage."
+        with caplog.at_level(logging.WARNING, logger="paramem.server.speaker"):
+            result = resolve_speaker_tokens(text, store)
+
+        # Left unsubstituted — widening SUBSTITUTION is an open owner decision.
+        assert "Speaker 0" in result
+        assert "Alice" not in result
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "Speaker 0" in message
+        # Never the surrounding reply text — it is personal content.
+        assert "Please welcome" not in message
+        assert "the stage" not in message
+
+    def test_no_near_miss_no_warning(self, tmp_path, caplog):
+        """A cleanly-resolved token produces no near-miss warning."""
+        import logging
+
+        store = self._store(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="paramem.server.speaker"):
+            from paramem.server.speaker import resolve_speaker_tokens
+
+            resolve_speaker_tokens("speaker0 likes hiking.", store)
+
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 # --- Engine registry ---
@@ -1150,27 +1380,38 @@ def test_oneshot_synthesize_closes_without_stopped():
 # ---------------------------------------------------------------------------
 
 
-class TestCloudSafetyInferenceIdentityGone:
-    """INFERENCE-IDENTITY injection is deleted; no raw speaker{N} id appears in the
-    prompt prefix or in the cloud system prompt.
+class TestCloudCarriesNoIdentity:
+    """Cloud never learns the speaker's id or name (NEW contract, 2026-08-02):
+    ``_escalate_to_cloud`` — the sole cloud transport primitive — takes no
+    speaker parameter at all and never calls ``_build_speaker_prefix``.  This
+    replaces the OLD invariant tested here previously ("display names to
+    cloud, ids never") — no identity of any kind reaches the cloud now; the
+    speaker{N} token is reserved for the LOCAL reasoning leg only, and a
+    display name is substituted only at the reply boundary
+    (``paramem.server.speaker.resolve_speaker_tokens``), never sent anywhere.
     """
 
-    def test_build_speaker_prefix_no_speaker_id_in_output(self) -> None:
-        """_build_speaker_prefix output contains no raw speaker{N} token."""
-        from paramem.server.inference import _build_speaker_prefix
+    def test_escalate_to_cloud_has_no_speaker_param(self) -> None:
+        """_escalate_to_cloud's signature carries no speaker/speaker_id param."""
+        import inspect
 
-        prefix = _build_speaker_prefix("Alice", "en", None)
-        assert "speaker0" not in prefix.lower()
-        assert "speaker9" not in prefix.lower()
+        from paramem.server.inference import _escalate_to_cloud
 
-    def test_build_speaker_prefix_cloud_path_same_as_local(self) -> None:
-        """Both paths (formerly local=True, cloud=False) now use the same function;
-        the result must never contain a raw id token regardless of caller.
-        """
-        from paramem.server.inference import _build_speaker_prefix
+        params = inspect.signature(_escalate_to_cloud).parameters
+        assert "speaker" not in params
+        assert "speaker_id" not in params
 
-        # Before: Cloud path was include_id_mapping=False; local=True.
-        # Now: single function, both produce the same clean prefix.
-        prefix = _build_speaker_prefix("Alice", "en", None)
-        assert "Alice" in prefix
-        assert "speaker" not in prefix.lower()
+    def test_escalate_to_cloud_system_prompt_has_no_identity_line(self) -> None:
+        """The prompt sent to the cloud agent carries no "You are speaking
+        with" line and no speaker{N} token — cloud gets the bare CLOUD_PROMPT."""
+        from paramem.server.inference import CLOUD_PROMPT, _escalate_to_cloud
+
+        cloud_agent = MagicMock()
+        cloud_agent.call.return_value = MagicMock(text="answer")
+
+        _escalate_to_cloud("hi", cloud_agent, config=None, language=None)
+
+        sent_prompt = cloud_agent.call.call_args.kwargs["system_prompt"]
+        assert sent_prompt == CLOUD_PROMPT
+        assert "You are speaking with" not in sent_prompt
+        assert "speaker" not in sent_prompt.lower()

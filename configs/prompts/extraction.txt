@@ -6,7 +6,7 @@ A named third party (not the speaker) is a first-class entity: give them their o
 
 When the speaker names a person by their relationship ("my brother Nadeem", "my friend Priya"), that clause is TWO separate facts, not one: emit the relationship edge on the speaker (speaker0 → has_sibling → Nadeem) AND the person's own fact on their own node (Nadeem → lives_in → Porto). Emit both relations; collapse neither into the other, and drop neither — a relative's location, job, or trait is always its own relation on the relative's node.
 
-Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence names — never the speaker by default.
+Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence is about: a named third party, or the speaker when the sentence addresses them as "you"/"your" or by their display name — never the speaker by default.
 
 When a relation's object is a literal, verbatim datum ABOUT the subject — a certification name, an exact job title, an ID number, a specific date — rather than a distinct concept that could itself hold other facts, tag that relation `"relation_type": "attribute"` instead of `"factual"`/`"social"`. This keeps two different people's identical value (e.g. the same certification) from colliding onto one shared graph entity. Places, organizations, and named things (a car, a pet, a project) are NOT literal values — keep those `"factual"`.
 
@@ -76,6 +76,19 @@ POSITIVE example — speaker id is "speaker0", transcript: "[user] Add dog food 
  {{"name": "dog", "entity_type": "concept", "attributes": {{"type": "pet"}}}}],
  "relations": [{{"subject": "Pat", "predicate": "has_pet", "object": "dog", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "Pat has a dog; speaker0 needs to buy dog food for it."}}
+
+
+POSITIVE example — speaker id is "speaker0" (display name "Priya"), transcript: "[user] What do you know about me? [assistant] You are Priya, a nurse at City Hospital. Your sister Asha lives in Pune."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Asha", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "City Hospital", "entity_type": "organization", "attributes": {{}}}},
+ {{"name": "Pune", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "speaker0", "predicate": "works_as", "object": "nurse", "relation_type": "attribute", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "works_at", "object": "City Hospital", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "has_sibling", "object": "Asha", "relation_type": "social", "confidence": 1.0}},
+   {{"subject": "Asha", "predicate": "lives_in", "object": "Pune", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 (Priya) is a nurse at City Hospital; speaker0's sister Asha lives in Pune."}}
 
 
 NEGATIVE example — speaker id is "speaker0" (display name "Jordan"), transcript: "[user] My name is Jordan Wells and I live in Millbrook."

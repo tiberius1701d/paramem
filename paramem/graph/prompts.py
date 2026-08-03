@@ -122,8 +122,8 @@ def _load_speaker_directive_section(section_name: str) -> str:
     * ``EXTRACTION-DIRECTIVE`` — loaded by ``build_speaker_context`` for
       the extraction user prompt.
     * ``THIRD-PARTY-DESCRIPTOR`` — loaded at module import by
-      ``inference.py`` as the fallback label when a ``speaker{N}`` token
-      has no display name (e.g. anonymous or unknown profile).
+      ``paramem.server.speaker`` as the fallback label when a ``speaker{N}``
+      token has no display name (e.g. anonymous or unknown profile).
 
     The file is read via :func:`_load_prompt` (``required=True``) rather
     than a bare ``Path.read_text()`` — this is the SAME chokepoint every

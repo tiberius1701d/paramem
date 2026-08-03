@@ -19,14 +19,14 @@ Each placeholder is `<Prefix>_<N>` where:
 
 ## Rules
 
-- **`speaker{{N}}` (e.g. `speaker0`) is already anonymous — leave it VERBATIM.** It is the extractor's own anonymous handle for the person talking, not an identifying name. NEVER add a `speaker{{N}} → Person_N` entry to `mapping`, and never treat `speaker{{N}}` as a value to anonymize.
+- **`speaker{{N}}` (e.g. `speaker0`) is already anonymous — leave it VERBATIM wherever it already appears.** NEVER add a `speaker{{N}} → Person_N` entry to `mapping`.
 - **Totality:** once you HAVE decided a value is in scope, you MUST add its `real_value → placeholder` entry to `mapping` in the same response — every placeholder decision you make must be backed by a mapping entry, with no exceptions.
 - Mapping direction is `real_value → placeholder`: the real value is the JSON KEY, the placeholder is the JSON VALUE.
 - Use the SAME placeholder for every occurrence of a value across the facts, the transcript, and your `anonymized_transcript` output.
 - The facts and transcript below are the material to work from. Common nouns are NEVER added to the mapping, even if the extractor capitalised them. "Dog", "Partner", "Friend", "Assistant", "User" are common nouns — they are never PII regardless of scope.
 - Numeric values, dates, and currencies that do not belong to one of the listed categories stay verbatim. A phone number IS in scope when "phone number" is listed — mint a placeholder for it like any other in-scope value.
 - **`anonymized_transcript` is a JSON array of turn strings, one element per turn, in the same order as the input, each a faithful rewrite of that turn changing ONLY the values you placeholdered.** Keep every `[user]`/`[assistant]` marker with its turn. Wording, punctuation, and structure everywhere else must be identical to the original. Do not summarize, paraphrase, drop, merge turns, or add content beyond the substitutions.
-
+{speaker_anchor_section}
 ## Examples
 
 POSITIVE — in-scope name substituted, out-of-scope place left verbatim (membership doubt — resolves to verbatim):

@@ -161,24 +161,28 @@ class ScannedPdfRejectedError(ValueError):
 # the repo-recorded extractor.py figure; ``anon_template`` and ``r_prose``
 # need no tokenizer at all, per above:
 #   envelope               = 8192 tok  (the single anonymize-call budget)
-#   anon_template words    = 1555 words (configs/prompts/anonymization.txt,
-#               rendered empty, current file — recomputed live by tests)
+#   anon_template words    = 1535 words (configs/prompts/anonymization.txt,
+#               rendered empty, current file — recomputed live by tests;
+#               shrank from 1684 words 2026-08-02 when the fold-onto-token
+#               speaker-anchor rule + worked example moved out into their
+#               own companion prompt, ``anonymization_speaker_anchor.txt``,
+#               rendered only when a speaker anchor is actually threaded)
 #   r_prose   = 1.9126 tokens/word  (document shape — the same
 #               measurement recorded as tokens.py's "document shape (CV)"
 #               row feeding ``MEASURED_TOKENS_PER_WORD``)
-#   anon_template = ceil(1555 * 1.9126)                          =  2975 tok
+#   anon_template = ceil(1535 * 1.9126)                          =  2936 tok
 #   reserve   = 48 (json envelope) + 10 (one mapping entry)      =    58 tok
 #   dense_chunk_real_tokens = 1500 words * r_prose (extractor.py's ~1500-word
 #               dense-chunk reference point)                    ~=  2869 tok
 #   f = 2200 (extractor.py's recorded dense-chunk output) / 2869 ~=  0.77
-#   chunk_real_tokens = (8192 - 2975 - 58) / (2 + 0.77)         ~=  1865 tok
+#   chunk_real_tokens = (8192 - 2936 - 58) / (2 + 0.77)         ~=  1879 tok
 #   cap_words = floor(chunk_real_tokens / r_prose)
-#             = floor(1865 / 1.9126)                              =   974 words
+#             = floor(1879 / 1.9126)                              =   982 words
 #
 # ``cap_words`` above is a REAL-token derivation, but the shipped constant
 # is deliberately NOT stored in real tokens — it is re-expressed in the
 # estimator's own unit:
-#     _DOC_MAX_TOKENS = cap_words * MEASURED_TOKENS_PER_WORD = 974 * 3.4 = 3311 tok
+#     _DOC_MAX_TOKENS = cap_words * MEASURED_TOKENS_PER_WORD = 982 * 3.4 = 3338 tok
 # That is why the MAX ratio (3.4, calibrated on fact JSON) does not shrink
 # the cap even though it over-counts prose by ~1.8x. Every runtime boundary
 # check is ``estimate_tokens(text) <= max_tokens``, i.e.
@@ -186,12 +190,12 @@ class ScannedPdfRejectedError(ValueError):
 # and cancels, so the decision reduces to ``chunk_words <= cap_words``
 # whatever the ratio happens to be. Store the cap in real tokens instead
 # and the cancellation is lost — the same 3.4 estimator would then measure
-# a 974-word prose chunk as 3311 "tokens" against an 1865-real-token
+# a 982-word prose chunk as 3338 "tokens" against an 1879-real-token
 # ceiling and cut documents to roughly half the derived length, and any
 # base-model swap that shifts the ratio would silently move the cap.
 # Pinned by ``tests/test_document_chunker.py``'s
 # ``TestDocMaxTokensDerivation::test_ratio_cancellation_invariant``.
-_DOC_MAX_TOKENS: int = 3311
+_DOC_MAX_TOKENS: int = 3338
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not
 # derived from the envelope). Real threshold is unchanged from before this
 # migration (200 words — "enough context for extraction"), re-expressed in

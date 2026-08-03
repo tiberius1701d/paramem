@@ -32,7 +32,7 @@ The one exception is the model-authored forwarded query behind
 predicate and suppresses BOTH hops (``ha_agent_id`` is operator-pointed
 and may be cloud-backed) when that verdict is personal.
 :func:`answer_via_cloud` is the sole cloud-egress funnel, for both local
-mode and cloud-only mode (``paramem.server.app._cloud_only_route`` and the
+mode and cloud-only mode (``paramem.server.app._relay_route`` and the
 ``/chat`` forced-route cloud-only branch route through it too, with
 ``model``/``tokenizer`` left ``None`` — cloud-only runs with no local model
 and therefore no ParaMem-held knowledge to protect).
@@ -49,7 +49,6 @@ from dataclasses import dataclass, field
 
 from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.prompts import _load_speaker_directive_section
 from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
 from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
@@ -57,14 +56,10 @@ from paramem.server.escalation import detect_escalation
 from paramem.server.router import Intent, RoutingPlan
 from paramem.server.sanitizer import is_self_referential
 from paramem.server.tools.ha_client import HAClient
-from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10
-
-# Loaded once at module import time; fails loud if speaker_directive.txt is missing.
-THIRD_PARTY_DESCRIPTOR: str = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
 
 
 def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:
@@ -85,25 +80,30 @@ def _language_instruction(language: str | None, config: ServerConfig | None = No
 
 
 def _build_speaker_prefix(
-    speaker: str | None,
+    speaker_id: str | None,
     language: str | None,
     config: ServerConfig | None,
 ) -> str:
-    """Assemble the speaker + language prefix for a system prompt.
+    """Assemble the speaker + language prefix for the LOCAL reasoning prompt.
 
-    This is the single shared implementation for the "You are speaking with X"
-    + language instruction block used by both local inference and cloud
-    escalation paths.
+    The "You are speaking with X" line is fed the raw ``speaker{N}`` token,
+    never the display name — identity stays in token space in every
+    model-facing surface (recalled facts, reasoning context, generated
+    replies).  A human-readable name is substituted only at the reply
+    boundary, by :func:`~paramem.server.speaker.resolve_speaker_tokens`,
+    after the turn is generated and persisted.
 
-    Speaker-id-to-name resolution at inference time is handled by the
-    ``speaker_resolver`` injected into :func:`MemoryStore.probe` — the raw
-    ``speaker{N}`` token in recalled facts is replaced with the display name at
-    the fact-render boundary, not via a prompt injection.  No id-mapping
-    sentence is emitted here; none reaches the cloud (privacy invariant).
+    This function is called ONLY on the local reasoning leg (from
+    :func:`_probe_and_reason` and :func:`_base_model_answer`).  The cloud leg
+    (:func:`_escalate_to_cloud`) never calls it and carries no identity line
+    at all — cloud never learns the speaker's id or name.
 
     Args:
-        speaker: Display name of the resolved speaker, or ``None`` when
-            unknown or suppressed (e.g. anonymous profile).
+        speaker_id: The speaker's canonical ``speaker{N}`` token, or ``None``
+            when unresolved.  Anonymous/undisclosed speakers are included —
+            their raw token is the identity line's payload the same as a
+            named speaker's; there is no name-presence gate here (see
+            :func:`_build_system_prompt`).
         language: BCP-47 language code, or ``None`` / ``"en"`` when no
             instruction is needed.
         config: Server config, used to derive the language display name via
@@ -114,42 +114,51 @@ def _build_speaker_prefix(
         system prompt.
     """
     parts: list[str] = []
-    if speaker:
-        parts.append(f"You are speaking with {speaker}.")
+    if speaker_id:
+        parts.append(f"You are speaking with {speaker_id}.")
     lang_instr = _language_instruction(language, config)
     if lang_instr:
         parts.append(lang_instr)
     return " ".join(parts)
 
 
-def _personalize_prompt(
-    base_prompt: str,
-    speaker: str | None,
-    language: str | None = None,
-    config: ServerConfig | None = None,
+def _build_system_prompt(
+    speaker_id: str | None,
+    language: str | None,
+    config: ServerConfig,
 ) -> str:
-    """Inject speaker name and language instruction into the system prompt.
+    """Assemble the complete system prompt for a LOCAL reasoning generate call.
 
-    Uses :func:`_build_speaker_prefix` to assemble the prefix so that the
-    local-inference and cloud-escalation paths share exactly one implementation.
+    THE single assembly point for the identity + language prefix on top of
+    ``config.voice.load_prompt()``.  Both :func:`_probe_and_reason` and
+    :func:`_base_model_answer` call this — collapsing what were previously
+    two byte-identical four-line blocks — so the two legs cannot drift from
+    each other.
 
-    Speaker-id-to-name resolution is handled at the fact-render boundary via
-    the ``speaker_resolver`` in :func:`MemoryStore.probe` — not by a prompt
-    injection.  No ``speaker_id`` param is needed or accepted here.
-
-    Greeting is handled at the app layer (prepended to response text)
-    so it works across all paths including escalation.
+    Identity for the LOCAL reasoning prompt is the raw ``speaker{N}`` token,
+    not the display name (see :func:`_build_speaker_prefix`).  The prefix is
+    present iff ``speaker_id`` is resolved — anonymous/undisclosed speakers
+    included; there is no display-name gate here.  A human-readable name is
+    substituted only at the reply boundary
+    (:func:`~paramem.server.speaker.resolve_speaker_tokens`), never in a
+    model-facing prompt.
 
     Args:
-        base_prompt: The base system prompt to prepend to.
-        speaker: Display name of the resolved speaker, or ``None``.
-        language: BCP-47 language code, or ``None`` / ``"en"``.
-        config: Server config for language display names.
+        speaker_id: The speaker's canonical ``speaker{N}`` token, or ``None``
+            when unresolved — gates whether the identity line is included
+            at all.
+        language: BCP-47 language code, or ``None``/``"en"`` for no
+            instruction.
+        config: Server config — supplies the language display name and the
+            base voice prompt (``config.voice.load_prompt()``).
+
+    Returns:
+        The complete system prompt: the identity/language prefix (when any)
+        followed by the base voice prompt.
     """
-    prefix = _build_speaker_prefix(speaker, language, config)
-    if prefix:
-        return prefix + " " + base_prompt
-    return base_prompt
+    prefix = _build_speaker_prefix(speaker_id, language, config)
+    base_prompt = config.voice.load_prompt()
+    return f"{prefix} {base_prompt}" if prefix else base_prompt
 
 
 @dataclass
@@ -157,6 +166,41 @@ class ChatResult:
     text: str
     escalated: bool = False
     probed_keys: list[str] = field(default_factory=list)
+
+
+def _is_personal_interrogative(text: str, config: ServerConfig, *, is_personal: bool) -> bool:
+    """Return True when *text* is both personal-class and interrogative.
+
+    THE one implementation of this conjunction — two independent gates
+    call it rather than re-deriving ``is_personal and _is_interrogative(...)``
+    themselves:
+
+    * :func:`_abstain_if_applicable` — additionally gates on
+      ``config.abstention.enabled`` (a feature toggle).
+    * ``paramem.server.app._relay_route``'s no-identity short-circuit —
+      deliberately NOT gated on ``config.abstention.enabled``.  A
+      speakerless caller has no store to abstain *from*; refusing the
+      personal interrogative there is a structural impossibility (there is
+      no identity for the question to be about), not a feature the
+      operator can toggle off.
+
+    Args:
+        text: The turn to classify.
+        config: Server config — supplies ``config.sentence_type`` for the
+            interrogative classifier.
+        is_personal: Precomputed personal-class verdict.  Callers compute
+            this independently — ``handle_chat``'s union of the intent
+            classifier and :func:`~paramem.server.sanitizer.is_self_referential`
+            for an identified speaker; plain ``is_self_referential`` for a
+            speakerless relay turn, which has no intent classifier to
+            consult (routing requires a resolved ``speaker_id``).
+
+    Returns:
+        ``True`` iff *is_personal* and *text* is interrogative.
+    """
+    from paramem.server.router import _is_interrogative
+
+    return is_personal and _is_interrogative(text, config=config.sentence_type)
 
 
 def _abstain_if_applicable(
@@ -169,11 +213,11 @@ def _abstain_if_applicable(
 ) -> tuple[ChatResult, str] | None:
     """Decide whether to short-circuit with the canned abstention response.
 
-    Gate: ``config.abstention.enabled`` AND ``is_personal`` AND the query
-    is interrogative (per :func:`paramem.server.router._is_interrogative`).
-    When the gate fires, returns ``(canned_chat_result, exit_via_label)``;
-    otherwise returns ``None`` and the caller continues the escalation
-    chain.
+    Gate: ``config.abstention.enabled`` AND :func:`_is_personal_interrogative`
+    (``is_personal`` AND the query is interrogative per
+    :func:`paramem.server.router._is_interrogative`).  When the gate fires,
+    returns ``(canned_chat_result, exit_via_label)``; otherwise returns
+    ``None`` and the caller continues the escalation chain.
 
     The cold-start variant fires when ``speaker_id`` is set but the
     router has no keys for them yet (between enrollment and the first
@@ -193,12 +237,9 @@ def _abstain_if_applicable(
     fix with zero hallucination risk on personal interrogatives that
     parametric memory cannot answer.
     """
-    from paramem.server.router import _is_interrogative
-
     if not (
         config.abstention.enabled
-        and is_personal
-        and _is_interrogative(text, config=config.sentence_type)
+        and _is_personal_interrogative(text, config, is_personal=is_personal)
     ):
         return None
     is_cold_start = bool(speaker_id) and (
@@ -228,7 +269,6 @@ def handle_chat(
     language: str | None = None,
     effective_mode: str | None = None,
     memory_store=None,
-    speaker_store=None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
 
@@ -262,7 +302,19 @@ def handle_chat(
     When ``config.debug`` is True a per-request routing-decision
     diagnostic is emitted via ``logging.info(extra={"routing": …})`` at
     function exit.
+
+    Raises:
+        ValueError: if ``speaker_id`` is ``None``.  ``handle_chat`` requires
+            a resolved speaker — speakerless requests are served entirely by
+            the relay path (``paramem.server.app._relay_route``, forked at
+            the ``ServingPath`` boundary before ``handle_chat`` is ever
+            called) and never reach here.
     """
+    if speaker_id is None:
+        raise ValueError(
+            "handle_chat requires a resolved speaker_id — speakerless requests "
+            "are served by the relay path (_relay_route), never by handle_chat."
+        )
     routing_diags: dict = {
         "conversation_id": conversation_id,
         "intent": Intent.UNKNOWN.value,
@@ -295,61 +347,23 @@ def handle_chat(
             # GENERAL.
             intent_is_personal = intent == Intent.PERSONAL
 
-            # Build the speaker resolver closure once per request.  Passed into
-            # memory_store.probe so raw speaker{N} tokens in recalled facts are
-            # replaced with display names at the render boundary.
-            # read-tolerance: canonicalize before lookup so pre-migration cased
-            # tokens (e.g. "Speaker0") still resolve during the forward-only
-            # transition.
-            def _speaker_resolver(tok: str) -> str:
-                if not is_speaker_id(tok):
-                    return tok
-                name = speaker_store.resolve_speaker_name(canonical(tok)) if speaker_store else None
-                return name if name else THIRD_PARTY_DESCRIPTOR
-
             # THE personal verdict, computed once.  Two arms, unioned: the
             # intent classifier and the self-reference gate.  Everything
             # downstream reads ``is_personal``; neither arm is re-derived
             # anywhere else.
             is_self_ref = is_self_referential(
                 text,
-                speaker_id=speaker_id,
                 personal_referent_config=config.personal_referent,
             )
             is_personal = intent_is_personal or is_self_ref
             routing_diags["is_self_referential"] = is_self_ref
 
-            # Anonymous deny-by-default: an unauthenticated caller has no claim
-            # on the speaker's private parametric memory.  When the router
-            # classified the turn as PERSONAL but ``speaker_id`` did not
-            # resolve, the personal probe path is unreachable for this
-            # caller.  Interrogative form → canned abstention (avoids
-            # leaking the existence of indexed facts via an answer).
-            # Declarative form → demote to non-personal so the turn flows
-            # to the General/Unknown HA → cloud path with cloud-side
-            # sanitization, instead of consulting the local store.  Pairs
-            # with the sanitizer paraphrase pass (Task #13) to keep
-            # CV-derived topics off the personal arm for anonymous callers.
-            if is_personal and not speaker_id:
-                routing_diags["paths_attempted"].append("anonymous_personal_deny")
-                abstention = _abstain_if_applicable(
-                    text,
-                    config,
-                    is_personal=True,
-                    speaker_id=None,
-                    router=router,
-                )
-                if abstention is not None:
-                    result, label = abstention
-                    routing_diags["exit_via"] = label
-                    logger.info(
-                        "Anonymous caller + PERSONAL intent — abstaining (%s)",
-                        label,
-                    )
-                    return result
-                # Declarative turn from anonymous caller: do NOT consult the
-                # personal store; relay via the standard escalation chain.
-                is_personal = False
+            # The former anonymous deny-by-default branch is gone: a
+            # speakerless caller never reaches ``handle_chat`` (the
+            # ``ServingPath`` boundary in ``paramem.server.app`` forks
+            # speakerless requests to the relay path before this function is
+            # called — see the contract assertion above), so ``speaker_id``
+            # is always resolved here and there is nothing left to deny.
 
             # PERSONAL → local PA probe + reason.  No cloud anywhere on this
             # path: is_personal=True suppresses every internal _escalate_to_cloud
@@ -373,8 +387,6 @@ def handle_chat(
                     effective_mode=effective_mode,
                     is_personal=True,
                     memory_store=memory_store,
-                    speaker_store=speaker_store,
-                    speaker_resolver=_speaker_resolver,
                 )
 
             # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
@@ -500,11 +512,7 @@ CLOUD_PROMPT = (
 )
 
 
-def _sanitize_history(
-    history: list[dict] | None,
-    *,
-    speaker_id: str | None = None,
-) -> list[dict]:
+def _sanitize_history(history: list[dict] | None) -> list[dict]:
     """Drop-gate conversation history for cloud: self-referential turns are removed.
 
     Unconditional — there is no pass-through or warn-only setting.  A
@@ -516,12 +524,6 @@ def _sanitize_history(
         history: Conversation turns to gate.  Only the last
             :data:`MAX_HISTORY_TURNS` are considered; empty-text turns are
             dropped.
-        speaker_id: Resolved speaker store ID, threaded to
-            :func:`~paramem.server.sanitizer.is_self_referential`'s
-            first-person detector (:func:`~paramem.server.sanitizer.
-            _is_about_speaker`) — without it, "I" / "my" in a history
-            turn never resolves to a concrete speaker and the detector
-            is dead on this channel.
 
     Returns:
         The surviving turns as ``{"role", "text"}`` dicts, in order.
@@ -534,7 +536,7 @@ def _sanitize_history(
         text = turn.get("text", "")
         if not text:
             continue
-        if is_self_referential(text, speaker_id=speaker_id):
+        if is_self_referential(text):
             logger.info("Dropped self-referential history turn from cloud payload")
             continue
         sanitized.append({"role": role, "text": text})
@@ -559,7 +561,7 @@ def answer_via_cloud(
 
     The sole cloud-egress funnel: every caller — local-mode routing (this
     module) and cloud-only routing
-    (``paramem.server.app._cloud_only_route`` and the ``/chat`` forced-route
+    (``paramem.server.app._relay_route`` and the ``/chat`` forced-route
     cloud-only branch) — reaches :func:`_escalate_to_cloud` only through
     here.
 
@@ -614,12 +616,11 @@ def answer_via_cloud(
         # drop-gated — an old turn can be personal even in cloud-only mode.
         if not cloud_permitted:
             return None
-        sanitized_history = _sanitize_history(history, speaker_id=speaker_id)
+        sanitized_history = _sanitize_history(history)
         return _escalate_to_cloud(
             text,
             cloud_agent,
             config,
-            speaker=speaker,
             sanitized_history=sanitized_history,
             language=language,
         )
@@ -666,14 +667,15 @@ def answer_via_cloud(
         # NOT bundled into a single anonymized transcript with the current
         # turn (that would show the cloud the history twice and forces
         # multi-turn text reproduction on the local 7B model, which it
-        # doesn't do reliably).  Instead: (i) drop-gate each turn,
-        # speaker_id threaded so the first-person detector actually fires
-        # on this channel, then (ii) substitute through ``payload.forward``
+        # doesn't do reliably).  Instead: (i) drop-gate each turn via
+        # ``_sanitize_history`` — content-only, no ``speaker_id`` (see
+        # ``is_self_referential``'s docstring: it takes no speaker_id
+        # parameter) — then (ii) substitute through ``payload.forward``
         # — no second LLM call.  Accepted residual: ``payload.forward``
         # only covers entities the anonymizer named in the CURRENT turn,
         # so a personal entity appearing ONLY in history is dropped by the
         # gate but not placeholdered.  See benchmarking.md.
-        drop_gated_history = _sanitize_history(history, speaker_id=speaker_id)
+        drop_gated_history = _sanitize_history(history)
         sanitized_history = [
             {**turn, "text": _substitute_whole_words(turn["text"], payload.forward)}
             for turn in drop_gated_history
@@ -683,7 +685,6 @@ def answer_via_cloud(
             payload.anon_transcript,
             cloud_agent,
             config,
-            speaker=speaker,
             sanitized_history=sanitized_history,
             language=language,
         )
@@ -705,12 +706,11 @@ def answer_via_cloud(
     # cloud_mode=block + non-PERSONAL: current turn goes verbatim (the
     # personal verdict already cleared it).  History is still drop-gated —
     # an old turn can be personal even when this one is not.
-    sanitized_history = _sanitize_history(history, speaker_id=speaker_id)
+    sanitized_history = _sanitize_history(history)
     return _escalate_to_cloud(
         text,
         cloud_agent,
         config,
-        speaker=speaker,
         sanitized_history=sanitized_history,
         language=language,
     )
@@ -720,7 +720,6 @@ def _escalate_to_cloud(
     text: str,
     cloud_agent: CloudAgent,
     config: ServerConfig,
-    speaker: str | None = None,
     sanitized_history: list[dict] | None = None,
     language: str | None = None,
 ) -> ChatResult:
@@ -734,6 +733,16 @@ def _escalate_to_cloud(
     :func:`answer_via_cloud`, which is the sole cloud-egress funnel for
     both local mode and cloud-only mode.
 
+    The system prompt carries NO identity line at all — no ``speaker_id``
+    token and no display name.  Unlike the local reasoning leg
+    (:func:`_build_speaker_prefix`, fed the ``speaker{N}`` token), the cloud
+    system prompt is the bare :data:`CLOUD_PROMPT` plus only the language
+    instruction.  This is scoped to the system prompt only: sanitized
+    history (:func:`_sanitize_history`) can still carry a ``speaker{N}``
+    token verbatim through ``answer_via_cloud``'s history-substitution path —
+    an accepted posture, not a leak — so "cloud never learns who it is
+    talking to" would overclaim.
+
     Args:
         text: The query text.  Sanitized/anonymized (or, in cloud-only mode,
             deliberately left verbatim per policy) by :func:`answer_via_cloud`
@@ -741,7 +750,6 @@ def _escalate_to_cloud(
             decided.
         cloud_agent: Cloud agent to delegate to.
         config: Server config.
-        speaker: Display name of the resolved speaker, or ``None``.
         sanitized_history: Conversation history turns, ALREADY drop-gated
             (and, under an anonymizing ``cloud_mode``, placeholdered) by
             :func:`answer_via_cloud` — this function does not sanitize.
@@ -749,8 +757,8 @@ def _escalate_to_cloud(
     """
     sanitized_history = sanitized_history or []
 
-    prefix = _build_speaker_prefix(speaker, language, config)
-    prompt = (prefix + " " + CLOUD_PROMPT) if prefix else CLOUD_PROMPT
+    lang_instr = _language_instruction(language, config)
+    prompt = (lang_instr + " " + CLOUD_PROMPT) if lang_instr else CLOUD_PROMPT
 
     logger.info(
         "cloud escalation (%d history turns): %s",
@@ -782,8 +790,6 @@ def _probe_and_reason(
     is_personal: bool = False,
     effective_mode: str | None = None,
     memory_store=None,
-    speaker_store=None,
-    speaker_resolver=None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -846,7 +852,6 @@ def _probe_and_reason(
         source=source,
         speaker_id=speaker_id,
         memoize=config.inference.preload_cache,
-        speaker_resolver=speaker_resolver,
     )
 
     # Restore predictable adapter state after weight probing: episodic is
@@ -985,7 +990,7 @@ def _probe_and_reason(
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
-    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
+    system_prompt = _build_system_prompt(speaker_id, language, config)
     messages = _build_messages(augmented_text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -1035,7 +1040,7 @@ def _base_model_answer(
     """
     from peft import PeftModel
 
-    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
+    system_prompt = _build_system_prompt(speaker_id, language, config)
     messages = _build_messages(text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -1111,7 +1116,6 @@ def _maybe_escalate(
 
     forwarded_is_personal = is_self_referential(
         forwarded_query,
-        speaker_id=speaker_id,
         personal_referent_config=config.personal_referent,
     )
 
@@ -1157,7 +1161,13 @@ def _build_messages(
     """Build chat messages enforcing strict user/assistant alternation.
 
     Mistral requires: system → user → assistant → user → ...
-    HA may send non-alternating history, so we enforce the pattern here.
+    History read back from ``SessionBuffer`` can itself be non-alternating:
+    the user and assistant turns of a single exchange are appended as two
+    separate, non-atomic ``SessionBuffer.append`` calls (see
+    ``paramem.server.app._run_chat_turn``) — if the assistant append fails
+    after the user append succeeds, a lone user turn survives and the next
+    request's history carries two consecutive user turns.  We enforce the
+    pattern here regardless of how it arose.
     """
     pairs = []
     if history:

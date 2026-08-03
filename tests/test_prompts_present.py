@@ -29,6 +29,18 @@ class TestPromptFilesPresent:
     def test_extraction_procedural_txt_exists(self):
         assert (_PROMPTS_DIR / "extraction_procedural.txt").exists()
 
+    def test_anonymization_speaker_anchor_txt_exists(self):
+        """Companion prompt fragment split out of ``anonymization.txt``
+        2026-08-02 — the fold-onto-token speaker-anchor rule + worked
+        examples, rendered into the base template's
+        ``{speaker_anchor_section}`` slot only when a speaker id is
+        threaded."""
+        assert (_PROMPTS_DIR / "anonymization_speaker_anchor.txt").exists()
+
+    def test_anonymization_speaker_anchor_txt_has_speaker_id_placeholder(self):
+        content = (_PROMPTS_DIR / "anonymization_speaker_anchor.txt").read_text()
+        assert "{speaker_id}" in content
+
     def test_extraction_txt_has_transcript_placeholder(self):
         content = (_PROMPTS_DIR / "extraction.txt").read_text()
         assert "{transcript}" in content
@@ -124,6 +136,27 @@ class TestPromptFilesPresent:
             "extraction_procedural.txt missing 'JSON' keyword — the output "
             "directive may be missing, breaking procedural parsing."
         )
+
+    def test_extraction_second_order_txt_exists(self):
+        assert (_PROMPTS_DIR / "extraction_second_order.txt").exists()
+
+    def test_extraction_second_order_txt_has_required_placeholders(self):
+        """The second-order user template requires ``{transcript}`` and
+        ``{speaker_context}`` (same call-site contract as
+        ``extraction.txt``/``extraction_procedural.txt``) plus
+        ``{named_people}`` — the gate-derived closed target set threaded
+        via ``extra_slots`` (:func:`paramem.graph.flows._stage_second_order_extract`).
+        A missing ``{named_people}`` slot means the phase silently reverts
+        to asking the model to re-derive the target set from raw prose —
+        the double-derivation defect this slot exists to close.
+        """
+        content = (_PROMPTS_DIR / "extraction_second_order.txt").read_text()
+        required = ("{transcript}", "{speaker_context}", "{named_people}")
+        for placeholder in required:
+            assert placeholder in content, (
+                f"extraction_second_order.txt missing placeholder {placeholder!r} — "
+                "the format-kwargs call site expects this slot."
+            )
 
 
 class TestSystemPromptFilesPresent:

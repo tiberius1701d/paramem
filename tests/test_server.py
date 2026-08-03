@@ -268,6 +268,36 @@ class TestSessionBuffer:
         assert "[user] I live in Amsterdam" in pending[0]["transcript"]
         assert pending[0]["speaker_id"] == "spk_abc"
 
+    def test_get_session_turns_conversational(self, tmp_path):
+        """Regression: a direct ``_turns[conversation_id]`` lookup is dead for
+        the conversational case — ``append`` always mints a distinct
+        session_id (``f"{conversation_id}-{timestamp}-{rand}"``), so
+        ``get_session_turns`` must route through the ``_open`` indirection
+        the same way ``append`` resolves it."""
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
+        buffer.append("conv1", "user", "Hello")
+        buffer.append("conv1", "assistant", "Hi there!")
+
+        turns = buffer.get_session_turns("conv1")
+        assert [t["text"] for t in turns] == ["Hello", "Hi there!"]
+
+    def test_get_session_turns_document_chunk_path(self, tmp_path):
+        """Document-chunk sessions use session_id == the routing handle
+        directly (``append_document_chunk`` never rotates) — the fallback
+        to treating the id as a session id directly must keep this path
+        working."""
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
+        buffer.set_speaker("doc-1-c000", "speaker0", "Alex")
+        buffer.set_document_metadata("doc-1-c000", doc_id="doc-1", chunk_count=1)
+        buffer.append_document_chunk("doc-1-c000", "user", "chunk text")
+
+        turns = buffer.get_session_turns("doc-1-c000")
+        assert [t["text"] for t in turns] == ["chunk text"]
+
+    def test_get_session_turns_unknown_conversation_empty(self, tmp_path):
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
+        assert buffer.get_session_turns("never-seen") == []
+
     def _setup_daily(self, tmp_path, monkeypatch, passphrase="pw"):
         """Install a daily age identity so the envelope-encrypt path engages."""
         from paramem.backup.key_store import (
@@ -713,6 +743,314 @@ class TestProbeAndReasonDispatch:
             "interim adapter name should NOT leak as a section heading; "
             "merge them under [Recent knowledge] instead"
         )
+
+    def _stub_common(self, monkeypatch, *, fact_prefix: str):
+        """Shared stubbing for the two identity-prompt tests below — mirrors
+        the pattern used by the two tests above, factored out since both new
+        tests need identical mocking with only the ``speaker``/``speaker_id``
+        arguments differing."""
+
+        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
+            results = {}
+            for keys in keys_by_adapter.values():
+                for k in keys:
+                    results[k] = {
+                        "key": k,
+                        "fact_text": f"{fact_prefix} likes {k}",
+                        "confidence": 1.0,
+                    }
+            return results
+
+        monkeypatch.setattr(
+            "paramem.memory.probe.probe_keys_grouped_by_adapter",
+            fake_grouped,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            lambda model, name: None,
+        )
+        monkeypatch.setattr(
+            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
+            staticmethod(lambda path: {}),
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.is_self_referential",
+            lambda text, **kwargs: False,
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer",
+            lambda model, tokenizer, prompt, **kwargs: "final answer",
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.PeftModel",
+            type(None),
+            raising=False,
+        )
+
+    def test_local_reasoning_prompt_carries_speaker_token_not_name(self, monkeypatch, tmp_path):
+        """The system prompt reaching _build_messages for a named speaker
+        contains the raw speaker{N} token and ZERO occurrences of the display
+        name — identity stays in token space on the LOCAL reasoning leg."""
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        self._stub_common(monkeypatch, fact_prefix="speaker0")
+
+        captured = {}
+
+        def capture_messages(text, history, system_prompt, tokenizer):
+            captured["system_prompt"] = system_prompt
+            captured["augmented_text"] = text
+            return [{"role": "user", "content": text}]
+
+        monkeypatch.setattr("paramem.server.inference._build_messages", capture_messages)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self._make_model(["episodic"])
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("You are an assistant.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        plan = self._make_plan([("episodic", ["e1"])])
+
+        from paramem.server.inference import _probe_and_reason
+
+        _probe_and_reason(
+            text="What do I like?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=_MS(replay_enabled=False),
+            speaker="Alice",
+            speaker_id="speaker0",
+        )
+
+        assert "system_prompt" in captured, "_build_messages was not called"
+        system_prompt = captured["system_prompt"]
+        assert "speaker0" in system_prompt
+        assert "Alice" not in system_prompt
+        # The assembled reasoning prompt as a whole (prefix + recalled facts)
+        # carries the token throughout and never the display name.
+        full_prompt = system_prompt + captured["augmented_text"]
+        assert "speaker0" in full_prompt
+        assert "Alice" not in full_prompt
+
+    def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch, tmp_path):
+        """Re-spec (B-form prefix from speaker_id presence): the local
+        system-prompt identity line is now gated on ``speaker_id`` alone —
+        anonymous/undisclosed speakers included.  ``speaker=None`` (the
+        display name, still absent pre-disclosure) no longer suppresses it;
+        only a ``speaker_id`` of ``None`` would.  The raw token is the
+        payload — never the display name, which stays absent from the
+        prompt regardless."""
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        self._stub_common(monkeypatch, fact_prefix="speaker3")
+
+        captured = {}
+
+        def capture_messages(text, history, system_prompt, tokenizer):
+            captured["system_prompt"] = system_prompt
+            return [{"role": "user", "content": text}]
+
+        monkeypatch.setattr("paramem.server.inference._build_messages", capture_messages)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self._make_model(["episodic"])
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("You are an assistant.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        plan = self._make_plan([("episodic", ["e1"])])
+
+        from paramem.server.inference import _probe_and_reason
+
+        _probe_and_reason(
+            text="What do I like?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=_MS(replay_enabled=False),
+            speaker=None,
+            speaker_id="speaker3",
+        )
+
+        assert "system_prompt" in captured, "_build_messages was not called"
+        system_prompt = captured["system_prompt"]
+        assert "You are speaking with speaker3." in system_prompt
+
+
+class TestBaseModelAnswerSystemPrompt:
+    """_base_model_answer's system-prompt assembly, mirrored against
+    _probe_and_reason's via the shared ``_build_system_prompt`` helper
+    (previously two byte-identical inline blocks with zero coverage on this
+    leg — a drift between the two would have been invisible to CI)."""
+
+    def test_speaker_token_and_language_reach_system_prompt(self, monkeypatch, tmp_path):
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        captured = {}
+
+        def capture_messages(text, history, system_prompt, tokenizer):
+            captured["system_prompt"] = system_prompt
+            return [{"role": "user", "content": text}]
+
+        monkeypatch.setattr("paramem.server.inference._build_messages", capture_messages)
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer",
+            lambda model, tokenizer, prompt, **kwargs: "a plain answer",
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.PeftModel",
+            type(None),
+            raising=False,
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = MagicMock()
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("Base voice prompt.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        from paramem.server.inference import _base_model_answer
+
+        result = _base_model_answer(
+            text="hello",
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            speaker="Alice",
+            speaker_id="speaker0",
+            language="de",
+        )
+
+        assert "system_prompt" in captured, "_build_messages was not called"
+        system_prompt = captured["system_prompt"]
+        assert "speaker0" in system_prompt
+        assert "Alice" not in system_prompt
+        assert "Respond in German" in system_prompt
+        assert "Base voice prompt." in system_prompt
+        assert result.text == "a plain answer"
+
+    def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch, tmp_path):
+        """Re-spec (B-form prefix from speaker_id presence): ``speaker=None``
+        no longer suppresses the identity token when ``speaker_id`` is set —
+        the prefix is gated on ``speaker_id`` alone, anonymous included."""
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        captured = {}
+
+        def capture_messages(text, history, system_prompt, tokenizer):
+            captured["system_prompt"] = system_prompt
+            return [{"role": "user", "content": text}]
+
+        monkeypatch.setattr("paramem.server.inference._build_messages", capture_messages)
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer",
+            lambda model, tokenizer, prompt, **kwargs: "a plain answer",
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.PeftModel",
+            type(None),
+            raising=False,
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = MagicMock()
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("Base voice prompt.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        from paramem.server.inference import _base_model_answer
+
+        _base_model_answer(
+            text="hello",
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            speaker=None,
+            speaker_id="speaker3",
+        )
+
+        system_prompt = captured["system_prompt"]
+        assert "You are speaking with speaker3." in system_prompt
+
+
+class TestBuildMessagesAlternationDefense:
+    """``_build_messages``'s same-role merge and leading-assistant strip
+    (inference.py) had ZERO behavioral coverage before this change — both
+    prompt-capture tests above patch ``_build_messages`` out entirely.
+
+    ``_run_chat_turn``'s user/assistant append pair
+    (``paramem/server/app.py``) is NOT wrapped in a ``try/except``: the
+    "user" append happens, then the "assistant" append happens as a
+    separate synchronous call with its own file write/fsync.  A failure on
+    the second append (e.g. disk full) after the first already succeeded —
+    "an errored request that persisted a user turn without an assistant
+    reply" — leaves a non-alternating history.  Alternation is therefore
+    NOT structurally guaranteed, so the defense is KEPT (not deleted) and
+    pinned here directly.
+    """
+
+    def test_consecutive_same_role_turns_merged(self, monkeypatch):
+        from paramem.server.inference import _build_messages
+
+        # Bypass adapt_messages/tokenizer template resolution entirely — it's
+        # a separate concern (system-role folding) from the merge/strip logic
+        # under test here.
+        monkeypatch.setattr(
+            "paramem.server.inference.adapt_messages",
+            lambda messages, tokenizer: messages,
+        )
+
+        history = [
+            {"role": "user", "text": "first"},
+            {"role": "user", "text": "second"},
+            {"role": "assistant", "text": "reply"},
+        ]
+        messages = _build_messages("question", history, "system prompt", tokenizer=MagicMock())
+
+        assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+        assert messages[1]["content"] == "first\nsecond"
+        assert messages[-1]["content"] == "question"
+
+    def test_leading_assistant_turn_stripped(self, monkeypatch):
+        from paramem.server.inference import _build_messages
+
+        monkeypatch.setattr(
+            "paramem.server.inference.adapt_messages",
+            lambda messages, tokenizer: messages,
+        )
+
+        history = [
+            {"role": "assistant", "text": "orphaned reply"},
+            {"role": "user", "text": "hi"},
+        ]
+        messages = _build_messages("question", history, "system prompt", tokenizer=MagicMock())
+
+        # The leading assistant turn is dropped; the surviving user turn ends
+        # up last, so the current-turn text is appended onto it (see
+        # _build_messages's final if/else) rather than becoming a new message.
+        assert [m["role"] for m in messages] == ["system", "user"]
+        assert messages[-1]["content"] == "hi\nquestion"
+        assert not any("orphaned reply" in m["content"] for m in messages)
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,6 @@ callers can import them from either module.
 import hashlib
 import json
 import logging
-from collections.abc import Callable
 from itertools import groupby
 
 from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
@@ -490,10 +489,7 @@ def finalize_recalled(
 # --- Fact-text helper ---
 
 
-def entry_fact_text(
-    entry: dict,
-    resolve: Callable[[str], str] | None = None,
-) -> str:
+def entry_fact_text(entry: dict) -> str:
     """Render a recalled entry as prose — the identity → display boundary.
 
     This is THE render boundary: it turns the *stored identity form* of a
@@ -507,9 +503,14 @@ def entry_fact_text(
     * ``subject`` / ``object`` are **identity-folded** — the graph merger keys
       them via :func:`paramem.utils.identity.canonical` at the node-identity
       boundary and keeps the first-seen display surface in the node's
-      ``attributes["name"]`` — so they are emitted as-is here (after the
-      optional ``resolve`` hook); no further transformation happens at this
-      boundary.
+      ``attributes["name"]`` — so they are emitted as-is here; no further
+      transformation happens at this boundary.  A ``speaker{N}`` token in
+      subject or object position is emitted verbatim too — it is NOT resolved
+      to a display name here.  Every model-facing surface (recalled facts,
+      reasoning context, generated replies) stays in token space; a token is
+      substituted for a human-readable name exactly once, at the reply
+      boundary, by :func:`~paramem.server.speaker.resolve_speaker_tokens`,
+      never at fact-render time.
     * ``predicate`` is stored in **identity form**, which is already
       space-form (``canonical``'s blank fold collapses ``_``/whitespace to a
       single space, e.g. ``"has sister-in-law"``), so it is used directly —
@@ -522,22 +523,14 @@ def entry_fact_text(
     Args:
         entry: Dict containing at minimum ``subject``, ``predicate``, and
             ``object`` keys.
-        resolve: Optional callable that maps a raw subject/object token to its
-            display form.  When provided, ``entry["subject"]`` and
-            ``entry["object"]`` are passed through it before assembly.  ``None``
-            (the default) preserves byte-identical behaviour — the raw SPO
-            tokens are used verbatim.  The resolver must be a pure function
-            (no side-effects) and must never raise; returning the token
-            unchanged for unrecognised inputs is the expected contract.
-            Typical use: resolve ``speaker{N}`` ids to display names at the
-            fact-render boundary (household-wide name injection).
 
     Returns:
         Human-readable fact string, e.g. ``"Alex lives in Heilbronn"`` (from
-        the stored predicate ``"lives in"``).
+        the stored predicate ``"lives in"``), or ``"speaker0 lives in
+        Heilbronn"`` when the subject is still a raw token.
     """
-    subject = resolve(entry["subject"]) if resolve is not None else entry["subject"]
-    obj = resolve(entry["object"]) if resolve is not None else entry["object"]
+    subject = entry["subject"]
+    obj = entry["object"]
     predicate = " ".join(entry["predicate"].split())
     return f"{subject} {predicate} {obj}"
 

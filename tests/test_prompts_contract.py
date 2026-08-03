@@ -767,10 +767,25 @@ class TestEnrichmentPromptContract:
         tmpl = _load_prompt("cloud_enrichment.txt", required=True)
         # Must not raise KeyError — every literal brace pair escaped as
         # `{{` / `}}`.  ``str.format`` itself validates this.
-        rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
+        rendered = tmpl.format(
+            transcript="Person_1 said hi.", facts_json="[]", speaker_id="speaker0"
+        )
         # Rendered output should still contain the example braced tokens
         # (single-brace form after format-escape).
         assert "{Event_1}" in rendered or "{Prefix_N}" in rendered
+
+    def test_omitted_speaker_id_slot_raises_key_error(self):
+        """Render-with-slots guard: the ``{speaker_id}`` slot added for
+        per-session speaker binding (parameterizing the "Speaker identity"
+        binding that used to hardcode ``speaker0``) is a REQUIRED
+        ``.format()`` kwarg now — an un-threaded call site is a runtime
+        ``KeyError`` this test makes visible at unit-test time instead of
+        letting CI miss it silently (a caller that forgets to thread
+        ``speaker_id`` would otherwise only fail at the first live cloud
+        enrichment call)."""
+        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        with pytest.raises(KeyError):
+            tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
 
     def test_preserves_bare_placeholder_convention(self):
         """The binding-recovery algorithm depends on cloud leaving existing
@@ -878,7 +893,9 @@ class TestEnrichmentPromptContract:
         )
         assert "bindings" in tmpl
         # Must still render cleanly (format-escape correctness for the new line).
-        rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
+        rendered = tmpl.format(
+            transcript="Person_1 said hi.", facts_json="[]", speaker_id="speaker0"
+        )
         assert "Before returning" in rendered
 
     # -- Speaker anchor -----------------
@@ -892,17 +909,19 @@ class TestEnrichmentPromptContract:
 
     def test_no_example_asserts_i_me_my_maps_to_person_1(self):
         """STRUCTURAL — scans every blank-line-separated block in the
-        prompt, not a hardcoded phrase.  A block that talks about the
-        speaker (mentions 'speaker' in its descriptive text) but has no
-        'speaker0' anchor present must not use ``Person_1`` as the fact
-        subject — that is exactly how 'Person_1 (the speaker' and its
-        reworded cousin 'Person_1 — the speaker' both re-teach the
-        positional guess that ``Person_1`` names the speaker.  A test
-        that only checked the literal substring passed for months while
-        three few-shots taught the opposite; this one cannot pass while
-        any block does."""
+        RENDERED prompt (``speaker_id="speaker0"``, the per-session
+        speaker-binding slot — see ``request_enrichment``), not a hardcoded phrase.
+        A block that talks about the speaker (mentions 'speaker' in its
+        descriptive text) but has no 'speaker0' anchor present must not
+        use ``Person_1`` as the fact subject — that is exactly how
+        'Person_1 (the speaker' and its reworded cousin 'Person_1 — the
+        speaker' both re-teach the positional guess that ``Person_1``
+        names the speaker.  A test that only checked the literal
+        substring passed for months while three few-shots taught the
+        opposite; this one cannot pass while any block does."""
         tmpl = _load_prompt("cloud_enrichment.txt", required=True)
-        blocks = re.split(r"\n\s*\n", tmpl)
+        rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
+        blocks = re.split(r"\n\s*\n", rendered)
         for block in blocks:
             if "speaker" not in block.lower():
                 continue
@@ -916,22 +935,26 @@ class TestEnrichmentPromptContract:
                 "while using Person_1 as a fact subject — this re-"
                 f"teaches Person_1 == the speaker: {block!r}"
             )
-        assert '"my"' in tmpl and "speaker0" in tmpl, (
+        assert '"my"' in rendered and "speaker0" in rendered, (
             "Enrichment prompt must still teach first-person coreference, now grounded on speaker0."
         )
 
     def test_first_person_few_shots_resolve_to_speaker0(self):
         """The 'my wife' / 'my sister's husband' / 'my father' coreference
         few-shots must bind the speaker to 'speaker0' — not a Person_N —
-        in the delta they actually emit."""
+        in the delta they actually emit.  The subject is now the
+        RENDERED ``{speaker_id}`` slot (per-session speaker binding), so this
+        renders with ``speaker_id="speaker0"`` before checking, rather
+        than scanning the raw (un-rendered) template text."""
         tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
         for anchor in (
             '"my wife is also a teacher"',
             '"my sister\'s husband"',
             '"my father is also an engineer"',
         ):
-            idx = tmpl.index(anchor)
-            window = tmpl[idx : idx + 400]
+            idx = rendered.index(anchor)
+            window = rendered[idx : idx + 400]
             assert '"subject":"speaker0"' in window or '"subject": "speaker0"' in window, (
                 f"First-person few-shot {anchor!r} must bind the speaker "
                 f"to 'speaker0', not a positionally-guessed Person_N: {window!r}"
@@ -940,10 +963,13 @@ class TestEnrichmentPromptContract:
     def test_non_speaker_cast_as_person_1(self):
         """At least one few-shot must show Person_1 naming someone OTHER
         than the speaker, so the model cannot re-derive 'Person_1 = me'
-        positionally even without an explicit rule saying so."""
+        positionally even without an explicit rule saying so.  Checked
+        on the RENDERED prompt (``speaker_id="speaker0"``) since the
+        subject is now the ``{speaker_id}`` slot."""
         tmpl = _load_prompt("cloud_enrichment.txt", required=True)
-        idx = tmpl.index('"we went there last summer"')
-        window = tmpl[idx : idx + 400]
+        rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
+        idx = rendered.index('"we went there last summer"')
+        window = rendered[idx : idx + 400]
         assert "speaker0" in window, "Example must still ground the speaker as speaker0."
         assert '"subject":"Person_1"' in window or '"subject": "Person_1"' in window, (
             "Example must cast Person_1 as a THIRD PARTY (not the speaker) "
@@ -962,7 +988,7 @@ class TestEnrichmentPromptContract:
         are exempt — they deliberately demonstrate the unbound-mint
         failure as the thing NOT to do."""
         tmpl = _load_prompt("cloud_enrichment.txt", required=True)
-        rendered = tmpl.format(transcript="x", facts_json="[]")
+        rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
         blocks = re.split(r"\n\s*\n", rendered)
         checked_any = False
         for block in blocks:
@@ -1094,6 +1120,35 @@ class TestPlausibilityPromptContract:
             "Mistral-7B EOS-mid-array truncation."
         )
 
+    def test_r4_carve_out_for_speaker_tokens_is_explicit(self):
+        """R4 ("conversation-role reference") lexically targets the
+        English WORD "Speaker" as a generic role label example, not the
+        `speaker{N}` identity-anchor token — but that distinction was only
+        implicit (survey finding, not stated in the prompt). This test
+        pins the explicit carve-out: R4 must state it targets the role
+        LABEL, never a `speaker{N}`-shaped subject/object, and this same
+        template drives BOTH the cloud AND local judges
+        (`judge_plausibility`, `paramem/graph/extractor.py`) — no
+        separate judge-specific override text exists.
+        """
+        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
+        r4_start = tmpl.index("R4.")
+        r4_end = tmpl.index("R5.")
+        r4_text = tmpl[r4_start:r4_end]
+        assert "speaker" in r4_text.lower(), (
+            "R4 must explicitly carve out speaker{N} tokens from the "
+            "conversation-role-reference drop rule."
+        )
+        assert "never drop" in r4_text.lower() or "not a conversation-role" in r4_text.lower(), (
+            "R4's speaker{N} carve-out must be a positive, explicit "
+            "statement (never dropped under R4), not just an incidental "
+            "mention of the word 'speaker'."
+        )
+        # Must still render cleanly with the doubled-brace speaker{{N}}
+        # literal escaped correctly.
+        rendered = tmpl.format(transcript="x", facts_json="[]")
+        assert "speaker{N}" in rendered
+
 
 class TestProceduralPrompt:
     def test_renders_with_speaker_context_empty(self):
@@ -1148,12 +1203,22 @@ class TestAnonymizationPrompt:
     """
 
     def _render(self, tmpl: str) -> str:
-        """Render the anonymization prompt with all expected kwargs."""
+        """Render the anonymization prompt with all expected kwargs.
+
+        ``speaker_anchor_section`` renders empty here (the caller-loaded
+        ``anonymization_speaker_anchor.txt`` companion is a SEPARATE
+        prompt file — see ``TestAnonymizationSpeakerAnchorPrompt`` below
+        for its own contract tests, and
+        ``TestAnonymizationPromptSpeakerAnchorSlotIntegration`` for the
+        combined render).
+        """
         return tmpl.format(
             scrub_categories="person name, phone number",
             facts_json='[{"subject": "Person_1", "predicate": "lives_in", '
             '"object": "City_1", "relation_type": "factual", "confidence": 0.9}]',
             transcript="Person_1 lives in City_1.",
+            speaker_id="speaker0",
+            speaker_anchor_section="",
         )
 
     def test_default_renders_without_format_errors(self):
@@ -1222,23 +1287,38 @@ class TestAnonymizationPrompt:
         assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
 
     def test_speaker_rule_present_and_no_example_maps_it(self):
-        """The prompt states speaker{N} is already anonymous and must
-        stay verbatim; NONE of the worked examples map a speaker{N}
-        token (the rule generalises — it isn't taught via an example
-        that could drift out of sync with the rule statement)."""
+        """The speaker{N}-verbatim rule (unconditional — applies whether or
+        not a speaker anchor was threaded) must state that a
+        speaker{N} token is already anonymous, and must declare the
+        ``{speaker_anchor_section}`` slot the fold-onto-token
+        authorization renders into (see
+        ``TestAnonymizationSpeakerAnchorPrompt`` below for that
+        companion prompt's own contract, moved out of this file
+        2026-08-02). What must never happen, and is what this test
+        checks directly, is an EXISTING speaker{N} token folded onto a
+        Person_N (i.e. re-anonymizing the anchor itself) anywhere in
+        THIS file's own examples.
+        """
         tmpl = _load_prompt("anonymization.txt", required=True)
         lower = tmpl.lower()
         assert "speaker" in lower and "verbatim" in lower, (
             "anonymization.txt must state the speaker{N}-stays-verbatim rule."
         )
-        examples_section = tmpl[tmpl.index("## Examples") :]
-        assert "speaker" not in examples_section.lower(), (
-            "No anonymization.txt example may map a speaker{N} token."
+        assert "{speaker_anchor_section}" in tmpl, (
+            "anonymization.txt must declare a {speaker_anchor_section} slot "
+            "for the fold-onto-token authorization companion prompt."
         )
-        # Must still render cleanly with the new rule line present.
+        examples_section = tmpl[tmpl.index("## Examples") :]
+        assert not re.search(r'"speaker\d+"\s*:\s*"Person_\d+"', examples_section), (
+            "No anonymization.txt example may map an EXISTING speaker{N} "
+            "token onto a Person_N — that is the failure mode this test "
+            "guards, not the word 'speaker' appearing at all."
+        )
+        # Must still render cleanly with the slot present and empty.
         rendered = self._render(tmpl)
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
+        assert "{speaker_anchor_section}" not in rendered
 
     def test_scrub_categories_slot_present(self):
         """The prompt must accept a {scrub_categories} slot and echo the
@@ -1251,6 +1331,8 @@ class TestAnonymizationPrompt:
             scrub_categories="person name, phone number, some very unusual category",
             facts_json="[]",
             transcript="x",
+            speaker_id="speaker0",
+            speaker_anchor_section="",
         )
         assert "some very unusual category" in rendered, (
             "A non-default scrub value must reach the rendered prompt verbatim — "
@@ -1318,6 +1400,110 @@ class TestAnonymizationPrompt:
             "anonymization.txt must instruct that the transcript rewrite changes "
             "only the in-scope PII, preserving everything else (fidelity)."
         )
+
+
+class TestAnonymizationSpeakerAnchorPrompt:
+    """Contract tests for the companion prompt
+    ``anonymization_speaker_anchor.txt`` — the fold-onto-token
+    speaker-anchor rule + worked examples, split out of
+    ``anonymization.txt`` 2026-08-02 (see ``TestAnonymizationPrompt``
+    above) into its own file so the base template renders anchor-less
+    cleanly when no speaker id is threaded (the document-ingest path,
+    the graph tier, and any calibration caller that omits it).
+    """
+
+    def _render(self, tmpl: str, speaker_id: str = "speaker0") -> str:
+        return tmpl.format(speaker_id=speaker_id)
+
+    def test_renders_without_format_errors(self):
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        rendered = self._render(tmpl)
+        assert "{speaker_id}" not in rendered
+
+    def test_declares_only_the_speaker_id_slot(self):
+        """This companion file must not declare any of the base
+        template's OTHER slots (facts_json/transcript/scrub_categories) —
+        it is rendered standalone with only ``speaker_id``, then inserted
+        as an opaque string into the base template's
+        ``{speaker_anchor_section}`` slot."""
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        for other_slot in ("{facts_json}", "{transcript}", "{scrub_categories}"):
+            assert other_slot not in tmpl, (
+                f"anonymization_speaker_anchor.txt must not declare {other_slot!r} — "
+                "it is rendered with speaker_id only."
+            )
+
+    def test_fold_onto_token_rule_and_worked_example_present(self):
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        rendered = self._render(tmpl)
+        assert "speaker0" in rendered
+        assert "anchor" in rendered.lower()
+        assert "POSITIVE" in rendered, (
+            "anonymization_speaker_anchor.txt must include at least one "
+            "worked example teaching the fold onto the anchor."
+        )
+
+    def test_multiple_self_naming_variants_fold_onto_same_anchor_instruction(self):
+        """The multiple-self-mentions case (review finding): the rule
+        must instruct that ALL coreferring self-naming variants within a
+        session fold onto the SAME anchor, and at least one worked
+        example must demonstrate two distinct real-value keys mapping to
+        the identical anchor value."""
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        lower = tmpl.lower()
+        assert "same anchor" in lower or "same" in lower and "anchor" in lower, (
+            "anonymization_speaker_anchor.txt must instruct that multiple "
+            "self-naming variants fold onto the SAME anchor."
+        )
+        rendered = self._render(tmpl, speaker_id="speaker0")
+        # Two distinct real-value keys mapped onto the identical placeholder
+        # value in the same worked-example JSON — the multi-mention case.
+        assert re.search(r'"[^"]+":\s*"speaker0".*?"[^"]+":\s*"speaker0"', rendered), (
+            "must include a worked example with two distinct keys folding "
+            "onto the same speaker0 anchor value"
+        )
+
+    def test_no_example_maps_an_existing_speaker_token_onto_person_n(self):
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        rendered = self._render(tmpl)
+        assert not re.search(r'"speaker\d+"\s*:\s*"Person_\d+"', rendered)
+
+
+class TestAnonymizationPromptSpeakerAnchorSlotIntegration:
+    """Combined render: the base template's ``{speaker_anchor_section}``
+    slot with the companion file's rendered content actually inserted —
+    the exact composition :func:`~paramem.cloud.anonymize.
+    _render_anonymize_prompt` performs — reads cleanly both ways.
+    """
+
+    def _render_combined(self, speaker_id: str | None) -> str:
+        base = _load_prompt("anonymization.txt", required=True)
+        anchor_tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        section = anchor_tmpl.format(speaker_id=speaker_id) if speaker_id else ""
+        return base.format(
+            scrub_categories="person name",
+            facts_json="[]",
+            transcript="x",
+            speaker_id=speaker_id or "",
+            speaker_anchor_section=section,
+        )
+
+    def test_anchor_present_when_speaker_id_given(self):
+        rendered = self._render_combined("speaker0")
+        assert "speaker0" in rendered
+        assert "## Speaker anchor" in rendered
+
+    def test_anchor_absent_and_prose_reads_cleanly_when_no_speaker_id(self):
+        rendered = self._render_combined(None)
+        assert "## Speaker anchor" not in rendered
+        assert "{speaker_anchor_section}" not in rendered
+        # No dangling artifact from the removed slot (e.g. an empty
+        # backtick-quoted anchor line, the pre-fix bug this whole split
+        # exists to fix).
+        assert "anchor is ``" not in rendered
+        assert "## Examples" in rendered
+        # No triple-blank-line runaway around the empty slot.
+        assert "\n\n\n\n" not in rendered
 
 
 class TestAnonymizationFactsPrompt:
@@ -1611,14 +1797,17 @@ class TestSpeakerDirectiveFile:
 
     * ``EXTRACTION-DIRECTIVE`` — loaded by ``build_speaker_context`` and
       injected into the extraction user prompt via ``{speaker_context}``.
-    * ``THIRD-PARTY-DESCRIPTOR`` — loaded at module import by ``inference.py``
-      as the neutral label for unresolvable ``speaker{N}`` tokens (e.g.
-      anonymous or unknown profiles).
+    * ``THIRD-PARTY-DESCRIPTOR`` — loaded at module import by
+      ``paramem.server.speaker`` as the neutral label for unresolvable
+      ``speaker{N}`` tokens (e.g. anonymous or unknown profiles),
+      substituted by :func:`~paramem.server.speaker.resolve_speaker_tokens`
+      at the reply boundary.
 
     ``INFERENCE-IDENTITY`` was deleted in Phase B (speaker-identity refactor):
-    id-to-name resolution is now handled at the fact-render boundary via
-    ``entry_fact_text(resolve=...)`` / ``MemoryStore.probe(speaker_resolver=...)``,
-    not via a prompt injection.  Tests verify the new section layout.
+    id-to-name resolution is not a prompt injection and does not happen at
+    the fact-render boundary either — it happens exactly once, at the reply
+    boundary, via ``resolve_speaker_tokens``.  Tests verify the new section
+    layout.
     """
 
     def test_file_exists(self):

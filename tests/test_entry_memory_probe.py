@@ -104,60 +104,35 @@ class TestEntryFactText:
         result = entry_fact_text({"subject": "Alex", "predicate": pred, "object": "chess"})
         assert result == "Alex has hobby chess"
 
-    # --- Phase B: resolve callback ---
+    # --- Speaker tokens render verbatim: resolution moved to the reply
+    # boundary (paramem.server.speaker.resolve_speaker_tokens); entry_fact_text
+    # takes no resolver of its own — every model-facing surface stays in
+    # token space. ---
 
-    def test_resolve_none_byte_identical(self) -> None:
-        """resolve=None (default) is byte-identical to passing no resolver."""
-        entry = {"subject": "speaker0", "predicate": "lives in", "object": "Berlin"}
-        assert entry_fact_text(entry) == entry_fact_text(entry, resolve=None)
-
-    def test_resolve_subject_position(self) -> None:
-        """resolver applied to subject when subject is a speaker{N} token."""
-        resolve = lambda t: "Dana" if t == "speaker9" else t  # noqa: E731
+    def test_speaker_token_subject_rendered_verbatim(self) -> None:
+        """A speaker{N} token in subject position is emitted as-is — no resolution
+        happens at the fact-render boundary."""
         result = entry_fact_text(
-            {"subject": "speaker9", "predicate": "lives in", "object": "Berlin"},
-            resolve=resolve,
+            {"subject": "speaker9", "predicate": "lives in", "object": "Berlin"}
         )
-        assert result == "Dana lives in Berlin"
+        assert result == "speaker9 lives in Berlin"
 
-    def test_resolve_object_position(self) -> None:
-        """resolver applied to object when object is a speaker{N} token."""
-        resolve = lambda t: "Dana" if t == "speaker9" else t  # noqa: E731
+    def test_speaker_token_object_rendered_verbatim(self) -> None:
+        """A speaker{N} token in object position is emitted as-is."""
         result = entry_fact_text(
-            {"subject": "speaker0", "predicate": "knows", "object": "speaker9"},
-            resolve=resolve,
+            {"subject": "speaker0", "predicate": "knows", "object": "speaker9"}
         )
-        assert "Dana" in result
-        assert "speaker9" not in result
+        assert result == "speaker0 knows speaker9"
 
-    def test_resolve_anon_returns_descriptor(self) -> None:
-        """When resolver returns THIRD_PARTY_DESCRIPTOR for anon, it appears in both positions."""
-        descriptor = "another speaker"
-        resolve = lambda t: descriptor if t.startswith("speaker") else t  # noqa: E731
-        result_subj = entry_fact_text(
-            {"subject": "speaker9", "predicate": "lives in", "object": "Paris"},
-            resolve=resolve,
-        )
-        assert descriptor in result_subj
-        assert "speaker9" not in result_subj
+    def test_no_resolve_parameter_accepted(self) -> None:
+        """entry_fact_text takes no resolver parameter — passing one raises."""
+        import pytest
 
-        result_obj = entry_fact_text(
-            {"subject": "speaker0", "predicate": "knows", "object": "speaker9"},
-            resolve=resolve,
-        )
-        assert descriptor in result_obj
-        assert "speaker9" not in result_obj
-
-    def test_resolve_non_speaker_passthrough(self) -> None:
-        """Non-speaker tokens are returned unchanged by a speaker-only resolver."""
-        from paramem.utils.identity import is_speaker_id
-
-        resolve = lambda t: "RESOLVED" if is_speaker_id(t) else t  # noqa: E731
-        result = entry_fact_text(
-            {"subject": "Alex", "predicate": "knows", "object": "Bob"},
-            resolve=resolve,
-        )
-        assert result == "Alex knows Bob"
+        with pytest.raises(TypeError):
+            entry_fact_text(
+                {"subject": "Alex", "predicate": "knows", "object": "Bob"},
+                resolve=lambda t: t,
+            )
 
 
 # ---------------------------------------------------------------------------

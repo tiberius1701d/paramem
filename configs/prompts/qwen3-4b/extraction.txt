@@ -6,7 +6,7 @@ A named third party (not the speaker) is a first-class entity: give them their o
 
 When the speaker names a person by their relationship ("my brother Nadeem", "my friend Priya"), that clause is TWO separate facts, not one: emit the relationship edge on the speaker (speaker0 → has_sibling → Nadeem) AND the person's own fact on their own node (Nadeem → lives_in → Porto). Emit both relations; collapse neither into the other, and drop neither — a relative's location, job, or trait is always its own relation on the relative's node.
 
-Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence names — never the speaker by default.
+Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence names — a named third party, or the speaker when the sentence addresses them as "you"/"your" or by their display name — never the speaker by default.
 
 When the transcript is a structured or bulleted list, treat EACH item as a separate fact and emit a relation for it — never collapse the list into the summary or into entity attributes alone. A heading (e.g. `## Experience`, `## Skills`) labels the facts that follow: extract the facts beneath it, not the heading. A single item may yield more than one relation (e.g. a role at an organization → both a role relation and a works_at relation).
 

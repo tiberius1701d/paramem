@@ -19,17 +19,23 @@ everywhere) and the render-boundary display-name substitution work end-to-end.
     Extract a short conversation where:
       * speaker0 (Alex) contributes a fact ABOUT speaker1 (Dana) as subject.
       * speaker0 contributes a fact where Dana is the object.
-    After extraction and keyed-entry build, directly call ``entry_fact_text``
-    with the production ``_speaker_resolver`` closure to verify that raw
-    ``speaker0`` / ``speaker1`` tokens are replaced with ``Alex`` / ``Dana``.
-    Also verify that an anonymous speaker registered via ``register_anonymous``
-    renders as ``"another speaker"`` (the THIRD-PARTY-DESCRIPTOR value), never
-    as the raw token.
+    After extraction and keyed-entry build, this verifies the CURRENT
+    contract: every model-facing render (``entry_fact_text``,
+    ``MemoryStore.probe``'s ``fact_text``) carries the raw ``speaker{N}``
+    token verbatim — there is no resolve-at-render path any more.  A
+    display name is substituted only at the reply boundary, by the single
+    resolver :func:`paramem.server.speaker.resolve_speaker_tokens`, applied
+    to the already-rendered text.  Also verifies that an anonymous speaker
+    registered via ``register_anonymous`` resolves to ``"another speaker"``
+    (the THIRD-PARTY-DESCRIPTOR value) through that same resolver, never as
+    the raw token.
 
-    For the MemoryStore.probe render paths, directly pre-populate a
-    ``MemoryStore`` with SPO entries and call ``store.probe()`` with
-    ``source=None`` (cache-hit path) and with ``speaker_resolver`` set, then
-    assert the returned ``fact_text`` contains the display names.
+    For the MemoryStore.probe render path, directly pre-populate a
+    ``MemoryStore`` with SPO entries, call ``store.probe()`` with
+    ``source=None`` (cache-hit path — no resolver kwarg; probe never
+    resolves), and assert the returned ``fact_text`` still carries the raw
+    token; only after passing it through ``resolve_speaker_tokens`` does the
+    display name appear.
 
 Outputs outputs/speaker_identity_probe/<timestamp>/results.json.
 No live-server data is read or written; everything lives in a tempdir.
@@ -62,7 +68,11 @@ from paramem.memory.store import MemoryStore  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
 from paramem.server.config import SanitizationConfig  # noqa: E402
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
-from paramem.server.speaker import _PROFILE_VERSION, SpeakerStore  # noqa: E402
+from paramem.server.speaker import (  # noqa: E402
+    _PROFILE_VERSION,
+    SpeakerStore,
+    resolve_speaker_tokens,
+)
 from paramem.training.consolidation import ConsolidationLoop  # noqa: E402
 from paramem.utils.config import (  # noqa: E402
     AdapterConfig,
@@ -120,23 +130,6 @@ def _build_buffer_and_store(tmp_dir: Path) -> tuple[SpeakerStore, SessionBuffer]
         debug=False,
     )
     return store, buffer
-
-
-def _make_speaker_resolver(store: SpeakerStore):
-    """Build the production speaker-resolver closure from *store*.
-
-    Mirrors inference.py lines 308–312 exactly:
-      * ``is_speaker_id(tok)`` → resolve via store
-      * unknown / anonymous → ``THIRD_PARTY_DESCRIPTOR``
-    """
-
-    def _resolver(tok: str) -> str:
-        if not is_speaker_id(tok):
-            return tok
-        name = store.resolve_speaker_name(tok.lower())
-        return name if name else THIRD_PARTY_DESCRIPTOR
-
-    return _resolver
 
 
 def run_cpu_identity_migration(out_dir: Path) -> dict:
@@ -268,16 +261,20 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
 
     Loads Mistral 7B, extracts a short conversation where speaker0=Alex
     mentions speaker1=Dana as subject and as object. Then verifies that
-    ``entry_fact_text`` with the production ``_speaker_resolver`` closure
-    replaces raw ``speaker0`` / ``speaker1`` tokens with ``Alex`` / ``Dana``.
+    ``entry_fact_text`` (which always renders the raw ``speaker{N}`` token —
+    it takes no resolver argument) followed by
+    :func:`~paramem.server.speaker.resolve_speaker_tokens` (the ONE
+    reply-boundary resolver, applied to the already-rendered text) replaces
+    raw ``speaker0`` / ``speaker1`` tokens with ``Alex`` / ``Dana``.
 
     Also verifies the MemoryStore.probe cache-hit path returns ``fact_text``
     with display names (pre-populated store, ``source=None``).
 
     Anonymous third-party path verified without GPU (CPU-only MemoryStore):
     registers an anonymous speaker, builds a synthetic SPO entry with the
-    anon id as subject, calls ``entry_fact_text`` with the resolver, and
-    asserts the result contains THIRD_PARTY_DESCRIPTOR.
+    anon id as subject, calls ``entry_fact_text`` then
+    ``resolve_speaker_tokens``, and asserts the result contains
+    THIRD_PARTY_DESCRIPTOR.
     """
     logger.info("Loading Mistral 7B (NF4)...")
     model_config = BENCHMARK_MODELS["mistral"]
@@ -364,8 +361,11 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         # Phase 2b: entry_fact_text render — raw SPO with speaker tokens.
         # Build synthetic entries for the speaker-as-subject and
         # speaker-as-object cases; these do NOT require GPU inference.
+        # entry_fact_text() takes no resolve argument any more — it always
+        # renders the raw speaker{N} token; resolve_speaker_tokens is the
+        # one place a display name is substituted, applied here to the
+        # already-rendered text (the reply-boundary contract).
         # ---------------------------------------------------------------
-        resolver = _make_speaker_resolver(store)
 
         # Case A: subject = speaker1 (Dana), object = "Berlin"
         entry_a = {
@@ -375,7 +375,7 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             "object": "Berlin",
         }
         fact_a_raw = entry_fact_text(entry_a)
-        fact_a_resolved = entry_fact_text(entry_a, resolve=resolver)
+        fact_a_resolved = resolve_speaker_tokens(fact_a_raw, store)
 
         # Case B: subject = speaker0 (Alex), object = speaker1 (Dana)
         entry_b = {
@@ -385,16 +385,18 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             "object": dana_id,
         }
         fact_b_raw = entry_fact_text(entry_b)
-        fact_b_resolved = entry_fact_text(entry_b, resolve=resolver)
+        fact_b_resolved = resolve_speaker_tokens(fact_b_raw, store)
 
         results["entry_fact_text_render"] = {
             "case_A_subject_is_dana_id": entry_a["subject"] == dana_id,
             "case_A_raw": fact_a_raw,
+            "case_A_raw_carries_token": dana_id in fact_a_raw,
             "case_A_resolved": fact_a_resolved,
             "case_A_pass": "Dana" in fact_a_resolved and dana_id not in fact_a_resolved,
             "case_B_subject_is_alex_id": entry_b["subject"] == alex_id,
             "case_B_object_is_dana_id": entry_b["object"] == dana_id,
             "case_B_raw": fact_b_raw,
+            "case_B_raw_carries_tokens": alex_id in fact_b_raw and dana_id in fact_b_raw,
             "case_B_resolved": fact_b_resolved,
             "case_B_pass": "Alex" in fact_b_resolved
             and "Dana" in fact_b_resolved
@@ -409,8 +411,10 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
 
         # ---------------------------------------------------------------
         # Phase 2c: MemoryStore.probe cache-hit path — pre-populate store,
-        # call probe with source=None and speaker_resolver set; assert
-        # fact_text in the returned result has display names.
+        # call probe with source=None (no resolver kwarg — probe() never
+        # resolves; every returned fact_text carries the raw token).  The
+        # display name only appears after passing fact_text through
+        # resolve_speaker_tokens, exactly as the reply boundary does.
         # ---------------------------------------------------------------
         mem_store = MemoryStore(replay_enabled=False)
 
@@ -423,10 +427,7 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             relation_type="factual",
             allow_empty_speaker=False,
         )
-        probe_a = mem_store.probe(
-            {"episodic": [entry_a["key"]]},
-            speaker_resolver=resolver,
-        )
+        probe_a = mem_store.probe({"episodic": [entry_a["key"]]})
         hit_a = probe_a.get(entry_a["key"])
 
         # Case B — put entry_b into store, then probe.
@@ -437,22 +438,26 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             relation_type="social",
             allow_empty_speaker=False,
         )
-        probe_b = mem_store.probe(
-            {"episodic": [entry_b["key"]]},
-            speaker_resolver=resolver,
-        )
+        probe_b = mem_store.probe({"episodic": [entry_b["key"]]})
         hit_b = probe_b.get(entry_b["key"])
 
-        cache_hit_a_fact = hit_a.get("fact_text", "") if hit_a else ""
-        cache_hit_b_fact = hit_b.get("fact_text", "") if hit_b else ""
+        cache_hit_a_fact_raw = hit_a.get("fact_text", "") if hit_a else ""
+        cache_hit_b_fact_raw = hit_b.get("fact_text", "") if hit_b else ""
+        cache_hit_a_fact = resolve_speaker_tokens(cache_hit_a_fact_raw, store)
+        cache_hit_b_fact = resolve_speaker_tokens(cache_hit_b_fact_raw, store)
 
         results["probe_cache_hit"] = {
             "case_A_hit_returned": hit_a is not None,
+            "case_A_fact_text_raw": cache_hit_a_fact_raw,
+            "case_A_raw_carries_token": dana_id in cache_hit_a_fact_raw,
             "case_A_fact_text": cache_hit_a_fact,
             "case_A_pass": hit_a is not None
             and "Dana" in cache_hit_a_fact
             and dana_id not in cache_hit_a_fact,
             "case_B_hit_returned": hit_b is not None,
+            "case_B_fact_text_raw": cache_hit_b_fact_raw,
+            "case_B_raw_carries_tokens": alex_id in cache_hit_b_fact_raw
+            and dana_id in cache_hit_b_fact_raw,
             "case_B_fact_text": cache_hit_b_fact,
             "case_B_pass": hit_b is not None
             and "Alex" in cache_hit_b_fact
@@ -479,9 +484,10 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             "object": "Hamburg",
         }
         fact_anon_raw = entry_fact_text(entry_anon)
-        fact_anon_resolved = entry_fact_text(entry_anon, resolve=resolver)
+        fact_anon_resolved = resolve_speaker_tokens(fact_anon_raw, store)
 
-        # Also probe through MemoryStore (cache-hit path, no speaker filter).
+        # Also probe through MemoryStore (cache-hit path, no speaker filter,
+        # no resolver kwarg — resolve_speaker_tokens is applied afterward).
         mem_store.put("episodic", entry_anon["key"], entry_anon)
         # allow_empty_speaker=True: anonymous speakers have a valid token but
         # no meaningful speaker_id restriction for this probe.
@@ -491,12 +497,10 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
             relation_type="factual",
             allow_empty_speaker=True,
         )
-        probe_anon = mem_store.probe(
-            {"episodic": [entry_anon["key"]]},
-            speaker_resolver=resolver,
-        )
+        probe_anon = mem_store.probe({"episodic": [entry_anon["key"]]})
         hit_anon = probe_anon.get(entry_anon["key"])
-        cache_anon_fact = hit_anon.get("fact_text", "") if hit_anon else ""
+        cache_anon_fact_raw = hit_anon.get("fact_text", "") if hit_anon else ""
+        cache_anon_fact = resolve_speaker_tokens(cache_anon_fact_raw, store)
 
         results["anonymous_render"] = {
             "anon_id": anon_id,

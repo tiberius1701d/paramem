@@ -157,9 +157,10 @@ async def process_utterance(
     # produced non-empty text.  The Wyoming/satellite path calls
     # process_utterance with compute_embedding=True and relies on the embedding
     # even when the transcript is empty (e.g. silent audio with a clear voice
-    # signal).  POST /voice computes the embedding on the shared-token path
-    # (auth_speaker_id is None); on the per-user token path compute_embedding
-    # is False (cheap path, identity is authoritative from the token).
+    # signal).  POST /voice computes the embedding on the unattributed-caller
+    # path (auth_speaker_id is None — an unattributed per-user token, or
+    # auth-OFF); on the ATTRIBUTED per-user token path compute_embedding is
+    # False (cheap path, identity is authoritative from the token).
     embedding: list[float] | None = None
     if compute_embedding:
         embedding = await loop.run_in_executor(

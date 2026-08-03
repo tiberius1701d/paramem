@@ -23,7 +23,7 @@ import json
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from paramem.cloud.placeholders import (
     _apply_bindings,
@@ -77,10 +77,70 @@ _JSON_ENVELOPE_KEYS = frozenset(
 )
 
 
+_CandidateVerdict = Literal["envelope", "unwrap", "defer", "skip"]
+
+
+def _classify_candidate(value: object) -> _CandidateVerdict:
+    """Classify one successfully-decoded JSON candidate from model output.
+
+    The verdicts, in strength order — designed to surface truncation
+    rather than silently consume a sub-structure of a truncated envelope,
+    and to keep content-free noise from outranking a real envelope:
+
+    * ``"envelope"`` — positive envelope evidence: a dict carrying an
+      envelope key (:data:`_JSON_ENVELOPE_KEYS`), or a list whose first
+      element is fact-shaped (``subject`` / ``predicate`` / ``object``).
+      Return the candidate span verbatim.
+    * ``"unwrap"`` — a ONE-element list wrapping a whole envelope dict
+      (``[{"entities": [...], "relations": [...]}]``, observed live).
+      Return the INNER dict.  Checked before the fact-shape rule so a
+      length-1 list keeps the same precedence it had when this was an
+      inline ``list_wrapped_envelope`` flag.
+    * ``"defer"`` — structurally valid but content-FREE: ``{}``, ``[]``,
+      or a bare integer array (``[0, 2, 5]``).  Each is a legitimate
+      whole-response shape (the plausibility drop-set's "all dropped" /
+      tolerated bare-array forms, an empty no-op delta) AND is textually
+      indistinguishable from prose noise — the cloud enrichment model
+      narrates its plan by bracketed fact index (``[9]``, ``[0] and
+      [5]``), the very notation ``configs/prompts/cloud_enrichment.txt``
+      teaches it.  Carrying no envelope evidence, such a candidate must
+      never outrank a real envelope appearing LATER in the same response,
+      so the caller remembers the first one and keeps scanning.
+    * ``"skip"`` — parsed, but not an envelope in any shape: a dict with
+      no envelope key or a list of non-fact dicts (both are what survives
+      a truncated outer envelope), a string/scalar list, a bare scalar.
+      Never returned, in any circumstance.
+    """
+    if isinstance(value, dict):
+        # Empty dict is unambiguously "no items" (drop-set-style no-op
+        # delta) — content-free, hence deferred, not accepted outright.
+        if not value:
+            return "defer"
+        # Rejects naked entity / relation dicts that survive a truncated
+        # outer envelope.
+        return "envelope" if set(value.keys()) & _JSON_ENVELOPE_KEYS else "skip"
+    if isinstance(value, list):
+        if not value:
+            return "defer"
+        first = value[0]
+        if isinstance(first, dict):
+            if len(value) == 1 and set(first.keys()) & _JSON_ENVELOPE_KEYS:
+                return "unwrap"
+            if "subject" in first or "predicate" in first or "object" in first:
+                return "envelope"
+            # An entity list that survived a truncated outer envelope —
+            # its elements have ``name`` / ``entity_type``.
+            return "skip"
+        if isinstance(first, int) and not isinstance(first, bool):
+            return "defer"
+        return "skip"
+    return "skip"
+
+
 def _extract_json_block(text: str) -> str:
     """Extract a JSON object/array envelope from model output.
 
-    Handles three real-world failure modes the model produces:
+    Handles five real-world failure modes the model produces:
 
     1. **Code-fenced output**: ``\\`\\`\\`json\\n{...}\\n\\`\\`\\``` — the
        fence is stripped before scanning.
@@ -94,15 +154,42 @@ def _extract_json_block(text: str) -> str:
        string emits a valid *inner* sub-object ``{"name": "x", ...}``
        even though the outer envelope never closed.  Returning that
        inner object would silently produce an empty graph downstream.
+    4. **Envelope wrapped in a one-element list**: ``[{"entities": [...],
+       "relations": [...]}]`` — the whole envelope dict, correct content
+       inside, wrapped in an extra list layer (observed live).  Accepted
+       only at list length 1 so a genuine multi-fact bare list (each
+       element fact-shaped, none envelope-shaped) is never misread.  This
+       one mode UNWRAPS: the returned text is the INNER envelope dict's
+       JSON (``json.dumps`` of the single element), not the outer list —
+       every caller (every structured-output parser in
+       ``paramem.graph.extractor`` plus
+       :func:`~paramem.cloud.anonymize.anonymize_transcript`) recovers a
+       plain envelope dict from ``json.loads`` on this function's return
+       value regardless of whether the model wrapped it in a list, rather
+       than each caller re-detecting and unwrapping this exact shape for
+       itself.
+    5. **Reasoning prose that indexes facts in brackets**: the cloud
+       enrichment model narrates its plan before emitting the delta —
+       "Fact ``[9]`` is a compound", "Facts ``[0]`` and ``[5]`` are
+       symmetric duplicates" — using exactly the bracketed-index notation
+       ``configs/prompts/cloud_enrichment.txt`` teaches it.  ``[9]`` is a
+       structurally valid JSON array sitting at a candidate position
+       EARLIER than the envelope, and is indistinguishable from the
+       plausibility drop-set's tolerated bare-integer form (``[0, 2,
+       5]``).  It is content-free, so it is DEFERRED, not returned (see
+       :func:`_classify_candidate`): the scan continues to the real
+       envelope, and a deferred candidate is returned only once the scan
+       proves no envelope follows it.
 
-    Algorithm: walk every ``{`` / ``[`` position in the text and try
-    ``raw_decode`` from each.  Accept the first candidate that yields
-    either a non-empty list, or a dict with at least one envelope key
-    (:data:`_JSON_ENVELOPE_KEYS`).  Inner sub-objects without envelope
-    keys are skipped so truncation surfaces as a parse failure rather
-    than a silently empty graph.  Preamble noise (``{Topic_1}``) is
-    skipped automatically because it raises ``JSONDecodeError``
-    immediately.
+    Algorithm: walk every ``{`` / ``[`` position in the text, try
+    ``raw_decode`` from each, and classify what decodes
+    (:func:`_classify_candidate`).  The first candidate with positive
+    envelope evidence wins immediately; content-free candidates (``{}``,
+    ``[]``, bare integer arrays) are remembered and returned only if the
+    scan ends without finding one; everything else is skipped, so
+    truncation surfaces as a parse failure rather than a silently empty
+    graph.  Preamble noise (``{Topic_1}``) is skipped automatically
+    because it raises ``JSONDecodeError`` immediately.
 
     Error messages distinguish three fail modes:
     a. ``saw_decode_success_no_envelope=True`` → JSON parsed but no
@@ -129,6 +216,9 @@ def _extract_json_block(text: str) -> str:
     last_exc: json.JSONDecodeError | None = None
     last_offset = -1
     saw_decode_success_no_envelope = False
+    # First content-free candidate (`{}` / `[]` / bare int array) seen —
+    # the answer only if the scan finds no evidence-carrying envelope.
+    deferred: str | None = None
     src_len = len(src)
     pos = 0
     while pos < src_len:
@@ -150,50 +240,32 @@ def _extract_json_block(text: str) -> str:
             # Skip past the failing opener and keep looking.
             pos = candidate + 1
             continue
-        # raw_decode succeeded — check whether this is the envelope or
-        # narrative noise / a truncated inner sub-object.
-        # Acceptance rules — both designed to surface truncation rather
-        # than silently consume a sub-structure of a truncated envelope:
-        #   • dict: must carry an envelope key (entities / relations /
-        #     facts / new_entity_bindings / summary / mapping / ...).
-        #     Rejects naked entity / relation dicts that survive a
-        #     truncated outer envelope.
-        #   • list: must be empty (plausibility's "all dropped" output)
-        #     OR have first element shaped like a fact (subject /
-        #     predicate / object key present). Rejects an entity list
-        #     that survives a truncated outer envelope — its elements
-        #     have ``name`` / ``entity_type``, not ``subject``.
-        if isinstance(value, dict):
-            # Empty dict is unambiguously "no items" (drop-set-style
-            # no-op delta), symmetric to the empty-list envelope below.
-            # A truncated outer envelope cannot produce `{}` because the
-            # model always emits at least one key before EOF or never
-            # closes the outer brace at all.
-            is_envelope = not value or bool(set(value.keys()) & _JSON_ENVELOPE_KEYS)
-        elif isinstance(value, list):
-            if not value:
-                is_envelope = True
-            else:
-                first = value[0]
-                if isinstance(first, dict):
-                    is_envelope = "subject" in first or "predicate" in first or "object" in first
-                elif isinstance(first, int) and not isinstance(first, bool):
-                    # Bare integer array — plausibility's tolerated drop-set
-                    # form (`[0, 2, 5]`).  Accepting any int-first list as
-                    # an envelope is safe: extractor / enrichment / anon
-                    # outputs that survive a truncated outer envelope have
-                    # dict-shaped first elements (entity / relation / fact),
-                    # not bare ints.
-                    is_envelope = True
-                else:
-                    is_envelope = False
-        else:
-            is_envelope = False
-        if is_envelope:
+        # raw_decode succeeded — is this the envelope, content-free noise
+        # (a prose fact reference `[9]` reads as a bare int array), or a
+        # truncated inner sub-object?
+        verdict = _classify_candidate(value)
+        if verdict == "unwrap":
+            # Unwrap HERE — the one primitive boundary every caller
+            # shares — rather than returning the outer list's text and
+            # letting each caller re-detect and unwrap this exact shape
+            # for itself (formerly duplicated in
+            # ``paramem.graph.extractor._parse_extraction``).
+            return json.dumps(value[0])
+        if verdict == "envelope":
             return src[candidate:end]
-        saw_decode_success_no_envelope = True
+        if verdict == "defer":
+            if deferred is None:
+                deferred = src[candidate:end]
+        else:
+            saw_decode_success_no_envelope = True
         pos = end
 
+    if deferred is not None:
+        # No evidence-carrying envelope anywhere in the response, so the
+        # content-free candidate IS the response: plausibility's `[]` /
+        # `[0, 2, 5]` drop sets and the empty `{}` no-op delta all arrive
+        # in exactly this shape.
+        return deferred
     if saw_decode_success_no_envelope:
         # Some JSON parsed cleanly but none had envelope keys.  Two
         # distinct root causes land here and must not be conflated:

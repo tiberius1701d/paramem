@@ -525,8 +525,13 @@ abstention:
   # paramem/server/config.py.
   response_file: configs/prompts/abstention_response.txt
   cold_start_response_file: configs/prompts/abstention_cold_start.txt
+  # Fired by the relay path (no speaker resolved at all) for a personal
+  # interrogative — distinct from cold_start_response (an identified but
+  # fresh speaker); see AbstentionConfig in paramem/server/config.py.
+  no_identity_response_file: configs/prompts/abstention_no_identity.txt
   # response_override: "..."             # uncomment to pin inline
   # cold_start_response_override: "..."  # uncomment to pin inline
+  # no_identity_response_override: "..."  # uncomment to pin inline
 
 # Intent classifier — residual classifier for routing decisions.  State
 # signals (graph match, HA match) decide cleanly when present; the

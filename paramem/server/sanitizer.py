@@ -16,8 +16,13 @@ Detection is two-tier, in order:
 2. **First-person token-set lookup** (:func:`_contains_first_person`) —
    English-only fallback used when tier 1 is unavailable or uncertain.
 
-Bound by ``speaker_id``: a self-referential query with no resolved
-speaker has no target to be personal about.
+Content-only: the predicate classifies purely from ``text`` — it does not
+accept or require a ``speaker_id``.  Whether there is a resolved speaker to
+apply the verdict to is a separate concern the caller owns (e.g.
+:func:`paramem.server.inference.handle_chat` asserts a resolved
+``speaker_id`` before it ever reaches a call site that reads this verdict —
+speakerless requests are served by the relay path, which never consults
+parametric memory or this predicate's verdict as a personal-content gate).
 """
 
 from paramem.utils.identity import prose_fold
@@ -61,8 +66,27 @@ def _contains_first_person(text: str) -> bool:
     return False
 
 
-def _is_about_speaker(text: str, personal_referent_config) -> bool:
-    """Decide whether ``text`` refers to / asks about the speaker themselves.
+def is_self_referential(
+    text: str,
+    *,
+    personal_referent_config=None,
+) -> bool:
+    """Return True when ``text`` refers to / asks about the speaker themselves.
+
+    Content-only classification — there is no ``speaker_id`` parameter and
+    no null-target gate.  A caller that needs to know "personal content
+    about *whom*" resolves the speaker separately; this predicate only
+    answers "is this text self-referential in content".
+
+    THE one implementation of the personal-referent verdict — every caller
+    (``handle_chat``'s ``is_personal`` union, the relay path's no-identity
+    short-circuit in ``paramem.server.app._relay_route``, the forwarded-query
+    verdict in ``_maybe_escalate``, the history drop-gate in
+    ``_sanitize_history``) imports this name directly rather than
+    re-deriving the conjunction below.  There used to be a second, private
+    ``_is_about_speaker`` wrapper with the identical body; it is retired —
+    a caller that imported it privately was re-deriving logic already
+    public here.
 
     Two-tier detection, in order:
 
@@ -83,6 +107,18 @@ def _is_about_speaker(text: str, personal_referent_config) -> bool:
     personal query to the cloud) is the privacy hole the encoder layer
     exists to close.  Tier 1 generalises across languages via the
     multilingual encoder; tier 2 catches English-without-encoder.
+
+    Args:
+        text: The text to classify — a chat turn, verbatim and unmodified.
+        personal_referent_config: Optional
+            :class:`paramem.server.config.PersonalReferentConfig`.  When
+            supplied (production), the encoder-based classifier drives the
+            decision; otherwise the English token-set fallback
+            (:func:`_contains_first_person`) does.
+
+    Returns:
+        ``True`` when the text is self-referential in content; ``False``
+        otherwise.
     """
     if personal_referent_config is not None:
         from paramem.server.personal_referent import (
@@ -98,30 +134,3 @@ def _is_about_speaker(text: str, personal_referent_config) -> bool:
         # verdict is None — encoder unavailable / margin not met.
         # Fall through to the English token-set fallback below.
     return _contains_first_person(text)
-
-
-def is_self_referential(
-    text: str,
-    *,
-    speaker_id: str | None = None,
-    personal_referent_config=None,
-) -> bool:
-    """Return True when ``text`` refers to / asks about the identified speaker.
-
-    Args:
-        text: The text to classify — a chat turn, verbatim and unmodified.
-        speaker_id: Identifier of the resolved speaker, or ``None`` when the
-            speaker has not been resolved.  Without an identified speaker
-            there is no one for "I" / "my" to refer to, so the gate returns
-            ``False`` regardless of ``text``.
-        personal_referent_config: Optional
-            :class:`paramem.server.config.PersonalReferentConfig`.  When
-            supplied (production), the encoder-based classifier drives the
-            decision; otherwise the English token-set fallback
-            (:func:`_contains_first_person`) does.
-
-    Returns:
-        ``True`` when the text is self-referential and a speaker is
-        identified; ``False`` otherwise.
-    """
-    return bool(speaker_id) and _is_about_speaker(text, personal_referent_config)

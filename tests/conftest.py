@@ -88,19 +88,16 @@ if not _gpu_explicitly_requested(sys.argv):
     # non-gpu run never blocks on (or even queries) the real GPU sensor.
     os.environ.setdefault("PARAMEM_COOLDOWN_DISABLED", "1")
 
-# ``_api_token`` in app.py is captured at import time (module-level
-# ``load_token_from_env()``).  Some test modules (e.g.
-# ``test_dataset_probe_commit.py``) import experiment scripts that call
-# ``load_dotenv`` at module level during pytest collection, re-seeding
-# ``PARAMEM_API_TOKEN`` from ``.env`` AFTER conftest's module-level code but
-# BEFORE app.py is first imported.  This causes BearerTokenMiddleware to be
-# constructed with a real token and then 401 every test client that doesn't
-# include it.
-#
-# Fix: pop the env var AND force-import app.py here so the middleware is
-# constructed while the token is absent.  Python caches the module in
-# ``sys.modules``; the later ``load_dotenv`` call sets the env var but the
-# already-built middleware retains ``self._token = ""``.
+# ``BearerTokenMiddleware`` no longer reads ``PARAMEM_API_TOKEN`` at all —
+# auth enablement is driven exclusively by ``_state["user_token_store"]``
+# (see ``paramem.server.app._build_user_token_store``), which every test
+# controls explicitly via monkeypatch.  The env var survives only as the
+# CARRIER value other consumers (the CLI's ``http_client.py``, example
+# scripts) read directly.  Popping it here — and force-importing app.py
+# before any experiment script's module-level ``load_dotenv`` call can
+# re-seed it from ``.env`` — is defense-in-depth test isolation for THOSE
+# consumers, not a workaround for the (now-retired) middleware-token
+# capture-at-import-time behavior this comment used to describe.
 os.environ.pop("PARAMEM_API_TOKEN", None)
 # Prevent resolve_token() from reading the real repo .env or ~/.config/paramem/
 # secrets during tests.  Auth-specific tests that need file-based resolution

@@ -69,6 +69,7 @@ resolve any matching token through it at their boundary — a deliberate, scoped
 exception to the "extraction only `.strip()`s" rule for display entities.
 """
 
+import re
 import unicodedata
 
 # THE single declaration of the speaker-id format: the canonical lowercase
@@ -253,3 +254,21 @@ def is_speaker_id(s: str) -> bool:
         False
     """
     return as_speaker_id(s) is not None
+
+
+# THE single declaration of the speaker-id token shape used for free-text
+# matching (as opposed to whole-string membership, which is
+# :func:`as_speaker_id`/:func:`is_speaker_id` above).  Both patterns compose
+# from :data:`SPEAKER_ID_PREFIX` so the shape is never rendered a third time.
+#
+# ``SPEAKER_TOKEN_RE`` is the strict matcher: :func:`~paramem.server.speaker.
+# resolve_speaker_tokens` (THE reply-boundary resolver) substitutes exactly
+# this shape and no other — widening it to catch near-miss renderings is an
+# open owner decision, not a default.  ``SPEAKER_NEAR_MISS_RE`` is a
+# detection-only companion: it matches a "speaker" prefix separated from its
+# index by 1-2 blank/punctuation characters (a space, underscore, or hyphen —
+# e.g. a model re-rendering ``speaker0`` as ``"Speaker 0"`` or ``"speaker_0"``)
+# so a caller can log when such a shape survives resolution unsubstituted.  It
+# deliberately does NOT drive substitution.
+SPEAKER_TOKEN_RE = re.compile(rf"\b{SPEAKER_ID_PREFIX}\d+\b", re.IGNORECASE)
+SPEAKER_NEAR_MISS_RE = re.compile(rf"\b{SPEAKER_ID_PREFIX}[\W_]{{1,2}}\d", re.IGNORECASE)

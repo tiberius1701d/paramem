@@ -67,8 +67,8 @@ pytestmark = [
 # raised from 0.75 to 0.80 so the test trips on the very first
 # per-fixture regression (any 1/4 failure) without going to the strict
 # 0.9× empirical recommendation.  NEEDS RECALIBRATION against the
-# redesigned prompt (model now also authors ``anonymized_transcript`` —
-# see FR-cal) AND against the 2026-07 scrub-vocabulary enrichment (5
+# redesigned prompt (model now also authors ``anonymized_transcript``)
+# AND against the 2026-07 scrub-vocabulary enrichment (5
 # terse labels -> 12 load-bearing terms) via
 # ``scripts/dev/calibrate_cloud_anonymizer.py`` before ship; the 0.80
 # threshold is carried forward as a conservative floor, not a
@@ -90,7 +90,7 @@ _DEFAULT_SCRUB = set(_PRODUCTION_DEFAULT_SCRUB)
 
 
 # Fixture transcripts: single-turn user queries — the production input
-# shape ``answer_via_cloud`` (paramem/server/inference.py:567)
+# shape ``answer_via_cloud`` (``paramem.server.inference``)
 # passes to ``anonymize_turn`` (the cloud-egress entry
 # point anonymizes only the current-turn text; conversation history flows
 # separately through ``_sanitize_history``).  Earlier multi-turn
@@ -98,32 +98,44 @@ _DEFAULT_SCRUB = set(_PRODUCTION_DEFAULT_SCRUB)
 # cloud-egress helper no longer receives in production.
 #
 # Each entry carries the user query, the speaker_name and speaker_id the
-# chat handler would have resolved via voice enrollment
-# (``app.py:3593`` threads ``_resolved.speaker_id`` into ``handle_chat``,
-# which threads it unchanged into ``answer_via_cloud`` at
-# ``inference.py:643`` and on into ``anonymize_turn``),
-# and the names that appear *in the query text* and MUST therefore be
-# anonymized before the cloud sees the query.
+# chat handler would have resolved via voice enrollment (the app layer's
+# speaker-resolution helper threads ``speaker_id`` into ``handle_chat``,
+# which threads it unchanged into ``answer_via_cloud`` and on into
+# ``anonymize_turn``), and the names that appear *in the query text* and
+# MUST therefore be anonymized before the cloud sees the query.
 #
 # ``speaker_id`` is NOT optional here even though the helper's own
 # signature defaults it to ``None`` for text-only requests with no
 # resolved speaker: ``anonymize_turn`` threads it into
-# ``build_speaker_context`` (extractor.py:322), which formats it verbatim
-# into the extraction-prompt speaker directive
-# (configs/prompts/speaker_directive.txt) as "the current speaker's
+# ``build_speaker_context`` (``paramem.graph.extractor``), which formats
+# it verbatim into the extraction-prompt speaker directive
+# (``configs/prompts/speaker_directive.txt``) as "the current speaker's
 # system identifier is {speaker_id}".  Omitting it does not skip the
-# directive — the helper falls back to the literal sentinel
-# ``"cloud_egress"`` (extractor.py:920), which conflicts with the
-# extraction few-shots in configs/prompts/extraction.txt (every example
-# hardcodes the subject as ``"speaker0"``) and is not the shape any real
-# request produces.  Using the production-shaped ``"speaker0"`` here is
-# load-bearing for the contract, not decorative.
+# directive — the extraction call still falls back to the literal
+# sentinel ``"cloud_egress"`` (``anonymize_turn``'s own docstring), which
+# conflicts with the extraction few-shots in
+# ``configs/prompts/extraction.txt`` (every example hardcodes the subject
+# as ``"speaker0"``) and is not the shape any real request produces.
+# Using the production-shaped ``"speaker0"`` here is load-bearing for the
+# contract, not decorative.  Note this fallback is scoped to the
+# extraction call only — the SEPARATE anonymizer speaker-anchor gate
+# (below) never forwards the ``"cloud_egress"`` sentinel.
 #
 # ``speaker_name`` is metadata used by the extraction prompt to bind
 # first-person facts to a concrete subject.  It is NOT included in
 # ``expected_names`` because the speaker's name does not appear in the
 # query text itself — there is nothing to leak.  The anonymizer may or
 # may not bind the speaker to a placeholder; either is privacy-safe.
+# EXCEPTION: the "speaker_self_naming" entry below is the one fixture
+# where the speaker DOES name themself in the query text, deliberately
+# testing fold-onto-token anonymization's authorization
+# (configs/prompts/anonymization_speaker_anchor.txt) — there
+# ``speaker_name`` legitimately doubles as the one entry in
+# ``expected_names``.  The anchor gate itself
+# (``paramem.graph.flows.anonymize_turn``) is ``is_speaker_id(speaker_id)``
+# only — a well-shaped id is sufficient regardless of whether
+# ``speaker_name`` resolves to a display name (owner ruling: anonymous
+# speakers keep the anchor too).
 _FIXTURE = [
     {
         "id": "single_person_self_claim",
@@ -177,7 +189,45 @@ _FIXTURE = [
         "transcript": "Should I call the vet about Pat's dog being sick?",
         "expected_names": ["Pat"],
     },
+    {
+        # Fold-onto-token anonymization fixture (2026-08): the speaker
+        # names THEMSELF, so the anonymizer is authorized to fold "Anna"
+        # directly onto the session's own `speaker0` anchor
+        # (configs/prompts/anonymization_speaker_anchor.txt "This
+        # session's own speaker anchor is {speaker_id}") instead of
+        # minting a fresh Person_N. This is the ONE fixture entry where a
+        # plain `deanonymize_text` round-trip cannot restore the original
+        # wording by design — see the reply-boundary resolve step in
+        # `test_cloud_anonymizer_contract` below.
+        "id": "speaker_self_naming",
+        "speaker_name": "Anna",
+        "speaker_id": "speaker0",
+        "transcript": "Hi, I'm Anna — can you remind me what I asked you yesterday?",
+        "expected_names": ["Anna"],
+    },
 ]
+
+
+def _resolve_speaker_tokens_for_test(text: str, speaker_id: str, speaker_name: str) -> str:
+    """Reply-boundary resolve for this GPU-only contract test — THE
+    production resolver (:func:`paramem.server.speaker.
+    resolve_speaker_tokens`), given a minimal stand-in store rather than a
+    real :class:`~paramem.server.speaker.SpeakerStore` (the module is
+    dependency-light — it imports only stdlib, ``paramem.backup.encryption``,
+    ``paramem.graph.prompts``, and ``paramem.utils.identity``, none of
+    which pull in app-level server state — so importing the real resolver
+    here does not widen this GPU contract test's dependency surface).
+    A no-op for any text that doesn't contain the fixture's own
+    ``speaker_id`` token (every fixture entry except ``speaker_self_naming``
+    above, which is why the fixture's ``speaker_id``/``speaker_name`` pair
+    is threaded in per-call rather than resolved against a shared store).
+    """
+    from types import SimpleNamespace
+
+    from paramem.server.speaker import resolve_speaker_tokens
+
+    stub_store = SimpleNamespace(resolve_speaker_name=lambda _sid: speaker_name)
+    return resolve_speaker_tokens(text, stub_store)
 
 
 @pytest.fixture()
@@ -283,12 +333,26 @@ def test_cloud_anonymizer_contract(loaded_model):
                 f"present in anon_text {anon_text!r} (extraction missed it)"
             )
 
-        # Round-trip contract: the production exit gate
-        # (deanonymize_text, observed-scoped against the exact
-        # text sent) restores the original transcript (modulo whitespace,
-        # which the anonymizer LLM may reflow).
+        # Round-trip contract: the production exit gate (deanonymize_text,
+        # observed-scoped against the exact text sent) restores the
+        # original transcript (modulo whitespace, which the anonymizer LLM
+        # may reflow) -- PLUS reply-boundary speaker-token resolution.
+        # Fold-onto-token anonymization means a self-naming mention (the
+        # "speaker_self_naming" fixture) has NO reverse entry by design
+        # (paramem.cloud.placeholders's speaker-value guard): plain
+        # deanonymize_text alone cannot restore "Anna" from "speaker0" and
+        # is not supposed to -- that resolution happens at the separate
+        # reply-boundary step, called directly (not emulated) via
+        # _resolve_speaker_tokens_for_test above. The substitution is a
+        # no-op for every other fixture entry (their anon_text never contains a
+        # literal speaker{N} token), so this does not loosen the contract
+        # for the pre-existing fixtures.
         scope = CloudScope.response(payload, cloud_bindings=None, sent=(anon_text,))
         round_trip = deanonymize_text(scope, anon_text)
+        if round_trip is not None:
+            round_trip = _resolve_speaker_tokens_for_test(
+                round_trip, entry["speaker_id"], entry["speaker_name"]
+            )
         if round_trip is None or _normalise(round_trip) != _normalise(transcript):
             failures.append(
                 f"[{entry['id']}] Round-trip mismatch:\n"

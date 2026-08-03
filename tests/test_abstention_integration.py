@@ -88,14 +88,10 @@ class TestSanitizerPrecondition:
         ],
     )
     def test_real_sanitizer_blocks_first_person_query(self, query):
-        # Self-referential resolution requires an identified speaker — the
-        # sanitizer's whole point is "personal data is graph-truth", and
-        # there is no resolution target for "I" / "my" without a
-        # speaker_id.  Production callers always have one when the
-        # speaker is enrolled (which is when self-referential matters).
-        assert is_self_referential(query, speaker_id="speaker0"), (
-            f"sanitizer should flag {query!r} as personal"
-        )
+        # Content-only classification (no speaker_id parameter) — the
+        # sanitizer's whole point is "does this text's content look
+        # self-referential", independent of whether a speaker is resolved.
+        assert is_self_referential(query), f"sanitizer should flag {query!r} as personal"
 
     @pytest.mark.parametrize(
         "query",
@@ -105,9 +101,7 @@ class TestSanitizerPrecondition:
         ],
     )
     def test_real_sanitizer_allows_non_personal(self, query):
-        assert not is_self_referential(query, speaker_id="speaker0"), (
-            f"sanitizer should not flag {query!r}"
-        )
+        assert not is_self_referential(query), f"sanitizer should not flag {query!r}"
 
 
 @pytest.mark.skipif(
