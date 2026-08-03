@@ -1161,9 +1161,10 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # production tokenizer (Mistral 7B) over the three payload shapes the
     # system ingests, shipped as their MAX so the fallback bounds rather
     # than averages:
-    #   transcript shape    : 188 words   / 270 tokens  = 1.44 tokens/word
+    #   transcript shape (re-measured 2026-08-03, supersedes 1.44) : 1.54 tokens/word
     #   document shape (CV) : 1534 words  / 2934 tokens = 1.91 tokens/word
-    #   fact-JSON shape      : 2415 words / 8191 tokens = 3.39 tokens/word  <- MAX
+    #   fact-JSON shape (2026-07-28) : 2415 words / 8191 tokens = 3.39 tokens/word
+    #   fact-JSON shape (2026-08-03 drift re-measurement)        = 3.657 tokens/word  <- MAX
     #
     # NOT independently governing: no estimate_tokens() call site reads
     # this yaml value — every caller (in-process or CLI) uses the module
@@ -1179,7 +1180,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # Per-tokenizer: after a base-model swap, re-measure and update BOTH
     # this key and MEASURED_TOKENS_PER_WORD together — updating only one
     # fails loudly at the next config load rather than silently drifting.
-    extraction_token_estimate_ratio: float = 3.4
+    extraction_token_estimate_ratio: float = 3.7
     # Calibration endpoint — POST /calibrate/{extract,anonymize,plausibility}
     # exposes per-stage prompt iteration against the same Mistral instance the
     # production cycle uses. Default OFF — opt-in dev tool, never live in
@@ -1781,9 +1782,37 @@ class InferenceConfig:
     ``ConsolidationLoop._hydrate_store_for_fold`` materialises the rest); its
     own persist tail reads those entries back, so it cannot honour an empty
     cache.
+
+    ``max_response_tokens``: ceiling on ``max_new_tokens`` for every
+    locally-generated conversational reply (the one literal-free site is
+    :func:`paramem.server.inference._generate_local_reply`). Latency-derived,
+    not VRAM-derived: the HA client conversation timeout is 30s
+    (``custom_components/paramem/const.py``'s ``DEFAULT_TIMEOUT``); a
+    measured decode fit of ``4.6s + 0.031s/token`` at a ~225-fact context,
+    with 25% headroom reserved for everything upstream of decode, gives
+    ``(0.75 * 30 - 4.6) / 0.031 ~= 577`` tokens — rounded down to **512**
+    (worst case ~20.5s, comfortably inside the 30s budget). No upper bound
+    is validated here: the ceiling this value protects belongs to the HA
+    client (operator-configurable 1-120s), which this dataclass cannot
+    read, so only a lower bound (``> 0``) is enforced. A reply that reaches
+    the cap is trimmed to its last complete sentence rather than delivered
+    mid-word (:func:`paramem.server.inference._trim_incomplete_sentence`).
     """
 
     preload_cache: bool = True
+    max_response_tokens: int = 512
+
+    def __post_init__(self) -> None:
+        """Reject a non-positive response-length ceiling.
+
+        No upper bound: see the class docstring's ``max_response_tokens``
+        paragraph for why the ceiling is owned by the HA client, not this
+        config.
+        """
+        if self.max_response_tokens <= 0:
+            raise ValueError(
+                f"inference.max_response_tokens must be > 0; got {self.max_response_tokens!r}"
+            )
 
 
 @dataclass

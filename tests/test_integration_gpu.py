@@ -293,6 +293,9 @@ class TestGraphEnrichmentDegradeGPU:
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
             cloud_enabled=True,
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
 
         graph = loop.merger.graph
@@ -853,6 +856,8 @@ class TestRunExtractGraphHelper:
             save_cycle_snapshots=False,
             prompts_dir=server_config.prompts_dir,
             extraction_max_tokens=cc.extraction_max_tokens,
+            extraction_plausibility_max_tokens=cc.extraction_plausibility_max_tokens,
+            extraction_anonymize_token_envelope=cc.extraction_anonymize_token_envelope,
             extraction_enrichment_provider=cc.extraction_enrichment_provider,
             extraction_enrichment_provider_model=cc.extraction_enrichment_provider_model,
             extraction_enrichment_provider_endpoint=(
@@ -921,6 +926,9 @@ class TestBatchConsolidationE2E:
             # this never actually anonymizes — same 5-category default the
             # server config ships (SanitizationConfig.scrub).
             extraction_scrub=set(SanitizationConfig().scrub),
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
 
         # Extract a session with personal facts

@@ -13,6 +13,7 @@ missing. They are structural (string-level) — a full LLM-compliance contract
 would require a live model and is out of scope here.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,31 @@ class TestPaVoicePromptFile:
         is empty. A future rewrite that drops it would silently break
         routing — guard it here."""
         assert "[ESCALATE]" in prompt_text
+
+    def test_prompt_states_a_numeric_word_budget(self, prompt_text: str):
+        """The ruled strengthening (truncation fix, item 4): a word budget
+        replaces the old "1-2 sentences" instruction. Pinned by pattern,
+        not exact prose — the numbers are calibration-tunable."""
+        assert re.search(r"\b\d+\s+words\b", prompt_text) is not None
+
+    def test_prompt_carries_summary_ordering_guidance(self, prompt_text: str):
+        """Summaries/recall should front-load the most important facts, so
+        a reply is still useful if the response-length cap cuts it short."""
+        lower = prompt_text.lower()
+        assert "most important" in lower
+
+    def test_load_prompt_head_excludes_classifier_section(self, tmp_path):
+        """Cheap insurance that the line-3 length-instruction edit did not
+        disturb the ##---INTENT-CLASSIFIER-SECTION--- marker: load_prompt()
+        returns the head only (no PERSONAL/COMMAND/GENERAL classifier
+        labels leak into the PA system prompt), and
+        load_intent_classifier_prompt() still finds its section."""
+        vc = VoiceConfig(prompt_file=str(PROMPT_FILE))
+        head = vc.load_prompt()
+        assert "PERSONAL" not in head
+        assert "COMMAND" not in head
+        assert "##---INTENT-CLASSIFIER-SECTION---" not in head
+        assert vc.load_intent_classifier_prompt() is not None
 
 
 class TestVoiceConfigFallback:

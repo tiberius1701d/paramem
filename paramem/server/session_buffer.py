@@ -19,9 +19,11 @@ when both are False (see :meth:`SessionBuffer.mark_consolidated`).
 Sessions that retry-capped instead of consolidating cleanly move under
 ``retention_dir/retired_recall_failed/`` (same rule, distinguishable
 subdirectory — see ``mark_consolidated``'s ``retired_session_ids``).
-``debug`` additionally exposes disk-only pending sessions through
-:meth:`SessionBuffer.get_session_turns` / ``pending_count`` for
-inspection.
+:meth:`SessionBuffer.get_conversation_turns` is a PRODUCTION serving read,
+called on every turn — not a debug-only inspection surface; it always
+serves in-memory ``_turns`` first. ``debug`` additionally lets it (and
+``pending_count``) fall through to disk-only pending sessions not yet
+loaded into ``_turns``.
 
 Document ingest: each chunk becomes a separate session whose id is
 ``<doc_id>-c<chunk_index:03d>``.  All chunk sessions for the same
@@ -48,8 +50,35 @@ from paramem.backup.encryption import (
     envelope_encrypt_bytes,
 )
 from paramem.server import retry_state as _retry_state
+from paramem.utils.tokens import (
+    ANONYMIZE_ENVELOPE_TOKENS,
+    ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+    CONVERSATION_FACTS_RATIO,
+    SESSION_ANON_SKELETON_TOKENS,
+    TRANSCRIPT_TOKENS_PER_WORD,
+    envelope_derived_cap_tokens,
+    estimate_tokens,
+)
 
 logger = logging.getLogger(__name__)
+
+# Size-rotation cap for a conversation's open session, in the estimator's
+# unit — see paramem.utils.tokens.envelope_derived_cap_tokens's docstring
+# for the identity (a session transcript is paid for TWICE against one
+# anonymize-call envelope: once as input, once echoed back as the rewrite,
+# plus its extracted-facts JSON), and paramem.graph.document_chunker's
+# _DOC_MAX_TOKENS for the sibling derivation over the document-ingest path.
+# 541 words -> 2001 estimator tokens (owner ruling, 2026-08-03): the
+# CONFIGURED 8192 envelope, worst-case facts ratio, not the live
+# VRAM-clamped envelope (a dense session can still fail anonymize under a
+# tight free-VRAM moment — self-healing incident, not silent loss).
+_TRANSCRIPT_MAX_TOKENS: int = envelope_derived_cap_tokens(
+    envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
+    skeleton_tokens=SESSION_ANON_SKELETON_TOKENS,
+    reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+    facts_ratio=CONVERSATION_FACTS_RATIO,
+    payload_tokens_per_word=TRANSCRIPT_TOKENS_PER_WORD,
+)
 
 
 def _snapshots_enabled() -> bool:
@@ -102,9 +131,11 @@ class SessionBuffer:
     :meth:`_append_turn`'s 2026-05-14 invariant). ``retain_sessions`` and
     ``debug`` govern what happens to that JSONL once a session retires:
     :meth:`mark_consolidated` moves it under ``retention_dir`` when
-    either flag is True, or deletes it when both are False. ``debug``
-    additionally makes disk-only pending sessions visible through
-    :meth:`get_session_turns` / ``pending_count`` for inspection.
+    either flag is True, or deletes it when both are False. Serving reads
+    (:meth:`get_conversation_turns`) always check in-memory ``_turns``
+    first, on every turn, regardless of ``debug``; ``debug`` additionally
+    makes disk-only PENDING sessions (not yet loaded into ``_turns``)
+    visible through that method and ``pending_count``.
 
     Two in-memory maps, split by concept (each field has exactly one home):
 
@@ -116,18 +147,23 @@ class SessionBuffer:
       ``conversation_id`` (the "conversation_key" role — one client/device
       handle may span several minted sessions over time). Holds
       ``session_id``, ``started_at``, ``last_turn_at``, ``speaker``,
-      ``speaker_id``, ``state``. Not persisted to the durable jsonl;
-      round-trips only through the encrypted graceful-restart snapshot
-      (:meth:`save_snapshot` / :meth:`load_snapshot`) — a cold restart (no
-      snapshot) starts ``_open`` empty, so the first post-restart turn
-      opens a fresh session (accepted restart-split).
+      ``speaker_id``, ``state``, ``session_tokens`` (size-rotation
+      accumulator), ``prior_session_ids`` (session ids this conversation
+      size-rotated out of during the current idle window). Not persisted
+      to the durable jsonl; round-trips only through the encrypted
+      graceful-restart snapshot (:meth:`save_snapshot` / :meth:`load_snapshot`)
+      — a cold restart (no snapshot) starts ``_open`` empty, so the first
+      post-restart turn opens a fresh session (accepted restart-split).
 
     :meth:`append` resolves/rotates the session_id for a ``conversation_id``
     via ``_open`` (minting a new session after ``idle_timeout`` of
-    inactivity) and delegates the actual write to the private
-    :meth:`_append_turn`. Document ingest calls :meth:`_append_turn`
-    directly with the deterministic chunk session_id — chunk sessions never
-    rotate.
+    inactivity, OR after the open session's accumulated size would exceed
+    ``_TRANSCRIPT_MAX_TOKENS``) and delegates the actual write to the
+    private :meth:`_append_turn`. A size rotation is invisible to
+    :meth:`get_conversation_turns` (the conversation's served context
+    follows the chain); an idle rotation resets it. Document ingest calls
+    :meth:`_append_turn` directly with the deterministic chunk session_id
+    — chunk sessions never rotate and never accumulate a chain.
     """
 
     def __init__(
@@ -309,26 +345,74 @@ class SessionBuffer:
             f.flush()
             os.fsync(f.fileno())
 
-    def _resolve_session_id(self, conversation_id: str) -> str:
+    def _resolve_session_id(self, conversation_id: str, role: str, text: str) -> str:
         """Resolve the concrete session_id for a conversation turn, rotating
-        on idle timeout.
+        on idle timeout OR on accumulated size.
 
         Mints a fresh ``session_id`` (and ``started_at``) when
-        *conversation_id* has no open session yet, or when the gap since its
-        last turn exceeds ``idle_timeout``. Otherwise returns the existing
+        *conversation_id* has no open session yet, when the gap since its
+        last turn exceeds ``idle_timeout``, or when admitting this turn
+        would push the session's accumulated estimated-token size past
+        :data:`_TRANSCRIPT_MAX_TOKENS` (owner ruling 2026-08-03 — sessions
+        are the extraction/anonymize unit and must fit inside one
+        anonymize-call envelope; the conversation's SERVING context is a
+        separate concern, read across a size-rotated chain by
+        :meth:`get_conversation_turns`). Otherwise returns the existing
         open session_id. Always stamps ``last_turn_at`` to now.
+
+        A size rotation records the retiring session_id onto
+        ``prior_session_ids`` so :meth:`get_conversation_turns` can still
+        read it; an idle rotation does NOT — context reset on idle is
+        deliberate, existing behaviour (ruling 15).
+
+        Args:
+            conversation_id: Caller's conversation routing handle.
+            role: This turn's role — fed to :meth:`_format_turns` so the
+                size accumulator counts the SAME marker-formatted surface
+                the anonymize call pays for.
+            text: This turn's text.
         """
         now = datetime.now(timezone.utc)
         state = self._open.setdefault(conversation_id, {"speaker": None, "state": STATE_NEW})
+
+        # _format_turns (not the raw text) because the anonymize envelope
+        # pays for the marker-formatted transcript, and TRANSCRIPT_TOKENS_PER_WORD
+        # was measured over that same formatted surface. Summing this
+        # per-turn, rather than estimating the whole accumulated session at
+        # once, OVER-estimates in the cap's own estimator unit:
+        # estimate_tokens's fallback path is ceil(words * ratio), and
+        # per-turn ceil summation is >= the whole-session ceil
+        # (Σ ceil(wᵢ·r) >= ceil(Σ wᵢ·r) for any wᵢ, r >= 0) — the newline
+        # that joins turns in the real transcript contributes zero WORDS to
+        # either side, so it does not reverse this. The accumulator can
+        # therefore only rotate AT-OR-EARLIER than the modeled envelope
+        # boundary, never later — the safe direction for a cap.
+        formatted, _ = self._format_turns([{"role": role, "text": text}])
+        turn_tokens = estimate_tokens(formatted[0]) if formatted else 0
+
         last_turn_at = state.get("last_turn_at")
-        needs_new_session = state.get("session_id") is None or (
-            last_turn_at is not None
-            and now - datetime.fromisoformat(last_turn_at) > self._idle_timeout
+        open_id = state.get("session_id")
+        accumulated = state.get("session_tokens", 0)
+
+        idle_expired = last_turn_at is not None and (
+            now - datetime.fromisoformat(last_turn_at) > self._idle_timeout
         )
+        # Turn is the atomic unit: a lone oversize turn is admitted whole
+        # (the Option-1 fail-closed residual) — accumulated > 0 is what
+        # makes that true, since a single turn can never rotate itself out.
+        size_exceeded = accumulated > 0 and accumulated + turn_tokens > _TRANSCRIPT_MAX_TOKENS
+        needs_new_session = open_id is None or idle_expired or size_exceeded
+
         if needs_new_session:
-            session_id = _mint_session_id(conversation_id)
-            state["session_id"] = session_id
+            context_continues = size_exceeded and not idle_expired
+            state["prior_session_ids"] = (
+                [*state.get("prior_session_ids", []), open_id] if context_continues else []
+            )
+            state["session_id"] = _mint_session_id(conversation_id)
             state["started_at"] = now.isoformat()
+            state["session_tokens"] = 0
+
+        state["session_tokens"] = state.get("session_tokens", 0) + turn_tokens
         state["last_turn_at"] = now.isoformat()
         return state["session_id"]
 
@@ -351,8 +435,13 @@ class SessionBuffer:
         speaker / client conversation id) — it is resolved to a concrete,
         possibly freshly-minted ``session_id`` via ``_open`` before the turn
         is written. A new session_id is minted on the first turn for this
-        handle, or when the gap since the last turn exceeds the configured
-        idle timeout; otherwise the turn joins the currently open session.
+        handle, when the gap since the last turn exceeds the configured
+        idle timeout, or when admitting this turn would push the session's
+        accumulated size past ``_TRANSCRIPT_MAX_TOKENS`` (a size rotation);
+        otherwise the turn joins the currently open session. A size
+        rotation is invisible to a caller reading via
+        :meth:`get_conversation_turns` — only the extraction/anonymize
+        unit rotates, not the conversation's served context.
 
         Args:
             conversation_id: Caller's conversation routing handle.
@@ -378,7 +467,7 @@ class SessionBuffer:
         if speaker_id is None:
             speaker_id = self.get_speaker_id(conversation_id)
             speaker = self.get_speaker(conversation_id)
-        session_id = self._resolve_session_id(conversation_id)
+        session_id = self._resolve_session_id(conversation_id, role, text)
         self._append_turn(
             session_id,
             role,
@@ -745,17 +834,42 @@ class SessionBuffer:
         return result
 
     def _prune_open_for_retired_sessions(self, session_ids: list[str]) -> None:
-        """Evict any ``_open`` entry whose ``session_id`` was just retired.
+        """Evict any ``_open`` entry whose CURRENT ``session_id`` was just
+        retired, and drop retired ids out of every surviving entry's
+        ``prior_session_ids`` chain.
 
         Called by :meth:`mark_consolidated` and :meth:`discard_sessions`
         after the durable ``_sessions``/``_turns`` cleanup. Keeps the
-        ephemeral routing map coherent with retirement: without this, a
-        conversation_key whose session just retired would keep pointing
-        ``_open[conversation_key]["session_id"]`` at the now-gone id, so the
-        next turn on that key would either silently reuse a retired
-        session_id (writing into an already-archived/deleted jsonl name) or
-        (if not stale enough to rotate) never mint a fresh session at all.
-        Also bounds ``_open``'s size to live conversations.
+        ephemeral routing map coherent with retirement: without the
+        eviction half, a conversation_key whose CURRENT session just
+        retired would keep pointing ``_open[conversation_key]["session_id"]``
+        at the now-gone id, so the next turn on that key would either
+        silently reuse a retired session_id (writing into an
+        already-archived/deleted jsonl name) or (if not stale enough to
+        rotate) never mint a fresh session at all. Also bounds ``_open``'s
+        size to live conversations.
+
+        Without the chain-filter half, a PRIOR chain member (a session this
+        conversation size-rotated out of, but is still live — a size
+        rotation is a normal pending session and can be consolidated while
+        the conversation continues) would linger in ``prior_session_ids``
+        forever after its own retirement: the list would grow without
+        bound and :meth:`get_conversation_turns` would keep trying to read
+        an already-popped ``_turns`` entry for it (harmless — it just
+        resolves to no turns for that id — but unbounded growth is not).
+
+        Concurrency note (verified, not a new guarantee): ``SessionBuffer``
+        holds no lock anywhere — this method's dict iteration/mutation and
+        :meth:`get_conversation_turns`'s reads of the same ``_open`` /
+        ``_turns`` state are not synchronized against each other. This is
+        the SAME inherited absence of a guarantee the scalar
+        ``session_id`` eviction above already had (a consolidation
+        thread's retirement racing a request thread's read was always
+        possible); the chain filter below shares that exposure rather than
+        introducing a new one. Production calls this method from the
+        background-consolidation thread while request threads may
+        concurrently call :meth:`append` / :meth:`get_conversation_turns`
+        on the same conversation; no ordering between them is enforced.
         """
         retired = set(session_ids)
         if not retired:
@@ -765,6 +879,11 @@ class SessionBuffer:
         ]
         for conv_id in stale_keys:
             del self._open[conv_id]
+
+        for state in self._open.values():
+            prior = state.get("prior_session_ids")
+            if prior:
+                state["prior_session_ids"] = [sid for sid in prior if sid not in retired]
 
     def mark_consolidated(
         self,
@@ -1103,40 +1222,53 @@ class SessionBuffer:
         if session_id in self._sessions:
             self._sessions[session_id].pop("recall_retry_count", None)
 
-    def get_session_turns(self, conversation_id: str) -> list[dict]:
-        """Read all turns from a conversation's currently open session.
+    def get_conversation_turns(self, conversation_id: str) -> list[dict]:
+        """Read a conversation's serving tail — every session in its current chain.
+
+        Sessions are the extraction/anonymize unit and rotate on size (see
+        :meth:`_resolve_session_id`); the conversation is the serving unit
+        and does NOT rotate on size — a mid-dialogue size rotation must stay
+        invisible to the model (ruling 15). Walks
+        ``[*prior_session_ids, session_id]`` in order and concatenates each
+        session's turns, so the result stays chronological across a size
+        rotation. An IDLE-timeout rotation DOES reset the chain
+        (``prior_session_ids`` is cleared, not carried forward) — context
+        reset on idle is deliberate, pre-existing behaviour.
 
         *conversation_id* is the caller's routing handle — the same key
-        :meth:`append` resolves through ``_open`` before writing (see
-        :meth:`_resolve_session_id`).  This accessor mirrors that
-        resolution: it looks up ``_open[conversation_id]["session_id"]``
-        for the concrete session id turns are actually stored under, then
-        reads ``_turns``/disk keyed by THAT id.  A direct
-        ``_turns[conversation_id]`` lookup (the previous implementation)
-        was silently dead for every conversational caller — ``append``
-        always mints a session id of the form
+        :meth:`append` resolves through ``_open`` before writing. A direct
+        ``_turns[conversation_id]`` lookup is dead for every conversational
+        caller — ``append`` always mints a session id of the form
         ``f"{conversation_id}-{timestamp}-{rand}"`` (:func:`_mint_session_id`),
-        which never equals the raw ``conversation_id``, so the direct
-        lookup never found anything once a session had rotated.
+        which never equals the raw ``conversation_id``.
 
-        Falls back to treating *conversation_id* as the session id directly
+        Falls back to treating *conversation_id* as a session id directly
         when there is no open-routing entry for it — this keeps the
         document-chunk path working, where ``session_id`` IS the caller's
-        routing handle (:meth:`append_document_chunk` never rotates).
+        routing handle (:meth:`append_document_chunk` never rotates, so it
+        never has a ``prior_session_ids`` chain either).
+
+        No window is applied here — ``_build_messages`` applies
+        ``MAX_HISTORY_TURNS`` exactly once, downstream
+        (``paramem/server/inference.py``); a second bound here would
+        duplicate that transformation. The chain is bounded structurally
+        instead: it resets on every idle rotation, and retired chain
+        members are dropped by :meth:`_prune_open_for_retired_sessions`.
         """
-        session_id = self._open.get(conversation_id, {}).get("session_id") or conversation_id
+        open_state = self._open.get(conversation_id, {})
+        session_id = open_state.get("session_id") or conversation_id
+        chain = [*open_state.get("prior_session_ids", []), session_id]
 
-        # In-memory first
-        if session_id in self._turns:
-            return list(self._turns[session_id])
-
-        # Fall back to disk
-        if self.debug:
-            path = self.session_dir / f"{session_id}.jsonl"
-            if path.exists():
-                return self._read_jsonl(path)
-
-        return []
+        turns: list[dict] = []
+        for sid in chain:
+            if sid in self._turns:
+                turns.extend(self._turns[sid])
+                continue
+            if self.debug:
+                path = self.session_dir / f"{sid}.jsonl"
+                if path.exists():
+                    turns.extend(self._read_jsonl(path))
+        return turns
 
     def get_summary(self) -> dict:
         """Per-speaker pending-session attribution summary.

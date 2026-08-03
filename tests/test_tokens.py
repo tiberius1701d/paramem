@@ -16,12 +16,25 @@ import math
 
 import pytest
 
+from paramem.graph.document_chunker import (
+    _ANON_SKELETON_TOKENS,
+    _DOC_MAX_TOKENS,
+    _F_DOC,
+    _R_PROSE,
+)
 from paramem.utils.tokens import (
     _DRIFT_SAMPLE_DOCUMENT,
     _DRIFT_SAMPLES,
+    ANONYMIZE_ENVELOPE_TOKENS,
+    ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+    CONVERSATION_FACTS_RATIO,
     MEASURED_TOKENS_PER_WORD,
+    SESSION_ANON_SKELETON_TOKENS,
+    TRANSCRIPT_TOKENS_PER_WORD,
     check_ratio_drift,
+    envelope_derived_cap_tokens,
     estimate_tokens,
+    words_to_estimator_tokens,
 )
 
 
@@ -124,9 +137,9 @@ class TestEstimateTokensBoundingClaim:
     """
 
     _PER_SHAPE_RATIOS = {
-        "transcript": 1.44,
+        "transcript": 1.54,
         "document": 1.91,
-        "fact_json": 3.39,
+        "fact_json": 3.657,
     }
 
     @pytest.mark.parametrize("shape_ratio", list(_PER_SHAPE_RATIOS.values()))
@@ -200,3 +213,134 @@ class TestCheckRatioDrift:
         result = check_ratio_drift(_DocumentSpikeTokenizer(), configured_ratio=10.0)
         assert result is not None
         assert result > 10.0
+
+
+class TestWordsToEstimatorTokens:
+    """floor(words * ratio); 0 for non-positive words."""
+
+    @pytest.mark.parametrize(
+        ("words", "expected"),
+        [
+            (200, 740),  # document context floor
+            (982, 3633),  # document-path cap word count
+            (541, 2001),  # conversation-path cap word count
+        ],
+    )
+    def test_floors_at_shipped_ratio(self, words, expected):
+        assert words_to_estimator_tokens(words) == expected
+
+    def test_ceil_would_disagree_with_floor_on_982(self):
+        """The reason the convention is floor, not ceil — pins the exact
+        boundary ruling 16's numbers depend on."""
+        import math
+
+        assert math.ceil(982 * MEASURED_TOKENS_PER_WORD) == 3634
+        assert words_to_estimator_tokens(982) == 3633
+
+    @pytest.mark.parametrize("words", [0, -1, -100])
+    def test_non_positive_words_returns_zero(self, words):
+        assert words_to_estimator_tokens(words) == 0
+
+    def test_explicit_ratio_overrides_default(self):
+        assert words_to_estimator_tokens(10, tokens_per_word=2.0) == 20
+
+
+class TestEnvelopeDerivedCapTokens:
+    """The shared budget-derivation function, at both shipped call sites.
+
+    Document-path terms are IMPORTED from document_chunker.py (which this
+    same change promoted them into) rather than re-declared locally — a
+    local copy would itself be a duplicate of the values these tests
+    exist to catch drift against.
+    """
+
+    def test_document_terms_match_doc_max_tokens(self):
+        cap = envelope_derived_cap_tokens(
+            envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
+            skeleton_tokens=_ANON_SKELETON_TOKENS,
+            reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+            facts_ratio=_F_DOC,
+            payload_tokens_per_word=_R_PROSE,
+        )
+        assert cap == _DOC_MAX_TOKENS
+        assert round(cap / MEASURED_TOKENS_PER_WORD) == 982
+
+    def test_conversation_terms_match_transcript_max_tokens(self):
+        from paramem.server.session_buffer import _TRANSCRIPT_MAX_TOKENS
+
+        cap = envelope_derived_cap_tokens(
+            envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
+            skeleton_tokens=SESSION_ANON_SKELETON_TOKENS,
+            reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+            facts_ratio=CONVERSATION_FACTS_RATIO,
+            payload_tokens_per_word=TRANSCRIPT_TOKENS_PER_WORD,
+        )
+        assert cap == _TRANSCRIPT_MAX_TOKENS
+        assert round(cap / MEASURED_TOKENS_PER_WORD) == 541
+
+        skeleton_and_reserve = SESSION_ANON_SKELETON_TOKENS + ANONYMIZE_OUTPUT_RESERVE_TOKENS
+        real_token_payload = (ANONYMIZE_ENVELOPE_TOKENS - skeleton_and_reserve) / (
+            2 + CONVERSATION_FACTS_RATIO
+        )
+        assert round(real_token_payload) == 834
+
+    @pytest.mark.parametrize(
+        ("shape", "facts_ratio", "payload_ratio"),
+        [
+            ("document", _F_DOC, _R_PROSE),
+            ("conversation", CONVERSATION_FACTS_RATIO, TRANSCRIPT_TOKENS_PER_WORD),
+        ],
+    )
+    def test_budget_identity_holds(self, shape, facts_ratio, payload_ratio):
+        """skeleton + f*P + 2P + reserve <= envelope, for the real-token
+        payload P the cap derives from."""
+        skeleton = _ANON_SKELETON_TOKENS if shape == "document" else SESSION_ANON_SKELETON_TOKENS
+        available = ANONYMIZE_ENVELOPE_TOKENS - skeleton - ANONYMIZE_OUTPUT_RESERVE_TOKENS
+        payload_real_tokens = available / (2 + facts_ratio)
+        total = (
+            skeleton
+            + facts_ratio * payload_real_tokens
+            + 2 * payload_real_tokens
+            + ANONYMIZE_OUTPUT_RESERVE_TOKENS
+        )
+        assert total <= ANONYMIZE_ENVELOPE_TOKENS + 1e-6
+
+    def test_raises_when_no_payload_budget_left(self):
+        with pytest.raises(ValueError, match="no payload budget left"):
+            envelope_derived_cap_tokens(
+                envelope_tokens=100,
+                skeleton_tokens=90,
+                reserve_tokens=20,
+                facts_ratio=1.0,
+                payload_tokens_per_word=1.5,
+            )
+
+    def test_raises_at_exact_zero_boundary(self):
+        with pytest.raises(ValueError, match="no payload budget left"):
+            envelope_derived_cap_tokens(
+                envelope_tokens=100,
+                skeleton_tokens=80,
+                reserve_tokens=20,
+                facts_ratio=1.0,
+                payload_tokens_per_word=1.5,
+            )
+
+
+class TestAnonymizeEnvelopeMirrors:
+    """Cross-module honesty checks: the checked mirrors equal the live
+    symbols they mirror, not a copied number that can drift."""
+
+    def test_envelope_equals_anonymize_default(self):
+        from paramem.cloud.anonymize import _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+
+        assert ANONYMIZE_ENVELOPE_TOKENS == _DEFAULT_ANONYMIZER_TOKEN_ENVELOPE
+
+    def test_reserve_equals_anonymize_output_constants_sum(self):
+        from paramem.cloud.anonymize import (
+            _MAPPING_ENTRY_OVERHEAD_TOKENS,
+            _OUTPUT_JSON_ENVELOPE_TOKENS,
+        )
+
+        assert ANONYMIZE_OUTPUT_RESERVE_TOKENS == (
+            _OUTPUT_JSON_ENVELOPE_TOKENS + _MAPPING_ENTRY_OVERHEAD_TOKENS
+        )

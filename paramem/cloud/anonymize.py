@@ -68,7 +68,7 @@ from paramem.cloud.placeholders import (
 from paramem.evaluation.recall import generate_answer
 from paramem.models.loader import adapt_messages
 from paramem.utils.identity import canonical, is_speaker_id
-from paramem.utils.tokens import estimate_tokens
+from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS, estimate_tokens
 from paramem.utils.vram_guard import effective_token_envelope, vram_scope
 
 logger = logging.getLogger(__name__)
@@ -78,8 +78,12 @@ logger = logging.getLogger(__name__)
 # (configs/server.yaml.example — "single-sequence 8192-token Mistral KV cache
 # is ~1 GiB; 0.5 GiB margin for activations"). One envelope, no second cap:
 # every caller derives its output allowance from this single budget (output =
-# envelope − prompt) — never a separate max_tokens knob.
-_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE: int = 8192
+# envelope − prompt) — never a separate max_tokens knob. Reads
+# paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS — the one executable home
+# for the literal, since paramem.graph.document_chunker and
+# paramem.server.session_buffer also need this value and must stay
+# importable without the cloud package (see paramem/utils/tokens.py).
+_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE: int = ANONYMIZE_ENVELOPE_TOKENS
 # Structural floor: below this no well-formed
 # {"mapping": ..., "anonymized_transcript": ...} envelope can complete, so a
 # smaller allowance only guarantees a truncated (fail-closed) response.

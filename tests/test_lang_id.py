@@ -197,7 +197,7 @@ def _make_probe_state(*, mode: str = "cloud-only") -> dict:
     cfg.consolidation.abort_quiesce_timeout_s = 1.0
 
     session_buffer = MagicMock()
-    session_buffer.get_session_turns.return_value = []
+    session_buffer.get_conversation_turns.return_value = []
 
     return {
         "config": cfg,

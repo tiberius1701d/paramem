@@ -50,12 +50,13 @@ from dataclasses import dataclass, field
 from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
 from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
-from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
+from paramem.models.loader import adapt_messages, base_model_inference, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
 from paramem.server.router import Intent, RoutingPlan
 from paramem.server.sanitizer import is_self_referential
 from paramem.server.tools.ha_client import HAClient
+from paramem.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -775,6 +776,82 @@ def _escalate_to_cloud(
     return ChatResult(text="I couldn't get an answer right now.", escalated=True)
 
 
+# A decoded reply re-tokenized with the same tokenizer is not guaranteed to
+# re-encode to exactly the token count that was generated: a hard
+# max_new_tokens cut can land mid-subword, and the decode->encode round trip
+# through a BPE tokenizer is not exactly invertible at that boundary. A
+# reply within this many tokens of the cap is still treated as a cap-hit —
+# without the tolerance, an off-by-one/two round-trip drift would silently
+# under-detect truncation and leave a mid-sentence cut untrimmed.
+_CAP_HIT_TOKEN_TOLERANCE = 2
+
+
+def _generate_local_reply(
+    text: str,
+    history: list[dict] | None,
+    model,
+    tokenizer,
+    config: ServerConfig,
+    *,
+    speaker_id: str | None,
+    language: str | None,
+) -> tuple[str, bool]:
+    """THE local reasoning generate — the one place a served reply is produced.
+
+    System-prompt assembly, message shaping, chat-template rendering and the
+    ``generate_answer`` call live here exactly once; :func:`_probe_and_reason`
+    and :func:`_base_model_answer` both call this instead of carrying their
+    own byte-identical tail.  ``max_new_tokens`` comes from
+    ``config.inference.max_response_tokens`` — the single literal-free site
+    for that cap.
+
+    Runs inside :func:`~paramem.models.loader.base_model_inference`, which
+    disables gradient checkpointing (so the KV cache stays live) and, when
+    *model* is a ``PeftModel``, disables the active adapter for the
+    duration — reasoning always runs on the base weights, whichever adapter
+    was last active for probing.
+
+    Cap-hit detection lives HERE — this is the one place the fact is
+    derivable, since only the generate call knows the actual token budget it
+    ran against. The decoded reply is re-tokenized with *tokenizer* and
+    compared against ``max_new_tokens`` within
+    :data:`_CAP_HIT_TOKEN_TOLERANCE`; the boolean is threaded to
+    :func:`_maybe_escalate` so trimming applies ONLY to a reply the cap
+    actually cut — a complete reply is never mutated.
+
+    Args:
+        text: The (possibly context-augmented) query text.
+        history: Prior turns for :func:`_build_messages`, or ``None``.
+        model: The (optionally PEFT-wrapped) model to generate from.
+        tokenizer: The model's tokenizer.
+        config: Server config — supplies the system prompt and the response
+            token cap.
+        speaker_id: The speaker's canonical ``speaker{N}`` token, or ``None``.
+        language: BCP-47 language code, or ``None``/``"en"``.
+
+    Returns:
+        ``(reply_text, is_truncated)`` — *reply_text* is untrimmed (trimming
+        happens in :func:`_maybe_escalate`, not here) and *is_truncated* is
+        True iff the reply's re-tokenized length is within
+        :data:`_CAP_HIT_TOKEN_TOLERANCE` of ``max_new_tokens``.
+    """
+    system_prompt = _build_system_prompt(speaker_id, language, config)
+    messages = _build_messages(text, history, system_prompt, tokenizer)
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    max_new_tokens = config.inference.max_response_tokens
+    with base_model_inference(model):
+        reply = generate_answer(
+            model,
+            tokenizer,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+        )
+    reply_tokens = estimate_tokens(reply, tokenizer)
+    is_truncated = reply_tokens >= max_new_tokens - _CAP_HIT_TOKEN_TOLERANCE
+    return reply, is_truncated
+
+
 def _probe_and_reason(
     text: str,
     plan: RoutingPlan,
@@ -815,8 +892,6 @@ def _probe_and_reason(
     Each result dict carries a ``fact_text`` field pre-rendered for the
     bullet list.
     """
-    from peft import PeftModel
-
     from paramem.memory.source import build_memory_source
     from paramem.models.loader import switch_adapter
 
@@ -990,17 +1065,15 @@ def _probe_and_reason(
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
-    system_prompt = _build_system_prompt(speaker_id, language, config)
-    messages = _build_messages(augmented_text, history, system_prompt, tokenizer)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    if isinstance(model, PeftModel):
-        with model.disable_adapter():
-            response = generate_answer(
-                model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
-            )
-    else:
-        response = generate_answer(model, tokenizer, prompt, max_new_tokens=256, temperature=0.0)
+    response, is_truncated = _generate_local_reply(
+        augmented_text,
+        history,
+        model,
+        tokenizer,
+        config,
+        speaker_id=speaker_id,
+        language=language,
+    )
 
     return _maybe_escalate(
         response,
@@ -1016,6 +1089,7 @@ def _probe_and_reason(
         is_personal=is_personal,
         model=model,
         tokenizer=tokenizer,
+        is_truncated=is_truncated,
     )
 
 
@@ -1038,19 +1112,15 @@ def _base_model_answer(
     a base-model [ESCALATE] from a personal-class query cannot reach
     Cloud.
     """
-    from peft import PeftModel
-
-    system_prompt = _build_system_prompt(speaker_id, language, config)
-    messages = _build_messages(text, history, system_prompt, tokenizer)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    if isinstance(model, PeftModel):
-        with model.disable_adapter():
-            response = generate_answer(
-                model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
-            )
-    else:
-        response = generate_answer(model, tokenizer, prompt, max_new_tokens=256, temperature=0.0)
+    response, is_truncated = _generate_local_reply(
+        text,
+        history,
+        model,
+        tokenizer,
+        config,
+        speaker_id=speaker_id,
+        language=language,
+    )
 
     return _maybe_escalate(
         response,
@@ -1064,7 +1134,91 @@ def _base_model_answer(
         is_personal=is_personal,
         model=model,
         tokenizer=tokenizer,
+        is_truncated=is_truncated,
     )
+
+
+_SENTENCE_TERMINATORS = ".!?…"
+# U+201C (LEFT DOUBLE QUOTATION MARK, "“") is included because German
+# typography reuses that glyph as the CLOSING quote (opening is „, U+201E)
+# — without it, a complete German reply ending in „…“ was misjudged as
+# incomplete (the trailing-closer strip never reached the terminator
+# underneath) and lost its closing quote to the (pre-truncation-gated) trim.
+_TRAILING_CLOSERS = "\"'’”»)]}“"
+
+
+def _is_boundary_terminator(text: str, index: int) -> bool:
+    """Return True if ``text[index]`` is a sentence-terminating character.
+
+    Excludes a ``.`` immediately preceded by a digit: a decimal (``3.5``)
+    or an enumerated list marker (``3.``) is not a sentence boundary, even
+    though ``.`` is a terminator in every other context. ``!``/``?``/``…``
+    are never excluded — only ``.`` participates in this ambiguity.
+    """
+    ch = text[index]
+    if ch not in _SENTENCE_TERMINATORS:
+        return False
+    if ch == "." and index > 0 and text[index - 1].isdigit():
+        return False
+    return True
+
+
+def _trim_incomplete_sentence(text: str) -> str:
+    """Drop a trailing incomplete sentence left by the token cap.
+
+    Applied at exactly one site — :func:`_maybe_escalate`'s no-tag return —
+    and ONLY when the caller has determined the reply was cap-truncated
+    (:func:`_generate_local_reply`'s ``is_truncated``); a complete reply is
+    never passed through this function at all, so it is never mutated. A
+    closing quote/bracket/paren immediately after a terminator does not
+    count as incompleteness (``He said "yes."`` / ``(yes.)`` both count as
+    complete).
+
+    No-op (returns *text* byte-identical) when:
+
+    - *text* is empty or whitespace-only.
+    - *text* already ends on a sentence terminator, ignoring any trailing
+      closing punctuation.
+    - *text* contains no terminator at all (nothing to trim back to).
+
+    Otherwise returns *text* sliced through the LAST terminator found,
+    plus any closing punctuation immediately following it. The slice
+    always contains at least that terminator character (a non-whitespace
+    character by construction), so trimming can never empty a reply — no
+    separate guard is needed for that.
+
+    Residual (accepted, not fixed here): an abbreviation period ("Dr.",
+    "e.g.") is indistinguishable from a real sentence terminator by this
+    function and may still cause a short-but-truthful cut on an
+    already-truncated reply. This is a known residual on already-broken
+    replies, not a promise that every cut lands on a true sentence
+    boundary.
+
+    Args:
+        text: The generated reply text.
+
+    Returns:
+        *text*, or a prefix of it ending on a complete sentence.
+    """
+    if not text or not text.strip():
+        return text
+
+    trailing = text.rstrip().rstrip(_TRAILING_CLOSERS)
+    if trailing and _is_boundary_terminator(trailing, len(trailing) - 1):
+        return text
+
+    last_idx = -1
+    for i in range(len(text)):
+        if _is_boundary_terminator(text, i):
+            last_idx = i
+    if last_idx == -1:
+        return text
+
+    end = last_idx + 1
+    while end < len(text) and text[end] in _TRAILING_CLOSERS:
+        end += 1
+
+    return text[:end]
 
 
 def _maybe_escalate(
@@ -1081,6 +1235,7 @@ def _maybe_escalate(
     is_personal: bool = False,
     model=None,
     tokenizer=None,
+    is_truncated: bool = False,
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route HA → cloud.
 
@@ -1108,11 +1263,31 @@ def _maybe_escalate(
     ``model`` and ``tokenizer`` are forwarded to
     :func:`answer_via_cloud` so the anonymizer (when
     selected) can rewrite outbound text.
+
+    ``is_truncated`` is :func:`_generate_local_reply`'s cap-hit verdict for
+    *response* — the trim below runs ONLY when it is True, so a complete
+    reply is never touched (kills the class of trim defects that mutated
+    healthy replies, e.g. losing a trailing German closing quote). A
+    response ending in a truncated tag fragment (``"…[ESCAL"``, not matched
+    by ``detect_escalation``'s exact ``find``) is a byproduct of the SAME
+    cap hit that set ``is_truncated``, so it is subsumed by the trim too —
+    see ``handle_chat``/``_probe_and_reason`` for where the verdict
+    actually originates (out of scope here: a truncated forwarded
+    ``[ESCALATE]`` query on the escalation path itself is a separate,
+    recorded residual).
+
+    Ordering is load-bearing: the trim runs on the no-tag return AFTER
+    :func:`~paramem.server.escalation.detect_escalation` has already run,
+    so a complete ``[ESCALATE]`` tag can never be eaten by it. The
+    hops-exhausted return below is NEVER trimmed regardless of
+    ``is_truncated`` — its text is everything BEFORE a tag the model
+    actually emitted and is therefore complete by construction.
     """
     should_escalate, forwarded_query = detect_escalation(response)
 
     if not should_escalate:
-        return ChatResult(text=response, probed_keys=probed_keys or [])
+        text = _trim_incomplete_sentence(response) if is_truncated else response
+        return ChatResult(text=text, probed_keys=probed_keys or [])
 
     forwarded_is_personal = is_self_referential(
         forwarded_query,

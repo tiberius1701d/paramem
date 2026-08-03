@@ -80,6 +80,7 @@ from paramem.utils.config import (  # noqa: E402
     TrainingConfig,
 )
 from paramem.utils.identity import is_speaker_id  # noqa: E402
+from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS  # noqa: E402
 
 logger = logging.getLogger("probe_speaker_identity_live")
 
@@ -310,6 +311,9 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         # probe (enrichment_provider="off"), but ConsolidationLoop's
         # ExtractionPipeline requires a scrub value regardless.
         extraction_scrub=set(SanitizationConfig().scrub),
+        extraction_max_tokens=8192,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=ANONYMIZE_ENVELOPE_TOKENS,
     )
 
     results: dict = {}

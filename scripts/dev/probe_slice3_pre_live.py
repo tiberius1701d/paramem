@@ -58,6 +58,7 @@ from paramem.utils.config import (  # noqa: E402
     ConsolidationConfig,
     TrainingConfig,
 )
+from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS  # noqa: E402
 
 logger = logging.getLogger("probe_slice3_pre_live")
 
@@ -251,6 +252,9 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         # probe (enrichment_provider="off"), but ConsolidationLoop's
         # ExtractionPipeline requires a scrub value regardless.
         extraction_scrub=set(SanitizationConfig().scrub),
+        extraction_max_tokens=8192,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=ANONYMIZE_ENVELOPE_TOKENS,
     )
 
     # Four cases layered from isolation to end-to-end:

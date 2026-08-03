@@ -3132,7 +3132,7 @@ async def chat(request: ChatRequest, http_request: Request):
         _forced_history = (
             []
             if _serving is ServingPath.RELAY
-            else buffer.get_session_turns(request.conversation_id)
+            else buffer.get_conversation_turns(request.conversation_id)
         )
         loop = asyncio.get_running_loop()
 
@@ -3671,7 +3671,7 @@ async def _run_chat_turn(
     own fork, in the ``/chat`` handler).
 
     Conversation history is server-authoritative: it is read from
-    ``SessionBuffer.get_session_turns(conversation_id)`` BEFORE this turn's
+    ``SessionBuffer.get_conversation_turns(conversation_id)`` BEFORE this turn's
     own ``buffer.append`` calls run, so it never doubles-up the current user
     utterance — the read always happens first, and it is the only read of
     history in this function.
@@ -3719,7 +3719,7 @@ async def _run_chat_turn(
 
     # Read BEFORE any append below — the current turn is not yet in the
     # buffer, so this can never include it.
-    history = buffer.get_session_turns(conversation_id)
+    history = buffer.get_conversation_turns(conversation_id)
 
     # Debounce stamps — monotonic for scheduler, wall-clock for /status display.
     # Both writes run on the asyncio event-loop thread (cooperative scheduling),
@@ -7627,7 +7627,7 @@ async def debug_probe(request: DebugProbeRequest):
     # loss of ad-hoc multi-turn testing is an accepted cost of retiring the
     # client-supplied history field.
     buffer = _state["session_buffer"]
-    history = buffer.get_session_turns(request.conversation_id)
+    history = buffer.get_conversation_turns(request.conversation_id)
 
     # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
     if _state["mode"] == "cloud-only":
@@ -15951,9 +15951,9 @@ async def _run_enrollment_for_speaker(
         return None
 
     # Chronological order: prior session turns first, then the live turn
-    # (extra_turns) last — get_session_turns returns turns in append order,
+    # (extra_turns) last — get_conversation_turns returns turns in append order,
     # so the live turn (not yet appended to the buffer) belongs after them.
-    all_turns: list[dict] = buffer.get_session_turns(conv_id) + list(extra_turns or [])
+    all_turns: list[dict] = buffer.get_conversation_turns(conv_id) + list(extra_turns or [])
 
     if not all_turns:
         return None

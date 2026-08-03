@@ -467,6 +467,9 @@ class TestStaleInTrainingCleanup:
             memory_store=_MS(replay_enabled=False),
             output_dir=tmp_path,
             extraction_scrub={"person name"},
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
         # _ensure_adapters runs in __init__; the stale dir should be gone
         assert not (tmp_path / "in_training").exists(), (

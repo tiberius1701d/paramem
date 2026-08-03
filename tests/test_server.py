@@ -268,20 +268,20 @@ class TestSessionBuffer:
         assert "[user] I live in Amsterdam" in pending[0]["transcript"]
         assert pending[0]["speaker_id"] == "spk_abc"
 
-    def test_get_session_turns_conversational(self, tmp_path):
+    def test_get_conversation_turns_conversational(self, tmp_path):
         """Regression: a direct ``_turns[conversation_id]`` lookup is dead for
         the conversational case — ``append`` always mints a distinct
         session_id (``f"{conversation_id}-{timestamp}-{rand}"``), so
-        ``get_session_turns`` must route through the ``_open`` indirection
+        ``get_conversation_turns`` must route through the ``_open`` indirection
         the same way ``append`` resolves it."""
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
         buffer.append("conv1", "assistant", "Hi there!")
 
-        turns = buffer.get_session_turns("conv1")
+        turns = buffer.get_conversation_turns("conv1")
         assert [t["text"] for t in turns] == ["Hello", "Hi there!"]
 
-    def test_get_session_turns_document_chunk_path(self, tmp_path):
+    def test_get_conversation_turns_document_chunk_path(self, tmp_path):
         """Document-chunk sessions use session_id == the routing handle
         directly (``append_document_chunk`` never rotates) — the fallback
         to treating the id as a session id directly must keep this path
@@ -291,12 +291,12 @@ class TestSessionBuffer:
         buffer.set_document_metadata("doc-1-c000", doc_id="doc-1", chunk_count=1)
         buffer.append_document_chunk("doc-1-c000", "user", "chunk text")
 
-        turns = buffer.get_session_turns("doc-1-c000")
+        turns = buffer.get_conversation_turns("doc-1-c000")
         assert [t["text"] for t in turns] == ["chunk text"]
 
-    def test_get_session_turns_unknown_conversation_empty(self, tmp_path):
+    def test_get_conversation_turns_unknown_conversation_empty(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
-        assert buffer.get_session_turns("never-seen") == []
+        assert buffer.get_conversation_turns("never-seen") == []
 
     def _setup_daily(self, tmp_path, monkeypatch, passphrase="pw"):
         """Install a daily age identity so the envelope-encrypt path engages."""
@@ -586,12 +586,6 @@ class TestProbeAndReasonDispatch:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
 
         model = self._make_model(["episodic", "procedural"])
-        # Disable PeftModel isinstance check so disable_adapter branch is skipped.
-        monkeypatch.setattr(
-            "paramem.server.inference.PeftModel",
-            type(None),
-            raising=False,
-        )
 
         # Write a minimal voice prompt file.
         prompt_file = tmp_path / "prompt.txt"
@@ -689,11 +683,6 @@ class TestProbeAndReasonDispatch:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
 
         model = self._make_model(["episodic", "procedural", "episodic_interim_20260516T1200"])
-        monkeypatch.setattr(
-            "paramem.server.inference.PeftModel",
-            type(None),
-            raising=False,
-        )
 
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("You are an assistant.")
@@ -780,11 +769,6 @@ class TestProbeAndReasonDispatch:
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer",
             lambda model, tokenizer, prompt, **kwargs: "final answer",
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference.PeftModel",
-            type(None),
-            raising=False,
         )
 
     def test_local_reasoning_prompt_carries_speaker_token_not_name(self, monkeypatch, tmp_path):
@@ -909,11 +893,6 @@ class TestBaseModelAnswerSystemPrompt:
             "paramem.server.inference.generate_answer",
             lambda model, tokenizer, prompt, **kwargs: "a plain answer",
         )
-        monkeypatch.setattr(
-            "paramem.server.inference.PeftModel",
-            type(None),
-            raising=False,
-        )
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
@@ -961,11 +940,6 @@ class TestBaseModelAnswerSystemPrompt:
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer",
             lambda model, tokenizer, prompt, **kwargs: "a plain answer",
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference.PeftModel",
-            type(None),
-            raising=False,
         )
 
         tokenizer = MagicMock()

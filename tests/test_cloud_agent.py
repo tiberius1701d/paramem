@@ -414,6 +414,8 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
+        # _generate_local_reply's cap-hit arithmetic needs a real int here.
+        config.inference.max_response_tokens = 512
         with (
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",
@@ -560,6 +562,8 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.registry_path = MagicMock()
         config.voice.load_prompt.return_value = "You are a helper."
+        # _generate_local_reply's cap-hit arithmetic needs a real int here.
+        config.inference.max_response_tokens = 512
 
         with (
             patch(
@@ -693,6 +697,8 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
+        # _generate_local_reply's cap-hit arithmetic needs a real int here.
+        config.inference.max_response_tokens = 512
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA would fail if called
@@ -756,6 +762,8 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
+        # _generate_local_reply's cap-hit arithmetic needs a real int here.
+        config.inference.max_response_tokens = 512
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fallback fails

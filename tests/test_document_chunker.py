@@ -25,6 +25,7 @@ import pytest
 from paramem.graph.document_chunker import (
     _DOC_MAX_TOKENS,
     _DOC_MIN_TOKENS,
+    _R_PROSE,
     DocumentChunk,
     EmptyDocumentError,
     ScannedPdfRejectedError,
@@ -39,12 +40,12 @@ from paramem.graph.document_chunker import (
 )
 from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
 
-# Document-shape ratio — the same value recorded as tokens.py's
-# "document shape (CV)" row feeding MEASURED_TOKENS_PER_WORD, and the same
-# value document_chunker.py's _DOC_MAX_TOKENS derivation comment uses for
-# BOTH the cap conversion and the anon_template estimate: one ratio
-# throughout, never a mix of an exact-tokenizer snapshot and an estimate.
-_R_PROSE = 1.9126
+# _R_PROSE is imported directly from document_chunker above — the same
+# ratio document_chunker.py's _DOC_MAX_TOKENS derivation comment uses for
+# BOTH the cap conversion and the anon_template estimate, one ratio
+# throughout (never a mix of an exact-tokenizer snapshot and an estimate).
+# A local copy of this value would itself be a duplicate the derivation
+# tests below are specifically designed to catch drift against.
 _ANONYMIZATION_TEMPLATE_PATH = (
     Path(__file__).resolve().parent.parent / "configs" / "prompts" / "anonymization.txt"
 )
@@ -708,7 +709,7 @@ class TestDocMaxTokensDerivation:
         """
         cap_words = _DOC_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
         word_counts = [round(cap_words) - 50, round(cap_words) + 50]
-        for ratio in (1.4, 3.4, 5.0, 8.0):  # a hypothetical base-model swap's ratio
+        for ratio in (1.4, 3.4, 3.7, 5.0, 8.0):  # a hypothetical base-model swap's ratio
             scaled_cap_tokens = cap_words * ratio  # _DOC_MAX_TOKENS re-derived at this ratio
             for words in word_counts:
                 text = "word " * words

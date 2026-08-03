@@ -98,6 +98,10 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         # shared cloud-admission verdict, whose first term is the master
         # switch — so it must be ON for any enrichment test to reach a call.
         cloud_enabled=True,
+        # Required keywords (no code-side default) — see kwargs docstring.
+        extraction_max_tokens=8192,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=8192,
     )
     defaults.update(kwargs)
 
@@ -3508,6 +3512,9 @@ class TestHarvestKeylessEdges:
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
 
@@ -3596,6 +3603,9 @@ class TestHarvestKeylessEdges:
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
 
@@ -3681,6 +3691,9 @@ class TestHarvestKeylessEdges:
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
 
         assert loop._procedural_next_index == 301, (
@@ -3741,6 +3754,9 @@ class TestHarvestKeylessEdges:
             extraction_enrichment_provider="anthropic",
             extraction_enrichment_provider_model="claude-sonnet-4-6",
             extraction_scrub={"person name"},
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
 
         assert loop._indexed_next_index == 261, (

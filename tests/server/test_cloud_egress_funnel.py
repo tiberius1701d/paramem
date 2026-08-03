@@ -338,7 +338,7 @@ def test_persist_before_resolve_cloud_only_leg(tmp_path, monkeypatch):
     assert result.text == "speaker0 asked about the weather."
 
     # Persisted turn: token-space, unresolved — the buffer never sees the name.
-    turns = state["session_buffer"].get_session_turns("conv-persist")
+    turns = state["session_buffer"].get_conversation_turns("conv-persist")
     assistant_turns = [t for t in turns if t["role"] == "assistant"]
     assert len(assistant_turns) == 1
     assert assistant_turns[0]["text"] == "speaker0 asked about the weather."
@@ -444,7 +444,7 @@ def test_notice_is_never_written_to_the_session_buffer(tmp_path, monkeypatch):
 
     assert app_module._DEGRADED_SERVING_NOTICE in spoken
     assert result.text == "answer"
-    turns = state["session_buffer"].get_session_turns("conv-buf")
+    turns = state["session_buffer"].get_conversation_turns("conv-buf")
     # Non-vacuous: pin that both turns (user + assistant) were actually
     # persisted, so the "not in" check below cannot pass on an empty list.
     assert len(turns) == 2

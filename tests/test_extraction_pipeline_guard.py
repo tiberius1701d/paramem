@@ -22,7 +22,7 @@ import pytest
 
 from paramem.memory.store import MemoryStore as _MS
 from paramem.utils.artifacts import on_session_extracted
-from tests._guard_utils import tracked_python_files
+from tests._guard_utils import enters_context_manager, tracked_python_files
 
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining extract_procedural_graph.
@@ -634,6 +634,8 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         semantic_adapter_config=AdapterConfig(),
         memory_store=_MS(replay_enabled=False),
         output_dir=tmp_path,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=8192,
         **flipped,
     )
 
@@ -678,6 +680,9 @@ def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
         output_dir=tmp_path,
         model_name="qwen3-4b",
         extraction_scrub={"person name"},
+        extraction_max_tokens=8192,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=8192,
     )
 
     assert loop.extraction.model_name == "qwen3-4b", (
@@ -989,6 +994,9 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
         save_cycle_snapshots=True,
         snapshot_dir=tmp_path,
         extraction_scrub={"person name"},
+        extraction_max_tokens=8192,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=8192,
     )
     loop.cycle_count = 7
     return loop
@@ -1393,20 +1401,7 @@ def test_name_enrollment_enters_base_model_inference():
             break
     assert target is not None, "_run_enrollment_for_speaker not found in paramem/server/app.py"
 
-    def _enters_base_model_inference(fn: ast.FunctionDef) -> bool:
-        for node in ast.walk(fn):
-            if isinstance(node, ast.With):
-                for item in node.items:
-                    call = item.context_expr
-                    if (
-                        isinstance(call, ast.Call)
-                        and isinstance(call.func, ast.Name)
-                        and call.func.id == "base_model_inference"
-                    ):
-                        return True
-        return False
-
-    assert _enters_base_model_inference(target), (
+    assert enters_context_manager(target, "base_model_inference"), (
         "_run_enrollment_for_speaker must wrap its extract_name_via_llm call in "
         "`with base_model_inference(model):` — name enrollment is structured "
         "extraction and must run on the base weights, not the training-active "

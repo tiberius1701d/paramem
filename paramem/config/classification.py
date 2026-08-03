@@ -163,6 +163,11 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "intent.encoder_query_prefix": Tier.PIPELINE_ALTERING,
     "intent.exemplars_dir": Tier.PIPELINE_ALTERING,
     "intent.confidence_margin": Tier.PIPELINE_ALTERING,
+    # --- inference (serving-path options; pure read-cache toggle and a
+    # response-length ceiling — neither changes a stored artifact or
+    # requires a rebuild) ---
+    "inference.preload_cache": Tier.OPERATIONAL,
+    "inference.max_response_tokens": Tier.OPERATIONAL,
     # --- voice ---
     "voice.prompt_file": Tier.OPERATIONAL,
     "voice.greeting_interval_hours": Tier.OPERATIONAL,

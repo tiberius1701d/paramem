@@ -143,6 +143,9 @@ class TestExtractionPathParity:
         from paramem.memory.store import MemoryStore as _MS
 
         loop_kwargs.setdefault("extraction_scrub", {"person name"})
+        loop_kwargs.setdefault("extraction_max_tokens", 8192)
+        loop_kwargs.setdefault("extraction_plausibility_max_tokens", 8192)
+        loop_kwargs.setdefault("extraction_anonymize_token_envelope", 8192)
         return ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
@@ -539,6 +542,9 @@ class TestInterimRefinementGate:
             output_dir=tmp_path,
             extraction_scrub={"person name"},
             cloud_enabled=cloud_enabled,
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
         return loop
 
@@ -12959,6 +12965,9 @@ class TestSameAsSpeakerPairGuard:
             # verdict's first term is the master switch, so it must be ON for
             # this test to reach a (mocked) cloud call.
             cloud_enabled=True,
+            extraction_max_tokens=8192,
+            extraction_plausibility_max_tokens=8192,
+            extraction_anonymize_token_envelope=8192,
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
         for tier in ("episodic", "semantic", "procedural"):

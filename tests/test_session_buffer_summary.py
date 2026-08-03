@@ -2,7 +2,8 @@
 
 import pytest
 
-from paramem.server.session_buffer import SessionBuffer
+from paramem.server.session_buffer import _TRANSCRIPT_MAX_TOKENS, SessionBuffer
+from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
 
 
 @pytest.fixture
@@ -943,6 +944,403 @@ class TestSessionRotation:
         buf.mark_consolidated([chunk_id])
 
         assert chunk_id not in buf._open, "doc chunk _open entry must be pruned on retirement"
+
+    # -----------------------------------------------------------------
+    # Size rotation (owner ruling 2026-08-03) + conversation-scoped chain read
+    # -----------------------------------------------------------------
+    #
+    # Note (plan-review verification): the four idle-rotation tests above
+    # (test_within_window_stays_one_session, test_idle_rollover_mints_
+    # two_sessions_with_distinct_started_at, test_restart_split_new_
+    # session_after_rehydrate, test_doc_chunks_never_rotate_even_past_
+    # idle_timeout) call through the public append()/append_document_chunk()
+    # API and are unaffected by _resolve_session_id's added role/text
+    # parameters — they never call it directly.
+
+    @staticmethod
+    def _turn_tokens(text: str, role: str = "user") -> int:
+        """The exact estimated-token cost _resolve_session_id assigns one
+        turn — via the same _format_turns + estimate_tokens path."""
+        formatted, _ = SessionBuffer._format_turns([{"role": role, "text": text}])
+        return estimate_tokens(formatted[0])
+
+    @classmethod
+    def _drive_to_size_rotation(cls, buf: SessionBuffer, conv_id: str, turn_text: str) -> int:
+        """Append *turn_text* repeatedly until a size rotation fires.
+
+        Detects rotation via the concrete ``session_id`` changing (not via
+        ``get_pending()`` count, which trivially rises 0->1 on a fresh
+        conversation's very first turn — a false positive for "rotated").
+
+        Returns the number of turns appended (including the rotating one).
+        Safety-capped so a broken cap constant fails the test loudly
+        instead of hanging.
+        """
+        buf.append(conv_id, "user", turn_text)
+        session_id = buf._open[conv_id]["session_id"]
+        count = 1
+        while True:
+            buf.append(conv_id, "user", turn_text)
+            count += 1
+            new_session_id = buf._open[conv_id]["session_id"]
+            if new_session_id != session_id:
+                return count
+            assert count < 10_000, "size rotation never fired — cap constant likely broken"
+
+    def test_size_rotation_fires_across_the_cap(self, tmp_path):
+        """Turns whose accumulated estimate crosses _TRANSCRIPT_MAX_TOKENS
+        land in two sessions."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        count = self._drive_to_size_rotation(buf, "conv-size", turn_text)
+        assert count > 1, "a single turn should never itself exceed the cap here"
+        assert len(buf.get_pending()) == 2
+
+    def test_lone_oversize_turn_admitted_whole(self, tmp_path):
+        """A single turn well over the cap produces ONE session containing
+        it, no split (the Option-1 fail-closed residual: accumulated > 0
+        is what makes rotation possible, so a lone turn is always admitted)."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        huge_text = ("word " * 5000).strip()
+        assert self._turn_tokens(huge_text) > _TRANSCRIPT_MAX_TOKENS
+        buf.append("conv-lone", "user", huge_text)
+        pending = buf.get_pending()
+        assert len(pending) == 1
+        assert huge_text in pending[0]["transcript"]
+
+    def test_accumulator_resets_on_size_rotation(self, tmp_path):
+        """After a size rotation the new session's accumulator holds only
+        the rotating turn's own cost — not the pre-rotation cumulative
+        total — so it accepts a full cap's worth again."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        self._drive_to_size_rotation(buf, "conv-reset", turn_text)
+        assert buf._open["conv-reset"]["session_tokens"] == self._turn_tokens(turn_text)
+
+    def test_idle_rotation_also_resets_accumulator(self, tmp_path):
+        """An idle-timeout rotation resets the accumulator exactly like a
+        size rotation — the new session's count reflects only the turn
+        that opened it."""
+        from datetime import datetime, timedelta, timezone
+
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        buf.append("conv-idle-acc", "user", "first turn with several words in it")
+        assert buf._open["conv-idle-acc"]["session_tokens"] > 0
+
+        stale = datetime.now(timezone.utc) - timedelta(minutes=20)
+        buf._open["conv-idle-acc"]["last_turn_at"] = stale.isoformat()
+
+        second_text = "second turn after the idle gap"
+        buf.append("conv-idle-acc", "user", second_text)
+        assert buf._open["conv-idle-acc"]["session_tokens"] == self._turn_tokens(second_text)
+
+    def test_idle_rotation_clears_chain_size_rotation_appends(self, tmp_path):
+        """Size rotation appends the retiring session onto
+        prior_session_ids; an idle rotation clears the chain instead
+        (ruling 15 — context reset on idle is deliberate)."""
+        from datetime import datetime, timedelta, timezone
+
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        self._drive_to_size_rotation(buf, "conv-chain", turn_text)
+        assert buf._open["conv-chain"]["prior_session_ids"] != []
+
+        stale = datetime.now(timezone.utc) - timedelta(minutes=20)
+        buf._open["conv-chain"]["last_turn_at"] = stale.isoformat()
+        buf.append("conv-chain", "user", "after the idle gap")
+
+        assert buf._open["conv-chain"]["prior_session_ids"] == []
+
+    def test_idle_expired_wins_over_size_exceeded_for_chain_continuity(self, tmp_path):
+        """When BOTH idle-expired and size-exceeded are true on the same
+        append, idle wins: the chain resets (prior_session_ids stays
+        empty) rather than carrying the retiring session forward. Pins
+        the `size_exceeded and not idle_expired` term in
+        _resolve_session_id's `context_continues` — dropping the
+        `and not idle_expired` clause would carry the chain forward here
+        and fail this test."""
+        from datetime import datetime, timedelta, timezone
+
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        turn_tokens = self._turn_tokens(turn_text)
+
+        buf.append("conv-both", "user", turn_text)
+        count = 1
+        # Build up to exactly one turn short of a size rotation: after the
+        # loop, the NEXT identical turn is guaranteed to size-rotate on
+        # its own merits (accumulated + turn_tokens > cap).
+        while buf._open["conv-both"]["session_tokens"] + turn_tokens <= _TRANSCRIPT_MAX_TOKENS:
+            buf.append("conv-both", "user", turn_text)
+            count += 1
+            assert count < 10_000, "never reached the size-rotation boundary"
+        session_id_before = buf._open["conv-both"]["session_id"]
+
+        # Force idle expiry too, on top of a turn that would independently
+        # size-rotate.
+        stale = datetime.now(timezone.utc) - timedelta(minutes=20)
+        buf._open["conv-both"]["last_turn_at"] = stale.isoformat()
+
+        buf.append("conv-both", "user", turn_text)
+
+        assert buf._open["conv-both"]["session_id"] != session_id_before, (
+            "a rotation must have fired (either trigger alone would cause one)"
+        )
+        assert buf._open["conv-both"]["prior_session_ids"] == [], (
+            "idle must win: the chain must reset, not carry the retiring "
+            "session forward, when idle-expired is also true"
+        )
+
+    def test_retiring_session_transcript_fits_within_the_transcript_cap(self, tmp_path):
+        """End-to-end pin mirroring the document path's
+        TestDocumentPathBudget (tests/test_document_chunker.py): build a
+        session up to the rotation boundary, then verify the RETIRED
+        session's actual formatted transcript — the same shape
+        get_pending() produces and the same shape the anonymize call is
+        sized against — fits within _TRANSCRIPT_MAX_TOKENS. Not the
+        internal per-turn accumulator (already pinned above), the real
+        end-to-end quantity."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        self._drive_to_size_rotation(buf, "conv-budget", turn_text)
+
+        current_session_id = buf._open["conv-budget"]["session_id"]
+        pending = buf.get_pending()
+        retired = [p for p in pending if p["session_id"] != current_session_id]
+        assert len(retired) == 1, f"expected exactly one retired session, got {len(retired)}"
+        retired_transcript = retired[0]["transcript"]
+        assert estimate_tokens(retired_transcript) <= _TRANSCRIPT_MAX_TOKENS
+
+    def test_chain_read_spans_size_rotation_chronologically(self, tmp_path):
+        """get_conversation_turns returns turns across a size rotation, in
+        chronological (append) order — a mid-dialogue size rotation is
+        invisible to a caller reading the conversation's served context."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text_base = ("word " * 100).strip()
+        appended: list[str] = []
+        i = 0
+        while len(buf.get_pending()) < 2:
+            text = f"turn{i} {turn_text_base}"
+            buf.append("conv-chrono", "user", text)
+            appended.append(text)
+            i += 1
+            assert i < 10_000, "size rotation never fired — cap constant likely broken"
+
+        turns = buf.get_conversation_turns("conv-chrono")
+        assert [t["text"] for t in turns] == appended
+
+    def test_chain_read_after_idle_rotation_returns_only_current_session(self, tmp_path):
+        """The ruling-15 boundary: an idle rotation DOES reset served
+        context — the chain read after one returns only the new session's
+        turns, not the pre-idle-gap ones."""
+        from datetime import datetime, timedelta, timezone
+
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        buf.append("conv-idle-chain", "user", "before the idle gap")
+
+        stale = datetime.now(timezone.utc) - timedelta(minutes=20)
+        buf._open["conv-idle-chain"]["last_turn_at"] = stale.isoformat()
+        buf.append("conv-idle-chain", "user", "after the idle gap")
+
+        turns = buf.get_conversation_turns("conv-idle-chain")
+        assert [t["text"] for t in turns] == ["after the idle gap"]
+
+    def _setup_daily(self, tmp_path, monkeypatch, passphrase="pw"):
+        """Install a daily age identity so the envelope-encrypt snapshot
+        path engages (mirrors tests/test_server.py's TestSessionBuffer
+        helper of the same name)."""
+        from paramem.backup.key_store import (
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+
+        ident = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(ident, passphrase), key_path)
+        monkeypatch.setenv("PARAMEM_DAILY_PASSPHRASE", passphrase)
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+        return ident
+
+    def test_snapshot_round_trip_preserves_rotation_state(self, tmp_path, monkeypatch):
+        """save_snapshot -> fresh buffer -> load_snapshot round-trips both
+        session_tokens and prior_session_ids (new keys inside the existing
+        "open" dict — no snapshot schema version bump needed)."""
+        self._setup_daily(tmp_path, monkeypatch)
+
+        buf1 = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        self._drive_to_size_rotation(buf1, "conv-snap", turn_text)
+        prior_before = list(buf1._open["conv-snap"]["prior_session_ids"])
+        tokens_before = buf1._open["conv-snap"]["session_tokens"]
+        assert prior_before != []
+
+        assert buf1.save_snapshot()
+
+        buf2 = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        assert buf2.load_snapshot()
+
+        assert buf2._open["conv-snap"]["prior_session_ids"] == prior_before
+        assert buf2._open["conv-snap"]["session_tokens"] == tokens_before
+
+    def test_snapshot_schema_tolerance_missing_rotation_keys(self, tmp_path, monkeypatch):
+        """An _open payload predating this change (neither session_tokens
+        nor prior_session_ids) loads cleanly and behaves as a fresh
+        accumulator (0, empty chain) — both fields are read with
+        .get(..., default) everywhere."""
+        self._setup_daily(tmp_path, monkeypatch)
+
+        buf1 = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        buf1.append("conv-legacy", "user", "hello")
+        # Simulate a pre-upgrade snapshot: strip the two new keys.
+        buf1._open["conv-legacy"].pop("session_tokens", None)
+        buf1._open["conv-legacy"].pop("prior_session_ids", None)
+        assert buf1.save_snapshot()
+
+        buf2 = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        assert buf2.load_snapshot()
+        assert "session_tokens" not in buf2._open["conv-legacy"]
+        assert "prior_session_ids" not in buf2._open["conv-legacy"]
+
+        # The next turn resumes cleanly: accumulator starts at 0 (bounded
+        # one-time over-run of at most one cap) and the chain starts empty.
+        buf2.append("conv-legacy", "user", "resumed turn")
+        assert buf2._open["conv-legacy"]["session_tokens"] == self._turn_tokens("resumed turn")
+        assert buf2._open["conv-legacy"].get("prior_session_ids", []) == []
+
+    def test_prune_drops_retired_prior_chain_member_leaves_conversation_open(self, tmp_path):
+        """Retiring a PRIOR chain member (a size-rotated-out session that is
+        now consolidated) drops it from prior_session_ids but leaves the
+        conversation's _open entry live; retiring the CURRENT session still
+        evicts the whole entry (existing behaviour)."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        turn_text = ("word " * 100).strip()
+        self._drive_to_size_rotation(buf, "conv-prune", turn_text)
+        prior_ids = list(buf._open["conv-prune"]["prior_session_ids"])
+        assert len(prior_ids) >= 1
+        current_id = buf._open["conv-prune"]["session_id"]
+
+        # Retire the PRIOR chain member only.
+        buf._prune_open_for_retired_sessions([prior_ids[0]])
+        assert "conv-prune" in buf._open, "conversation must stay open"
+        assert prior_ids[0] not in buf._open["conv-prune"]["prior_session_ids"]
+        assert buf._open["conv-prune"]["session_id"] == current_id
+
+        # Retiring the CURRENT session still evicts the whole entry.
+        buf._prune_open_for_retired_sessions([current_id])
+        assert "conv-prune" not in buf._open
+
+    def test_document_chunk_path_never_rotates_chain_read_unaffected(self, tmp_path):
+        """append_document_chunk never rotates (no _resolve_session_id
+        call at all) and get_conversation_turns still resolves it by
+        treating the routing handle as the session id directly — no
+        prior_session_ids chain ever forms for a doc-chunk session."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        chunk_id = "doc-2-c000"
+        buf.set_speaker(chunk_id, "spk-a", "Alice")
+        buf.set_document_metadata(chunk_id, doc_id="doc-2", chunk_count=1)
+        # Text well over the size cap — must NOT rotate for a doc chunk.
+        huge_text = ("word " * 5000).strip()
+        buf.append_document_chunk(chunk_id, "user", huge_text)
+
+        assert len(buf.get_pending()) == 1
+        assert buf._open[chunk_id].get("prior_session_ids") in (None, [])
+        turns = buf.get_conversation_turns(chunk_id)
+        assert [t["text"] for t in turns] == [huge_text]
+
+    def test_rotation_decision_margin_inside_vs_outside_the_cap(self, tmp_path):
+        """A turn sequence well INSIDE the cap never rotates; a sequence
+        whose second turn pushes the total comfortably (50+ words) PAST
+        the cap does. The cap constant itself is ratio-invariant by
+        construction (it is built through
+        paramem.utils.tokens.envelope_derived_cap_tokens /
+        words_to_estimator_tokens, whose ratio-cancellation property is
+        pinned generically in tests/test_tokens.py and, for the document
+        shape specifically, in
+        TestDocMaxTokensDerivation::test_ratio_cancellation_invariant) —
+        this test pins the session_buffer-specific consumption of that
+        cap, not the cancellation property itself, which is not
+        re-derived here (no duplicate invariant)."""
+        buf = SessionBuffer(
+            session_dir=tmp_path / "sessions",
+            state_dir=tmp_path / "state",
+            idle_timeout_minutes=10,
+        )
+        cap_words = _TRANSCRIPT_MAX_TOKENS / MEASURED_TOKENS_PER_WORD
+
+        # Well inside the cap: a handful of short turns.
+        for i in range(3):
+            buf.append("conv-inside", "user", f"short turn {i}")
+        assert len(buf.get_pending()) == 1
+
+        # Well outside the cap: two turns whose combined word count
+        # exceeds cap_words by a comfortable margin (50+ words).
+        turn_words = int(cap_words) + 200
+        buf.append("conv-outside", "user", ("word " * turn_words).strip())
+        buf.append("conv-outside", "user", ("word " * turn_words).strip())
+        assert len(buf.get_pending()) == 3  # 1 (conv-inside) + 2 (conv-outside rotated)
 
 
 # ---------------------------------------------------------------------------

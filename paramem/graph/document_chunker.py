@@ -47,7 +47,14 @@ import pypdf
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
-from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD, estimate_tokens
+from paramem.utils.tokens import (
+    ANONYMIZE_ENVELOPE_TOKENS,
+    ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+    MEASURED_TOKENS_PER_WORD,
+    envelope_derived_cap_tokens,
+    estimate_tokens,
+    words_to_estimator_tokens,
+)
 
 
 class UnsupportedFormatError(ValueError):
@@ -72,135 +79,89 @@ class ScannedPdfRejectedError(ValueError):
 #
 # Derived from the single per-call token envelope
 # (``consolidation.extraction_anonymize_token_envelope``, default 8192 —
-# ``paramem/cloud/anonymize.py``'s ``_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE``),
-# NOT an independent heuristic. A document chunk is consumed by two local
-# calls, in order: session-tier extraction
-# (``configs/prompts/extraction.txt``, the chunk fills its
-# ``{transcript}`` slot — ``paramem/graph/flows.py``'s ``extract_graph``
-# docstring: "document chunks land in the {transcript} slot of the same
-# prompt"), then anonymize on the extracted facts AND the chunk itself
-# (``paramem/graph/stage_anonymize.py`` threads ``ctx.transcript`` — the
-# same chunk text — into ``anonymize(transcript=...)``). The binding call is
-# the second one: its OUTPUT must echo the chunk back as the
-# ``anonymized_transcript`` rewrite, so the chunk's real-token cost is paid
-# TWICE against the SAME envelope (once as transcript input, once as echoed
-# output) PLUS the extracted-facts JSON the same call also carries as input:
+# ``paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS``), NOT an independent
+# heuristic. A document chunk is consumed by two local calls, in order:
+# session-tier extraction (``configs/prompts/extraction.txt``, the chunk
+# fills its ``{transcript}`` slot), then anonymize on the extracted facts
+# AND the chunk itself (``paramem/graph/stage_anonymize.py`` threads
+# ``ctx.transcript`` — the same chunk text — into
+# ``anonymize(transcript=...)``). The binding call is the second one: its
+# OUTPUT must echo the chunk back as the ``anonymized_transcript`` rewrite,
+# so the chunk's real-token cost is paid TWICE against the SAME envelope
+# (once as transcript input, once as echoed output) PLUS the
+# extracted-facts JSON the same call also carries as input — the identity
+# and the estimator-unit rule are stated ONCE, in
+# :func:`~paramem.utils.tokens.envelope_derived_cap_tokens`'s docstring;
+# this comment records only this path's TERMS.
 #
-#     envelope >= anon_template + f*chunk + chunk + (chunk + reserve)
-#     chunk_real_tokens <= (envelope - anon_template - reserve) / (2 + f)
+# Two paragraphs of design rationale that are NOT part of the derivation
+# arithmetic, and must survive any future trim of this comment:
 #
-# ``f`` is the extracted-facts-JSON-to-chunk token ratio — NOT folded into
-# the template term (a prior revision of this derivation approximated it
-# that way and under-budgeted the facts term by ~4x, which let a dense
-# chunk's anonymize call overrun the envelope; carrying ``f`` as its own
-# term is the fix). ``f`` is derived from a repo-recorded measurement, not
-# re-measured here: ``paramem/graph/extractor.py``'s
-# ``_DEFAULT_FILTER_MAX_TOKENS`` comment records "Empirical worst-case
-# observed output for a dense resume chunk was ~2200 tokens" for the local
-# extraction call over the chunker's then-1500-word max. That 2200-token
-# figure is local EXTRACTION's raw
-# output (the triples JSON an extraction call emits for a dense chunk),
-# used here as the anonymize call's "facts" term proxy — the extracted
-# facts an anonymize call renders into ``facts_json`` derive from that same
-# extraction output (allowing for the second-order pass and normalization
-# in between, not separately quantified). ``reserve`` is the anonymize
-# response's fixed JSON-skeleton plus one mapping-entry's overhead
-# (``paramem/cloud/anonymize.py``'s ``_OUTPUT_JSON_ENVELOPE_TOKENS`` = 48,
-# ``_MAPPING_ENTRY_OVERHEAD_TOKENS`` = 10 — recorded here as plain numbers,
-# not imported: this module must stay importable without the cloud package,
-# see the module docstring above).
+# 1. These constants are compiled-in literals, not read from
+#    ``configs/``/yaml at import time: ``configs/prompts/`` is not packaged
+#    (``pyproject.toml``'s ``[tool.setuptools.package-data]`` ships only
+#    ``web/static/*`` and ``training/donor_fixture.json``) and this
+#    module's own docstring above states the CLI must stay portable to a
+#    host that does not have the operator's server-side config/prompts
+#    checked out — an import-time file read here would make ``import
+#    paramem.graph.document_chunker`` (and therefore the CLI) fail outside
+#    a full repo checkout. The literal's honesty is enforced from the
+#    OUTSIDE instead: ``tests/test_document_chunker.py``'s derivation
+#    tests recompute the same formula from the live prompt file on every
+#    run (exact equality, no tolerance band — the formula is
+#    deterministic), so a prompt edit that changes the template's word
+#    count is caught by construction.
+# 2. The cap is stored in the estimator's own unit
+#    (:func:`~paramem.utils.tokens.words_to_estimator_tokens`), never real
+#    tokens — see that function's docstring for why (ratio cancellation at
+#    every runtime ``estimate_tokens(text) <= max_tokens`` comparison).
+#    Pinned by ``tests/test_document_chunker.py``'s
+#    ``TestDocMaxTokensDerivation::test_ratio_cancellation_invariant``.
 #
-# ``anon_template`` is NOT a frozen tokenizer measurement (review
-# follow-up: a fixed "3188 tok, tokenizer-measured" constant here, checked
-# only against a wide word-count TOLERANCE BAND in the test suite, left
-# ~4 tokens of real end-to-end slack that a +2-word template edit could
-# already overrun while the band-check still passed). Instead it is
-# DERIVED from the SAME r_prose ratio every other term in this comment
-# uses, applied to the template's OWN live word count — self-consistent
-# (one ratio, not a mix of an exact-tokenizer snapshot and an estimate),
-# and EXACTLY reproducible from the checked-in prompt file with no
-# tokenizer needed:
-#     anon_template = ceil(words(configs/prompts/anonymization.txt
-#                     rendered empty) * r_prose)
-# ``tests/test_document_chunker.py``'s derivation tests recompute this
-# SAME formula from the live file on every run and use it directly (exact
-# equality — no tolerance band, none needed: the formula is deterministic)
-# — so a prompt edit that changes the template's word count is caught by
-# construction, not by a hand-maintained magic number going stale.
-# ``_DOC_MAX_TOKENS`` below is still a plain recorded literal, NOT computed
-# at import time: ``configs/prompts/`` is not packaged
-# (``pyproject.toml``'s ``[tool.setuptools.package-data]`` ships only
-# ``web/static/*`` and ``training/donor_fixture.json``) and this module's
-# own docstring above states the CLI must stay portable to a host that
-# does not have the operator's server-side config/prompts checked out — an
-# import-time file read here would make `import
-# paramem.graph.document_chunker` (and therefore the CLI) fail outside a
-# full repo checkout.
-#
-# The rejected alternative was to compute this constant (and, upstream,
-# the words->tokens ratio itself) at import time from the live
-# yaml/prompt files, so that no recorded number could ever go stale. It
-# was rejected for the reason just given: a config-free, tokenizer-free
-# import is what makes both this module and
-# ``paramem/utils/tokens.py`` usable from a CLI that has no server-side
-# checkout and no model in memory, and an import-time read trades that
-# property away for staleness protection that a test can provide instead.
-# Hence both are compiled-in literals whose honesty is enforced from the
-# outside: the ratio by a boot-time drift check against its
-# ``consolidation.extraction_token_estimate_ratio`` yaml mirror (config
-# load fails on mismatch), and this cap by the exact-equality derivation
-# test described above, which recomputes the same formula from the live
-# prompt file on every run.
-#
-# Measured with the production tokenizer (Mistral 7B, 2026-07-28) for
-# ``f`` only, and COUNTS ONLY: that measurement runs over real personal
-# records, so nothing but the resulting integers may be written down here
-# or anywhere else tracked — never the measured text, and never the script
-# that reads it (the same rule that keeps ``paramem/utils/tokens.py``'s
-# ratio-measurement script out of this repository). ``f``'s numerator is
-# the repo-recorded extractor.py figure; ``anon_template`` and ``r_prose``
-# need no tokenizer at all, per above:
-#   envelope               = 8192 tok  (the single anonymize-call budget)
-#   anon_template words    = 1535 words (configs/prompts/anonymization.txt,
-#               rendered empty, current file — recomputed live by tests;
-#               shrank from 1684 words 2026-08-02 when the fold-onto-token
-#               speaker-anchor rule + worked example moved out into their
-#               own companion prompt, ``anonymization_speaker_anchor.txt``,
-#               rendered only when a speaker anchor is actually threaded)
-#   r_prose   = 1.9126 tokens/word  (document shape — the same
-#               measurement recorded as tokens.py's "document shape (CV)"
-#               row feeding ``MEASURED_TOKENS_PER_WORD``)
-#   anon_template = ceil(1535 * 1.9126)                          =  2936 tok
-#   reserve   = 48 (json envelope) + 10 (one mapping entry)      =    58 tok
+# Terms (``f`` and ``anon_template`` measured with the production tokenizer,
+# Mistral 7B, 2026-07-28, COUNTS ONLY — that measurement runs over real
+# personal records, so nothing but the resulting integers may be written
+# down here or anywhere else tracked; see ``paramem/utils/tokens.py``'s
+# module docstring for the same privacy rule):
+#   envelope   = paramem.utils.tokens.ANONYMIZE_ENVELOPE_TOKENS   = 8192 tok
+#   reserve    = paramem.utils.tokens.ANONYMIZE_OUTPUT_RESERVE_TOKENS = 58 tok
+#   r_prose    = 1.9126 tokens/word  (document shape — the same measurement
+#                recorded as tokens.py's "document shape (CV)" row)
+#   anon_template words = 1535 words (configs/prompts/anonymization.txt,
+#                rendered empty, current file — recomputed live by tests)
+#   skeleton   = ceil(1535 * 1.9126)                              = 2936 tok
 #   dense_chunk_real_tokens = 1500 words * r_prose (extractor.py's ~1500-word
-#               dense-chunk reference point)                    ~=  2869 tok
-#   f = 2200 (extractor.py's recorded dense-chunk output) / 2869 ~=  0.77
-#   chunk_real_tokens = (8192 - 2936 - 58) / (2 + 0.77)         ~=  1879 tok
-#   cap_words = floor(chunk_real_tokens / r_prose)
-#             = floor(1879 / 1.9126)                              =   982 words
-#
-# ``cap_words`` above is a REAL-token derivation, but the shipped constant
-# is deliberately NOT stored in real tokens — it is re-expressed in the
-# estimator's own unit:
-#     _DOC_MAX_TOKENS = cap_words * MEASURED_TOKENS_PER_WORD = 982 * 3.4 = 3338 tok
-# That is why the MAX ratio (3.4, calibrated on fact JSON) does not shrink
-# the cap even though it over-counts prose by ~1.8x. Every runtime boundary
-# check is ``estimate_tokens(text) <= max_tokens``, i.e.
-# ``words * ratio <= cap_words * ratio``: the ratio appears on BOTH sides
-# and cancels, so the decision reduces to ``chunk_words <= cap_words``
-# whatever the ratio happens to be. Store the cap in real tokens instead
-# and the cancellation is lost — the same 3.4 estimator would then measure
-# a 982-word prose chunk as 3338 "tokens" against an 1879-real-token
-# ceiling and cut documents to roughly half the derived length, and any
-# base-model swap that shifts the ratio would silently move the cap.
-# Pinned by ``tests/test_document_chunker.py``'s
-# ``TestDocMaxTokensDerivation::test_ratio_cancellation_invariant``.
-_DOC_MAX_TOKENS: int = 3338
+#                dense-chunk reference point)                    ~= 2869 tok
+#   f = 2200 (extractor.py's recorded dense-chunk output) / 2869  ~= 0.767
+#       (``extractor.py``'s ``_DEFAULT_FILTER_MAX_TOKENS`` comment records
+#       "Empirical worst-case observed output for a dense resume chunk was
+#       ~2200 tokens" — local EXTRACTION's raw triples-JSON output, used
+#       here as the anonymize call's "facts" term proxy; ``f`` is carried
+#       as its OWN term rather than folded into the template term — a
+#       prior revision that folded it under-budgeted the facts term by
+#       ~4x, letting a dense chunk's anonymize call overrun the envelope)
+_R_PROSE: float = 1.9126
+_ANON_SKELETON_TOKENS: int = 2936  # ceil(1535 words * _R_PROSE)
+_DENSE_CHUNK_WORDS: int = 1500
+_DENSE_CHUNK_OUTPUT_TOKENS: int = 2200
+# UNROUNDED — passing a rounded f (e.g. 0.77) shifts cap_words from 982 to
+# 981 and _DOC_MAX_TOKENS from 3633 to 3629; see the ratio-cancellation
+# comment above for why the estimator-unit re-encoding, not this ratio's
+# precision, is what keeps the runtime comparison exact.
+_F_DOC: float = _DENSE_CHUNK_OUTPUT_TOKENS / (_DENSE_CHUNK_WORDS * _R_PROSE)
+
+_DOC_MAX_TOKENS: int = envelope_derived_cap_tokens(
+    envelope_tokens=ANONYMIZE_ENVELOPE_TOKENS,
+    skeleton_tokens=_ANON_SKELETON_TOKENS,
+    reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
+    facts_ratio=_F_DOC,
+    payload_tokens_per_word=_R_PROSE,
+)  # 982 words -> 3633 estimator tokens
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not
 # derived from the envelope). Real threshold is unchanged from before this
 # migration (200 words — "enough context for extraction"), re-expressed in
-# the estimator's own unit: 200 * MEASURED_TOKENS_PER_WORD = 680.
-_DOC_MIN_TOKENS: int = 680
+# the estimator's own unit via words_to_estimator_tokens.
+_DOC_MIN_TOKENS: int = words_to_estimator_tokens(200)  # 200 words -> 740
 
 
 @dataclass(frozen=True)
@@ -462,13 +423,13 @@ def _overlap_tokens_to_words(overlap_tokens: int) -> int:
 
     The conversion deliberately uses
     :data:`~paramem.utils.tokens.MEASURED_TOKENS_PER_WORD` (the module's
-    uniform fallback ratio, 3.4 — the fact-JSON-calibrated MAX, not
+    uniform fallback ratio, 3.7 — the fact-JSON-calibrated MAX, not
     ``r_prose``), NOT the document-prose ratio ``r_prose`` (1.9126) that
     :data:`_DOC_MAX_TOKENS`'s one-off OFFLINE derivation uses.  Every
     RUNTIME comparison in this module — ``max_tokens``, ``min_tokens``,
     every ``s_count``/``current_count`` via plain
     :func:`~paramem.utils.tokens.estimate_tokens` calls with no tokenizer —
-    is computed in that SAME 3.4-calibrated unit, and this function's
+    is computed in that SAME 3.7-calibrated unit, and this function's
     result feeds directly into that same running ``current_count``.  Using
     ``r_prose`` here would mix units within one comparison (correct against
     a real-token target, inconsistent against every other quantity in the
@@ -477,7 +438,7 @@ def _overlap_tokens_to_words(overlap_tokens: int) -> int:
     denominated in the one estimator unit. The
     practical effect: a caller's ``overlap_tokens=N`` request resolves to
     fewer WORDS than ``N`` divided by the document's true prose ratio would
-    give (``r_prose / MEASURED_TOKENS_PER_WORD`` ≈ 56% of that), i.e. this
+    give (``r_prose / MEASURED_TOKENS_PER_WORD`` ≈ 52% of that), i.e. this
     function is itself conservative about how much text it carries forward
     — consistent with every other conservative bound in this module.  No
     in-repo caller passes ``overlap_tokens > 0`` today (verified by grep);

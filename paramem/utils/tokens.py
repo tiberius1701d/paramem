@@ -57,11 +57,15 @@ logger = logging.getLogger(__name__)
 # Fallback words->tokens ratio. MEASURED ONCE with the production tokenizer
 # (Mistral 7B, mistralai/Mistral-7B-Instruct-v0.3, pinned by
 # tests/fixtures/server.yaml) over the three payload shapes the system
-# actually ingests. Value is the MAX of the three per-shape ratios, rounded
-# up to 1 decimal: the fallback must bound, not average.
-#   transcript shape    : 188 words   / 270 tokens  = 1.44 tokens/word
-#   document shape (CV) : 1534 words  / 2934 tokens = 1.91 tokens/word
-#   fact-JSON shape      : 2415 words / 8191 tokens = 3.39 tokens/word  <- MAX
+# actually ingests. Value is the MAX of the per-shape ratios, rounded up to 1
+# decimal: the fallback must bound, not average.
+#   transcript shape (re-measured 2026-08-03, supersedes the original
+#     188 words / 270 tokens = 1.44 tokens/word measurement, over
+#     conversational session transcript/extraction pairs) : 1.54 tokens/word
+#   document shape (CV)                    : 1534 words / 2934 tokens = 1.91 tokens/word
+#   fact-JSON shape (2026-07-28 measurement)   : 2415 words / 8191 tokens = 3.39 tokens/word
+#   fact-JSON shape (2026-08-03 drift re-measurement of the same shape,
+#     recorded beside the original since both bound it)  : 3.657 tokens/word  <- MAX
 # PUBLIC (no leading underscore): paramem.graph.document_chunker imports
 # this cross-module to keep its own offline-derived _DOC_MAX_TOKENS
 # constant in the SAME estimator unit as this module's runtime fallback:
@@ -71,7 +75,139 @@ logger = logging.getLogger(__name__)
 # while both sides read THIS constant. A private name masked that as an
 # implementation detail when it is in fact a supported cross-module read
 # surface.
-MEASURED_TOKENS_PER_WORD: float = 3.4
+MEASURED_TOKENS_PER_WORD: float = 3.7
+
+# ---------------------------------------------------------------------------
+# Envelope-derived budget primitives — the ONE encoding of
+# "(envelope - skeleton - reserve) / (2 + facts_ratio)" plus the
+# ratio-cancellation unit rule, shared by every caller that must fit a
+# payload (a document chunk, a conversation transcript) inside one
+# anonymize-call token envelope alongside its extracted-facts JSON and its
+# own echoed-back rewrite.  See :func:`envelope_derived_cap_tokens`'s
+# docstring for the identity itself.
+# ---------------------------------------------------------------------------
+
+# Total tokens (prompt + output) one local anonymize() call may occupy.
+# THE single executable home for this literal: paramem.cloud.anonymize's
+# ``_DEFAULT_ANONYMIZER_TOKEN_ENVELOPE`` reads this constant rather than
+# carrying a second copy — document_chunker (which must stay importable
+# without the cloud package) and session_buffer both need the value, so a
+# third recorded literal would have existed without this inversion.
+ANONYMIZE_ENVELOPE_TOKENS: int = 8192
+# The anonymize response's fixed JSON skeleton (48 tokens) plus one
+# mapping-entry's overhead (10 tokens) = 58.  A CHECKED MIRROR of
+# paramem.cloud.anonymize's ``_OUTPUT_JSON_ENVELOPE_TOKENS`` +
+# ``_MAPPING_ENTRY_OVERHEAD_TOKENS`` — not an import, because those two
+# constants are also used independently inside that module and cannot be
+# inverted the way ``ANONYMIZE_ENVELOPE_TOKENS`` was.
+# tests/test_tokens.py pins the two live symbols equal to this value.
+ANONYMIZE_OUTPUT_RESERVE_TOKENS: int = 58
+# Conversation-transcript prose ratio (the session-tier payload shape),
+# measured 2026-08-03 against the production tokenizer over real
+# transcript/extraction pairs (counts only — see the module docstring's
+# privacy rule; the median of 4 pairs, ~7% above the previous 1.44 estimate).
+TRANSCRIPT_TOKENS_PER_WORD: float = 1.54
+# Session-tier anonymize prompt skeleton: the anchor section + system prompt
+# + chat markup, on top of the document path's 2936 (measured 2026-08-03,
+# same derivation shape as document_chunker.py's document-path skeleton).
+SESSION_ANON_SKELETON_TOKENS: int = 3838
+# Extracted-facts-JSON-to-transcript token ratio. Worst case of three
+# measured values (1.19 / 1.53 / 3.15 — min/median/max over the same 4
+# transcript/extraction pairs); the max is shipped because the derived cap
+# must bound the facts term, not average it.
+CONVERSATION_FACTS_RATIO: float = 3.15
+
+
+def words_to_estimator_tokens(
+    words: int,
+    *,
+    tokens_per_word: float = MEASURED_TOKENS_PER_WORD,
+) -> int:
+    """THE word-cap -> estimator-unit encoding (the ratio-cancellation form).
+
+    A cap derived in real tokens is re-expressed in words, then re-encoded
+    in the estimator's own unit via this function, so every runtime
+    boundary check (``estimate_tokens(text) <= cap``) reduces to
+    ``words <= cap_words`` regardless of *tokens_per_word* — the ratio
+    appears on both sides of the comparison and cancels. Storing a cap in
+    real tokens instead loses that cancellation and makes the cap silently
+    move whenever the ratio is re-measured.
+
+    Args:
+        words: Word count to encode. Values ``<= 0`` return ``0``.
+        tokens_per_word: The ratio to encode with. Defaults to
+            :data:`MEASURED_TOKENS_PER_WORD` — the same ratio every
+            production caller's ``estimate_tokens()`` compares against.
+
+    Returns:
+        ``math.floor(words * tokens_per_word)``; ``0`` for ``words <= 0``.
+    """
+    if words <= 0:
+        return 0
+    return math.floor(words * tokens_per_word)
+
+
+def envelope_derived_cap_tokens(
+    *,
+    envelope_tokens: int,
+    skeleton_tokens: int,
+    reserve_tokens: int,
+    facts_ratio: float,
+    payload_tokens_per_word: float,
+    tokens_per_word: float = MEASURED_TOKENS_PER_WORD,
+) -> int:
+    """THE anonymize-envelope budget derivation, in estimator units.
+
+    A payload of ``P`` real tokens sent to one anonymize call costs,
+    against a single envelope: itself as input, its extracted-facts JSON
+    (``facts_ratio * P``), and itself echoed back as the rewritten
+    transcript/chunk — plus the prompt skeleton and the fixed output
+    reserve::
+
+        envelope  >=  skeleton + facts_ratio*P + P + P + reserve
+        P         <=  (envelope - skeleton - reserve) / (2 + facts_ratio)
+        cap_words  =  floor(P / payload_tokens_per_word)
+
+    The result is re-expressed in the estimator's own unit via
+    :func:`words_to_estimator_tokens` — see that function's docstring for
+    why (ratio cancellation at every runtime comparison).
+
+    Args:
+        envelope_tokens: Total (prompt + output) token budget for one
+            anonymize call.
+        skeleton_tokens: Fixed prompt-template token cost (system prompt +
+            chat markup + any anchor section), excluding the payload.
+        reserve_tokens: Fixed output-side reserve (JSON envelope + mapping
+            overhead).
+        facts_ratio: Extracted-facts-JSON-to-payload token ratio for this
+            payload shape.
+        payload_tokens_per_word: The payload shape's own prose ratio (real
+            tokens per word), used only to convert the real-token payload
+            budget into a word count.
+        tokens_per_word: Ratio used to re-encode the word cap into the
+            estimator's unit. Defaults to :data:`MEASURED_TOKENS_PER_WORD`.
+
+    Returns:
+        The cap in the estimator's unit (``words_to_estimator_tokens``
+        output), never real tokens.
+
+    Raises:
+        ValueError: When ``envelope_tokens - skeleton_tokens -
+            reserve_tokens <= 0`` — a mis-measured skeleton or a shrunken
+            envelope leaves no payload budget at all, which is a
+            configuration error, not a legitimate zero-word cap.
+    """
+    available = envelope_tokens - skeleton_tokens - reserve_tokens
+    if available <= 0:
+        raise ValueError(
+            f"envelope_derived_cap_tokens: no payload budget left — "
+            f"envelope_tokens ({envelope_tokens!r}) - skeleton_tokens "
+            f"({skeleton_tokens!r}) - reserve_tokens ({reserve_tokens!r}) "
+            f"= {available!r}, must be > 0"
+        )
+    payload_real_tokens = available / (2 + facts_ratio)
+    cap_words = math.floor(payload_real_tokens / payload_tokens_per_word)
+    return words_to_estimator_tokens(cap_words, tokens_per_word=tokens_per_word)
 
 
 def estimate_tokens(

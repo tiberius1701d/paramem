@@ -342,7 +342,7 @@ class TestAnonymizeTokenEnvelopeAndRatioConfig:
 
         cfg = ConsolidationScheduleConfig()
         assert cfg.extraction_anonymize_token_envelope == 8192
-        assert cfg.extraction_token_estimate_ratio == 3.4
+        assert cfg.extraction_token_estimate_ratio == 3.7
 
     def test_envelope_zero_or_negative_rejected_at_load(self, tmp_path):
         yaml_file = _write_yaml(
@@ -369,6 +369,29 @@ class TestAnonymizeTokenEnvelopeAndRatioConfig:
             load_server_config(yaml_file)
 
 
+class TestInferenceConfigMaxResponseTokens:
+    """``inference.max_response_tokens`` — the ceiling on a locally-generated
+    reply's ``max_new_tokens``."""
+
+    def test_default_is_512(self):
+        from paramem.server.config import InferenceConfig
+
+        assert InferenceConfig().max_response_tokens == 512
+
+    @pytest.mark.parametrize("bad_value", [0, -1])
+    def test_non_positive_rejected_at_construction(self, bad_value):
+        from paramem.server.config import InferenceConfig
+
+        with pytest.raises(ValueError, match="max_response_tokens"):
+            InferenceConfig(max_response_tokens=bad_value)
+
+    def test_loaded_from_fixture_yaml(self):
+        """The fixture config actually threads the yaml key through —
+        ``inference_raw`` is only applied when the block is non-empty."""
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        assert cfg.inference.max_response_tokens == 512
+
+
 class TestRatioIsACheckedMirrorOfTheCodeConstant:
     """``extraction_token_estimate_ratio`` governs
     nothing at runtime — every ``estimate_tokens()`` call site uses the
@@ -379,9 +402,9 @@ class TestRatioIsACheckedMirrorOfTheCodeConstant:
     """
 
     def test_value_matching_the_constant_loads_cleanly(self):
-        """The shipped default (3.4) equals the code constant — no
-        error, matching the pre-existing ``test_defaults`` case but
-        pinned here as the POSITIVE half of the checked-mirror contract."""
+        """The shipped default equals the code constant — no error,
+        matching the pre-existing ``test_defaults`` case but pinned here
+        as the POSITIVE half of the checked-mirror contract."""
         from paramem.server.config import ConsolidationScheduleConfig
         from paramem.utils.tokens import MEASURED_TOKENS_PER_WORD
 

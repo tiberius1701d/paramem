@@ -939,7 +939,7 @@ def test_run_enrollment_turns_chronological_order(tmp_path, monkeypatch):
     """Regression: prior session turns come BEFORE the live turn.
 
     ``all_turns`` previously prepended ``extra_turns`` (the live turn) ahead
-    of ``buffer.get_session_turns()``'s output, inverting chronological order
+    of ``buffer.get_conversation_turns()``'s output, inverting chronological order
     for the LLM name-extractor.  Pins: buffer turns first, the live turn
     last.
     """
@@ -954,7 +954,7 @@ def test_run_enrollment_turns_chronological_order(tmp_path, monkeypatch):
         {"role": "user", "text": "Hi there"},
         {"role": "assistant", "text": "Hello! How can I help?"},
     ]
-    buffer.get_session_turns.return_value = list(prior_turns)
+    buffer.get_conversation_turns.return_value = list(prior_turns)
     fresh["session_buffer"] = buffer
     monkeypatch.setattr(app_module, "_state", fresh)
 
@@ -1214,7 +1214,7 @@ def test_chat_legacy_history_key_accepted_and_ignored(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["text"] == "OK."
     # Discriminating assertion: history threaded to handle_chat comes from
-    # SessionBuffer.get_session_turns (empty for a brand-new conversation
+    # SessionBuffer.get_conversation_turns (empty for a brand-new conversation
     # id), never from the legacy request body — the dropped field's content
     # must never reach the dispatcher.
     mock_handle_chat.assert_called_once()
@@ -1274,7 +1274,7 @@ def test_persist_before_resolve_reply_boundary(tmp_path, monkeypatch):
     assert resp.json()["text"] == "Alice likes hiking."
 
     # Persisted turn: token-space, unresolved — the buffer never sees the name.
-    turns = fresh["session_buffer"].get_session_turns("persist-test-conv")
+    turns = fresh["session_buffer"].get_conversation_turns("persist-test-conv")
     assistant_turns = [t for t in turns if t["role"] == "assistant"]
     assert len(assistant_turns) == 1
     assert assistant_turns[0]["text"] == "speaker0 likes hiking."

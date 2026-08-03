@@ -61,6 +61,7 @@ from paramem.utils.config import (  # noqa: E402
     ConsolidationConfig,
     TrainingConfig,
 )
+from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS  # noqa: E402
 
 logger = logging.getLogger("probe_retroclaim_live")
 
@@ -127,7 +128,7 @@ def run_cpu_claim_mechanism(out_dir: Path) -> dict:
         for role, text, emb in TURNS_CLAIMED:
             buffer.append(conv_id, role, text, embedding=emb)
 
-        pre_turns = buffer.get_session_turns(conv_id)
+        pre_turns = buffer.get_conversation_turns(conv_id)
         results["pre_claim_turns"] = {
             "count": len(pre_turns),
             "user_turns_have_embedding": all(
@@ -149,7 +150,7 @@ def run_cpu_claim_mechanism(out_dir: Path) -> dict:
 
         # 1d. Retro-claim — rewrites orphan turns.
         claimed_count = buffer.claim_sessions_for_speaker(anon_id, "Alice", store)
-        post_turns = buffer.get_session_turns(conv_id)
+        post_turns = buffer.get_conversation_turns(conv_id)
         results["claim_sessions_for_speaker"] = {
             "claimed_count": claimed_count,
             "turns_attributed_to_anon_id": all(t.get("speaker_id") == anon_id for t in post_turns),
@@ -253,6 +254,9 @@ def run_gpu_phases(out_dir: Path) -> dict:
         # probe (enrichment_provider="off"), but ConsolidationLoop's
         # ExtractionPipeline requires a scrub value regardless.
         extraction_scrub=set(SanitizationConfig().scrub),
+        extraction_max_tokens=8192,
+        extraction_plausibility_max_tokens=8192,
+        extraction_anonymize_token_envelope=ANONYMIZE_ENVELOPE_TOKENS,
     )
 
     results: dict = {"phase2": {}, "phase3": {}}
