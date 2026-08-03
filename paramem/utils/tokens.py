@@ -108,9 +108,10 @@ ANONYMIZE_OUTPUT_RESERVE_TOKENS: int = 58
 # privacy rule; the median of 4 pairs, ~7% above the previous 1.44 estimate).
 TRANSCRIPT_TOKENS_PER_WORD: float = 1.54
 # Session-tier anonymize prompt skeleton: the anchor section + system prompt
-# + chat markup, on top of the document path's 2936 (measured 2026-08-03,
-# same derivation shape as document_chunker.py's document-path skeleton).
-SESSION_ANON_SKELETON_TOKENS: int = 3838
+# + chat markup, on top of the document path's 3751 (re-measured 2026-08-03
+# after the anonymization-prompt revision; same derivation shape as
+# document_chunker.py's document-path skeleton).
+SESSION_ANON_SKELETON_TOKENS: int = 4708
 # Extracted-facts-JSON-to-transcript token ratio. Worst case of three
 # measured values (1.19 / 1.53 / 3.15 — min/median/max over the same 4
 # transcript/extraction pairs); the max is shipped because the derived cap

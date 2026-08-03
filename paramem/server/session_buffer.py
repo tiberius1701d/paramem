@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # anonymize-call envelope: once as input, once echoed back as the rewrite,
 # plus its extracted-facts JSON), and paramem.graph.document_chunker's
 # _DOC_MAX_TOKENS for the sibling derivation over the document-ingest path.
-# 541 words -> 2001 estimator tokens (owner ruling, 2026-08-03): the
+# 431 words -> 1594 estimator tokens (owner ruling, 2026-08-03): the
 # CONFIGURED 8192 envelope, worst-case facts ratio, not the live
 # VRAM-clamped envelope (a dense session can still fail anonymize under a
 # tight free-VRAM moment — self-healing incident, not silent loss).

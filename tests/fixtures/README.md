@@ -57,8 +57,9 @@ Editing `tests/fixtures/server.yaml` ripples to every test that loads it.
 ## Other fixtures
 
 * `plausibility_contract.json` — labelled fact set for the plausibility
-  contract test (16 facts derived lexically from the 6 DROP rules + 4 KEEP
-  positives). Calibrated against Mistral 7B.
+  contract test (12 facts: 8 DROP cases derived lexically from four of
+  the six DROP rules — R1/R2/R5/R6, two each — + 4 KEEP positives).
+  Calibrated against Mistral 7B.
 * `provenance_gate_failures.json` — assistant-into-graph hallucination
   cases extracted from the PerLTQA probe (10 of 206 = ~5%).
 * `longmemeval_oracle_*.json` — LongMemEval evaluation samples.

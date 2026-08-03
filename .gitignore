@@ -117,6 +117,9 @@ ingest/
 # Orchestrator-internal working docs (handovers, alignment plans, session logs)
 .agent/
 
+# Timestamped backups of orchestrator-internal memory (may contain personal data)
+.memory.bak-*/
+
 # Internal design plans and follow-up specs (not for public repo)
 docs/
 # Allowlist: anonymized text/markdown fixtures used by chunker + CLI tests.

@@ -222,20 +222,20 @@ class TestWordsToEstimatorTokens:
         ("words", "expected"),
         [
             (200, 740),  # document context floor
-            (982, 3633),  # document-path cap word count
-            (541, 2001),  # conversation-path cap word count
+            (828, 3063),  # document-path cap word count
+            (431, 1594),  # conversation-path cap word count
         ],
     )
     def test_floors_at_shipped_ratio(self, words, expected):
         assert words_to_estimator_tokens(words) == expected
 
-    def test_ceil_would_disagree_with_floor_on_982(self):
+    def test_ceil_would_disagree_with_floor_on_828(self):
         """The reason the convention is floor, not ceil — pins the exact
-        boundary ruling 16's numbers depend on."""
+        boundary the shipped cap numbers depend on."""
         import math
 
-        assert math.ceil(982 * MEASURED_TOKENS_PER_WORD) == 3634
-        assert words_to_estimator_tokens(982) == 3633
+        assert math.ceil(828 * MEASURED_TOKENS_PER_WORD) == 3064
+        assert words_to_estimator_tokens(828) == 3063
 
     @pytest.mark.parametrize("words", [0, -1, -100])
     def test_non_positive_words_returns_zero(self, words):
@@ -263,7 +263,7 @@ class TestEnvelopeDerivedCapTokens:
             payload_tokens_per_word=_R_PROSE,
         )
         assert cap == _DOC_MAX_TOKENS
-        assert round(cap / MEASURED_TOKENS_PER_WORD) == 982
+        assert round(cap / MEASURED_TOKENS_PER_WORD) == 828
 
     def test_conversation_terms_match_transcript_max_tokens(self):
         from paramem.server.session_buffer import _TRANSCRIPT_MAX_TOKENS
@@ -276,13 +276,13 @@ class TestEnvelopeDerivedCapTokens:
             payload_tokens_per_word=TRANSCRIPT_TOKENS_PER_WORD,
         )
         assert cap == _TRANSCRIPT_MAX_TOKENS
-        assert round(cap / MEASURED_TOKENS_PER_WORD) == 541
+        assert round(cap / MEASURED_TOKENS_PER_WORD) == 431
 
         skeleton_and_reserve = SESSION_ANON_SKELETON_TOKENS + ANONYMIZE_OUTPUT_RESERVE_TOKENS
         real_token_payload = (ANONYMIZE_ENVELOPE_TOKENS - skeleton_and_reserve) / (
             2 + CONVERSATION_FACTS_RATIO
         )
-        assert round(real_token_payload) == 834
+        assert round(real_token_payload) == 665
 
     @pytest.mark.parametrize(
         ("shape", "facts_ratio", "payload_ratio"),

@@ -689,11 +689,22 @@ def answer_via_cloud(
             sanitized_history=sanitized_history,
             language=language,
         )
-        # ``sent`` is the current-turn text only at this step — history
-        # turns are anonymized via ``payload.forward`` above, not via a
-        # cloud round trip, so they carry no NEW placeholder tokens to
-        # scope; a scoped-observed deanon of the cloud's response.
-        scope = CloudScope.response(payload, cloud_bindings=None, sent=(payload.anon_transcript,))
+        # ``observed`` means "tokens the provider was actually shown"
+        # (CloudScope.response's docstring, deanonymize.py) — and history
+        # is shown: ``_escalate_to_cloud`` passes ``sanitized_history`` to
+        # ``cloud_agent.call(history=...)``, which providers (e.g.
+        # AnthropicAgent.call) render verbatim into the messages sent to
+        # the provider.  A placeholder that occurs only in a history turn
+        # (e.g. the wrapper-seeded speaker-name entry from
+        # ``paramem.cloud.placeholders``) is therefore observed too; ``sent``
+        # must include every history turn's text alongside the current turn
+        # or such a token is wrongly scoped out and a cloud echo of it blocks
+        # the whole reply.
+        scope = CloudScope.response(
+            payload,
+            cloud_bindings=None,
+            sent=(payload.anon_transcript, *(turn["text"] for turn in sanitized_history)),
+        )
         deanon_text = deanonymize_text(scope, result.text)
         if deanon_text is None:
             # Fail-closed: a declared-but-unobserved placeholder (or

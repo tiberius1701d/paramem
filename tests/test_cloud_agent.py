@@ -1156,6 +1156,109 @@ class TestCloudModePolicy:
             f"Expected the forward-map substitution to apply to history: {sent_history!r}"
         )
 
+    def test_history_only_placeholder_echo_resolves_not_blocks(self):
+        """Regression: a placeholder occurring ONLY in a sanitized history
+        turn (never in the current-turn anon transcript) must still be in
+        ``CloudScope``'s ``observed`` set, because the history IS sent to
+        the provider (``_escalate_to_cloud`` passes ``sanitized_history``
+        to ``cloud_agent.call(history=...)``, which providers render
+        verbatim into the messages).  Before the fix, ``CloudScope.response``
+        was scoped to the current-turn text only (``sent=(payload.anon_transcript,)``),
+        so a cloud echo of a history-only placeholder came back
+        declared-but-unobserved and ``deanonymize_text`` fail-closed the
+        entire reply (returned ``None``) instead of resolving it.  This test
+        does not mock ``deanonymize_text`` — the real production resolution
+        path runs.
+        """
+        from paramem.server.inference import answer_via_cloud
+
+        cloud_agent = self._make_cloud_agent()
+        # The cloud model echoes the placeholder it saw only in history.
+        cloud_agent.call.return_value = CloudResponse(text="Yes, Person_1 called earlier.")
+        config = self._config("anonymize")
+        config.sanitization.scrub = {"person name"}
+
+        payload = self._payload(
+            status="ok",
+            anon_transcript="What's the weather like?",
+            forward={"Alex": "Person_1"},
+            reverse={"Person_1": "Alex"},
+        )
+        # "Alex" appears only in history, never in the current-turn text —
+        # no first-person markers, so it survives the drop gate unchanged
+        # (same setup as test_history_names_are_anonymized_under_anonymize_mode).
+        history = [{"role": "user", "text": "Did Alex call?"}]
+
+        with patch("paramem.graph.flows.anonymize_turn", return_value=payload):
+            result = answer_via_cloud(
+                "What's the weather like?",
+                cloud_agent,
+                config,
+                is_personal=False,
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                speaker_id="spk-test",
+                history=history,
+            )
+
+        assert result is not None, (
+            "Expected the history-only placeholder echo to resolve, not block the entire reply"
+        )
+        assert result.text == "Yes, Alex called earlier."
+
+    def test_unobserved_placeholder_echo_still_blocks(self):
+        """Fail-closed complement of the test above: a DECLARED placeholder
+        that appears in NEITHER the current-turn anon transcript NOR any
+        sanitized history turn must still make ``answer_via_cloud`` return
+        ``None`` when the cloud reply echoes it.
+
+        This pins the fail-closed direction of ``observed`` (the recorded
+        design decision in ``CloudScope.response``'s docstring,
+        ``paramem/cloud/deanonymize.py``): ``observed`` scopes only tokens
+        the provider was actually shown, and an unobserved declared token
+        surviving in the cloud's response must drop the answer rather than
+        resolve it.  Widening ``sent`` beyond what was actually sent to the
+        provider would silently defeat this guard — this test would then
+        fail to reproduce the block and catch that regression.  Real
+        ``CloudScope.response`` + real ``deanonymize_text`` run — nothing
+        mocked past ``anonymize_turn``.
+        """
+        from paramem.server.inference import answer_via_cloud
+
+        cloud_agent = self._make_cloud_agent()
+        # The cloud reply echoes "Person_2" — a placeholder the provider
+        # was never shown (neither in the current turn nor in history).
+        cloud_agent.call.return_value = CloudResponse(text="Yes, Person_2 called too.")
+        config = self._config("anonymize")
+        config.sanitization.scrub = {"person name"}
+
+        payload = self._payload(
+            status="ok",
+            anon_transcript="What's the weather like?",
+            forward={"Alex": "Person_1", "Jordan": "Person_2"},
+            reverse={"Person_1": "Alex", "Person_2": "Jordan"},
+        )
+        # "Alex"/"Person_1" appears in history; "Jordan"/"Person_2" never
+        # appears anywhere sent to the provider — it is declared but not
+        # observed.
+        history = [{"role": "user", "text": "Did Alex call?"}]
+
+        with patch("paramem.graph.flows.anonymize_turn", return_value=payload):
+            result = answer_via_cloud(
+                "What's the weather like?",
+                cloud_agent,
+                config,
+                is_personal=False,
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                speaker_id="spk-test",
+                history=history,
+            )
+
+        assert result is None, (
+            "Expected the unobserved placeholder echo to block the reply, not resolve it"
+        )
+
 
 class TestCannotAnonymizeEgress:
     """``answer_via_cloud`` with ``model``/``tokenizer`` absent.

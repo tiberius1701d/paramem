@@ -7,15 +7,20 @@ is re-tuned; only a live model run can verify that the judge's keep/drop
 decisions still match the ground-truth labels.
 
 This test runs the real local model against a hand-curated fixture
-(tests/fixtures/plausibility_contract.json) of labeled facts derived
-lexically from the six DROP rules. It asserts the judge's keep/drop
-decisions match the ground-truth labels on at least 75% of facts — the
-measured baseline for Mistral 7B at temperature 0 against this fixture.
+(tests/fixtures/plausibility_contract.json) of 12 labeled facts (4 KEEP
++ 8 DROP) derived lexically from four of the six DROP rules — R1, R2,
+R5, R6, two cases each. R3 has no cases; R4's cases were deliberately
+removed (see the fixture's own ``rationale`` field — the extractor
+provably never emits a conversation-role entity, so an R4 input is not
+producible). It asserts the judge's keep/drop decisions match the
+ground-truth labels on at least 75% of facts — the measured baseline
+for Mistral 7B at temperature 0 against this fixture.
 
-Why 75% and not 90%: on initial calibration Mistral 7B kept 4 facts it
-should have dropped (one each on R1/R5, two on R6) — two of those are
-LITERALLY worked examples in the prompt's few-shot. The KEEP-by-default
-bias appears to override rule-match on edge cases regardless of added
+Why 75% and not 90%: Mistral 7B scores 9/12 against this fixture —
+misses on one R1 case and both R6 cases (the R6 pair has never been
+dropped in any measured run). ceil(12 * 0.75) = 9, so 9/12 is exactly
+the knife-edge measured floor, not headroom. The KEEP-by-default bias
+appears to override rule-match on edge cases regardless of added
 imperative text. Pushing the threshold higher would either require
 switching to a stronger judge (Claude, GPT) or a structural prompt
 rework beyond adding "MUST drop" language. The 75% threshold preserves
@@ -78,7 +83,7 @@ def _fact_key(fact: dict) -> tuple[str, str, str]:
 
 
 def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
-    """Live local judge matches >= 90% of ground-truth keep/drop labels."""
+    """Live local judge matches >= 75% of ground-truth keep/drop labels."""
     from paramem.graph.extractor import judge_plausibility
 
     model, tokenizer = loaded_model
@@ -92,18 +97,15 @@ def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
         for f in labeled_facts
     ]
 
-    # Mirror production: the judge always runs inside ExtractionPipeline's
-    # ``disable_adapter()`` context (extraction_pipeline.py:262-263) — the base
-    # model judges, never a personal adapter. Replicate that here so the result
-    # is not contaminated by adapters that earlier shared-model tests left loaded.
-    from peft import PeftModel
+    # Mirror the production boundary (extraction_pipeline.py wraps every
+    # extractor/judge call in base_model_inference): the judge must run on
+    # the base model, never a personal adapter, so the result is not
+    # contaminated by adapters that earlier shared-model tests left loaded.
+    from paramem.models.loader import base_model_inference
 
-    if isinstance(model, PeftModel):
-        with model.disable_adapter():
-            survivors, _raw = judge_plausibility(judge_input, transcript, model, tokenizer)
-    else:
-        survivors, _raw = judge_plausibility(judge_input, transcript, model, tokenizer)
-    assert survivors is not None, "Judge returned None (parse failure) — check raw output"
+    with base_model_inference(model):
+        survivors, raw = judge_plausibility(judge_input, transcript, model, tokenizer)
+    assert survivors is not None, f"Judge returned None (parse failure). Raw output: {raw!r}"
 
     survivor_keys = {_fact_key(f) for f in survivors}
 

@@ -75,6 +75,20 @@ pytestmark = [
 # re-verified number.
 # Re-run scripts/dev/calibrate_cloud_anonymizer.py after any change to
 # extractor.py, the default scope, or the anonymization prompt.
+#
+# 2026-08-03 anonymization-prompt revision: per-fixture forward maps and
+# round trips were measured live against these exact fixture transcripts
+# (Mistral 7B, temperature 0) before the prompt files shipped. The 0.80
+# floor is retained as a conservative floor rather than raised to the
+# observed rate.
+#
+# Caution: three of the prompt's own few-shot examples share sentence
+# frames with fixture entries above -- "my friend, ... moved ... for a
+# new job" (anonymization_speaker_anchor.txt), "check with X tomorrow
+# about the Y deadline" (anonymization.txt), and the dog/workshop nouns
+# (anonymization.txt). A per-fixture pass on those entries partly measures
+# few-shot proximity, not pure generalization -- do not over-read the
+# pass rate as a generalization guarantee.
 _MATCH_THRESHOLD = 0.80
 
 
@@ -256,12 +270,13 @@ def _normalise(text: str) -> str:
 def test_cloud_anonymizer_contract(loaded_model):
     """Real-LLM contract: leak-guard correctness + round-trip integrity.
 
-    Each query in the fixture is run through ``anonymize_outbound``.
+    Each query in the fixture is run through ``anonymize_turn``.
     Per-query contract (when the call is not a genuine block —
     ``anon_text`` non-empty; ``mapping`` may legitimately be empty):
       1. No real name in mapping leaks into anon_text (forward leak guard).
-         This is what ``anonymize_outbound`` already enforces — verified
-         here on real LLM output.
+         No production code enforces this invariant post-hoc — the
+         forward-path leak guard was deliberately deleted (fcae4c6); this
+         test IS the enforcement, asserted here directly on real LLM output.
       2. Every expected name appears in ``mapping.keys()`` (coverage) and
          is absent from ``anon_text`` — an empty ``mapping`` proves this
          the hard way: if ``expected_names`` are truly present in the
@@ -444,6 +459,12 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     # cloud's response with placeholders the user sees.
     scope = CloudScope.response(payload, cloud_bindings=None, sent=(anon_text,))
     round_trip = deanonymize_text(scope, anon_text)
+    # The production exit resolves speaker tokens after deanonymize, so the
+    # round-trip contract includes that leg (same as the sibling test above).
+    if round_trip is not None:
+        round_trip = _resolve_speaker_tokens_for_test(
+            round_trip, entry["speaker_id"], entry["speaker_name"]
+        )
     assert round_trip is not None and _normalise(round_trip) == _normalise(transcript), (
         f"[{entry['id']}, scrub=person_name+city] Round-trip mismatch:\n"
         f"  original:   {transcript!r}\n"

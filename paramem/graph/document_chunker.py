@@ -127,9 +127,9 @@ class ScannedPdfRejectedError(ValueError):
 #   reserve    = paramem.utils.tokens.ANONYMIZE_OUTPUT_RESERVE_TOKENS = 58 tok
 #   r_prose    = 1.9126 tokens/word  (document shape — the same measurement
 #                recorded as tokens.py's "document shape (CV)" row)
-#   anon_template words = 1535 words (configs/prompts/anonymization.txt,
+#   anon_template words = 1961 words (configs/prompts/anonymization.txt,
 #                rendered empty, current file — recomputed live by tests)
-#   skeleton   = ceil(1535 * 1.9126)                              = 2936 tok
+#   skeleton   = ceil(1961 * 1.9126)                              = 3751 tok
 #   dense_chunk_real_tokens = 1500 words * r_prose (extractor.py's ~1500-word
 #                dense-chunk reference point)                    ~= 2869 tok
 #   f = 2200 (extractor.py's recorded dense-chunk output) / 2869  ~= 0.767
@@ -141,11 +141,11 @@ class ScannedPdfRejectedError(ValueError):
 #       prior revision that folded it under-budgeted the facts term by
 #       ~4x, letting a dense chunk's anonymize call overrun the envelope)
 _R_PROSE: float = 1.9126
-_ANON_SKELETON_TOKENS: int = 2936  # ceil(1535 words * _R_PROSE)
+_ANON_SKELETON_TOKENS: int = 3751  # ceil(1961 words * _R_PROSE)
 _DENSE_CHUNK_WORDS: int = 1500
 _DENSE_CHUNK_OUTPUT_TOKENS: int = 2200
-# UNROUNDED — passing a rounded f (e.g. 0.77) shifts cap_words from 982 to
-# 981 and _DOC_MAX_TOKENS from 3633 to 3629; see the ratio-cancellation
+# UNROUNDED — passing a rounded f (e.g. 0.77) shifts cap_words from 828 to
+# 827 and _DOC_MAX_TOKENS from 3063 to 3059; see the ratio-cancellation
 # comment above for why the estimator-unit re-encoding, not this ratio's
 # precision, is what keeps the runtime comparison exact.
 _F_DOC: float = _DENSE_CHUNK_OUTPUT_TOKENS / (_DENSE_CHUNK_WORDS * _R_PROSE)
@@ -156,7 +156,7 @@ _DOC_MAX_TOKENS: int = envelope_derived_cap_tokens(
     reserve_tokens=ANONYMIZE_OUTPUT_RESERVE_TOKENS,
     facts_ratio=_F_DOC,
     payload_tokens_per_word=_R_PROSE,
-)  # 982 words -> 3633 estimator tokens
+)  # 828 words -> 3063 estimator tokens
 # Context floor, not a budget (unlike _DOC_MAX_TOKENS above, this is not
 # derived from the envelope). Real threshold is unchanged from before this
 # migration (200 words — "enough context for extraction"), re-expressed in
