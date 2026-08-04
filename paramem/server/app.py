@@ -696,7 +696,7 @@ class InterimDiscardResponse(BaseModel):
     ----------
     status:
         ``"discarded"`` when the ring was non-empty and was destroyed;
-        ``"noop_no_interim_slots"`` when there was nothing to discard.
+        ``"noop_empty_ring"`` when there was nothing to discard.
     discarded_tiers:
         Interim tier names (``episodic_interim_<stamp>``) dropped from the
         :class:`~paramem.memory.store.MemoryStore`.
@@ -7853,9 +7853,12 @@ async def interim_discard(request: InterimDiscardRequest):
        full-fold absorb path, which this operation deliberately bypasses.
     5. Pop any ``adapter_manifest_status`` rows for the discarded names.
     6. Record the outcome via :func:`~paramem.server.run_status.record_last_run`
-       (``op_type="consolidation"``, ``outcome="interim_discarded"``).
-    7. Reload ``_state["router"]`` so the speaker→key index drops the
-       discarded keys.
+       (``op_type="consolidation"``, ``outcome="interim_discarded"``) —
+       best-effort; a write failure is logged, not raised, matching every
+       other finalizer (e.g. ``_finalize_interim``).
+    7. Stamp ``_state["last_consolidation"]`` (on the event loop, inside the
+       no-await tail) and reload ``_state["router"]`` so the speaker→key
+       index drops the discarded keys.
 
     Not touched, by design: pending sessions in the ``SessionBuffer`` (never
     in a slot; absorbed by the next fold), main-tier registries/weights,
@@ -7900,7 +7903,7 @@ async def interim_discard(request: InterimDiscardRequest):
     inv = _interim_discard_inventory(loop, config)
     if inv["empty"]:
         return InterimDiscardResponse(
-            status="noop_no_interim_slots",
+            status="noop_empty_ring",
             discarded_tiers=[],
             unloaded_adapters=[],
             removed_dirs=[],
@@ -7976,21 +7979,27 @@ async def interim_discard(request: InterimDiscardRequest):
         for name in discarded_names:
             manifest_status.pop(name, None)
         # Step 6 — operator-visible run record; a stale prior-fold row would
-        # otherwise misdescribe the post-discard state of memory.
-        record_last_run(
-            state_dir,
-            op_type="consolidation",
-            outcome="interim_discarded",
-            summary=(
-                f"Interim ring discarded: {len(inv['store_tiers'])} tier(s), "
-                f"{sum(inv['active_keys'].values())} active key(s)"
-            ),
-            detail={
-                "discarded_tiers": inv["store_tiers"],
-                "unloaded_adapters": unloaded,
-                "removed_dirs": removed_dirs,
-            },
-        )
+        # otherwise misdescribe the post-discard state of memory.  A
+        # run_status.json write failure must not turn an already-completed
+        # destructive ring drop into an HTTP 500 (matches the six finalizers,
+        # e.g. _finalize_interim).
+        try:
+            record_last_run(
+                state_dir,
+                op_type="consolidation",
+                outcome="interim_discarded",
+                summary=(
+                    f"Interim ring discarded: {len(inv['store_tiers'])} tier(s), "
+                    f"{sum(inv['active_keys'].values())} active key(s)"
+                ),
+                detail={
+                    "discarded_tiers": inv["store_tiers"],
+                    "unloaded_adapters": unloaded,
+                    "removed_dirs": removed_dirs,
+                },
+            )
+        except Exception:
+            logger.exception("Post-discard run-status bookkeeping failed (non-fatal)")
         return unloaded, resolved
 
     _state["consolidating"] = True
@@ -8010,6 +8019,7 @@ async def interim_discard(request: InterimDiscardRequest):
         # consolidation arbitrator, nothing else.  /chat is kept off the PEFT mutation by
         # `gpu_lock` alone (acquired above, held across the executor call).  Adding an await
         # here re-opens both windows at once.
+        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
         _state["router"].reload()
 
         return InterimDiscardResponse(

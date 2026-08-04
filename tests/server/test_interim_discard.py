@@ -10,7 +10,7 @@ Coverage
   no mutation.
 - Happy path: real store tiers + on-disk dirs + PEFT names all reaped;
   main tiers untouched; response counts match the pre-mutation inventory.
-- Empty ring: 200 ``noop_no_interim_slots``, nothing touched.
+- Empty ring: 200 ``noop_empty_ring``, nothing touched.
 - Guard matrix: consolidating / bg training / cloud-only / trial-active all
   409 with the mapped error, no mutation.
 - Operation order: drop_tier -> unload_interim_adapters -> save_key_metadata
@@ -23,14 +23,18 @@ Coverage
   ``outcome="interim_discarded"``.
 - Non-PEFT (simulate) venue: bare object model, PEFT half skipped.
 - Failure path: 500 propagates, ``_state["consolidating"]`` cleared in the
-  ``finally``.
+  ``finally``, ``_state["last_consolidation"]`` left unstamped.
 - ``_state["consolidating"]`` is True for the duration of the mutation.
 - Auth: ``/interim/discard`` carries ``require_admin`` in the real route
   table (also covered by ``tests/server/test_require_admin.py``).
+- ``_state["last_consolidation"]`` stamped on a confirmed discard, left
+  ``None`` on a no-op; a ``record_last_run`` failure is swallowed
+  (logged, not raised) and the stamp/router-reload tail still runs.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -130,6 +134,7 @@ def _make_state(
         "router": router or MagicMock(),
         "adapter_manifest_status": {},
         "session_buffer": session_buffer or MagicMock(),
+        "last_consolidation": None,
     }
 
 
@@ -240,6 +245,13 @@ class TestHappyPath:
         # Router reloaded; consolidating cleared.
         state["router"].reload.assert_called_once_with()
         assert state["consolidating"] is False
+
+        # last_consolidation stamped on the event loop (GET /status must not
+        # show a fresh last_consolidation_result beside a stale timestamp).
+        # Parse (not just isinstance-check) so a malformed non-ISO string
+        # would fail this test rather than pass it.
+        assert state["last_consolidation"] is not None
+        datetime.fromisoformat(state["last_consolidation"])
 
     def test_main_tiers_untouched(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
@@ -358,7 +370,7 @@ class TestEmptyRing:
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["status"] == "noop_no_interim_slots"
+        assert body["status"] == "noop_empty_ring"
         assert body["discarded_tiers"] == []
         assert body["unloaded_adapters"] == []
         assert body["removed_dirs"] == []
@@ -367,6 +379,7 @@ class TestEmptyRing:
         # key_metadata.json was never written.
         assert not cfg.key_metadata_path.exists()
         state["router"].reload.assert_not_called()
+        assert state["last_consolidation"] is None
 
     def test_noop_also_short_circuits_unconfirmed_request(self, tmp_path, monkeypatch):
         """An empty ring returns the noop 200 even without confirm=true — a
@@ -381,7 +394,7 @@ class TestEmptyRing:
         resp = client.post("/interim/discard", json={})
 
         assert resp.status_code == 200
-        assert resp.json()["status"] == "noop_no_interim_slots"
+        assert resp.json()["status"] == "noop_empty_ring"
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +657,9 @@ class TestFailurePath:
 
         assert resp.status_code == 500
         assert state["consolidating"] is False
+        # The executor call raised before the coroutine ever reached the
+        # no-await tail, so the stamp must not have run.
+        assert state["last_consolidation"] is None
 
     def test_consolidating_is_true_during_the_operation(self, tmp_path, monkeypatch):
         cfg = _make_config(tmp_path)
@@ -671,6 +687,41 @@ class TestFailurePath:
         assert resp.status_code == 200, resp.text
         assert observed == [True]
         assert state["consolidating"] is False
+
+    def test_run_status_write_failure_does_not_500(self, tmp_path, monkeypatch):
+        """A ``record_last_run`` failure must not turn an already-completed
+        destructive ring drop into an HTTP 500 — matches the six finalizers
+        (e.g. ``_finalize_interim``), which all wrap the call in
+        ``try/except Exception: logger.exception(...)``.  Pre-fix, this call
+        was the only one of seven writers left unwrapped, so this raise
+        propagated straight through to a 500 despite the mutation having
+        already fully succeeded.
+        """
+        cfg = _make_config(tmp_path)
+        store = MemoryStore(replay_enabled=True)
+        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
+        model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
+        loop = _make_loop(store, model)
+        state = _make_state(tmp_path, loop=loop, config=cfg)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("run_status.json write failed")
+
+        monkeypatch.setattr(app_module, "record_last_run", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/interim/discard", json={"confirm": True})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "discarded"
+        assert state["consolidating"] is False
+        # The mutation still happened despite the bookkeeping failure.
+        assert "episodic_interim_20260801T0000" not in store.tiers_with_registry()
+        # The swallow happens inside _discard_sync (Step 6); the coroutine's
+        # no-await tail (stamp + router.reload) still runs afterward — the
+        # bookkeeping failure must not skip it.
+        assert state["last_consolidation"] is not None
+        datetime.fromisoformat(state["last_consolidation"])
 
 
 # ---------------------------------------------------------------------------

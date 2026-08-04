@@ -291,20 +291,48 @@ def fmt_result(r):
     if not r:
         return "-"
     status = r.get("outcome", "?")
-    # sessions/episodic_qa/procedural_rels/total_keys/jobs are written inside
+    # sessions/episodic_rels/procedural_rels/total_keys/adapter/tiers_rebuilt/
+    # discarded_tiers/unloaded_adapters/removed_dirs are written inside
     # RunRecord.detail (see paramem/server/run_status.py::RunRecord.to_dict),
     # not at the top level of the record — only op_type/outcome/summary/at/
-    # detail are top-level.
+    # detail are top-level. Writer sites (paramem/server/app.py):
+    # _finalize_simulate ("simulated"), _finalize_interim ("trained"/etc.),
+    # _finalize_no_facts ("no_facts"), _finalize_full
+    # ("full_trained"/"rolled_back"), _finalize_full_status_only
+    # ("aborted"/"noop"), _finalize_migration ("migration_complete"/
+    # "migration_partial"), interim_discard ("interim_discarded").
     detail = r.get("detail") or {}
+    # `or []`/`or 0` throughout: a present-but-None value (not just a missing
+    # key) must degrade the rendered field, not raise — under `set -euo
+    # pipefail` an uncaught TypeError here kills the entire status render,
+    # not just this line.
     if status == "simulated":
         return (
-            f"simulated {detail.get('sessions', 0)}s → "
-            f"{detail.get('episodic_qa', 0)}ep, {detail.get('procedural_rels', 0)}pr"
+            f"simulated {detail.get('sessions') or 0}s → "
+            f"{detail.get('episodic_rels') or 0}rel, {detail.get('procedural_rels') or 0}pr"
         )
     if status == "trained":
-        return f"trained {detail.get('total_keys', 0)} keys ({','.join(detail.get('jobs', [])) or '?'})"
+        adapter = detail.get("adapter") or "?"
+        return (
+            f"trained {detail.get('total_keys') or 0} keys "
+            f"({detail.get('sessions') or 0}s, adapter={adapter})"
+        )
     if status == "no_facts":
-        return f"no facts from {detail.get('sessions', 0)} sessions"
+        return f"no facts from {detail.get('sessions') or 0} sessions"
+    if status in ("full_trained", "rolled_back"):
+        tiers = ",".join(detail.get("tiers_rebuilt") or []) or "-"
+        extra = f", rollback={detail.get('rollback_tier')}" if detail.get("rollback_tier") else ""
+        return (
+            f"{status} {detail.get('total_keys') or 0} keys "
+            f"(tiers={tiers}, drift={detail.get('graph_drift_count') or 0}{extra})"
+        )
+    if status == "interim_discarded":
+        tiers = ",".join(detail.get("discarded_tiers") or []) or "-"
+        return (
+            f"interim_discarded {len(detail.get('discarded_tiers') or [])} tier(s) "
+            f"(tiers={tiers}, adapters={len(detail.get('unloaded_adapters') or [])}, "
+            f"dirs={len(detail.get('removed_dirs') or [])})"
+        )
     return status
 
 def short_model_id(mid):

@@ -1,4 +1,5 @@
-"""Tests for paramem-status.sh Attention block + Migrate footer rendering.
+"""Tests for paramem-status.sh rendering: Attention block, Migrate footer,
+Security footer, and ``fmt_result``'s per-outcome Consol-line rendering.
 
 Strategy: spawn the bash script via subprocess.run with PARAMEM_SERVER_PORT
 overridden to point at a temporary HTTP server serving a hand-crafted
@@ -322,6 +323,156 @@ class TestMigrateFooter:
         # Script must exit 0 and render something without crashing.
         assert result.returncode == 0
         assert "ParaMem Server" in result.stdout
+
+
+class TestConsolResultRendering:
+    """``fmt_result`` must read the REAL writer detail keys (RunRecord.detail
+    as written by ``_finalize_simulate``/``_finalize_interim``/``_finalize_full``
+    in ``paramem/server/app.py``), not stale/never-written key names.
+
+    Each assertion below discriminates the pre-fix script: pre-fix, the
+    ``simulated`` branch read ``detail['episodic_qa']`` (no longer written by
+    any current writer — see b547c73/e4d5587 for its history) and always
+    rendered ``0ep``; the ``trained`` branch read ``detail['jobs']`` (same —
+    no longer written) and always rendered ``(?)``; ``full_trained``/
+    ``rolled_back`` fell through to the bare outcome string with zero detail.
+    """
+
+    def test_simulated_renders_episodic_and_procedural_rel_counts(self):
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "simulated",
+            "summary": "Simulate: 5 episodic, 2 procedural",
+            "detail": {
+                "sessions": 3,
+                "skipped_oom": 0,
+                "episodic_rels": 5,
+                "procedural_rels": 2,
+                "simulated": True,
+            },
+        }
+        result = _run_pstatus(status)
+        assert "simulated 3s" in result.stdout
+        assert "5rel" in result.stdout
+        assert "2pr" in result.stdout
+        # Pre-fix key ("episodic_qa", no longer written) always rendered "0ep" here.
+        assert "0ep" not in result.stdout
+
+    def test_trained_renders_total_keys_sessions_and_adapter(self):
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "trained",
+            "summary": "Interim trained: adapter=episodic_interim_20260801T0000, 120 total keys",
+            "detail": {
+                "sessions": 4,
+                "total_keys": 120,
+                "adapter": "episodic_interim_20260801T0000",
+            },
+        }
+        result = _run_pstatus(status)
+        assert "trained 120 keys" in result.stdout
+        assert "4s" in result.stdout
+        assert "adapter=episodic_interim_20260801T0000" in result.stdout
+        # Pre-fix key ("jobs", no longer written) always rendered "(?)" here.
+        assert "(?)" not in result.stdout
+
+    def test_full_trained_renders_tiers_and_drift_detail(self):
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "full_trained",
+            "summary": "Full cycle full_trained: 550 total keys",
+            "detail": {
+                "tiers_rebuilt": ["episodic", "semantic"],
+                "rollback_tier": None,
+                "graph_drift_count": 3,
+                "total_keys": 550,
+            },
+        }
+        result = _run_pstatus(status)
+        assert "full_trained 550 keys" in result.stdout
+        assert "tiers=episodic,semantic" in result.stdout
+        assert "drift=3" in result.stdout
+
+    def test_rolled_back_renders_rollback_tier(self):
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "rolled_back",
+            "summary": "Full cycle rolled_back: 400 total keys",
+            "detail": {
+                "tiers_rebuilt": ["semantic"],
+                "rollback_tier": "semantic",
+                "graph_drift_count": 1,
+                "total_keys": 400,
+            },
+        }
+        result = _run_pstatus(status)
+        assert "rolled_back 400 keys" in result.stdout
+        assert "rollback=semantic" in result.stdout
+
+    def test_full_trained_tolerates_none_detail_values(self):
+        """A present-but-``None`` ``tiers_rebuilt``/``graph_drift_count``/
+        ``total_keys`` must degrade the rendered line, not crash the whole
+        script — under ``set -euo pipefail`` an uncaught Python ``TypeError``
+        in the embedded parser kills the entire status render, not just the
+        Consol line. Pre-fix, ``",".join(detail.get("tiers_rebuilt", []))``
+        raised ``TypeError: NoneType is not iterable`` on this input; the
+        script exited non-zero and produced no output at all.
+        """
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "full_trained",
+            "summary": "Full cycle full_trained",
+            "detail": {
+                "tiers_rebuilt": None,
+                "rollback_tier": None,
+                "graph_drift_count": None,
+                "total_keys": None,
+            },
+        }
+        result = _run_pstatus(status)
+        assert result.returncode == 0, result.stderr
+        assert "full_trained 0 keys" in result.stdout
+        assert "tiers=-" in result.stdout
+        assert "drift=0" in result.stdout
+
+    def test_interim_discarded_renders_tier_and_adapter_counts(self):
+        """``fmt_result`` must render the discard writer's real keys
+        (``discarded_tiers``/``unloaded_adapters``/``removed_dirs`` —
+        ``interim_discard`` in ``paramem/server/app.py``); pre-fix this
+        outcome fell through to the bare ``interim_discarded`` string with
+        zero detail."""
+        status = dict(_BASE_STATUS)
+        status["consolidating"] = False
+        status["last_consolidation_result"] = {
+            "op_type": "consolidation",
+            "outcome": "interim_discarded",
+            "summary": "Interim ring discarded: 2 tier(s), 3 active key(s)",
+            "detail": {
+                "discarded_tiers": [
+                    "episodic_interim_20260801T0000",
+                    "episodic_interim_20260802T0000",
+                ],
+                "unloaded_adapters": ["episodic_interim_20260801T0000"],
+                "removed_dirs": ["interim_20260801T0000", "interim_20260802T0000"],
+            },
+        }
+        result = _run_pstatus(status)
+        assert "interim_discarded 2 tier(s)" in result.stdout
+        assert (
+            "tiers=episodic_interim_20260801T0000,episodic_interim_20260802T0000" in result.stdout
+        )
+        assert "adapters=1" in result.stdout
+        assert "dirs=2" in result.stdout
 
 
 class TestSecurityFooter:
