@@ -562,7 +562,6 @@ def phase_A(
         model,
         tokenizer,
         "episodic",
-        registry_path=None,
         quads_path=phase_dir / "quads.json",
         key_count=len(keyed),
     )
@@ -657,7 +656,6 @@ def phase_B(
         model,
         tokenizer,
         "episodic",
-        registry_path=None,
         quads_path=phase_dir / "quads.json",
         key_count=len(swap_keyed),
     )
@@ -751,7 +749,6 @@ def phase_C1(
         model,
         tokenizer,
         "journal",
-        registry_path=None,
         quads_path=phase_dir / "quads.json",
         key_count=len(keyed),
     )
@@ -848,7 +845,6 @@ def phase_C2(
         model,
         tokenizer,
         "journal",
-        registry_path=None,
         quads_path=phase_dir / "quads.json",
         key_count=len(fill_keyed),
     )

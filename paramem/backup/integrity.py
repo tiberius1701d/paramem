@@ -543,9 +543,11 @@ def verify_infrastructure_integrity(
     registry_ok_keys: dict[str, list[str]] = {}  # tier -> active_keys list (SERVE)
     registry_known_keys: dict[str, list[str]] = {}  # tier -> known (active∪stale) list
     simhash_ok_keys: dict[str, list[str]] = {}  # tier -> simhash keys list
+    tier_root_by_name: dict[str, Path] = {}  # tier -> resolved slot root (for display labels)
 
     for tier_name, tier_root, tier_kind in tiers_to_check:
         tier_root = Path(tier_root)
+        tier_root_by_name[tier_name] = tier_root
 
         # --- Determine if this tier is "committed" (has any data) ---
         # A partial interim slot (dir present but registry absent) is skipped.
@@ -682,7 +684,10 @@ def verify_infrastructure_integrity(
         # Keys in registry but not in simhash (in-payload self-consistency).
         # Since simhashes and registry keys are now in the same file, this
         # detects an in-file invariant violation rather than cross-file desync.
-        _reg_file = str(adapter_dir / tier_name / "indexed_key_registry.json")
+        # Uses the tier's already-resolved slot root (interim tiers live at
+        # <adapter_dir>/episodic/interim_<stamp>/, not a flat
+        # <adapter_dir>/<tier_name>/ join) — the resolver is not called again.
+        _reg_file = str(tier_root_by_name[tier_name] / "indexed_key_registry.json")
         missing_from_sh = sorted(reg_set - sh_set)
         if missing_from_sh:
             sample = missing_from_sh[:10]

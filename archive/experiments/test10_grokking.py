@@ -1142,7 +1142,6 @@ def run_control_shuffled(
             model,
             tokenizer,
             adapter_name,
-            registry_path=None,
             quads_path=epoch_dir / "quads.json",
             key_count=len(shuffled_pairs),
         )
@@ -1449,7 +1448,6 @@ def run_experiment(
             model,
             tokenizer,
             adapter_name,
-            registry_path=None,
             quads_path=epoch_dir / "quads.json",
             key_count=len(quads),
         )

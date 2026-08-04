@@ -1319,7 +1319,6 @@ def run_seed(
             model,
             tokenizer,
             "episodic",
-            registry_path=None,
             quads_path=phase_a_dir / "quads.json",
             key_count=len(a_keyed),
         )
@@ -1433,7 +1432,6 @@ def run_seed(
                 model,
                 tokenizer,
                 "episodic",
-                registry_path=None,
                 quads_path=phase_b_dir / "quads.json",
                 key_count=len(b_swap_keyed),
             )
@@ -1577,7 +1575,6 @@ def run_seed(
             model,
             tokenizer,
             "journal",
-            registry_path=None,
             quads_path=phase_c1_dir / "quads.json",
             key_count=len(c1_keyed),
         )
@@ -1685,7 +1682,6 @@ def run_seed(
                 model,
                 tokenizer,
                 "journal",
-                registry_path=None,
                 quads_path=phase_c2_dir / "quads.json",
                 key_count=len(c2_fill_keyed),
             )

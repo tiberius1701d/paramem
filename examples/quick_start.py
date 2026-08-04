@@ -65,8 +65,10 @@ Prerequisites
 Automatic cleanup
 -----------------
 ``POST /speaker/forget`` is always called for the test speaker (in a
-``finally`` block), removing its profile and marking its keys stale.  If
-cleanup fails, a warning with the ``speaker_id`` is printed for manual
+``finally`` block), removing its profile and hard-erasing its keys from the
+registry and SimHash map (despite the ``strategy`` field's ``"mark_stale"``
+name, the operation performed is a hard erase, not a soft stale transition).
+If cleanup fails, a warning with the ``speaker_id`` is printed for manual
 recovery.
 
 Base URL

@@ -1193,7 +1193,6 @@ def _build_donor_checkpoint(
         model,
         tokenizer,
         DONOR_BUILD_ADAPTER_NAME,
-        registry_path=None,
         registry_sha256_override="",
         key_count=len(entries),
         adapter_root=checkpoint_root,

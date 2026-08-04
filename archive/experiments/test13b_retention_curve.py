@@ -952,7 +952,6 @@ def main():  # noqa: C901  (complexity acceptable for experiment orchestration)
             model,
             tokenizer,
             adapter_name,
-            registry_path=None,
             quads_path=output_dir / "fill_keyed.json",
             key_count=len(fill_keyed),
         )

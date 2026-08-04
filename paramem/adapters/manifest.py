@@ -410,6 +410,58 @@ def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | 
     return max(candidates, key=_slot_mtime)
 
 
+def tier_registry_sha256(tier_root: Path) -> str:
+    """SHA-256 of ``<tier_root>/indexed_key_registry.json`` plaintext bytes.
+
+    Each main-tier slot and each interim slot's manifest is stamped with
+    that tier's OWN registry hash — passing a single hash across all tiers
+    makes non-primary tiers (and interim slots) unmountable on boot, since
+    ``find_live_slot`` requires an exact match against ``meta.registry_sha256``.
+    Slot matching must therefore always resolve the hash per-tier, using
+    *tier_root* already resolved for that tier (main: ``<adapter_dir>/<tier>/``;
+    interim: ``<adapter_dir>/episodic/interim_<stamp>/`` — see
+    :func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`).
+
+    Absent-check plus delegate: this function itself only distinguishes "no
+    registry file" (``""``) from "a registry file exists" (delegated to
+    :func:`~paramem.backup.hashing.plaintext_sha256`, imported lazily to keep
+    ``paramem.backup`` out of manifest consumers' import graph — there is no
+    import cycle, ``paramem.backup`` does not import this module at module
+    scope; the lazy import is a dependency-direction choice, not a cycle
+    workaround). A read/decrypt failure on an EXISTING file is not the same
+    condition as an absent file and is NOT swallowed here — it propagates to
+    the caller. Callers at a boot boundary that must degrade rather than fail
+    the boot (e.g. ``app.py``'s startup mount/revalidate paths) catch locally
+    there and log the distinction; the ``POST /speaker/forget`` handler
+    deliberately does not catch, because its pre-erase hash read happens
+    before any mutation and a decrypt failure there is safe to surface as a
+    request error rather than silently misdiagnosed as "no live slot found".
+
+    Args:
+        tier_root: Resolved tier root directory holding
+            ``indexed_key_registry.json`` at its root.
+
+    Returns:
+        SHA-256 hex digest of the plaintext registry bytes, or ``""`` when
+        the registry file does not exist.
+
+    Raises:
+        RuntimeError: The file exists, carries an age envelope, and the
+            daily identity is not loaded (see
+            :func:`~paramem.backup.encryption.read_maybe_encrypted`).
+        pyrage.DecryptError: The file exists and is an undecryptable age
+            envelope.
+        OSError: The file exists but cannot otherwise be read.
+    """
+    registry_path = tier_root / "indexed_key_registry.json"
+    if not registry_path.exists():
+        return ""
+
+    from paramem.backup.hashing import plaintext_sha256
+
+    return plaintext_sha256(registry_path)
+
+
 def resolve_adapter_slot(base_dir: Path, adapter_name: str, live_hash: str) -> Path | None:
     """Resolve the live adapter slot, handling both pre- and post-migration layouts.
 
@@ -658,7 +710,6 @@ def build_manifest_for(
     tokenizer,
     adapter_name: str,
     *,
-    registry_path: "Path | None",
     key_count: "int | None" = None,
     base_model_hash_cache: "dict | None" = None,
     registry_sha256_override: "str | None" = None,
@@ -696,17 +747,17 @@ def build_manifest_for(
         tokenizer: A HuggingFace tokenizer with ``name_or_path`` and
             ``tokenizer.json``/``backend_tokenizer``.
         adapter_name: Name of the adapter being saved.
-        registry_path: Path to ``indexed_key_registry.json`` on disk, or
-            ``None`` when the registry has not been written yet.  Ignored
-            when *registry_sha256_override* is provided.
         key_count: Number of indexed keys.
         base_model_hash_cache: Optional mutable dict used to cache the
             base-model weight hash.  Caller owns it; pass ``_state`` on the
             server path and a local dict in experiments.
-        registry_sha256_override: When provided, used directly as
-            ``registry_sha256`` instead of reading *registry_path*.  Used
-            by the atomic-save path where bytes are hashed before writing to disk
-            (pre-stamp invariant: manifest records the hash before the file exists).
+        registry_sha256_override: The registry hash to record as
+            ``registry_sha256`` — every production caller computes this via
+            :func:`tier_registry_sha256` (or, on the atomic-save path, by
+            hashing the registry bytes before they are written to disk — the
+            pre-stamp invariant: the manifest records the hash before the
+            file exists). ``None``/absent yields an empty ``registry_sha256``
+            (fresh-install / experiment path, no registry exists yet).
         window_stamp: ``"YYYYMMDDTHHMM"`` cadence-window the slot represents
             (see ``AdapterManifest.window_stamp``).  Empty string when the
             caller cannot determine the window — e.g. ad-hoc experiment
@@ -855,25 +906,11 @@ def build_manifest_for(
     )
 
     # --- registry_sha256 ---
-    # Hash the PLAINTEXT content, not the on-disk bytes. age re-encrypts with a
-    # fresh content key on every write, so a ciphertext-based hash would change
-    # on every re-encrypt and break live-slot drift detection.
-    # read_maybe_encrypted unwraps the age envelope when present and returns
-    # the original bytes otherwise.
-    if registry_sha256_override is not None:
-        registry_sha256 = registry_sha256_override
-    elif registry_path is not None and registry_path.exists():
-        try:
-            from paramem.backup.encryption import read_maybe_encrypted
-
-            registry_sha256 = hashlib.sha256(read_maybe_encrypted(registry_path)).hexdigest()
-        except (OSError, Exception) as exc:  # noqa: BLE001
-            logger.warning(
-                "build_manifest_for: could not hash registry at %s: %s", registry_path, exc
-            )
-            registry_sha256 = UNKNOWN
-    else:
-        registry_sha256 = ""
+    # Every production caller supplies registry_sha256_override (computed via
+    # tier_registry_sha256, or pre-hashed on the atomic-save path). Absent it,
+    # the manifest carries an empty hash — the fresh-install / experiment path
+    # where no registry exists yet.
+    registry_sha256 = registry_sha256_override if registry_sha256_override is not None else ""
 
     # --- key_count ---
     resolved_key_count: int | str = key_count if key_count is not None else UNKNOWN

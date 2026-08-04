@@ -560,7 +560,7 @@ class TestLiveSlotManifestReStamp:
         h_old = hashlib.sha256(ep_reg.save_bytes()).hexdigest()
 
         # Persist the pre-erase registry to disk. The handler reads the
-        # PRE-ERASE hash from the ON-DISK file via _compute_tier_registry_sha256
+        # PRE-ERASE hash from the ON-DISK file via tier_registry_sha256
         # (not by re-serialising the in-memory registry — see the root-cause
         # comment at the /speaker/forget call site), so the on-disk bytes must
         # exist and match H_old for find_live_slot to locate the manifest below.
@@ -734,6 +734,13 @@ class TestLiveSlotManifestReStamp:
             first_seen="",
         )
 
+        # Persist the pre-erase registry to disk so the handler's pre-erase hash
+        # (tier_registry_sha256, read from the on-disk file) is non-empty — this
+        # models the already-orphaned-slot case (a prior crash between
+        # registry.save and manifest re-stamp), not an absent registry.
+        registry_path = tmp_path / "adapters" / tier_name / "indexed_key_registry.json"
+        ep_reg.save(registry_path)
+
         # Write a slot with a DIFFERENT registry_sha256 so find_live_slot won't match H_old.
         slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
         slot_dir.mkdir(parents=True)
@@ -765,3 +772,236 @@ class TestLiveSlotManifestReStamp:
         assert any("slot already orphaned" in msg for msg in error_messages), (
             f"Expected orphaned-slot ERROR in logs, got: {error_messages}"
         )
+
+    def test_empty_pre_hash_skips_restamp_and_find_live_slot(self, tmp_path, monkeypatch, caplog):
+        """Tier has in-memory keys but no on-disk registry (pre-erase hash == "").
+
+        Must: return 200, log a WARNING (not ERROR), never consult
+        find_live_slot for this tier, and leave any existing manifest
+        untouched — an unreadable/absent registry must not bind a stray
+        ""-stamped slot.
+        """
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            relation_type="factual",
+            first_seen="",
+        )
+        # Deliberately NOT saved to disk — no indexed_key_registry.json
+        # exists, so tier_registry_sha256 (the pre-erase hash) is "".
+
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path / "adapters"
+        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        # A stray slot dir with a manifest that must be left byte-for-byte
+        # untouched — proves the skip branch never re-stamps anything for
+        # this tier (its registry_sha256 is irrelevant here: find_live_slot
+        # is never even consulted for a "" pre-erase hash).
+        slot_dir = cfg.adapter_dir / tier_name / "20260101-000000"
+        slot_dir.mkdir(parents=True)
+        stray_manifest = _minimal_manifest_for_tier(tier_name, "unrelated" * 8, key_count=0)
+        write_manifest(slot_dir, stray_manifest)
+
+        loop = MagicMock()
+        loop.store = real_store
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        with patch("paramem.adapters.manifest.find_live_slot") as mock_find_live_slot:
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        mock_find_live_slot.assert_not_called()
+
+        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "had no readable pre-erase registry on disk" in msg for msg in warning_messages
+        ), f"Expected empty-pre-hash WARNING in logs, got: {warning_messages}"
+
+        # No manifest touched.
+        assert read_manifest(slot_dir) == stray_manifest
+
+
+# ---------------------------------------------------------------------------
+# Interim-tier arc: registry/manifest paths must use the nested interim
+# layout (adapter_dir/episodic/interim_<stamp>/), not a flat
+# adapter_dir/<tier_name>/ join.
+# ---------------------------------------------------------------------------
+
+
+class TestInterimTierForget:
+    """/speaker/forget on a speaker whose key lives in an interim tier.
+
+    Root cause being tested: a flat ``adapter_dir / tier_name`` join is wrong
+    for interim tier names (``episodic_interim_<stamp>``) — the real root is
+    ``adapter_dir/episodic/interim_<stamp>/`` (resolved by
+    :func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`).  The
+    flat join would mint a stray top-level ``adapter_dir/episodic_interim_<stamp>/``
+    directory (which bricks the next boot via ``detect_legacy_adapter_layout``),
+    never rewrite the interim slot's real registry (the erase reverts on
+    reload), and read the pre-erase hash as ``""`` (the manifest re-stamp
+    then silently fails to rebind the slot).
+    """
+
+    def test_interim_key_erased_durably_and_manifest_restamped(self, tmp_path, monkeypatch):
+        """Erasing an interim-tier key persists to the nested interim root and re-stamps."""
+        from paramem.memory.interim_adapter import (
+            INTERIM_NAME_PREFIX,
+            detect_legacy_adapter_layout,
+        )
+
+        stamp = "20260803T1200"
+        tier_name = f"{INTERIM_NAME_PREFIX}{stamp}"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+
+        # Build a real MemoryStore with a real interim-tier KeyRegistry.
+        real_store = MemoryStore(replay_enabled=True)
+        interim_reg = real_store.registry(tier_name)
+        interim_reg.add(key_to_forget)
+        interim_reg.add(key_to_keep)
+
+        fingerprint = compute_simhash(key_to_forget, "Alice", "lives_in", "Berlin")
+        real_store.put(
+            tier_name,
+            key_to_forget,
+            {"key": key_to_forget, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            simhash=fingerprint,
+        )
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            relation_type="episodic",
+            first_seen="",
+        )
+
+        # The REAL nested interim root: adapter_dir/episodic/interim_<stamp>/.
+        interim_root = adapter_dir / "episodic" / f"interim_{stamp}"
+        h_old = hashlib.sha256(interim_reg.save_bytes()).hexdigest()
+        registry_path = interim_root / "indexed_key_registry.json"
+        interim_reg.save(registry_path)
+
+        # Weight slot subdir, stamped with the pre-erase hash.
+        slot_dir = interim_root / "20260803-120000"
+        slot_dir.mkdir(parents=True)
+        original_manifest = _minimal_manifest_for_tier(tier_name, h_old, key_count=2)
+        write_manifest(slot_dir, original_manifest)
+
+        cfg = MagicMock()
+        cfg.adapter_dir = adapter_dir
+
+        loop = MagicMock()
+        loop.store = real_store
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+
+        # (a) No legacy top-level episodic_interim_* dir was minted, and none
+        # of the ordinary paths (KeyRegistry.save's mkdir(parents=True)) can
+        # have created one either.
+        assert detect_legacy_adapter_layout(adapter_dir) == []
+        assert not (adapter_dir / tier_name).exists()
+
+        # (b) Durable erase: a FRESH on-disk walk (independent of the live
+        # in-memory store) shows the key AND its simhash gone from the real
+        # interim root; the sibling key survives.
+        fresh_registries = MemoryStore.read_registries_from_disk(adapter_dir)
+        assert tier_name in fresh_registries, (
+            f"interim tier {tier_name!r} not found on disk at {interim_root} "
+            f"(registries found: {sorted(fresh_registries)})"
+        )
+        fresh_interim_reg = fresh_registries[tier_name]
+        assert not fresh_interim_reg.knows(key_to_forget)
+        assert not fresh_interim_reg.has_simhash(key_to_forget)
+        assert fresh_interim_reg.knows(key_to_keep)
+
+        # (c) The slot's meta.json registry_sha256 is re-stamped to the
+        # post-erase hash — i.e. it matches the literal on-disk bytes.
+        h_new = hashlib.sha256(registry_path.read_bytes()).hexdigest()
+        manifest_after = read_manifest(slot_dir)
+        assert manifest_after.registry_sha256 == h_new
+        assert find_live_slot(interim_root, h_new) == slot_dir
+        assert find_live_slot(interim_root, h_old) is None
+
+    def test_malformed_interim_tier_name_aborts_before_mutation(self, tmp_path, monkeypatch):
+        """A malformed interim tier name errors BEFORE the store is mutated."""
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+        # "foo" does not parse as an INTERIM_STAMP_FORMAT stamp — a stray
+        # interim tier name the store should never carry, but which
+        # adapter_slot_root_for_name must reject rather than silently
+        # building a bogus path from it.
+        tier_name = f"{INTERIM_NAME_PREFIX}foo"
+        key_to_forget = "graph1"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        malformed_reg = real_store.registry(tier_name)
+        malformed_reg.add(key_to_forget)
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            relation_type="episodic",
+            first_seen="",
+        )
+
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path / "adapters"
+        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        loop = MagicMock()
+        loop.store = real_store
+
+        speaker_store = _make_speaker_store(speaker_id)
+        buffer = _make_buffer(speaker_id, [])
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=speaker_store,
+            buffer=buffer,
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500, resp.text
+
+        # The store must be untouched — the abort happens before
+        # store.discard_keys runs.
+        assert malformed_reg.knows(key_to_forget)
+
+        # Nothing downstream of the erase ran either — the abort happens
+        # before ANY mutation, not just before the registry erase.
+        speaker_store.remove.assert_not_called()
+        buffer.discard_sessions.assert_not_called()

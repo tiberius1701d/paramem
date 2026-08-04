@@ -1004,30 +1004,34 @@ class RollbackResponse(BaseModel):
 # its health, and should it be mounted?"
 
 
-def _compute_tier_registry_sha256(config, tier: str) -> str:
-    """SHA-256 of ``<adapter_dir>/<tier>/indexed_key_registry.json`` plaintext bytes.
+def _tier_registry_sha256_boot_degraded(tier_root: Path, tier_label: str) -> str:
+    """``tier_registry_sha256`` with boot-boundary degrade-on-failure.
 
-    Each main-tier slot's manifest is stamped with that tier's OWN registry
-    hash (see ``commit_tier_slot`` step 2 / I5 ordering for the procedural
-    case).  Slot matching must therefore use the per-tier hash too — passing a
-    single episodic hash across all tiers makes procedural and semantic slots
-    unmountable on boot.
+    ``tier_registry_sha256`` propagates a read/decrypt failure on an
+    EXISTING registry file (it only swallows "file absent" to ``""``).  The
+    three boot-path callers here (startup mount, post-full-cycle revalidate,
+    interim mount) must not crash the server over a single tier's
+    undecryptable/unreadable registry — this wrapper is the one place that
+    degrades such a failure to an empty hash (which resolves downstream to
+    "no live slot matched", an unhealthy-but-surfaced ``manifest_status`` row,
+    not a boot crash) and logs it as an ERROR so the operator sees it.
 
-    Hashes plaintext (after ``read_maybe_encrypted`` decrypt) — see
-    ``manifest.py::build_manifest_for`` for why ciphertext-based hashing breaks
-    drift detection under Security ON.  Empty string when the tier's registry
-    does not exist or cannot be read.
+    Deliberately NOT used by ``POST /speaker/forget``: its pre-erase hash
+    read happens before any store mutation, so a decrypt failure there is
+    safe — and more honest — to surface as a request error than to silently
+    misdiagnose as "no live slot found".
     """
-    registry_path = config.adapter_dir / tier / "indexed_key_registry.json"
-    if not registry_path.exists():
-        return ""
+    from paramem.adapters.manifest import tier_registry_sha256
+
     try:
-        import hashlib as _rhash
-
-        from paramem.backup.encryption import read_maybe_encrypted as _rme
-
-        return _rhash.sha256(_rme(registry_path)).hexdigest()
-    except Exception:  # noqa: BLE001
+        return tier_registry_sha256(tier_root)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "boot: could not hash registry for tier %s at %s: %s — degrading to unmatched",
+            tier_label,
+            tier_root,
+            exc,
+        )
         return ""
 
 
@@ -1093,10 +1097,15 @@ def _validate_main_adapter_slot(
         read_manifest,
     )
     from paramem.backup.backup import sweep_orphan_pending
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
     severity = "red" if _is_primary_adapter(name) else "yellow"
 
-    kind_dir = config.adapter_dir / name
+    # name is always a main-tier name here (episodic/semantic/procedural) —
+    # adapter_slot_root_for_name returns config.adapter_dir / name unchanged
+    # for those; routed through the one resolver for consistency with every
+    # other slot-root computation in this module.
+    kind_dir = adapter_slot_root_for_name(config.adapter_dir, name)
     if kind_dir.exists():
         sweep_orphan_pending(kind_dir)
 
@@ -1203,6 +1212,8 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
     if config is None or model is None or tokenizer is None:
         return
 
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
     manifest_status = state.setdefault("adapter_manifest_status", {})
 
     for name, adapter_cfg in (
@@ -1219,7 +1230,9 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
             model,
             tokenizer,
             config,
-            _compute_tier_registry_sha256(config, name),
+            _tier_registry_sha256_boot_degraded(
+                adapter_slot_root_for_name(config.adapter_dir, name), name
+            ),
             manifest_status,
         )
 
@@ -1272,11 +1285,13 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
 
     from paramem.adapters.manifest import find_live_slot
     from paramem.backup.backup import sweep_orphan_pending
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
     # Per-tier paths live at <adapter_dir>/<tier>/indexed_key_registry.json; each
     # tier's slot manifest is stamped with that tier's own registry hash, so
-    # slot matching is per-tier (see _compute_tier_registry_sha256).
+    # slot matching is per-tier (see tier_registry_sha256 /
+    # _tier_registry_sha256_boot_degraded).
 
     def _load_one(name: str, slot: Path):
         """Mount a single adapter from *slot* onto *model* (mutates nonlocal model).
@@ -1324,7 +1339,9 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             model,
             tokenizer,
             config,
-            _compute_tier_registry_sha256(config, name),
+            _tier_registry_sha256_boot_degraded(
+                adapter_slot_root_for_name(config.adapter_dir, name), name
+            ),
             manifest_status,
         )
         if should_mount and slot is not None:
@@ -1340,18 +1357,9 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         # not the main-episodic ``live_registry_sha256``.  Each interim's
         # ``indexed_key_registry.json`` is the authoritative ledger for that
         # interim's slot; comparing to the main hash always misses when a
-        # full cycle hasn't run yet (the main registry is empty).
-        _interim_registry_path = _interim_path / "indexed_key_registry.json"
-        _interim_hash = ""
-        if _interim_registry_path.exists():
-            import hashlib as _ihash
-
-            from paramem.backup.encryption import read_maybe_encrypted as _irme
-
-            try:
-                _interim_hash = _ihash.sha256(_irme(_interim_registry_path)).hexdigest()
-            except Exception:  # noqa: BLE001
-                _interim_hash = ""
+        # full cycle hasn't run yet (the main registry is empty).  ``_interim_path``
+        # IS the interim tier root (yielded by ``iter_interim_dirs``).
+        _interim_hash = _tier_registry_sha256_boot_degraded(_interim_path, _interim_name)
 
         slot = find_live_slot(_interim_path, _interim_hash)
         if slot is None:
@@ -1374,7 +1382,27 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
                     logger.error("Failed to load interim adapter %s: %s", _interim_name, exc)
                 # Flat layout has no meta.json → default "qa"
             else:
-                logger.warning("Interim adapter %s: no matching slot — skipping", _interim_name)
+                # Simulate mode never creates a timestamped weight slot (only
+                # graph.json) — an interim dir with no meta.json-bearing
+                # subdirectory at all is the expected/benign simulate-mode
+                # shape, not a torn state, so it only warrants a WARNING.
+                # A weight-slot candidate that exists but didn't match the
+                # registry hash (find_live_slot returned None despite one
+                # being present) is the genuinely torn case and stays ERROR.
+                _has_weight_slot_candidate = any(
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and (child / "meta.json").exists()
+                    for child in _interim_path.iterdir()
+                )
+                if _has_weight_slot_candidate:
+                    logger.error("Interim adapter %s: no matching slot — skipping", _interim_name)
+                else:
+                    logger.warning(
+                        "Interim adapter %s: no weight-slot candidates found "
+                        "(simulate mode or not yet trained) — skipping",
+                        _interim_name,
+                    )
             continue
 
         _load_one(_interim_name, slot)
@@ -7365,6 +7393,19 @@ async def speaker_forget(request: SpeakerForgetRequest):
         HTTPException 503: When the consolidation loop is not initialised
             (server not yet ready or in cloud-only mode without a loaded model).
         HTTPException 400: When ``strategy`` is not ``"mark_stale"``.
+        HTTPException 500: When a stale key belongs to a tier whose on-disk
+            slot root cannot be resolved (malformed interim tier name).
+            Raised before ``store.discard_keys`` runs, so the store is left
+            untouched.
+        RuntimeError, pyrage.DecryptError, OSError: Uncaught and surfaced by
+            FastAPI as a bare 500 when a tier's on-disk registry EXISTS but
+            cannot be read/decrypted (age envelope with no daily identity
+            loaded, undecryptable ciphertext, or another read failure) while
+            reading the pre-erase hash (``tier_registry_sha256``). This is
+            read BEFORE ``store.discard_keys`` runs, so the store is left
+            untouched. Deliberately not caught here — see
+            ``tier_registry_sha256``'s docstring for why this boundary
+            propagates instead of degrading.
 
     Note
     ----
@@ -7421,20 +7462,42 @@ async def speaker_forget(request: SpeakerForgetRequest):
     # Remove keys from every per-tier KeyRegistry (in-memory + disk).
     # Also drop their simhash entries so the SimHash gate cannot verify them.
     # Uses store.discard_keys(mode="erase") — the shared helper that preserves
-    # the tier asymmetry: registry over tiers_with_registry(), simhash over the
-    # three main tiers only.  This is a HARD erasure (privacy / right-to-forget);
+    # the tier asymmetry: registry over tiers_with_registry(), simhash over
+    # EVERY tier with a registry, main and interim alike (store.py::discard_keys,
+    # mode="erase" walks tiers_with_registry() unconditionally — there is no
+    # main-only carve-out).  This is a HARD erasure (privacy / right-to-forget);
     # soft-stale is wrong here (the record must be GONE, including the simhash).
     if stale_keys:
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
         # Determine which tiers are affected BEFORE the erase so we know
         # which registry files to persist after.  The erase removes the keys
         # from _active_keys (and _stale); checking membership afterward returns
         # False, making it impossible to detect the tiers post-mutation.
-        _tiers_with_keys: list[str] = []
+        # _tier_root's keys ARE the affected-tier set — no separate list.
+        _tier_root: dict[str, Path] = {}
         _tier_pre_sha: dict[str, str] = {}
         for _tier_name in loop.store.tiers_with_registry():
             _reg = loop.store.registry(_tier_name)
             if any(_reg.knows(k) for k in stale_keys):
-                _tiers_with_keys.append(_tier_name)
+                # Resolve the tier's on-disk slot root BEFORE the erase mutates
+                # RAM. adapter_slot_root_for_name raises ValueError on a
+                # malformed interim tier name — abort here, before any
+                # mutation, so a bad name never leaves the store half-erased
+                # with nothing persisted.
+                try:
+                    _root = adapter_slot_root_for_name(config.adapter_dir, _tier_name)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "status": "malformed_tier_name",
+                            "detail": f"speaker/forget: cannot resolve slot root for "
+                            f"tier {_tier_name!r}: {exc}",
+                        },
+                    ) from exc
+                _tier_root[_tier_name] = _root
                 # Read the PRE-ERASE hash from disk, not from re-serialising the
                 # in-memory registry: the manifest was stamped against whatever
                 # bytes `_save_adapters` last wrote, and only the on-disk file
@@ -7446,14 +7509,14 @@ async def speaker_forget(request: SpeakerForgetRequest):
                 # orphaning the slot (find_live_slot below returns None,
                 # unmountable at next restart) even though nothing on disk
                 # actually changed.
-                _tier_pre_sha[_tier_name] = _compute_tier_registry_sha256(config, _tier_name)
+                _tier_pre_sha[_tier_name] = tier_registry_sha256(_root)
 
         loop.store.discard_keys(stale_keys, mode="erase")
 
         # Persist updated registries for affected tiers.
-        for tier_name in _tiers_with_keys:
+        for tier_name, tier_root in _tier_root.items():
             registry = loop.store.registry(tier_name)
-            tier_reg_path = config.adapter_dir / tier_name / "indexed_key_registry.json"
+            tier_reg_path = tier_root / "indexed_key_registry.json"
             # ORDERING IS LOAD-BEARING: registry.save (durable privacy erase) FIRST,
             # then manifest re-stamp.  A crash between the two leaves the slot in the
             # same recoverable orphan state as today (find_live_slot returns None →
@@ -7485,29 +7548,43 @@ async def speaker_forget(request: SpeakerForgetRequest):
             # FUTURE: if a second out-of-fold registry-mutation caller is added (e.g. a
             # single-fact stale endpoint), extract this block into a shared helper in
             # paramem/adapters/manifest.py.
-            from dataclasses import replace as _replace
-
-            from paramem.adapters.manifest import (
-                find_live_slot as _find_live_slot,
-            )
-            from paramem.adapters.manifest import (
-                read_manifest as _read_manifest,
-            )
-            from paramem.adapters.manifest import (
-                write_manifest as _write_manifest,
-            )
-
-            _h_new = _hashlib.sha256(registry.save_bytes()).hexdigest()
-            _slot = _find_live_slot(config.adapter_dir / tier_name, _tier_pre_sha[tier_name])
-            if _slot is None:
-                logger.error(
-                    "speaker/forget: tier %s live slot for pre-erase hash %s… not found — "
-                    "slot already orphaned; recover via consolidation fold or registry restore",
+            _pre_sha = _tier_pre_sha[tier_name]
+            if _pre_sha == "":
+                # No readable pre-erase registry on disk (absent or corrupt).
+                # An empty hash would otherwise match any stray ""-stamped
+                # slot (the fresh-install convention in find_live_slot) —
+                # binding the re-stamp to the wrong slot is worse than
+                # skipping it, so skip and surface the gap instead.
+                logger.warning(
+                    "speaker/forget: tier %s had no readable pre-erase registry on disk "
+                    "(empty hash) — skipping manifest re-stamp to avoid binding a stray "
+                    '""-stamped slot; recover via consolidation fold or registry restore',
                     tier_name,
-                    _tier_pre_sha[tier_name][:12],
                 )
             else:
-                _write_manifest(_slot, _replace(_read_manifest(_slot), registry_sha256=_h_new))
+                from dataclasses import replace as _replace
+
+                from paramem.adapters.manifest import (
+                    find_live_slot as _find_live_slot,
+                )
+                from paramem.adapters.manifest import (
+                    read_manifest as _read_manifest,
+                )
+                from paramem.adapters.manifest import (
+                    write_manifest as _write_manifest,
+                )
+
+                _h_new = _hashlib.sha256(registry.save_bytes()).hexdigest()
+                _slot = _find_live_slot(tier_root, _pre_sha)
+                if _slot is None:
+                    logger.error(
+                        "speaker/forget: tier %s live slot for pre-erase hash %s… not found — "
+                        "slot already orphaned; recover via consolidation fold or registry restore",
+                        tier_name,
+                        _pre_sha[:12],
+                    )
+                else:
+                    _write_manifest(_slot, _replace(_read_manifest(_slot), registry_sha256=_h_new))
             logger.info(
                 "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
                 tier_name,
@@ -8568,13 +8645,12 @@ async def migration_preview(request: PreviewRequest):
         if registry_path is None:
             registry_path = Path(str(adapter_dir)).parent / "registry" / "key_metadata.json"
         if registry_path.exists():
-            # Hash plaintext content — see manifest.py::build_manifest_for.
-            import hashlib as _rhash
-
-            from paramem.backup.encryption import read_maybe_encrypted as _rme
+            # Hash plaintext content — see manifest.py::tier_registry_sha256
+            # for the plaintext-after-decrypt rationale.
+            from paramem.backup.hashing import plaintext_sha256
 
             try:
-                live_registry_sha256 = _rhash.sha256(_rme(registry_path)).hexdigest()
+                live_registry_sha256 = plaintext_sha256(registry_path)
             except Exception:  # noqa: BLE001
                 live_registry_sha256 = ""
 
@@ -9741,11 +9817,9 @@ async def _run_base_swap_orchestration(
                 if hasattr(config, "paths") and config.paths.data is not None:
                     reg_path = config.paths.key_metadata
                     if reg_path.exists():
-                        import hashlib as _hlib
+                        from paramem.backup.hashing import plaintext_sha256
 
-                        from paramem.backup.encryption import read_maybe_encrypted as _rme
-
-                        live_registry_sha256 = _hlib.sha256(_rme(reg_path)).hexdigest()
+                        live_registry_sha256 = plaintext_sha256(reg_path)
             except Exception:  # noqa: BLE001
                 live_registry_sha256 = ""
 

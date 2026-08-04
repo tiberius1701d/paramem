@@ -1136,7 +1136,6 @@ def build_donor(
             loop.model,
             loop.tokenizer,
             build_name,
-            registry_path=None,
             registry_sha256_override="",
             key_count=len(entries),
             adapter_root=Path(loop.donor_adapter_root),

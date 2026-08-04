@@ -374,7 +374,6 @@ def train_at_scale(model, tokenizer, quads, registry, scale, args, output_dir):
         model,
         tokenizer,
         adapter_name,
-        registry_path=None,
         quads_path=None,
         key_count=scale,
     )

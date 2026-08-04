@@ -4,9 +4,12 @@ Covers:
 - Roundtrip write→read, idempotency, UNKNOWN roundtrip, synthesized field.
 - Read errors: missing file, malformed JSON, missing required field.
 - build_manifest_for: happy path, missing _commit_hash → UNKNOWN,
-  registry_path=None → empty hash,
+  registry_sha256_override absent → empty hash,
   cache avoids recompute, synthesized always False,
-  registry_sha256_override bypasses registry_path.
+  registry_sha256_override used directly.
+- tier_registry_sha256: absent registry → "", present plaintext → sha256,
+  present-but-unreadable → raises (propagates, no swallow), encrypted
+  round-trip → sha256 of plaintext, no daily identity available → raises.
 - atomic_save_adapter: pending→slot promotion, manifest=None omits meta.json,
   PEFT-nested subdir flatten inside pending slot, slot collision bump.
 - find_live_slot: empty/missing dir, match, empty-hash matches empty slots,
@@ -238,17 +241,18 @@ class TestBuildManifestFor:
     def test_happy_path(self, tmp_path: Path) -> None:
         registry = tmp_path / "registry.json"
         registry.write_bytes(b'{"active_keys":[]}')
+        override = hashlib.sha256(b'{"active_keys":[]}').hexdigest()
 
         m = build_manifest_for(
             self._make_model(),
             self._make_tokenizer(),
             "episodic",
-            registry_path=registry,
+            registry_sha256_override=override,
         )
         assert m.schema_version == MANIFEST_SCHEMA_VERSION
         assert m.name == "episodic"
         assert m.synthesized is False
-        assert m.registry_sha256 == hashlib.sha256(b'{"active_keys":[]}').hexdigest()
+        assert m.registry_sha256 == override
         assert m.lora.rank == 8
         assert m.lora.alpha == 16
 
@@ -257,16 +261,14 @@ class TestBuildManifestFor:
             self._make_model(commit=None),
             self._make_tokenizer(),
             "episodic",
-            registry_path=None,
         )
         assert m.base_model.sha == UNKNOWN
 
-    def test_registry_path_none_gives_empty_hash(self, tmp_path: Path) -> None:
+    def test_registry_override_absent_gives_empty_hash(self, tmp_path: Path) -> None:
         m = build_manifest_for(
             self._make_model(),
             self._make_tokenizer(),
             "episodic",
-            registry_path=None,
         )
         assert m.registry_sha256 == ""
 
@@ -287,7 +289,6 @@ class TestBuildManifestFor:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 base_model_hash_cache=cache,
             )
             calls_after_first = mock_resolve.call_count
@@ -296,7 +297,6 @@ class TestBuildManifestFor:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 base_model_hash_cache=cache,
             )
             calls_after_second = mock_resolve.call_count
@@ -310,20 +310,16 @@ class TestBuildManifestFor:
             self._make_model(),
             self._make_tokenizer(),
             "episodic",
-            registry_path=None,
         )
         assert m.synthesized is False
 
-    def test_registry_sha256_override_bypasses_path(self, tmp_path: Path) -> None:
-        registry = tmp_path / "registry.json"
-        registry.write_bytes(b"irrelevant_content")
+    def test_registry_sha256_override_used_directly(self, tmp_path: Path) -> None:
         override = "aabbccddeeff0011"
 
         m = build_manifest_for(
             self._make_model(),
             self._make_tokenizer(),
             "episodic",
-            registry_path=registry,  # should be ignored when override present
             registry_sha256_override=override,
         )
         assert m.registry_sha256 == override
@@ -333,7 +329,6 @@ class TestBuildManifestFor:
             self._make_model(),
             self._make_tokenizer(),
             "episodic",
-            registry_path=None,
             key_count=42,
         )
         assert m.key_count == 42
@@ -361,7 +356,6 @@ class TestBuildManifestFor:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
             )
 
         assert m.base_model.hash != UNKNOWN
@@ -388,13 +382,11 @@ class TestBuildManifestFor:
                 model_a,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
             )
             m_b = build_manifest_for(
                 model_b,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
             )
         assert m_a.base_model.hash == m_b.base_model.hash
         assert m_a.base_model.hash != UNKNOWN
@@ -621,6 +613,149 @@ class TestFindLiveSlot:
     def test_hash_mismatch_returns_none(self, tmp_path: Path) -> None:
         self._write_slot_with_hash(tmp_path, "20260421-000000", "old_hash")
         assert find_live_slot(tmp_path, "new_hash") is None
+
+
+# ---------------------------------------------------------------------------
+# 5b. tier_registry_sha256
+# ---------------------------------------------------------------------------
+
+
+class TestTierRegistrySha256:
+    """The single shared implementation of the per-tier registry hash.
+
+    Contract: absent registry file → ``""``.  A read/decrypt failure on an
+    EXISTING file is NOT swallowed — it propagates (delegated to
+    :func:`~paramem.backup.hashing.plaintext_sha256`).  Boot-boundary callers
+    that want to degrade instead of crashing catch locally
+    (``app.py::_tier_registry_sha256_boot_degraded``); ``/speaker/forget``
+    deliberately does not catch.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_daily_identity_cache(self):
+        """Encrypted-registry tests mint/rotate a daily identity — isolate
+        the module-level cache and env var so they never leak into other
+        tests in this (or any other) file."""
+        import os
+
+        from paramem.backup.key_store import (
+            DAILY_PASSPHRASE_ENV_VAR,
+            _clear_daily_identity_cache,
+        )
+
+        os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
+        _clear_daily_identity_cache()
+        yield
+        os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
+        _clear_daily_identity_cache()
+
+    def _mint_daily_identity(self, tmp_path: Path, monkeypatch, passphrase: str = "pw"):
+        """Mint a daily identity, point module defaults at it, and return it."""
+        from pyrage import x25519
+
+        from paramem.backup.key_store import (
+            DAILY_PASSPHRASE_ENV_VAR,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+            write_recovery_pub_file,
+        )
+
+        daily = mint_daily_identity()
+        recovery = x25519.Identity.generate()
+        daily_path = tmp_path / "daily_key.age"
+        recovery_path = tmp_path / "recovery.pub"
+        write_daily_key_file(wrap_daily_identity(daily, passphrase), daily_path)
+        write_recovery_pub_file(recovery.to_public(), recovery_path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, passphrase)
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", daily_path)
+        monkeypatch.setattr("paramem.backup.key_store.RECOVERY_PUB_PATH_DEFAULT", recovery_path)
+        return daily
+
+    def test_absent_registry_returns_empty_string(self, tmp_path: Path) -> None:
+        """No indexed_key_registry.json under tier_root → ''."""
+        from paramem.adapters.manifest import tier_registry_sha256
+
+        assert tier_registry_sha256(tmp_path / "episodic") == ""
+
+    def test_present_plaintext_registry_returns_sha256(self, tmp_path: Path) -> None:
+        """Present plaintext registry → sha256 hex digest of its bytes."""
+        from paramem.adapters.manifest import tier_registry_sha256
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+        payload = b'{"active_keys": ["graph1"], "stale": {}, "simhash": {}}'
+        (tier_root / "indexed_key_registry.json").write_bytes(payload)
+
+        assert tier_registry_sha256(tier_root) == hashlib.sha256(payload).hexdigest()
+
+    def test_unreadable_registry_raises(self, tmp_path: Path) -> None:
+        """A directory named indexed_key_registry.json (unreadable as bytes) → raises.
+
+        Existing-but-unreadable is NOT the same condition as absent — the
+        contract only swallows "file absent" to "".  A read failure on an
+        existing file propagates (see class docstring).
+        """
+        from paramem.adapters.manifest import tier_registry_sha256
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+        # A directory in place of the expected file — read_bytes raises
+        # IsADirectoryError (an OSError subclass).
+        (tier_root / "indexed_key_registry.json").mkdir()
+
+        with pytest.raises(OSError):
+            tier_registry_sha256(tier_root)
+
+    def test_encrypted_registry_hashes_the_plaintext(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a daily identity loaded, the digest is sha256 of the
+        PLAINTEXT bytes, not the on-disk age ciphertext — pins the
+        load-bearing plaintext-after-decrypt invariant (age re-encrypts with
+        a fresh content key on every write, so a ciphertext-based hash would
+        change on every re-encrypt and break live-slot drift detection).
+        """
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.backup.encryption import AGE_MAGIC, write_infra_bytes
+
+        self._mint_daily_identity(tmp_path, monkeypatch)
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+        registry_path = tier_root / "indexed_key_registry.json"
+        plaintext = b'{"active_keys": ["graph1"], "stale": {}, "simhash": {}}'
+        write_infra_bytes(registry_path, plaintext)
+
+        # Sanity: on-disk bytes really are age-encrypted (proves the digest
+        # below cannot be trivially equal to a raw-bytes hash by accident).
+        on_disk = registry_path.read_bytes()
+        assert on_disk.startswith(AGE_MAGIC), "expected age envelope, got plaintext"
+        assert on_disk != plaintext
+
+        assert tier_registry_sha256(tier_root) == hashlib.sha256(plaintext).hexdigest()
+
+    def test_encrypted_registry_no_identity_available_raises(self, tmp_path: Path) -> None:
+        """An age-encrypted registry with no daily identity loaded → raises.
+
+        Matches the new contract: a decrypt failure on an EXISTING file is
+        not "absent" and must not be misdiagnosed as an empty hash.
+        """
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.backup.encryption import age_encrypt_bytes
+        from paramem.backup.key_store import mint_daily_identity
+
+        # Encrypt to a real recipient, but never load a daily identity in
+        # this process — read_maybe_encrypted must raise RuntimeError.
+        encrypter = mint_daily_identity()
+        ciphertext = age_encrypt_bytes(b'{"active_keys":[]}', [encrypter.to_public()])
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+        (tier_root / "indexed_key_registry.json").write_bytes(ciphertext)
+
+        with pytest.raises(RuntimeError):
+            tier_registry_sha256(tier_root)
 
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +1191,6 @@ class TestBuildManifestForHashPaths:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 adapter_root=tmp_path,
             )
 
@@ -1082,7 +1216,6 @@ class TestBuildManifestForHashPaths:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 adapter_root=tmp_path,
             )
 
@@ -1113,7 +1246,6 @@ class TestBuildManifestForHashPaths:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 adapter_root=tmp_path,
             )
 
@@ -1142,7 +1274,6 @@ class TestBuildManifestForHashPaths:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 adapter_root=tmp_path,
             )
 
@@ -1165,7 +1296,6 @@ class TestBuildManifestForHashPaths:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 adapter_root=tmp_path,
             )
 
@@ -1193,7 +1323,6 @@ class TestBuildManifestForHashPaths:
                 model,
                 self._make_tokenizer(),
                 "episodic",
-                registry_path=None,
                 base_model_hash_cache=cache,
                 adapter_root=tmp_path,
             )

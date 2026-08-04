@@ -155,7 +155,6 @@ def main():
             model,
             tokenizer,
             adapter_name,
-            registry_path=None,
             quads_path=None,
             key_count=len(quads),
         )
@@ -331,7 +330,6 @@ def main():
                 model,
                 tokenizer,
                 adapter_name,
-                registry_path=None,
                 quads_path=None,
                 key_count=len(trained_keys),
             )

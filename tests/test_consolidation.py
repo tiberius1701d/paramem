@@ -1890,7 +1890,6 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
                 model,
                 tokenizer,
                 "episodic",
-                registry_path=None,
                 base_model_hash_cache=cache,
                 adapter_root=adapter_root,
             )

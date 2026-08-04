@@ -27,6 +27,7 @@ from paramem.memory.interim_adapter import (
     INTERIM_NAME_PREFIX,
     create_interim_adapter,
     current_interim_stamp,
+    detect_legacy_adapter_layout,
     interim_dir_for_name,
     interim_stamp_from_name,
     interim_tiers_newest_first,
@@ -1127,3 +1128,56 @@ class TestMainTierBackupScope:
             with main_tier_backup_scope(model, self._configs(), tiers=("episodic",)) as scope:
                 assert scope.model is replacement
                 assert scope.model is not model
+
+
+# ---------------------------------------------------------------------------
+# detect_legacy_adapter_layout
+# ---------------------------------------------------------------------------
+
+
+class TestDetectLegacyAdapterLayout:
+    """Flags top-level ``episodic_interim_<stamp>`` dirs (pre-2026-05-14 layout).
+
+    The boot lifespan refuses to start on a non-empty result — the current
+    code paths scan ``adapter_dir/episodic/interim_*`` (via
+    :func:`iter_interim_dirs`), so a legacy top-level
+    ``adapter_dir/episodic_interim_*`` dir is invisible to them and would
+    silently degrade the server (see ``app.py`` boot lifespan).
+    """
+
+    def test_clean_dir_returns_empty_list(self, tmp_path: Path) -> None:
+        """A clean adapter_dir (no legacy dirs) yields an empty list."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir()
+        (adapter_dir / "episodic").mkdir()
+        assert detect_legacy_adapter_layout(adapter_dir) == []
+
+    def test_legacy_top_level_dirs_returned_sorted(self, tmp_path: Path) -> None:
+        """Top-level episodic_interim_* dirs are returned, sorted."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir()
+        later = adapter_dir / f"{INTERIM_NAME_PREFIX}20260420T0000"
+        earlier = adapter_dir / f"{INTERIM_NAME_PREFIX}20260101T0000"
+        later.mkdir()
+        earlier.mkdir()
+
+        result = detect_legacy_adapter_layout(adapter_dir)
+
+        assert result == sorted([earlier, later])
+
+    def test_non_dir_adapter_dir_returns_empty_list(self, tmp_path: Path) -> None:
+        """adapter_dir that is not a directory (missing, or a file) yields []."""
+        missing = tmp_path / "does_not_exist"
+        assert detect_legacy_adapter_layout(missing) == []
+
+        as_file = tmp_path / "adapters_as_file"
+        as_file.write_text("not a directory")
+        assert detect_legacy_adapter_layout(as_file) == []
+
+    def test_matching_files_not_dirs_are_not_returned(self, tmp_path: Path) -> None:
+        """A file (not a dir) matching the glob pattern is excluded."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir()
+        (adapter_dir / f"{INTERIM_NAME_PREFIX}20260420T0000").write_text("not a directory")
+
+        assert detect_legacy_adapter_layout(adapter_dir) == []

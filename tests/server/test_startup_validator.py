@@ -378,6 +378,60 @@ class TestNoMatchingSlot:
         assert row["severity"] == "red"  # episodic is primary
 
 
+class TestInterimNoMatchingSlotLogLevel:
+    """Interim-mount log level for an unmatched interim dir is structurally
+    gated: WARNING for the benign no-weight-slot-candidate shape (simulate
+    mode never creates a timestamped weight slot), ERROR only when a real
+    weight-slot candidate (a subdir with meta.json) exists but its hash
+    doesn't match — the genuinely torn case.
+    """
+
+    def test_no_weight_slot_candidate_is_warning_not_error(self, tmp_path: Path, caplog) -> None:
+        """Simulate-mode shape (graph.json only, no meta.json anywhere) → WARNING."""
+        import logging
+
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "graph.json").write_text("{}")
+        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        _run(config)
+
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("episodic_interim_20260619T1200" in msg for msg in error_messages), (
+            f"Benign simulate-mode shape must not log ERROR, got: {error_messages}"
+        )
+        assert any("episodic_interim_20260619T1200" in msg for msg in warning_messages), (
+            f"Expected a WARNING naming the interim adapter, got: {warning_messages}"
+        )
+
+    def test_weight_slot_candidate_with_hash_mismatch_is_error(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A real weight-slot candidate (meta.json) whose hash doesn't match → ERROR."""
+        import logging
+
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+        # Real weight-slot candidate whose registry_sha256 will not match the
+        # live (empty) registry's "" hash.
+        _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
+
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        _run(config)
+
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "episodic_interim_20260619T1200" in msg and "no matching slot" in msg
+            for msg in error_messages
+        ), f"Expected an ERROR naming the interim adapter, got: {error_messages}"
+
+
 class TestMultipleRows:
     def test_multiple_adapter_rows_independent(self, tmp_path: Path) -> None:
         config = _make_config(

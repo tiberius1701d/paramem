@@ -1896,7 +1896,6 @@ class ConsolidationLoop:
                 self.model,
                 self.tokenizer,
                 name,
-                registry_path=None,
                 key_count=total_key_count,
                 base_model_hash_cache=fingerprint_cache,
                 registry_sha256_override=_sha,

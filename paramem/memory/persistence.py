@@ -471,7 +471,6 @@ def commit_tier_slot(
                 loop.model,
                 loop.tokenizer,
                 adapter_name,
-                registry_path=None,
                 key_count=len(loop.store.all_active_keys()),
                 base_model_hash_cache=fingerprint_cache,
                 registry_sha256_override=registry_sha256,

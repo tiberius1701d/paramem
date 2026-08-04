@@ -1533,7 +1533,6 @@ def run_cell(
             model,
             tokenizer,
             "episodic",
-            registry_path=None,
             key_count=len(a_keyed),
         )
         save_adapter(model, base_dir / "episodic_adapter", "episodic", manifest=_manifest_a)
@@ -1677,7 +1676,6 @@ def run_cell(
             model,
             tokenizer,
             "episodic",
-            registry_path=None,
             key_count=len(overwrite_swap_keyed),
         )
         save_adapter(model, corrupted_dir / "episodic_adapter", "episodic", manifest=_manifest_c)

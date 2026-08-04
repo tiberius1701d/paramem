@@ -2094,7 +2094,6 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     model,
                     tokenizer,
                     adapter_name_a,
-                    registry_path=None,
                     quads_path=v_dir / "A" / "quads.json",
                     key_count=len(keyed_a),
                 )
@@ -2191,7 +2190,6 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     model,
                     tokenizer,
                     "journal",
-                    registry_path=None,
                     quads_path=v_dir / "B" / "quads.json",
                     key_count=len(scaffold_keyed),
                 )
@@ -2245,7 +2243,6 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     model,
                     tokenizer,
                     "journal",
-                    registry_path=None,
                     quads_path=v_dir / "B" / "quads.json",
                     key_count=len(scaffold_keyed),
                 )
@@ -2379,7 +2376,6 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 model,
                 tokenizer,
                 "journal",
-                registry_path=None,
                 quads_path=c_dir / "quads.json",
                 key_count=len(fill_keyed),
             )
@@ -2513,7 +2509,6 @@ def run_mode_scale(
             model,
             tokenizer,
             "episodic",
-            registry_path=None,
             quads_path=run_dir / "A" / "quads.json",
             key_count=len(keyed_a),
         )
@@ -2567,7 +2562,6 @@ def run_mode_scale(
             model,
             tokenizer,
             "journal",
-            registry_path=None,
             quads_path=run_dir / "B" / "quads.json",
             key_count=len(scaffold_keyed),
         )
@@ -2640,7 +2634,6 @@ def run_mode_scale(
             model,
             tokenizer,
             "journal",
-            registry_path=None,
             quads_path=run_dir / "C" / "quads.json",
             key_count=len(fill_keyed),
         )
@@ -2947,7 +2940,6 @@ def run_mode_multiround(
             model,
             tokenizer,
             "journal",
-            registry_path=None,
             quads_path=round_dir / "swap_keyed.json",
             key_count=len(swap_keyed),
         )
@@ -3003,7 +2995,6 @@ def run_mode_multiround(
                 model,
                 tokenizer,
                 "journal",
-                registry_path=None,
                 quads_path=round_dir / "unchanged_keyed.json",
                 key_count=len(unchanged_keyed),
             )

@@ -71,7 +71,7 @@ def _make_adapter_slot(
         The registry SHA-256 to embed in meta.json.  Must equal
         ``hashlib.sha256(<tier_root>/indexed_key_registry.json bytes).hexdigest()``
         so that ``find_live_slot`` can match this slot against the per-tier
-        hash computed by ``write_bundle._tier_registry_sha256``.
+        hash computed by ``manifest.tier_registry_sha256``.
     adapter_name:
         The adapter name to embed in meta.json.
     weight_bytes:
@@ -128,7 +128,7 @@ def _make_fixtures(
 
     The slot's ``meta.registry_sha256`` is derived from the bytes written to
     ``episodic/indexed_key_registry.json`` so that
-    ``write_bundle._tier_registry_sha256`` and ``find_live_slot`` agree.
+    ``manifest.tier_registry_sha256`` and ``find_live_slot`` agree.
     When ``include_indexed_key_registry=False`` no registry file is written and
     the slot is stamped with ``""`` (the empty-registry sentinel).
 
@@ -156,12 +156,12 @@ def _make_fixtures(
     episodic_dir.mkdir(parents=True)
 
     # Compute the registry_sha256 from the content that will be written so that
-    # write_bundle._tier_registry_sha256(episodic_dir) == slot.meta.registry_sha256.
+    # manifest.tier_registry_sha256(episodic_dir) == slot.meta.registry_sha256.
     indexed_key_content = b'{"keys": {}}'
     if include_indexed_key_registry:
         registry_sha256 = _sha256(indexed_key_content)
     else:
-        # No registry file → _tier_registry_sha256 returns "" → stamp slot with ""
+        # No registry file → tier_registry_sha256 returns "" → stamp slot with ""
         registry_sha256 = ""
 
     _make_adapter_slot(episodic_dir, "20260520-123456", registry_sha256, weight_bytes=weight_bytes)
@@ -209,7 +209,7 @@ def _make_interim_family(
     The caller is responsible for supplying a ``registry_sha256`` that matches
     the bytes written to ``interim_family_dir/indexed_key_registry.json``.  Use
     ``_sha256(<content>)`` on the intended ``indexed_key_registry.json`` content
-    and pass that value here so ``write_bundle._tier_registry_sha256`` and
+    and pass that value here so ``manifest.tier_registry_sha256`` and
     ``find_live_slot`` agree.  When ``include_indexed_key_registry=False``, pass
     ``""`` (the empty-registry sentinel).
 
@@ -452,7 +452,7 @@ class TestWriteBundleHappyPath:
         """bundle manifest records the live_registry_sha256 verbatim."""
         fixtures = _make_fixtures(tmp_path)
         # live_registry_sha256 is stored verbatim in the bundle manifest regardless
-        # of its value; slot resolution uses _tier_registry_sha256 (per-tier content
+        # of its value; slot resolution uses tier_registry_sha256 (per-tier content
         # hash), not this field.  Use the fixture's computed hash so the slot resolves.
         reg_sha = fixtures["registry_sha256"]
         slot = write_bundle(
@@ -586,7 +586,7 @@ class TestInterimSlotCapture:
         base_dir.mkdir(parents=True)
 
         # Episodic dir: NO main slot, only an interim family.
-        # _tier_registry_sha256 hashes interim_family_dir/indexed_key_registry.json;
+        # tier_registry_sha256 hashes interim_family_dir/indexed_key_registry.json;
         # stamp the slot with the same hash so find_live_slot matches.
         interim_content = b'{"keys": {"interim_key": "val"}}'
         interim_hash = _sha256(interim_content)
@@ -953,9 +953,9 @@ class TestMultiAdapterBundle:
         Each adapter manifest entry records its OWN distinct ``registry_sha256``.
         ``find_live_slot`` resolves each slot via its per-tier hash:
 
-        - ``_tier_registry_sha256(episodic_dir)`` == sha256(episodic content A)
+        - ``tier_registry_sha256(episodic_dir)`` == sha256(episodic content A)
           → matches main episodic slot stamped with hash A.
-        - ``_tier_registry_sha256(interim_family_dir)`` == sha256(interim content B)
+        - ``tier_registry_sha256(interim_family_dir)`` == sha256(interim content B)
           → matches interim slot stamped with hash B.
 
         hash A ≠ hash B, proving independent per-tier resolution.
@@ -1019,7 +1019,7 @@ class TestMultiAdapterBundle:
         """indexed_key_registry.json is captured for BOTH procedural main and episodic main.
 
         Each tier has its own ``indexed_key_registry.json`` content (and thus its own
-        per-tier hash), so the slot stamps and ``_tier_registry_sha256`` calls match
+        per-tier hash), so the slot stamps and ``tier_registry_sha256`` calls match
         independently for each tier.
         """
         data_dir = tmp_path / "ha"
@@ -1257,7 +1257,7 @@ class TestFailLoudNoSlot:
 
         The mismatch is created by overwriting ``indexed_key_registry.json`` with
         different content after the fixture slot was stamped.  This causes
-        ``_tier_registry_sha256(episodic_dir)`` to return a hash that does not match
+        ``tier_registry_sha256(episodic_dir)`` to return a hash that does not match
         the slot's ``meta.registry_sha256``, so ``find_live_slot`` returns ``None``.
         """
         fixtures = _make_fixtures(tmp_path)

@@ -468,7 +468,7 @@ The `paramem` management CLI talks to the running server over HTTP (default `htt
 **Backups are self-contained.** Each backup is a single timestamped *bundle* under `data/ha/backups/snapshot/<ts>/` holding everything needed to restore the system's recall:
 
 - `server.yaml` (config)
-- the key registry (`key_metadata.json`) and, per adapter tier, its `indexed_key_registry.json` + `simhash_registry.json` — **without the registries the weights are useless** (you can't enumerate or verify recalled facts)
+- the key registry (`key_metadata.json`) and, per adapter tier, its `indexed_key_registry.json` (SimHash fingerprints live inside this file, not a separate one) — **without the registries the weights are useless** (you can't enumerate or verify recalled facts)
 - each enabled adapter's live slot — `adapter_model.safetensors` + `adapter_config.json` + `meta.json` — resolved the same way the server mounts it (finalized main slot, or the live interim slot when no full cycle has run yet)
 - `speaker_profiles.json` (voice enrollment)
 - a top-level `bundle.meta.json` with the file inventory, per-adapter registry hashes, and the base-model identity
@@ -763,7 +763,7 @@ In one call it: (1) removes the speaker's indexed-memory keys from every per-tie
 
 The `strategy` field is named `"mark_stale"` (the only supported value today; a future `"discard_interim"` strategy is the request field's other extension point), but the operation it performs is a hard **erase**, not a soft stale transition: each key is dropped entirely from its tier's registry (both the active and stale partitions) and its SimHash fingerprint is removed with it — this is **registry-level** erasure, safe to run on a live, serving store. It does **not** trigger retraining, and the key becomes unservable immediately (the SimHash gate can no longer verify it). It does **not**, however, remove the key's contribution from the adapter weights: under warm-init consolidation, a routine fold keeps a resident tier's existing weights rather than retraining it from scratch, so the residual weight encoding is not automatically trimmed by ordinary training cycles. The only door that actually rebuilds a tier's weights from its live keys — trimming what was erased — is an operator-invoked `POST /reconsolidate`. `strategy` is the only request field besides `speaker_id`, defaults to `"mark_stale"`, and is currently the only supported value (any other value returns `400`).
 
-Responses: `200` with the removal report on success; `400` for an unsupported `strategy`; `503` when the consolidation loop is not initialised (server not yet ready, or cloud-only with no loaded model). A `removed_speaker: false` with empty lists means the speaker ID was unknown to the store — the call is idempotent and safe to repeat.
+Responses: `200` with the removal report on success; `400` for an unsupported `strategy`; `503` when the consolidation loop is not initialised (server not yet ready, or cloud-only with no loaded model); `500` when one of the speaker's keys belongs to a malformed interim tier whose on-disk location cannot be resolved, or when a tier's registry exists on disk but cannot be read or decrypted (e.g. Security ON with no daily identity loaded) — either way the request aborts before any key is erased, so the store is left untouched. A `removed_speaker: false` with empty lists means the speaker ID was unknown to the store — the call is idempotent and safe to repeat.
 
 #### Enabling Web Push
 

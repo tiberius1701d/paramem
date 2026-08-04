@@ -654,7 +654,6 @@ def _migrate_tier_simulate_to_train(
             loop.model,
             loop.tokenizer,
             name,
-            registry_path=None,
             key_count=len(entries),
             base_model_hash_cache=fingerprint_cache,
             registry_sha256_override=_reg_sha,

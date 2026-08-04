@@ -31,7 +31,6 @@ No canonicalization is applied.
 
 from __future__ import annotations
 
-import hashlib
 import json as _json
 import logging
 import os
@@ -704,24 +703,7 @@ def write_bundle(
     # manifest.py imports from paramem.backup.encryption (not backup.py), so there
     # is no actual cycle today.  The local import is kept as a guard — the comment
     # documents the intent so future refactors don't move the import without review.
-    from paramem.adapters.manifest import find_live_slot
-
-    def _tier_registry_sha256(tier_root: Path) -> str:
-        """Hash of this tier's ``indexed_key_registry.json`` (decrypted) — the
-        value ``find_live_slot`` matches against each slot's
-        ``meta.registry_sha256``.
-
-        Mirrors the server mount path (``app.py::_compute_tier_registry_sha256``
-        for mains and the per-interim hash at the interim mount): every tier and
-        interim slot is stamped with its OWN registry hash, so a single global
-        ``live_registry_sha256`` cannot resolve all tiers (a full cycle leaves
-        the main registry empty while interims carry their own). Returns ``""``
-        when the registry is absent (matches empty-stamped slots).
-        """
-        reg = tier_root / "indexed_key_registry.json"
-        if not reg.exists():
-            return ""
-        return hashlib.sha256(read_maybe_encrypted(reg)).hexdigest()
+    from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
 
     base_dir = Path(base_dir)
     tier = meta_fields.get("tier", "manual")
@@ -873,7 +855,7 @@ def write_bundle(
     # --- capture main tiers ---
     for adapter_name, adapter_kind_dir in adapter_dirs.items():
         adapter_kind_dir = Path(adapter_kind_dir)
-        main_slot = find_live_slot(adapter_kind_dir, _tier_registry_sha256(adapter_kind_dir))
+        main_slot = find_live_slot(adapter_kind_dir, tier_registry_sha256(adapter_kind_dir))
 
         if main_slot is None:
             if adapter_name == "episodic":
@@ -926,7 +908,7 @@ def write_bundle(
         adapter_base_dir = next(iter(adapter_dirs.values())).parent
 
         for interim_name, interim_dir in iter_interim_dirs(adapter_base_dir):
-            interim_slot = find_live_slot(interim_dir, _tier_registry_sha256(interim_dir))
+            interim_slot = find_live_slot(interim_dir, tier_registry_sha256(interim_dir))
             if interim_slot is None:
                 logger.debug(
                     "write_bundle: no live slot in interim family %s "
