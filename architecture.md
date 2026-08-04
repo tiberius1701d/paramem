@@ -142,7 +142,7 @@ sees only anonymized placeholders. Every stage falls forward — a failure at st
 N keeps the predecessor's output and continues.
 
 1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. The session speaker's stable `speaker{N}` system id is injected as the canonical subject of their facts; the display name is passed as comprehension context only, and a name is substituted for the id only at the reply boundary, when a response is about to be shown or spoken to the user.
-2. **Anonymize** — `configs/prompts/anonymization.txt` for the transcript-bearing session tier and chat egress, `configs/prompts/anonymization_facts.txt` (mapping only, no transcript machinery) for the transcript-free graph tier — via `paramem.cloud.anonymize.anonymize`, the ONE anonymize chain every cloud-bound path composes through: the local model is the sole classifier against the operator-configured `sanitization.scrub` PII-vocabulary hints — no code-side entity-type gate — and returns TWO artifacts: the `{real → placeholder}` mapping and its own rewrite of the transcript with in-scope values placeholdered (`anonymized_transcript`). The chain still builds the anonymized fact array deterministically (one entry per `graph.relations`, `subject`/`object` substituted through the mapping via an edge-aware, case-sensitive `_substitute_whole_words`, `predicate`/`relation_type`/`confidence` copied verbatim — the predicate is never a substitution target), so a fact can never be lost, reworded, or dropped by the anonymizer, and a placeholder can never be glued into a predicate at this stage. The transcript, by contrast, is authored by the model rather than mechanically rebuilt from the mapping: prose classification is context-dependent (a name and a common-word homograph share identical bytes — "Will" vs "Will I?") in a way the case-sensitive fact fields are not, so only the model, holding that context, can rewrite it correctly. A parse failure; a missing/empty `anonymized_transcript` returned over a non-empty input transcript when the model's own mapping named something (the one inconsistent shape that fails closed — an empty/missing rewrite is otherwise legitimate: nothing to rewrite when the input transcript is empty, or when the model's own mapping came back empty, in which case the chain proceeds on the ORIGINAL argument transcript, the same "nothing in scope" verdict already accepted on the facts surface); or (for the graph tier — see below) a call where the model named real content but nothing survived to the final table — fails closed (`AnonymizedContract.status == "failed"`) — callers never fall back to the original real-name transcript on an actual fail-closed verdict. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`) — except the speaker's own `speaker{N}` anchor, which is deliberately exempt (already anonymous, never minted, never re-braced) and can appear as a forward-map value without matching that shape.
+2. **Anonymize** — `configs/prompts/anonymization.txt` for the transcript-bearing session tier and chat egress, `configs/prompts/anonymization_facts.txt` (mapping only, no transcript machinery) for the transcript-free graph tier — via `paramem.cloud.anonymize.anonymize`, the ONE anonymize chain every cloud-bound path composes through: the local model is the sole classifier against the operator-configured `sanitization.scrub` PII-vocabulary hints — no code-side entity-type gate — and returns TWO artifacts: the `{real → placeholder}` mapping and its own rewrite of the transcript with in-scope values placeholdered (`anonymized_transcript`). The chain still builds the anonymized fact array deterministically (one entry per `graph.relations`, `subject`/`object` substituted through the mapping via an edge-aware, case-sensitive `_substitute_whole_words`, `predicate`/`relation_type`/`confidence` copied verbatim — the predicate is never a substitution target), so a fact can never be lost, reworded, or dropped by the anonymizer, and a placeholder can never be glued into a predicate at this stage. The transcript, by contrast, is authored by the model rather than mechanically rebuilt from the mapping: prose classification is context-dependent (a name and a common-word homograph share identical bytes — "Will" vs "Will I?") in a way the case-sensitive fact fields are not, so only the model, holding that context, can rewrite it correctly. A parse failure; a missing/empty `anonymized_transcript` returned over a non-empty input transcript when the model's own mapping named something (the one inconsistent shape that fails closed — an empty/missing rewrite is otherwise legitimate: nothing to rewrite when the input transcript is empty, or when the model's own mapping came back empty, in which case the chain proceeds on the ORIGINAL argument transcript, the same "nothing in scope" verdict already accepted on the facts surface); or (for the graph tier — see below) a call where the model named real content but nothing survived to the final table — fails closed (`AnonymizedContract.status == "failed"`) — callers never fall back to the original real-name transcript on an actual fail-closed verdict. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`) — except the speaker's own `speaker{N}` anchor, which is deliberately exempt (already anonymous, never minted, never re-braced) and can appear as a forward-map value without matching that shape. That fold is conditional, not automatic: it fires only when the `[user]` turn in the transcript contains a self-introduction ("I'm …" / "my name is …" / "call me …"), in which case the anonymizer folds the spoken name — and every coreferring self-naming variant in the same transcript — onto the speaker's own `speaker{N}` anchor as a forward-map value, scrubbing it from the outbound payload while the anchor stays the one stable handle. Absent a self-introduction, every name in the transcript becomes an ordinary `Person_N` placeholder, no matter what any fact claims about it.
 3. **Entity-surface correction** (`configs/prompts/entity_correction.txt`): the local model reviews real entity surfaces on the anonymization reverse map and node attributes and corrects misspelled place/org/concept names; an apply-gate rejects any proposal targeting an entity not already known, and all verdicts — accepted and rejected — are recorded on `graph.diagnostics["entity_correction_verdicts"]` (persisted as a debug artifact when debug is on). Speaker/person nodes are left untouched.
 4. **Cloud enrichment with delta protocol** (`configs/prompts/cloud_enrichment.txt`): cloud returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope). `add`/`modify` entries are restricted to the fields that actually reach a relation (subject/predicate/object/relation_type/confidence/symmetric) — any other key an LLM invents is stripped before the entry enters the pipeline, so it can never later be mistaken for an unresolved placeholder. Rejection is per-action, never whole-delta (2026-07-22 cloud-admission redesign, `_apply_enrichment_delta`): an `add` naming a token neither in the anonymized facts/transcript cloud was shown nor in its own `bindings` (orphan) is dropped; a `modify` whose `fields` would introduce one is discarded and the pre-enrichment fact is kept unchanged instead; `drop` is honored unconditionally. A binding whose key collides with the local map is purely informational (`graph.diagnostics["cloud_binding_collisions"]`) and never a rejection reason — the local value always wins on resolution. Per-cycle counts and the distinct rejected tokens are operator-visible in `graph.diagnostics["cloud_enrichment_report"]` plus a WARNING-level log line.
 5. **De-anonymize** (`_apply_bindings`): the single deanon exit gate, in three ordered steps. First, a **predicate invariant** run BEFORE substitution drops (never repairs) any fact whose `predicate` field contains a token from the declared placeholder vocabulary (the union of the anonymizer's `reverse` map and cloud's `bindings`) — the predicate is never a substitution target, so checking it after substitution would silently miss an already-corrupted predicate. Second, **substitution**: deterministic substring replacement of placeholder tokens with their real values, resolved against an observed-scoped map — the local (real) mapping for tokens cloud was actually shown, cloud's own `bindings` for tokens it minted, with the local mapping always taking precedence on conflict. Third, a **residual sweep** checks every fact field (subject/predicate/object/relation_type/confidence/symmetric — never a non-fact field an LLM invented) against the same declared vocabulary, plus a placeholder-shaped-token regex as a last-resort, fail-closed backstop for an undeclared orphan the vocabulary check can't see; the regex is never load-bearing for resolution or substitution, only for this final net. Both steps are fail-closed (drop, not repair) and both record counters/lists in `graph.diagnostics` (`predicate_placeholder_dropped` / `predicate_placeholder_dropped_facts` for the predicate invariant, written at the deanon stage — a placeholder glued into a predicate can only arrive in cloud's *returned* facts now, since the anonymizer stage never produces facts at all — and `residual_dropped_facts` for the residual sweep) — disjoint categories, never double-counted.
@@ -151,6 +151,8 @@ N keeps the predecessor's output and continues.
 A **fallback path** runs local plausibility on the raw extraction when the primary chain empties out. Per-stage diagnostics record raw outputs, transcript round-trip, and dropped facts for audit.
 
 **No post-hoc leak check between steps 2 and 4** (removed — see SECURITY.md for the residual this leaves and why it was deleted, not weakened). The anonymized FACTS cloud sees are built entirely by the script in step 2 from a table it mints and owns (`_build_anonymization_mapping`), substituted through `_substitute_whole_words` — an exact, case-sensitive primitive; there is nothing left for a post-hoc scan to verify on that surface. The anonymized TRANSCRIPT cloud sees, by contrast, is authored by the model itself in step 2 — a post-hoc scan there would just be re-verifying the model's own classification judgment, which this design deliberately does not do at runtime (see SECURITY.md); that surface is instead verified offline, at the calibration gate. What still needs a runtime check is what cloud sends *back* (step 5), which is a model rewriting content, not a table the script owns.
+
+**Session-tier enrichment-incident arbitration.** A failed local-anonymization pass and a degraded cloud-enrichment pass are reconciled as two distinct operator-visible incidents rather than conflated into one: a failed anonymization raises its own incident and the enrichment call for that session never runs, while a clean or opted-out anonymization pass resolves the anonymize incident and lets the enrichment outcome (if any) govern the enrichment incident on its own. When the operator has cloud egress disabled entirely, neither incident can ever self-heal by running cleanly, so any still-open incident of either kind resolves the next time a session is processed, carrying a recorded reason that distinguishes "resolved by a clean run" from "resolved because cloud is off" — the same story the graph-tier incident below already tells, kept coherent rather than duplicated.
 
 **Second call site — graph-tier enrichment.** The privacy envelope above (steps 2–6) is not session-tier-only. `paramem.training.graph_enrich.enrich_graph`'s post-merge, cross-session cloud pass (`paramem.graph.extractor.request_graph_enrichment`) runs the SAME anonymize → cloud → de-anonymize chain, through `paramem.cloud` (`anonymize.py` / `deanonymize.py`) — the one round-trip contract every cloud-egress path (session-tier extraction, graph-tier enrichment, chat egress, and their calibration harnesses) composes through (`paramem.cloud.placeholders` remains the model-free, IO-free primitive kit `paramem.cloud` is built from), before any subgraph triple leaves the process.
 
@@ -310,6 +312,59 @@ PERSONAL" short-circuit caused imperatives from enrolled speakers
 to misroute into the PA path). The router scopes keys by speaker
 but lets the classifier decide intent.
 
+### AD-23: Reply-Boundary Speaker Resolution and the Speakerless Relay Path
+
+**Identity stays `speaker{N}` everywhere the model operates.**
+Recalled facts, the reasoning context, generated replies,
+persisted turn text, and cloud payloads all carry the raw
+token, never a display name — with the one documented
+exception at AD-16 step 1 (consolidation-time extraction
+receives the display name as comprehension context,
+substituted for the id only at the reply boundary). One
+resolver, `resolve_speaker_tokens`
+(`paramem/server/speaker.py`), owns every token-to-name
+substitution, and it fires only where text is about to be
+shown or spoken to a person — never on text a model will
+read. Four such exits exist: the `/chat` response text, the
+`spoken_text` `POST /voice` both returns as its own response
+text and hands to TTS synthesis (one resolution, reused for
+both), the admin `/debug/probe` endpoint's response text, and
+a defensive, idempotent second pass in the Wyoming TTS
+handler that guards a caller reaching TTS synthesis without
+going through `/chat` or `/voice` at all. An unresolvable
+third-party token renders as a neutral descriptor at the
+three app-layer exits; the Wyoming defensive pass instead
+leaves it verbatim, so a genuine contract violation stays
+audible rather than being narrated as "another speaker." The
+name ↔ `speaker{N}` binding itself never leaves the device.
+
+**A request is served on a relay path, not the personal one,
+only when every resolution step fails to yield a speaker.**
+Bound-token identity, a voice-embedding match, session
+history, and anonymous-speaker promotion are each tried in
+turn; only when all of them miss does the turn route to
+`_relay_route` — HA, cloud, or the local base model only,
+prefixed with a notice — instead of the local
+parametric-memory dispatch. The relay path touches none of
+the personal machinery: no knowledge-store access, no
+conversation-history egress (even in cloud-only mode a
+speakerless turn sends empty history — the stronger of the
+two privacy conditions wins), and no consolidation while the
+turn stays unattributed — a text-only relay turn with no
+voice embedding is dropped outright, while a voice relay turn
+is held until a claim attributes it. Claims happen
+automatically, at every consolidation pass (embedding match
+against enrolled profiles) or on in-conversation name
+enrollment, with an explicit operator door as a further
+option. The relay path also runs no intent classification:
+routing an unattributed turn needs no `RoutingPlan`, since
+there is no `speaker_id` to route personally for. One case is
+caught before HA or cloud is even tried: a personal
+interrogative with no identity returns the canned no-identity
+abstention response instead of risking a confabulated or
+leaked answer; a personal declarative still reaches the
+normal cloud-egress sanitization every other leg applies.
+
 ### AD-21: One Cloud Master Switch, One Personal Verdict, One Egress Funnel
 
 **One switch.** `cloud.enabled` (`CloudConfig`) is the single on-off for all
@@ -356,6 +411,16 @@ own verdict from the same `is_self_referential` predicate, computed in
 `_maybe_escalate`; a self-referential forwarded query suppresses the HA hop as
 well as the cloud hop, because `ha_agent_id` is operator-pointed and may be
 cloud-backed.
+
+**History is server-assembled, never client-supplied.**
+`ChatRequest` carries no history field of any kind.
+`_run_chat_turn` — the single turn-handling path shared by
+`/chat` and `POST /voice` — reads the conversation's prior
+turns from the server's own session store
+(`SessionBuffer.get_conversation_turns`) before dispatching
+to either the local or the relay leg, so nothing a client
+sends can inject fabricated turns into the context a reply is
+built from or a cloud payload carries.
 
 **One egress funnel.** `answer_via_cloud` is the sole cloud-egress entry
 point, in both local and cloud-only mode; `cloud_mode`
