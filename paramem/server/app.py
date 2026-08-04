@@ -625,20 +625,18 @@ class SpeakerForgetRequest(BaseModel):
     ----------
     speaker_id:
         The speaker ID to forget (e.g. ``"speaker0"``).  Exact match.
-    strategy:
-        Erasure strategy.  Only ``"mark_stale"`` is implemented; the field is
-        a future extension point for a ``"discard_interim"`` strategy
-        (discard the whole interim slot).
 
     Note
     ----
-    ``discard_interim`` strategy (discard the whole interim slot) is out of
-    scope for this revision.  Extend this field and add a handler branch when
-    that strategy is needed.
+    There is exactly one erasure operation (hard erase — see
+    :func:`speaker_forget`'s docstring); it has no variant to select.
+    Discarding an interim slot wholesale (rather than erasing one speaker's
+    keys within it) is a separate operation — ``POST /interim/discard``.
+    Unrecognised fields in the request body are ignored (``extra="ignore"``),
+    so a caller still sending a ``strategy`` field is unaffected.
     """
 
     speaker_id: str
-    strategy: str = "mark_stale"
 
 
 class SpeakerForgetResponse(BaseModel):
@@ -664,6 +662,68 @@ class SpeakerForgetResponse(BaseModel):
     removed_speaker: bool
     stale_keys: list[str]
     discarded_sessions: list[str]
+
+
+# --- Interim discard schemas ---
+
+# THE one place the unconfirmed-request status code is declared.  Owner
+# ruling: 409 — collapses every "this will not mutate now" answer (busy,
+# cloud-only, trial-active, unconfirmed) into the same refusal band a client
+# already has to branch on.  Handler, tests, and the DEPLOYMENT.md example all
+# read it from here rather than hard-coding the literal.
+_INTERIM_DISCARD_UNCONFIRMED_STATUS: int = 409
+
+
+class InterimDiscardRequest(BaseModel):
+    """Request body for ``POST /interim/discard``.
+
+    Attributes
+    ----------
+    confirm:
+        Must be ``True`` to actually discard the ring.  ``False`` (default)
+        returns the pre-mutation inventory (``_INTERIM_DISCARD_UNCONFIRMED_STATUS``)
+        without mutating anything — the operator's own invocation is the only
+        source for this value; the system cannot derive it.
+    """
+
+    confirm: bool = False
+
+
+class InterimDiscardResponse(BaseModel):
+    """Response body for ``POST /interim/discard``.
+
+    Attributes
+    ----------
+    status:
+        ``"discarded"`` when the ring was non-empty and was destroyed;
+        ``"noop_no_interim_slots"`` when there was nothing to discard.
+    discarded_tiers:
+        Interim tier names (``episodic_interim_<stamp>``) dropped from the
+        :class:`~paramem.memory.store.MemoryStore`.
+    unloaded_adapters:
+        PEFT adapter names deleted from the live model (the reaper's return
+        value) — empty in the simulate/non-PEFT venue.
+    removed_dirs:
+        On-disk interim slot directory names removed (``interim_<stamp>``).
+    active_keys_destroyed:
+        Per-tier count of active keys destroyed, keyed by tier name, as
+        measured before the mutation.
+    stale_keys_destroyed:
+        Per-tier count of stale keys destroyed, keyed by tier name, as
+        measured before the mutation.
+    resolved_incidents:
+        Number of ring-lifecycle incidents (``full_consolidation_overdue``,
+        ``interim_cap_reached``, ``interim_overflow_pending``) transitioned
+        to ``resolved`` by this call.
+    """
+
+    status: str
+    discarded_tiers: list[str]
+    unloaded_adapters: list[str]
+    removed_dirs: list[str]
+    active_keys_destroyed: dict[str, int]
+    stale_keys_destroyed: dict[str, int]
+    resolved_incidents: int
 
 
 # --- Migration schemas ---
@@ -7354,14 +7414,17 @@ async def admin_assign_orphans(speaker_id: str | None = None):
 async def speaker_forget(request: SpeakerForgetRequest):
     """Forget a speaker: erase their indexed-memory keys, discard pending sessions.
 
-    The ``strategy`` field is named ``"mark_stale"``, but the operation
-    performed is a hard erase (:meth:`~paramem.memory.store.MemoryStore.discard_keys`
-    with ``mode="erase"``) — registry-level, safe on a live store, and does
-    not trigger retraining. Forgetting is registry-level, not weight-level:
-    the erased key is unservable immediately at the SimHash gate, but a
-    resident tier's weight encoding is not automatically trimmed by ordinary
-    (warm-init) consolidation cycles — only an operator-invoked
-    ``POST /reconsolidate`` (cold rebuild) does that.
+    The operation performed is a full in-store retirement
+    (:meth:`~paramem.memory.store.MemoryStore.discard_keys` with
+    ``mode="erase"``, which delegates to
+    :meth:`~paramem.memory.store.MemoryStore.delete` per key) plus the
+    on-disk fact content in every affected tier's ``graph.json`` — safe on a
+    live store, and does not trigger retraining. Forgetting still does not
+    trim resident adapter weights: the erased key is unservable immediately
+    at the SimHash gate, but a resident tier's weight encoding is not
+    automatically trimmed by ordinary (warm-init) consolidation cycles —
+    only an operator-invoked ``POST /reconsolidate`` (cold rebuild) does
+    that.
 
     Steps
     -----
@@ -7370,11 +7433,19 @@ async def speaker_forget(request: SpeakerForgetRequest):
        speaker→key and is available between cycles (unlike the transient merged
        graph, which is cleared at cycle-end).
 
-    2. **Remove keys from every per-tier KeyRegistry** — both in-memory (so
-       keyed recall no longer serves them) and on disk (so the next restart
-       does not resurrect them).  Simhash entries for the same keys are dropped
-       from the in-memory store and saved to disk so the SimHash gate cannot
-       verify them at inference time.
+    2. **Erase the keys from the store and from disk.**
+       ``store.discard_keys(mode="erase")`` drops the entry payload, the
+       per-tier registry (active + stale + simhash), and the bookkeeping
+       record for each key, in-memory.  For every affected tier the updated
+       registry is persisted to disk (so a restart does not resurrect the
+       key), the fact content itself is erased from that tier's
+       ``graph.json`` when one exists
+       (:func:`~paramem.memory.persistence.erase_keys_from_graph_file`), and
+       the live weight slot's manifest is re-stamped when the tier has one
+       on disk (train venue only — the simulate venue has no weight slot to
+       re-stamp).  ``loop.promoted_keys`` and the on-disk ``key_metadata.json``
+       are then rewritten once so a forgotten-but-promoted key does not
+       survive to the next restart.
 
     3. **Remove the speaker profile** from
        :class:`~paramem.server.speaker.SpeakerStore` (persisted immediately).
@@ -7383,8 +7454,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
        :class:`~paramem.server.session_buffer.SessionBuffer`.
 
     Args:
-        request: :class:`SpeakerForgetRequest` with ``speaker_id`` and
-            optional ``strategy`` (only ``"mark_stale"`` is implemented).
+        request: :class:`SpeakerForgetRequest` with ``speaker_id``.
 
     Returns:
         :class:`SpeakerForgetResponse` reporting what was removed.
@@ -7392,7 +7462,6 @@ async def speaker_forget(request: SpeakerForgetRequest):
     Raises:
         HTTPException 503: When the consolidation loop is not initialised
             (server not yet ready or in cloud-only mode without a loaded model).
-        HTTPException 400: When ``strategy`` is not ``"mark_stale"``.
         HTTPException 500: When a stale key belongs to a tier whose on-disk
             slot root cannot be resolved (malformed interim tier name).
             Raised before ``store.discard_keys`` runs, so the store is left
@@ -7409,20 +7478,9 @@ async def speaker_forget(request: SpeakerForgetRequest):
 
     Note
     ----
-    ``discard_interim`` strategy (discard the whole interim slot) is out of
-    scope for this revision.  Extend ``SpeakerForgetRequest.strategy`` and add
-    a handler branch here when that strategy is needed.
+    Discarding an interim slot wholesale (rather than erasing one speaker's
+    keys within it) is ``POST /interim/discard`` — a separate admin door.
     """
-    if request.strategy != "mark_stale":
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "status": "unsupported_strategy",
-                "detail": f"Strategy {request.strategy!r} is not implemented. "
-                "Only 'mark_stale' is supported.",
-            },
-        )
-
     loop = _state.get("consolidation_loop")
     if loop is None:
         raise HTTPException(
@@ -7459,17 +7517,21 @@ async def speaker_forget(request: SpeakerForgetRequest):
     }
     stale_keys: list[str] = sorted(keys)
 
-    # Remove keys from every per-tier KeyRegistry (in-memory + disk).
-    # Also drop their simhash entries so the SimHash gate cannot verify them.
-    # Uses store.discard_keys(mode="erase") — the shared helper that preserves
-    # the tier asymmetry: registry over tiers_with_registry(), simhash over
-    # EVERY tier with a registry, main and interim alike (store.py::discard_keys,
-    # mode="erase" walks tiers_with_registry() unconditionally — there is no
-    # main-only carve-out).  This is a HARD erasure (privacy / right-to-forget);
-    # soft-stale is wrong here (the record must be GONE, including the simhash).
+    # Remove keys from every per-tier KeyRegistry (in-memory + disk), their
+    # cached entry payload, and their bookkeeping record.  Uses
+    # store.discard_keys(mode="erase"), which now delegates to
+    # MemoryStore.delete per key: entries, registry (active + stale +
+    # simhash) and bookkeeping are dropped in lockstep across every tier,
+    # the same full retirement delete()/drop_tier() perform elsewhere.  This
+    # is a HARD erasure (privacy / right-to-forget); soft-stale is wrong here
+    # (the record must be GONE, including the simhash).  The per-tier loop
+    # below additionally erases the fact content from each tier's on-disk
+    # graph.json (persistence.erase_keys_from_graph_file) — the store-level
+    # erase above only ever mutated RAM/registry.
     if stale_keys:
         from paramem.adapters.manifest import tier_registry_sha256
         from paramem.memory.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.persistence import erase_keys_from_graph_file
 
         # Determine which tiers are affected BEFORE the erase so we know
         # which registry files to persist after.  The erase removes the keys
@@ -7523,6 +7585,16 @@ async def speaker_forget(request: SpeakerForgetRequest):
             # preload 0/N), never in a slot bound to a registry that still lists the
             # erased key.
             registry.save(tier_reg_path)
+            # Erase the fact content itself from this tier's on-disk graph
+            # (simulate-mode venue; the train-mode venue is adapter weights,
+            # trimmed only by an operator-invoked /reconsolidate — see the
+            # WHY THIS IS HONEST note below).  Registry-first, content-second:
+            # the registry write above is already durable, so a crash between
+            # the two leaves an orphaned graph edge no reader can resolve
+            # (payload ⊇ registry is the only shape every reader — DiskMemorySource,
+            # build_tier_graph_from_store, boot preload — is defended against).
+            # A no-op (returns 0, no write) when graph.json does not exist.
+            erase_keys_from_graph_file(tier_root / "graph.json", keys)
             # Re-stamp the live weight slot's manifest so find_live_slot rebinds on restart.
             #
             # INVARIANT: any out-of-fold registry mutation must re-stamp the hash-matching
@@ -7549,7 +7621,28 @@ async def speaker_forget(request: SpeakerForgetRequest):
             # single-fact stale endpoint), extract this block into a shared helper in
             # paramem/adapters/manifest.py.
             _pre_sha = _tier_pre_sha[tier_name]
-            if _pre_sha == "":
+            # Venue gate: a weight-slot manifest (meta.json — the same signal
+            # find_live_slot itself scans for) can only exist in the train
+            # venue.  In the simulate venue (graph.json-only) tier_root holds
+            # no timestamped slot subdirs at all, so find_live_slot always
+            # returns None there — re-stamping is not "the slot is orphaned",
+            # it is "there is no slot to re-stamp".  Gated on disk content
+            # rather than config.consolidation.mode so an in-flight
+            # simulate<->train migration (whose per-tier venue can transiently
+            # differ from the configured mode) is judged by what is actually
+            # on disk for THIS tier.  The registry save and graph erase above
+            # are venue-agnostic and already ran regardless.
+            _has_weight_slot = tier_root.is_dir() and any(
+                child.is_dir() and not child.name.startswith(".") and (child / "meta.json").exists()
+                for child in tier_root.iterdir()
+            )
+            if not _has_weight_slot:
+                logger.debug(
+                    "speaker/forget: tier %s has no on-disk weight slot — skipping "
+                    "manifest re-stamp (simulate venue or never-trained tier)",
+                    tier_name,
+                )
+            elif _pre_sha == "":
                 # No readable pre-erase registry on disk (absent or corrupt).
                 # An empty hash would otherwise match any stray ""-stamped
                 # slot (the fresh-install convention in find_live_slot) —
@@ -7591,6 +7684,18 @@ async def speaker_forget(request: SpeakerForgetRequest):
                 speaker_id,
             )
 
+        # Retire the forgotten keys from promoted_keys and rewrite
+        # key_metadata.json once, after the store is fully mutated.
+        # _save_key_metadata rebuilds "keys" from store.all_known_keys() (the
+        # erase already dropped them there), but writes sorted(loop.promoted_keys)
+        # verbatim — without this, a forgotten-but-promoted key survives on
+        # disk until restart (training/consolidation.py filters promoted_keys
+        # against is_known() on load, not on save).
+        loop.promoted_keys.difference_update(stale_keys)
+        from paramem.server.consolidation import _save_key_metadata
+
+        _save_key_metadata(loop, config)
+
     # Remove the speaker profile.
     speaker_store = _state.get("speaker_store")
     removed_speaker = False
@@ -7620,6 +7725,304 @@ async def speaker_forget(request: SpeakerForgetRequest):
         stale_keys=stale_keys,
         discarded_sessions=discarded_sessions,
     )
+
+
+def _interim_discard_inventory(loop, config) -> dict:
+    """Return the pre-mutation inventory of the interim ring.
+
+    Pure read — touches no state.  One source per fact, no re-derivation:
+
+    - ``store_tiers``: :func:`~paramem.memory.interim_adapter.interim_tiers_newest_first`
+      — THE canonical interim-tier enumeration.
+    - ``disk_dirs``: the adapter names yielded by
+      :func:`~paramem.memory.interim_adapter.iter_interim_dirs` **unfiltered**
+      — the exact set :func:`~paramem.memory.interim_adapter.unload_interim_adapters`
+      will remove from disk (payload-bearing or not).
+    - ``peft_names``: interim-prefixed keys in ``loop.model.peft_config`` when
+      ``loop.model`` is a :class:`~peft.PeftModel`, else empty.
+    - ``active_keys`` / ``stale_keys``: per-tier counts from the store, for
+      every name in ``store_tiers``.
+
+    Returns:
+        dict with keys ``"store_tiers"`` (list[str], newest stamp first),
+        ``"disk_dirs"`` (list[str], interim adapter names with an on-disk
+        directory), ``"disk_dir_names"`` (dict[str, str] mapping each
+        ``disk_dirs`` adapter name to its actual on-disk directory name, as
+        yielded by ``iter_interim_dirs`` — carried through so a caller never
+        has to re-derive the path from the name via
+        :func:`~paramem.memory.interim_adapter.interim_dir_for_name`, which
+        raises ``ValueError`` on a directory whose stamp suffix isn't
+        well-formed (e.g. a stray ``interim_garbage/``); that dir is still a
+        real on-disk directory the reaper will remove), ``"peft_names"``
+        (list[str]), ``"active_keys"`` (dict[str, int]), ``"stale_keys"``
+        (dict[str, int]), and ``"empty"`` (bool — True when ``store_tiers``,
+        ``disk_dirs`` and ``peft_names`` are all empty).
+    """
+    from peft import PeftModel
+
+    from paramem.memory.interim_adapter import (
+        INTERIM_NAME_PREFIX,
+        interim_tiers_newest_first,
+        iter_interim_dirs,
+    )
+
+    store_tiers = interim_tiers_newest_first(loop.store)
+    disk_pairs = sorted(iter_interim_dirs(config.adapter_dir), key=lambda pair: pair[0])
+    disk_dirs = [name for name, _path in disk_pairs]
+    disk_dir_names = {name: path.name for name, path in disk_pairs}
+    peft_names = (
+        sorted(n for n in loop.model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
+        if isinstance(loop.model, PeftModel)
+        else []
+    )
+    return {
+        "store_tiers": store_tiers,
+        "disk_dirs": disk_dirs,
+        "disk_dir_names": disk_dir_names,
+        "peft_names": peft_names,
+        "active_keys": {t: len(loop.store.active_keys_in_tier(t)) for t in store_tiers},
+        "stale_keys": {t: len(loop.store.stale_keys_in_tier(t)) for t in store_tiers},
+        "empty": not store_tiers and not disk_dirs and not peft_names,
+    }
+
+
+# Verdict → (HTTP error code, human message) for POST /interim/discard's busy
+# guard.  Reuses _consolidation_dispatch_guards() — the single predicate for
+# "is a memory-mutating operation safe now" — rather than re-implementing the
+# four checks; this only maps its verdict onto the 409 body idiom the repo
+# already uses for destructive-surgery routes (POST /backup/restore).
+_INTERIM_DISCARD_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
+    "deferred_already_running": (
+        "consolidating",
+        "Consolidation is running; wait for completion before discarding the interim ring.",
+    ),
+    "deferred_cloud_only": (
+        "cloud_only",
+        "Server is in cloud-only mode; no local model or consolidation loop is available. "
+        "Reacquire the GPU (POST /gpu/acquire), then discard.",
+    ),
+    "deferred_bg_training": (
+        "training_active",
+        "Background training is active; wait for completion before discarding the interim ring.",
+    ),
+    "deferred_trial_active": (
+        "trial_active",
+        "A migration TRIAL is in progress. Accept or roll back the migration first.",
+    ),
+}
+
+
+@app.post(
+    "/interim/discard",
+    response_model=InterimDiscardResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def interim_discard(request: InterimDiscardRequest):
+    """Discard the entire interim ring in-process, without folding it into main memory.
+
+    The only door that removes interim slots without first absorbing their
+    content into the main tiers — the full-fold absorb branch
+    (:func:`~paramem.training.consolidation.ConsolidationLoop.consolidate`)
+    is the other place :func:`~paramem.memory.interim_adapter.unload_interim_adapters`
+    is called, and it always runs after the interim keys have been folded
+    into the mains.  Here nothing is folded: the facts in every interim slot
+    are the only copy, and they are gone once this returns ``"discarded"``.
+
+    Whole-ring only — there is no per-slot selection.  Every downstream
+    consequence of the ring (the mint gate's capacity count, the three
+    ring-lifecycle incidents, the full-cycle deadline) is ring-level, so a
+    partial discard would leave those signals describing a ring that no
+    longer matches reality.
+
+    Steps (synchronous; the GPU-touching half runs under ``gpu_lock`` off
+    the event loop):
+
+    1. Drop every interim tier from the :class:`~paramem.memory.store.MemoryStore`
+       (RAM first — the tier becomes unroutable immediately).
+    2. Reap the ring via the one reaper
+       (:func:`~paramem.memory.interim_adapter.unload_interim_adapters`):
+       delete the PEFT adapters (when any) and ``rmtree`` every on-disk slot,
+       payload-bearing or not.
+    3. Prune ``loop.promoted_keys`` of the discarded tiers' keys (mirrors
+       ``POST /speaker/forget``'s pruning — otherwise a discarded-but-promoted
+       key survives on disk until restart), then rewrite ``key_metadata.json``
+       from the now-smaller :meth:`~paramem.memory.store.MemoryStore.all_known_keys`.
+    4. Resolve the three ring-lifecycle incidents
+       (``full_consolidation_overdue``, ``interim_cap_reached``,
+       ``interim_overflow_pending``) — their only other clear site is the
+       full-fold absorb path, which this operation deliberately bypasses.
+    5. Pop any ``adapter_manifest_status`` rows for the discarded names.
+    6. Record the outcome via :func:`~paramem.server.run_status.record_last_run`
+       (``op_type="consolidation"``, ``outcome="interim_discarded"``).
+    7. Reload ``_state["router"]`` so the speaker→key index drops the
+       discarded keys.
+
+    Not touched, by design: pending sessions in the ``SessionBuffer`` (never
+    in a slot; absorbed by the next fold), main-tier registries/weights,
+    donor stores, the schedule stamp.
+
+    Errors
+    ------
+    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only``
+        A fold, background training, or a migration TRIAL is in flight, or
+        the server has no local model loaded.  No mutation on any of these.
+    409 ``confirmation_required`` (``_INTERIM_DISCARD_UNCONFIRMED_STATUS``)
+        ``confirm`` was not ``true`` and the ring is non-empty.  The response
+        detail carries ``would_discard`` — the same inventory the mutation
+        path would destroy — so the operator can see the blast radius before
+        committing.  Nothing is mutated.
+    500
+        Uncaught — surfaced by FastAPI when the reap or the registry rewrite
+        fails mid-operation. ``_state["consolidating"]`` is cleared in a
+        ``finally`` regardless of outcome; the operation is idempotent and
+        safe to retry (a second call reaps whatever the first left behind).
+    """
+    # Step 0a — shared pre-dispatch guard: already-running / cloud-only /
+    # bg-training / migration TRIAL.  No second implementation of these four
+    # checks — see _consolidation_dispatch_guards' own docstring.
+    guard = _consolidation_dispatch_guards()
+    if guard is not None:
+        error, message = _INTERIM_DISCARD_GUARD_VERDICTS.get(
+            guard, (guard, "Cannot discard the interim ring right now.")
+        )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
+
+    config = _state["config"]
+    # Step 0b — get-or-create rather than "loop is None -> 503": guard 0a
+    # already proved mode == "local" (a model is loaded), so the loop can
+    # always be created here, and gating on a pre-existing loop would make
+    # this endpoint unusable on a freshly booted server — exactly the state
+    # an operator most plausibly wants to discard from.
+    loop = _get_or_create_consolidation_loop(config)
+
+    # Step 0c — pure read; a no-op ring must not write key_metadata.json,
+    # must not touch incidents, must not log a destructive run.
+    inv = _interim_discard_inventory(loop, config)
+    if inv["empty"]:
+        return InterimDiscardResponse(
+            status="noop_no_interim_slots",
+            discarded_tiers=[],
+            unloaded_adapters=[],
+            removed_dirs=[],
+            active_keys_destroyed={},
+            stale_keys_destroyed={},
+            resolved_incidents=0,
+        )
+
+    # Step 0d — the operator sees the blast radius before committing;
+    # nothing is written on this path.  Status code is the owner's ruling
+    # (_INTERIM_DISCARD_UNCONFIRMED_STATUS), not a hard-coded literal.
+    if request.confirm is not True:
+        raise HTTPException(
+            status_code=_INTERIM_DISCARD_UNCONFIRMED_STATUS,
+            detail={
+                "error": "confirmation_required",
+                "message": (
+                    "Discarding the interim ring destroys the only copy of its facts. "
+                    'Resend with {"confirm": true} to proceed.'
+                ),
+                "would_discard": inv,
+            },
+        )
+
+    from paramem.memory.interim_adapter import unload_interim_adapters
+    from paramem.server.consolidation import _save_key_metadata
+    from paramem.server.gpu_lock import gpu_lock
+
+    state_dir = config.paths.data / "state"
+    # Every name this operation destroys, from every source it could have
+    # been recorded under — the union covers a name recorded only via the
+    # boot-time disk scan (adapter_manifest_status row with no live PEFT
+    # entry) as well as the common case (store + PEFT).
+    discarded_names = set(inv["store_tiers"]) | set(inv["peft_names"]) | set(inv["disk_dirs"])
+    # Carried through from the inventory (disk_dir_names) rather than
+    # re-derived via interim_dir_for_name, which raises ValueError on a
+    # stray dir whose stamp suffix isn't well-formed (e.g. interim_garbage/)
+    # — a real on-disk directory unload_interim_adapters would still remove.
+    removed_dirs = [inv["disk_dir_names"][n] for n in inv["disk_dirs"]]
+
+    def _discard_sync() -> tuple[list[str], int]:
+        """Steps 1–6 — the GPU-touching + file-write half, run off the event loop."""
+        # Collect every key the discarded interim tiers know (active + stale)
+        # before Step 1 drops them — drop_tier removes the tier's registry,
+        # so this is the last point the keys are enumerable.
+        discarded_keys: set[str] = set()
+        for tier in inv["store_tiers"]:
+            discarded_keys.update(loop.store.active_keys_in_tier(tier))
+            discarded_keys.update(loop.store.stale_keys_in_tier(tier))
+        # Step 1 — RAM first: the tier becomes unroutable immediately.
+        for tier in inv["store_tiers"]:
+            loop.store.drop_tier(tier)
+        # Step 2 — ONE reaper, both venues (PEFT delete + on-disk rmtree).
+        unloaded = unload_interim_adapters(loop.model, config.adapter_dir)
+        # Step 3 — prune promoted_keys of the discarded tiers' keys (mirrors
+        # POST /speaker/forget's pruning), then rebuild key_metadata.json now
+        # the discarded keys are gone from all_known_keys().
+        loop.promoted_keys.difference_update(discarded_keys)
+        _save_key_metadata(loop, config)
+        # Step 4 — the ring's own incidents have no other clear site once
+        # the ring is gone (_oldest_interim_stamp returns None post-discard).
+        resolved = 0
+        for _type in (
+            "full_consolidation_overdue",
+            "interim_cap_reached",
+            "interim_overflow_pending",
+        ):
+            resolved += resolve_incidents_by_type(
+                state_dir, _type, reason="interim ring discarded without absorption"
+            )
+        # Step 5 — manifest rows describing slots that no longer exist.
+        manifest_status = _state.get("adapter_manifest_status", {})
+        for name in discarded_names:
+            manifest_status.pop(name, None)
+        # Step 6 — operator-visible run record; a stale prior-fold row would
+        # otherwise misdescribe the post-discard state of memory.
+        record_last_run(
+            state_dir,
+            op_type="consolidation",
+            outcome="interim_discarded",
+            summary=(
+                f"Interim ring discarded: {len(inv['store_tiers'])} tier(s), "
+                f"{sum(inv['active_keys'].values())} active key(s)"
+            ),
+            detail={
+                "discarded_tiers": inv["store_tiers"],
+                "unloaded_adapters": unloaded,
+                "removed_dirs": removed_dirs,
+            },
+        )
+        return unloaded, resolved
+
+    _state["consolidating"] = True
+    try:
+        async with gpu_lock():
+            loop_aio = asyncio.get_running_loop()
+            unloaded_adapters, resolved_incidents = await loop_aio.run_in_executor(
+                None, _discard_sync
+            )
+
+        # NO-AWAIT TAIL — LOAD-BEARING.  From the run_in_executor above returning to the
+        # flag clear in `finally` there must be ZERO await points: this coroutine then runs
+        # the router reload + response build without yielding, so no /chat turn can observe
+        # a store whose interim tiers are gone but whose router index still lists their keys.
+        # Same argument as `_dispatch_to_executor`.  Note WHY this is the
+        # whole story: /chat never reads _state["consolidating"] — that flag excludes the
+        # consolidation arbitrator, nothing else.  /chat is kept off the PEFT mutation by
+        # `gpu_lock` alone (acquired above, held across the executor call).  Adding an await
+        # here re-opens both windows at once.
+        _state["router"].reload()
+
+        return InterimDiscardResponse(
+            status="discarded",
+            discarded_tiers=inv["store_tiers"],
+            unloaded_adapters=unloaded_adapters,
+            removed_dirs=removed_dirs,
+            active_keys_destroyed=inv["active_keys"],
+            stale_keys_destroyed=inv["stale_keys"],
+            resolved_incidents=resolved_incidents,
+        )
+    finally:
+        _state["consolidating"] = False
 
 
 # --------------------------------------------------------------------------
@@ -8634,27 +9037,7 @@ async def migration_preview(request: PreviewRequest):
 
     # --- Shape-change detection ---
     adapter_dir = config.adapter_dir if config is not None else default_data_dir() / "adapters"
-    live_registry_sha256 = ""
-    if config is not None:
-        registry_path = None
-        try:
-            if hasattr(config, "paths") and config.paths.data is not None:
-                registry_path = config.paths.key_metadata
-        except (AttributeError, TypeError):
-            registry_path = None
-        if registry_path is None:
-            registry_path = Path(str(adapter_dir)).parent / "registry" / "key_metadata.json"
-        if registry_path.exists():
-            # Hash plaintext content — see manifest.py::tier_registry_sha256
-            # for the plaintext-after-decrypt rationale.
-            from paramem.backup.hashing import plaintext_sha256
-
-            try:
-                live_registry_sha256 = plaintext_sha256(registry_path)
-            except Exception:  # noqa: BLE001
-                live_registry_sha256 = ""
-
-    shape_changes = compute_shape_changes(parsed_candidate, adapter_dir, live_registry_sha256)
+    shape_changes = compute_shape_changes(parsed_candidate, adapter_dir)
 
     # --- Detect simulate-mode ---
     simulate_mode_override = detect_simulate_mode(parsed_candidate)

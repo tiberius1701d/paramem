@@ -603,21 +603,26 @@ class MemoryStore:
 
     def drop_tier(self, tier: str) -> None:
         """Remove *tier* wholesale: its entries, registry (incl. simhash), and
-        the bookkeeping records for every key it held active.
+        the bookkeeping records for every key it held, active or stale.
 
         Compensates a failed interim commit whose tier registration must be
         rolled back atomically — the tier-granularity peer of :meth:`delete`
         (single-key, all tiers) and :meth:`move` (single-key, cross-tier).
         Bookkeeping has no tier index of its own (it is a flat ``key ->
-        record`` dict), so :meth:`active_keys_in_tier` is used to enumerate
-        which records to drop before the registry itself is removed.
+        record`` dict), so :meth:`active_keys_in_tier` and
+        :meth:`stale_keys_in_tier` are used to enumerate which records to
+        drop before the registry itself is removed — a stale key's
+        bookkeeping record must not survive the tier that carried it (a
+        discarded tier's stale-key rows would otherwise be re-indexed by
+        :meth:`~paramem.server.router.QueryRouter.reload` against a tier that
+        no longer exists).
 
         No-op when *tier* is unknown to either ``_entries`` or ``_registry``.
 
         The entire compound mutation (bookkeeping + entries + registry/simhash)
         is performed under a single lock acquisition."""
         with self._lock:
-            for key in self.active_keys_in_tier(tier):
+            for key in self.active_keys_in_tier(tier) + self.stale_keys_in_tier(tier):
                 self._bookkeeping.pop(key, None)
             self._entries.pop(tier, None)
             self._registry.pop(tier, None)
@@ -782,12 +787,10 @@ class MemoryStore:
         """Return the stale keys for *tier* from the registry.
 
         Per-tier analogue of :meth:`active_keys_in_tier` for the stale
-        partition. Used by fold telemetry (``paramem.training.consolidation``)
-        to measure encoded-vs-active divergence at fold entry — a key that
-        has been fully erased via ``discard_keys(mode="erase")`` (rather
-        than soft-staled) is removed from the registry entirely and is
-        therefore invisible to this count, by design (the registry has
-        nothing left to report).
+        partition. A key that has been fully erased via
+        ``discard_keys(mode="erase")`` (rather than soft-staled) is removed
+        from the registry entirely and is therefore invisible to this count,
+        by design (the registry has nothing left to report).
         """
         with self._lock:
             reg = self._registry.get(tier)
@@ -881,16 +884,21 @@ class MemoryStore:
         Supports two modes:
 
         ``mode="erase"`` (hard removal, used by ``/forget``):
-            For each key, call :meth:`KeyRegistry.remove` on every tier's
-            registry that holds it (active or stale).  ``remove`` drops both
-            the key from ``_active_keys``/``_stale`` and its fingerprint from
-            ``_simhash``.
+            Full retirement — delegates to :meth:`delete` per key, so
+            entries, registry (active + stale + simhash) and bookkeeping are
+            dropped in lockstep across every tier, exactly as :meth:`delete`
+            and :meth:`drop_tier` do.  This is the same compound retirement
+            those two primitives perform; ``discard_keys`` no longer walks
+            the registries itself, which would otherwise be a second
+            implementation of :meth:`delete`'s registry walk.
 
         ``mode="stale"`` (soft removal, used by the fold dedup write-back):
             For each key, call :meth:`KeyRegistry.stale` on the owning tier.
             The stale transition automatically carries the active simhash into
             the stale record (encapsulated in :meth:`KeyRegistry.stale`), so
-            the fingerprint is retained for the stale-echo probe.
+            the fingerprint is retained for the stale-echo probe.  Entries
+            and bookkeeping are untouched — only the erase branch retires
+            those.
 
         Guards ``replay_enabled``: when replay is disabled, all mutations are
         no-ops and this method returns without raising.
@@ -899,20 +907,15 @@ class MemoryStore:
         their own disk saves (the registry files carry the unified simhash now).
 
         The entire mutation is performed under a single lock acquisition.
-        Nested calls to :meth:`tiers_with_registry` succeed via RLock
-        reentrancy.
+        Nested calls to :meth:`delete` / :meth:`tiers_with_registry` succeed
+        via RLock reentrancy.
         """
         if not self._replay_enabled:
             return
         with self._lock:
             if mode == "erase":
-                for tier_name in self.tiers_with_registry():
-                    reg = self._registry.get(tier_name)
-                    if reg is None:
-                        continue
-                    for key in keys:
-                        if reg.knows(key):
-                            reg.remove(key)
+                for key in keys:
+                    self.delete(key)
             elif mode == "stale":
                 for key in keys:
                     for tier_name in self.tiers_with_registry():

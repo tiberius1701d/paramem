@@ -14,6 +14,10 @@ Public API
 - :func:`entry_by_key` — look up a single key; ``None`` on miss.
 - :func:`build_tier_graph_from_store` — project a :class:`MemoryStore` tier
   to a fresh ``MultiDiGraph`` for persistence.
+- :func:`erase_keys_from_graph_file` — surgical read-modify-write removal of
+  the edges for a set of keys from an on-disk tier graph (used by
+  ``POST /speaker/forget`` to retire the underlying fact content, not just
+  the registry pointer).
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
   as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
@@ -281,6 +285,47 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
             speaker_id=entry.get("speaker_id", ""),
         )
     return graph
+
+
+def erase_keys_from_graph_file(path: Path, keys: set[str]) -> int:
+    """Remove every edge whose ``ik_key`` is in *keys* from the graph at *path*.
+
+    Returns the number of edges removed; 0 (and no write) when the file does
+    not exist or holds no matching edge.  Nodes left with degree 0 are
+    dropped.  Read and write both go through the encryption-aware pair
+    (:func:`load_memory_from_disk` / :func:`save_memory_to_disk`), so an
+    age-wrapped graph stays age-wrapped and the write stays atomic.
+
+    *keys* must be passed as a ``set`` — the membership test runs once per
+    edge, so a list argument would make the pass O(edges x keys).
+
+    Args:
+        path: Tier ``graph.json`` path (main tier root or interim slot root).
+        keys: Indexed-memory keys to erase.
+
+    Returns:
+        Number of edges removed.
+    """
+    path = Path(path)
+    if not path.exists():
+        return 0
+
+    graph = load_memory_from_disk(path)
+    to_remove = [
+        (subject, object_, nx_edge_key)
+        for subject, object_, nx_edge_key, data in graph.edges(keys=True, data=True)
+        if data.get(_IK_KEY_ATTR) in keys
+    ]
+    if not to_remove:
+        return 0
+
+    for subject, object_, nx_edge_key in to_remove:
+        graph.remove_edge(subject, object_, key=nx_edge_key)
+
+    graph.remove_nodes_from(list(nx.isolates(graph)))
+
+    save_memory_to_disk(graph, path)
+    return len(to_remove)
 
 
 # ---------------------------------------------------------------------------

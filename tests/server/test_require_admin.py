@@ -253,6 +253,7 @@ _ADMIN_PATHS = {
     "/calibrate/plausibility",
     "/integrity",
     "/speaker/forget",
+    "/interim/discard",
 }
 
 

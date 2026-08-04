@@ -290,13 +290,21 @@ def fmt_duration(seconds):
 def fmt_result(r):
     if not r:
         return "-"
-    status = r.get("status", "?")
+    status = r.get("outcome", "?")
+    # sessions/episodic_qa/procedural_rels/total_keys/jobs are written inside
+    # RunRecord.detail (see paramem/server/run_status.py::RunRecord.to_dict),
+    # not at the top level of the record — only op_type/outcome/summary/at/
+    # detail are top-level.
+    detail = r.get("detail") or {}
     if status == "simulated":
-        return f"simulated {r.get('sessions', 0)}s → {r.get('episodic_qa', 0)}ep, {r.get('procedural_rels', 0)}pr"
+        return (
+            f"simulated {detail.get('sessions', 0)}s → "
+            f"{detail.get('episodic_qa', 0)}ep, {detail.get('procedural_rels', 0)}pr"
+        )
     if status == "trained":
-        return f"trained {r.get('total_keys', 0)} keys ({','.join(r.get('jobs', [])) or '?'})"
+        return f"trained {detail.get('total_keys', 0)} keys ({','.join(detail.get('jobs', [])) or '?'})"
     if status == "no_facts":
-        return f"no facts from {r.get('sessions', 0)} sessions"
+        return f"no facts from {detail.get('sessions', 0)} sessions"
     return status
 
 def short_model_id(mid):
@@ -388,11 +396,18 @@ fields = {
     # clears the 1.0 recall gate.
     "pending_rehydration": d.get("pending_rehydration", False),
     "effective_mode": d.get("effective_mode") or "-",
+    # completed_tiers/failed_tiers also live in RunRecord.detail, not top-level.
     "migration_completed_tiers": ",".join(
-        ((d.get("last_consolidation_result") or {}).get("completed_tiers") or [])
+        (
+            ((d.get("last_consolidation_result") or {}).get("detail") or {}).get("completed_tiers")
+            or []
+        )
     ) or "-",
     "migration_failed_tiers": ",".join(
-        sorted((d.get("last_consolidation_result") or {}).get("failed_tiers") or {})
+        sorted(
+            ((d.get("last_consolidation_result") or {}).get("detail") or {}).get("failed_tiers")
+            or {}
+        )
     ) or "-",
 }
 # Scalar line

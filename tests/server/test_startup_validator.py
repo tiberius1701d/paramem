@@ -432,6 +432,35 @@ class TestInterimNoMatchingSlotLogLevel:
         ), f"Expected an ERROR naming the interim adapter, got: {error_messages}"
 
 
+class TestEmptiedInterimSlotSurvivesBoot:
+    """An interim simulate slot emptied by ``/speaker/forget`` (graph.json
+    rewritten to zero edges, registry rewritten to zero active keys) must
+    survive the boot validator as a preserved simulate-mode slot — not fall
+    through to the torn-write ``rmtree`` branch.  ``iter_interim_dirs``
+    filters on file PRESENCE, not content, so an all-erased slot still lands
+    in the interim mount path; deleting it here would be the wrong
+    classification for a slot the forget handler deliberately rewrites
+    rather than removes.
+    """
+
+    def test_zero_edge_zero_key_interim_slot_dir_survives(self, tmp_path: Path) -> None:
+        """graph.json with no edges + registry with zero active keys → the
+        interim directory (and both files) still exist after mounting."""
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "graph.json").write_text('{"directed": true, "nodes": [], "links": []}')
+        (interim_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": [], "fidelity_history": {}, "stale": {}, "simhash": {}}'
+        )
+
+        _run(config)
+
+        assert interim_dir.exists(), "an emptied-but-registered interim slot must not be deleted"
+        assert (interim_dir / "graph.json").exists()
+        assert (interim_dir / "indexed_key_registry.json").exists()
+
+
 class TestMultipleRows:
     def test_multiple_adapter_rows_independent(self, tmp_path: Path) -> None:
         config = _make_config(

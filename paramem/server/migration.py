@@ -50,6 +50,7 @@ from paramem.adapters.manifest import (
     ManifestError,
     find_live_slot,
     read_manifest,
+    tier_registry_sha256,
 )
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
@@ -485,23 +486,35 @@ _SHAPE_CONSEQUENCE: dict[str, str] = {
 def compute_shape_changes(
     candidate_yaml: dict,
     adapter_dir: Path,
-    live_registry_sha256: str,
 ) -> list[ShapeChange]:
     """Return shape-change rows for every enabled adapter that has a meta.json.
 
     For each adapter name whose ``adapters.<name>.enabled`` is ``True`` in
     *candidate_yaml*:
 
-    1. Call ``find_live_slot(adapter_dir / name, live_registry_sha256)`` to
-       locate the current on-disk slot.
-    2. If no slot is found, skip silently (adapter not yet trained).
-    3. If a slot exists but ``read_manifest`` raises, log WARN and skip (no
+    1. Resolve that adapter's OWN tier registry hash via
+       ``tier_registry_sha256(adapter_dir / name)`` — the same hash every
+       manifest writer stamps (``commit_tier_slot``,
+       ``_save_adapters._build``, ``active_store_migration``, ``backup.py``'s
+       bundle writer).  A single hash computed once for all tiers can never
+       match a per-tier stamp, which is why this used to be a caller-supplied
+       parameter — dropped in favour of resolving it here, per adapter.
+    2. Call ``find_live_slot(adapter_dir / name, that hash)`` to locate the
+       current on-disk slot.
+    3. If no slot is found, skip silently (adapter not yet trained).
+    4. If a slot exists but ``read_manifest`` raises, log WARN and skip (no
        row emitted).
-    4. Compare ``manifest.lora.{rank, alpha, target_modules}`` against the
+    5. Compare ``manifest.lora.{rank, alpha, target_modules}`` against the
        candidate config.  Emit one ``ShapeChange`` per differing field.
        ``dropout`` is NOT compared here — it is not a shape field (see
        ``_SHAPE_CONSEQUENCE``'s module comment); an operator dropout edit
        never carries the weight-discard consequence a real shape change does.
+
+    A tier whose registry file exists but cannot be read/decrypted is
+    skipped with a WARNING (no row) rather than degraded to an empty hash:
+    ``""`` is ``find_live_slot``'s fresh-install match convention
+    (``manifest.py:373``), and degrading to it would bind the row to an
+    unrelated ``""``-stamped slot instead of surfacing the read failure.
 
     Parameters
     ----------
@@ -510,9 +523,6 @@ def compute_shape_changes(
     adapter_dir:
         Filesystem path to the adapter directory
         (``config.adapter_dir`` / ``data/ha/adapters/``).
-    live_registry_sha256:
-        SHA-256 of the live ``key_metadata.json`` file, or ``""`` for a
-        fresh install.
 
     Returns
     -------
@@ -532,7 +542,19 @@ def compute_shape_changes(
             continue
 
         kind_dir = adapter_dir / adapter_name
-        slot = find_live_slot(kind_dir, live_registry_sha256)
+        try:
+            tier_hash = tier_registry_sha256(kind_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "compute_shape_changes: skipping adapter %r — cannot read/decrypt "
+                "tier registry at %s: %s",
+                adapter_name,
+                kind_dir,
+                exc,
+            )
+            continue
+
+        slot = find_live_slot(kind_dir, tier_hash)
         if slot is None:
             # Not yet trained — skip silently.
             continue

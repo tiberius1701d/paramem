@@ -6,15 +6,18 @@ Mocked — no GPU, no real model.  Mirrors the mocking style of
 Coverage
 --------
 - ``store.discard_keys(keys, mode="erase")`` called with exactly the keys
-  resolved via ``store.iter_bookkeeping()`` for the speaker: hard-removes
-  keys from the registry (GONE from both active and stale); registry saved
-  for affected tiers; simhash saved for affected main tiers.
+  resolved via ``store.iter_bookkeeping()`` for the speaker: full retirement
+  (entry payload, registry — GONE from both active and stale — and
+  bookkeeping, dropped in lockstep via delegation to ``MemoryStore.delete``);
+  registry saved for affected tiers; each affected tier's on-disk
+  ``graph.json`` has the erased keys' edges surgically removed
+  (``persistence.erase_keys_from_graph_file``); ``loop.promoted_keys`` and
+  on-disk ``key_metadata.json`` no longer carry the erased keys.
 - Speaker profile removed: ``speaker_store.remove`` called; response reflects
   the bool return.
 - Pending sessions for the speaker discarded: ``discard_sessions`` called;
   response lists them.
 - ``consolidation_loop is None`` → 503 with ``"not_ready"`` status detail.
-- Unsupported ``strategy`` → 400.
 - Auth: ``/speaker/forget`` carries the ``require_admin`` dependency in the
   real app route table.
 """
@@ -22,10 +25,12 @@ Coverage
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import networkx as nx
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
@@ -40,6 +45,12 @@ from paramem.adapters.manifest import (
     write_manifest,
 )
 from paramem.memory.entry import compute_simhash
+from paramem.memory.persistence import (
+    _IK_KEY_ATTR,
+    iter_entries,
+    load_memory_from_disk,
+    save_memory_to_disk,
+)
 from paramem.memory.store import MemoryStore
 from paramem.training.key_registry import KeyRegistry
 
@@ -49,12 +60,52 @@ from paramem.training.key_registry import KeyRegistry
 
 
 def _make_config(tmp_path: Path) -> MagicMock:
-    """Minimal config mock with adapter_dir under tmp_path."""
+    """Minimal config mock with adapter_dir and key_metadata_path under tmp_path.
+
+    ``key_metadata_path`` must be a real ``Path`` (not a bare MagicMock
+    attribute) — the handler now calls ``_save_key_metadata(loop, config)``
+    once per forget, which writes to
+    ``getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path``.
+    """
     cfg = MagicMock()
     adapter_dir = tmp_path / "adapters"
     adapter_dir.mkdir(parents=True, exist_ok=True)
     cfg.adapter_dir = adapter_dir
+    cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
     return cfg
+
+
+def _prep_loop_for_save_key_metadata(loop: MagicMock) -> None:
+    """Set the three attributes ``_save_key_metadata`` needs on a mock loop.
+
+    ``_save_key_metadata`` (called once per forget after the store is fully
+    mutated) reads ``loop.cycle_count``, ``loop.promoted_keys`` (a real
+    ``set`` — it calls ``.difference_update`` on it before the save), and
+    ``getattr(loop, "trial_key_metadata_path", None)``.  A bare
+    ``MagicMock()`` attribute is truthy, so leaving
+    ``trial_key_metadata_path`` unset would silently route the write to a
+    mock path instead of ``config.key_metadata_path``.
+    """
+    loop.promoted_keys = set()
+    loop.cycle_count = 0
+    loop.trial_key_metadata_path = None
+
+
+def _make_loop_with_store(store: MemoryStore) -> MagicMock:
+    """Build a MagicMock ConsolidationLoop wrapping a real MemoryStore.
+
+    Used by tests that need real store mutation semantics (registry, entry,
+    bookkeeping, simhash) but drive everything else on the loop through a
+    mock.  Pre-wires the three attributes ``_save_key_metadata`` requires
+    (see :func:`_prep_loop_for_save_key_metadata`) so the handler's
+    post-erase ``loop.promoted_keys.difference_update(...)`` +
+    ``_save_key_metadata(loop, config)`` call does not crash on mock
+    plumbing unrelated to the behaviour under test.
+    """
+    loop = MagicMock()
+    loop.store = store
+    _prep_loop_for_save_key_metadata(loop)
+    return loop
 
 
 def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
@@ -71,13 +122,22 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     It then calls
     ``store.discard_keys(keys, mode="erase")`` (the shared helper).  Tests verify
     that the helper is called with the correct arguments.
+
+    Also pre-wires what the handler's post-erase ``_save_key_metadata(loop,
+    config)`` call needs: the three attributes from
+    :func:`_prep_loop_for_save_key_metadata`, plus
+    ``store.all_known_keys.return_value = []`` (``_save_key_metadata``
+    iterates it; an unconfigured ``MagicMock()`` call result is not
+    iterable).
     """
     loop = MagicMock()
+    _prep_loop_for_save_key_metadata(loop)
 
     # iter_bookkeeping returns bookkeeping records keyed by speaker_id.
     # The handler iterates all records and filters by record.get("speaker_id").
     bk_records = [(k, {"speaker_id": speaker_id, "relation_type": "episodic"}) for k in keys]
     loop.store.iter_bookkeeping.return_value = iter(bk_records)
+    loop.store.all_known_keys.return_value = []
 
     # Per-tier KeyRegistry mocks.
     ep_registry = MagicMock(spec=KeyRegistry)
@@ -176,9 +236,11 @@ class TestMarkStaleKeys:
         # iter_bookkeeping was called (not keys_for_speaker which used merger.graph).
         loop.store.iter_bookkeeping.assert_called_once_with()
 
-        # store.discard_keys must be called with mode="erase" (hard erasure, not soft-stale).
-        # Verify the helper was called; the erase-vs-stale distinction is tested in
-        # the store unit tests (TestDiscardKeys in test_memory_persistence/store tests).
+        # store.discard_keys must be called with mode="erase" — full retirement
+        # (entries + registry/simhash + bookkeeping dropped in lockstep, via
+        # delegation to MemoryStore.delete per key), not soft-stale.  Verify the
+        # helper was called; the erase contract itself is pinned in
+        # tests/test_memory_store.py::TestDiscardKeys.
         loop.store.discard_keys.assert_called_once_with(sorted(keys), mode="erase")
 
         # registry.save called with the episodic adapter path (episodic contains the keys).
@@ -412,7 +474,7 @@ class TestPendingSessionDiscard:
 
 
 class TestErrorCases:
-    """consolidation_loop is None → 503; unsupported strategy → 400."""
+    """consolidation_loop is None → 503."""
 
     def test_consolidation_loop_none_returns_503(self, tmp_path, monkeypatch):
         """When consolidation_loop is None, endpoint returns 503 with not_ready detail."""
@@ -430,8 +492,10 @@ class TestErrorCases:
         detail = resp.json().get("detail", {})
         assert detail.get("status") == "not_ready"
 
-    def test_unsupported_strategy_returns_400(self, tmp_path, monkeypatch):
-        """Requesting an unsupported strategy returns 400."""
+    def test_legacy_strategy_field_is_ignored_not_rejected(self, tmp_path, monkeypatch):
+        """A caller still sending a retired ``strategy`` field is unaffected: the
+        request schema's default ``extra="ignore"`` (pydantic) drops the field
+        silently and the erase proceeds normally rather than 400ing."""
         speaker_id = "speaker0"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
@@ -444,12 +508,10 @@ class TestErrorCases:
         client = _make_client(monkeypatch, state)
         resp = client.post(
             "/speaker/forget",
-            json={"speaker_id": speaker_id, "strategy": "discard_interim"},
+            json={"speaker_id": speaker_id, "strategy": "mark_stale"},
         )
 
-        assert resp.status_code == 400
-        detail = resp.json().get("detail", {})
-        assert detail.get("status") == "unsupported_strategy"
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +586,7 @@ class TestLiveSlotManifestReStamp:
         ep_reg.add(key_to_keep)
 
         # Build the loop mock, using the real MemoryStore for registry + discard_keys.
-        loop = MagicMock()
-        loop.store = real_store
+        loop = _make_loop_with_store(real_store)
 
         # Add a simhash entry so the simhash-clean branch is exercised too.
         # IMPORTANT: this must happen BEFORE computing H_old so that save_bytes()
@@ -579,8 +640,7 @@ class TestLiveSlotManifestReStamp:
         assert find_live_slot(kind_dir, h_old) == slot_dir
 
         # Build config pointing at tmp_path/adapters.
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path / "adapters"
+        cfg = _make_config(tmp_path)
 
         state = _make_state(
             tmp_path,
@@ -679,11 +739,9 @@ class TestLiveSlotManifestReStamp:
         kind_dir = tmp_path / "adapters" / tier_name
         assert find_live_slot(kind_dir, h_legacy) == slot_dir
 
-        loop = MagicMock()
-        loop.store = real_store
+        loop = _make_loop_with_store(real_store)
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path / "adapters"
+        cfg = _make_config(tmp_path)
 
         state = _make_state(
             tmp_path,
@@ -747,11 +805,9 @@ class TestLiveSlotManifestReStamp:
         mismatched_manifest = _minimal_manifest_for_tier(tier_name, "deadbeef" * 8, key_count=1)
         write_manifest(slot_dir, mismatched_manifest)
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path / "adapters"
+        cfg = _make_config(tmp_path)
 
-        loop = MagicMock()
-        loop.store = real_store
+        loop = _make_loop_with_store(real_store)
 
         state = _make_state(
             tmp_path,
@@ -797,9 +853,7 @@ class TestLiveSlotManifestReStamp:
         # Deliberately NOT saved to disk — no indexed_key_registry.json
         # exists, so tier_registry_sha256 (the pre-erase hash) is "".
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path / "adapters"
-        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+        cfg = _make_config(tmp_path)
 
         # A stray slot dir with a manifest that must be left byte-for-byte
         # untouched — proves the skip branch never re-stamps anything for
@@ -810,8 +864,7 @@ class TestLiveSlotManifestReStamp:
         stray_manifest = _minimal_manifest_for_tier(tier_name, "unrelated" * 8, key_count=0)
         write_manifest(slot_dir, stray_manifest)
 
-        loop = MagicMock()
-        loop.store = real_store
+        loop = _make_loop_with_store(real_store)
 
         state = _make_state(
             tmp_path,
@@ -836,6 +889,56 @@ class TestLiveSlotManifestReStamp:
 
         # No manifest touched.
         assert read_manifest(slot_dir) == stray_manifest
+
+    def test_simulate_venue_no_weight_slot_no_error_log(self, tmp_path, monkeypatch, caplog):
+        """Simulate-mode forget: the tier registry is real and present on
+        disk (non-empty pre-erase hash) but no weight-slot manifest exists
+        at all — the simulate venue never mints one.  find_live_slot would
+        always return None here, which is NOT "the slot is orphaned"; it is
+        "there is no slot to re-stamp".  Must not log an ERROR."""
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            relation_type="factual",
+            first_seen="",
+        )
+
+        # A real, non-empty pre-erase registry on disk — the simulate venue
+        # writes indexed_key_registry.json same as train — but NO weight-slot
+        # subdirectory (no meta.json) anywhere under the tier root.
+        cfg = _make_config(tmp_path)
+        registry_path = cfg.adapter_dir / tier_name / "indexed_key_registry.json"
+        ep_reg.save(registry_path)
+
+        loop = _make_loop_with_store(real_store)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        caplog.set_level(logging.DEBUG, logger="paramem.server.app")
+        with patch("paramem.adapters.manifest.find_live_slot") as mock_find_live_slot:
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        mock_find_live_slot.assert_not_called()
+
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_messages == [], (
+            f"simulate-venue forget must not log an ERROR; got: {error_messages}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -907,11 +1010,10 @@ class TestInterimTierForget:
         original_manifest = _minimal_manifest_for_tier(tier_name, h_old, key_count=2)
         write_manifest(slot_dir, original_manifest)
 
-        cfg = MagicMock()
-        cfg.adapter_dir = adapter_dir
+        cfg = _make_config(tmp_path)
+        assert cfg.adapter_dir == adapter_dir
 
-        loop = MagicMock()
-        loop.store = real_store
+        loop = _make_loop_with_store(real_store)
 
         state = _make_state(
             tmp_path,
@@ -975,12 +1077,9 @@ class TestInterimTierForget:
             first_seen="",
         )
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path / "adapters"
-        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+        cfg = _make_config(tmp_path)
 
-        loop = MagicMock()
-        loop.store = real_store
+        loop = _make_loop_with_store(real_store)
 
         speaker_store = _make_speaker_store(speaker_id)
         buffer = _make_buffer(speaker_id, [])
@@ -1005,3 +1104,406 @@ class TestInterimTierForget:
         # before ANY mutation, not just before the registry erase.
         speaker_store.remove.assert_not_called()
         buffer.discard_sessions.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Full retirement: repeat-forget idempotency, entry/bookkeeping/router state,
+# and promoted_keys + key_metadata.json rewrite
+# ---------------------------------------------------------------------------
+
+
+class TestFullRetirement:
+    """The erased key is gone from every RAM structure and from
+    ``key_metadata.json`` — not just the registry pointer."""
+
+    def test_repeat_forget_is_idempotent(self, tmp_path, monkeypatch):
+        """A second forget for the same speaker reports nothing left to erase."""
+        speaker_id = "speaker0"
+        key = "graph1"
+
+        real_store = MemoryStore(replay_enabled=True)
+        real_store.put(
+            "episodic",
+            key,
+            {"key": key, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            simhash=compute_simhash(key, "Alice", "lives_in", "Berlin"),
+        )
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        # A real SpeakerStore.remove returns True only the first time (the
+        # profile is gone on the second call) — model that here since this
+        # test uses a mock speaker_store.
+        speaker_store = _make_speaker_store(speaker_id)
+        speaker_store.remove.side_effect = [True, False]
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=speaker_store,
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+        client = _make_client(monkeypatch, state)
+
+        first = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        assert first.status_code == 200, first.text
+        assert first.json()["stale_keys"] == [key]
+
+        second = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["stale_keys"] == []
+        assert body["removed_speaker"] is False
+
+    def test_bookkeeping_entries_and_router_index_cleared(self, tmp_path, monkeypatch):
+        """After forget: bookkeeping gone, entry payload gone, and a QueryRouter
+        rebuilt on the same store indexes no keys for the speaker."""
+        from paramem.server.router import QueryRouter
+
+        speaker_id = "speaker0"
+        key = "graph1"
+
+        real_store = MemoryStore(replay_enabled=True)
+        real_store.put(
+            "episodic",
+            key,
+            {"key": key, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            simhash=compute_simhash(key, "Alice", "lives_in", "Berlin"),
+        )
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        assert resp.status_code == 200, resp.text
+
+        assert real_store.bookkeeping_for_key(key) is None
+        assert real_store.get(key) is None
+
+        router = QueryRouter(cfg.adapter_dir, real_store)
+        assert router._speaker_key_index.get(speaker_id, set()) == set()
+
+    def test_promoted_keys_and_key_metadata_rewritten(self, tmp_path, monkeypatch):
+        """loop.promoted_keys drops the forgotten key and key_metadata.json on
+        disk is rewritten without it; a surviving key is untouched."""
+        from paramem.backup.encryption import read_maybe_encrypted
+
+        speaker_id = "speaker0"
+        forgotten = "graph1"
+        surviving = "graph2"
+
+        real_store = MemoryStore(replay_enabled=True)
+        real_store.put(
+            "episodic",
+            forgotten,
+            {"key": forgotten, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            simhash=compute_simhash(forgotten, "Alice", "lives_in", "Berlin"),
+        )
+        real_store.set_bookkeeping(
+            forgotten, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+        real_store.put(
+            "episodic",
+            surviving,
+            {"key": surviving, "subject": "Bob", "predicate": "has_job", "object": "Engineer"},
+            simhash=compute_simhash(surviving, "Bob", "has_job", "Engineer"),
+        )
+        real_store.set_bookkeeping(
+            surviving, speaker_id="speaker1", relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        loop.promoted_keys = {forgotten, surviving}
+
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        assert resp.status_code == 200, resp.text
+
+        assert forgotten not in loop.promoted_keys
+        assert surviving in loop.promoted_keys
+
+        raw = read_maybe_encrypted(cfg.key_metadata_path)
+        metadata = json.loads(raw.decode("utf-8"))
+        assert forgotten not in metadata["keys"]
+        assert forgotten not in metadata["promoted_keys"]
+        assert surviving in metadata["keys"]
+        assert surviving in metadata["promoted_keys"]
+
+
+# ---------------------------------------------------------------------------
+# Simulate-mode graph.json content erasure
+# ---------------------------------------------------------------------------
+
+
+class TestGraphContentErasure:
+    """The fact content in a tier's on-disk ``graph.json`` is erased, not
+    just the registry pointer — the resurrection surface closed by
+    ``erase_keys_from_graph_file``."""
+
+    def test_main_tier_graph_edge_erased_survivor_kept(self, tmp_path, monkeypatch):
+        """A main-tier graph.json: the erased key's edge is removed; the
+        surviving edge's data (and its otherwise-isolated node) survive
+        unchanged, and the file still exists afterward."""
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        cfg = _make_config(tmp_path)
+        graph_path = cfg.adapter_dir / tier_name / "graph.json"
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "Alice",
+            "Berlin",
+            **{_IK_KEY_ATTR: key_to_forget, "predicate": "lives_in", "speaker_id": speaker_id},
+        )
+        g.add_edge(
+            "Bob",
+            "Engineer",
+            **{_IK_KEY_ATTR: key_to_keep, "predicate": "has_job", "speaker_id": "speaker1"},
+        )
+        save_memory_to_disk(g, graph_path)
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        assert graph_path.exists()
+
+        g2 = load_memory_from_disk(graph_path)
+        entries = {e["key"]: e for e in iter_entries(g2)}
+        assert key_to_forget not in entries
+        assert key_to_keep in entries
+        assert entries[key_to_keep]["subject"] == "Bob"
+        assert entries[key_to_keep]["object"] == "Engineer"
+        assert entries[key_to_keep]["predicate"] == "has_job"
+        assert entries[key_to_keep]["speaker_id"] == "speaker1"
+        assert "Alice" not in g2
+        assert "Berlin" not in g2
+
+    def test_interim_slot_graph_edge_erased(self, tmp_path, monkeypatch):
+        """An interim-slot graph.json (nested ``episodic/interim_<stamp>/``
+        layout): the nested file is the one rewritten — no legacy top-level
+        dir is minted, extending the existing interim layout assertions."""
+        from paramem.memory.interim_adapter import (
+            INTERIM_NAME_PREFIX,
+            detect_legacy_adapter_layout,
+        )
+
+        stamp = "20260803T1200"
+        tier_name = f"{INTERIM_NAME_PREFIX}{stamp}"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        adapter_dir = cfg.adapter_dir
+
+        real_store = MemoryStore(replay_enabled=True)
+        interim_reg = real_store.registry(tier_name)
+        interim_reg.add(key_to_forget)
+        interim_reg.add(key_to_keep)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="episodic", first_seen=""
+        )
+
+        interim_root = adapter_dir / "episodic" / f"interim_{stamp}"
+        graph_path = interim_root / "graph.json"
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "Alice",
+            "Berlin",
+            **{_IK_KEY_ATTR: key_to_forget, "predicate": "lives_in", "speaker_id": speaker_id},
+        )
+        g.add_edge(
+            "Carl",
+            "Chess",
+            **{_IK_KEY_ATTR: key_to_keep, "predicate": "likes", "speaker_id": "speaker1"},
+        )
+        save_memory_to_disk(g, graph_path)
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+
+        # No legacy top-level dir was minted.
+        assert detect_legacy_adapter_layout(adapter_dir) == []
+        assert not (adapter_dir / tier_name).exists()
+
+        # The nested file is the one rewritten.
+        assert graph_path.exists()
+        g2 = load_memory_from_disk(graph_path)
+        entries = {e["key"]: e for e in iter_entries(g2)}
+        assert key_to_forget not in entries
+        assert key_to_keep in entries
+
+
+# ---------------------------------------------------------------------------
+# Integration: the real handler's output fed to the real migrate() — the
+# composition where the resurrection defect actually happened.
+# ---------------------------------------------------------------------------
+
+
+class TestForgetThenMigrateDoesNotResurrect:
+    """Run the real ``/speaker/forget`` handler over a real on-disk simulate
+    tier, then run ``active_store_migration.migrate()`` against that exact
+    output directory with the GPU stack stubbed exactly as
+    ``test_active_store_migration.py::TestMigrateTierSimulateToTrain
+    .test_happy_path_orchestration`` does — nothing erased comes back.
+
+    Other tests in this file and in ``test_active_store_migration.py`` pin
+    the two halves — the graph erase and the migration filter — in
+    isolation; this test pins the composition, which is where the
+    resurrection defect actually happened.
+    """
+
+    def test_forget_then_migrate_does_not_resurrect_erased_key(self, tmp_path, monkeypatch):
+        from paramem.server.active_store_migration import MigrationState, migrate
+
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        cfg = _make_config(tmp_path)
+        graph_path = cfg.adapter_dir / tier_name / "graph.json"
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "Alice",
+            "Berlin",
+            **{_IK_KEY_ATTR: key_to_forget, "predicate": "lives_in", "speaker_id": speaker_id},
+        )
+        g.add_edge(
+            "Bob",
+            "Engineer",
+            **{_IK_KEY_ATTR: key_to_keep, "predicate": "has_job", "speaker_id": "speaker1"},
+        )
+        save_memory_to_disk(g, graph_path)
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        # --- run the real /speaker/forget handler ---
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["stale_keys"] == [key_to_forget]
+
+        # --- run the real migrate() against the handler's own output dir,
+        # with the GPU stack stubbed like test_happy_path_orchestration ---
+        loop.episodic_config = MagicMock()
+        loop.semantic_config = MagicMock()
+        loop.procedural_config = MagicMock()
+        loop.training_config = MagicMock(num_epochs=2)
+        loop.config = MagicMock()
+        loop.config.recall_sanity_threshold = 1.0
+        loop.model = MagicMock()
+        loop.model.peft_config = {}
+        loop.tokenizer = MagicMock()
+        loop.fingerprint_cache = None
+        loop._train_tier_adapter.return_value = ({"aborted": False}, None)
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        def _fake_cache_entry(*, key, subject, predicate, object, speaker_id, **_kw):
+            return {
+                "key": key,
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+                "speaker_id": speaker_id,
+            }
+
+        loop._cache_entry.side_effect = _fake_cache_entry
+
+        slot_path = cfg.adapter_dir / tier_name / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.build_registry",
+                return_value={key_to_keep: 0},
+            ),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            migration_state = MigrationState.for_mode_switch(
+                source_mode="simulate", target_mode="train"
+            )
+            migrate(loop, cfg, migration_state)
+
+        assert loop._train_tier_adapter.call_count == 1
+        trained_entries = loop._train_tier_adapter.call_args.args[0]
+        trained_keys = {e["key"] for e in trained_entries}
+        assert key_to_forget not in trained_keys, (
+            f"erased key resurrected in migrated entries: {trained_keys}"
+        )
+        assert trained_keys == {key_to_keep}
+
+        post_registry = real_store.registry(tier_name)
+        assert not post_registry.knows(key_to_forget)
+
+        on_disk_registry_path = cfg.adapter_dir / tier_name / "indexed_key_registry.json"
+        on_disk = json.loads(on_disk_registry_path.read_bytes())
+        assert key_to_forget not in on_disk.get("active_keys", [])

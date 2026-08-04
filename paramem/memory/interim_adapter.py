@@ -23,6 +23,8 @@ Callers (wiring schedule):
       mints a new interim adapter slot during an interim training tick.
   Full consolidation fold (ConsolidationLoop.consolidate) — calls
       unload_interim_adapters as phase 3 of the atomic finalize sequence.
+  POST /interim/discard (paramem.server.app) — calls unload_interim_adapters
+      to reap the ring without folding it into the main tiers first.
 
 SOLE-ADAPTER TRAP NOTE: unload_interim_adapters is only safe to call while
 the three main adapters (episodic, semantic, procedural) are still loaded.
@@ -30,6 +32,14 @@ The sole-adapter trap (delete_adapter → create_adapter on a PeftModel with
 zero remaining adapters) does NOT apply here because the mains survive the
 call. Do NOT call unload_interim_adapters before confirming the main adapters
 are present in model.peft_config.
+
+ACTIVE-ADAPTER DETERMINISM: unload_interim_adapters switches the active
+adapter to "episodic" (when present) before deleting any interim adapter.
+PEFT's delete_adapter silently reassigns the active adapter to whichever
+resident adapter it meets first when the deleted one was active — the
+switch-before-delete makes the post-reap active adapter deterministic for
+every caller, not just the ones that happen to restore "episodic" themselves
+afterward.
 """
 
 from __future__ import annotations
@@ -42,7 +52,7 @@ from pathlib import Path
 
 from peft import PeftModel
 
-from paramem.models.loader import create_adapter
+from paramem.models.loader import create_adapter, switch_adapter
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.utils.config import AdapterConfig
 
@@ -363,6 +373,13 @@ def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
     The three main adapters (episodic, semantic, procedural) remain loaded
     throughout — the sole-adapter trap does not apply.
 
+    Before any ``delete_adapter`` call, the active adapter is switched to
+    "episodic" (when present in ``model.peft_config``) so the post-reap
+    active adapter is deterministic regardless of which adapter happened to
+    be active when this was called — see the module docstring's
+    ACTIVE-ADAPTER DETERMINISM note for why the switch lives here rather
+    than at each call site.
+
     Args:
         model: Live model.  A :class:`~peft.PeftModel` has its interim adapters
             deleted and must contain at least one main adapter so
@@ -380,6 +397,8 @@ def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
         if isinstance(model, PeftModel)
         else []
     )
+    if interim_names and "episodic" in model.peft_config:
+        switch_adapter(model, "episodic")
     for name in interim_names:
         model.delete_adapter(name)
         logger.info("Deleted interim adapter from PEFT: %s", name)

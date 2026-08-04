@@ -797,6 +797,66 @@ class TestStagingAdapterGPU:
         )
 
 
+# --- 7b2. unload_interim_adapters switch-before-delete guard, real PeftModel ---
+
+
+class TestUnloadInterimAdaptersSwitchGPU:
+    """Real-model integration for the switch-before-delete guard added to
+    ``unload_interim_adapters`` (``paramem/memory/interim_adapter.py``).
+
+    Unit tests (``tests/test_interim_adapter_lifecycle.py``) mock the model
+    entirely, so they cannot observe PEFT's actual ``delete_adapter``
+    reassignment behaviour — the hazard the guard exists for
+    (``consolidation.py:3830-3844``: deleting the active adapter leaves PEFT
+    to silently reassign to whichever resident adapter it meets first).
+    This proves the guard against a real ``PeftModel`` with real
+    LoRA-injected modules.
+    """
+
+    def test_switches_to_episodic_before_deleting_a_real_interim_adapter(
+        self, model_and_tokenizer, tmp_path
+    ):
+        from peft import PeftModel
+
+        from paramem.memory.interim_adapter import interim_dir_for_name, unload_interim_adapters
+        from paramem.models.loader import active_adapter_name, create_adapter, switch_adapter
+        from paramem.utils.config import AdapterConfig
+
+        model, _tokenizer = model_and_tokenizer
+        cfg = AdapterConfig()
+
+        created_episodic = not isinstance(model, PeftModel) or "episodic" not in model.peft_config
+        if created_episodic:
+            model = create_adapter(model, cfg, "episodic")
+
+        interim_name = "episodic_interim_20260804T0000"
+        model = create_adapter(model, cfg, interim_name)
+
+        try:
+            # Mirror the production hazard the guard exists for: an interim
+            # adapter can legitimately be active when the reap runs (the
+            # router probes interim tiers by name — router.py:288-336).
+            switch_adapter(model, interim_name)
+            assert active_adapter_name(model) == interim_name
+
+            slot_dir = interim_dir_for_name(tmp_path, interim_name)
+            slot_dir.mkdir(parents=True)
+
+            unloaded = unload_interim_adapters(model, tmp_path)
+
+            assert unloaded == [interim_name]
+            assert interim_name not in model.peft_config
+            assert not slot_dir.exists()
+            # Proven against real delete_adapter reassignment, not a mock:
+            # the active adapter is deterministically "episodic".
+            assert active_adapter_name(model) == "episodic"
+        finally:
+            if interim_name in model.peft_config:
+                model.delete_adapter(interim_name)
+            if created_episodic and "episodic" in model.peft_config:
+                model.delete_adapter("episodic")
+
+
 # --- 7c. ExtractionPipeline.run chokepoint end-to-end on GPU ---
 
 

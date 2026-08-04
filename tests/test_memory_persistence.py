@@ -24,6 +24,7 @@ from paramem.memory.persistence import (
     _IK_KEY_ATTR,
     build_tier_graph_from_store,
     entry_by_key,
+    erase_keys_from_graph_file,
     iter_entries,
     load_memory_from_disk,
     save_memory_to_disk,
@@ -638,3 +639,142 @@ class TestEncryptionRoundTrip:
         # Plaintext must be valid JSON and contain the "directed" key.
         parsed = json.loads(raw.decode("utf-8"))
         assert "directed" in parsed
+
+
+# ---------------------------------------------------------------------------
+# 11. erase_keys_from_graph_file: surgical edge removal
+# ---------------------------------------------------------------------------
+
+
+class TestEraseKeysFromGraphFile:
+    def test_missing_file_returns_zero_no_write(self, tmp_path):
+        """Absent file → 0, and no file is created."""
+        path = tmp_path / "graph.json"
+        result = erase_keys_from_graph_file(path, {"graph1"})
+        assert result == 0
+        assert not path.exists()
+
+    def test_no_matching_edge_returns_zero_file_unchanged(self, tmp_path):
+        """A present file with no edge matching *keys* → 0, bytes unchanged."""
+        g = _make_simple_graph()  # single edge, key="graph1"
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+        before = path.read_bytes()
+
+        result = erase_keys_from_graph_file(path, {"graph_absent"})
+
+        assert result == 0
+        assert path.read_bytes() == before
+
+    def test_removes_matching_edge_keeps_surviving_edge(self, tmp_path):
+        """The named key's edge is removed; a sibling edge's data is unchanged."""
+        g = nx.MultiDiGraph()
+        _add_keyed_edge(
+            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        )
+        _add_keyed_edge(
+            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
+        )
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+
+        removed = erase_keys_from_graph_file(path, {"graph1"})
+
+        assert removed == 1
+        g2 = load_memory_from_disk(path)
+        entries = {e["key"]: e for e in iter_entries(g2)}
+        assert "graph1" not in entries
+        assert "graph2" in entries
+        assert entries["graph2"]["subject"] == "Bob"
+        assert entries["graph2"]["object"] == "Engineer"
+        assert entries["graph2"]["predicate"] == "has_job"
+        assert entries["graph2"]["speaker_id"] == "S1"
+
+    def test_removes_multiple_keys_in_one_pass(self, tmp_path):
+        """All edges whose ik_key is in *keys* are removed in a single write."""
+        g = nx.MultiDiGraph()
+        _add_keyed_edge(
+            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        )
+        _add_keyed_edge(
+            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
+        )
+        _add_keyed_edge(
+            g, "Carl", "Chess", indexed_key="graph3", predicate="likes", speaker_id="S2"
+        )
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+
+        removed = erase_keys_from_graph_file(path, {"graph1", "graph3"})
+
+        assert removed == 2
+        g2 = load_memory_from_disk(path)
+        keys = {e["key"] for e in iter_entries(g2)}
+        assert keys == {"graph2"}
+
+    def test_isolated_node_dropped_after_edge_removal(self, tmp_path):
+        """A node left with degree 0 by the erase is dropped from the graph."""
+        g = _make_simple_graph(subject="Alice", object_="Berlin")  # only edge: Alice->Berlin
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+
+        removed = erase_keys_from_graph_file(path, {"graph1"})
+
+        assert removed == 1
+        g2 = load_memory_from_disk(path)
+        assert g2.number_of_nodes() == 0
+        assert "Alice" not in g2
+        assert "Berlin" not in g2
+
+    def test_node_still_in_use_by_surviving_edge_is_kept(self, tmp_path):
+        """A node shared by an erased edge and a surviving edge is not dropped."""
+        g = nx.MultiDiGraph()
+        _add_keyed_edge(
+            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        )
+        _add_keyed_edge(
+            g, "Alice", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S0"
+        )
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+
+        removed = erase_keys_from_graph_file(path, {"graph1"})
+
+        assert removed == 1
+        g2 = load_memory_from_disk(path)
+        assert "Alice" in g2
+        assert "Berlin" not in g2
+        entries = list(iter_entries(g2))
+        assert len(entries) == 1
+        assert entries[0]["key"] == "graph2"
+
+    def test_write_stays_atomic_and_envelope_aware(self, tmp_path, monkeypatch):
+        """The write goes through save_memory_to_disk: an age-wrapped file
+        stays age-wrapped after erase, and the survivor decrypts correctly."""
+        _setup_daily(tmp_path, monkeypatch)
+        g = nx.MultiDiGraph()
+        _add_keyed_edge(
+            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        )
+        _add_keyed_edge(
+            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
+        )
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+
+        removed = erase_keys_from_graph_file(path, {"graph1"})
+
+        assert removed == 1
+        raw = path.read_bytes()
+        assert raw.startswith(AGE_MAGIC), "erase write must stay age-wrapped"
+        g2 = load_memory_from_disk(path)
+        keys = {e["key"] for e in iter_entries(g2)}
+        assert keys == {"graph2"}
+
+    def test_returns_int_count(self, tmp_path):
+        """The return value is an int, not a bool or other truthy type."""
+        g = _make_simple_graph()
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+        result = erase_keys_from_graph_file(path, {"graph1"})
+        assert type(result) is int

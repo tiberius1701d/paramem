@@ -159,11 +159,13 @@ class BundleManifest:
     label : str | None
         Optional operator-supplied annotation.
     live_registry_sha256 : str
-        SHA-256 hex of the registry (``key_metadata.json``) bytes at bundle
-        creation time.  This hash ties the captured adapter weights to the
-        captured registry: ``find_live_slot(adapter_kind_dir,
-        live_registry_sha256)`` selects exactly the weights stored in this
-        bundle.
+        SHA-256 hex of ``key_metadata.json`` at bundle creation time.
+        Provenance only — it is not used to select any slot.  Slot selection
+        is per-tier: each captured slot is resolved with
+        ``find_live_slot(adapter_kind_dir, tier_registry_sha256(adapter_kind_dir))``
+        (``backup.py:858``) and its own hash is recorded at
+        ``adapters.<name>.registry_sha256``; a single global hash cannot
+        address both main and interim tiers (``backup.py:847-848``).
     base_model : dict
         Base-model identity copied from the first enabled adapter's
         ``meta.json``.  Expected keys: ``repo`` (str), ``sha`` (str),

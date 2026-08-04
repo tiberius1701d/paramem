@@ -12,8 +12,18 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
 
+from paramem.adapters.manifest import (
+    MANIFEST_SCHEMA_VERSION,
+    AdapterManifest,
+    BaseModelFingerprint,
+    LoRAShape,
+    TokenizerFingerprint,
+    tier_registry_sha256,
+    write_manifest,
+)
 from paramem.server.migration import (
     compute_base_change,
     compute_shape_changes,
@@ -178,20 +188,20 @@ class TestDetectSimulateMode:
 class TestComputeShapeChangesNoManifest:
     def test_empty_adapters_returns_empty(self, tmp_path):
         """Empty adapters section → no shape changes."""
-        result = compute_shape_changes({}, tmp_path, "")
+        result = compute_shape_changes({}, tmp_path)
         assert result == []
 
     def test_disabled_adapter_is_skipped(self, tmp_path):
         """Adapter with enabled=False is not checked."""
         yaml = {"adapters": {"episodic": {"enabled": False, "rank": 16}}}
-        result = compute_shape_changes(yaml, tmp_path, "")
+        result = compute_shape_changes(yaml, tmp_path)
         assert result == []
 
     def test_missing_slot_skips_silently(self, tmp_path):
         """No matching slot → no row emitted."""
         yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
         # No slot directory created — find_live_slot returns None
-        result = compute_shape_changes(yaml, tmp_path, "")
+        result = compute_shape_changes(yaml, tmp_path)
         assert result == []
 
 
@@ -223,7 +233,7 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path, "")
+            result = compute_shape_changes(yaml, tmp_path)
 
         assert any(r["field"] == "rank" and r["adapter"] == "episodic" for r in result), result
 
@@ -239,7 +249,7 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path, "")
+            result = compute_shape_changes(yaml, tmp_path)
 
         assert any(r["field"] == "alpha" for r in result), result
 
@@ -255,7 +265,7 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path, "")
+            result = compute_shape_changes(yaml, tmp_path)
 
         assert result == []
 
@@ -278,7 +288,7 @@ class TestComputeShapeChangesWithManifest:
                 side_effect=ManifestSchemaError("bad json"),
             ),
         ):
-            result = compute_shape_changes(yaml_data, tmp_path, "")
+            result = compute_shape_changes(yaml_data, tmp_path)
 
         # No row emitted — the unreadable manifest is silently skipped.
         assert result == []
@@ -306,9 +316,158 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path, "")
+            result = compute_shape_changes(yaml, tmp_path)
 
         assert any(r["field"] == "target_modules" for r in result), result
+
+
+# ---------------------------------------------------------------------------
+# compute_shape_changes — per-tier registry hash (no live_registry_sha256
+# parameter; each adapter's own tier registry hash resolves its live slot)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeShapeChangesLiveSlotIntegration:
+    """Regression coverage for the per-tier hash fix.
+
+    Before the fix, ``compute_shape_changes`` took a single caller-supplied
+    ``live_registry_sha256`` hashed from ``key_metadata.json`` — a file no
+    manifest writer ever stamps a slot with (every writer stamps the
+    *tier's own* ``indexed_key_registry.json`` hash via
+    ``tier_registry_sha256``).  The two digests could never be equal, so
+    ``find_live_slot`` always returned ``None`` and shape detection never
+    fired.  These tests use real registry files and real manifest slots —
+    no ``find_live_slot``/``read_manifest`` mocking — so they fail against
+    the pre-fix signature/behaviour and pass once the hash is resolved
+    per-adapter inside the loop.
+    """
+
+    def _write_slot_for(
+        self,
+        adapter_dir,
+        adapter_name: str,
+        registry_payload: bytes,
+        *,
+        rank: int = 8,
+        alpha: int = 16,
+    ):
+        """Write a real tier registry plus a manifest slot stamped with its
+        own ``tier_registry_sha256`` hash; return the slot directory."""
+        tier_root = adapter_dir / adapter_name
+        tier_root.mkdir(parents=True, exist_ok=True)
+        (tier_root / "indexed_key_registry.json").write_bytes(registry_payload)
+        live_hash = tier_registry_sha256(tier_root)
+
+        slot = tier_root / "20260421-040000"
+        slot.mkdir(parents=True)
+        manifest = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=adapter_name,
+            trained_at="2026-04-21T04:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+            ),
+            lora=LoRAShape(
+                rank=rank, alpha=alpha, dropout=0.0, target_modules=("q_proj", "v_proj")
+            ),
+            registry_sha256=live_hash,
+            key_count=1,
+        )
+        write_manifest(slot, manifest)
+        return slot
+
+    def test_shape_change_detected_against_live_slot(self, tmp_path):
+        """A real tier registry + a slot stamped with its own hash: shape
+        detection finds the live slot and emits the rank-change row."""
+        self._write_slot_for(
+            tmp_path,
+            "episodic",
+            b'{"active_keys": ["graph1"], "stale": {}, "simhash": {}}',
+            rank=8,
+            alpha=16,
+        )
+        yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16, "alpha": 16}}}
+
+        result = compute_shape_changes(yaml, tmp_path)
+
+        assert len(result) == 1
+        assert result[0]["adapter"] == "episodic"
+        assert result[0]["field"] == "rank"
+
+    def test_two_adapters_each_resolved_by_own_registry_hash(self, tmp_path):
+        """Two enabled adapters with different registry content, each slot
+        stamped with its own hash: a single global hash could never address
+        both tiers, but per-tier resolution yields a row for each."""
+        self._write_slot_for(
+            tmp_path,
+            "episodic",
+            b'{"active_keys": ["graph1"], "stale": {}, "simhash": {}}',
+            rank=8,
+            alpha=16,
+        )
+        self._write_slot_for(
+            tmp_path,
+            "semantic",
+            b'{"active_keys": ["graph2", "graph3"], "stale": {}, "simhash": {}}',
+            rank=8,
+            alpha=16,
+        )
+        yaml = {
+            "adapters": {
+                "episodic": {"enabled": True, "rank": 16, "alpha": 16},
+                "semantic": {"enabled": True, "rank": 8, "alpha": 32},
+            }
+        }
+
+        result = compute_shape_changes(yaml, tmp_path)
+
+        by_adapter = {(r["adapter"], r["field"]) for r in result}
+        assert ("episodic", "rank") in by_adapter
+        assert ("semantic", "alpha") in by_adapter
+        assert len(result) == 2
+
+    def test_decrypt_failure_skips_with_warn_other_adapter_still_returns(self, tmp_path, caplog):
+        """A read/decrypt failure resolving one adapter's tier registry hash
+        is skipped with a WARNING and no raise; a second healthy adapter
+        still yields its row."""
+        self._write_slot_for(
+            tmp_path,
+            "semantic",
+            b'{"active_keys": ["graph2"], "stale": {}, "simhash": {}}',
+            rank=8,
+            alpha=16,
+        )
+        (tmp_path / "episodic").mkdir(parents=True)
+
+        real_tier_registry_sha256 = tier_registry_sha256
+
+        def side_effect(kind_dir):
+            if kind_dir.name == "episodic":
+                raise RuntimeError("simulated decrypt failure")
+            return real_tier_registry_sha256(kind_dir)
+
+        yaml = {
+            "adapters": {
+                "episodic": {"enabled": True, "rank": 16},
+                "semantic": {"enabled": True, "alpha": 32},
+            }
+        }
+
+        with (
+            patch("paramem.server.migration.tier_registry_sha256", side_effect=side_effect),
+            caplog.at_level(logging.WARNING, logger="paramem.server.migration"),
+        ):
+            result = compute_shape_changes(yaml, tmp_path)
+
+        assert all(r["adapter"] != "episodic" for r in result)
+        assert any(r["adapter"] == "semantic" and r["field"] == "alpha" for r in result)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        warning_messages = [r.getMessage() for r in warnings]
+        assert any(
+            "episodic" in msg and "cannot read/decrypt" in msg for msg in warning_messages
+        ), f"expected a WARNING naming the skipped adapter; got: {warning_messages}"
 
 
 # ---------------------------------------------------------------------------

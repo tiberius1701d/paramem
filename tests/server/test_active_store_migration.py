@@ -495,6 +495,45 @@ class TestMigrateTierTrainToSimulate:
         assert len(entries) == 1
         assert entries[0]["speaker_id"] == "spk-alice"
 
+    def test_extra_graph_key_triggers_reconstruction(self, tmp_path):
+        """graph.json holds a key the active registry does NOT — the old
+        superset test (``all(k in graph_keys for k in active_keys)``) let
+        this through unnoticed; the equality check must still fire
+        reconstruction so a stray/stale graph edge cannot survive the
+        train→simulate switch."""
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
+
+        cfg = _make_config(tmp_path, mode="simulate")
+        keys = ["g0", "g1"]
+        loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
+
+        # Pre-write a graph.json that is a strict SUPERSET of the active keys:
+        # g0, g1, plus a stray "g_extra" the registry does not know.
+        target = cfg.adapter_dir / "episodic" / "graph.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        graph = nx.MultiDiGraph()
+        for key in [*keys, "g_extra"]:
+            eid = graph.add_edge("Subject", "Object", predicate="related_to")
+            graph["Subject"]["Object"][eid][_IK_KEY_ATTR] = key
+        save_memory_to_disk(graph, target)
+
+        reconstruction = self._make_graph_result("episodic", keys)
+
+        with patch(
+            "paramem.graph.reconstruct.reconstruct_graph",
+            return_value=reconstruction,
+        ) as mock_reconstruct:
+            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
+
+        mock_reconstruct.assert_called_once()
+
+        # Reconstruction rebuilds strictly from active keys — the stray key
+        # is gone from the rewritten graph.json.
+        loaded = load_memory_from_disk(target)
+        graph_keys = {q["key"] for q in iter_entries(loaded)}
+        assert graph_keys == set(keys)
+        assert "g_extra" not in graph_keys
+
 
 # ---------------------------------------------------------------------------
 # migrate() orchestrator
@@ -1104,6 +1143,137 @@ class TestMigrateTierSimulateToTrain:
         ):
             with pytest.raises(RuntimeError, match=r"recall .* < 0\.8"):
                 _migrate_tier_simulate_to_train(loop2, cfg2, "episodic")
+
+    def test_registry_filters_stale_graph_entry_not_reregistered(self, tmp_path):
+        """The resurrection regression: graph.json holds g0 and g1, but the
+        tier registry (models a crash between forget's registry.save and its
+        graph erase) knows only g1.  The entries reaching
+        ``loop._train_tier_adapter`` must contain only g1, and g0 must not be
+        re-registered into the tier registry.  Fails on the pre-fix code
+        (:568-578 re-registers g0 wholesale from graph.json)."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0"), _full_quad("g1")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        # The tier registry only knows g1 — g0 was already erased (forget ran,
+        # registry.save completed) but its graph.json edge survived a crash.
+        loop.store.registry("episodic").add("g1")
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g1": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        assert loop._train_tier_adapter.call_count == 1
+        trained_entries = loop._train_tier_adapter.call_args.args[0]
+        trained_keys = {e["key"] for e in trained_entries}
+        assert trained_keys == {"g1"}, f"g0 must be filtered out; got {trained_keys}"
+        assert not loop.store.registry("episodic").knows("g0"), (
+            "g0 must NOT be re-registered into the tier registry"
+        )
+
+    def test_absent_registry_file_migrates_all_entries_unfiltered(self, tmp_path):
+        """Registry file ABSENT (the commit_tier_slot torn-write case): an
+        empty in-memory registry with no on-disk file to corroborate it
+        cannot prove orphanhood, so every graph entry is still migrated
+        (matches test_happy_path_orchestration; TestMigrateTierSimulateToTrain
+        ._make_loop seeds an empty MemoryStore and writes no registry file at
+        the slot root, so this is the existing suite's normal case, pinned
+        explicitly here)."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0"), _full_quad("g1")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        assert loop.store.registry("episodic").list_known() == []
+        assert not (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        trained_entries = loop._train_tier_adapter.call_args.args[0]
+        trained_keys = {e["key"] for e in trained_entries}
+        assert trained_keys == {"g0", "g1"}
+
+    def test_present_but_empty_registry_file_skips_tier(self, tmp_path):
+        """Registry file PRESENT and empty is authoritative: forget can erase
+        a tier's last key (registry.save lands durably) and then crash
+        before its graph erase runs.  On-disk presence with zero known keys
+        proves the tier really has none, so migrate must skip the tier
+        rather than resurrect the stale graph content as a freshly-keyed
+        fact."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0"), _full_quad("g1")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        # An empty-but-present registry file at the canonical slot-root path.
+        _write_adapter_registry(cfg.adapter_dir, "episodic", [])
+        loop = self._make_loop()
+        assert loop.store.registry("episodic").list_known() == []
+
+        with pytest.raises(_TierSkipped, match="present and empty"):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        # Nothing was trained.
+        loop._train_tier_adapter.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Crash-window recovery via the real migrate() orchestrator
+# ---------------------------------------------------------------------------
+
+
+class TestForgetCrashWindowRecoveryViaMigrate:
+    """The registry is written durably before the graph erase in
+    ``POST /speaker/forget`` (``paramem/server/app.py::speaker_forget``); a
+    crash between the two leaves ``graph.json`` still holding the forgotten
+    key's edge while the on-disk registry already reports it gone.  The
+    real ``migrate()`` orchestrator must not resurrect that key."""
+
+    def test_migrate_skips_tier_left_in_crash_window_after_last_key_forgotten(self, tmp_path):
+        from paramem.training.key_registry import KeyRegistry
+
+        cfg = _make_config(tmp_path, mode="train")
+        key = "g0"
+        # graph.json still holds the "forgotten" key's edge — the forget
+        # handler's graph erase (persistence.erase_keys_from_graph_file)
+        # never ran before the crash.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", [_full_quad(key)])
+        # The registry write landed durably and is now empty — the tier's
+        # last key was already dropped from it (forget's registry.save
+        # completed before the crash).
+        _write_adapter_registry(cfg.adapter_dir, "episodic", [])
+
+        loop = MagicMock()
+        from paramem.memory.store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=True)
+        loop.store.load_registry("episodic", KeyRegistry())  # matches on-disk: empty
+
+        state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
+        result = migrate(loop, cfg, state)
+
+        # Tier is skipped (not trained), and the key is never re-registered.
+        assert "episodic" in result.completed_tiers
+        assert "episodic" not in result.failed_tiers
+        assert not loop.store.registry("episodic").knows(key)
+        loop._train_tier_adapter.assert_not_called()
+        # The stale graph.json is left on disk for the operator to clean up
+        # via the next full fold/reconcile — migrate() does not delete it on
+        # a skip (only on a successful migration).
+        assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
 
 
 # ---------------------------------------------------------------------------

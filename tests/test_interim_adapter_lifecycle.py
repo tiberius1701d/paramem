@@ -591,6 +591,51 @@ class TestUnloadInterimAdapters:
             "episodic_interim_20260418T0000",
         ]
 
+    def test_switches_to_episodic_before_first_delete(self, tmp_path: Path) -> None:
+        """set_adapter("episodic") is called BEFORE any delete_adapter call —
+        the post-delete active adapter must be deterministic (PEFT silently
+        reassigns the active adapter to whatever it meets first when the
+        deleted one was active)."""
+        model = _make_stub_peft_model(
+            "episodic",
+            "semantic",
+            "procedural",
+            "episodic_interim_20260417T0000",
+            "episodic_interim_20260418T0000",
+        )
+        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
+            (tmp_path / name).mkdir()
+
+        call_order: list[str] = []
+        model.set_adapter.side_effect = lambda name: call_order.append(f"set_adapter:{name}")
+        model.delete_adapter.side_effect = lambda name: call_order.append(f"delete_adapter:{name}")
+
+        unload_interim_adapters(model, tmp_path)
+
+        assert call_order[0] == "set_adapter:episodic"
+        assert call_order.count("set_adapter:episodic") == 1
+        delete_calls = [c for c in call_order if c.startswith("delete_adapter:")]
+        assert len(delete_calls) == 2
+        # The switch precedes every delete, not just the first.
+        assert call_order.index("set_adapter:episodic") < min(
+            call_order.index(c) for c in delete_calls
+        )
+
+    def test_no_switch_when_episodic_absent(self, tmp_path: Path) -> None:
+        """When "episodic" is not resident, set_adapter is never called and
+        the deletes still run (guard branch)."""
+        model = _make_stub_peft_model(
+            "semantic",
+            "procedural",
+            "episodic_interim_20260417T0000",
+        )
+        (tmp_path / "episodic_interim_20260417T0000").mkdir()
+
+        unload_interim_adapters(model, tmp_path)
+
+        model.set_adapter.assert_not_called()
+        model.delete_adapter.assert_called_once_with("episodic_interim_20260417T0000")
+
 
 # ---------------------------------------------------------------------------
 # Test 5 — unload_interim_adapters when no interim adapters present

@@ -414,12 +414,25 @@ def _migrate_tier_train_to_simulate(
     if not needs_reconstruction:
         loaded = load_memory_from_disk(target_graph)
         graph_keys = {q["key"] for q in iter_entries(loaded)}
-        if not all(k in graph_keys for k in active_keys):
+        active_key_set = set(active_keys)
+        if graph_keys != active_key_set:
+            # Equality, not a superset test: a graph carrying EXTRA (e.g.
+            # forgotten-but-not-yet-erased, or otherwise stale) keys must not
+            # pass as fresh — the registry is the lifecycle authority.
+            # reconstruct_graph rebuilds strictly from active_keys_in_tier
+            # (paramem.graph.reconstruct.reconstruct_graph probes
+            # active_keys_in_tier), so it cannot re-mint a key the registry
+            # does not know even though this branch fires more often than the
+            # old subset check.
             needs_reconstruction = True
+            missing = active_key_set - graph_keys
+            extra = graph_keys - active_key_set
             logger.info(
-                "train_to_simulate store %s: graph.json present but missing keys — "
-                "reconstructing from weights",
+                "train_to_simulate store %s: graph.json key set does not match the "
+                "active registry (missing=%d, extra=%d) — reconstructing from weights",
                 name,
+                len(missing),
+                len(extra),
             )
 
     if needs_reconstruction:
@@ -559,6 +572,64 @@ def _migrate_tier_simulate_to_train(
     entries = list(iter_entries(graph))
     if not entries:
         raise _TierSkipped(f"empty graph.json at {source_graph}")
+
+    # Registry-authoritative filter: a crash between the forget handler's
+    # registry.save and its graph erase (persistence.erase_keys_from_graph_file)
+    # can transiently leave graph.json a SUPERSET of the tier registry — a
+    # forgotten key's edge still on disk after the registry has already
+    # dropped it.  The registry is the lifecycle authority, so when it is
+    # non-empty, filter entries down to keys it still knows; this is the only
+    # thing standing between that crash window and a re-keyed fact (the
+    # forget handler deliberately writes the registry first).
+    known_keys = set(loop.store.registry(name).list_known())
+    if known_keys:
+        filtered_entries = [e for e in entries if e["key"] in known_keys]
+        dropped = len(entries) - len(filtered_entries)
+        if dropped:
+            logger.warning(
+                "simulate_to_train store %s: dropped %d graph entr%s not known to the "
+                "tier registry (stale/orphaned graph content, e.g. a crash between "
+                "forget's registry save and graph erase)",
+                name,
+                dropped,
+                "y" if dropped == 1 else "ies",
+            )
+        entries = filtered_entries
+        if not entries:
+            raise _TierSkipped(
+                f"all graph entries at {source_graph} filtered out — "
+                f"none are known to the {name} tier registry"
+            )
+    else:
+        # An empty in-memory registry is ambiguous UNLESS the on-disk file's
+        # presence disambiguates it:
+        #
+        # * Registry file PRESENT and empty is authoritative — forget can
+        #   erase a tier's last key (registry.save lands durably) and then
+        #   crash before its graph erase runs.  On-disk presence with zero
+        #   known keys proves the tier really has none, so the stale graph
+        #   content left behind must not resurrect as a freshly-keyed fact.
+        #   Skip the tier, matching how other already-refused tiers report.
+        # * Registry file ABSENT is the commit_tier_slot torn-write case (the
+        #   registry write never landed) — indistinguishable from a
+        #   transient unmounted tier and can never prove orphanhood, so all
+        #   entries are kept and a WARNING is logged instead (unchanged from
+        #   before this guard was added).
+        registry_file = slot_root / "indexed_key_registry.json"
+        if registry_file.exists():
+            raise _TierSkipped(
+                f"tier registry at {registry_file} is present and empty — treating "
+                f"{len(entries)} graph entr{'y' if len(entries) == 1 else 'ies'} at "
+                f"{source_graph} as already-erased, not migrating"
+            )
+        logger.warning(
+            "simulate_to_train store %s: tier registry file is absent at %s — migrating "
+            "all %d graph entries unfiltered (an absent registry cannot distinguish a "
+            "torn commit_tier_slot write from a transient unmounted tier)",
+            name,
+            registry_file,
+            len(entries),
+        )
 
     tier_config = _tier_adapter_config(loop, name)
 

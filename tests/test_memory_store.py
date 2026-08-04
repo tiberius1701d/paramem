@@ -616,6 +616,24 @@ class TestDropTier:
         s.drop_tier("does_not_exist")  # must not raise
         assert s.get("graph1") == _entry("graph1")
 
+    def test_drop_tier_drops_bookkeeping_for_stale_keys_too(self):
+        """A soft-staled key's bookkeeping must not survive its tier being
+        dropped — only active_keys_in_tier was swept before, leaving a stale
+        key's bookkeeping record orphaned (re-indexed by router.reload
+        against a tier that no longer exists)."""
+        s = MemoryStore()
+        s.put("episodic_interim_20260417T0000", "graph1", _entry("graph1"), simhash=1)
+        s.put("episodic_interim_20260417T0000", "graph2", _entry("graph2"), simhash=2)
+        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
+        s.set_bookkeeping("graph2", speaker_id="speaker0", relation_type="factual", first_seen="t0")
+        s.registry("episodic_interim_20260417T0000").stale("graph2")
+
+        s.drop_tier("episodic_interim_20260417T0000")
+
+        assert dict(s.iter_bookkeeping()) == {}
+        assert s.bookkeeping_for_key("graph1") is None
+        assert s.bookkeeping_for_key("graph2") is None
+
 
 # ---------------------------------------------------------------------------
 # reactivate — dual of discard_keys(mode="stale") (Part B rollback primitive)
@@ -1187,6 +1205,41 @@ class TestDiscardKeys:
         s.discard_keys(["graph1"], mode="stale")
         assert s.is_stale("graph1")
         assert not s.is_stale("nonexistent")
+
+    def test_erase_drops_entry_and_bookkeeping_sibling_key_keeps_both(self):
+        """mode='erase' is full retirement: entry payload and bookkeeping
+        record are dropped, delegating to :meth:`delete` per key.  A sibling
+        key in the same tier keeps both."""
+        s = self._make_store_with_key("graph1", "episodic")
+        s.set_bookkeeping(
+            "graph1", speaker_id="speaker1", relation_type="factual", first_seen="2026-01-01"
+        )
+        s.put("episodic", "graph2", _entry("graph2"), simhash=0xC0FFEE, register=True)
+        s.set_bookkeeping(
+            "graph2", speaker_id="speaker1", relation_type="factual", first_seen="2026-01-01"
+        )
+
+        s.discard_keys(["graph1"], mode="erase")
+
+        assert s.get("graph1") is None, "erase must drop the entry payload"
+        assert s.bookkeeping_for_key("graph1") is None, "erase must drop the bookkeeping record"
+        assert s.get("graph2") is not None, "sibling key's entry must survive"
+        assert s.bookkeeping_for_key("graph2") is not None, (
+            "sibling key's bookkeeping record must survive"
+        )
+
+    def test_stale_keeps_entry_and_bookkeeping(self):
+        """mode='stale' must NOT leak the erase-mode entry/bookkeeping drop
+        into the soft path — entry and bookkeeping both survive."""
+        s = self._make_store_with_key("graph1", "episodic")
+        s.set_bookkeeping(
+            "graph1", speaker_id="speaker1", relation_type="factual", first_seen="2026-01-01"
+        )
+
+        s.discard_keys(["graph1"], mode="stale")
+
+        assert s.get("graph1") is not None, "stale must keep the entry payload"
+        assert s.bookkeeping_for_key("graph1") is not None, "stale must keep the bookkeeping record"
 
     def test_all_stale_keys_aggregates_across_tiers(self):
         """MemoryStore.all_stale_keys() returns stale keys across all registered tiers."""
