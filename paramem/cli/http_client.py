@@ -6,12 +6,27 @@ connection pooling across subcommands buys nothing.
 Exceptions are normalized to two public types so callers can handle them
 without importing httpx directly:
 
-- :exc:`ServerUnavailable` — server returned 404; feature not in this version.
+- :exc:`ServerUnavailable` — the route itself is absent (older server); the
+  404 body carries no structured ``detail`` object (FastAPI's own
+  route-missing body is the string ``"Not Found"``, not a dict).
 - :exc:`ServerUnreachable` — TCP refused / DNS failure / read timeout.
+
+A 404 whose body DOES carry a structured ``detail`` object is an endpoint
+that exists and is reporting its own well-formed "not found" outcome (e.g.
+``/migration/accept`` with no trial active) — that raises
+:exc:`ServerHTTPError` like any other HTTP error, so the command-level
+handler can inspect ``detail["error"]`` and respond accordingly instead of
+being told the route doesn't exist.
+
+:func:`parse_error_detail` is the one shared parser for a
+:class:`ServerHTTPError`'s JSON body — every subcommand that needs to branch
+on the server's ``detail.error`` discriminator calls it rather than keeping a
+local copy; it is also what distinguishes the two 404 shapes above.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -98,10 +113,13 @@ def resolve_token(*, allow_files: bool | None = None) -> str | None:
 
 
 class ServerUnavailable(Exception):
-    """Server returned 404 for the requested endpoint.
+    """Server returned 404 with no structured ``detail`` body — the route itself is absent.
 
     The feature has not been implemented in the server version currently
     running.  The caller should print a version-alignment message and exit 1.
+    A 404 that DOES carry a structured ``detail`` object is an existing
+    endpoint reporting its own "not found" outcome and raises
+    :exc:`ServerHTTPError` instead — see this module's docstring.
     """
 
 
@@ -128,6 +146,32 @@ class ServerHTTPError(Exception):
         super().__init__(f"HTTP {status_code} from {url}")
 
 
+def parse_error_detail(body: str) -> dict:
+    """Return the ``detail`` object from a FastAPI JSON error body, or ``{}``.
+
+    Best-effort: never raises.  *body* is typically :attr:`ServerHTTPError.body`.
+    A non-JSON body, a JSON body without a ``detail`` key, or a ``detail``
+    that is not itself an object all return ``{}`` rather than raising.
+
+    Parameters
+    ----------
+    body:
+        Raw response body string from the server.
+
+    Returns
+    -------
+    dict
+        The parsed ``detail`` dict, or ``{}`` when it is absent or malformed.
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if isinstance(parsed, dict) and isinstance(parsed.get("detail"), dict):
+        return parsed["detail"]
+    return {}
+
+
 def get_json(url: str, *, timeout: float = 5.0, token: str | None = None) -> dict:
     """Perform a GET request and return the parsed JSON body.
 
@@ -151,11 +195,14 @@ def get_json(url: str, *, timeout: float = 5.0, token: str | None = None) -> dic
     Raises
     ------
     ServerUnavailable
-        If the server responds with HTTP 404.
+        HTTP 404 with no structured ``detail`` body — the route itself is
+        absent (older server).
     ServerUnreachable
         If the TCP connection fails or times out.
     ServerHTTPError
-        For any non-2xx, non-404 response (e.g. 5xx or 400).
+        Any non-2xx response other than a route-missing 404 — including a
+        404 that DOES carry a structured ``detail`` (an existing endpoint
+        reporting its own "not found" outcome; see this module's docstring).
     """
     if token is None:
         token = resolve_token()
@@ -166,7 +213,7 @@ def get_json(url: str, *, timeout: float = 5.0, token: str | None = None) -> dic
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
         raise ServerUnreachable(str(exc)) from exc
 
-    if response.status_code == 404:
+    if response.status_code == 404 and not parse_error_detail(response.text):
         raise ServerUnavailable(f"404 from {url}")
     if response.status_code >= 400:
         raise ServerHTTPError(response.status_code, url, response.text)
@@ -205,11 +252,14 @@ def post_json(
     Raises
     ------
     ServerUnavailable
-        If the server responds with HTTP 404.
+        HTTP 404 with no structured ``detail`` body — the route itself is
+        absent (older server).
     ServerUnreachable
         If the TCP connection fails or times out.
     ServerHTTPError
-        For any non-2xx, non-404 response (e.g. 5xx or 400).
+        Any non-2xx response other than a route-missing 404 — including a
+        404 that DOES carry a structured ``detail`` (an existing endpoint
+        reporting its own "not found" outcome; see this module's docstring).
     """
     if token is None:
         token = resolve_token()
@@ -220,7 +270,7 @@ def post_json(
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
         raise ServerUnreachable(str(exc)) from exc
 
-    if response.status_code == 404:
+    if response.status_code == 404 and not parse_error_detail(response.text):
         raise ServerUnavailable(f"404 from {url}")
     if response.status_code >= 400:
         raise ServerHTTPError(response.status_code, url, response.text)

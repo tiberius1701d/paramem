@@ -654,7 +654,7 @@ class TestSafetyBundle:
         seed "over cap" against), so the exemption is locked at the
         mechanism level instead: the safety-bundle write's internal
         ``write_bundle`` call passes ``backups_cfg=None``, which must keep
-        ``_enforce_disk_cap`` uncalled.  A later refactor that starts passing
+        ``enforce_disk_cap`` uncalled.  A later refactor that starts passing
         a real ``backups_cfg`` at that call site would make this assertion
         fail immediately.
         """
@@ -669,7 +669,7 @@ class TestSafetyBundle:
 
         # Second restore: must take a safety bundle and complete without the
         # disk-cap check ever running.
-        with patch("paramem.backup.backup._enforce_disk_cap") as mock_enforce_disk_cap:
+        with patch("paramem.backup.backup.enforce_disk_cap") as mock_enforce_disk_cap:
             result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
 
         mock_enforce_disk_cap.assert_not_called()

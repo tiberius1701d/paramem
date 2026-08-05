@@ -87,7 +87,21 @@ class TrialStash(TypedDict):
     """In-memory mirror of ``TrialMarker`` stored on ``_state["migration"]["trial"]``.
 
     Populated by ``/migration/confirm`` (step 5) and by crash recovery
-    (RESUME_TRIAL case).  Sentinel ``None`` in LIVE/STAGING.
+    (RESUME_TRIAL case).  Sentinel ``None`` in STAGING, and in LIVE for every
+    migration kind except a just-finished base swap: ``_finish_base_swap``
+    (``paramem/server/app.py``) resets a base-swap TRIAL to
+    ``state="LIVE"`` but leaves a terminal report on ``trial`` (started_at /
+    candidate_config_sha256 / backup_paths carried forward, ``gates`` set to
+    the swap's outcome) so ``GET /migration/status`` can still report which
+    swap finished and where its bundle is.  The next ``POST
+    /migration/preview`` clears the report **only when its pre-flight check
+    passes** — it then rebuilds the stash with ``trial=None``.  A failed
+    pre-flight (``app.py``'s ``migration_preview``, disk-pressure/check_error
+    branch) returns its response without storing anything into
+    ``_state["migration"]`` at all, so the terminal report survives
+    unchanged and a retried preview clears it once pre-flight passes.  Every
+    consumer that treats a non-``None`` trial as "a trial is active" must
+    also check ``state == "TRIAL"``.
 
     The ``gates`` sub-dict is initially ``{"status": "pending"}`` when the
     trial consolidation is running and updated to ``{"status": "no_new_sessions",

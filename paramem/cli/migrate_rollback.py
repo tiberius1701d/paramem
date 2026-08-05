@@ -18,31 +18,6 @@ from paramem.cli import http_client
 from paramem.cli.migrate import _render_apply_result
 
 
-def _parse_detail(body: str) -> dict:
-    """Attempt to parse an HTTP error response body as JSON.
-
-    Returns the ``detail`` sub-dict if present, else an empty dict.  Never
-    raises — parsing failures are best-effort.
-
-    Parameters
-    ----------
-    body:
-        Raw response body string from the server.
-
-    Returns
-    -------
-    dict
-        Parsed ``detail`` dict, or ``{}`` on parse failure.
-    """
-    try:
-        parsed = json.loads(body)
-        if isinstance(parsed, dict) and isinstance(parsed.get("detail"), dict):
-            return parsed["detail"]
-        return {}
-    except (json.JSONDecodeError, ValueError):
-        return {}
-
-
 def run(args: argparse.Namespace) -> int:
     """Execute the ``migrate-rollback`` subcommand.
 
@@ -56,10 +31,15 @@ def run(args: argparse.Namespace) -> int:
 
     - Response body contains ``archive_warning``: primary action (config
       restore) succeeded; trial adapter archive failed.  Print warning; exit 0.
-    - 409 ``not_trial``: no trial active — intent already satisfied; exit 0
-      (idempotent/informational, matches ``migrate-cancel`` / ``not_staging``
-      precedent).
+    - 409 ``not_trial`` / 404 ``not_found``: no trial active — intent already
+      satisfied; exit 0 (idempotent/informational, matches ``migrate-cancel``
+      / ``not_staging`` precedent).  Both codes mean the same thing: the
+      server rejects with 404 ``not_found`` when ``state == "LIVE"`` and 409
+      ``not_trial`` when ``state == "STAGING"``.
     - ``ServerUnreachable``: server not reachable; exit 2.
+    - A plain 404 with no structured ``detail`` (route absent on an older
+      server) raises ``ServerUnavailable`` instead of ``ServerHTTPError`` —
+      handled separately below.
 
     Parameters
     ----------
@@ -69,8 +49,9 @@ def run(args: argparse.Namespace) -> int:
     Returns
     -------
     int
-        0 on success (including degraded success with archive_warning),
-        1 on HTTP errors / 404,
+        0 on success (including degraded success with archive_warning, and
+        not_trial/not_found — intent already satisfied),
+        1 on other HTTP errors / route-absent 404,
         2 on connection failure.
     """
     url = f"{args.server_url}/migration/rollback"
@@ -93,9 +74,9 @@ def run(args: argparse.Namespace) -> int:
         )
         return 2
     except http_client.ServerHTTPError as exc:
-        if exc.status_code == 409:
-            detail = _parse_detail(exc.body)
-            if detail.get("error") == "not_trial":
+        if exc.status_code in (404, 409):
+            detail = http_client.parse_error_detail(exc.body)
+            if detail.get("error") in ("not_trial", "not_found"):
                 print("paramem migrate-rollback: no trial active; nothing to rollback.")
                 return 0
         print(

@@ -60,9 +60,11 @@ class AttentionItem:
         for the session-tier pass and the graph-tier pass simultaneously,
         and only the key separates them.
     level:
-        ``"action_required"`` (yellow), ``"failed"`` (red), or
-        ``"info"`` (cyan).  Used by the pstatus renderer to choose the
-        row color and the banner color (red overrides yellow).
+        ``"action_required"`` (yellow), ``"failed"`` (red), ``"warning"``, or
+        ``"info"`` (cyan — anything not ``failed``/``action_required`` renders
+        cyan; see ``scripts/dev/paramem-status.sh``).  Used by the pstatus
+        renderer to choose the row color and the banner color (red overrides
+        yellow).
     summary:
         Human-readable one-line description shown by pstatus.  ≤ ~80
         chars.
@@ -76,7 +78,7 @@ class AttentionItem:
     """
 
     kind: str  # NOT Literal — new alert categories extend without schema bump
-    level: str  # "action_required" | "failed" | "info"
+    level: str  # "action_required" | "failed" | "warning" | "info"
     summary: str
     action_hint: str | None
     age_seconds: int | None
@@ -1186,7 +1188,10 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
         preview (``migration_pre_flight_fail``), or one row when the check
         itself could not be evaluated (``migration_pre_flight_check_error``,
         e.g. an unreadable component or an unmeasurable disk cap). Empty
-        when the check ran and passed cleanly, or during STAGING/TRIAL.
+        when the check ran and passed cleanly, or during STAGING/TRIAL.  Both
+        rows are ``level="action_required"`` — a failed pre-flight and an
+        unevaluable pre-flight block the same door (``/migration/preview``)
+        identically, so neither is merely informational.
     """
     if config is None:
         return []
@@ -1246,7 +1251,7 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
         return [
             AttentionItem(
                 kind="migration_pre_flight_fail",
-                level="info",
+                level="action_required",
                 summary=(
                     f"PRE-FLIGHT FAIL — disk pressure (used {used_gb:.1f} of {cap_gb:.1f} GB cap)"
                 ),

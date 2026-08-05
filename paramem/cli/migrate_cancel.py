@@ -17,27 +17,6 @@ import sys
 from paramem.cli import http_client
 
 
-def _parse_409_body(body: str) -> dict:
-    """Attempt to parse a 409 response body as JSON.
-
-    Returns the parsed dict, or an empty dict when the body is not valid JSON.
-
-    Parameters
-    ----------
-    body:
-        Raw response body string from the server.
-
-    Returns
-    -------
-    dict
-        Parsed JSON object, or ``{}`` on parse failure.
-    """
-    try:
-        return json.loads(body)
-    except (json.JSONDecodeError, ValueError):
-        return {}
-
-
 def run(args: argparse.Namespace) -> int:
     """Execute the ``migrate-cancel`` subcommand.
 
@@ -84,9 +63,8 @@ def run(args: argparse.Namespace) -> int:
         return 2
     except http_client.ServerHTTPError as exc:
         if exc.status_code == 409:
-            parsed = _parse_409_body(exc.body)
-            detail = parsed.get("detail", {})
-            if isinstance(detail, dict) and detail.get("error") == "not_staging":
+            detail = http_client.parse_error_detail(exc.body)
+            if detail.get("error") == "not_staging":
                 print(
                     "paramem migrate-cancel: no candidate is currently staged; nothing to cancel."
                 )

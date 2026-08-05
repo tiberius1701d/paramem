@@ -100,8 +100,11 @@ class Incident:
         ``"consolidation_retry_exhausted"``).  Extensible: new failure types
         add a ``type`` without a schema bump.
     severity:
-        One of ``"info"``, ``"warning"``, ``"failed"``.  Maps 1:1 to
-        ``AttentionItem.level`` for the attention populator.
+        One of ``"info"``, ``"warning"``, ``"failed"``.  Passed through
+        verbatim as ``AttentionItem.level`` by ``_collect_incident_items``
+        (``paramem/server/attention.py``).  ``AttentionItem.level``'s
+        vocabulary is a superset — ``"action_required"`` is emitted by other
+        populators but is never an incident severity.
     first_seen:
         ISO-8601 UTC timestamp when the incident was first recorded.
         Monotonic — never updated on subsequent occurrences.

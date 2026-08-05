@@ -902,6 +902,134 @@ class TestConfirmBaseSwapPrechecks:
         assert resp.status_code == 409, resp.text
         assert resp.json()["detail"]["error"] == "unknown_model"
 
+    def test_confirm_base_swap_409_disk_pressure(self, client_base_swap, base_state):
+        """The disk-cap door refuses BEFORE any state mutation or task launch.
+
+        Nothing is staged: STAGING is retained, the trial stash stays
+        ``None``, no background orchestration task is created, no trial
+        marker is written, and no bundle slot appears on disk.  Also pins
+        that the gate is called with the SAME ``backups_root`` and
+        ``config.security.backups`` this state carries — not some other
+        object (a copy, a default, or the wrong config).
+        """
+        from paramem.backup.types import DiskCapExceeded
+
+        state_dir = base_state["config"].paths.data / "state"
+        calls: list[tuple] = []
+
+        def _raise(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise DiskCapExceeded("disk_pressure: max_total_disk_gb reached (used 20.1 of 20 GB)")
+
+        with (
+            patch("paramem.server.app.predict_base_bytes", return_value=object()),
+            patch("paramem.server.app.enforce_disk_cap", side_effect=_raise),
+        ):
+            resp = client_base_swap.post("/migration/confirm", json={})
+
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "disk_pressure"
+
+        assert len(calls) == 1, f"expected enforce_disk_cap called exactly once; got {calls}"
+        call_args, call_kwargs = calls[0]
+        assert not call_kwargs, f"expected a positional call; got kwargs {call_kwargs}"
+        expected_backups_root = (base_state["config"].paths.data / "backups").resolve()
+        assert call_args[0] == expected_backups_root, (
+            f"expected backups_root={expected_backups_root!r}; got {call_args[0]!r}"
+        )
+        assert call_args[1] is base_state["config"].security.backups, (
+            "expected the state's own config.security.backups object, not a copy"
+        )
+
+        assert base_state["migration"]["state"] == "STAGING"
+        assert base_state["migration"]["trial"] is None
+        assert base_state.get("base_swap_task") is None
+        assert read_trial_marker(state_dir) is None
+
+        snapshot_dir = base_state["config"].paths.data / "backups" / "snapshot"
+        assert not snapshot_dir.exists() or not any(snapshot_dir.iterdir()), (
+            "no bundle slot may exist after a disk-cap refusal at confirm time"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _finish_base_swap: carry-forward contract (direct unit test, no orchestration)
+# ---------------------------------------------------------------------------
+
+
+class TestFinishBaseSwapCarryForward:
+    """``_finish_base_swap`` carries identity fields from the replaced stash.
+
+    Exercises the coroutine directly (not via the full orchestration) so the
+    carry-forward contract — ``started_at`` / ``candidate_config_sha256`` /
+    ``backup_paths`` survive into the terminal report, every other trial
+    field resets to its LIVE sentinel, ``recovery_required`` and ``state``
+    are handled correctly — is pinned independently of any caller.
+    """
+
+    def test_carries_forward_identity_fields_and_resets_the_rest(self, monkeypatch):
+        prior_trial = {
+            "started_at": "2026-05-24T00:00:00+00:00",
+            "pre_trial_config_sha256": "should-not-survive",
+            "candidate_config_sha256": "aabb1234",
+            "backup_paths": {"bundle": "/abs/backups/snapshot/20260524-000000"},
+            "trial_adapter_dir": "/abs/state/trial_adapter",
+            "trial_graph_dir": "/abs/state/trial_graph",
+            "gates": {"status": "pending"},
+        }
+        fresh_state = {
+            "migration": {
+                "state": "TRIAL",
+                "trial": prior_trial,
+                "recovery_required": ["episodic"],
+                "base_swap_active": True,
+            },
+        }
+        monkeypatch.setattr(app_module, "_state", fresh_state)
+
+        asyncio.run(
+            app_module._finish_base_swap(
+                {"status": "pass", "completed_at": "2026-05-24T01:00:00+00:00"}
+            )
+        )
+
+        migration = fresh_state["migration"]
+        assert migration["state"] == "LIVE"
+        assert migration["recovery_required"] == ["episodic"], (
+            "recovery_required must be carried forward, not reset"
+        )
+
+        trial = migration["trial"]
+        assert trial is not None, "the terminal report replaces trial, it does not clear it"
+        assert trial["started_at"] == prior_trial["started_at"]
+        assert trial["candidate_config_sha256"] == prior_trial["candidate_config_sha256"]
+        assert trial["backup_paths"] == prior_trial["backup_paths"]
+        # Every other field returns to its LIVE sentinel.
+        assert trial["pre_trial_config_sha256"] == ""
+        assert trial["trial_adapter_dir"] == ""
+        assert trial["trial_graph_dir"] == ""
+        # gates is replaced by the payload passed to _finish_base_swap.
+        assert trial["gates"] == {"status": "pass", "completed_at": "2026-05-24T01:00:00+00:00"}
+
+    def test_missing_prior_trial_defaults_to_live_sentinels(self, monkeypatch):
+        """No prior trial (e.g. migration dict present but trial=None) still
+        produces a valid terminal report — carry-forward fields default to
+        their empty sentinels rather than raising.
+        """
+        fresh_state = {
+            "migration": {"state": "TRIAL", "trial": None, "recovery_required": []},
+        }
+        monkeypatch.setattr(app_module, "_state", fresh_state)
+
+        asyncio.run(app_module._finish_base_swap({"status": "setup_failed"}))
+
+        trial = fresh_state["migration"]["trial"]
+        assert trial["started_at"] == ""
+        assert trial["candidate_config_sha256"] == ""
+        assert trial["backup_paths"] == {}
+        assert trial["gates"] == {"status": "setup_failed"}
+
 
 # ---------------------------------------------------------------------------
 # _run_base_swap_orchestration: ordering + success/failure paths (mocked)
@@ -973,6 +1101,9 @@ class TestRunBaseSwapPhaseA:
         succeed: bool = True,
         reload_mode: str = "local",
         gpu_release_override=None,
+        write_bundle_error: Exception | None = None,
+        patch_gates: bool = True,
+        resume_phase: str = "",
     ):
         """Helper: run _run_base_swap_orchestration with mocks via asyncio.run().
 
@@ -985,8 +1116,21 @@ class TestRunBaseSwapPhaseA:
         ``_fake_gpu_release`` coroutine as the ``_gpu_release_internal``
         patch target (e.g. to simulate a refused release returning the 503
         ``JSONResponse`` shape instead of the success dict).
+        ``write_bundle_error`` — when given, ``write_bundle`` raises it instead
+        of returning a bundle slot (e.g. ``DiskCapExceeded`` / ``OSError`` for
+        the setup-failure classifier tests).
+        ``patch_gates`` — when ``True`` (default), both ``_update_trial_gates``
+        and ``_finish_base_swap`` are patched with recorders that append into
+        ``gates_received`` — this preserves every existing assertion against
+        ``gates_received`` unchanged.  When ``False``, neither is patched, so
+        the real state transition (``_state["migration"]``) is observable
+        after the run — required to assert the ``setup_failed`` reset for
+        real rather than through a recording stub.
+        ``resume_phase`` — forwarded to ``_run_base_swap_orchestration``;
+        default ``""`` (fresh start).
         """
         import asyncio
+        import contextlib
 
         import paramem.server.app as app_module
 
@@ -1011,6 +1155,8 @@ class TestRunBaseSwapPhaseA:
 
         def _fake_write_bundle(**kwargs):
             call_order.append("bundle")
+            if write_bundle_error is not None:
+                raise write_bundle_error
             return bundle_slot
 
         submit_count = [0]
@@ -1077,6 +1223,9 @@ class TestRunBaseSwapPhaseA:
         async def _fake_update_gates(payload):
             gates_received.append(payload)
 
+        async def _fake_finish_base_swap(payload):
+            gates_received.append(payload)
+
         _reload_mode = reload_mode
 
         async def _fake_gpu_release():
@@ -1111,29 +1260,46 @@ class TestRunBaseSwapPhaseA:
                 # Simulate config refresh: new model is now live.
                 state["config"].model_name = "qwen3-4b"
 
-        with (
-            patch("paramem.server.app.write_bundle", _fake_write_bundle),
-            patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch(
-                "paramem.server.migration.promote_config",
-                lambda s, d, **kw: rename_calls.append((str(s), str(d))),
-            ),
-            patch("paramem.server.app._update_trial_gates", _fake_update_gates),
-            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
-            patch(
-                "paramem.server.app.ThermalPolicy.from_consolidation_config",
-                return_value=MagicMock(),
-            ),
-            patch(
-                "paramem.server.app._gpu_release_internal",
-                gpu_release_override if gpu_release_override is not None else _fake_gpu_release,
-            ),
-            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
-            patch(
-                "paramem.server.app._live_reload_base_model",
-                lambda *a, **kw: None,
-            ),
-        ):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("paramem.server.app.write_bundle", _fake_write_bundle))
+            stack.enter_context(patch("paramem.server.app.migrate", side_effect=_fake_migrate))
+            stack.enter_context(
+                patch(
+                    "paramem.server.migration.promote_config",
+                    lambda s, d, **kw: rename_calls.append((str(s), str(d))),
+                )
+            )
+            if patch_gates:
+                stack.enter_context(
+                    patch("paramem.server.app._update_trial_gates", _fake_update_gates)
+                )
+                stack.enter_context(
+                    patch("paramem.server.app._finish_base_swap", _fake_finish_base_swap)
+                )
+            stack.enter_context(
+                patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock())
+            )
+            stack.enter_context(
+                patch(
+                    "paramem.server.app.ThermalPolicy.from_consolidation_config",
+                    return_value=MagicMock(),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "paramem.server.app._gpu_release_internal",
+                    gpu_release_override if gpu_release_override is not None else _fake_gpu_release,
+                )
+            )
+            stack.enter_context(
+                patch("paramem.server.app._apply_config_live", _fake_apply_config_live)
+            )
+            stack.enter_context(
+                patch(
+                    "paramem.server.app._live_reload_base_model",
+                    lambda *a, **kw: None,
+                )
+            )
             asyncio.run(
                 app_module._run_base_swap_orchestration(
                     candidate_path_str=str(cand_yaml),
@@ -1144,6 +1310,7 @@ class TestRunBaseSwapPhaseA:
                     new_model="qwen3-4b",
                     started_at="2026-05-24T00:00:00+00:00",
                     candidate_hash="aabb",
+                    resume_phase=resume_phase,
                 )
             )
 
@@ -1325,6 +1492,274 @@ class TestRunBaseSwapPhaseA:
         assert "consolidating" in _exc, (
             f"Expected the refusal detail in the recorded exception; got {failed_gates[0]}"
         )
+
+    def test_resume_with_missing_marker_is_not_setup_failed(self, tmp_path, monkeypatch):
+        """A resume launch (marker already tracked as written) with no marker
+        on disk must NOT be misclassified as setup_failed.
+
+        ``_marker_written`` starts ``True`` for ``resume_phase="phaseA_done"``
+        (a resume's own precondition is that its marker still reads back), so
+        even though ``read_trial_marker`` returns ``None`` here (no marker was
+        ever seeded on disk for this test), the classifier must fall through
+        to ``phase_b_failed`` — the durable-state-loss case, not "nothing
+        changed" — and the real migration state must stay ``TRIAL``.
+        """
+        state = self._make_phase_a_state(tmp_path)
+        _, _, _, _, state_dir = self._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            resume_phase="phaseA_done",
+            patch_gates=False,
+        )
+
+        assert state["migration"]["state"] == "TRIAL", (
+            "a resume launch with a lost marker must stay TRIAL, not reset to LIVE"
+        )
+        assert state["migration"]["trial"]["gates"]["status"] == "phase_b_failed"
+        assert read_trial_marker(state_dir) is None
+
+
+# ---------------------------------------------------------------------------
+# Setup failure: a fresh-start attempt fails before the phaseA marker exists
+# ---------------------------------------------------------------------------
+
+
+class TestBaseSwapSetupFailure:
+    """Failures before ``write_trial_marker`` runs classify as ``setup_failed``.
+
+    Composes ``TestRunBaseSwapPhaseA``'s ``_make_phase_a_state`` /
+    ``_run_phase_a`` helpers via ``self._phase_a`` (a plain instance, not a
+    pytest subclass — subclassing would re-collect and re-run every test on
+    that class here too) rather than duplicating the mock scaffolding.  Every
+    test here passes ``patch_gates=False`` so ``_finish_base_swap`` /
+    ``_update_trial_gates`` run for real and the resulting
+    ``_state["migration"]`` reflects the actual reset, not a recorder.
+    """
+
+    _phase_a = TestRunBaseSwapPhaseA()
+
+    def test_bundle_disk_cap_sets_setup_failed(self, tmp_path, monkeypatch):
+        """A DiskCapExceeded from write_bundle resets to LIVE with setup_failed."""
+        from paramem.backup.types import DiskCapExceeded
+
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        _, _, _, _, state_dir = self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            write_bundle_error=DiskCapExceeded("disk_pressure: max_total_disk_gb reached"),
+            patch_gates=False,
+        )
+
+        assert state["migration"]["state"] == "LIVE"
+        gates = state["migration"]["trial"]["gates"]
+        assert gates["status"] == "setup_failed"
+        assert gates.get("completed_at")
+        assert state["migration"]["candidate_path"] == ""
+        assert read_trial_marker(state_dir) is None
+
+    def test_bundle_oserror_sets_setup_failed(self, tmp_path, monkeypatch):
+        """A bare OSError from write_bundle also classifies as setup_failed."""
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        _, _, _, _, state_dir = self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            write_bundle_error=OSError("disk full"),
+            patch_gates=False,
+        )
+
+        assert state["migration"]["state"] == "LIVE"
+        gates = state["migration"]["trial"]["gates"]
+        assert gates["status"] == "setup_failed"
+        assert gates.get("completed_at")
+        assert state["migration"]["candidate_path"] == ""
+        assert read_trial_marker(state_dir) is None
+
+    def test_setup_failure_records_incident(self, tmp_path, monkeypatch):
+        """setup_failed records exactly one active migration_phase_failed incident."""
+        from paramem.backup.types import DiskCapExceeded
+        from paramem.server.incidents import read_incidents
+
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        _, _, _, _, state_dir = self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            write_bundle_error=DiskCapExceeded("disk_pressure: max_total_disk_gb reached"),
+            patch_gates=False,
+        )
+
+        incidents = [i for i in read_incidents(state_dir) if i.status == "active"]
+        matching = [i for i in incidents if i.id == "migration_phase_failed:setup_failed"]
+        assert len(matching) == 1, f"expected exactly one active incident; got {incidents}"
+        assert matching[0].severity == "failed"
+        assert matching[0].detail.get("phase") == "setup"
+
+    def test_setup_failure_leaves_accept_and_rollback_sane(self, tmp_path, monkeypatch):
+        """After the reset, accept and rollback both refuse with 404 not_found.
+
+        ``migration_accept`` and ``migration_rollback`` both check
+        ``state == "LIVE"`` first and return 404 ``not_found`` — the same
+        "no trial active" shape either endpoint already returns for any
+        LIVE server, not a 409.
+        """
+        from paramem.backup.types import DiskCapExceeded
+
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            write_bundle_error=DiskCapExceeded("disk_pressure: max_total_disk_gb reached"),
+            patch_gates=False,
+        )
+        assert state["migration"]["state"] == "LIVE"
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        accept_resp = client.post("/migration/accept")
+        assert accept_resp.status_code == 404, accept_resp.text
+        assert accept_resp.json()["detail"]["error"] == "not_found"
+
+        rollback_resp = client.post("/migration/rollback")
+        assert rollback_resp.status_code == 404, rollback_resp.text
+        assert rollback_resp.json()["detail"]["error"] == "not_found"
+
+    def test_setup_failure_allows_retry(self, tmp_path, monkeypatch):
+        """After the reset, the stash is a clean LIVE sentinel — retryable."""
+        from paramem.backup.types import DiskCapExceeded
+
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        self._phase_a._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            write_bundle_error=DiskCapExceeded("disk_pressure: max_total_disk_gb reached"),
+            patch_gates=False,
+        )
+
+        assert state["migration"]["state"] == "LIVE"
+        assert state["migration"]["candidate_hash"] == ""
+        assert state["migration"]["tier_diff"] == []
+
+    def test_phase_a_failure_keeps_real_trial_state(self, tmp_path, monkeypatch):
+        """Regression for the setup_failed scoping: a phaseA marker exists (the
+        Phase A submit itself failed, not the pre-marker setup), so the real
+        migration state stays TRIAL — not reset to LIVE like setup_failed.
+
+        Complements ``test_bundle_and_marker_preserved_on_phase_a_failure``
+        above (which patches gates and checks the recorder); this asserts the
+        real ``_state["migration"]`` transition.
+        """
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        _, _, _, _, state_dir = self._phase_a._run_phase_a(
+            state, monkeypatch, tmp_path, succeed=False, patch_gates=False
+        )
+
+        assert state["migration"]["state"] == "TRIAL"
+        assert state["migration"]["trial"]["gates"]["status"] == "phase_a_failed"
+        marker = read_trial_marker(state_dir)
+        assert marker is not None, "marker must be preserved on phase_a_failed"
+        assert marker.base_swap_phase == "phaseA"
+
+    def test_success_publishes_pass_gates_and_returns_live(self, tmp_path, monkeypatch):
+        """Regression: a successful swap publishes gates.status='pass' for real.
+
+        Before ``_finish_base_swap`` existed, the success arm reset
+        ``_state["migration"]`` and then called ``_update_trial_gates``, which
+        is a no-op once ``trial is None`` — so ``/migration/status`` reported
+        ``gates=None`` after every successful swap and the CLI long-poll never
+        terminated.  ``patch_gates=False`` here means the real
+        ``_finish_base_swap`` runs, so this observes the fix directly.
+        """
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        self._phase_a._run_phase_a(
+            state, monkeypatch, tmp_path, succeed=True, reload_mode="local", patch_gates=False
+        )
+
+        assert state["migration"]["state"] == "LIVE"
+        gates = state["migration"]["trial"]["gates"]
+        assert gates["status"] == "pass"
+        assert gates.get("completed_at")
+
+    def test_success_resolves_prior_phase_failed_incident(self, tmp_path, monkeypatch):
+        """A successful retry resolves a prior active migration_phase_failed incident."""
+        from paramem.server.incidents import read_incidents, record_incident
+
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        state_dir = state["config"].paths.data / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        record_incident(
+            state_dir,
+            type="migration_phase_failed",
+            key="setup_failed",
+            severity="failed",
+            summary="Base-swap migration setup_failed",
+            detail={
+                "phase": "setup",
+                "exception": "prior failure",
+                "at": "2026-05-24T00:00:00+00:00",
+            },
+        )
+
+        self._phase_a._run_phase_a(
+            state, monkeypatch, tmp_path, succeed=True, reload_mode="local", patch_gates=False
+        )
+
+        incidents = read_incidents(state_dir)
+        matching = [i for i in incidents if i.id == "migration_phase_failed:setup_failed"]
+        assert matching, "expected the pre-seeded incident to still be present"
+        assert matching[0].status == "resolved"
+
+    def test_incident_resolve_failure_does_not_repaint_success(self, tmp_path, monkeypatch, caplog):
+        """A raise from resolve_incidents_by_type AFTER a completed swap must
+        never repaint the swap as failed.
+
+        ``resolve_incidents_by_type`` is best-effort housekeeping against
+        external on-disk state (``incidents.json``), run in its own narrow
+        try/except AFTER ``_finish_base_swap`` has already published
+        ``gates.status="pass"`` — its failure is logged and swallowed, never
+        reaching the function-wide except handler that would otherwise
+        overwrite the already-published "pass" gates and mint a false
+        ``migration_phase_failed`` incident.
+        """
+        import logging
+
+        from paramem.server.incidents import read_incidents
+
+        state = self._phase_a._make_phase_a_state(tmp_path)
+        state_dir = state["config"].paths.data / "state"
+
+        def _raising_resolve(*_a, **_kw):
+            raise json.JSONDecodeError("bad json", "doc", 0)
+
+        with (
+            patch("paramem.server.app.resolve_incidents_by_type", side_effect=_raising_resolve),
+            caplog.at_level(logging.ERROR, logger="paramem.server.app"),
+        ):
+            self._phase_a._run_phase_a(
+                state, monkeypatch, tmp_path, succeed=True, reload_mode="local", patch_gates=False
+            )
+
+        gates = state["migration"]["trial"]["gates"]
+        assert gates["status"] == "pass", (
+            f"a post-publish housekeeping failure must never repaint success; got {gates}"
+        )
+        assert state["migration"]["state"] == "LIVE"
+
+        incidents = read_incidents(state_dir)
+        assert not any(i.type == "migration_phase_failed" for i in incidents), (
+            f"no migration_phase_failed incident may be recorded on a successful "
+            f"swap; got {incidents}"
+        )
+
+        assert any(r.exc_info is not None for r in caplog.records), (
+            "expected the swallowed resolve_incidents_by_type failure to be logged "
+            "with logger.exception"
+        )
+        assert "resolve_incidents_by_type" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1567,10 +2002,13 @@ class TestBaseSwapOrchestration:
             f"Expected Phase A < reload < Phase B; got order {call_order}"
         )
 
-        # Final status is 'pass'.
-        assert any(g.get("status") == "pass" for g in gates_received), (
-            f"Expected 'pass' on full success; got {gates_received}"
+        # Final status is 'pass' — the success arm now calls _finish_base_swap,
+        # not the patched _update_trial_gates, so this is read from the real
+        # migration stash rather than the gates_received recorder.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Expected 'pass' on full success; got {state['migration']}"
         )
+        assert state["migration"]["state"] == "LIVE"
 
         # Marker is cleared.
         from paramem.server.trial_state import read_trial_marker as _rtm
@@ -1727,10 +2165,13 @@ class TestBaseSwapOrchestration:
         idx_reload = call_order.index("post_phase_b_reload")
         assert idx_b < idx_reload, f"Reload must fire AFTER Phase B submit; got order {call_order}"
 
-        # Status=pass still fires (reload is best-effort housekeeping, not gating).
-        assert any(g.get("status") == "pass" for g in gates_received), (
-            f"Expected 'pass' on full success; got {gates_received}"
+        # Status=pass still fires (reload is best-effort housekeeping, not
+        # gating) — the success arm calls _finish_base_swap, not the patched
+        # _update_trial_gates, so read the real migration stash.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Expected 'pass' on full success; got {state['migration']}"
         )
+        assert state["migration"]["state"] == "LIVE"
 
         # Marker is cleared on success.
         from paramem.server.trial_state import read_trial_marker as _rtm
@@ -1758,14 +2199,13 @@ class TestBaseSwapOrchestration:
 
         # Phase B ran; reload was attempted.
         assert "phase_b_submit" in call_order
-        # Final status is still pass — the reload is best-effort.
-        assert any(g.get("status") == "pass" for g in gates_received), (
-            f"Reload failure must not block success; got {gates_received}"
+        # Final status is still pass — the reload is best-effort.  Read the
+        # real migration stash: the success arm calls _finish_base_swap, not
+        # the patched _update_trial_gates.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Reload failure must not block success; got {state['migration']}"
         )
-        # No phase_b_failed payload.
-        assert not any(g.get("status") == "phase_b_failed" for g in gates_received), (
-            "Reload failure must not raise to phase_b_failed"
-        )
+        assert state["migration"]["state"] == "LIVE"
 
     def _run_orchestration_with_reload_tracking(
         self,
@@ -2221,16 +2661,17 @@ class TestBaseSwapResumePhaseAware:
         original_bundle.mkdir()
         self._write_phase_a_done_marker(state_dir, str(original_bundle.resolve()))
 
-        _, _, final_state_dir, gates = self._run_orchestration(
-            state, monkeypatch, tmp_path, resume_phase="phaseA_done"
-        )
+        self._run_orchestration(state, monkeypatch, tmp_path, resume_phase="phaseA_done")
         # On success the marker is cleared.  Verify the orchestration succeeded
         # (gates status == 'pass') and that bundle_slot in Phase B marker was
         # the original path (verifiable via the phaseB marker written before
-        # submit — check via gates since marker is cleared on success).
-        assert any(g.get("status") == "pass" for g in gates), (
-            f"Expected pass after phaseA_done resume; got {gates}"
+        # submit — check via gates since marker is cleared on success).  Read
+        # the real migration stash: the success arm calls _finish_base_swap,
+        # not the patched _update_trial_gates.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Expected pass after phaseA_done resume; got {state['migration']}"
         )
+        assert state["migration"]["state"] == "LIVE"
 
     def test_resume_at_phase_b_does_not_call_write_bundle(self, tmp_path, monkeypatch):
         """Resume at phaseB must NOT call write_bundle."""
@@ -2540,7 +2981,7 @@ class TestBaseSwapStep3ResumeReload:
             state["cloud_only_reason"] = None
             state["config"].model_name = "qwen3-4b"
 
-        apply_called, submit_calls, gates, _ = self._run_orchestration(
+        apply_called, submit_calls, _gates, _ = self._run_orchestration(
             state,
             monkeypatch,
             tmp_path,
@@ -2556,12 +2997,13 @@ class TestBaseSwapStep3ResumeReload:
             f"Phase B must run after a successful reload; submit_calls={submit_calls}"
         )
 
-        # Final gate status must be 'pass'.
-        statuses = [g.get("status") for g in gates]
-        assert "pass" in statuses, f"Expected 'pass' gate status; got {statuses}"
-        assert "reload_deferred" not in statuses, (
-            f"reload_deferred must NOT appear when reload succeeds; got {statuses}"
+        # Final gate status must be 'pass' — read the real migration stash:
+        # the success arm calls _finish_base_swap, not the patched
+        # _update_trial_gates.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Expected 'pass' gate status; got {state['migration']}"
         )
+        assert state["migration"]["state"] == "LIVE"
 
     def test_fresh_start_deferred_vram_no_phase_b(self, tmp_path, monkeypatch):
         """Fresh start with insufficient VRAM: reload deferred, Phase B not run.
@@ -2617,7 +3059,7 @@ class TestBaseSwapStep3ResumeReload:
         """
         state = self._make_state(tmp_path, model_name="qwen3-4b", mode="local")
 
-        apply_called, submit_calls, gates, _ = self._run_orchestration(
+        apply_called, submit_calls, _gates, _ = self._run_orchestration(
             state,
             monkeypatch,
             tmp_path,
@@ -2635,9 +3077,12 @@ class TestBaseSwapStep3ResumeReload:
             f"Phase B must run on phaseA_done resume; submit_calls={submit_calls}"
         )
 
-        # Final gate status must be 'pass'.
-        statuses = [g.get("status") for g in gates]
-        assert "pass" in statuses, f"Expected 'pass' gate status; got {statuses}"
+        # Final gate status must be 'pass' — read the real migration stash:
+        # the success arm calls _finish_base_swap, not the patched
+        # _update_trial_gates.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Expected 'pass' gate status; got {state['migration']}"
+        )
 
     def test_phase_a_done_resume_defers_when_model_not_loaded(self, tmp_path, monkeypatch):
         """phaseA_done resume: if boot came up cloud-only (model not resident),
@@ -3712,7 +4157,9 @@ class TestPhaseBModelIdentityGuard:
             f"migrate called {migrate_call_count[0]} times"
         )
 
-        statuses = [g.get("status") for g in gates_received]
-        assert "pass" in statuses, (
-            f"Expected 'pass' gate status on correct model identity; got {statuses}"
+        # Read the real migration stash: the success arm calls
+        # _finish_base_swap, not the patched _update_trial_gates.
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"Expected 'pass' gate status on correct model identity; got {state['migration']}"
         )
+        assert state["migration"]["state"] == "LIVE"

@@ -3,9 +3,11 @@
 Covers:
 - Happy path: POST /migration/accept → 200 → prints response + exits 0.
 - --json mode: emits raw JSON.
-- 404 (ServerUnavailable) → stderr + exit 1.
+- 404 (ServerUnavailable, route absent — plain body) → stderr + exit 1.
 - ServerUnreachable → stderr + exit 2.
 - 409 not_trial → friendly message to stdout + exit 0 (idempotent).
+- 404 not_found (structured detail — no trial active) → same friendly
+  message + exit 0 (idempotent), same as 409 not_trial.
 - 409 gates_failed → stderr + exit 1.
 - 409 gates_not_finished → stderr + exit 1.
 - 409 other code → generic error to stderr + exit 1.
@@ -49,6 +51,25 @@ def _raise_409(error: str):
     def _raise(*a, **kw):
         raise http_client.ServerHTTPError(
             status_code=409,
+            url="http://127.0.0.1:8420/migration/accept",
+            body=json.dumps({"detail": {"error": error, "message": f"error={error}"}}),
+        )
+
+    return _raise
+
+
+def _raise_structured_404(error: str):
+    """Return a callable that raises a 404 ServerHTTPError with a structured detail.
+
+    Mirrors what the real ``post_json`` now raises for a 404 whose body
+    carries a dict ``detail`` (an existing endpoint's own outcome) — distinct
+    from ``ServerUnavailable``, which is reserved for a route-missing 404
+    (plain/string ``detail``).
+    """
+
+    def _raise(*a, **kw):
+        raise http_client.ServerHTTPError(
+            status_code=404,
             url="http://127.0.0.1:8420/migration/accept",
             body=json.dumps({"detail": {"error": error, "message": f"error={error}"}}),
         )
@@ -179,6 +200,31 @@ class TestMigrateAccept409:
         captured = capsys.readouterr()
         assert rc == 1
         assert "server returned HTTP" in captured.err or "409" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 404 not_found (structured detail) — same idempotent treatment as 409 not_trial
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateAccept404NotFound:
+    def test_404_not_found_exits_0_with_friendly_message(self, monkeypatch, capsys):
+        """404 not_found (state==LIVE, no trial active) → friendly message + exit 0.
+
+        The server returns 404 ``not_found`` when ``state == "LIVE"`` and 409
+        ``not_trial`` when ``state == "STAGING"`` — both mean "no trial is
+        active" and get the same idempotent treatment.
+        """
+        monkeypatch.setattr(http_client, "post_json", _raise_structured_404("not_found"))
+        rc = main(["migrate-accept"])
+        captured = capsys.readouterr()
+        assert rc == 0, f"Expected exit 0 for 404 not_found, got {rc}"
+        assert "nothing to accept" in captured.out.lower(), (
+            f"Expected friendly message, got stdout: {captured.out!r}"
+        )
+        # Must not appear on stderr, and must not be mistaken for a route-missing 404.
+        assert "server returned HTTP" not in captured.err
+        assert "does not implement" not in captured.err
 
 
 # ---------------------------------------------------------------------------

@@ -40,9 +40,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
+from paramem.backup.backup import enforce_disk_cap, write_bundle
 from paramem.backup.backup import write as backup_write
-from paramem.backup.backup import write_bundle
-from paramem.backup.types import ArtifactKind
+from paramem.backup.types import ArtifactKind, DiskCapExceeded
 from paramem.cloud.providers import get_cloud_agent
 from paramem.graph.extractor import ExtractionFailed
 from paramem.graph.name_extraction import extract_name_via_llm
@@ -407,7 +407,12 @@ class StatusResponse(BaseModel):
     # current migration state. Sub-fields:
     #   state          : "live" | "staging" | "trial" | "failed"
     #   config_rev     : 8-char prefix of sha256(server.yaml at load time)
-    #   trial_started_at : ISO-8601 UTC, or None when not in TRIAL
+    #   trial_started_at : ISO-8601 UTC, or None when no trial (or terminal
+    #                    base-swap report) is stashed.  Not gated on
+    #                    state=="trial": after a base swap finishes,
+    #                    _finish_base_swap resets state to "live" but leaves
+    #                    started_at on the terminal report, so this can be
+    #                    non-None while state=="live" — see TrialStash.
     #   gates          : copy of _state["migration"]["trial"]["gates"], or None
     #   comparison     : {"rendered": bool, "flags": list[str]} or None
     migration: dict = {}
@@ -9898,6 +9903,10 @@ async def migration_confirm(request: ConfirmRequest):
         Step 3 failed; Step 2 backups deleted.
     500 ``config_swap_failed``
         Step 4 failed; marker and backups deleted.
+    409 ``disk_pressure``
+        Base-swap branch only — the backup store is at its cap, so the
+        rollback anchor cannot be written.  Checked before any mutation;
+        nothing staged, STAGING retained.
     """
     from fastapi import HTTPException
 
@@ -10246,6 +10255,20 @@ async def migration_confirm(request: ConfirmRequest):
                         ),
                     },
                 )
+
+            # Disk-cap door — checked BEFORE any state mutation.  The
+            # rollback anchor (write_bundle, inside the orchestration) is
+            # cap-gated, so a store at its cap would otherwise refuse the
+            # anchor after TRIAL was already committed, wedging the process
+            # until the orchestration's own failure classifier runs. Refuse
+            # here instead: nothing staged, state unchanged, prune and retry.
+            try:
+                enforce_disk_cap(backups_root, config.security.backups)
+            except DiskCapExceeded as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "disk_pressure", "message": str(exc)},
+                ) from exc
 
             # Set state to TRIAL immediately (async task updates it further).
             _state["migration"]["state"] = "TRIAL"
@@ -10787,10 +10810,15 @@ async def _run_base_swap_orchestration(
        lands in cloud-only with ``cloud_only_reason`` set, but the swap
        is complete on disk so step 7 still fires.
     7. **Success** — clear the active-store state file (already done by
-       ``migrate()`` on all_tiers_done), clear the trial marker, clear the
-       base-swap marker in the in-memory trial stash, set
-       ``_state["mode"] = "local"`` (should already be set by the reload, but
-       explicit for clarity after Phase B), set migration status to ``pass``.
+       ``migrate()`` on all_tiers_done), clear the trial marker, reset the
+       migration stash to ``state="LIVE"`` carrying a terminal ``gates``
+       report via :func:`_finish_base_swap` (status ``pass``), then
+       best-effort resolve any active ``migration_phase_failed`` incident
+       left by a prior failed attempt at this same swap.  That resolve runs
+       in its own try/except **after** the "pass" report is already
+       published: its failure (e.g. a corrupt ``incidents.json``) is logged
+       and swallowed, never allowed to re-enter this coroutine's own
+       exception handler and repaint a genuinely completed swap as failed.
 
     **Resume semantics** (controlled by ``resume_phase``)
 
@@ -10816,6 +10844,21 @@ async def _run_base_swap_orchestration(
 
     **Failure semantics**
 
+    - Setup failure (``write_trial_marker`` never committed — tracked
+      directly via ``_marker_written``, never inferred from the marker being
+      absent on disk, since the success path also clears the marker before
+      it publishes): gates → ``setup_failed`` via :func:`_finish_base_swap`,
+      which resets the migration stash to ``state="LIVE"``.  The live config
+      was never renamed, so ``POST /migration/preview`` is immediately
+      retryable.  ``write_bundle`` may still have committed before a later
+      pre-marker step raised (tracked via ``_bundle_written``) — when it did,
+      the retention-immune bundle slot is surfaced as ``gates["bundle_path"]``
+      rather than silently claimed away; it is never auto-deleted.  A resume
+      launched at ``phaseA_done``/``phaseB`` starts with both flags already
+      ``True`` (a resume's own precondition is that its marker still reads
+      back), so a mid-resume failure is never misclassified as setup_failed —
+      it falls through to the ``phase_b_failed`` case below, ``state`` stays
+      ``TRIAL``.
     - Phase A failure: gates → ``phase_a_failed``; bundle + marker preserved
       for ``POST /migration/rollback``.
     - Reload deferred: gates → ``reload_deferred``; marker stays at
@@ -10865,6 +10908,14 @@ async def _run_base_swap_orchestration(
     migration = _state.get("migration")
     if isinstance(migration, dict):
         migration["base_swap_active"] = True
+
+    # Durable-mutation tracking, set directly at the point each write commits
+    # (never inferred from disk state afterward — see the classifier below).
+    # A resume launch already has both from a prior fresh-start run (the
+    # "_resume_marker is None" guard a few lines down raises if that is not
+    # true), so both start True for resume_phase in ("phaseA_done", "phaseB").
+    _bundle_written = resume_phase not in ("", "phaseA")
+    _marker_written = resume_phase not in ("", "phaseA")
 
     try:
         config = _state.get("config")
@@ -10934,6 +10985,7 @@ async def _run_base_swap_orchestration(
                 candidate_config_path=Path(candidate_path_str),
             )
             bundle_slot_str = str(bundle_slot.resolve())
+            _bundle_written = True
 
             # Update the in-memory trial stash with the bundle slot.
             migration_stash = _state.get("migration", {})
@@ -10968,6 +11020,7 @@ async def _run_base_swap_orchestration(
                 bundle_slot=bundle_slot_str,
             )
             write_trial_marker(state_dir, marker)
+            _marker_written = True
 
             # Arm the train→simulate active-store migration state file.
             migration_state = MigrationState.for_mode_switch(
@@ -11385,14 +11438,17 @@ async def _run_base_swap_orchestration(
         _clear_migrate_state(Path(config_b.adapter_dir))
         clear_trial_marker(state_dir)
 
-        prior_recovery = list((_state.get("migration") or {}).get("recovery_required") or [])
-        from paramem.server.migration import initial_migration_state
-
-        _state["migration"] = initial_migration_state()
-        _state["migration"]["recovery_required"] = prior_recovery
-
         completed_at = datetime.now(timezone.utc).isoformat()
-        await _update_trial_gates(
+        # Logged BEFORE the publish (not after) so nothing between here and
+        # the end of the try can raise once "pass" is live — see the
+        # try/except immediately below for the one statement that remains
+        # after the publish.
+        logger.info(
+            "base-swap orchestration complete: old=%s new=%s",
+            old_model,
+            new_model,
+        )
+        await _finish_base_swap(
             {
                 "status": "pass",
                 "completed_at": completed_at,
@@ -11403,41 +11459,98 @@ async def _run_base_swap_orchestration(
                 ),
             }
         )
-        logger.info(
-            "base-swap orchestration complete: old=%s new=%s",
-            old_model,
-            new_model,
-        )
+        # Best-effort housekeeping against external on-disk state
+        # (incidents.json), run AFTER "pass" is already published.  This is
+        # boundary error handling for that external state, not suppression
+        # of an orchestration failure: a genuinely completed swap must never
+        # be repainted as failed by a later, unrelated I/O error — so this
+        # is caught and logged rather than left to re-enter the except-arm's
+        # classifier below (which would overwrite the "pass" gates and mint
+        # a false migration_phase_failed incident).  A prior failed attempt
+        # for this same swap may have left an active migration_phase_failed
+        # incident (setup_failed / phase_a_failed / phase_b_failed); clear it
+        # now that the retry succeeded, so a permanently red attention row
+        # does not survive a clean run.
+        try:
+            resolve_incidents_by_type(
+                _state["config"].paths.data / "state",
+                "migration_phase_failed",
+                reason=f"base-swap completed: {old_model} → {new_model}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "base-swap orchestration: resolve_incidents_by_type failed after a "
+                "successful swap (old=%s new=%s) — the swap itself completed; prior "
+                "migration_phase_failed incidents remain unresolved in /status until "
+                "manually resolved or the next successful swap",
+                old_model,
+                new_model,
+            )
 
     except Exception as exc:  # noqa: BLE001
         completed_at = datetime.now(timezone.utc).isoformat()
-        # Determine which phase failed from the current marker on disk.
+        # Determine which phase failed.  ``_marker_written`` is the tracked
+        # invariant (set at the point ``write_trial_marker`` actually
+        # committed, never inferred from disk afterward) — the marker being
+        # absent on disk is NOT proof it was never written: the success path
+        # clears it (clear_trial_marker) BEFORE publishing via
+        # _finish_base_swap, so even a failure at that publish step itself
+        # would otherwise look identical, on disk, to "nothing was ever
+        # written".  Once "pass" actually publishes, nothing after it in the
+        # try can reach this except-arm (resolve_incidents_by_type has its
+        # own narrow try/except precisely so a housekeeping failure there
+        # can never repaint a completed swap as failed).  The marker is
+        # still read here because a *present* marker's ``base_swap_phase``
+        # is the only way to tell phase_a_failed from phase_b_failed.
         _failed_marker = None
+        _marker_read_failed = False
         try:
             _failed_marker = read_trial_marker(state_dir)
         except Exception:  # noqa: BLE001
-            pass
-        _phase = (
-            getattr(_failed_marker, "base_swap_phase", "unknown")
-            if _failed_marker is not None
-            else "unknown"
-        )
-        if _phase in ("phaseA", ""):
-            _status = "phase_a_failed"
+            _marker_read_failed = True
+
+        if _failed_marker is None and not _marker_read_failed and not _marker_written:
+            _phase, _status = "setup", "setup_failed"
+        elif _failed_marker is not None and _failed_marker.base_swap_phase in ("phaseA", ""):
+            _phase, _status = _failed_marker.base_swap_phase, "phase_a_failed"
         else:
+            _phase = (
+                getattr(_failed_marker, "base_swap_phase", "unknown")
+                if _failed_marker is not None
+                else "unknown"
+            )
             _status = "phase_b_failed"
 
-        await _update_trial_gates(
-            {
+        if _status == "setup_failed":
+            # The marker was never written, so promote_config never ran —
+            # the live config is untouched and there is no marker to roll
+            # back.  A bundle slot MAY still exist (write_bundle can commit
+            # before a later step in the same fresh-start attempt raises,
+            # e.g. the pre_trial_hash read or write_trial_marker itself);
+            # when it does, it is a real, retention-immune (30-day) rollback
+            # anchor, not orphaned residue — surfaced via ``bundle_path`` so
+            # the CLI reports it honestly instead of claiming nothing
+            # changed.  Never auto-deleted here; the operator prunes it
+            # deliberately if unwanted.
+            _setup_failed_gates = {
                 "status": _status,
                 "exception": str(exc),
                 "completed_at": completed_at,
             }
-        )
+            if _bundle_written:
+                _setup_failed_gates["bundle_path"] = bundle_slot_str
+            await _finish_base_swap(_setup_failed_gates)
+        else:
+            await _update_trial_gates(
+                {"status": _status, "exception": str(exc), "completed_at": completed_at}
+            )
         logger.exception("base-swap orchestration failed (phase=%s): %s", _phase, exc)
         # Record the phase failure as a durable incident.  The existing
         # bundle + POST /migration/rollback path is unchanged; this adds
         # durability + /status visibility alongside the trial-gates marker.
+        # Recorded after the gates/state update above — record_incident
+        # writes to config.paths.data / "state", which the migration reset
+        # does not touch.
         record_incident(
             _state["config"].paths.data / "state",
             type="migration_phase_failed",
@@ -11446,7 +11559,9 @@ async def _run_base_swap_orchestration(
             summary=f"Base-swap migration {_status}",
             detail={"phase": _phase, "exception": str(exc), "at": completed_at},
         )
-        # Bundle and marker are preserved for rollback.
+        # Bundle and marker are preserved for rollback.  setup_failed has no
+        # marker to preserve (never written) and preserves the bundle only
+        # when write_bundle already committed (see ``bundle_path`` above).
 
     finally:
         # ── Clear the in-flight guard ────────────────────────────────────────
@@ -11570,6 +11685,58 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
         loop.trial_key_metadata_path = trial_registry_dir / "registry" / "key_metadata.json"
 
     return loop
+
+
+async def _finish_base_swap(gates: dict) -> None:
+    """Return the migration stash to LIVE carrying the swap's terminal report.
+
+    Holds ``migration_lock`` for the whole reset — same discipline as
+    :func:`_update_trial_gates` (and stricter than the reset it replaces on
+    the success path, which ran unlocked).  ``recovery_required`` and the
+    trial stash's identity fields (``started_at`` / ``candidate_config_sha256``
+    / ``backup_paths``) are carried forward from the stash being replaced, so
+    ``GET /migration/status`` still reports WHICH swap finished and where its
+    bundle is; ``gates`` is replaced by *gates*.  Every other field returns to
+    its LIVE sentinel, so preview/confirm are available again and
+    accept/rollback see a non-``TRIAL`` state (refuse) rather than a stale
+    ``TRIAL``.  The next ``POST /migration/preview`` clears the report — it
+    rebuilds the stash with ``trial=None``.
+
+    Callers: the base-swap orchestration's success arm (``gates={"status":
+    "pass", ...}``) and its ``setup_failed`` classifier arm (the trial marker
+    was never committed, so the live config was never renamed and the
+    process must not stay wedged in TRIAL with no marker to roll back;
+    ``gates`` may carry a ``bundle_path`` when ``write_bundle`` already
+    committed before the failure).
+
+    Deadlock note: ``_run_base_swap_orchestration`` never holds
+    ``migration_lock`` itself — ``POST /migration/confirm`` creates the
+    orchestration task inside its own ``async with lock`` block but returns
+    without an intervening ``await``, so the task's first run starts after
+    that lock has released.  The boot-completion resume launch
+    (``app.py`` lifespan, around the ``_base_swap_resume_marker`` handling)
+    and the ``/gpu/acquire`` deferred-resume relaunch both call this same
+    coroutine from outside any lock, so acquiring it here is safe.
+    """
+    lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
+    async with lock:
+        from paramem.server.migration import TrialStash, initial_migration_state
+
+        prior = _state.get("migration") or {}
+        prior_trial = prior.get("trial") or {}
+        prior_recovery = list(prior.get("recovery_required") or [])
+
+        _state["migration"] = initial_migration_state()
+        _state["migration"]["recovery_required"] = prior_recovery
+        _state["migration"]["trial"] = TrialStash(
+            started_at=prior_trial.get("started_at", ""),
+            pre_trial_config_sha256="",
+            candidate_config_sha256=prior_trial.get("candidate_config_sha256", ""),
+            backup_paths=prior_trial.get("backup_paths", {}),
+            trial_adapter_dir="",
+            trial_graph_dir="",
+            gates=gates,
+        )
 
 
 async def _update_trial_gates(gates: dict) -> None:

@@ -2,7 +2,7 @@
 
 Tests cover:
 - Clean store → []
-- Over-cap store → one item, level=info
+- Over-cap store → one item, level=action_required
 - Suppressed during STAGING
 - Suppressed during TRIAL
 - config=None → []
@@ -86,7 +86,7 @@ class TestPreFlightItemsEmptyWhenUnderCap:
 
 
 # ---------------------------------------------------------------------------
-# Test 22 — over-cap store → one item, level=info
+# Test 22 — over-cap store → one item, level=action_required
 # ---------------------------------------------------------------------------
 
 
@@ -112,7 +112,7 @@ class TestPreFlightItemsEmitsOnOverCap:
         assert len(items) == 1
         item = items[0]
         assert item.kind == "migration_pre_flight_fail"
-        assert item.level == "info"
+        assert item.level == "action_required"
         assert "disk pressure" in item.summary.lower()
         assert "backup-prune" in item.action_hint.lower()
         # Used/cap GB must appear in summary.

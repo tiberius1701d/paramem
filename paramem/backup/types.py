@@ -316,7 +316,10 @@ class DiskCapExceeded(BackupError):
     """A write was refused because the backup store is at/over its global cap.
 
     Raised by ``backup.write`` / ``backup.write_bundle`` BEFORE any bytes are
-    written, so a refusal never leaves a partial slot.
+    written, so a refusal never leaves a partial slot.  Also raised directly
+    by ``backup.enforce_disk_cap`` — the same predicate called ahead of
+    ``write_bundle`` by ``POST /migration/confirm``'s base-swap pre-check, so
+    the refusal lands at the endpoint instead of mid-orchestration.
     """
 
 

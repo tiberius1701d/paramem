@@ -14,27 +14,6 @@ import sys
 from paramem.cli import http_client
 
 
-def _parse_error_body(body: str) -> dict:
-    """Attempt to parse a JSON error response body.
-
-    Returns the parsed dict, or an empty dict on parse failure.
-
-    Parameters
-    ----------
-    body:
-        Raw response body string from the server.
-
-    Returns
-    -------
-    dict
-        Parsed JSON object, or ``{}`` on parse failure.
-    """
-    try:
-        return json.loads(body)
-    except (json.JSONDecodeError, ValueError):
-        return {}
-
-
 def run(args: argparse.Namespace) -> int:
     """Execute the ``backup-restore`` subcommand.
 
@@ -83,9 +62,8 @@ def run(args: argparse.Namespace) -> int:
         return 2
     except http_client.ServerHTTPError as exc:
         if exc.status_code == 409:
-            parsed = _parse_error_body(exc.body)
-            detail = parsed.get("detail", {})
-            error_code = detail.get("error", "") if isinstance(detail, dict) else ""
+            detail = http_client.parse_error_detail(exc.body)
+            error_code = detail.get("error", "")
             if error_code == "trial_active":
                 print(
                     "Cannot restore during TRIAL. Run 'paramem migrate-accept' or "
@@ -110,12 +88,8 @@ def run(args: argparse.Namespace) -> int:
                 )
             return 1
         if exc.status_code == 400:
-            parsed = _parse_error_body(exc.body)
-            detail = parsed.get("detail", {})
-            if isinstance(detail, dict):
-                message = detail.get("message", exc.body.strip())
-            else:
-                message = exc.body.strip()
+            detail = http_client.parse_error_detail(exc.body)
+            message = detail.get("message", exc.body.strip()) if detail else exc.body.strip()
             print(f"paramem backup-restore: {message}", file=sys.stderr)
             return 1
         print(

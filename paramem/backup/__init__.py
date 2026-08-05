@@ -6,6 +6,8 @@ Public surface
 - ``read()``   — read an artifact from a slot, validate, and decrypt.
 - ``prune()``  — apply a retention policy to a kind directory.
 - ``sweep_orphan_pending()`` — startup sweep of incomplete ``.pending/`` dirs.
+- ``enforce_disk_cap()`` — the write-door disk-cap predicate, callable ahead
+  of a write that hasn't started yet (e.g. the pre-base-swap gate).
 
 Types
 -----
@@ -24,6 +26,7 @@ Errors
 """
 
 from paramem.backup.backup import (
+    enforce_disk_cap,
     prune,
     read,
     sweep_orphan_pending,
@@ -48,6 +51,7 @@ __all__ = [
     "read",
     "prune",
     "sweep_orphan_pending",
+    "enforce_disk_cap",
     # Types
     "ArtifactMeta",
     "ArtifactKind",

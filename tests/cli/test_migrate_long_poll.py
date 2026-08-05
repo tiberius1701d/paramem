@@ -9,9 +9,14 @@ Covers:
 - Case-insensitive accept/rollback matching.
 - Drift check before accept/rollback POSTs.
 - Comparison report rendering.
+- Base-swap terminal statuses, including 'setup_failed' (server already
+  reset to LIVE) and the synchronous 409 disk_pressure refusal at confirm
+  time (before any orchestration launches or poll begins).
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -640,11 +645,44 @@ _BS_STATUS_PENDING = {
 }
 
 _BS_STATUS_PASS = {
-    "state": "TRIAL",
+    # The server resets the migration stash to LIVE on a successful base
+    # swap (_finish_base_swap) — the poll loop itself ignores "state" and
+    # only branches on gates.status, so this is honesty about what
+    # /migration/status actually returns, not a behaviour change.
+    "state": "LIVE",
     "gates": {
         "status": "pass",
         "completed_at": "2026-05-24T01:00:00+00:00",
         "message": "Base-swap migration complete. Model: mistral → qwen3-4b.",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_SETUP_FAILED = {
+    # Also LIVE — the setup-failure classifier resets the stash the same
+    # way the success arm does (_finish_base_swap).  No "bundle_path" key —
+    # write_bundle never committed, so "nothing was changed" is accurate.
+    "state": "LIVE",
+    "gates": {
+        "status": "setup_failed",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "exception": "disk_pressure: max_total_disk_gb reached (used 20.1 of 20 GB)",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_SETUP_FAILED_WITH_BUNDLE = {
+    # setup_failed where write_bundle already committed before a later
+    # pre-marker step raised (e.g. write_trial_marker itself) — the bundle
+    # is a real, retention-immune rollback anchor, not orphaned residue.
+    "state": "LIVE",
+    "gates": {
+        "status": "setup_failed",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "exception": "marker write failed: disk full",
+        "bundle_path": "/abs/data/ha/backups/snapshot/20260524-010000",
     },
     "comparison_report": None,
     "server_started_at": "2026-05-24T00:00:00+00:00",
@@ -859,3 +897,154 @@ class TestBaseSwapLongPoll:
         assert rc == 130
         captured = capsys.readouterr()
         assert "poll interrupted" in captured.err
+
+    def test_base_swap_setup_failed_exits_1(self, monkeypatch, capsys):
+        """Base-swap ending in 'setup_failed' exits 1 with a 'nothing changed' message.
+
+        The setup_failed terminal status is server-reported LIVE + gates —
+        distinct from the confirm-time 409 disk_pressure refusal (which the
+        CLI never even reaches a poll for).  Must not print Phase B or
+        /gpu/acquire language — nothing was retried there; the swap never
+        started.
+        """
+        get_seq = [_STATUS_STAGING, _BS_STATUS_SETUP_FAILED]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 1, f"Expected exit 1 on setup_failed; got {rc}"
+        captured = capsys.readouterr()
+        assert "setup failed" in captured.err.lower()
+        assert "nothing was changed" in captured.err.lower()
+        assert "Phase B" not in captured.err
+        assert "/gpu/acquire" not in captured.err
+
+    def test_base_swap_setup_failed_with_bundle_reports_rollback_anchor(self, monkeypatch, capsys):
+        """setup_failed with gates['bundle_path'] set must NOT claim 'nothing was changed'.
+
+        write_bundle can commit before a later pre-marker step raises (e.g.
+        write_trial_marker itself) — the CLI must name the retention-immune
+        bundle slot instead of falsely claiming nothing happened.
+        """
+        get_seq = [_STATUS_STAGING, _BS_STATUS_SETUP_FAILED_WITH_BUNDLE]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 1, f"Expected exit 1 on setup_failed; got {rc}"
+        captured = capsys.readouterr()
+        assert "setup failed" in captured.err.lower()
+        assert "nothing was changed" not in captured.err.lower()
+        bundle_path = _BS_STATUS_SETUP_FAILED_WITH_BUNDLE["gates"]["bundle_path"]
+        assert bundle_path in captured.err
+        assert "retention-immune" in captured.err.lower()
+        assert "backup-prune" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Confirm-time 409 disk_pressure refusal (before any orchestration launches)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmDiskPressureRefusal:
+    """``POST /migration/confirm`` can refuse synchronously with 409 disk_pressure.
+
+    Distinct from every ``TestBaseSwapLongPoll`` case above: the refusal
+    happens at confirm time, before the long-poll loop starts, so there is
+    no ``_BS_STATUS_*`` sequence to poll — only the STAGING-drift GET and
+    the confirm POST are exercised.
+    """
+
+    def test_confirm_disk_pressure_refusal_renders_and_cancels(self, monkeypatch, capsys):
+        """A 409 disk_pressure at confirm echoes the server's advice and cancels the stash.
+
+        The mocked ``message`` mirrors ``DiskCapExceeded``'s real text
+        (``paramem/backup/backup.py``), which already ends with the
+        prune/raise-cap advice — the CLI must echo it verbatim rather than
+        appending a second copy of the same advice.
+        """
+        cancel_calls: list[str] = []
+        server_message = (
+            "disk_pressure: max_total_disk_gb reached (used 20.10 of 20 GB) — "
+            "run `paramem backup-prune` or raise security.backups.max_total_disk_gb"
+        )
+
+        def _post(url, body=None, **kwargs):
+            if "preview" in url:
+                return _BASE_SWAP_PREVIEW
+            if "confirm" in url:
+                raise http_client.ServerHTTPError(
+                    409,
+                    url,
+                    json.dumps({"detail": {"error": "disk_pressure", "message": server_message}}),
+                )
+            if "cancel" in url:
+                cancel_calls.append(url)
+                return {"state": "LIVE"}
+            raise AssertionError(f"Unexpected POST to {url!r}")
+
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(_STATUS_STAGING))
+        monkeypatch.setattr(http_client, "post_json", _post)
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+
+        assert rc == 1, f"Expected exit 1 on confirm-time disk_pressure; got {rc}"
+        captured = capsys.readouterr()
+        assert "refused before" in captured.err.lower()
+        assert "anything changed" in captured.err.lower()
+        assert "re-run" in captured.err.lower()
+        assert "paramem migrate <path>" in captured.err
+        # The server message (with its own prune/raise-cap advice) appears
+        # exactly once — the CLI must not append a second copy of it.
+        # ("max_total_disk_gb" legitimately appears twice WITHIN that single
+        # copy of the message — "reached" and "raise security.backups." —
+        # so "backup-prune" is the count that pins no duplication: it
+        # appears exactly once in the server message.)
+        assert captured.err.count("backup-prune") == 1
+        assert server_message in captured.err
+        assert cancel_calls, "expected POST /migration/cancel to discard the STAGING stash"
+
+    def test_confirm_non_disk_pressure_http_error_takes_generic_path(self, monkeypatch, capsys):
+        """A 409 with a different error code takes the generic 'confirm failed' path.
+
+        No cancel POST is issued (the disk_pressure branch is the only one
+        that discards the STAGING stash) and the message is the generic
+        exception rendering, not the disk_pressure advice.
+        """
+        cancel_calls: list[str] = []
+
+        def _post(url, body=None, **kwargs):
+            if "preview" in url:
+                return _BASE_SWAP_PREVIEW
+            if "confirm" in url:
+                raise http_client.ServerHTTPError(
+                    409,
+                    url,
+                    json.dumps({"detail": {"error": "trial_active", "message": "already TRIAL"}}),
+                )
+            if "cancel" in url:
+                cancel_calls.append(url)
+                return {"state": "LIVE"}
+            raise AssertionError(f"Unexpected POST to {url!r}")
+
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(_STATUS_STAGING))
+        monkeypatch.setattr(http_client, "post_json", _post)
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+
+        assert rc == 1, f"Expected exit 1 on a generic confirm HTTP error; got {rc}"
+        captured = capsys.readouterr()
+        assert "confirm failed" in captured.err.lower()
+        assert "refused before" not in captured.err.lower()
+        assert "backup-prune" not in captured.err
+        assert not cancel_calls, (
+            "the generic confirm-error path must not issue POST /migration/cancel"
+        )

@@ -69,6 +69,7 @@ _TERMINAL_GATE_STATUSES: frozenset[str] = frozenset(
 # _run_base_swap_orchestration.
 _BASE_SWAP_TERMINAL_STATUSES: frozenset[str] = _TERMINAL_GATE_STATUSES | frozenset(
     {
+        "setup_failed",
         "phase_a_failed",
         "phase_b_failed",
         "phase_b_model_mismatch",
@@ -344,7 +345,13 @@ def _render_base_swap_terminal(gs: str, gates: dict) -> None:
     """Render the terminal state of a base-swap migration to stdout/stderr.
 
     Called after the base-swap long-poll loop exits on a terminal status.
-    Covers all statuses set by ``_run_base_swap_orchestration``.
+    Covers all statuses set by ``_run_base_swap_orchestration``, including
+    ``setup_failed`` — the swap failed before Phase A's trial marker was
+    written, so the live config was never renamed and the migration state
+    is already back to ``LIVE``.  ``write_bundle`` can still have committed
+    before the failure (a rollback anchor already on disk); when it did,
+    ``gates["bundle_path"]`` names it — "nothing was changed" is only
+    printed when that key is absent.
 
     Parameters
     ----------
@@ -360,6 +367,26 @@ def _render_base_swap_terminal(gs: str, gates: dict) -> None:
         print("  Base-swap migration complete. Server is now running on the new model.")
         if message:
             print(f"  {message}")
+    elif gs == "setup_failed":
+        print("  Base-swap setup failed before Phase A started.", file=sys.stderr)
+        if exception_text:
+            print(f"  Exception: {exception_text}", file=sys.stderr)
+        bundle_path = gates.get("bundle_path", "")
+        if bundle_path:
+            print(
+                f"  A pre-swap rollback anchor was already written to {bundle_path} — "
+                "it is retention-immune for 30 days and was left in place; prune it "
+                "manually with `paramem backup-prune` if you don't need it.",
+                file=sys.stderr,
+            )
+        else:
+            print("  Nothing was changed.", file=sys.stderr)
+        print(
+            "  The previous model is still live and the migration state is back to LIVE. "
+            "Fix the cause (`pstatus` ATTENTION block / journalctl --user -u paramem-server), "
+            "then re-run `paramem migrate <path>`.",
+            file=sys.stderr,
+        )
     elif gs == "reload_deferred":
         # VRAM insufficient: Phase A done, reload waiting for VRAM to free.
         print("  Base-swap Phase A complete. Reload deferred — insufficient VRAM.")
@@ -704,9 +731,14 @@ def _run_long_poll_flow(server_url: str) -> int:
     5. Drift checks before accept/rollback.
 
     For base-swap migrations (``confirm_resp["base_swap"] == True``), step 3
-    polls against the extended ``_BASE_SWAP_TERMINAL_STATUSES`` set and step 4
-    renders base-swap-specific terminal messages instead of the accept/rollback
-    3-way prompt (base-swap success does not require an explicit accept).
+    polls against the extended ``_BASE_SWAP_TERMINAL_STATUSES`` set — which
+    includes ``setup_failed`` (the swap refused or failed before Phase A
+    started; the server is already back to LIVE, nothing to poll) — and step
+    4 renders base-swap-specific terminal messages instead of the
+    accept/rollback 3-way prompt (base-swap success does not require an
+    explicit accept).  Step 2 itself can also refuse synchronously with a
+    409 ``disk_pressure`` before any orchestration launches; that is handled
+    inline at step 2, not via the terminal-status set.
 
     Parameters
     ----------
@@ -736,7 +768,25 @@ def _run_long_poll_flow(server_url: str) -> int:
     # Step 2: POST /migration/confirm.
     try:
         confirm_resp = http_client.post_json(f"{server_url}/migration/confirm")
-    except (http_client.ServerHTTPError, http_client.ServerUnreachable) as exc:
+    except http_client.ServerHTTPError as exc:
+        detail = http_client.parse_error_detail(exc.body)
+        if detail.get("error") == "disk_pressure":
+            # detail["message"] is DiskCapExceeded's own text (backup.py) and
+            # already ends with the prune/raise-cap advice — echo it verbatim
+            # rather than repeating that advice a second time.
+            print(
+                "paramem migrate: the backup store is at its cap, so the pre-swap "
+                "rollback anchor cannot be written — the migration was refused before "
+                "anything changed.\n"
+                f"  {detail.get('message', '')}\n"
+                "Re-run `paramem migrate <path>` once that clears.",
+                file=sys.stderr,
+            )
+            _post_cancel(server_url)  # discard the stash; the server is still STAGING
+            return 1
+        print(f"paramem migrate: confirm failed: {exc}", file=sys.stderr)
+        return 1
+    except http_client.ServerUnreachable as exc:
         print(f"paramem migrate: confirm failed: {exc}", file=sys.stderr)
         return 1
 

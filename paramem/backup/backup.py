@@ -268,11 +268,12 @@ def _promote_slot(base_dir: Path) -> tuple[Path, str]:
 
 
 # ---------------------------------------------------------------------------
-# _enforce_disk_cap() — shared by write() and write_bundle()
+# enforce_disk_cap() — shared by write(), write_bundle(), and the pre-base-swap
+# gate in POST /migration/confirm
 # ---------------------------------------------------------------------------
 
 
-def _enforce_disk_cap(backups_root: Path, backups_cfg: "ServerBackupsConfig") -> None:
+def enforce_disk_cap(backups_root: Path, backups_cfg: "ServerBackupsConfig") -> None:
     """Refuse the write when the backup store has reached its global cap.
 
     Rule 1 of the retention precedence (see paramem/backup/retention.py's module
@@ -280,6 +281,17 @@ def _enforce_disk_cap(backups_root: Path, backups_cfg: "ServerBackupsConfig") ->
 
     Measured with ``bypass_cache=True`` — a write decision must not act on a
     5-second-stale scan.
+
+    Public so a caller can run the same predicate ahead of a write it has not
+    yet started: ``/migration/confirm``'s base-swap branch calls this before
+    committing any migration state, so a store at its cap is refused at the
+    endpoint instead of surfacing mid-orchestration when ``write_bundle``
+    hits the same gate.  This is a **pure predicate** — it reads
+    ``compute_disk_usage`` and either returns or raises; it consumes nothing
+    and mutates nothing.  Calling it here and again inside ``write_bundle``
+    is therefore a fail-fast, not a double-applied transformation: the
+    write door remains the authoritative check under TOCTOU (the store can
+    still fill between the two calls).
 
     Raises
     ------
@@ -353,9 +365,12 @@ def write(
         ``write_bundle`` it is the pre-restore safety bundle inside
         :func:`restore_bundle`; for ``write`` it is the ``/backup/restore``
         config-branch safety slot and the ``/migration/rollback`` pre-mortem.
-        There is no default: every caller states its posture explicitly, and
-        ``grep -rn "backups_cfg=None" paramem/`` is the exemption registry
-        (exactly three lines).
+        There is no default: every caller states its posture explicitly.
+        ``grep -rn "backups_cfg=None" paramem/`` finds three CALL SITES —
+        one in this file (``restore_bundle``'s safety-bundle write, noted
+        below) and two in ``app.py`` — plus three non-call mentions of this
+        instruction's own quoted text: here, the matching paragraph on
+        ``write_bundle``, and that same ``restore_bundle`` note.
 
     Returns
     -------
@@ -374,7 +389,7 @@ def write(
         On any filesystem error.
     """
     if backups_cfg is not None:
-        _enforce_disk_cap(Path(backups_root), backups_cfg)
+        enforce_disk_cap(Path(backups_root), backups_cfg)
     base_dir = Path(backups_root) / kind.value
 
     # --- resolve payload bytes ---
@@ -720,9 +735,12 @@ def write_bundle(
         ``write_bundle`` it is the pre-restore safety bundle inside
         :func:`restore_bundle`; for ``write`` it is the ``/backup/restore``
         config-branch safety slot and the ``/migration/rollback`` pre-mortem.
-        There is no default: every caller states its posture explicitly, and
-        ``grep -rn "backups_cfg=None" paramem/`` is the exemption registry
-        (exactly three lines).
+        There is no default: every caller states its posture explicitly.
+        ``grep -rn "backups_cfg=None" paramem/`` finds three CALL SITES —
+        one in this file (``restore_bundle``'s safety-bundle write, noted
+        below) and two in ``app.py`` — plus three non-call mentions of this
+        instruction's own quoted text: here, the matching paragraph on
+        ``write_bundle``, and that same ``restore_bundle`` note.
     meta_fields:
         Caller-supplied metadata dict.  Required key: ``"tier"`` (str).
         Optional: ``"label"`` (str | None).
@@ -789,7 +807,7 @@ def write_bundle(
     from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
 
     if backups_cfg is not None:
-        _enforce_disk_cap(Path(backups_root), backups_cfg)
+        enforce_disk_cap(Path(backups_root), backups_cfg)
     base_dir = Path(backups_root) / _BUNDLE_DIR_NAME
     tier = meta_fields.get("tier", "manual")
     label = meta_fields.get("label")

@@ -1,4 +1,4 @@
-"""Tests for bearer-token resolution in ``paramem.cli.http_client``.
+"""Tests for bearer-token resolution and 404 classification in ``paramem.cli.http_client``.
 
 Covers:
 1. env-only resolution: ``PARAMEM_API_TOKEN`` in env → returned.
@@ -7,6 +7,9 @@ Covers:
 4. ``allow_files=False`` → ``None`` even with files present.
 5. Quote-stripping: leading/trailing ``"`` and ``'`` are removed.
 6. ``get_json``/``post_json`` attach/omit ``Authorization`` based on resolved token.
+7. 404 classification: a plain (route-missing) 404 body still raises
+   ``ServerUnavailable``; a 404 carrying a structured ``detail`` object (an
+   existing endpoint's own outcome) raises ``ServerHTTPError`` instead.
 
 All tests use ``monkeypatch`` for env and HOME; no real ``~/.config`` or repo
 ``.env`` is ever touched.  The ``PARAMEM_CLI_NO_TOKEN_FILES=1`` flag set by
@@ -16,8 +19,11 @@ All tests use ``monkeypatch`` for env and HOME; no real ``~/.config`` or repo
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from paramem.cli import http_client
 from paramem.cli.http_client import _repo_env_path, resolve_token
@@ -346,3 +352,81 @@ class TestHttpClientAuthHeader:
             http_client.post_json("http://127.0.0.1:8420/consolidate", token="override-tok")
 
         assert captured["headers"].get("Authorization") == "Bearer override-tok"
+
+
+# ---------------------------------------------------------------------------
+# 7. 404 classification: route-missing vs. an endpoint's own structured outcome
+# ---------------------------------------------------------------------------
+
+
+class TestHttpClient404Classification:
+    """A 404 is ``ServerUnavailable`` only when its body carries no structured
+    ``detail`` object — FastAPI's own route-missing body is ``{"detail": "Not
+    Found"}``, a *string* ``detail``, which ``parse_error_detail`` returns
+    ``{}`` for.  A 404 with a dict ``detail`` (an existing endpoint reporting
+    its own "not found" outcome, e.g. ``/migration/accept`` with no trial
+    active) raises ``ServerHTTPError`` instead, so command-level handlers can
+    inspect ``detail["error"]``.
+    """
+
+    def _make_mock_client(self, *, status_code: int, text: str):
+        """Build a MagicMock httpx.Client context manager returning *text* as the body."""
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = text
+        resp.json.return_value = json.loads(text) if text else {}
+        mock_client = MagicMock()
+        mock_client.__enter__ = lambda s: mock_client
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get.return_value = resp
+        mock_client.post.return_value = resp
+        return mock_client
+
+    def test_get_json_route_missing_404_raises_server_unavailable(self, monkeypatch):
+        """A plain route-missing 404 body still raises ServerUnavailable (guard rail)."""
+        mock_client = self._make_mock_client(status_code=404, text='{"detail": "Not Found"}')
+        with (
+            patch("paramem.cli.http_client.httpx.Client", return_value=mock_client),
+            pytest.raises(http_client.ServerUnavailable),
+        ):
+            http_client.get_json("http://127.0.0.1:8420/no/such/route")
+
+    def test_post_json_route_missing_404_raises_server_unavailable(self, monkeypatch):
+        """Same guard rail for post_json."""
+        mock_client = self._make_mock_client(status_code=404, text='{"detail": "Not Found"}')
+        with (
+            patch("paramem.cli.http_client.httpx.Client", return_value=mock_client),
+            pytest.raises(http_client.ServerUnavailable),
+        ):
+            http_client.post_json("http://127.0.0.1:8420/no/such/route")
+
+    def test_post_json_empty_body_404_raises_server_unavailable(self, monkeypatch):
+        """An empty 404 body (no JSON at all) also still raises ServerUnavailable."""
+        mock_client = self._make_mock_client(status_code=404, text="")
+        with (
+            patch("paramem.cli.http_client.httpx.Client", return_value=mock_client),
+            pytest.raises(http_client.ServerUnavailable),
+        ):
+            http_client.post_json("http://127.0.0.1:8420/no/such/route")
+
+    def test_post_json_structured_404_raises_server_http_error(self, monkeypatch):
+        """A 404 with a structured dict detail raises ServerHTTPError, not ServerUnavailable."""
+        body = json.dumps({"detail": {"error": "not_found", "message": "No trial is active."}})
+        mock_client = self._make_mock_client(status_code=404, text=body)
+        with patch("paramem.cli.http_client.httpx.Client", return_value=mock_client):
+            with pytest.raises(http_client.ServerHTTPError) as exc_info:
+                http_client.post_json("http://127.0.0.1:8420/migration/accept")
+
+        assert exc_info.value.status_code == 404
+        detail = http_client.parse_error_detail(exc_info.value.body)
+        assert detail["error"] == "not_found"
+
+    def test_get_json_structured_404_raises_server_http_error(self, monkeypatch):
+        """Same classification for get_json."""
+        body = json.dumps({"detail": {"error": "not_found", "message": "gone"}})
+        mock_client = self._make_mock_client(status_code=404, text=body)
+        with (
+            patch("paramem.cli.http_client.httpx.Client", return_value=mock_client),
+            pytest.raises(http_client.ServerHTTPError),
+        ):
+            http_client.get_json("http://127.0.0.1:8420/some/endpoint")
