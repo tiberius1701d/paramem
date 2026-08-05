@@ -22,7 +22,12 @@ Public API
   as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
 - :func:`reap_tier_artifacts` — remove one tier's on-disk artifacts, shape derived
-  from the tier root itself (interim slot vs. main tier).
+  from the tier root itself (interim slot vs. main tier). Rename-condemns
+  each removed root into ``.pending-delete/`` before deleting it there, so a
+  crash mid-delete leaves the corpse out of the live namespace instead of
+  half-deleted in place.
+- :func:`resume_pending_reaps` — boot-time sweep that finishes any deletion
+  :func:`reap_tier_artifacts` left stranded under ``.pending-delete/``.
 
 Internal edge attribute naming
 -------------------------------
@@ -73,6 +78,14 @@ _IK_KEY_ATTR = "ik_key"
 # overwritten by the source node's name on save and lost on round-trip (same
 # reserved-key collision class as "key" → "ik_key").
 _EDGE_SOURCE_ATTR = "edge_source"
+
+# Tombstone directory :func:`reap_tier_artifacts` rename-condemns into before
+# deleting, and :func:`resume_pending_reaps` sweeps at boot. Dot-prefixed so
+# it is invisible to every tier/interim-dir enumerator (``interim_*`` globs,
+# ``find_live_slot``'s dot-entry skip) without those callers needing to know
+# it exists. Lives at the adapter-dir root, one dir shared by both the
+# interim-slot and main-tier reap branches.
+_PENDING_DELETE_DIR_NAME = ".pending-delete"
 
 
 def save_memory_to_disk(graph: nx.MultiDiGraph, path: Path) -> None:
@@ -310,6 +323,29 @@ def reap_tier_artifacts(tier_root: Path) -> list[Path]:
         sparing it here would leave scratch behind and the root would never
         become empty enough to ``rmdir``.
 
+    In the main-tier branch, ``indexed_key_registry.json`` is condemned LAST
+    by construction — it is the commit signal a boot sweep reads to decide
+    whether a tier holds any keys, so a crash mid-reap must never leave the
+    registry gone while a weight slot survives (see the ordering comment at
+    the child-iteration site for the full rationale).
+
+    Crash-safe deletion (rename-then-delete): every condemned root — the
+    whole slot in the interim branch, each surviving child in the main-tier
+    branch — is first ``os.rename``d into
+    ``<adapter_dir>/.pending-delete/<name>`` (created on demand; a same-name
+    collision means a prior crash left condemned debris there already, so it
+    is removed first) and only then deleted. ``os.rename`` is atomic on
+    POSIX/WSL2-ext4, so a crash before the rename leaves the live namespace
+    untouched and a crash after it leaves the condemned tree already outside
+    the live namespace — unambiguously gone from the boot sweep's point of
+    view — rather than a registry-less corpse that looks identical to a torn
+    *commit* (see :func:`commit_tier_slot`'s crash-semantics note, which is
+    the shape this deliberately does NOT produce). :func:`resume_pending_reaps`
+    finishes anything left stranded in ``.pending-delete/`` at boot.
+    *adapter_dir* is derived from *tier_root*'s own shape (interim slot →
+    grandparent; main tier → parent) rather than taken as a parameter, so
+    every existing caller keeps working unchanged.
+
     ``INTERIM_DIR_PREFIX`` is imported lazily from
     :mod:`paramem.memory.interim_adapter` — a top-level import would create
     an import cycle now that :func:`paramem.memory.interim_adapter.unload_interim_adapters`
@@ -323,7 +359,9 @@ def reap_tier_artifacts(tier_root: Path) -> list[Path]:
             (``<adapter_dir>/<episodic|semantic|procedural>/``).
 
     Returns:
-        The removed paths, deepest-first and sorted (files and directories
+        The removed paths, deepest-first and sorted, expressed at their
+        ORIGINAL (pre-rename) locations — callers reason about the live
+        namespace, not the transient tombstone shape (files and directories
         under the same parent are ordered so nothing is orphaned).  Empty
         list when *tier_root* does not exist. No-op-safe; idempotent — a
         second call on an already-reaped root returns ``[]``.
@@ -333,49 +371,182 @@ def reap_tier_artifacts(tier_root: Path) -> list[Path]:
 
     from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
 
-    def _remove_tree(root: Path) -> list[Path]:
-        if not root.exists():
-            return []
-        # A main tier root's direct children are a mix of plain files
-        # (indexed_key_registry.json, graph.json) and directories (timestamped
-        # weight slots) — shutil.rmtree/os.walk both require a directory, so a
-        # file child is unlinked directly rather than routed through rmtree.
-        if not root.is_dir():
-            root.unlink()
-            return [root]
-        paths: list[Path] = [root]
-        for dirpath, dirnames, filenames in os.walk(root):
-            base = Path(dirpath)
-            paths.extend(base / name for name in filenames)
-            paths.extend(base / name for name in dirnames)
-        shutil.rmtree(root)
-        return paths
-
     tier_root = Path(tier_root)
     if not tier_root.exists():
         return []
 
+    is_interim_slot = tier_root.name.startswith(INTERIM_DIR_PREFIX)
+    # Interim slot roots live at <adapter_dir>/episodic/interim_<stamp>/;
+    # main tier roots live at <adapter_dir>/<tier>/ — both shapes are fixed
+    # (see adapter_slot_root_for_name / interim_dir_for_name), so the
+    # ancestor distance to adapter_dir is a reliable function of the shape
+    # alone, never re-derived by any other means.
+    adapter_dir = tier_root.parent.parent if is_interim_slot else tier_root.parent
+    pending_dir = adapter_dir / _PENDING_DELETE_DIR_NAME
+
+    def _condemn_and_remove(path: Path) -> list[Path]:
+        if not path.exists():
+            return []
+        # Original (pre-rename) paths — walked before the rename so the
+        # returned list always describes the live namespace as it existed
+        # right before condemnation, never the transient tombstone shape.
+        # A main tier root's direct children are a mix of plain files
+        # (indexed_key_registry.json, graph.json) and directories (timestamped
+        # weight slots); both go through the same rename-then-delete step —
+        # a single file's unlink is already atomic, but routing it through
+        # the tombstone too keeps one code path and one collision rule.
+        if not path.is_dir():
+            original_paths: list[Path] = [path]
+        else:
+            original_paths = [path]
+            for dirpath, dirnames, filenames in os.walk(path):
+                base = Path(dirpath)
+                original_paths.extend(base / name for name in filenames)
+                original_paths.extend(base / name for name in dirnames)
+
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        tombstone = pending_dir / path.name
+        if tombstone.exists():
+            # Stale leftover from a prior crash — already-condemned debris.
+            if tombstone.is_dir():
+                shutil.rmtree(tombstone)
+            else:
+                tombstone.unlink()
+
+        os.rename(path, tombstone)
+        if tombstone.is_dir():
+            shutil.rmtree(tombstone)
+        else:
+            tombstone.unlink()
+        return original_paths
+
     removed: list[Path] = []
-    if tier_root.name.startswith(INTERIM_DIR_PREFIX):
-        removed.extend(_remove_tree(tier_root))
+    if is_interim_slot:
+        removed.extend(_condemn_and_remove(tier_root))
     else:
         # Interim tier containers (separate tiers, reaped by their own call)
         # live only under episodic/ — an interim_*-named child anywhere else
         # is training scratch, not a tier, and must not be spared.
         spare_interim_children = tier_root.name == "episodic"
-        for child in sorted(tier_root.iterdir()):
-            if (
+        children = [
+            child
+            for child in sorted(tier_root.iterdir())
+            if not (
                 spare_interim_children
                 and child.is_dir()
                 and child.name.startswith(INTERIM_DIR_PREFIX)
-            ):
-                continue
-            removed.extend(_remove_tree(child))
+            )
+        ]
+        # The registry file is condemned LAST, by construction — never by
+        # sorted()'s incidental ASCII collation (which today happens to put
+        # "indexed_key_registry.json" after digit-named slot dirs, but
+        # states nothing about that ordering and nothing pins it). The
+        # registry is the commit signal the boot sweep
+        # (_sweep_keyless_tier_artifacts, paramem/server/app.py) reads to
+        # decide whether a tier holds any keys, so a crash mid-reap must
+        # always leave "registry present, some/all weight slots gone" —
+        # never "registry gone, a weight slot still present", which nothing
+        # else would revisit. A stable sort on "is this the registry"
+        # preserves relative order among every other child.
+        children.sort(key=lambda c: c.name == "indexed_key_registry.json")
+        for child in children:
+            removed.extend(_condemn_and_remove(child))
         if not any(tier_root.iterdir()):
             tier_root.rmdir()
             removed.append(tier_root)
 
+    # Every condemned entry is deleted from the tombstone dir immediately
+    # after its own rename (inside _condemn_and_remove), so a fully
+    # successful reap leaves .pending-delete/ empty — clean it up rather
+    # than leaving an empty dir behind on every reap.
+    if pending_dir.exists() and not any(pending_dir.iterdir()):
+        pending_dir.rmdir()
+
     return sorted(removed, key=lambda p: (-len(p.parts), str(p)))
+
+
+def resume_pending_reaps(adapter_dir: Path) -> None:
+    """Finish any :func:`reap_tier_artifacts` deletion interrupted mid-rmtree.
+
+    :func:`reap_tier_artifacts` rename-condemns every root it deletes into
+    ``<adapter_dir>/.pending-delete/<name>`` before deleting it there, so a
+    crash between the rename and the delete leaves the condemned tree
+    stranded under the tombstone dir — already out of the live namespace,
+    but not yet actually gone from disk. Call this once at boot, before any
+    live-namespace tier scan (mirrors the existing
+    ``sweep_orphan_pending``-before-``find_live_slot`` ordering in
+    :mod:`paramem.backup.atomic`), to finish those deletions and remove the
+    now-empty tombstone dir.
+
+    Best-effort: this is called from ``_load_model_into_state`` during boot,
+    and every other failure mode its caller
+    (``_sweep_keyless_tier_artifacts``, ``paramem/server/app.py``) can hit is
+    already log-and-continue — an unguarded exception here would be the one
+    way this sweep aborts the entire boot instead. A single entry that
+    cannot be removed (permission error, still held open, etc.) is logged at
+    ERROR and skipped rather than raised; it is retried on the next boot.
+    The tombstone directory itself existing as a regular file (an
+    unexpected shape, but not a reason to abort boot) is tolerated the same
+    way — unlinked directly instead of raising ``NotADirectoryError`` out of
+    ``iterdir()``.
+
+    Idempotent — a missing or already-empty ``.pending-delete`` dir is a
+    silent no-op. One scan root only: this does not walk into any other
+    directory under *adapter_dir*.
+
+    Args:
+        adapter_dir: Adapter root (``config.adapter_dir``).
+
+    Returns:
+        ``None``.
+    """
+    import shutil
+
+    adapter_dir = Path(adapter_dir)
+    pending_dir = adapter_dir / _PENDING_DELETE_DIR_NAME
+    if not pending_dir.exists():
+        return
+
+    if not pending_dir.is_dir():
+        try:
+            pending_dir.unlink()
+        except OSError:
+            logger.error(
+                "resume_pending_reaps: %s is a file, not a directory, and could "
+                "not be removed — left for next boot",
+                pending_dir,
+                exc_info=True,
+            )
+        return
+
+    for entry in sorted(pending_dir.iterdir()):
+        logger.warning(
+            "resume_pending_reaps: resuming interrupted deletion of %s",
+            entry,
+        )
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except OSError:
+            logger.error(
+                "resume_pending_reaps: failed to remove %s — left stranded, "
+                "will retry on next boot",
+                entry,
+                exc_info=True,
+            )
+
+    try:
+        pending_dir.rmdir()
+    except OSError:
+        # Non-empty because at least one entry above failed to be removed —
+        # leave the tombstone dir itself for the next boot's resume rather
+        # than raising out of this best-effort sweep.
+        logger.error(
+            "resume_pending_reaps: %s not empty after resume attempt — left for next boot",
+            pending_dir,
+        )
 
 
 def erase_keys_from_graph_file(path: Path, keys: set[str]) -> int:

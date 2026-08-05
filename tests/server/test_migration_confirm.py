@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
@@ -946,6 +947,7 @@ class TestRunBaseSwapPhaseA:
         *,
         succeed: bool = True,
         reload_mode: str = "local",
+        gpu_release_override=None,
     ):
         """Helper: run _run_base_swap_orchestration with mocks via asyncio.run().
 
@@ -954,6 +956,10 @@ class TestRunBaseSwapPhaseA:
         ``reload_mode`` sets the simulated post-reload ``_state["mode"]``:
           "local"      — reload succeeded; Phase B will run (default).
           "cloud-only" — reload was deferred; Phase B must NOT run.
+        ``gpu_release_override`` — when given, replaces the default
+        ``_fake_gpu_release`` coroutine as the ``_gpu_release_internal``
+        patch target (e.g. to simulate a refused release returning the 503
+        ``JSONResponse`` shape instead of the success dict).
         """
         import asyncio
 
@@ -1049,9 +1055,17 @@ class TestRunBaseSwapPhaseA:
         _reload_mode = reload_mode
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: load the renamed-config base model.
@@ -1085,7 +1099,10 @@ class TestRunBaseSwapPhaseA:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch(
+                "paramem.server.app._gpu_release_internal",
+                gpu_release_override if gpu_release_override is not None else _fake_gpu_release,
+            ),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -1181,6 +1198,107 @@ class TestRunBaseSwapPhaseA:
         # Status must be phase_a_failed.
         assert any(g.get("status") == "phase_a_failed" for g in gates_received), (
             f"Expected phase_a_failed gate status; got {gates_received}"
+        )
+
+    def test_fresh_start_with_base_swap_active_does_not_409(self, tmp_path, monkeypatch):
+        """Regression: the orchestration itself sets
+        migration['base_swap_active']=True on entry (`app.py` around
+        ``_run_base_swap_orchestration``'s in-flight guard). The fresh-start
+        reload step must call ``_gpu_release_internal`` directly rather than
+        the ``/gpu/release`` route handler ``gpu_release`` — the handler's
+        first guard 409s on exactly that flag, since it exists to refuse
+        *external* callers during an active swap.
+
+        This test intentionally does NOT patch ``gpu_release`` (only
+        ``_gpu_release_internal``, via the shared ``_run_phase_a`` helper) —
+        so if ``app.py``'s fresh-start reload step regresses back to
+        ``await gpu_release()``, the real (unpatched) route handler runs,
+        its base_swap_active guard fires, the raised HTTPException(409) is
+        caught by the orchestration's outer exception handler, and this test
+        fails because a ``phase_a_failed``-shaped gate is recorded instead of
+        ``pass``. Separately asserts the real route handler DOES still 409
+        when called directly with the same state, proving the guard itself
+        is intact and the fix is specifically about which callable the
+        orchestration invokes.
+        """
+        # First: the route handler's own guard, exercised in isolation on a
+        # minimal state, still refuses when base_swap_active is True — the
+        # guard itself is untouched by this fix.
+        monkeypatch.setattr(
+            app_module, "_state", {"migration": {"base_swap_active": True}, "mode": "local"}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(app_module.gpu_release())
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["error"] == "base_swap_active"
+
+        # Then: the orchestration itself legitimately holds
+        # base_swap_active=True (set at its own entry) for the duration of
+        # its run — its fresh-start reload step must NOT hit that guard.
+        # The finally block in _run_base_swap_orchestration clears the flag
+        # again once the coroutine completes, so this must be checked via
+        # the recorded gates, not by re-querying state after the fact.
+        state = self._make_phase_a_state(tmp_path)
+        state["migration"]["base_swap_active"] = True
+
+        call_order, rename_calls, gates_received, _, state_dir = self._run_phase_a(
+            state, monkeypatch, tmp_path, succeed=True, reload_mode="local"
+        )
+
+        assert not any(g.get("status") == "phase_a_failed" for g in gates_received), (
+            f"orchestration must not fail with base_swap_active pre-set; got {gates_received}"
+        )
+        assert any(g.get("status") == "pass" for g in gates_received), (
+            f"Expected 'pass' gate status; got {gates_received}"
+        )
+        assert "apply_config_live" in call_order
+
+    def test_fresh_start_release_refusal_is_not_ignored(self, tmp_path, monkeypatch):
+        """``_gpu_release_internal`` returning its 503-refusal shape (rather
+        than the success dict) must not be silently treated as success: the
+        orchestration raises, which its own outer exception handler turns
+        into a ``phase_a_failed`` gate — and ``_apply_config_live`` must
+        never run against a base model that was never actually released.
+        """
+        from fastapi.responses import JSONResponse
+
+        async def _refusing_gpu_release():
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "consolidating",
+                    "detail": "GPU release refused: a consolidation cycle is in flight.",
+                },
+            )
+
+        state = self._make_phase_a_state(tmp_path)
+        call_order, _, gates_received, _, _ = self._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            succeed=True,
+            gpu_release_override=_refusing_gpu_release,
+        )
+
+        # Phase A itself already completed (its marker is "phaseA_done" by
+        # the time the refused release is hit in Step 3), so the outer
+        # exception handler's phase-inference classifies this failure as
+        # "phase_b_failed" rather than "phase_a_failed" — the important
+        # assertion is that it IS recorded as a failure, and that Phase B
+        # never actually started.
+        failed_gates = [g for g in gates_received if str(g.get("status", "")).endswith("_failed")]
+        assert failed_gates, (
+            f"Expected a *_failed gate status on a refused release; got {gates_received}"
+        )
+        assert "apply_config_live" not in call_order, (
+            "must not reload the new base after a refused release"
+        )
+        assert "phase_b_submit" not in call_order, (
+            "must not proceed into Phase B after a refused release"
+        )
+        _exc = failed_gates[0].get("exception", "")
+        assert "consolidating" in _exc, (
+            f"Expected the refusal detail in the recorded exception; got {failed_gates[0]}"
         )
 
 
@@ -1322,9 +1440,17 @@ class TestBaseSwapOrchestration:
         _rm = reload_mode
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: load the renamed-config base model."""
@@ -1345,7 +1471,7 @@ class TestBaseSwapOrchestration:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -1491,9 +1617,17 @@ class TestBaseSwapOrchestration:
             return fake_a if call_n[0] == 1 else fake_b
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: load the renamed-config base model."""
@@ -1515,7 +1649,7 @@ class TestBaseSwapOrchestration:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -1683,8 +1817,12 @@ class TestBaseSwapOrchestration:
         _rm = reload_mode
 
         async def _fake_gpu_release():
+            # Returns the success-dict shape the real _gpu_release_internal
+            # returns — the orchestration checks this now (see the module
+            # docstring note on _fake_gpu_release above).
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             call_order.append("apply_config_live")
@@ -1708,7 +1846,7 @@ class TestBaseSwapOrchestration:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch("paramem.server.app._live_reload_base_model", reload_fn),
         ):
@@ -1934,9 +2072,17 @@ class TestBaseSwapResumePhaseAware:
         _rm = reload_mode
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: load the renamed-config base model."""
@@ -1956,7 +2102,7 @@ class TestBaseSwapResumePhaseAware:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -2271,9 +2417,17 @@ class TestBaseSwapStep3ResumeReload:
         gates_received: list[dict] = []
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: load the renamed-config base model.
@@ -2324,7 +2478,7 @@ class TestBaseSwapStep3ResumeReload:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -2714,9 +2868,17 @@ class TestBaseSwapActiveFlag:
         )
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live with deferred reload: leave mode=cloud-only."""
@@ -2733,7 +2895,7 @@ class TestBaseSwapActiveFlag:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -3235,9 +3397,17 @@ class TestPhaseBModelIdentityGuard:
             gates_received.append(payload)
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: set mode and config.model_name as controlled by test."""
@@ -3256,7 +3426,7 @@ class TestPhaseBModelIdentityGuard:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",
@@ -3463,9 +3633,17 @@ class TestPhaseBModelIdentityGuard:
             gates_received.append(payload)
 
         async def _fake_gpu_release():
-            """Simulate gpu_release: drain base model, enter cloud-only."""
+            """Simulate gpu_release: drain base model, enter cloud-only.
+
+            Returns the same success-dict shape the real
+            ``_gpu_release_internal`` returns on success — the orchestration
+            now checks this return value (raises on anything else; see
+            ``TestFreshStartReleaseRefusalIsNotIgnored`` below) rather than
+            ignoring it.
+            """
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
+            return {"mode": "cloud-only", "released": True, "reason": "released"}
 
         def _fake_apply_config_live():
             """Simulate _apply_config_live: correct reload — mode=local, model_name=qwen3-4b."""
@@ -3483,7 +3661,7 @@ class TestPhaseBModelIdentityGuard:
                 "paramem.server.app.ThermalPolicy.from_consolidation_config",
                 return_value=MagicMock(),
             ),
-            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._gpu_release_internal", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
             patch(
                 "paramem.server.app._live_reload_base_model",

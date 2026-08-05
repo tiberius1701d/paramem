@@ -175,6 +175,50 @@ class TestConsolidationDispatchGuards:
         monkeypatch.setattr(app_module, "_state", state)
         assert app_module._consolidation_dispatch_guards() == "deferred_trial_active"
 
+    def test_base_swap_active_returns_deferred_string(self, monkeypatch) -> None:
+        """migration.base_swap_active=True → ``"deferred_base_swap_active"``,
+        the same ``deferred_*`` string shape every other arm here returns.
+        This is a belt guard, not the primary refusal: on every production
+        path ``base_swap_active`` is set only after ``migration["state"]`` is
+        already ``"TRIAL"``, so ``_trial_active()`` (checked further down)
+        already refuses in practice — this arm exists in case the flag ever
+        lags the state.  All six callers of this guard (the four
+        consolidation routes via ``_dispatch_consolidation``, plus
+        ``/speaker/forget`` and ``/interim/discard``, which call this
+        function directly) turn the string into a 409 via their own verdict
+        maps.
+        """
+        import paramem.server.app as app_module
+
+        state = _make_dispatch_state()
+        state["migration"] = {"base_swap_active": True}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        assert app_module._consolidation_dispatch_guards() == "deferred_base_swap_active"
+
+    def test_base_swap_active_is_checked_before_the_other_guards(self, monkeypatch) -> None:
+        """base_swap_active=True with consolidating=True too still returns the
+        base-swap deferral, not ``deferred_already_running`` — it is the
+        first check in the function.
+        """
+        import paramem.server.app as app_module
+
+        state = _make_dispatch_state(consolidating=True)
+        state["migration"] = {"base_swap_active": True}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        assert app_module._consolidation_dispatch_guards() == "deferred_base_swap_active"
+
+    def test_base_swap_inactive_does_not_defer(self, monkeypatch) -> None:
+        """migration present but base_swap_active=False (or absent) is not a
+        refusal on its own — falls through to the other guards / None."""
+        import paramem.server.app as app_module
+
+        state = _make_dispatch_state()
+        state["migration"] = {"base_swap_active": False}
+        monkeypatch.setattr(app_module, "_state", state)
+        assert app_module._consolidation_dispatch_guards() is None
+
 
 # ---------------------------------------------------------------------------
 # TestConsolidationArbitrator — action resolution + the ONE content gate
@@ -1551,6 +1595,36 @@ class TestConsolidationRoutes:
         assert actions_seen.count(ConsolidationAction.AUTO) == 1, (
             "AUTO must be requested by exactly one door: /scheduled-tick"
         )
+
+    def test_all_four_routes_defer_with_200_while_a_base_swap_is_active(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """base_swap_active=True with ``migration["state"]`` still ``"LIVE"``
+        (the flag-only belt shape — never a reachable production state, since
+        every production path sets ``state="TRIAL"`` before the flag; see
+        ``_consolidation_dispatch_guards``'s docstring) → every one of the
+        four consolidation routes takes their ordinary HTTP 200 ``deferred_*``
+        convention with ``status="deferred_base_swap_active"``, and nothing
+        is dispatched.  Clearing the flag lets dispatch proceed again on the
+        same client/state.
+        """
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
+        state["migration"] = {"base_swap_active": True}
+
+        client, submitted = _route_client(state, monkeypatch)
+
+        for path in ("/scheduled-tick", "/consolidate", "/consolidate/interim", "/reconsolidate"):
+            resp = client.post(path)
+            assert resp.status_code == 200, path
+            assert resp.json()["status"] == "deferred_base_swap_active", path
+
+        assert submitted == [], "no dispatch may occur while a base swap is active"
+
+        state["migration"]["base_swap_active"] = False
+        resp = client.post("/consolidate")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "started_full"
 
 
 # ---------------------------------------------------------------------------

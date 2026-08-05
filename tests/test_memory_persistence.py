@@ -1,12 +1,15 @@
 """Unit tests for paramem.memory.persistence.
 
 Covers round-trip contract, encryption awareness, iter_entries edge-skipping,
-entry_by_key hit/miss, entity index helpers, and build_tier_graph_from_store.
+entry_by_key hit/miss, entity index helpers, build_tier_graph_from_store, and
+reap_tier_artifacts' rename-then-delete crash safety (+ resume_pending_reaps).
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+from pathlib import Path
 
 import networkx as nx
 import pytest
@@ -22,12 +25,14 @@ from paramem.backup.key_store import (
 from paramem.memory.persistence import (
     _EDGE_SOURCE_ATTR,
     _IK_KEY_ATTR,
+    _PENDING_DELETE_DIR_NAME,
     build_tier_graph_from_store,
     entry_by_key,
     erase_keys_from_graph_file,
     iter_entries,
     load_memory_from_disk,
     reap_tier_artifacts,
+    resume_pending_reaps,
     save_memory_to_disk,
 )
 
@@ -890,3 +895,256 @@ class TestReapTierArtifacts:
 
         depths = [len(p.parts) for p in removed]
         assert depths == sorted(depths, reverse=True)
+
+    def test_no_pending_delete_leftover_on_success(self, tmp_path):
+        """A fully successful reap (no crash) leaves no ``.pending-delete``
+        directory at all — every tombstone entry is removed immediately
+        after its own rename, and the now-empty tombstone dir is cleaned up
+        too."""
+        tier_root = tmp_path / "procedural"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+
+        reap_tier_artifacts(tier_root)
+
+        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# reap_tier_artifacts — rename-then-delete crash safety (tombstone)
+# ---------------------------------------------------------------------------
+
+
+class TestReapTierArtifactsTombstone:
+    """A condemned root is renamed into ``.pending-delete/<name>`` before
+    being deleted there. A crash between the rename and the delete leaves
+    the corpse stranded under the tombstone dir — already out of the live
+    namespace — rather than half-deleted in its original location."""
+
+    def test_crash_after_rename_leaves_interim_slot_out_of_live_namespace(
+        self, tmp_path, monkeypatch
+    ):
+        """A shutil.rmtree failure AFTER the rename step leaves the
+        condemned interim slot stranded under .pending-delete/, fully out
+        of the live namespace and invisible to iter_interim_dirs — never
+        half-deleted in its original location. Reverting the rename step
+        (monkeypatching os.rename to a no-op, i.e. restoring the old direct
+        shutil.rmtree(root) behaviour) would leave interim_root sitting in
+        the live namespace instead, which the assertions below reject."""
+        from paramem.memory.interim_adapter import iter_interim_dirs
+
+        adapter_dir = tmp_path
+        episodic_root = adapter_dir / "episodic"
+        interim_root = episodic_root / "interim_20260417T0000"
+        nested_slot = interim_root / "20260417-120000"
+        nested_slot.mkdir(parents=True)
+        (nested_slot / "adapter_model.safetensors").write_bytes(b"")
+        (interim_root / "indexed_key_registry.json").write_text("{}")
+
+        real_rmtree = shutil.rmtree
+
+        def _boom(path, *a, **kw):
+            raise OSError("simulated crash mid-delete")
+
+        monkeypatch.setattr(shutil, "rmtree", _boom)
+        try:
+            with pytest.raises(OSError):
+                reap_tier_artifacts(interim_root)
+        finally:
+            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+
+        # Out of the live namespace immediately — the rename already ran.
+        assert not interim_root.exists()
+        assert list(iter_interim_dirs(adapter_dir)) == []
+
+        # Stranded under the tombstone dir, not yet actually deleted.
+        tombstone = adapter_dir / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
+        assert tombstone.exists()
+        assert (tombstone / "20260417-120000" / "adapter_model.safetensors").exists()
+
+    def test_crash_during_main_tier_reap_preserves_interim_children(self, tmp_path, monkeypatch):
+        """A crash while reaping a main tier's non-interim child leaves the
+        sibling interim_* child completely untouched — the main-tier
+        branch's interim-sparing behaviour survives the tombstone rewrite."""
+        tier_root = tmp_path / "episodic"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+        interim = tier_root / "interim_20260417T0000"
+        interim.mkdir()
+        (interim / "adapter_model.safetensors").write_bytes(b"")
+
+        def _boom(path, *a, **kw):
+            raise OSError("simulated crash mid-delete")
+
+        real_rmtree = shutil.rmtree
+        monkeypatch.setattr(shutil, "rmtree", _boom)
+        try:
+            with pytest.raises(OSError):
+                reap_tier_artifacts(tier_root)
+        finally:
+            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+
+        assert interim.exists()
+        assert (interim / "adapter_model.safetensors").exists()
+        assert not slot.exists(), "the condemned slot is out of the live namespace"
+
+    def test_stale_pending_delete_collision_is_cleared_before_rename(self, tmp_path):
+        """A same-name leftover already sitting in ``.pending-delete/`` from
+        a prior crash is treated as already-condemned debris and removed
+        first — without this, ``os.rename`` onto a non-empty destination
+        directory would raise and the reap would fail outright."""
+        adapter_dir = tmp_path
+        tier_root = adapter_dir / "semantic"
+        child = tier_root / "20260417-120000"
+        child.mkdir(parents=True)
+        (child / "adapter_model.safetensors").write_bytes(b"")
+
+        stale = adapter_dir / _PENDING_DELETE_DIR_NAME / "20260417-120000"
+        stale.mkdir(parents=True)
+        (stale / "leftover_from_prior_crash.bin").write_bytes(b"debris")
+
+        removed = reap_tier_artifacts(tier_root)
+
+        assert child in removed
+        assert not tier_root.exists()
+        assert not (adapter_dir / _PENDING_DELETE_DIR_NAME).exists()
+
+
+class TestResumePendingReaps:
+    """Boot-time sweep that finishes any deletion reap_tier_artifacts left
+    stranded under ``.pending-delete/``."""
+
+    def test_missing_dir_is_silent_noop(self, tmp_path):
+        """No ``.pending-delete`` directory at all is a silent no-op."""
+        resume_pending_reaps(tmp_path)
+        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+
+    def test_clears_stranded_tombstone(self, tmp_path, caplog):
+        """A directory stranded under ``.pending-delete/`` (simulating a
+        crash between reap_tier_artifacts' rename and its delete) is
+        removed, along with the now-empty tombstone dir itself, and the
+        removal is logged as a WARNING naming the resumed path."""
+        import logging
+
+        stranded = tmp_path / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
+        nested = stranded / "20260417-120000"
+        nested.mkdir(parents=True)
+        (nested / "adapter_model.safetensors").write_bytes(b"")
+
+        caplog.set_level(logging.WARNING, logger="paramem.memory.persistence")
+        resume_pending_reaps(tmp_path)
+
+        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("interim_20260417T0000" in msg for msg in warnings), (
+            f"expected a WARNING naming the resumed path, got: {warnings}"
+        )
+
+    def test_clears_stranded_file(self, tmp_path):
+        """A stranded plain-file entry under ``.pending-delete/`` (the file
+        child branch of reap_tier_artifacts) is unlinked, not just handled
+        for directories."""
+        pending = tmp_path / _PENDING_DELETE_DIR_NAME
+        pending.mkdir(parents=True)
+        (pending / "indexed_key_registry.json").write_text("{}")
+
+        resume_pending_reaps(tmp_path)
+
+        assert not pending.exists()
+
+    def test_idempotent_double_resume(self, tmp_path):
+        """Calling resume_pending_reaps a second time after it already
+        cleared everything is a safe no-op."""
+        stranded = tmp_path / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
+        stranded.mkdir(parents=True)
+
+        resume_pending_reaps(tmp_path)
+        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+
+        resume_pending_reaps(tmp_path)  # must not raise
+        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+
+    def test_end_to_end_crash_then_resume(self, tmp_path, monkeypatch):
+        """A reap_tier_artifacts crash-injection followed by
+        resume_pending_reaps leaves nothing behind — the full
+        crash-then-boot-resume cycle."""
+        tier_root = tmp_path / "episodic"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+
+        real_rmtree = shutil.rmtree
+
+        def _boom(path, *a, **kw):
+            raise OSError("simulated crash mid-delete")
+
+        monkeypatch.setattr(shutil, "rmtree", _boom)
+        try:
+            with pytest.raises(OSError):
+                reap_tier_artifacts(tier_root)
+        finally:
+            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+
+        assert (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+
+        resume_pending_reaps(tmp_path)
+
+        assert not (tmp_path / _PENDING_DELETE_DIR_NAME).exists()
+
+    def test_entry_that_raises_does_not_block_the_remaining_entries(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Best-effort: one entry whose removal raises (e.g. a permission
+        error) is logged at ERROR and skipped — it must not prevent the
+        OTHER entries under ``.pending-delete/`` from being cleared, and
+        must not propagate out of ``resume_pending_reaps`` (which would
+        abort the entire boot via ``_load_model_into_state``)."""
+        import logging
+
+        pending = tmp_path / _PENDING_DELETE_DIR_NAME
+        poisoned = pending / "interim_poisoned"
+        poisoned.mkdir(parents=True)
+        (poisoned / "adapter_model.safetensors").write_bytes(b"")
+        clean = pending / "interim_clean"
+        clean.mkdir(parents=True)
+        (clean / "adapter_model.safetensors").write_bytes(b"")
+
+        real_rmtree = shutil.rmtree
+
+        def _boom(path, *a, **kw):
+            if Path(path).name == "interim_poisoned":
+                raise OSError("simulated permission error")
+            return real_rmtree(path, *a, **kw)
+
+        monkeypatch.setattr(shutil, "rmtree", _boom)
+        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
+        try:
+            # Must not raise — the poisoned entry's OSError is caught internally.
+            resume_pending_reaps(tmp_path)
+        finally:
+            monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+
+        # The clean entry was removed despite the poisoned one failing.
+        assert not clean.exists()
+        # The poisoned entry is left stranded (retried on next boot), and the
+        # tombstone dir itself survives since it is non-empty.
+        assert poisoned.exists()
+        assert pending.exists()
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("interim_poisoned" in r.getMessage() for r in error_records), (
+            f"expected an ERROR log naming the failed entry, got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_regular_file_pending_delete_is_removed(self, tmp_path):
+        """``.pending-delete`` itself existing as a regular file (rather
+        than a directory) is tolerated — unlinked directly instead of
+        raising ``NotADirectoryError`` out of ``iterdir()``."""
+        pending = tmp_path / _PENDING_DELETE_DIR_NAME
+        pending.write_bytes(b"unexpected file, not a directory")
+
+        resume_pending_reaps(tmp_path)
+
+        assert not pending.exists()

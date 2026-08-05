@@ -440,6 +440,128 @@ class TestGuardMatrix:
         assert resp.json()["detail"]["error"] == "trial_active"
         loop.store.drop_tier.assert_not_called()
 
+    def test_base_swap_active_refuses_409(self, tmp_path, monkeypatch):
+        """migration.base_swap_active=True refuses 409, same as the other
+        four guard verdicts — closes the window where a base-swap
+        orchestration's direct (non-mode-flipping) dispatch could win
+        ``gpu_lock`` ahead of this door and release + recreate the
+        ConsolidationLoop this door already captured a reference to.
+        """
+        state = _make_state(tmp_path, migration={"base_swap_active": True})
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, tmp_path, state)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "base_swap_active"
+        loop.store.drop_tier.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Loop staleness across gpu_lock — a config-apply (or, before this fix, a
+# base-swap orchestration racing ahead of the base_swap_active guard) that
+# releases + recreates the ConsolidationLoop while this door holds gpu_lock
+# must not leave the sync worker mutating the released pre-lock loop.
+# ---------------------------------------------------------------------------
+
+
+class TestLoopStalenessAcrossLock:
+    def test_discard_sync_mutates_the_fresh_loop_not_the_pre_lock_capture(
+        self, tmp_path, monkeypatch
+    ):
+        """Swap ``_state['consolidation_loop']`` to a fresh mock while the
+        handler holds ``gpu_lock`` (simulating a config-apply that raced
+        ahead of this door and won the lock first) — the executor-side
+        mutation (``store.drop_tier`` / PEFT unmount) must land on the FRESH
+        loop's store/model, not the loop the handler captured before the
+        lock, which proves ``_discard_sync`` re-resolves ``loop`` as its
+        first statement rather than closing over the pre-lock capture.
+        """
+        import contextlib
+
+        import paramem.server.gpu_lock as gpu_lock_module
+
+        cfg = _make_config(tmp_path)
+        tier = "episodic_interim_20260801T0000"
+
+        store_a = MemoryStore(replay_enabled=True)  # the handler's pre-lock capture
+        _seed_interim_slot(store_a, cfg.adapter_dir, "20260801T0000", "graph1")
+        model_a = _make_peft_model("episodic", tier)
+        loop_a = _make_loop(store_a, model_a)
+
+        store_b = MemoryStore(replay_enabled=True)  # swapped in while the lock is held
+        _seed_interim_slot(store_b, cfg.adapter_dir, "20260801T0000", "graph1")
+        model_b = _make_peft_model("episodic", tier)
+        loop_b = _make_loop(store_b, model_b)
+
+        state = _make_state(tmp_path, loop=loop_a, config=cfg)
+
+        @contextlib.asynccontextmanager
+        async def _swap_loop_gpu_lock():
+            state["consolidation_loop"] = loop_b
+            yield
+
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(gpu_lock_module, "gpu_lock", _swap_loop_gpu_lock)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/interim/discard", json={"confirm": True})
+
+        assert resp.status_code == 200, resp.text
+        # The pre-lock capture is untouched...
+        assert tier in store_a.tiers_with_registry()
+        assert tier in model_a.peft_config
+        # ...the fresh (swapped-in) loop is the one actually mutated.
+        assert tier not in store_b.tiers_with_registry()
+        assert tier not in model_b.peft_config
+
+    def test_discard_sync_mutates_the_fresh_config_not_the_pre_lock_capture(
+        self, tmp_path, monkeypatch
+    ):
+        """Same race, but on ``_state['config']`` rather than the loop: a
+        config-apply that wins ``gpu_lock`` first also replaces
+        ``_state["config"]``.  ``_discard_sync``'s on-disk deletion
+        (``unload_interim_adapters(loop.model, config.adapter_dir)``) must
+        target the FRESH config's ``adapter_dir``, not the pre-lock one —
+        proves the sync worker re-resolves ``config`` too, not just ``loop``.
+        """
+        import contextlib
+
+        import paramem.server.gpu_lock as gpu_lock_module
+
+        tier = "episodic_interim_20260801T0000"
+
+        cfg_a = _make_config(tmp_path / "a")  # the handler's pre-lock capture
+        store_a = MemoryStore(replay_enabled=True)
+        _seed_interim_slot(store_a, cfg_a.adapter_dir, "20260801T0000", "graph1")
+        model_a = _make_peft_model("episodic", tier)
+        loop_a = _make_loop(store_a, model_a)
+
+        cfg_b = _make_config(tmp_path / "b")  # swapped in while the lock is held
+        store_b = MemoryStore(replay_enabled=True)
+        _seed_interim_slot(store_b, cfg_b.adapter_dir, "20260801T0000", "graph1")
+        model_b = _make_peft_model("episodic", tier)
+        loop_b = _make_loop(store_b, model_b)
+
+        state = _make_state(tmp_path, loop=loop_a, config=cfg_a)
+
+        @contextlib.asynccontextmanager
+        async def _swap_config_and_loop_gpu_lock():
+            state["config"] = cfg_b
+            state["consolidation_loop"] = loop_b
+            yield
+
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(gpu_lock_module, "gpu_lock", _swap_config_and_loop_gpu_lock)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/interim/discard", json={"confirm": True})
+
+        assert resp.status_code == 200, resp.text
+        # The pre-lock config's on-disk slot is untouched...
+        assert (cfg_a.adapter_dir / "episodic" / "interim_20260801T0000").exists()
+        assert tier in model_a.peft_config
+        # ...the fresh (swapped-in) config's on-disk slot is the one reaped.
+        assert not (cfg_b.adapter_dir / "episodic" / "interim_20260801T0000").exists()
+        assert tier not in model_b.peft_config
+
 
 # ---------------------------------------------------------------------------
 # Operation order

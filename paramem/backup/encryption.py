@@ -253,6 +253,32 @@ class ModeProbe:
     plaintext_paths: list[Path] = field(default_factory=list)
 
 
+def _under_hidden_dir(path: Path, root: Path) -> bool:
+    """True when any path segment between *root* and *path* is dot-prefixed.
+
+    ``rglob`` descends into every subdirectory unconditionally, including
+    dot-prefixed ones (e.g. ``.pending-delete/`` — the reap tombstone
+    directory, :mod:`paramem.memory.persistence`) that condemned-but-not-yet-
+    deleted debris can transiently sit in. Mirrors the dot-entry skip already
+    applied at every ``iterdir()`` walker in this codebase (e.g.
+    ``paramem.backup.backup``'s "skip .pending and other hidden entries").
+
+    Args:
+        path: Candidate file path, expected to be under *root*.
+        root: Root directory the ``rglob`` walk started from.
+
+    Returns:
+        ``True`` if *path* sits under a dot-prefixed directory relative to
+        *root*; ``False`` otherwise (including when *path* is not under
+        *root* at all).
+    """
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return any(part.startswith(".") for part in relative_parts[:-1])
+
+
 def infra_paths(data_dir: Path) -> list[Path]:
     """Return the list of infrastructure files subject to envelope encryption.
 
@@ -337,6 +363,8 @@ def infra_paths(data_dir: Path) -> list[Path]:
     # the other infra files.
     if adapters_root.exists():
         for resume in adapters_root.rglob("staging_resume.json"):
+            if _under_hidden_dir(resume, adapters_root):
+                continue  # skip .pending-delete and other hidden dirs
             paths.append(resume)
     # Adapter safetensors — full-file encrypted when daily identity is loaded.
     # Each tier's slot directories (and episodic/interim_* siblings) may hold
@@ -345,6 +373,8 @@ def infra_paths(data_dir: Path) -> list[Path]:
     # adapter weight blobs alongside the JSON metadata.
     if adapters_root.exists():
         for safetensors in adapters_root.rglob("adapter_model.safetensors"):
+            if _under_hidden_dir(safetensors, adapters_root):
+                continue  # skip .pending-delete and other hidden dirs
             paths.append(safetensors)
     return paths
 

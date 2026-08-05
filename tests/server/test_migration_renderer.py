@@ -201,13 +201,61 @@ class TestComputeShapeChangesNoManifest:
         assert warnings == []
 
     def test_missing_slot_skips_silently(self, tmp_path):
-        """No matching slot → no row emitted, and no warning (not-yet-trained
-        is not a warning condition)."""
+        """Never-trained tier (kind dir exists, zero candidate slots) →
+        no row emitted, and no warning (not-yet-trained is not a warning
+        condition)."""
         yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
-        # No slot directory created — find_live_slot returns None
+        # Kind dir exists but has no meta.json-bearing subdirectory at all —
+        # the true never-trained shape, distinct from "kind dir absent"
+        # and from "candidates exist but none match".
+        (tmp_path / "episodic").mkdir(parents=True)
         result, warnings = compute_shape_changes(yaml, tmp_path)
         assert result == []
         assert warnings == []
+
+    def test_missing_kind_dir_skips_silently(self, tmp_path):
+        """Kind dir absent entirely → no row, no warning (degenerate
+        never-trained case)."""
+        yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
+        # No slot directory created at all — find_live_slot returns None
+        # because kind_dir.is_dir() is False.
+        result, warnings = compute_shape_changes(yaml, tmp_path)
+        assert result == []
+        assert warnings == []
+
+    def test_candidate_present_but_unmatched_warns(self, tmp_path):
+        """Kind dir has a weight-slot candidate (meta.json present) but
+        find_live_slot returns None (unreadable or hash-mismatched) → a
+        warning naming the adapter and candidate count is appended, no row
+        emitted."""
+        yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
+        slot = tmp_path / "episodic" / "20260421-040000"
+        slot.mkdir(parents=True)
+        (slot / "meta.json").write_text("{}")  # candidate exists on disk
+
+        with patch("paramem.server.migration.find_live_slot", return_value=None):
+            result, warnings = compute_shape_changes(yaml, tmp_path)
+
+        assert result == []
+        assert len(warnings) == 1
+        assert "episodic" in warnings[0]
+        assert "1" in warnings[0]
+
+    def test_two_candidates_present_but_unmatched_warns_with_count(self, tmp_path):
+        """Two candidate slots, neither matching → warning names count=2."""
+        yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
+        for stamp in ("20260421-040000", "20260422-040000"):
+            slot = tmp_path / "episodic" / stamp
+            slot.mkdir(parents=True)
+            (slot / "meta.json").write_text("{}")
+
+        with patch("paramem.server.migration.find_live_slot", return_value=None):
+            result, warnings = compute_shape_changes(yaml, tmp_path)
+
+        assert result == []
+        assert len(warnings) == 1
+        assert "episodic" in warnings[0]
+        assert "2" in warnings[0]
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +351,30 @@ class TestComputeShapeChangesWithManifest:
         assert "episodic" in warnings[0]
         assert "cannot read manifest" in warnings[0]
         assert str(slot) in warnings[0]
+
+    def test_oserror_from_read_manifest_skips_with_warn_not_500(self, tmp_path):
+        """A bare OSError from read_manifest (e.g. Path.read_text() failing
+        for a permission or I/O reason, not a JSON/schema error) is caught
+        alongside ManifestError — skip with a warning, never an uncaught
+        exception. This test fails if the catch is narrowed back to
+        ManifestError only."""
+        yaml_data = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
+        slot = tmp_path / "episodic" / "ts"
+        slot.mkdir(parents=True)
+
+        with (
+            patch("paramem.server.migration.find_live_slot", return_value=slot),
+            patch(
+                "paramem.server.migration.read_manifest",
+                side_effect=OSError("simulated I/O failure"),
+            ),
+        ):
+            result, warnings = compute_shape_changes(yaml_data, tmp_path)
+
+        assert result == []
+        assert len(warnings) == 1
+        assert "episodic" in warnings[0]
+        assert "cannot read manifest" in warnings[0]
 
     def test_target_modules_change_detected(self, tmp_path):
         """target_modules change → ShapeChange for target_modules field."""

@@ -47,6 +47,7 @@ import hashlib
 import json
 import logging
 import mmap
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -360,12 +361,44 @@ def _slot_mtime(slot: Path) -> float:
         return 0.0
 
 
+def _iter_slot_candidates(adapter_kind_dir: Path) -> Iterator[Path]:
+    """Yield every non-hidden subdirectory of *adapter_kind_dir* carrying a ``meta.json``.
+
+    Presence-only: a "candidate" is a subdirectory that looks like a weight
+    slot because it has a ``meta.json`` file, regardless of whether that
+    manifest is actually readable or matches any particular registry hash.
+    ``.pending`` and all other dot-prefixed entries are skipped. This is the
+    single shared predicate behind :func:`find_live_slot` (which additionally
+    reads and validates each candidate's manifest) and
+    :func:`count_slot_candidates` (which only counts) — collapsed from
+    duplicated inline predicates at both.
+
+    Args:
+        adapter_kind_dir: Directory scoped to a single adapter kind (e.g.
+            ``data/ha/adapters/episodic/``) or an interim tier root.
+
+    Yields:
+        Candidate slot directories, in ``iterdir()`` order (unspecified).
+        Nothing when *adapter_kind_dir* does not exist or is not a directory.
+    """
+    if not adapter_kind_dir.is_dir():
+        return
+    for entry in adapter_kind_dir.iterdir():
+        if entry.name.startswith("."):
+            continue  # skip .pending and other hidden entries
+        if not entry.is_dir():
+            continue
+        if not (entry / "meta.json").exists():
+            continue
+        yield entry
+
+
 def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | None:
     """Return the slot whose ``meta.registry_sha256`` matches *live_registry_sha256*.
 
-    Scans *adapter_kind_dir* for non-hidden subdirectories with a readable
-    ``meta.json``.  ``.pending`` and all other dot-prefixed entries are
-    skipped.  Unreadable manifests produce a WARN log and are skipped.
+    Scans *adapter_kind_dir* via :func:`_iter_slot_candidates` for candidate
+    slot directories, then reads and validates each one's ``meta.json``.
+    Unreadable manifests produce a WARN log and are skipped.
 
     When multiple slots match (e.g. two identical consecutive saves), the
     newest (highest ``st_mtime``) wins.
@@ -383,19 +416,13 @@ def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | 
     Returns:
         Path to the best matching slot, or ``None`` when no match is found.
     """
-    if not adapter_kind_dir.is_dir():
-        return None
-
     candidates: list[Path] = []
-    for entry in adapter_kind_dir.iterdir():
-        if entry.name.startswith("."):
-            continue  # skip .pending and other hidden entries
-        if not entry.is_dir():
-            continue
+    for entry in _iter_slot_candidates(adapter_kind_dir):
         try:
             manifest = read_manifest(entry)
         except ManifestNotFoundError:
-            # Slot without meta.json — skip silently (may be a non-slot subdir)
+            # Race: meta.json removed between the candidate scan above and
+            # this read — skip silently.
             continue
         except ManifestSchemaError as exc:
             logger.warning("find_live_slot: skipping unreadable meta.json in %s: %s", entry, exc)
@@ -408,6 +435,32 @@ def find_live_slot(adapter_kind_dir: Path, live_registry_sha256: str) -> Path | 
         return None
 
     return max(candidates, key=_slot_mtime)
+
+
+def count_slot_candidates(adapter_kind_dir: Path) -> int:
+    """Count weight-slot candidates in *adapter_kind_dir* (presence-only).
+
+    Delegates to :func:`_iter_slot_candidates` — see its docstring for what
+    counts as a candidate. This is the single implementation of the "does
+    this tier dir have any trained slot at all" check that used to be
+    duplicated at four call sites: the boot mount loop's main-tier
+    validation (``_validate_main_adapter_slot``) and its interim-tier
+    fallback, ``/speaker/forget``'s manifest re-stamp gate, and
+    :func:`~paramem.server.migration.compute_shape_changes`'s
+    never-trained-vs-all-corrupt distinction. It lets each caller tell "not
+    yet trained" (zero candidates — silent skip is correct) apart from "every
+    candidate slot is unreadable or doesn't match" (one or more candidates,
+    but :func:`find_live_slot` still returned ``None`` — worth a WARNING).
+
+    Args:
+        adapter_kind_dir: Directory scoped to a single adapter kind (e.g.
+            ``data/ha/adapters/episodic/``) or an interim tier root.
+
+    Returns:
+        The number of matching subdirectories. ``0`` when *adapter_kind_dir*
+        does not exist or is not a directory.
+    """
+    return sum(1 for _ in _iter_slot_candidates(adapter_kind_dir))
 
 
 def tier_registry_sha256(tier_root: Path) -> str:

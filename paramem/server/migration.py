@@ -48,6 +48,7 @@ import yaml
 
 from paramem.adapters.manifest import (
     ManifestError,
+    count_slot_candidates,
     find_live_slot,
     read_manifest,
     tier_registry_sha256,
@@ -509,9 +510,17 @@ def compute_shape_changes(
        parameter — dropped in favour of resolving it here, per adapter.
     2. Call ``find_live_slot(adapter_dir / name, that hash)`` to locate the
        current on-disk slot.
-    3. If no slot is found, skip silently (adapter not yet trained).
-    4. If a slot exists but ``read_manifest`` raises, log WARN and skip (no
-       row emitted).
+    3. If no slot is found: when the kind directory has zero weight-slot
+       candidates (``count_slot_candidates``), skip silently — the adapter
+       has never been trained. When it has one or more candidates but none
+       matched (every manifest unreadable, or none stamped with the live
+       hash), log WARN and append a warning naming the adapter kind and
+       candidate count — this is the genuinely torn case ``find_live_slot``
+       would otherwise conflate with never-trained.
+    4. If a slot exists but ``read_manifest`` raises (``ManifestError`` or
+       ``OSError`` — ``read_manifest`` calls ``Path.read_text()``, which can
+       raise a bare ``OSError`` independent of the JSON/schema errors it
+       wraps as ``ManifestError``), log WARN and skip (no row emitted).
     5. Compare ``manifest.lora.{rank, alpha, target_modules}`` against the
        candidate config.  Emit one ``ShapeChange`` per differing field.
        ``dropout`` is NOT compared here — it is not a shape field (see
@@ -538,9 +547,10 @@ def compute_shape_changes(
         ``(changes, warnings)``. ``changes`` holds all detected shape changes,
         ordered by adapter name then field name. ``warnings`` holds one
         human-readable string per adapter skipped because its tier registry
-        or manifest could not be read — the same substance as the WARNING
-        logged at each skip site. A tier skipped because it has no live slot
-        yet (not-yet-trained) contributes no warning.
+        or manifest could not be read, or because every on-disk candidate
+        slot failed to match ``find_live_slot`` — the same substance as the
+        WARNING logged at each skip site. A tier with zero weight-slot
+        candidates (never trained) contributes no warning.
     """
     adapters_cfg = candidate_yaml.get("adapters", {})
     if not isinstance(adapters_cfg, dict):
@@ -574,12 +584,30 @@ def compute_shape_changes(
 
         slot = find_live_slot(kind_dir, tier_hash)
         if slot is None:
-            # Not yet trained — skip silently.
+            # find_live_slot skips unreadable manifests internally, so a
+            # tier whose every candidate slot is corrupt or hash-mismatched
+            # lands here too — the same signal as never-trained. Tell them
+            # apart by whether any candidate slot exists at all.
+            candidate_count = count_slot_candidates(kind_dir)
+            if candidate_count == 0:
+                # Not yet trained — skip silently.
+                continue
+            logger.warning(
+                "compute_shape_changes: skipping adapter %r — %d candidate "
+                "slot(s) in %s, none readable/matching the live registry hash",
+                adapter_name,
+                candidate_count,
+                kind_dir,
+            )
+            warnings.append(
+                f"adapter {adapter_name!r}: {candidate_count} candidate slot(s) in "
+                f"{kind_dir}, none readable/matching — skipped shape-change check"
+            )
             continue
 
         try:
             manifest = read_manifest(slot)
-        except ManifestError as exc:
+        except (ManifestError, OSError) as exc:
             logger.warning(
                 "compute_shape_changes: skipping adapter %r — cannot read manifest "
                 "from slot %s: %s",

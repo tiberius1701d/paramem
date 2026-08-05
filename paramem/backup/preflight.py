@@ -6,6 +6,12 @@ with the scheduled backup runner code.
 The check estimates the footprint of a would-be pre-migration backup (config +
 graph + registry) and compares it against the remaining global cap.  If the
 estimate would push usage over the cap, ``fail_code="disk_pressure"`` is set.
+
+``fail_code`` also admits ``"check_error"`` — the caller-minted sentinel
+:func:`~paramem.server.app.migration_preview` constructs when
+:func:`compute_pre_flight_check` itself raises. It is declared here (rather
+than left as a string only the caller knows about) because this module owns
+the ``fail_code`` domain; the caller only mints the value.
 """
 
 from __future__ import annotations
@@ -29,20 +35,26 @@ class PreFlightCheck:
     ----------
     fail_code:
         ``"disk_pressure"`` when the estimated backup footprint plus current
-        usage would exceed the global cap; ``None`` when the check passes.
+        usage would exceed the global cap; ``"check_error"`` when the caller
+        minted this instance because :func:`compute_pre_flight_check` itself
+        raised (no real measurement was taken — the three measurement fields
+        are ``None`` in that case); ``None`` when the check ran and passed.
     disk_used_bytes:
-        Current disk usage in bytes across the entire backup store.
+        Current disk usage in bytes across the entire backup store, or
+        ``None`` when ``fail_code == "check_error"`` (no measurement taken).
     disk_cap_bytes:
-        Global cap in bytes (``max_total_disk_gb * 1024**3``).
+        Global cap in bytes (``max_total_disk_gb * 1024**3``), or ``None``
+        under the same ``check_error`` condition.
     estimate_bytes:
         Estimated size of the would-be pre-migration backup (sum of config,
-        graph, and registry bytes as they currently exist on disk).
+        graph, and registry bytes as they currently exist on disk), or
+        ``None`` under the same ``check_error`` condition.
     """
 
-    fail_code: str | None  # "disk_pressure" | None
-    disk_used_bytes: int
-    disk_cap_bytes: int
-    estimate_bytes: int
+    fail_code: str | None  # "disk_pressure" | "check_error" | None
+    disk_used_bytes: int | None
+    disk_cap_bytes: int | None
+    estimate_bytes: int | None
 
 
 def compute_pre_flight_check(

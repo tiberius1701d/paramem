@@ -995,3 +995,63 @@ class TestKeylessTierSweep:
         assert call_order, "expected both the sweep and find_live_slot to be called"
         assert call_order[0] == "sweep", "the sweep must run before any slot is resolved"
         assert "find_live_slot" in call_order
+
+    def test_resume_pending_reaps_runs_before_keyless_scan(self, tmp_path: Path) -> None:
+        """resume_pending_reaps (the crash-safe reap's tombstone resume) is
+        the sweep's first action — it must run before the keyless-tier
+        registry scan begins, not merely before find_live_slot. Moving the
+        call to after the scan loop (but still inside the sweep, still
+        before find_live_slot) would pass an order check pinned only against
+        find_live_slot, so this test tracks the scan's own KeyRegistry.load
+        call directly."""
+        from paramem.memory import persistence as persistence_module
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+        from paramem.training.key_registry import KeyRegistry
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": [], "fidelity_history": {}, "stale": {}, "simhash": {}}'
+        )
+
+        call_order: list[str] = []
+        real_resume = persistence_module.resume_pending_reaps
+        real_load = KeyRegistry.load
+
+        def _tracked_resume(adapter_dir):
+            call_order.append("resume")
+            return real_resume(adapter_dir)
+
+        def _tracked_load(path):
+            call_order.append("scan")
+            return real_load(path)
+
+        with (
+            patch.object(persistence_module, "resume_pending_reaps", side_effect=_tracked_resume),
+            patch(
+                "paramem.training.key_registry.KeyRegistry.load",
+                side_effect=_tracked_load,
+            ),
+        ):
+            _sweep_keyless_tier_artifacts(config)
+
+        assert call_order == ["resume", "scan"], (
+            f"resume_pending_reaps must run before the keyless registry scan, got {call_order}"
+        )
+
+    def test_pending_delete_leftover_is_resumed_at_boot(self, tmp_path: Path) -> None:
+        """A ``.pending-delete/`` leftover from a prior crash (a
+        reap_tier_artifacts deletion interrupted mid-rmtree) is fully
+        resumed before mount — the stray content and the tombstone dir
+        itself are both gone after boot."""
+        from paramem.memory.persistence import _PENDING_DELETE_DIR_NAME
+
+        config = _make_config(tmp_path)
+        stray = config.adapter_dir / _PENDING_DELETE_DIR_NAME / "interim_20260417T0000"
+        stray.mkdir(parents=True)
+        (stray / "indexed_key_registry.json").write_text("{}")
+
+        _run(config)
+
+        assert not (config.adapter_dir / _PENDING_DELETE_DIR_NAME).exists()

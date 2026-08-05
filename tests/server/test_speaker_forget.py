@@ -1739,6 +1739,125 @@ class TestGuardMatrix:
         assert resp.json()["detail"]["error"] == "trial_active"
         loop.store.discard_keys.assert_not_called()
 
+    def test_base_swap_active_refuses_409(self, tmp_path, monkeypatch):
+        """migration.base_swap_active=True refuses 409, same as the other
+        four guard verdicts — closes the window where a base-swap
+        orchestration's direct (non-mode-flipping) dispatch could win
+        ``gpu_lock`` ahead of this door and release + recreate the
+        ConsolidationLoop this door already captured a reference to.
+        """
+        state = _make_state(tmp_path, migration={"base_swap_active": True})
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, state)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "base_swap_active"
+        loop.store.discard_keys.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Loop staleness across gpu_lock — a config-apply (or, before this fix, a
+# base-swap orchestration racing ahead of the base_swap_active guard) that
+# releases + recreates the ConsolidationLoop while this door holds gpu_lock
+# must not leave the sync worker mutating the released pre-lock loop.
+# ---------------------------------------------------------------------------
+
+
+class TestLoopStalenessAcrossLock:
+    def test_forget_sync_mutates_the_fresh_loop_not_the_pre_lock_capture(
+        self, tmp_path, monkeypatch
+    ):
+        """Swap ``_state['consolidation_loop']`` to a fresh mock while the
+        handler holds ``gpu_lock`` (simulating a config-apply that raced
+        ahead of this door and won the lock first) — the executor-side
+        mutation (``store.discard_keys``) must land on the FRESH loop, not
+        the loop the handler captured before the lock, which proves
+        ``_forget_sync`` re-resolves ``loop`` as its first statement rather
+        than closing over the pre-lock capture.
+        """
+        import contextlib
+
+        import paramem.server.gpu_lock as gpu_lock_module
+
+        speaker_id = "speaker0"
+        keys = ["graph1"]
+        loop_a = _make_loop(speaker_id, keys)  # the handler's pre-lock capture
+        loop_b = _make_loop(speaker_id, keys)  # swapped in while the lock is held
+
+        state = _make_state(
+            tmp_path,
+            loop=loop_a,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+        )
+
+        @contextlib.asynccontextmanager
+        async def _swap_loop_gpu_lock():
+            state["consolidation_loop"] = loop_b
+            yield
+
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(gpu_lock_module, "gpu_lock", _swap_loop_gpu_lock)
+
+        with patch("paramem.memory.persistence.save_registry"):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        loop_a.store.discard_keys.assert_not_called()
+        loop_b.store.discard_keys.assert_called_once_with(sorted(keys), mode="erase")
+
+    def test_forget_sync_mutates_the_fresh_config_not_the_pre_lock_capture(
+        self, tmp_path, monkeypatch
+    ):
+        """Same race, but on ``_state['config']`` rather than the loop: a
+        config-apply that wins ``gpu_lock`` first also replaces
+        ``_state["config"]``.  ``_forget_sync``'s registry-write path
+        (``adapter_slot_root_for_name(config.adapter_dir, tier_name)``) must
+        resolve against the FRESH config's ``adapter_dir``, not the pre-lock
+        one — proves the sync worker re-resolves ``config`` too, not just
+        ``loop``.
+        """
+        import contextlib
+
+        import paramem.server.gpu_lock as gpu_lock_module
+
+        speaker_id = "speaker0"
+        keys = ["graph1"]
+        cfg_a = _make_config(tmp_path / "a")  # the handler's pre-lock capture
+        cfg_b = _make_config(tmp_path / "b")  # swapped in while the lock is held
+        loop_a = _make_loop(speaker_id, keys)
+        loop_b = _make_loop(speaker_id, keys)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop_a,
+            config=cfg_a,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+        )
+
+        @contextlib.asynccontextmanager
+        async def _swap_config_and_loop_gpu_lock():
+            state["config"] = cfg_b
+            state["consolidation_loop"] = loop_b
+            yield
+
+        monkeypatch.setattr(app_module, "_state", state)
+        monkeypatch.setattr(gpu_lock_module, "gpu_lock", _swap_config_and_loop_gpu_lock)
+
+        with patch("paramem.memory.persistence.save_registry"):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        # The pre-lock loop/config pair is entirely untouched...
+        loop_a._ep_registry.save.assert_not_called()
+        # ...the fresh (swapped-in) loop's registry is written under the
+        # fresh (swapped-in) config's adapter_dir.
+        loop_b._ep_registry.save.assert_called_once()
+        written_path = loop_b._ep_registry.save.call_args.args[0]
+        assert cfg_b.adapter_dir in written_path.parents
+        assert cfg_a.adapter_dir not in written_path.parents
+
 
 # ---------------------------------------------------------------------------
 # Reap: a tier this forget reduces to zero known keys is unmounted and

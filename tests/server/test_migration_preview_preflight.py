@@ -5,12 +5,15 @@ Tests verify:
 - Over-cap: 200 with pre_flight_fail="disk_pressure", state="LIVE", diff still populated.
 - Over-cap does not enter STAGING (second call still works → proves LIVE).
 - End-to-end chain: preview pre-flight-fail → /status emits migration_pre_flight_fail item.
+- The pre-flight check raising → 200 with pre_flight_fail="check_error", state="LIVE",
+  the exception is logged (never silently swallowed into a "ran and passed" shape).
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -366,3 +369,90 @@ class TestPreFlightFailSurfacesInStatusAttentionItems:
         assert "migration_pre_flight_fail" in attention_kinds, (
             f"Expected migration_pre_flight_fail in attention items; got: {attention_kinds}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — pre-flight check raises → 200, pre_flight_fail="check_error",
+# LIVE (not STAGING), and the exception is logged.
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewPreFlightRaiseIsSurfacedNotSwallowed:
+    def test_preflight_raise_returns_check_error_and_stays_live(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """compute_pre_flight_check raising → pre_flight_fail='check_error', state='LIVE'.
+
+        Before the fix this was a bare ``except Exception: pre_flight = None``,
+        which rendered ``pre_flight_fail: None`` — identical to a check that
+        ran and passed.  This test fails if that swallow is restored.
+        """
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        state = _make_state(tmp_path, config=config)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        cand = _write_candidate(tmp_path)
+
+        with (
+            patch(
+                "paramem.backup.preflight.compute_pre_flight_check",
+                side_effect=RuntimeError("simulated pre-flight crash"),
+            ),
+            caplog.at_level(logging.ERROR, logger="paramem.server.app"),
+        ):
+            resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pre_flight_fail"] == "check_error"
+        assert body["state"] == "LIVE"
+        # Diff was still computed before the gate.
+        assert body.get("unified_diff") is not None
+        assert body.get("tier_diff") is not None
+
+        # State stays LIVE — no stash persisted (mirrors the disk_pressure branch).
+        assert state["migration"]["state"] == "LIVE"
+
+        # The exception must be logged, not silently swallowed.
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("check_error" in r.getMessage() for r in error_records), (
+            f"Expected the pre-flight exception to be logged; got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        assert any(r.exc_info for r in error_records), (
+            "Expected logger.exception (with traceback) at the swallow site"
+        )
+
+    def test_second_preview_after_check_error_still_works(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A check_error preview does not leave STAGING behind — a second
+        preview call still succeeds (proves state stayed LIVE)."""
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        state = _make_state(tmp_path, config=config)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        cand = _write_candidate(tmp_path)
+
+        with patch(
+            "paramem.backup.preflight.compute_pre_flight_check",
+            side_effect=RuntimeError("simulated pre-flight crash"),
+        ):
+            resp1 = client.post("/migration/preview", json={"candidate_path": str(cand)})
+        assert resp1.status_code == 200
+        assert resp1.json()["pre_flight_fail"] == "check_error"
+
+        # Second call (no patch) — must succeed and stage normally, proving
+        # the first call left no residual STAGING/already_staging 409.
+        resp2 = client.post("/migration/preview", json={"candidate_path": str(cand)})
+        assert resp2.status_code == 200, f"Second call got {resp2.status_code}: {resp2.text}"
+        assert resp2.json()["pre_flight_fail"] is None
+        assert resp2.json()["state"] == "STAGING"

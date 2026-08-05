@@ -14,6 +14,9 @@ Covers:
   PEFT-nested subdir flatten inside pending slot, slot collision bump.
 - find_live_slot: empty/missing dir, match, empty-hash matches empty slots,
   skips .pending, unreadable meta skipped, multiple → newest, hash mismatch.
+- count_slot_candidates: missing/non-dir → 0, no candidates → 0, dot-dirs
+  and meta.json-less dirs excluded, counts unreadable/mismatched candidates
+  too (presence-only, not validity).
 - resolve_adapter_slot: both branches (flat and legacy nested).
 """
 
@@ -39,6 +42,7 @@ from paramem.adapters.manifest import (
     _lookup_hash_from_manifests,
     _resolve_base_safetensors,
     build_manifest_for,
+    count_slot_candidates,
     find_live_slot,
     read_manifest,
     resolve_adapter_slot,
@@ -613,6 +617,65 @@ class TestFindLiveSlot:
     def test_hash_mismatch_returns_none(self, tmp_path: Path) -> None:
         self._write_slot_with_hash(tmp_path, "20260421-000000", "old_hash")
         assert find_live_slot(tmp_path, "new_hash") is None
+
+
+# ---------------------------------------------------------------------------
+# 5a. count_slot_candidates
+# ---------------------------------------------------------------------------
+
+
+class TestCountSlotCandidates:
+    """The single "does this tier dir have a candidate weight slot" check,
+    collapsed from four duplicated call sites (the boot mount loop's
+    main-tier validation and its interim-tier fallback, /speaker/forget's
+    manifest re-stamp gate, and compute_shape_changes' never-trained-vs-corrupt
+    distinction)."""
+
+    def test_missing_dir_returns_zero(self, tmp_path: Path) -> None:
+        assert count_slot_candidates(tmp_path / "nonexistent") == 0
+
+    def test_not_a_dir_returns_zero(self, tmp_path: Path) -> None:
+        f = tmp_path / "not_a_dir"
+        f.write_text("x")
+        assert count_slot_candidates(f) == 0
+
+    def test_empty_dir_returns_zero(self, tmp_path: Path) -> None:
+        assert count_slot_candidates(tmp_path) == 0
+
+    def test_subdir_without_meta_json_not_counted(self, tmp_path: Path) -> None:
+        (tmp_path / "not_a_slot").mkdir()
+        assert count_slot_candidates(tmp_path) == 0
+
+    def test_subdir_with_meta_json_counted(self, tmp_path: Path) -> None:
+        slot = tmp_path / "20260421-000000"
+        slot.mkdir()
+        (slot / "meta.json").write_text("{}")
+        assert count_slot_candidates(tmp_path) == 1
+
+    def test_dot_prefixed_dir_excluded(self, tmp_path: Path) -> None:
+        pending = tmp_path / ".pending"
+        pending.mkdir()
+        (pending / "meta.json").write_text("{}")
+        assert count_slot_candidates(tmp_path) == 0
+
+    def test_counts_multiple_candidates(self, tmp_path: Path) -> None:
+        for ts in ("20260421-000000", "20260421-000001", "20260421-000002"):
+            slot = tmp_path / ts
+            slot.mkdir()
+            (slot / "meta.json").write_text("{}")
+        assert count_slot_candidates(tmp_path) == 3
+
+    def test_unreadable_meta_still_counted(self, tmp_path: Path) -> None:
+        """count_slot_candidates is presence-only — an unreadable/malformed
+        meta.json still counts as a candidate (unlike find_live_slot, which
+        skips it). This is the distinction that lets callers tell
+        never-trained (0 candidates) apart from all-candidates-corrupt
+        (N candidates, find_live_slot still returns None)."""
+        slot = tmp_path / "20260421-000000"
+        slot.mkdir()
+        (slot / "meta.json").write_text("{bad json")
+        assert count_slot_candidates(tmp_path) == 1
+        assert find_live_slot(tmp_path, "") is None
 
 
 # ---------------------------------------------------------------------------

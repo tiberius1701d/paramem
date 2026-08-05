@@ -17,6 +17,7 @@ from paramem.backup.encryption import (
     assert_mode_consistency,
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
+    infra_paths,
     read_maybe_encrypted,
     write_infra_bytes,
 )
@@ -52,6 +53,41 @@ def _env_isolation(monkeypatch):
 # ---------------------------------------------------------------------------
 # envelope_encrypt_bytes — age path
 # ---------------------------------------------------------------------------
+
+
+class TestInfraPathsSkipsPendingDelete:
+    """``infra_paths``' safetensors/staging_resume ``rglob`` walks must not
+    descend into ``.pending-delete/`` (the reap tombstone directory,
+    ``paramem.memory.persistence``) — condemned-but-not-yet-deleted debris
+    sitting there must never be listed for encryption/rotation."""
+
+    def test_safetensors_under_pending_delete_excluded(self, tmp_path: Path) -> None:
+        adapters_root = tmp_path / "adapters"
+        live_slot = adapters_root / "episodic" / "20260421-000000"
+        live_slot.mkdir(parents=True)
+        (live_slot / "adapter_model.safetensors").write_bytes(b"live")
+
+        stray = adapters_root / ".pending-delete" / "episodic" / "20260101-000000"
+        stray.mkdir(parents=True)
+        (stray / "adapter_model.safetensors").write_bytes(b"condemned")
+
+        paths = infra_paths(tmp_path)
+        assert live_slot / "adapter_model.safetensors" in paths
+        assert stray / "adapter_model.safetensors" not in paths
+
+    def test_staging_resume_under_pending_delete_excluded(self, tmp_path: Path) -> None:
+        adapters_root = tmp_path / "adapters"
+        live_slot = adapters_root / "episodic"
+        live_slot.mkdir(parents=True)
+        (live_slot / "staging_resume.json").write_bytes(b"{}")
+
+        stray = adapters_root / ".pending-delete" / "episodic"
+        stray.mkdir(parents=True)
+        (stray / "staging_resume.json").write_bytes(b"{}")
+
+        paths = infra_paths(tmp_path)
+        assert live_slot / "staging_resume.json" in paths
+        assert stray / "staging_resume.json" not in paths
 
 
 class TestEnvelopeEncryptBytesHelper:

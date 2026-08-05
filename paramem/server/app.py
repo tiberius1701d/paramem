@@ -830,15 +830,17 @@ class PreviewResponse(BaseModel):
     shape_changes:
         Shape-change rows for enabled adapters with on-disk meta.json.
     pre_flight_fail:
-        ``None`` when no pre-flight check fires; ``"disk_pressure"`` (or
-        similar) when a pre-flight check rejects the preview.  Always present
-        in the response so callers can check the field unconditionally
-        (Condition 3).
+        ``None`` when no pre-flight check fires; ``"disk_pressure"`` (over
+        the backup store's global cap) or ``"check_error"`` (the check
+        itself raised) when a pre-flight check rejects the preview.  Always
+        present in the response so callers can check the field
+        unconditionally.
     warnings:
         Human-readable rows for adapter tiers skipped during shape-change
-        detection (unreadable/undecryptable tier registry, or an unreadable
-        adapter manifest).  Always present; empty list when nothing was
-        skipped.
+        detection: an unreadable/undecryptable tier registry, an unreadable
+        adapter manifest, or a tier with one or more on-disk candidate slots
+        where none is readable or matches the live registry hash.  Always
+        present; empty list when nothing was skipped.
     """
 
     state: str
@@ -1177,6 +1179,7 @@ def _validate_main_adapter_slot(
     from paramem.adapters.manifest import (
         ManifestNotFoundError,
         ManifestSchemaError,
+        count_slot_candidates,
         find_live_slot,
         read_manifest,
     )
@@ -1201,11 +1204,7 @@ def _validate_main_adapter_slot(
         # gates on meta.json).  A subdir containing only progress.json (aborted
         # training run) is NOT a real slot and must not trigger the no_matching_slot
         # red incident; it should fall through to the fresh-install branch instead.
-        has_slots = kind_dir.exists() and any(
-            e
-            for e in kind_dir.iterdir()
-            if not e.name.startswith(".") and e.is_dir() and (e / "meta.json").is_file()
-        )
+        has_slots = count_slot_candidates(kind_dir) > 0
         if has_slots:
             _record_manifest_row(
                 manifest_status, name, "no_matching_slot", "no_matching_slot", severity
@@ -1341,6 +1340,14 @@ def _dispatch_finalize(finalize: Callable[[], None]) -> None:
 def _sweep_keyless_tier_artifacts(config) -> list[str]:
     """Reap every tier whose on-disk registry legitimately tracks zero keys.
 
+    First action: :func:`~paramem.memory.persistence.resume_pending_reaps`
+    finishes any tier-artifact deletion a prior :func:`reap_tier_artifacts`
+    call left stranded under ``.pending-delete/`` (crash between the
+    rename-condemn and the actual delete). This must run before the keyless
+    scan below — a stranded tombstone is already out of the live namespace,
+    so the scan below cannot see or reap it; only the tombstone-specific
+    resume can finish it.
+
     Runs pre-mount, at the top of :func:`_mount_adapters_from_slots` — before
     any slot is resolved for any tier, before ``find_live_slot`` is called,
     and before the boot-degraded hash helper
@@ -1414,8 +1421,10 @@ def _sweep_keyless_tier_artifacts(config) -> list[str]:
         iter_interim_dirs,
         slot_payload_kind,
     )
-    from paramem.memory.persistence import reap_tier_artifacts
+    from paramem.memory.persistence import reap_tier_artifacts, resume_pending_reaps
     from paramem.training.key_registry import KeyRegistry
+
+    resume_pending_reaps(config.adapter_dir)
 
     roots: list[tuple[str, Path]] = [
         (name, config.adapter_dir / name) for name in ("episodic", "semantic", "procedural")
@@ -1528,7 +1537,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     """
     from peft import PeftModel
 
-    from paramem.adapters.manifest import find_live_slot
+    from paramem.adapters.manifest import count_slot_candidates, find_live_slot
     from paramem.backup.backup import sweep_orphan_pending
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
@@ -1643,12 +1652,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
                 # A weight-slot candidate that exists but didn't match the
                 # registry hash (find_live_slot returned None despite one
                 # being present) is the genuinely torn case and stays ERROR.
-                _has_weight_slot_candidate = any(
-                    child.is_dir()
-                    and not child.name.startswith(".")
-                    and (child / "meta.json").exists()
-                    for child in _interim_path.iterdir()
-                )
+                _has_weight_slot_candidate = count_slot_candidates(_interim_path) > 0
                 if _has_weight_slot_candidate:
                     logger.error("Interim adapter %s: no matching slot — skipping", _interim_name)
                 else:
@@ -7444,6 +7448,72 @@ async def _apply_config_live_guarded() -> dict:
     return apply_result
 
 
+async def _gpu_release_internal():
+    """Unload the base model in-process and switch to cloud-only mode.
+
+    Body of the ``/gpu/release`` handler, extracted so
+    ``_run_base_swap_orchestration``'s fresh-start path can invoke the same
+    lock-guarded teardown directly — the route handler's ``base_swap_active``
+    guard exists to refuse *external* callers during an active swap and would
+    wrongly 409 on the orchestration's own in-flight flag.
+
+    Starting the auto-reclaim loop is deliberately NOT done here — it is
+    route policy ("step aside for an external consumer, come back later"),
+    owned by the ``/gpu/release`` handler. The base-swap orchestration's
+    fresh-start reload calls this function only to release ahead of its own
+    immediate ``_apply_config_live`` reload; a reclaim task started here
+    could fire and reload the OLD base after a deferred swap, flipping
+    ``mode`` back to ``"local"`` so ``/gpu/acquire``'s deferred-Phase-B
+    relaunch (gated on ``mode == "cloud-only"``) would never trigger.
+
+    Runs under ``gpu_lock`` (mirroring ``/gpu/acquire``'s reload dispatch):
+    the synchronous teardown (``_release_base_model_in_process``) executes
+    off the event-loop thread via ``run_in_executor``, and the consolidating
+    flag is re-checked *inside* the lock — the async lock acquire is itself
+    an await point, so a cycle could start between the caller's pre-lock
+    check and lock acquisition without this recheck (mirrors
+    ``_apply_config_live``'s in-lock TOCTOU guard). The mode flip to
+    ``cloud-only`` happens inside the lock too, closing the window where a
+    chat leg could win the lock with ``mode`` still ``"local"`` and no
+    resident model. The voice-profile swap runs OUTSIDE the lock — it
+    acquires ``gpu_lock_sync`` itself, and nesting would deadlock the
+    non-reentrant lock (matches ``/gpu/acquire``'s deliberate pattern).
+
+    Returns:
+        dict ``{"mode": "cloud-only", "released": True, "reason": "released"}``
+            on success.
+        ``JSONResponse`` 503 ``{"error": "consolidating", ...}`` if a
+            consolidation cycle is found in flight under the lock.
+    """
+    from paramem.server.gpu_lock import gpu_lock
+
+    async with gpu_lock():
+        if _state.get("consolidating", False):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "consolidating",
+                    "detail": (
+                        "GPU release refused: a consolidation cycle is in flight. "
+                        "Retry once /status reports consolidating=false."
+                    ),
+                },
+            )
+
+        logger.info(
+            "Release requested via /gpu/release — unloading model and switching to cloud-only."
+        )
+
+        await asyncio.get_running_loop().run_in_executor(None, _release_base_model_in_process)
+
+        _state["mode"] = "cloud-only"
+        _state["cloud_only_reason"] = "released"
+
+    await asyncio.get_running_loop().run_in_executor(None, _set_voice_pipeline_profile, "cpu")
+
+    return {"mode": "cloud-only", "released": True, "reason": "released"}
+
+
 @app.post("/gpu/release", dependencies=[Depends(require_admin)])
 async def gpu_release():
     """Release the GPU model in-process; switch to cloud-only mode.
@@ -7505,20 +7575,21 @@ async def gpu_release():
             },
         )
 
-    logger.info("Release requested via /gpu/release — unloading model and switching to cloud-only.")
+    result = await _gpu_release_internal()
 
-    _release_base_model_in_process()
-    await asyncio.get_running_loop().run_in_executor(None, _set_voice_pipeline_profile, "cpu")
+    # Reclaim-task start is route policy, not the internal's: only a REAL
+    # release (the dict shape) starts it — the 503-in-flight JSONResponse
+    # above short-circuits before reaching here, and the base-swap
+    # orchestration's own fresh-start reload calls `_gpu_release_internal`
+    # directly (never this route), so it never starts one either.  See
+    # `_gpu_release_internal`'s docstring for why that separation matters.
+    if isinstance(result, dict):
+        reclaim_task = _state.get("reclaim_task")
+        if reclaim_task is None or reclaim_task.done():
+            reclaim_interval = _state["config"].server.reclaim_interval_minutes
+            _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
 
-    _state["mode"] = "cloud-only"
-    _state["cloud_only_reason"] = "released"
-
-    reclaim_task = _state.get("reclaim_task")
-    if reclaim_task is None or reclaim_task.done():
-        reclaim_interval = _state["config"].server.reclaim_interval_minutes
-        _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
-
-    return {"mode": "cloud-only", "released": True, "reason": "released"}
+    return result
 
 
 @app.post("/incidents/{incident_id}/ack", dependencies=[Depends(require_admin)])
@@ -7740,6 +7811,11 @@ _SPEAKER_FORGET_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
         "trial_active",
         "A migration TRIAL is in progress. Accept or roll back the migration first.",
     ),
+    "deferred_base_swap_active": (
+        "base_swap_active",
+        "A base-swap migration is actively running. "
+        "Wait for it to complete (or fail) before forgetting a speaker.",
+    ),
 }
 
 
@@ -7815,11 +7891,12 @@ async def speaker_forget(request: SpeakerForgetRequest):
 
     Errors
     ------
-    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only``
-        A fold, background training, or a migration TRIAL is in flight, or
-        the server has no local model loaded (:func:`_consolidation_dispatch_guards`,
-        mapped via ``_SPEAKER_FORGET_GUARD_VERDICTS``).  No mutation on any
-        of these.
+    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only`` |
+    ``base_swap_active``
+        A fold, background training, a migration TRIAL, or an active
+        base-swap migration is in flight, or the server has no local model
+        loaded (:func:`_consolidation_dispatch_guards`, mapped via
+        ``_SPEAKER_FORGET_GUARD_VERDICTS``).  No mutation on any of these.
     500 ``malformed_tier_name``
         A stale key belongs to a tier whose on-disk slot root cannot be
         resolved.  Raised before ``store.discard_keys`` runs (from inside
@@ -7883,6 +7960,15 @@ async def speaker_forget(request: SpeakerForgetRequest):
         ``removed_dirs``); the caller's no-await tail fills in
         ``removed_speaker`` and ``discarded_sessions``.
         """
+        # Re-resolve rather than close over the handler's pre-lock `loop`
+        # AND `config`: a config-apply that won the lock ahead of us may
+        # have replaced `_state["config"]` and released + recreated the
+        # process-lifetime ConsolidationLoop, and every mutation below
+        # (registry writes, PEFT unmount) must land on the live objects, not
+        # a stale pre-lock capture (door staleness race).
+        config = _state["config"]
+        loop = _get_or_create_consolidation_loop(config)
+
         reaped_tiers: list[str] = []
         unloaded_adapters: list[str] = []
         removed_dirs: list[str] = []
@@ -7899,7 +7985,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
         # graph.json (persistence.erase_keys_from_graph_file) — the store-level
         # erase above only ever mutated RAM/registry.
         if erased_keys:
-            from paramem.adapters.manifest import tier_registry_sha256
+            from paramem.adapters.manifest import count_slot_candidates, tier_registry_sha256
             from paramem.memory.interim_adapter import (
                 INTERIM_NAME_PREFIX,
                 adapter_slot_root_for_name,
@@ -8016,12 +8102,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
                     # differ from the configured mode) is judged by what is actually
                     # on disk for THIS tier.  The registry save and graph erase above
                     # are venue-agnostic and already ran regardless.
-                    _has_weight_slot = tier_root.is_dir() and any(
-                        child.is_dir()
-                        and not child.name.startswith(".")
-                        and (child / "meta.json").exists()
-                        for child in tier_root.iterdir()
-                    )
+                    _has_weight_slot = count_slot_candidates(tier_root) > 0
                     if not _has_weight_slot:
                         logger.debug(
                             "speaker/forget: tier %s has no on-disk weight slot — skipping "
@@ -8279,6 +8360,11 @@ _INTERIM_DISCARD_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
         "trial_active",
         "A migration TRIAL is in progress. Accept or roll back the migration first.",
     ),
+    "deferred_base_swap_active": (
+        "base_swap_active",
+        "A base-swap migration is actively running. "
+        "Wait for it to complete (or fail) before discarding the interim ring.",
+    ),
 }
 
 
@@ -8336,9 +8422,12 @@ async def interim_discard(request: InterimDiscardRequest):
 
     Errors
     ------
-    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only``
-        A fold, background training, or a migration TRIAL is in flight, or
-        the server has no local model loaded.  No mutation on any of these.
+    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only`` |
+    ``base_swap_active``
+        A fold, background training, a migration TRIAL, or an active
+        base-swap migration is in flight, or the server has no local model
+        loaded (:func:`_consolidation_dispatch_guards`, mapped via
+        ``_INTERIM_DISCARD_GUARD_VERDICTS``).  No mutation on any of these.
     409 ``confirmation_required`` (``_INTERIM_DISCARD_UNCONFIRMED_STATUS``)
         ``confirm`` was not ``true`` and the ring is non-empty.  The response
         detail carries ``would_discard`` — the same inventory the mutation
@@ -8416,6 +8505,15 @@ async def interim_discard(request: InterimDiscardRequest):
 
     def _discard_sync() -> tuple[list[str], int]:
         """Steps 1–6 — the GPU-touching + file-write half, run off the event loop."""
+        # Re-resolve rather than close over the handler's pre-lock `loop`
+        # AND `config`: a config-apply that won the lock ahead of us may
+        # have replaced `_state["config"]` and released + recreated the
+        # process-lifetime ConsolidationLoop, and every mutation below
+        # (registry drop, PEFT unmount) must land on the live objects, not
+        # a stale pre-lock capture (door staleness race).
+        config = _state["config"]
+        loop = _get_or_create_consolidation_loop(config)
+
         # Collect every key the discarded interim tiers know (active + stale)
         # before Step 1 drops them — drop_tier removes the tier's registry,
         # so this is the last point the keys are enumerable.
@@ -9418,6 +9516,11 @@ async def migration_preview(request: PreviewRequest):
         The migration stash is already in ``STAGING`` state.
     409 ``trial_active``
         A trial is in progress.
+
+    A pre-flight failure (disk pressure, or the check itself raising) does
+    NOT raise — it returns 200 with ``pre_flight_fail`` set
+    (``"disk_pressure"`` or ``"check_error"``) and ``state`` left at
+    ``"LIVE"``; no stash is persisted.
     """
     from fastapi import HTTPException
 
@@ -9534,6 +9637,7 @@ async def migration_preview(request: PreviewRequest):
     # compute_pre_flight_check guards itself against MagicMock / non-real configs
     # (returns no-pressure result when max_total_disk_gb is not a real numeric).
     # No call-site guard needed here.
+    from paramem.backup.preflight import PreFlightCheck
     from paramem.backup.preflight import compute_pre_flight_check as _compute_pre_flight
     from paramem.server.migration import MigrationStashState
 
@@ -9549,7 +9653,6 @@ async def migration_preview(request: PreviewRequest):
     except (AttributeError, TypeError):
         _backups_root_for_pf = (default_data_dir() / "backups").resolve()
 
-    pre_flight = None
     try:
         pre_flight = _compute_pre_flight(
             server_config=config,
@@ -9559,10 +9662,26 @@ async def migration_preview(request: PreviewRequest):
             registry_path=_registry_path_for_pf,
         )
     except Exception:
-        # Defensive: pre-flight failure must not block the preview entirely.
-        pre_flight = None
+        # An exception here must not surface as an uncaught 500 — but it must
+        # not silently render as "ran and passed" either (that was
+        # indistinguishable from `pre_flight_fail: None`, the honest-pass
+        # case, until this fix). Log it and take the SAME fail branch a real
+        # disk_pressure check would take: state stays LIVE, no stash is
+        # persisted, and the response carries a distinct fail code the CLI's
+        # forward-compat "unknown code" branch already turns into rc=1.
+        logger.exception("migration_preview: pre-flight check raised — treating as check_error")
+        # No real measurement was taken — None rather than 0, which would
+        # read as "store is empty" once rendered.  PreFlightCheck declares
+        # this shape (fail_code="check_error" pairs with None measurement
+        # fields) — see its docstring.
+        pre_flight = PreFlightCheck(
+            fail_code="check_error",
+            disk_used_bytes=None,
+            disk_cap_bytes=None,
+            estimate_bytes=None,
+        )
 
-    if pre_flight is not None and pre_flight.fail_code is not None:
+    if pre_flight.fail_code is not None:
         # State stays LIVE (Decision A) — do NOT store the stash.
         # Build a preview-only (non-stored) stash for render_preview_response.
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -9584,8 +9703,13 @@ async def migration_preview(request: PreviewRequest):
             warnings=shape_change_warnings,
         )
         payload = render_preview_response(preview_stash, pre_flight_fail=pre_flight.fail_code)
-        payload["pre_flight_disk_used_gb"] = pre_flight.disk_used_bytes / (1024**3)
-        payload["pre_flight_disk_cap_gb"] = pre_flight.disk_cap_bytes / (1024**3)
+        # None measurement fields (the check_error sentinel shape) pass
+        # through as None — PreviewResponse already declares both GB fields
+        # ``float | None`` for exactly this case.
+        _used = pre_flight.disk_used_bytes
+        _cap = pre_flight.disk_cap_bytes
+        payload["pre_flight_disk_used_gb"] = _used / (1024**3) if _used is not None else None
+        payload["pre_flight_disk_cap_gb"] = _cap / (1024**3) if _cap is not None else None
         return PreviewResponse(**payload)
 
     # --- Build stash (pre-flight passed) ---
@@ -10537,12 +10661,16 @@ async def _run_base_swap_orchestration(
        the candidate (Qwen3) variant.
     3. **In-process reload** — two sub-cases based on ``resume_phase``:
 
-       - **Fresh start** (``resume_phase == ""``): drain and reload the base via
-         the existing ``/gpu/release`` + ``/gpu/acquire`` primitives.
-         ``gpu_release`` drains BOTH the base model AND the voice pipeline to
-         cloud-only; ``gpu_acquire`` then loads the renamed-config base on the
-         clean GPU, so the VRAM gate sees accurate free bytes and the reload
-         fits in-process without a restart.
+       - **Fresh start** (``resume_phase == ""``): drain and reload the base
+         in-process via :func:`_gpu_release_internal` (called directly, NOT
+         the ``/gpu/release`` route handler — this orchestration legitimately
+         holds ``base_swap_active=True`` and the route's own guard would
+         refuse it) followed by :func:`_apply_config_live`.
+         ``_gpu_release_internal`` drains BOTH the base model AND the voice
+         pipeline to cloud-only; ``_apply_config_live`` then re-reads the
+         renamed-on-disk config and loads it on the clean GPU, so the VRAM
+         gate sees accurate free bytes and the reload fits in-process
+         without a restart.
          If the reload was **deferred** (insufficient VRAM), set gates to
          ``reload_deferred`` and return.  ``/gpu/acquire`` re-launches
          (``resume_phase="phaseA_done"``) when VRAM frees.
@@ -10875,9 +11003,14 @@ async def _run_base_swap_orchestration(
                 #   1. Drop THIS coroutine's references to Phase A's
                 #      ConsolidationLoop / BackgroundTrainer — they pin the OLD
                 #      base model.  Phase B re-creates its own loop_b / bt_b.
-                #   2. gpu_release: the only path that actually reclaims the old
-                #      base + voice here (the bare reload-release left it resident
-                #      at 1.34 GiB free; gpu_release drains to ~6.5 GiB free).
+                #   2. _gpu_release_internal: the only path that actually reclaims
+                #      the old base + voice here (the bare reload-release left it
+                #      resident at 1.34 GiB free; release drains to ~6.5 GiB
+                #      free).  Calls the internal directly (not the `/gpu/release`
+                #      route handler) because this orchestration legitimately
+                #      holds `base_swap_active=True` — the route's first guard
+                #      exists to refuse *external* callers during an active swap
+                #      and would 409 on our own in-flight flag.
                 #   3. _apply_config_live: re-reads the renamed-on-disk config and
                 #      reloads the NEW base with a full rebuild (gpu_acquire would
                 #      keep the stale in-memory config).  _live_reload_base_model
@@ -10886,7 +11019,25 @@ async def _run_base_swap_orchestration(
                 # base_swap_active is True, so neither re-enters this orchestration.
                 loop = None
                 bt = None
-                await gpu_release()
+                _release_result = await _gpu_release_internal()
+                # _gpu_release_internal's success shape is the dict below; a
+                # refusal (503 consolidating, in-lock TOCTOU recheck — see its
+                # docstring) is a JSONResponse instead. A non-HTTP caller like
+                # this orchestration must not silently treat that refusal as
+                # success and press on into _apply_config_live against a base
+                # model that was never actually released — raise so the
+                # existing outer exception handler records this as
+                # phase_a_failed (marker is still at "phaseA" here), which is
+                # the correct outcome for a refused release.
+                if not isinstance(_release_result, dict):
+                    _release_detail = getattr(_release_result, "body", b"").decode(
+                        "utf-8", errors="replace"
+                    )
+                    raise RuntimeError(
+                        "base-swap fresh-start reload: _gpu_release_internal refused the "
+                        f"release (status={getattr(_release_result, 'status_code', '?')}): "
+                        f"{_release_detail}"
+                    )
                 await asyncio.get_running_loop().run_in_executor(None, _apply_config_live)
 
                 # After the executor returns, check whether the reload succeeded
@@ -11546,6 +11697,12 @@ async def migration_diff():
             },
         )
 
+    # pre_flight_fail is always None here by construction, not by omission:
+    # STAGING is entered ONLY from /migration/preview's success branch
+    # (the sole `state="STAGING"` construction site, above), which only runs
+    # after pre_flight.fail_code is None; migration_recovery.py resumes a
+    # torn migration to TRIAL, never STAGING. So every reachable STAGING
+    # state already passed pre-flight — there is no failed check to report.
     payload = render_preview_response(migration, pre_flight_fail=None)
     return MigrationDiffResponse(**payload)
 
@@ -14071,6 +14228,8 @@ def _consolidation_dispatch_guards() -> "str | None":
     Checks the cross-cutting block conditions that prevent any consolidation
     fold from starting, for every action:
 
+    - A base-swap migration is actively running
+      (``_state["migration"]["base_swap_active"]``).
     - ``_state["consolidating"]`` — another fold is already running.
     - ``_state["mode"] != "local"`` — cloud-only mode (no model loaded).
     - Background trainer is actively training (GPU lock contention risk).
@@ -14079,11 +14238,23 @@ def _consolidation_dispatch_guards() -> "str | None":
       consolidation route), mirrored here for in-process callers that never
       go through FastAPI's dependency resolution.
 
+    The base-swap check is a belt, not the buckle: on every production path
+    ``base_swap_active`` is set only after ``migration["state"]`` is already
+    ``"TRIAL"`` (``POST /migration/confirm`` sets ``TRIAL`` before the
+    orchestration sets the flag; boot recovery sets ``TRIAL`` before
+    launching the resumed orchestration; the sole reset — orchestration
+    completion — clears both together), so ``_trial_active()`` below already
+    refuses in practice. This check is explicit in case the flag ever lags
+    the state — the same "in practice the state=TRIAL check fires first"
+    framing ``/migration/confirm``'s own belt guard uses.
+
     Returns:
         A non-None ``"deferred_*"`` reason string when a block is in effect,
         ``None`` when clear (caller should proceed).  The string mirrors the
         vocabulary used by :func:`_dispatch_consolidation`.
     """
+    if (_state.get("migration") or {}).get("base_swap_active", False):
+        return "deferred_base_swap_active"
     if _state["consolidating"]:
         return "deferred_already_running"
     if _state["mode"] != "local":
@@ -14362,8 +14533,8 @@ def _dispatch_consolidation(
     Order (unconditional gates first, so an explicit request cannot walk past a
     safety property):
 
-    1. ``_consolidation_dispatch_guards()`` — already-running / cloud-only /
-       bg-training / migration TRIAL active.  All actions.
+    1. ``_consolidation_dispatch_guards()`` — base-swap active / already-running /
+       cloud-only / bg-training / migration TRIAL active.  All actions.
     2. **Idle debounce** — all actions.  This protects a live chat turn from a
        long GPU seizure; it is a safety property, not a schedule, so an explicit
        request defers on it too.
@@ -14421,6 +14592,10 @@ def _dispatch_consolidation(
         elif _guard == "deferred_trial_active":
             logger.info(
                 "Consolidation dispatch (%s): migration TRIAL active — deferred", action.value
+            )
+        elif _guard == "deferred_base_swap_active":
+            logger.info(
+                "Consolidation dispatch (%s): base-swap migration active — deferred", action.value
             )
         else:
             logger.info(
