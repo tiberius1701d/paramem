@@ -6,12 +6,16 @@ Tests cover:
 - Suppressed during STAGING
 - Suppressed during TRIAL
 - config=None → []
+- Unevaluable check (raise) → one migration_pre_flight_check_error item, logged
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from paramem.server.attention import _collect_pre_flight_items
 from paramem.server.config import (
@@ -170,15 +174,20 @@ class TestPreFlightItemsToleratesNoneConfig:
 
 
 # ---------------------------------------------------------------------------
-# Test 26 — MagicMock config → [] (no false positive from _collect_pre_flight_items)
+# Test 26 — MagicMock config → one migration_pre_flight_check_error item, logged
 # ---------------------------------------------------------------------------
 
 
-class TestPreFlightItemsToleratesMockConfig:
-    def test_preflight_items_tolerates_mock_config(self, tmp_path: Path) -> None:
-        """MagicMock config → [] — the guard inside compute_pre_flight_check prevents
-        a false migration_pre_flight_fail item when tests seed a backup dir but supply
-        a MagicMock config (e.g. via /status in unit tests).
+class TestPreFlightItemsSurfacesMockConfigAsActionRequired:
+    def test_preflight_items_surfaces_mock_config_as_action_required(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """MagicMock config → one migration_pre_flight_check_error item, logged.
+
+        A MagicMock config has no real max_total_disk_gb, so
+        compute_pre_flight_check raises PreFlightUnavailable rather than
+        rendering a fake pass; the populator surfaces that as a distinct
+        attention item instead of swallowing it silently.
         """
         mock_config = MagicMock()
         # Seed a large backup slot that would exceed any small cap.
@@ -192,5 +201,68 @@ class TestPreFlightItemsToleratesMockConfig:
         mock_config.paths.data = tmp_path
 
         state = {"migration": {"state": "LIVE", "recovery_required": []}}
-        items = _collect_pre_flight_items(state, mock_config)
+        with caplog.at_level(logging.ERROR, logger="paramem.server.attention"):
+            items = _collect_pre_flight_items(state, mock_config)
+
+        assert len(items) == 1
+        item = items[0]
+        assert item.kind == "migration_pre_flight_check_error"
+        assert item.level == "action_required"
+        assert any(r.exc_info is not None for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Test 27 — compute_pre_flight_check raising → one item, logged, no crash
+# ---------------------------------------------------------------------------
+
+
+class TestPreFlightItemsSurfacesRaise:
+    def test_preflight_items_surfaces_raise(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """compute_pre_flight_check raising → one migration_pre_flight_check_error
+        item; the populator logs the failure and does not propagate it."""
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        state = _live_state()
+
+        with (
+            caplog.at_level(logging.ERROR, logger="paramem.server.attention"),
+            patch(
+                "paramem.backup.preflight.compute_pre_flight_check",
+                side_effect=RuntimeError("scan failed"),
+            ),
+        ):
+            items = _collect_pre_flight_items(state, config)
+
+        assert len(items) == 1
+        assert items[0].kind == "migration_pre_flight_check_error"
+        assert items[0].level == "action_required"
+        assert any(r.exc_info is not None for r in caplog.records)
+
+    def test_preflight_items_staging_suppresses_raise(self, tmp_path: Path) -> None:
+        """STAGING suppression wins even when the underlying check would raise —
+        the check is never reached."""
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        state = _staging_state()
+
+        with patch(
+            "paramem.backup.preflight.compute_pre_flight_check",
+            side_effect=RuntimeError("scan failed"),
+        ):
+            items = _collect_pre_flight_items(state, config)
+
+        assert items == []
+
+    def test_preflight_items_trial_suppresses_raise(self, tmp_path: Path) -> None:
+        """TRIAL suppression wins even when the underlying check would raise —
+        the check is never reached."""
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        state = _trial_state()
+
+        with patch(
+            "paramem.backup.preflight.compute_pre_flight_check",
+            side_effect=RuntimeError("scan failed"),
+        ):
+            items = _collect_pre_flight_items(state, config)
+
         assert items == []

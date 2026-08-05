@@ -70,6 +70,8 @@ def _base_config(tmp_path: Path) -> MagicMock:
     cfg.consolidation.training_temp_limit = 0
     cfg.paths.data = tmp_path / "data"
     cfg.paths.data.mkdir(parents=True, exist_ok=True)
+    cfg.security.backups.max_total_disk_gb = 20.0
+    cfg.paths.key_metadata = tmp_path / "data" / "registry" / "key_metadata.json"
     return cfg
 
 

@@ -10,11 +10,11 @@ without spinning a FastAPI server or loading a model.
 
 Display order (most actionable first):
 
-    Migration → Consolidation → Sweeper → Backup* → Config drift →
-    Boot degraded → Key rotation* → Encryption* → Adapter fingerprint →
-    Local recall inactive → Voice degradation → Pre-flight*
+    Migration → Consolidation → Sweeper → Backup → Config drift →
+    Boot degraded → Key rotation* → Encryption → Adapter fingerprint →
+    Local recall inactive → Voice degradation → Pre-flight
 
-    (* stub returns [] — future populators fill them.)
+    (* stub returns [] — reserved for a future populator.)
 """
 
 from __future__ import annotations
@@ -128,7 +128,8 @@ def _age_seconds_from_iso(iso_str: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Populators — 5 active, 4 stubs reserved for future categories
+# Populators — 17 active, 1 stub (_collect_key_rotation_items) reserved
+# for a future category
 # ---------------------------------------------------------------------------
 
 
@@ -992,7 +993,8 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     try:
         usage = _retention.compute_disk_usage(backups_root, backups_cfg)
     except Exception:
-        usage = None  # silently skip DISK PRESSURE alert on scan failure
+        logger.exception("backup disk-usage scan failed — DISK PRESSURE alert skipped")
+        usage = None
 
     if usage is not None:
         disk_used = usage.total_bytes
@@ -1180,7 +1182,11 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
     Returns
     -------
     list[AttentionItem]
-        Zero or one item when disk pressure would block a migration preview.
+        Zero or one item: one row when disk pressure would block a migration
+        preview (``migration_pre_flight_fail``), or one row when the check
+        itself could not be evaluated (``migration_pre_flight_check_error``,
+        e.g. an unreadable component or an unmeasurable disk cap). Empty
+        when the check ran and passed cleanly, or during STAGING/TRIAL.
     """
     if config is None:
         return []
@@ -1218,7 +1224,21 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
             registry_path=registry_path,
         )
     except Exception:
-        return []  # scan failure — silent; do not crash /status
+        logger.exception("pre-flight check could not be evaluated — surfacing as an attention item")
+        return [
+            AttentionItem(
+                kind="migration_pre_flight_check_error",
+                level="action_required",
+                summary=(
+                    "PRE-FLIGHT UNAVAILABLE — the backup disk-pressure check could not be evaluated"
+                ),
+                action_hint=(
+                    "check the server journal (journalctl --user -u paramem-server); "
+                    "a migration preview refuses to stage until this clears."
+                ),
+                age_seconds=None,
+            )
+        ]
 
     if pf.fail_code == "disk_pressure":
         used_gb = pf.disk_used_bytes / (1024**3)
@@ -1228,8 +1248,7 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
                 kind="migration_pre_flight_fail",
                 level="info",
                 summary=(
-                    f"Migration: PRE-FLIGHT FAIL — disk pressure "
-                    f"(used {used_gb:.1f} of {cap_gb:.1f} GB cap)"
+                    f"PRE-FLIGHT FAIL — disk pressure (used {used_gb:.1f} of {cap_gb:.1f} GB cap)"
                 ),
                 action_hint=(
                     "Run paramem backup-prune to free space, or raise "
@@ -1312,11 +1331,11 @@ def collect_attention_items(
 
     Display order (most actionable first):
 
-        Migration → Consolidation → Sweeper → Backup* → Config drift →
-        Boot degraded → Key rotation* → Encryption* → Adapter fingerprint →
-        Local recall inactive → Voice degradation → Pre-flight*
+        Migration → Consolidation → Sweeper → Backup → Config drift →
+        Boot degraded → Key rotation* → Encryption → Adapter fingerprint →
+        Local recall inactive → Voice degradation → Pre-flight
 
-        (* stub returns [] — future populators fill them.)
+        (* stub returns [] — reserved for a future populator.)
 
     Parameters
     ----------
@@ -1339,16 +1358,16 @@ def collect_attention_items(
     items.extend(_collect_sweeper_items(state))
     # NOTE: _collect_backup_items, _collect_incident_items, and
     # _collect_pre_flight_items take (state, config); _collect_key_rotation_items
-    # and _collect_encryption_items are stubs that keep a (state)-only signature
-    # until they are wired — do NOT unify the signatures here before they are
-    # populated.
+    # (still a stub) and _collect_encryption_items (active — reads
+    # state["encryption"], no config lookup needed) keep a (state)-only
+    # signature — do NOT unify the signatures here without reason.
     items.extend(_collect_backup_items(state, config))
     items.extend(_collect_incident_items(state, config))
     items.extend(_collect_config_drift_items(state))
     items.extend(_collect_boot_degraded_items(state))
     items.extend(_collect_integrity_cleanup_items(state))
     items.extend(_collect_key_rotation_items(state))  # stub
-    items.extend(_collect_encryption_items(state))  # stub
+    items.extend(_collect_encryption_items(state))
     items.extend(_collect_adapter_fingerprint_items(state))
     items.extend(_collect_local_recall_inactive_items(state))
     items.extend(_collect_voice_degradation_items(state, config))

@@ -27,6 +27,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class PreFlightUnavailable(RuntimeError):
+    """The backups disk cap could not be measured.
+
+    Raised only when ``server_config.security.backups.max_total_disk_gb`` is
+    not a real numeric (``None``, a ``MagicMock``, or ``server_config`` itself
+    is ``None``). Failures reading a component of the estimate or the disk
+    usage scan are not this class — they propagate as their own type
+    (``OSError``, ``RuntimeError``, or :class:`pyrage.DecryptError`); see
+    :func:`compute_pre_flight_check`'s ``Raises`` section.
+    """
+
+
 @dataclass(frozen=True)
 class PreFlightCheck:
     """One pre-flight evaluation for /migration/preview.
@@ -107,44 +119,43 @@ def compute_pre_flight_check(
         All four fields populated unconditionally so callers can surface the
         numbers whether or not pre-flight failed.
 
+    Raises
+    ------
+    PreFlightUnavailable
+        The backups cap is unavailable (``server_config`` is ``None`` or its
+        ``security.backups.max_total_disk_gb`` is not a real numeric value —
+        e.g. a ``MagicMock`` in a test fixture).
+    OSError, RuntimeError, pyrage.DecryptError
+        A component of the estimate or the disk-usage scan could not be read
+        (e.g. a permission error, an age-encrypted artifact with no daily
+        identity loaded — ``RuntimeError`` via
+        :func:`paramem.backup.encryption.read_maybe_encrypted` — or corrupt/
+        tampered age ciphertext — ``pyrage.DecryptError``, not a subclass of
+        ``OSError`` or ``RuntimeError``). Not caught here — propagates to the
+        caller, which mints ``check_error``.
+
     Notes
     -----
-    - Returns no-pressure result when ``server_config`` is a ``MagicMock`` (or
-      otherwise lacks a real ``max_total_disk_gb`` numeric value) — protects
-      test fixtures from false positives without masking real config errors in
-      production.
-    - Any I/O error inside the estimate loop is swallowed (logged WARN) and
-      counted as 0 bytes for that component.  The preview must not crash on a
-      transient read error — the estimate is a heuristic, not an authoritative
-      size.
     - Graph bytes are read from the persisted ``episodic/graph.json`` file
       (``loop.merger.graph`` is cleared at cycle-end; re-serializing it would
       always yield an empty-graph estimate).  Reading the on-disk file also
       reflects what the actual backup would capture.
-    - Any I/O error inside the estimate loop is swallowed (logged WARN) and
-      counted as 0 bytes for that component (accepted — heuristic, not
-      authoritative).
     """
     from paramem.backup.encryption import read_maybe_encrypted
     from paramem.backup.retention import compute_disk_usage
 
-    # Guard: return no-pressure result when the config is not a real ServerConfig.
-    # A MagicMock (or any object whose security.backups.max_total_disk_gb is not a
-    # real numeric) would cause int(MagicMock()) to silently resolve to 1, producing
-    # a false-positive disk_pressure fail in unit tests.  This guard is the single
-    # source of truth — both the /migration/preview call site and the /status
-    # populator (_collect_pre_flight_items) benefit automatically.
+    # Guard: raise when the cap is unavailable rather than fake a pass.  A
+    # MagicMock (or any object whose security.backups.max_total_disk_gb is not
+    # a real numeric) would otherwise let int(MagicMock()) resolve silently, or
+    # a zeroed fake result would stage a candidate on an unmeasured estimate.
     _max_gb = getattr(
         getattr(getattr(server_config, "security", None), "backups", None),
         "max_total_disk_gb",
         None,
     )
     if not isinstance(_max_gb, (int, float)):
-        return PreFlightCheck(
-            fail_code=None,
-            disk_used_bytes=0,
-            disk_cap_bytes=0,
-            estimate_bytes=0,
+        raise PreFlightUnavailable(
+            f"backups cap unavailable: security.backups.max_total_disk_gb={_max_gb!r}"
         )
 
     backups_root = Path(backups_root)
@@ -157,12 +168,9 @@ def compute_pre_flight_check(
     # Config contribution.  Decrypted-length is the honest input — the future
     # pre-migration backup re-encrypts plaintext, so ciphertext length on disk
     # would be a double-count of age envelope overhead.
-    try:
-        config_path = Path(live_config_path)
-        if config_path.exists():
-            estimate_bytes += len(read_maybe_encrypted(config_path))
-    except (OSError, Exception) as exc:  # noqa: BLE001
-        logger.warning("compute_pre_flight_check: could not read live config for estimate: %s", exc)
+    config_path = Path(live_config_path)
+    if config_path.exists():
+        estimate_bytes += len(read_maybe_encrypted(config_path))
 
     # Graph contribution: read the canonical episodic/graph.json on disk.
     # merger.graph is cleared at cycle-end (in the finally block), so calling
@@ -170,34 +178,19 @@ def compute_pre_flight_check(
     # The on-disk file is the durable artifact that the backup itself would
     # capture, so reading it is both correct and avoids a re-serialization.
     if loop is not None and hasattr(loop, "output_dir"):
-        try:
-            _graph_path = Path(getattr(loop, "output_dir")) / "episodic" / "graph.json"
-            if _graph_path.exists():
-                estimate_bytes += len(read_maybe_encrypted(_graph_path))
-        except Exception as exc:
-            logger.warning(
-                "compute_pre_flight_check: could not read episodic graph.json for estimate: %s",
-                exc,
-            )
+        _graph_path = Path(getattr(loop, "output_dir")) / "episodic" / "graph.json"
+        if _graph_path.exists():
+            estimate_bytes += len(read_maybe_encrypted(_graph_path))
 
     # Registry contribution.  See note above on decrypted-length choice.
     if registry_path is not None:
-        try:
-            reg_path = Path(registry_path)
-            if reg_path.exists():
-                estimate_bytes += len(read_maybe_encrypted(reg_path))
-        except (OSError, Exception) as exc:  # noqa: BLE001
-            logger.warning(
-                "compute_pre_flight_check: could not read registry for estimate: %s", exc
-            )
+        reg_path = Path(registry_path)
+        if reg_path.exists():
+            estimate_bytes += len(read_maybe_encrypted(reg_path))
 
     # --- Step 2: Current disk usage (TTL-cached) ---
-    try:
-        usage = compute_disk_usage(backups_root, backups_cfg)
-        disk_used_bytes = usage.total_bytes
-    except Exception as exc:
-        logger.warning("compute_pre_flight_check: could not compute disk usage: %s", exc)
-        disk_used_bytes = 0
+    usage = compute_disk_usage(backups_root, backups_cfg)
+    disk_used_bytes = usage.total_bytes
 
     # --- Step 3: Cap comparison ---
     fail_code: str | None = None

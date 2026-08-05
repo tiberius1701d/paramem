@@ -2017,20 +2017,37 @@ def _build_user_token_store(config) -> "UserTokenStore | None":
 def _degrade_to_cloud_only(reason: str) -> None:
     """Release the base model and enter the cloud-only degraded state.
 
-    Factors out the inline degrade block originally at app.py:2062-2067.
-    Called from two sites:
-      1. The post-load VRAM budget gate (reason='insufficient_vram').
-      2. The persistent-CUDA-fault crash-loop guard (reason='cuda_fault_persistent').
+    Owns the COMPLETE transition: model + tokenizer released and nulled,
+    ``cloud_only_reason`` set, ``mode`` set to ``"cloud-only"``, subscribers
+    notified.  Callers do not set ``mode``.
 
-    Sets ``cloud_only_reason`` in ``_state``; the caller is responsible for
-    updating any lifespan-frame ``cloud_only`` local.  On 'cuda_fault_persistent'
-    the reason is in ``permanent_cloud_only`` (app.py:1929), so the GPU is never
-    auto-reclaimed (re-entering would re-poison the context).
+    Called from the post-load VRAM budget gate (reason='insufficient_vram')
+    and the persistent-CUDA-fault crash-loop guard
+    (reason='cuda_fault_persistent'); on the latter the reason is in
+    ``_PERMANENT_CLOUD_ONLY_REASONS`` so the GPU is never auto-reclaimed
+    (re-entering a poisoned context would re-trigger the fault).
+
+    Every reachable call site is boot-phase code, so no concurrent GPU-lock
+    holder can exist; the release therefore runs unlocked.  That precondition
+    is checked, not assumed — if a future call site breaks it the release is
+    still performed (this is a crash path; refusing would strand the server
+    with a resident model it cannot use) and the violation is logged at ERROR.
     """
+    from paramem.server.gpu_lock import gpu_lock_is_held
+
+    if gpu_lock_is_held():
+        logger.error(
+            "_degrade_to_cloud_only(%s): GPU lock is held while degrading — the "
+            "unlocked in-process release is only safe from boot-phase callers. "
+            "Proceeding (crash path), but this call site needs the lock-aware "
+            "teardown used by /gpu/release.",
+            reason,
+        )
     _release_base_model_in_process()
     _state["cloud_only_reason"] = reason
     _state["model"] = None
     _state["tokenizer"] = None
+    _state["mode"] = "cloud-only"
     notify_server(SERVER_CLOUD_ONLY)
 
 
@@ -2114,11 +2131,13 @@ def _cuda_liveness_canary() -> None:
 def _fail_fast_cuda(exc: BaseException, phase: str) -> None:
     """Record the fatal CUDA exit and os._exit(1), or degrade cloud-only if exhausted.
 
-    NEVER calls _release_base_model_in_process — that calls safe_empty_cache →
-    synchronize, which re-hits the sticky error on a poisoned context.  Recovery
-    is os._exit(1) ONLY (systemd Restart=on-failure → fresh CUDA context) unless
-    the crash-loop guard says retries are exhausted, in which case the server
-    degrades to cloud-only and continues serving.
+    Recovery is os._exit(1) ONLY (systemd Restart=on-failure → fresh CUDA
+    context) UNLESS the crash-loop guard says retries are exhausted, in
+    which case this function delegates to :func:`_degrade_to_cloud_only`
+    (which DOES call ``_release_base_model_in_process`` — that call is
+    accepted there because a poisoned context left in a permanently
+    degraded server is worse than one more safe_empty_cache → synchronize
+    hit) and the server continues serving cloud-only instead of restarting.
     """
     logger.critical("FATAL CUDA fault during %s — %s", phase, exc)
     if _cuda_crashloop_exhausted():
@@ -2190,6 +2209,16 @@ def _check_token_ratio_drift(config) -> None:
     }
 
 
+# GPU-lock timeout for lifespan shutdown's base-model release: long enough for
+# a background-trainer worker mid-fold to reach its next epoch boundary and
+# release (the shutdown flag set earlier in this same teardown only stops
+# training AT that boundary, not immediately), short enough that a genuinely
+# stuck holder does not indefinitely stall shutdown — the alternative is
+# systemd SIGKILL skipping the remaining teardown below the release. Mirrors
+# _apply_config_live's _APPLY_CONFIG_LOCK_TIMEOUT_S.
+_SHUTDOWN_GPU_LOCK_TIMEOUT_S: float = 60.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
@@ -2210,6 +2239,14 @@ async def lifespan(app: FastAPI):
     # here too for the same clean-slate guarantee.
     _state["base_swap_task"] = None
     _state["boot_completion_task"] = None
+    # ``mode`` is process-global and this lifespan is never guaranteed to be
+    # the first one in the process (TestClient reuse, in-process restart) —
+    # a prior lifespan's degrade can otherwise leave "cloud-only" resident
+    # and pin THIS boot's mode-write guard (below) into treating a healthy
+    # local boot as an in-progress degrade. Reset to the pre-boot default
+    # from the module-level ``_state`` initializer above ("local") so this
+    # lifespan starts from the same clean slate as a fresh process.
+    _state["mode"] = "local"
 
     # Deployment-integrity gate: fail loudly if the shared prompt assets are
     # missing (broken checkout / non-editable pip install). Prompts are not
@@ -2444,7 +2481,8 @@ async def lifespan(app: FastAPI):
     if not cloud_only and _gpu_occupied():
         logger.warning(
             "GPU is occupied by another process — starting in cloud-only mode. "
-            "Will auto-reclaim when GPU is free."
+            "No auto-reclaim for this reason; reclaim manually with "
+            "`pstatus --acquire` (POST /gpu/acquire) once the GPU is free."
         )
         notify_server(SERVER_CLOUD_ONLY)
         cloud_only = True
@@ -2456,11 +2494,7 @@ async def lifespan(app: FastAPI):
     # the bytes ahead of time. cuda_fault_persistent is included so a sticky
     # CUDA context fault that lands the server cloud-only is never auto-reclaimed
     # (re-entering the poisoned context would re-trigger the same fault).
-    permanent_cloud_only = _state.get("cloud_only_reason") in (
-        "explicit",
-        "gpu_conflict",
-        "cuda_fault_persistent",
-    )
+    permanent_cloud_only = _state.get("cloud_only_reason") in _PERMANENT_CLOUD_ONLY_REASONS
 
     # Startup VRAM validation. Hoisted out of the ``if not cloud_only:`` branch
     # so --defer-model startups (cloud_only=True but GPU pair loaded later by
@@ -2599,6 +2633,7 @@ async def lifespan(app: FastAPI):
     except BaseException as _eager_exc:
         if is_fatal_cuda_fault(_eager_exc):
             _fail_fast_cuda(_eager_exc, "eager_consolidation_loop")
+            cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
         else:
             logger.exception(
                 "Eager consolidation-loop creation failed at boot — continuing "
@@ -2743,12 +2778,25 @@ async def lifespan(app: FastAPI):
         full_period or "<manual only>",
     )
 
-    _state["mode"] = "cloud-only" if cloud_only else "local"
+    # _degrade_to_cloud_only commits mode="cloud-only" itself; the boot-computed
+    # value must never overwrite it.
+    if _state.get("mode") != "cloud-only":
+        _state["mode"] = "cloud-only" if cloud_only else "local"
     _state["event_loop"] = asyncio.get_running_loop()
 
     # Auto-reclaim: only when started without the model (--defer-model).
-    # In local mode we already have the GPU — nothing to reclaim.
-    if cloud_only and not _state.get("cloud_only_startup", False):
+    # In local mode we already have the GPU — nothing to reclaim. Also never
+    # armed when the boot itself already landed on a permanent cloud-only
+    # reason (e.g. 'cuda_fault_persistent' from the crash-loop guard above,
+    # via _fail_fast_cuda -> _degrade_to_cloud_only): _auto_reclaim_loop does
+    # not consult _PERMANENT_CLOUD_ONLY_REASONS itself, so arming it here
+    # would reload the base model straight back into the same poisoned CUDA
+    # context that just forced the degrade.
+    if (
+        cloud_only
+        and not _state.get("cloud_only_startup", False)
+        and _state.get("cloud_only_reason") not in _PERMANENT_CLOUD_ONLY_REASONS
+    ):
         reclaim_interval = config.server.reclaim_interval_minutes
         _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
     # Speaker enrollment is utterance-driven: the chat handler invokes
@@ -2855,8 +2903,9 @@ async def lifespan(app: FastAPI):
         _cuda_liveness_canary()
     except BaseException as _canary_exc:
         if is_fatal_cuda_fault(_canary_exc):
+            # On the exhausted-burst path _degrade_to_cloud_only already
+            # committed mode="cloud-only"; the server stays up, cloud-only.
             _fail_fast_cuda(_canary_exc, "post-preload canary")
-            cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
         else:
             raise
 
@@ -2953,8 +3002,31 @@ async def lifespan(app: FastAPI):
     # Release the base model — single owner for base-model + bt/loop + intent-handle
     # release. Shutdown does not separately call unload_model on _state["model"];
     # _release_base_model_in_process is the only release path here.
+    #
+    # A background-trainer worker thread can legitimately still hold
+    # gpu_lock_sync mid-fold at this point (the shutdown flag set above only
+    # stops training at the NEXT epoch boundary) — release under the lock
+    # with a bounded wait rather than racing it unlocked. This cannot
+    # deadlock: async gpu_lock holders release on the event-loop thread, but
+    # by this point the loop's lock-taking tasks are cancelled just above and
+    # in-flight HTTP requests have already drained, so the realistic holder
+    # class is sync worker threads, which release on their own thread. On
+    # timeout, log and proceed unlocked — shutdown must complete; the
+    # alternative is systemd SIGKILL skipping the remaining teardown below.
+    from paramem.server.gpu_lock import gpu_lock_sync
+
     _t = time.perf_counter()
-    _release_base_model_in_process()
+    try:
+        with gpu_lock_sync(timeout=_SHUTDOWN_GPU_LOCK_TIMEOUT_S):
+            _release_base_model_in_process()
+    except TimeoutError:
+        logger.error(
+            "shutdown: could not acquire GPU lock within %ss — a lock holder "
+            "outlasted the shutdown wait; releasing the base model unlocked "
+            "so shutdown can complete",
+            _SHUTDOWN_GPU_LOCK_TIMEOUT_S,
+        )
+        _release_base_model_in_process()
     logger.info("shutdown timing: _release_base_model_in_process %.2fs", time.perf_counter() - _t)
 
     wyoming_server = _state.get("wyoming_server")
@@ -3809,6 +3881,11 @@ _INVOLUNTARY_CLOUD_ONLY_REASONS: frozenset[str] = frozenset(
         "apply_failed",
         "cuda_fault_persistent",
     }
+)
+
+#: Cloud-only reasons that must never be auto-reclaimed this process lifetime.
+_PERMANENT_CLOUD_ONLY_REASONS: frozenset[str] = frozenset(
+    {"explicit", "gpu_conflict", "cuda_fault_persistent"}
 )
 
 #: Prepended once per conversation when a turn is served over the degraded
@@ -9634,9 +9711,8 @@ async def migration_preview(request: PreviewRequest):
     simulate_mode_override = detect_simulate_mode(parsed_candidate)
 
     # --- Pre-flight: disk-pressure gate on backup store ---
-    # compute_pre_flight_check guards itself against MagicMock / non-real configs
-    # (returns no-pressure result when max_total_disk_gb is not a real numeric).
-    # No call-site guard needed here.
+    # This endpoint owns the check_error mint below (compute_pre_flight_check
+    # raises rather than faking a pass; the except branch here catches that).
     from paramem.backup.preflight import PreFlightCheck
     from paramem.backup.preflight import compute_pre_flight_check as _compute_pre_flight
     from paramem.server.migration import MigrationStashState
@@ -10008,7 +10084,9 @@ async def migration_confirm(request: ConfirmRequest):
             # trial marker), so the backup slot is the only restore point for a
             # mode switch the operator wants to undo.
             try:
-                pre_trial_hash, ms_config_slot = backup_live_config(live_config_path, backups_root)
+                pre_trial_hash, ms_config_slot = backup_live_config(
+                    live_config_path, backups_root, config.security.backups
+                )
             except Exception as exc:
                 raise HTTPException(
                     status_code=500,
@@ -10225,7 +10303,9 @@ async def migration_confirm(request: ConfirmRequest):
         # backup_paths["graph"] / ["registry"].
         written_slots: list[Path] = []
         try:
-            pre_trial_hash, config_slot = backup_live_config(live_config_path, backups_root)
+            pre_trial_hash, config_slot = backup_live_config(
+                live_config_path, backups_root, config.security.backups
+            )
             written_slots.append(config_slot)
 
         except Exception as exc:
@@ -10843,7 +10923,8 @@ async def _run_base_swap_orchestration(
                 config_path=live_config_path,
                 registry_path=registry_path,
                 adapter_dirs=adapter_dirs,
-                base_dir=backups_root / "snapshot",
+                backups_root=backups_root,
+                backups_cfg=config.security.backups,
                 meta_fields={"tier": "pre_base_swap", "label": f"pre_base_swap_{new_model}"},
                 adapter_scope="live",
                 live_registry_sha256=live_registry_sha256,
@@ -12339,7 +12420,8 @@ async def migration_rollback():
                     "tier": "rollback_pre_mortem",
                     "pre_trial_hash": pre_trial_config_sha256,
                 },
-                base_dir=backups_root / "config",
+                backups_root=backups_root,
+                backups_cfg=None,  # undo anchor — exempt from the disk cap
             )
         except Exception as exc:
             raise HTTPException(
@@ -13528,7 +13610,8 @@ async def backup_restore(req: BackupRestoreRequest):
             ArtifactKind.CONFIG,
             live_config_path.read_bytes() if live_config_path.exists() else b"",
             meta_fields={"tier": "manual", "label": safety_label},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=None,  # undo anchor — exempt from the disk cap
         )
         safety_slot_path = str(safety_slot)
     except Exception as exc:

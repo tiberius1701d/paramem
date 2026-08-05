@@ -2,10 +2,11 @@
 
 Orchestrates the full backup pipeline:
   1. Schedule guard (``schedule: "off"`` → no-op).
-  2. Disk-pressure write gate (rule 1).
-  3. Per-artifact write loop.
-  4. Post-write pruning (best-effort).
-  5. Returns a ``ScheduledBackupResult`` dataclass.
+  2. Per-artifact write loop.  The disk-pressure cap (rule 1) is enforced by
+     ``backup.write`` / ``backup.write_bundle`` themselves, so a refusal can
+     land mid-loop — see the loop's ``disk_pressure_error`` handling.
+  3. Post-write pruning (best-effort).
+  4. Returns a ``ScheduledBackupResult`` dataclass.
 
 The tier is a parameter (default ``"daily"``) selected by the caller —
 the standalone CLI runner, or ``/backup/create`` (which forwards the
@@ -52,22 +53,32 @@ class ScheduledBackupResult:
     completed_at:
         ISO-8601 UTC timestamp when the run completed.
     success:
-        ``True`` when at least one artifact was written and pruning did not
-        raise.  ``False`` on disk-pressure refusal or write error.
+        ``False`` when a non-cap write error or a disk-cap refusal occurred
+        this run, ``True`` otherwise.  A cap refusal can land mid-loop —
+        artifacts already written before it stay in ``written_slots``, and
+        pruning still runs (it is what relieves the pressure).
     tier:
         Backup tier tag — always ``"daily"`` in production.
     label:
         Optional operator-supplied annotation.
     written_slots:
         Mapping of artifact name → absolute slot path string for artifacts
-        written successfully this run.
+        written successfully this run.  Never zeroed by a later refusal in
+        the same run.
     skipped_artifacts:
         ``(artifact_name, reason)`` pairs for artifacts that were not written.
     error:
-        ``repr`` of the first exception encountered, or ``None`` on success.
+        ``repr`` of the first non-cap write exception, or the disk-cap
+        refusal message when one occurred, or ``None`` on success.
     prune_result_summary:
         Summary dict of the ``PruneResult`` from this run, or ``None`` when
-        pruning did not run (disk pressure, write failure, or schedule off).
+        pruning did not run — a non-cap write error occurred, or the run
+        short-circuited before the write loop (schedule off, ``keep=0``).
+        Pruning DOES run after a disk-cap refusal, even when it left
+        ``written_slots`` empty: pruning is what relieves the pressure the
+        refusal detected, and the persistent over-cap case (every configured
+        artifact refused, nothing written this run) is exactly when running
+        it matters most.
     """
 
     started_at: str
@@ -109,14 +120,9 @@ def run_scheduled_backup(
     1b. **keep=0 short-circuit** — when the target tier's ``keep == 0``,
         return a no-op success immediately with all artifacts in
         ``skipped_artifacts``.  Avoids writing + immediately pruning; the
-        ``prune()`` call (step 4) handles removal of any existing slots.
+        ``prune()`` call (step 3) handles removal of any existing slots.
 
-    2. **Disk-pressure write gate** (rule 1) — compute current disk usage.
-       When ``pct_of_cap >= 1.0``, refuse the write.  Return
-       ``success=False`` with ``error="disk_pressure: ..."`` and all
-       artifacts listed in ``skipped_artifacts``.
-
-    3. **Per-artifact write loop** — for each artifact in
+    2. **Per-artifact write loop** — for each artifact in
        ``server_config.security.backups.artifacts``:
 
        - ``"snapshot_bundle"`` → call ``write_bundle(...)`` to produce a
@@ -141,19 +147,31 @@ def run_scheduled_backup(
          Skip with reason ``"registry empty (no keys yet)"`` when the file
          does not exist.  Write even when the file is empty (0 bytes).
 
-       On any write exception: record the exception in ``error``, mark
-       remaining artifacts as ``"aborted after prior failure"``, and return
-       ``success=False`` (skip pruning).
+       Each artifact's write door (``backup.write`` / ``backup.write_bundle``)
+       enforces the global disk cap (rule 1) itself.  A ``DiskCapExceeded``
+       refusal does NOT abort the loop early: it is recorded and every
+       remaining artifact (this one included) is marked ``"disk_pressure"`` in
+       ``skipped_artifacts``, while any artifact already written earlier in
+       this run stays in ``written_slots`` — a cap refusal is not a reason to
+       misreport slots that are genuinely on disk.  Any other write exception
+       still aborts the remaining loop: record it in ``error`` and mark the
+       rest ``"aborted after prior failure"``.
 
        Note: ``security.backups.artifacts`` still accepts the deprecated
        ``["config", "graph", "registry"]`` list for backward compatibility.
        New installations should use ``["snapshot_bundle"]``.
 
-    4. **Pruning** — only when at least one artifact was written.  Wrap in
-       ``try/except``: prune failure logs ERROR but ``success`` stays
-       ``True``.
+    3. **Pruning** — runs when ``first_error is None`` AND (at least one
+       artifact was written this run OR a disk-cap refusal occurred this
+       run).  Gated on ``first_error`` (a non-cap write failure) but NOT on
+       a cap refusal: pruning is exactly the operation that relieves the
+       pressure a refusal just detected, so it still runs after one — even
+       when the refusal left ``written_slots`` empty (the persistent
+       over-cap case, and the only case for a single-artifact
+       ``snapshot_bundle`` config).  Wrap in ``try/except``: prune failure
+       logs ERROR but does not change ``success``.
 
-    5. Returns ``ScheduledBackupResult``.
+    4. Returns ``ScheduledBackupResult``.
 
     Parameters
     ----------
@@ -185,8 +203,8 @@ def run_scheduled_backup(
     """
     from paramem.backup.backup import write as backup_write
     from paramem.backup.backup import write_bundle as backup_write_bundle
-    from paramem.backup.retention import compute_disk_usage, prune
-    from paramem.backup.types import ArtifactKind, BackupError
+    from paramem.backup.retention import prune
+    from paramem.backup.types import ArtifactKind, BackupError, DiskCapExceeded
 
     if now is None:
         now = datetime.now(timezone.utc)
@@ -232,32 +250,22 @@ def run_scheduled_backup(
             prune_result_summary=None,
         )
 
-    # Step 2: Disk-pressure write gate (rule 1).
     backups_root = Path(backups_root)
-    disk_usage = compute_disk_usage(backups_root, backups_cfg, bypass_cache=True)
-    if disk_usage.pct_of_cap >= 1.0:
-        used_gb = disk_usage.total_bytes / (1024**3)
-        cap_gb = backups_cfg.max_total_disk_gb
-        err = f"disk_pressure: max_total_disk_gb reached (used {used_gb:.2f} of {cap_gb} GB)"
-        logger.error("run_scheduled_backup: %s", err)
-        return ScheduledBackupResult(
-            started_at=started_at,
-            completed_at=_completed_now(),
-            success=False,
-            tier=tier,
-            label=label,
-            written_slots={},
-            skipped_artifacts=[(a, "disk_pressure") for a in artifacts_cfg],
-            error=err,
-            prune_result_summary=None,
-        )
 
-    # Step 3: Per-artifact write loop.
+    # Step 2: Per-artifact write loop.  The disk cap (rule 1) is enforced by
+    # backup.write / backup.write_bundle themselves — see the DiskCapExceeded
+    # handling below.
     written_slots: dict[str, str] = {}
     skipped_artifacts: list[tuple[str, str]] = []
     first_error: str | None = None
+    disk_pressure_error: str | None = None  # kept apart from first_error
 
     for artifact_name in artifacts_cfg:
+        if disk_pressure_error is not None:
+            # Cap already reached this run: every remaining artifact is
+            # refused for that reason, not "aborted after prior failure".
+            skipped_artifacts.append((artifact_name, "disk_pressure"))
+            continue
         if first_error is not None:
             skipped_artifacts.append((artifact_name, "aborted after prior failure"))
             continue
@@ -293,7 +301,8 @@ def run_scheduled_backup(
                     config_path=Path(live_config_path),
                     registry_path=registry_path,
                     adapter_dirs=adapter_dirs,
-                    base_dir=backups_root / "snapshot",
+                    backups_root=backups_root,
+                    backups_cfg=backups_cfg,
                     meta_fields={"tier": tier, "label": label},
                     adapter_scope=adapter_scope,
                     speaker_profiles_path=speaker_profiles_path
@@ -305,6 +314,10 @@ def run_scheduled_backup(
                     "run_scheduled_backup: wrote snapshot_bundle slot %s",
                     bundle_slot,
                 )
+            except DiskCapExceeded as exc:
+                disk_pressure_error = str(exc)
+                logger.error("run_scheduled_backup: %s", disk_pressure_error)
+                skipped_artifacts.append((artifact_name, "disk_pressure"))
             except BackupError as exc:
                 first_error = repr(exc)
                 logger.error("run_scheduled_backup: write_bundle failed: %s", exc)
@@ -374,18 +387,26 @@ def run_scheduled_backup(
                 kind,
                 artifact_bytes,
                 meta_fields={"tier": tier, "label": label},
-                base_dir=backups_root / artifact_name,
+                backups_root=backups_root,
+                backups_cfg=backups_cfg,
             )
             written_slots[artifact_name] = str(slot_dir)
             logger.info("run_scheduled_backup: wrote %s slot %s", artifact_name, slot_dir)
+        except DiskCapExceeded as exc:
+            disk_pressure_error = str(exc)
+            logger.error("run_scheduled_backup: %s", disk_pressure_error)
+            skipped_artifacts.append((artifact_name, "disk_pressure"))
         except Exception as exc:
             first_error = repr(exc)
             logger.error("run_scheduled_backup: failed to write %s: %s", artifact_name, exc)
             continue
 
-    # Step 4: Pruning (only when at least one artifact was written).
+    # Step 3: Pruning — gated on first_error, NOT on the cap refusal.  A
+    # refusal is precisely when pruning is most useful: slots that did land
+    # are on disk and the retention rules are what free the space for the
+    # next run.
     prune_result_summary: dict | None = None
-    if written_slots and first_error is None:
+    if first_error is None and (written_slots or disk_pressure_error is not None):
         try:
             pr = prune(
                 backups_root=backups_root,
@@ -405,7 +426,10 @@ def run_scheduled_backup(
             logger.error("run_scheduled_backup: pruning failed (backup still on disk): %s", exc)
             # success stays True — the backup is on disk; pruning is best-effort.
 
-    success = first_error is None
+    # The two flags are mutually exclusive by construction (whichever is set
+    # first short-circuits the other's branch at loop entry), so this
+    # selection is unambiguous.
+    success = first_error is None and disk_pressure_error is None
     return ScheduledBackupResult(
         started_at=started_at,
         completed_at=_completed_now(),
@@ -414,6 +438,6 @@ def run_scheduled_backup(
         label=label,
         written_slots=written_slots,
         skipped_artifacts=skipped_artifacts,
-        error=first_error,
+        error=first_error if first_error is not None else disk_pressure_error,
         prune_result_summary=prune_result_summary,
     )

@@ -5,9 +5,12 @@ accept all inputs as parameters — no module-level state reach-in.
 
 Rule precedence (strongest first)
 ----------------------------------
-1. ``max_total_disk_gb`` — global cap across all tiers.  Rule 1 is enforced by
-   the *runner* (write refusal when ``pct_of_cap >= 1.0``), NOT by ``prune()``.
-   ``prune()`` reports usage in ``disk_usage_{before,after}``.
+1. ``max_total_disk_gb`` — global cap across all tiers.  Rule 1 is enforced
+   at the write doors (``backup.write`` / ``backup.write_bundle``, via the
+   cap check in ``paramem/backup/backup.py``), which refuse a write when
+   ``total_bytes >= cap_bytes`` (byte comparison, not the percentage),
+   NOT by ``prune()``.  ``prune()`` reports usage in
+   ``disk_usage_{before,after}``.
 2. Per-tier ``max_disk_gb`` — tier-level cap.  Oldest-within-tier slots pruned
    first until usage drops to cap or only immune slots remain.
 3. Per-tier ``keep`` count — oldest-within-tier slots pruned after ``keep``
@@ -317,7 +320,7 @@ def prune(
 
     See module docstring for rule semantics.  Brief summary:
 
-    - Rule 1 is enforced by the runner (write refusal), NOT here.
+    - Rule 1 is enforced at the write doors (write refusal), NOT here.
     - Rule 2 (per-tier cap): applied first, oldest-within-tier pruned until
       tier bytes ≤ cap or only immune slots remain.
     - Rule 3 (keep count): applied per-tier.  ``keep="unlimited"`` skips rule.

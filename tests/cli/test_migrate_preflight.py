@@ -4,6 +4,7 @@ Tests cover:
 9  — pre_flight_fail="disk_pressure" → disk-pressure message + paramem backup-prune + rc=1
 10 — pre_flight_fail="something_new" → generic message + rc=1
 11 — pre_flight_fail=None → reaches proceed prompt (operator N → cancel + rc=1)
+12 — pre_flight_fail="check_error" → could-not-be-evaluated message + rc=1
 """
 
 from __future__ import annotations
@@ -128,3 +129,34 @@ class TestMigrateCliNoPreflightContinuesToPrompt:
         assert any("cancel" in url for url in cancel_called), (
             "Expected /migration/cancel to be POSTed on N"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — pre_flight_fail="check_error" → could-not-be-evaluated message + rc=1
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateCliPrintsCheckErrorMessageAndExits1:
+    def test_migrate_cli_prints_check_error_message_and_exits_1(self, monkeypatch, capsys) -> None:
+        """pre_flight_fail='check_error' → could-not-be-evaluated message; rc=1; no cancel POST."""
+        cancel_called = []
+
+        def _fake_post(url, body=None, **kw):
+            if "cancel" in url:
+                cancel_called.append(url)
+            return _preview_response(pre_flight_fail="check_error")
+
+        monkeypatch.setattr(http_client, "post_json", _fake_post)
+
+        rc = main(["migrate", "/tmp/cand.yaml"])
+        captured = capsys.readouterr()
+
+        assert rc == 1, f"Expected rc=1, got {rc}"
+        assert "could not be evaluated" in captured.err.lower(), (
+            f"Stderr must say pre-flight could not be evaluated: {captured.err!r}"
+        )
+        assert "nothing was staged" in captured.err.lower(), (
+            f"Stderr must confirm nothing was staged: {captured.err!r}"
+        )
+        # No /migration/cancel must be POSTed (state is LIVE, nothing to cancel).
+        assert not cancel_called, f"cancel should not have been called: {cancel_called}"

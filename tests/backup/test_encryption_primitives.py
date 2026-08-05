@@ -375,6 +375,7 @@ class TestBackupWriteUsesAgeEnvelope:
         from paramem.backup.backup import write as backup_write
         from paramem.backup.meta import read_meta
         from paramem.backup.types import ArtifactKind
+        from paramem.server.config import ServerBackupsConfig
 
         _setup_daily(tmp_path, monkeypatch)
         recovery_path = tmp_path / "absent.pub"
@@ -384,7 +385,8 @@ class TestBackupWriteUsesAgeEnvelope:
             ArtifactKind.CONFIG,
             b"model: mistral\n",
             meta_fields={"tier": "scheduled"},
-            base_dir=tmp_path / "config",
+            backups_root=tmp_path,
+            backups_cfg=ServerBackupsConfig(),
         )
         meta = read_meta(slot_dir)
 
@@ -395,6 +397,7 @@ class TestBackupWriteUsesAgeEnvelope:
         from paramem.backup.backup import write as backup_write
         from paramem.backup.meta import read_meta
         from paramem.backup.types import ArtifactKind
+        from paramem.server.config import ServerBackupsConfig
 
         monkeypatch.setattr(
             "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", tmp_path / "absent.age"
@@ -406,7 +409,8 @@ class TestBackupWriteUsesAgeEnvelope:
             ArtifactKind.CONFIG,
             b"model: mistral\n",
             meta_fields={"tier": "scheduled"},
-            base_dir=tmp_path / "config",
+            backups_root=tmp_path,
+            backups_cfg=ServerBackupsConfig(),
         )
         meta = read_meta(slot_dir)
 

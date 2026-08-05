@@ -44,6 +44,16 @@ def gpu_lock_sync(timeout: float = -1):
         _gpu_thread_lock.release()
 
 
+def gpu_lock_is_held() -> bool:
+    """True when the GPU lock is currently held by ANY thread.
+
+    Read-only probe: unlike a trial ``acquire(blocking=False)`` it never takes
+    the lock, so it cannot momentarily block a real acquirer and cannot leak
+    the lock if the caller raises between the trial acquire and its release.
+    """
+    return _gpu_thread_lock.locked()
+
+
 def acquire_gpu():
     """Acquire the GPU lock (blocking). For asymmetric acquire/release patterns."""
     _gpu_thread_lock.acquire()

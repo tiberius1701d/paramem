@@ -5,7 +5,9 @@ Tests cover:
 - Over-cap → disk_pressure
 - Cloud-only (loop=None) → graph contribution = 0
 - Missing registry file → registry contribution = 0
-- I/O errors swallowed (PermissionError or graph.json read error) → valid result without crash
+- Unreadable component (config, graph, registry) → raises; no partial estimate
+- Cap unavailable (MagicMock / None config) → raises PreFlightUnavailable
+- Disk-usage scan failure → raises
 """
 
 from __future__ import annotations
@@ -13,7 +15,13 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from paramem.backup.preflight import PreFlightCheck, compute_pre_flight_check
+import pytest
+
+from paramem.backup.preflight import (
+    PreFlightCheck,
+    PreFlightUnavailable,
+    compute_pre_flight_check,
+)
 from paramem.server.config import (
     PathsConfig,
     SecurityConfig,
@@ -194,13 +202,13 @@ class TestPreFlightNoRegistryFile:
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — I/O errors swallowed → valid PreFlightCheck without crash
+# Test 5 — unreadable components raise; no partial estimate
 # ---------------------------------------------------------------------------
 
 
-class TestPreFlightSwallowsReadErrors:
-    def test_preflight_swallows_permission_error_on_config(self, tmp_path: Path) -> None:
-        """PermissionError reading live config → counted as 0 bytes; graph still counted."""
+class TestPreFlightPropagatesReadErrors:
+    def test_preflight_raises_when_config_unreadable(self, tmp_path: Path) -> None:
+        """PermissionError reading live config propagates — no partial estimate."""
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -221,8 +229,11 @@ class TestPreFlightSwallowsReadErrors:
                 raise PermissionError("permission denied")
             return original_read_bytes(self)
 
-        with patch.object(Path, "read_bytes", _patched_read_bytes):
-            result = compute_pre_flight_check(
+        with (
+            patch.object(Path, "read_bytes", _patched_read_bytes),
+            pytest.raises(PermissionError),
+        ):
+            compute_pre_flight_check(
                 server_config=config,
                 loop=loop,
                 backups_root=backups_root,
@@ -230,19 +241,13 @@ class TestPreFlightSwallowsReadErrors:
                 registry_path=None,
             )
 
-        # Should not raise; config contribution = 0, graph still counted.
-        assert isinstance(result, PreFlightCheck)
-        assert result.fail_code is None
-        # estimate = 0 (config error) + len(b"graph") = 5
-        assert result.estimate_bytes == len(b"graph")
-
-    def test_preflight_swallows_graph_read_error(self, tmp_path: Path) -> None:
-        """read_maybe_encrypted on graph.json raising → graph counted as 0 bytes; no crash.
+    def test_preflight_raises_when_graph_unreadable(self, tmp_path: Path) -> None:
+        """read_maybe_encrypted on graph.json raising propagates — no partial estimate.
 
         Preflight reads graph bytes from output_dir/episodic/graph.json via
-        read_maybe_encrypted instead of loop.merger.save_bytes().  When that read
-        fails (e.g. PermissionError), the graph contribution must be 0 and the
-        function must not raise.
+        read_maybe_encrypted instead of loop.merger.save_bytes(). When that read
+        fails (e.g. PermissionError), the failure must propagate rather than be
+        counted as a 0-byte contribution.
         """
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
@@ -264,8 +269,11 @@ class TestPreFlightSwallowsReadErrors:
                 raise PermissionError("graph read denied")
             return original_read_bytes(self)
 
-        with patch.object(Path, "read_bytes", _fail_graph_read):
-            result = compute_pre_flight_check(
+        with (
+            patch.object(Path, "read_bytes", _fail_graph_read),
+            pytest.raises(PermissionError),
+        ):
+            compute_pre_flight_check(
                 server_config=config,
                 loop=loop,
                 backups_root=backups_root,
@@ -273,25 +281,105 @@ class TestPreFlightSwallowsReadErrors:
                 registry_path=None,
             )
 
-        assert isinstance(result, PreFlightCheck)
-        assert result.fail_code is None
-        # estimate = config_bytes + 0 (graph read error)
-        assert result.estimate_bytes == len(b"model: mistral\n")
+    def test_preflight_raises_when_registry_unreadable(self, tmp_path: Path) -> None:
+        """PermissionError reading the registry file propagates — no partial estimate."""
+        config = _make_config(tmp_path, max_total_disk_gb=10.0)
+        backups_root = tmp_path / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        live_config = tmp_path / "server.yaml"
+        live_config.write_bytes(b"model: mistral\n")
+
+        registry = tmp_path / "registry.json"
+        registry.write_bytes(b'{"keys": []}')
+
+        original_read_bytes = Path.read_bytes
+
+        def _fail_registry_read(self):
+            if self == registry:
+                raise PermissionError("registry read denied")
+            return original_read_bytes(self)
+
+        with (
+            patch.object(Path, "read_bytes", _fail_registry_read),
+            pytest.raises(PermissionError),
+        ):
+            compute_pre_flight_check(
+                server_config=config,
+                loop=None,
+                backups_root=backups_root,
+                live_config_path=live_config,
+                registry_path=registry,
+            )
+
+    def test_preflight_raises_when_disk_usage_scan_fails(self, tmp_path: Path) -> None:
+        """compute_disk_usage raising propagates — a failed scan is not a 0-byte usage."""
+        config = _make_config(tmp_path, max_total_disk_gb=10.0)
+        backups_root = tmp_path / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        live_config = tmp_path / "server.yaml"
+        live_config.write_bytes(b"model: mistral\n")
+
+        with (
+            patch(
+                "paramem.backup.retention.compute_disk_usage",
+                side_effect=OSError("scan failed"),
+            ),
+            pytest.raises(OSError, match="scan failed"),
+        ):
+            compute_pre_flight_check(
+                server_config=config,
+                loop=None,
+                backups_root=backups_root,
+                live_config_path=live_config,
+                registry_path=None,
+            )
+
+    def test_preflight_raises_when_encrypted_component_unreadable(self, tmp_path: Path) -> None:
+        """An age-encrypted artifact with no daily identity loaded raises — every
+        component present (config, graph, registry) but none is estimated."""
+        config = _make_config(tmp_path, max_total_disk_gb=10.0)
+        backups_root = tmp_path / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        live_config = tmp_path / "server.yaml"
+        live_config.write_bytes(b"model: mistral\n")
+
+        registry = tmp_path / "registry.json"
+        registry.write_bytes(b'{"keys": []}')
+
+        loop = _make_loop(b'{"nodes":[],"links":[]}', tmp_path)
+
+        with (
+            patch(
+                "paramem.backup.encryption.read_maybe_encrypted",
+                side_effect=RuntimeError("daily identity not loadable"),
+            ),
+            pytest.raises(RuntimeError, match="daily identity not loadable"),
+        ):
+            compute_pre_flight_check(
+                server_config=config,
+                loop=loop,
+                backups_root=backups_root,
+                live_config_path=live_config,
+                registry_path=registry,
+            )
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — MagicMock config → no-pressure result (no false positive)
+# Test 6 — cap unavailable → PreFlightUnavailable
 # ---------------------------------------------------------------------------
 
 
-class TestPreFlightMagicMockConfigNoFalsePositive:
-    def test_preflight_mock_config_returns_no_pressure(self, tmp_path: Path) -> None:
-        """MagicMock server_config → fail_code=None (no false positive).
+class TestPreFlightRejectsUnmeasurableCap:
+    def test_preflight_raises_when_cap_unavailable(self, tmp_path: Path) -> None:
+        """MagicMock server_config → raises PreFlightUnavailable (no false pass).
 
         MagicMock attributes resolve to MagicMock objects, not real numerics.
-        The guard inside compute_pre_flight_check must detect this and return
-        a no-pressure result rather than letting int(MagicMock()) silently
-        produce cap_bytes=1 and emit a false disk_pressure fail.
+        The guard inside compute_pre_flight_check must detect this and raise
+        rather than let int(MagicMock()) silently produce cap_bytes=1, or a
+        zeroed result render as an honest, unmeasured pass.
         """
         mock_config = MagicMock()
 
@@ -300,16 +388,27 @@ class TestPreFlightMagicMockConfigNoFalsePositive:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        result = compute_pre_flight_check(
-            server_config=mock_config,
-            loop=None,
-            backups_root=backups_root,
-            live_config_path=live_config,
-            registry_path=None,
-        )
+        with pytest.raises(PreFlightUnavailable):
+            compute_pre_flight_check(
+                server_config=mock_config,
+                loop=None,
+                backups_root=backups_root,
+                live_config_path=live_config,
+                registry_path=None,
+            )
 
-        assert isinstance(result, PreFlightCheck)
-        assert result.fail_code is None
-        assert result.disk_used_bytes == 0
-        assert result.disk_cap_bytes == 0
-        assert result.estimate_bytes == 0
+    def test_preflight_raises_when_config_none(self, tmp_path: Path) -> None:
+        """server_config=None → raises PreFlightUnavailable."""
+        backups_root = tmp_path / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+        live_config = tmp_path / "server.yaml"
+        live_config.write_bytes(b"model: mistral\n")
+
+        with pytest.raises(PreFlightUnavailable):
+            compute_pre_flight_check(
+                server_config=None,
+                loop=None,
+                backups_root=backups_root,
+                live_config_path=live_config,
+                registry_path=None,
+            )

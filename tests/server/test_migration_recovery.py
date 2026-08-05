@@ -12,6 +12,7 @@ from pathlib import Path
 
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
+from paramem.server.config import ServerBackupsConfig
 from paramem.server.migration_recovery import (
     RecoveryAction,
     recover_migration_state,
@@ -43,7 +44,8 @@ def _write_pre_migration_backup(
         ArtifactKind.CONFIG,
         data,
         meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
-        base_dir=backups_root / "config",
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
     )
 
 

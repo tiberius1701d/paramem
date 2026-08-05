@@ -470,6 +470,105 @@ class TestPersistentCallableWorker:
             "Persistent worker thread must remain alive between jobs."
         )
 
+    def test_concurrent_stop_callable_worker_is_race_free(self) -> None:
+        """Two racing ``_stop_callable_worker()`` calls on the same live
+        worker thread must both return cleanly (never an
+        ``AttributeError: 'NoneType' object has no attribute 'join'`` from a
+        nulled-out handle raced out from under the other caller), and leave
+        ``_worker_thread`` None afterward.  Reachable in production: the
+        lifespan shutdown releases the base model with no lock while
+        ``/gpu/release`` releases it under ``gpu_lock``, so two threads can
+        be inside ``BackgroundTrainer.release()`` concurrently.
+
+        After both stops return, a subsequent ``submit()`` must still run
+        its job.  Two racing stops enqueue two
+        ``_WORKER_STOP`` sentinels; a fix that leaves the surplus sentinel
+        queued would let the next worker dequeue it as its first item and
+        exit immediately, stranding the submitted job.
+
+        Repeated across iterations (not just once) to make the interleaving
+        likely; each iteration's joins use a short explicit timeout so the
+        whole test stays far inside CI's 60s per-test budget.
+        """
+        model = _make_stub_model("episodic", "in_training")
+        config = _minimal_training_config()
+
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=config,
+            output_dir="/tmp/test_bt_stop_race",
+        )
+
+        with patch("paramem.server.gpu_lock.gpu_lock_sync", new=self._noop_gpu_lock()):
+            for iteration in range(20):
+                started = threading.Event()
+                bt.submit(started.set, inference_fallback_adapter="episodic")
+                assert started.wait(timeout=1.0), (
+                    f"iteration {iteration}: worker did not start its job"
+                )
+
+                errors: list[BaseException] = []
+
+                def _stop() -> None:
+                    try:
+                        bt._stop_callable_worker(timeout=1.0)
+                    except BaseException as exc:  # noqa: BLE001
+                        errors.append(exc)
+
+                t1 = threading.Thread(target=_stop)
+                t2 = threading.Thread(target=_stop)
+                t1.start()
+                t2.start()
+                t1.join(timeout=2.0)
+                t2.join(timeout=2.0)
+
+                assert not t1.is_alive() and not t2.is_alive(), (
+                    f"iteration {iteration}: a stop call did not return"
+                )
+                assert errors == [], (
+                    f"iteration {iteration}: _stop_callable_worker raised: {errors}"
+                )
+                assert bt._worker_thread is None, (
+                    f"iteration {iteration}: worker handle not nulled after both stops"
+                )
+
+                # The residual the narrow race test misses: a surplus queued
+                # sentinel would strand this job.
+                done = threading.Event()
+                bt.submit(done.set, inference_fallback_adapter="episodic")
+                assert done.wait(timeout=2.0), (
+                    f"iteration {iteration}: job stranded after concurrent stop race "
+                    "— a surplus _WORKER_STOP sentinel was left queued"
+                )
+
+    def test_release_twice_is_idempotent(self) -> None:
+        """Calling release() a second time is a no-op — no exception, state
+        stays released."""
+        model = _make_stub_model("episodic", "in_training")
+        config = _minimal_training_config()
+
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=config,
+            output_dir="/tmp/test_bt_release_idempotent",
+        )
+
+        started = threading.Event()
+        with patch("paramem.server.gpu_lock.gpu_lock_sync", new=self._noop_gpu_lock()):
+            bt.submit(started.set, inference_fallback_adapter="episodic")
+            assert started.wait(timeout=2.0), "worker did not start its job"
+
+        bt.release()
+        assert bt.model is None
+        assert bt.tokenizer is None
+        assert bt._worker_thread is None
+
+        bt.release()  # second call — must not raise
+        assert bt.model is None
+        assert bt.tokenizer is None
+
 
 # ---------------------------------------------------------------------------
 # Test 12 — train_adapter aborted return value

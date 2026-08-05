@@ -31,7 +31,12 @@ from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.backup.types import FatalConfigError
-from paramem.server.config import ServerConfig, build_server_config, load_server_config
+from paramem.server.config import (
+    ServerBackupsConfig,
+    ServerConfig,
+    build_server_config,
+    load_server_config,
+)
 from paramem.server.migration import (
     CandidateChanged,
     CandidateConfigInvalid,
@@ -258,7 +263,7 @@ class TestBackupLiveConfig:
         live.write_bytes(b"model: mistral\n")
         backups_root = tmp_path / "backups"
 
-        pre_hash, slot = backup_live_config(live, backups_root)
+        pre_hash, slot = backup_live_config(live, backups_root, ServerBackupsConfig())
 
         assert pre_hash == _sha256_file(live)
         assert slot.is_dir()
@@ -270,7 +275,9 @@ class TestBackupLiveConfig:
         assert meta["pre_trial_hash"] == pre_hash
 
     def test_missing_live_config_yields_empty_hash(self, tmp_path):
-        pre_hash, slot = backup_live_config(tmp_path / "absent.yaml", tmp_path / "backups")
+        pre_hash, slot = backup_live_config(
+            tmp_path / "absent.yaml", tmp_path / "backups", ServerBackupsConfig()
+        )
         assert pre_hash == ""
         assert slot.is_dir()
 
@@ -296,6 +303,8 @@ class TestPreviewKeepsSecretsOutOfEverything:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
+        config.security.backups.max_total_disk_gb = 20.0
+        config.paths.key_metadata = tmp_path / "data" / "ha" / "registry" / "key_metadata.json"
         fresh = {
             "model": None,
             "config": config,

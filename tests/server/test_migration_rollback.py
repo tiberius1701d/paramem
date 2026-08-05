@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
+from paramem.server.config import ServerBackupsConfig
 from paramem.server.migration import TrialStash, initial_migration_state
 from paramem.server.trial_state import (
     TRIAL_MARKER_SCHEMA_VERSION,
@@ -101,7 +102,8 @@ def _make_state(
         ArtifactKind.CONFIG,
         a_yaml_bytes,
         {"tier": "pre_migration"},
-        base_dir=backups_root / "config",
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
     )
 
     # Derive the artifact filename from the real slot for the marker.
@@ -258,6 +260,40 @@ class TestRollbackHappyPath:
         slots = [d for d in config_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
         # Should have at least the original + pre_mortem slot.
         assert len(slots) >= 2
+
+    def test_rollback_writes_pre_mortem_backup_when_store_over_cap(self, client, state):
+        """The rollback_pre_mortem backup is written even when the store is
+        already far over any operator-configured disk cap — it anchors an
+        undo, exempt from the cap by owner ruling.  A future edit that starts
+        passing a real ``backups_cfg`` at this call site would turn this into
+        a 500 ``rollback_backup_failed``, so this test fails loudly.
+        """
+        # A cap tiny enough that one seeded backup slot alone exceeds it.
+        state["config"].security.backups = ServerBackupsConfig(max_total_disk_gb=1e-9)
+        backups_root = state["config"].paths.data / "backups"
+        config_dir = backups_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        # Seed a real slot (disk accounting walks only <kind>/<timestamp>/
+        # slot directories, not loose files, so a genuine slot is required
+        # to put the store over cap).
+        backup_write(
+            ArtifactKind.CONFIG,
+            b"x" * (1024 * 1024),
+            {"tier": "daily"},
+            backups_root=backups_root,
+            backups_cfg=None,  # seed the store without gating the seed itself
+        )
+        slots_before = [
+            d for d in config_dir.iterdir() if d.is_dir() and not d.name.startswith(".")
+        ]
+
+        resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 200, resp.text
+        slots_after = [d for d in config_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert len(slots_after) > len(slots_before), (
+            "the rollback_pre_mortem slot must still be written when the store is over cap"
+        )
 
     def test_rollback_pre_mortem_path_in_response(self, client, state):
         """RollbackResponse.rollback_pre_mortem_backup_path is an absolute path."""
@@ -655,7 +691,8 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
             ArtifactKind.CONFIG,
             a_bytes,
             {"tier": "pre_migration"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
 
         # Identify the artifact filename (must end with .bin, not .meta.json).
@@ -815,7 +852,8 @@ class TestRollbackDecryptsEncryptedArtifact:
             ArtifactKind.CONFIG,
             a_bytes,
             {"tier": "pre_migration"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
 
         # --- Step 3: verify the artifact is an age envelope ---

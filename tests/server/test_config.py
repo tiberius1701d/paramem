@@ -94,6 +94,7 @@ class TestSecurityOrphanSweepConfig:
 
         from paramem.backup.backup import write as backup_write
         from paramem.backup.types import ArtifactKind
+        from paramem.server.config import ServerBackupsConfig
         from paramem.server.migration_recovery import RecoveryAction, recover_migration_state
 
         live_content = b"model: mistral\n"
@@ -107,7 +108,8 @@ class TestSecurityOrphanSweepConfig:
             ArtifactKind.CONFIG,
             b"config: live\n",
             meta_fields={"tier": "pre_migration", "pre_trial_hash": live_hash},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
 
         # Monkeypatch datetime.now to be 2h in the future so a 1h window rejects the backup.

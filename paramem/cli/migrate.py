@@ -918,11 +918,20 @@ def render_preview(result: dict, server_url: str) -> int:
         if pre_flight_fail == "disk_pressure":
             used_gb = result.get("pre_flight_disk_used_gb") or 0.0
             cap_gb = result.get("pre_flight_disk_cap_gb") or 0.0
-            # Disk-pressure message: includes used/cap GB, backup-prune hint, config key to raise.
+            # Predicted, not guaranteed: the preview gate fires on
+            # used+estimate > cap, the write refusal on used >= cap — a
+            # preview failure does not certify a confirm-time refusal.
             print(
-                f"Migration will fail at the pre-migration backup step — backup store\n"
-                f"at {used_gb:.2f} / {cap_gb:.2f} GB. Run `paramem backup-prune` or raise\n"
+                f"Pre-flight: a pre-migration backup would push the backup store past its cap\n"
+                f"(store at {used_gb:.2f} / {cap_gb:.2f} GB). Run `paramem backup-prune` or raise\n"
                 f"security.backups.max_total_disk_gb before retrying.",
+                file=sys.stderr,
+            )
+        elif pre_flight_fail == "check_error":
+            print(
+                "Pre-flight could not be evaluated — the server could not measure the "
+                "backup store.\nNothing was staged. Check the server journal "
+                "(journalctl --user -u paramem-server).",
                 file=sys.stderr,
             )
         else:

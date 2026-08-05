@@ -293,8 +293,9 @@ def _partition_by_registry_tier(relations, *, procedural_enabled=True):
 class TestLockLeakGuard:
     """The entry guard raises RuntimeError when the GPU lock is NOT held.
 
-    The lock must be released (not leaked) before the raise so the process
-    can continue normally after catching the exception.
+    The guard is a read-only probe (``gpu_lock_is_held()``, which calls
+    ``_gpu_thread_lock.locked()``) — it never takes the lock itself, so
+    there is nothing for it to release and nothing it can leak.
     """
 
     def test_raises_when_lock_not_held(self, tmp_path: Path) -> None:
@@ -305,16 +306,16 @@ class TestLockLeakGuard:
         loop = _make_loop(model, tmp_path)  # empty registry — no keys, no training
 
         # Call WITHOUT holding the lock — should raise RuntimeError.
-        with pytest.raises(RuntimeError, match="_gpu_thread_lock"):
+        with pytest.raises(RuntimeError, match="requires the caller to hold"):
             loop.consolidate(mode="train")
 
-        # The lock must NOT be held after the raise (no leak).
+        # The probe never took the lock, so it is still free after the raise.
         lock_is_free = _gpu_thread_lock.acquire(blocking=False)
         if lock_is_free:
             _gpu_thread_lock.release()
         assert lock_is_free, (
-            "GPU lock is still held after consolidate raised RuntimeError — "
-            "the lock was leaked. The entry guard must release before raising."
+            "GPU lock is held after consolidate raised RuntimeError — the "
+            "read-only guard probe must never acquire the lock."
         )
 
     def test_no_raise_when_lock_held(self, tmp_path: Path) -> None:

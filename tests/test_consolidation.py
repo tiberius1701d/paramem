@@ -3479,9 +3479,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            # Simulate GPU lock already held: acquire returns False so the entry
-            # guard does NOT raise (it only raises when acquire returns True).
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             # consolidate imports train_adapter and
             # copy_adapter_weights locally; patch at the source modules.
             patch("paramem.training.trainer.train_adapter", return_value=aborted_metrics),
@@ -3506,10 +3504,6 @@ class TestAbortSkipsCommit:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
             patch("paramem.models.loader.switch_adapter"),
         ):
-            # GPU lock entry guard: acquire(blocking=False) returns False →
-            # the guard body (release + raise) is skipped.
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(AbortedDuringConsolidation):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -3573,7 +3567,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.object(
                 ConsolidationLoop, "_train_tier_adapter", side_effect=RuntimeError("boom")
             ),
@@ -3596,8 +3590,6 @@ class TestAbortSkipsCommit:
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters") as mock_unload,
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(RuntimeError, match="boom"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -3663,7 +3655,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
             patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
@@ -3688,8 +3680,6 @@ class TestAbortSkipsCommit:
                 side_effect=RuntimeError("registry rewrite exploded"),
             ),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(RuntimeError, match="registry rewrite exploded"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -3753,7 +3743,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
             patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
@@ -3787,8 +3777,6 @@ class TestAbortSkipsCommit:
                 side_effect=RuntimeError("disk write failed"),
             ),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(RuntimeError, match="disk write failed"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -3859,7 +3847,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch("paramem.training.consolidation.torch.cuda.is_available", return_value=False),
             patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
             patch.object(
@@ -3884,8 +3872,6 @@ class TestAbortSkipsCommit:
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(_DistinctiveError, match="boom"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -3948,7 +3934,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             self._mock_cuda_available_stats(),
             patch(
                 "paramem.training.consolidation.record_fold_telemetry",
@@ -3976,8 +3962,6 @@ class TestAbortSkipsCommit:
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(AbortedDuringConsolidation):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -4032,7 +4016,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             self._mock_cuda_available_stats(),
             patch(
                 "paramem.training.consolidation.record_fold_telemetry",
@@ -4065,8 +4049,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             result = loop.consolidate(mode="train", trainer=None, router=None)
 
         assert result is not None
@@ -4128,7 +4110,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             self._mock_cuda_available_stats(),
             patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
             patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
@@ -4158,8 +4140,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             loop.consolidate(mode="train", trainer=None, router=None)
 
         assert mock_telemetry.called, (
@@ -4222,7 +4202,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             self._mock_cuda_available_stats(),
             patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
             patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
@@ -4252,8 +4232,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             loop.consolidate(mode="train", trainer=None, router=None)
 
         assert mock_telemetry.called
@@ -4326,7 +4304,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4360,8 +4338,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             loop.consolidate(mode="train", trainer=None, router=None)
 
         assert mock_telemetry.called
@@ -4440,7 +4416,7 @@ class TestAbortSkipsCommit:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4481,8 +4457,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             loop.consolidate(mode="train", trainer=None, router=None)
 
         assert mock_telemetry.called
@@ -4538,7 +4512,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4572,8 +4546,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             loop.consolidate(mode="train", trainer=None, router=None)
 
         tier_train_calls = [
@@ -4633,7 +4605,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4667,8 +4639,6 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             loop.consolidate(mode="train", trainer=None, router=None)
 
         tier_train_calls = [
@@ -4731,7 +4701,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4756,8 +4726,6 @@ class TestAbortSkipsCommit:
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(RuntimeError, match="boom"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -4826,7 +4794,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4857,8 +4825,6 @@ class TestAbortSkipsCommit:
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(_OriginalTrainingError, match="original training failure"):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -4918,7 +4884,7 @@ class TestAbortSkipsCommit:
         from paramem.graph.reconstruct import ReconstructionResult
 
         with (
-            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
             patch.multiple(
                 "paramem.training.consolidation.torch.cuda",
                 is_available=MagicMock(return_value=False),
@@ -4945,8 +4911,6 @@ class TestAbortSkipsCommit:
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
-            mock_lock.acquire.return_value = False
-
             with pytest.raises(AbortedDuringConsolidation):
                 loop.consolidate(mode="train", trainer=None, router=None)
 
@@ -18872,11 +18836,11 @@ class TestConsolidateEntry:
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
 
-        with pytest.raises(RuntimeError, match="_gpu_thread_lock"):
+        with pytest.raises(RuntimeError, match="requires the caller to hold"):
             loop.consolidate(mode="train")
 
         assert not _gpu_thread_lock.locked(), (
-            "the entry guard must release the lock it probed before raising"
+            "the entry guard (a read-only .locked() probe) must never take the lock"
         )
 
 

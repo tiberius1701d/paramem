@@ -58,6 +58,8 @@ def _make_state(tmp_path: Path) -> dict:
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
     config.paths.data = tmp_path / "data"
     config.paths.data.mkdir(parents=True, exist_ok=True)
+    config.security.backups.max_total_disk_gb = 20.0
+    config.paths.key_metadata = tmp_path / "data" / "registry" / "key_metadata.json"
     return {
         "model": None,
         "config": config,

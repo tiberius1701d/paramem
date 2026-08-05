@@ -104,7 +104,8 @@ def _seed_config_slot(backups_root: Path, slot_name: str = "20260421-040000") ->
         ArtifactKind.CONFIG,
         b"model: mistral\n",
         meta_fields={"tier": "daily"},
-        base_dir=config_dir,
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
     )
     return slot_dir
 
@@ -144,13 +145,15 @@ class TestListMixedKindsNewestFirst:
             ArtifactKind.CONFIG,
             b"config_data",
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         _slot2 = backup_write(
             ArtifactKind.REGISTRY,
             b"registry_data",
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "registry",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
 
         state = _make_state(tmp_path, config)
@@ -185,13 +188,15 @@ class TestListFilteredByKind:
             ArtifactKind.CONFIG,
             b"config_data",
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_write(
             ArtifactKind.REGISTRY,
             b"registry_data",
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "registry",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
 
         state = _make_state(tmp_path, config)
@@ -397,7 +402,8 @@ class TestRestoreHappyPathConfig:
             ArtifactKind.CONFIG,
             backup_content,
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_id = slot_dir.name
 
@@ -421,6 +427,43 @@ class TestRestoreHappyPathConfig:
         # Recovery banner must be appended.
         recovery = state["migration"]["recovery_required"]
         assert any("backup" in msg.lower() for msg in recovery)
+
+
+class TestRestoreConfigSafetySlotExemptFromDiskCap:
+    def test_restore_config_writes_safety_slot_when_store_over_cap(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The config-branch safety slot is written even when the store is
+        already over the configured cap — it is the undo anchor for a config
+        restore, exempt from the cap by owner ruling.  A future edit that
+        starts passing a real ``backups_cfg`` at this call site would turn
+        this into a 500 ``config_restore_failed``, so this test fails loudly.
+        """
+        # A cap tiny enough that the seeded backup slot alone exceeds it.
+        config = _make_config(tmp_path, max_total_disk_gb=1e-9)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        backup_content = b"model: gemma\n"
+        slot_dir = backup_write(
+            ArtifactKind.CONFIG,
+            backup_content,
+            meta_fields={"tier": "daily"},
+            backups_root=backups_root,
+            backups_cfg=None,  # seed the store without gating the seed itself
+        )
+        backup_id = slot_dir.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "config" in body["restored"]
+        assert "config" in body["backed_up_pre_restore"], (
+            "the safety slot must still be written when the store is over cap"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +490,8 @@ class TestRestoreUnbootableConfigReturns400:
             ArtifactKind.CONFIG,
             unbootable_content,
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_id = slot_dir.name
 
@@ -479,7 +523,8 @@ class TestRestoreUnbootableConfigReturns400:
             ArtifactKind.CONFIG,
             backup_content,
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_id = slot_dir.name
 
@@ -525,7 +570,8 @@ class TestRestoreNonConfigKindReturns400:
             ArtifactKind.GRAPH,
             b'{"nodes": []}',
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "graph",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_id = slot_dir.name
 
@@ -629,7 +675,8 @@ class TestRestoreEncryptedWrongKeyReturns500:
             ArtifactKind.CONFIG,
             b"model: mistral\n",
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "config",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_id = slot_dir.name
 
@@ -691,7 +738,8 @@ class TestPruneHappyPath:
                 ArtifactKind.CONFIG,
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
-                base_dir=backups_root / "config",
+                backups_root=backups_root,
+                backups_cfg=ServerBackupsConfig(),
             )
             _slots.append(s)
 
@@ -731,7 +779,8 @@ class TestPruneDryRun:
                 ArtifactKind.CONFIG,
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
-                base_dir=backups_root / "config",
+                backups_root=backups_root,
+                backups_cfg=ServerBackupsConfig(),
             )
 
         state = _make_state(tmp_path, config)
@@ -774,7 +823,8 @@ def _setup_age_slot_for_endpoint_test(
         ArtifactKind.CONFIG,
         b"model: mistral\n",
         meta_fields={"tier": "daily"},
-        base_dir=backups_root / "config",
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
     )
     return slot_dir, key_path, ident
 
@@ -959,7 +1009,8 @@ def _make_bundle_slot(backups_root: Path, adapter_dirs: dict, config_path, regis
         config_path=config_path,
         registry_path=registry_path,
         adapter_dirs=adapter_dirs,
-        base_dir=bundle_base,
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
         meta_fields={"tier": "manual", "label": "test_bundle"},
         adapter_scope="live",
     )
@@ -1248,7 +1299,8 @@ class TestRestoreSnapshotBundleCorrupt:
             ArtifactKind.GRAPH,
             b'{"nodes": []}',
             meta_fields={"tier": "daily"},
-            base_dir=backups_root / "graph",
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
         backup_id = slot_dir.name
 

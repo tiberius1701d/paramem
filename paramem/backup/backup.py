@@ -37,6 +37,7 @@ import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from paramem.backup.age_envelope import AGE_MAGIC
 from paramem.backup.atomic import rename_pending_to_slot
@@ -58,12 +59,16 @@ from paramem.backup.types import (
     BackupError,
     BundleManifest,
     BundleManifestError,
+    DiskCapExceeded,
     FingerprintMismatchError,
     PruneReport,
     RestoreAbortedError,
     RestoreResult,
     RetentionPolicy,
 )
+
+if TYPE_CHECKING:
+    from paramem.server.config import ServerBackupsConfig
 
 # iter_interim_dirs is imported at module level (no cycle: interim_adapter
 # does not import from paramem.backup.backup).
@@ -263,6 +268,37 @@ def _promote_slot(base_dir: Path) -> tuple[Path, str]:
 
 
 # ---------------------------------------------------------------------------
+# _enforce_disk_cap() — shared by write() and write_bundle()
+# ---------------------------------------------------------------------------
+
+
+def _enforce_disk_cap(backups_root: Path, backups_cfg: "ServerBackupsConfig") -> None:
+    """Refuse the write when the backup store has reached its global cap.
+
+    Rule 1 of the retention precedence (see paramem/backup/retention.py's module
+    docstring): the cap is enforced at the write door, never by ``prune()``.
+
+    Measured with ``bypass_cache=True`` — a write decision must not act on a
+    5-second-stale scan.
+
+    Raises
+    ------
+    DiskCapExceeded
+        ``usage.total_bytes >= usage.cap_bytes`` — nothing was written.
+    """
+    from paramem.backup.retention import compute_disk_usage
+
+    usage = compute_disk_usage(backups_root, backups_cfg, bypass_cache=True)
+    if usage.total_bytes >= usage.cap_bytes:
+        raise DiskCapExceeded(
+            f"disk_pressure: max_total_disk_gb reached "
+            f"(used {usage.total_bytes / 1024**3:.2f} of "
+            f"{backups_cfg.max_total_disk_gb} GB) — run `paramem backup-prune` "
+            f"or raise security.backups.max_total_disk_gb"
+        )
+
+
+# ---------------------------------------------------------------------------
 # write()
 # ---------------------------------------------------------------------------
 
@@ -272,18 +308,21 @@ def write(
     source: bytes | Path,
     meta_fields: dict,
     *,
-    base_dir: Path,
+    backups_root: Path,
+    backups_cfg: "ServerBackupsConfig | None",
 ) -> Path:
     """Write an artifact + sidecar into a new timestamped slot directory.
 
     Sequence (crash-safe):
     1. Determine whether the daily age identity is loadable.
-    2. Create ``.pending/<ts>/`` inside *base_dir* via ``_promote_slot``.
+    2. Create ``.pending/<ts>/`` inside ``<backups_root>/<kind>/`` via
+       ``_promote_slot``.
     3. Write artifact file (ciphertext or plaintext) inside pending.
     4. Compute content hash of the on-disk bytes.
     5. Write ``.meta.json`` sidecar inside pending.
     6. ``fsync`` the artifact file, sidecar, and the pending directory entry.
-    7. ``os.rename(.pending/<ts>/, <base_dir>/<ts>/)`` — atomic promotion.
+    7. ``os.rename(.pending/<ts>/, <backups_root>/<kind>/<ts>/)`` — atomic
+       promotion.
 
     A crash at any step leaves either no slot (steps 2–6) or a ``.pending/``
     residue (step 7 incomplete) that ``sweep_orphan_pending`` removes on
@@ -299,23 +338,45 @@ def write(
     meta_fields:
         Caller-supplied metadata.  Required keys: ``"tier"`` (str).  Optional:
         ``"label"`` (str | None), any future kind-specific extension fields.
-    base_dir:
-        Per-kind backup directory (e.g. ``data/ha/backups/config/``).
-        Created with parents if absent.
+    backups_root:
+        Root of the backup store (e.g. ``data/ha/backups/``).  The per-kind
+        directory (``<backups_root>/<kind.value>/``) is derived internally and
+        created with parents if absent.
+    backups_cfg:
+        The live ``security.backups`` config, used to enforce the global disk
+        cap before anything is written.  Production derivation:
+        ``server_config.security.backups`` at every gated door (scheduled
+        runner, ``/backup/create``, pre-migration and pre-base-swap).  ``None``
+        means **this write is exempt from the cap** — an undo anchor, which the
+        owner ruled must never be blocked by a housekeeping quota.  Exempt
+        sites are enumerated in this docstring and nowhere else: for
+        ``write_bundle`` it is the pre-restore safety bundle inside
+        :func:`restore_bundle`; for ``write`` it is the ``/backup/restore``
+        config-branch safety slot and the ``/migration/rollback`` pre-mortem.
+        There is no default: every caller states its posture explicitly, and
+        ``grep -rn "backups_cfg=None" paramem/`` is the exemption registry
+        (exactly three lines).
 
     Returns
     -------
     Path
-        The promoted slot directory (``<base_dir>/<ts>/``).
+        The promoted slot directory (``<backups_root>/<kind>/<ts>/``).
 
     Raises
     ------
+    DiskCapExceeded
+        The store is at/over ``backups_cfg.max_total_disk_gb``; nothing was
+        written.  Never raised when ``backups_cfg`` is ``None``.
     BackupError
         If a unique pending slot could not be allocated after 10 collision
         retries (pathological — frozen clock or extreme write rate).
     OSError
         On any filesystem error.
     """
+    if backups_cfg is not None:
+        _enforce_disk_cap(Path(backups_root), backups_cfg)
+    base_dir = Path(backups_root) / kind.value
+
     # --- resolve payload bytes ---
     payload: bytes = source if isinstance(source, bytes) else Path(source).read_bytes()
 
@@ -334,7 +395,7 @@ def write(
 
     # --- allocate pending slot (with collision retry) ---
     encrypted_flag = do_encrypt
-    pending_slot, timestamp = _promote_slot(Path(base_dir))
+    pending_slot, timestamp = _promote_slot(base_dir)
 
     artifact_filename = _artifact_filename(kind, timestamp, encrypted_flag)
 
@@ -371,16 +432,16 @@ def write(
         os.close(dir_fd)
 
     # --- atomic promotion ---
-    base_dir = Path(base_dir)
     slot_dir = base_dir / timestamp
     rename_pending_to_slot(pending_slot, slot_dir)
 
     # --- fsync parent directories for rename durability (power-loss safety) ---
     # On Linux/ext4 the rename is atomic for ordering, but the directory entry
     # is not guaranteed durable across power loss until the parent inode is
-    # fsynced.  We fsync both the immediate parent (kind directory) and base_dir
-    # in case base_dir/kind/ was freshly created during this write.
-    for parent in (slot_dir.parent, base_dir):
+    # fsynced.  We fsync both the kind directory (slot_dir.parent) and the
+    # store root, in case the kind directory was freshly created during this
+    # write.
+    for parent in (slot_dir.parent, Path(backups_root)):
         _fsync_dir(parent)
 
     logger.debug(
@@ -565,12 +626,16 @@ def _copy_artifact(
     }
 
 
+_BUNDLE_DIR_NAME = "snapshot"  # bundles share the kind dir with per-file session snapshots
+
+
 def write_bundle(
     *,
     config_path: Path,
     registry_path: Path,
     adapter_dirs: dict[str, Path],
-    base_dir: Path,
+    backups_root: Path,
+    backups_cfg: "ServerBackupsConfig | None",
     meta_fields: dict,
     adapter_scope: str = "live",
     live_registry_sha256: str = "",
@@ -640,9 +705,24 @@ def write_bundle(
         each directory using ``live_registry_sha256``.  The adapter-base dir
         (parent of the episodic dir) is derived from the episodic entry to
         discover interim families via ``iter_interim_dirs``.
-    base_dir:
-        Bundle-kind backup directory (e.g. ``data/ha/backups/snapshot/``).
-        Created with parents if absent.
+    backups_root:
+        Root of the backup store (e.g. ``data/ha/backups/``).  The bundle-kind
+        directory (``<backups_root>/snapshot/``) is derived internally and
+        created with parents if absent.
+    backups_cfg:
+        The live ``security.backups`` config, used to enforce the global disk
+        cap before anything is written.  Production derivation:
+        ``server_config.security.backups`` at every gated door (scheduled
+        runner, ``/backup/create``, pre-migration and pre-base-swap).  ``None``
+        means **this write is exempt from the cap** — an undo anchor, which the
+        owner ruled must never be blocked by a housekeeping quota.  Exempt
+        sites are enumerated in this docstring and nowhere else: for
+        ``write_bundle`` it is the pre-restore safety bundle inside
+        :func:`restore_bundle`; for ``write`` it is the ``/backup/restore``
+        config-branch safety slot and the ``/migration/rollback`` pre-mortem.
+        There is no default: every caller states its posture explicitly, and
+        ``grep -rn "backups_cfg=None" paramem/`` is the exemption registry
+        (exactly three lines).
     meta_fields:
         Caller-supplied metadata dict.  Required key: ``"tier"`` (str).
         Optional: ``"label"`` (str | None).
@@ -680,10 +760,13 @@ def write_bundle(
     Returns
     -------
     Path
-        The promoted bundle slot directory (``<base_dir>/<ts>/``).
+        The promoted bundle slot directory (``<backups_root>/snapshot/<ts>/``).
 
     Raises
     ------
+    DiskCapExceeded
+        The store is at/over ``backups_cfg.max_total_disk_gb``; nothing was
+        written.  Never raised when ``backups_cfg`` is ``None``.
     BackupError
         If the chosen ``adapter_scope`` resolves no weight slot for the primary
         ``episodic`` recall.  For ``adapter_scope="main"`` this happens when
@@ -705,7 +788,9 @@ def write_bundle(
     # documents the intent so future refactors don't move the import without review.
     from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
 
-    base_dir = Path(base_dir)
+    if backups_cfg is not None:
+        _enforce_disk_cap(Path(backups_root), backups_cfg)
+    base_dir = Path(backups_root) / _BUNDLE_DIR_NAME
     tier = meta_fields.get("tier", "manual")
     label = meta_fields.get("label")
 
@@ -1002,7 +1087,9 @@ def write_bundle(
     rename_pending_to_slot(pending_slot, slot_dir)
 
     # --- fsync parent directories for rename durability ---
-    for parent in (slot_dir.parent, base_dir):
+    # Fsync the kind directory (slot_dir.parent) and the store root, in case
+    # the kind directory was freshly created during this write.
+    for parent in (slot_dir.parent, Path(backups_root)):
         _fsync_dir(parent)
 
     logger.debug(
@@ -1302,7 +1389,9 @@ def restore_bundle(
        ``"manual"``, label ``"pre_restore_safety_<bundle_id>"``).  Skipped
        gracefully (``safety_slot=None``) when the live store has no episodic
        slot (fresh/empty target): a ``BackupError`` from the safety write is
-       caught, logged, and restore continues.  All other errors abort.
+       caught, logged, and restore continues.  All other errors abort.  This
+       write passes ``backups_cfg=None`` — the safety bundle is deliberately
+       exempt from the global disk cap so a recovery is never blocked by it.
     5. **Atomic restore** (adapter slots written; registry written LAST):
 
        - For each adapter in ``manifest.adapters``: create a fresh slot dir
@@ -1471,7 +1560,8 @@ def restore_bundle(
                 config_path=live_config_path_for_safety,
                 registry_path=live_registry_path,
                 adapter_dirs=safety_adapter_dirs,
-                base_dir=data_dir / "backups" / "snapshot",
+                backups_root=data_dir / "backups",
+                backups_cfg=None,  # undo anchor — exempt from the disk cap
                 meta_fields={"tier": "manual", "label": safety_label},
                 speaker_profiles_path=(
                     live_speaker_profiles if live_speaker_profiles.exists() else None

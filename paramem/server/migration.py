@@ -56,7 +56,7 @@ from paramem.adapters.manifest import (
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
 from paramem.config.classification import Tier, classify, walk_dict_leaves
-from paramem.server.config import ServerConfig, build_server_config
+from paramem.server.config import ServerBackupsConfig, ServerConfig, build_server_config
 
 logger = logging.getLogger(__name__)
 
@@ -1002,7 +1002,9 @@ def promote_config(
         os.close(dir_fd)
 
 
-def backup_live_config(live_config_path: Path, backups_root: Path) -> tuple[str, Path]:
+def backup_live_config(
+    live_config_path: Path, backups_root: Path, backups_cfg: ServerBackupsConfig
+) -> tuple[str, Path]:
     """Write the ``pre_migration`` backup slot for the live config.
 
     Config is the only required pre-migration artifact: a migration's sole live
@@ -1017,6 +1019,12 @@ def backup_live_config(live_config_path: Path, backups_root: Path) -> tuple[str,
         pre-hash and an empty artifact (fresh install).
     backups_root:
         Backups root directory; the slot is written under ``<backups_root>/config``.
+    backups_cfg:
+        The live ``security.backups`` config.  Non-optional on purpose: the
+        pre-migration backup is a gated door (a forward change the operator
+        chose, preceded by ``/migration/preview``'s disk-pressure warning), so
+        this helper cannot be handed the exempt (``None``) form even by
+        accident.  Production derivation: ``_state["config"].security.backups``.
 
     Returns
     -------
@@ -1026,6 +1034,10 @@ def backup_live_config(live_config_path: Path, backups_root: Path) -> tuple[str,
 
     Raises
     ------
+    DiskCapExceeded
+        The backup store is at/over ``backups_cfg.max_total_disk_gb``; no
+        mutation has happened yet.  Both callers already map any
+        ``backup_write`` failure to ``500 backup_write_failed``.
     OSError
         The backup write failed.  The caller must map this to
         ``500 backup_write_failed``; no other mutation has happened yet.
@@ -1039,7 +1051,8 @@ def backup_live_config(live_config_path: Path, backups_root: Path) -> tuple[str,
         ArtifactKind.CONFIG,
         config_bytes,
         meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_hash},
-        base_dir=Path(backups_root) / "config",
+        backups_root=Path(backups_root),
+        backups_cfg=backups_cfg,
     )
     return pre_hash, slot
 

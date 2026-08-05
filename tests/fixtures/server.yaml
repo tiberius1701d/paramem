@@ -761,7 +761,10 @@ vram:
 # slot directory under data/ha/backups/<artifact>/<ts>/.
 #
 # max_total_disk_gb: global cap. The retention engine enforces rules 2+3+4+5
-# against this; the runner enforces rule 1 (write refusal at 100%).
+# against this; rule 1 (write refusal once the store is at/over cap) is
+# enforced at the write doors themselves. Undo-anchor writes (restore safety
+# slots, migration-rollback pre-mortem backups) are exempt from rule 1 by
+# design. Must be > 0 — a non-positive value is a config error at boot.
 #
 # Defaults shown below. Uncomment to override.
 # security:

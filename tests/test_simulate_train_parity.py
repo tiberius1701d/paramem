@@ -3313,11 +3313,11 @@ class TestFoldHydratesAPartiallyPreloadedStore:
             store_probe_calls.append(dict(keys_by_adapter))
             return _orig_store_probe(self_inner, keys_by_adapter, **kwargs)
 
-        # The consolidate(mode="train") entry guard requires the caller to hold
-        # _gpu_thread_lock; a mock whose acquire() reports False satisfies it
+        # The consolidate(mode="train") entry guard calls gpu_lock_is_held(),
+        # which reads _gpu_thread_lock.locked(); a bare MagicMock's locked()
+        # already returns a truthy MagicMock, which satisfies it
         # (patch.object cannot patch a C-level threading.Lock attribute).
         _mock_lock = MagicMock()
-        _mock_lock.acquire.return_value = False
         patches = _patches_for_train_mode()
         with (
             patch("paramem.server.gpu_lock._gpu_thread_lock", _mock_lock),

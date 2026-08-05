@@ -1,5 +1,6 @@
 """Unit tests for cloud agent adapters (no API calls — mocked)."""
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -180,6 +181,38 @@ class TestOpenAICompatAdapter:
         resp = agent.call("test")
         assert "couldn't reach" in resp.text
 
+    @patch("paramem.cloud.providers.openai_compat.httpx.Client")
+    def test_call_http_error_logs_response_body(self, mock_client_cls, caplog):
+        """The provider HTTP error body (where a 400 like Groq's
+        tool_choice/tool_use_failed rejection explains itself) must reach
+        the log, not just the status code."""
+        import httpx
+
+        error_body = (
+            '{"error": {"message": "Tool choice is none, but model called '
+            'a tool", "code": "tool_use_failed"}}'
+        )
+        response = httpx.Response(
+            400,
+            text=error_body,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        )
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = response
+        mock_client_cls.return_value = mock_client
+
+        agent = OpenAICompatAgent(self._make_config())
+        with caplog.at_level(logging.ERROR, logger="paramem.cloud.providers.openai_compat"):
+            resp = agent.call("What's the weather?")
+
+        assert "couldn't get an answer" in resp.text
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "400" in errors[0].getMessage()
+        assert "tool_use_failed" in errors[0].getMessage()
+
     def test_default_endpoint_openai(self):
         agent = OpenAICompatAgent(self._make_config(provider="openai", endpoint=""))
         assert "openai.com" in agent._endpoint
@@ -193,6 +226,44 @@ class TestOpenAICompatAdapter:
             self._make_config(endpoint="http://localhost:11434/v1/chat/completions")
         )
         assert "localhost" in agent._endpoint
+
+
+class TestAnthropicAdapter:
+    def _make_config(self, **kwargs):
+        defaults = {"provider": "anthropic", "model": "claude-sonnet", "api_key": "sk-test"}
+        defaults.update(kwargs)
+        return CloudAgentConfig(**defaults)
+
+    def test_call_api_status_error_logs_response_body(self, caplog):
+        """``APIStatusError.message`` already carries "Error code: {status} -
+        {body}" (verified against the installed anthropic SDK); the log line
+        must surface it, not just the bare status code."""
+        anthropic = pytest.importorskip("anthropic")
+        import httpx
+
+        from paramem.cloud.providers.anthropic_adapter import AnthropicAgent
+
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request)
+        body = {
+            "error": {
+                "message": "Tool choice is none, but model called a tool",
+                "code": "tool_use_failed",
+            }
+        }
+        error = anthropic.APIStatusError(f"Error code: 400 - {body}", response=response, body=body)
+
+        agent = AnthropicAgent(self._make_config())
+        agent._client.messages.create = MagicMock(side_effect=error)
+
+        with caplog.at_level(logging.ERROR, logger="paramem.cloud.providers.anthropic_adapter"):
+            resp = agent.call("What's the weather?")
+
+        assert "couldn't get an answer" in resp.text
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "400" in errors[0].getMessage()
+        assert "tool_use_failed" in errors[0].getMessage()
 
 
 class TestRegistry:
@@ -495,6 +566,102 @@ class TestPrivacyRouting:
         # HA was attempted first and returned None
         ha_client.conversation_process.assert_called_once()
         # cloud agent called as fallback
+        cloud_agent.call.assert_called_once()
+        assert result.escalated is True
+        assert result.text == "cloud answer"
+
+    def test_ha_error_response_falls_through_to_cloud(self, monkeypatch):
+        """A non-routine HA conversation-agent error (the class the
+        structured-error gate in ``HAClient.conversation_process``
+        classifies as a failure) surfaces as ``None`` through the *real*
+        transport, so ``handle_chat``'s existing fallback chain proceeds
+        to cloud. Drives ``HAClient`` end-to-end with a fake WebSocket
+        transport rather than a mock — a MagicMock'd ``conversation_process``
+        would execute none of the gate's classification logic. The gate's
+        own branch coverage lives in test_ha_client_conversation.py; this
+        test only proves handle_chat wires the real client's failure signal
+        through to the cloud fallback."""
+        import json
+
+        from paramem.server.inference import handle_chat
+        from paramem.server.tools.ha_client import HAClient
+
+        cloud_agent = self._make_mock_cloud_agent()
+        router = self._make_mock_router(known_entities=["Jordan"])
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        tokenizer = MagicMock()
+
+        config = MagicMock()
+        config.voice.load_prompt.return_value = "You are a helper."
+        # agent_id is JSON-serialized into the WS service call payload — must
+        # be a real string, not a MagicMock attribute.
+        config.ha_agent_id = "conversation.groq"
+
+        # A non-routine error envelope: response_type == "error" with an
+        # unrecognized code — the motivating incident's class, where the
+        # agent itself failed rather than reporting a semantic no-match.
+        error_envelope = {
+            "success": True,
+            "result": {
+                "response": {
+                    "response": {
+                        "response_type": "error",
+                        "data": {"code": "unknown"},
+                        "speech": {
+                            "plain": {
+                                "speech": (
+                                    "Sorry, I had a problem talking to OpenAI: "
+                                    "Error code: 400 - ..."
+                                )
+                            }
+                        },
+                    }
+                }
+            },
+        }
+        messages = [
+            json.dumps({"type": "auth_required"}),
+            json.dumps({"type": "auth_ok"}),
+            json.dumps(error_envelope),
+        ]
+
+        class _FakeWS:
+            """Scripted WebSocket transport replaying the handshake plus
+            the error envelope above. Same shape as the fake transport in
+            test_ha_client_conversation.py."""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def recv(self, timeout=None):
+                return messages.pop(0)
+
+            def send(self, payload):
+                pass
+
+        monkeypatch.setattr("websockets.sync.client.connect", lambda *a, **kw: _FakeWS())
+        ha_client = HAClient(url="http://ha.local:8123", token="test-token")
+
+        result = handle_chat(
+            text="What time is it good for a walk today?",
+            conversation_id="test",
+            speaker=None,
+            speaker_id="spk-test",
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            router=router,
+            ha_client=ha_client,
+            cloud_agent=cloud_agent,
+            memory_store=_MS(replay_enabled=False),
+        )
+
         cloud_agent.call.assert_called_once()
         assert result.escalated is True
         assert result.text == "cloud answer"

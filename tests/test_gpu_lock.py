@@ -12,6 +12,7 @@ import torch
 from paramem.server.gpu_lock import (
     acquire_gpu,
     gpu_lock,
+    gpu_lock_is_held,
     gpu_lock_released,
     gpu_lock_sync,
     release_gpu,
@@ -166,6 +167,48 @@ def _acquire_with_timeout(timeout: float) -> bool:
     from paramem.server.gpu_lock import _gpu_thread_lock
 
     return _gpu_thread_lock.acquire(timeout=timeout)
+
+
+class TestGpuLockIsHeld:
+    """gpu_lock_is_held() is a read-only probe — it never takes the lock."""
+
+    def test_false_when_free(self):
+        assert gpu_lock_is_held() is False
+
+    def test_true_when_held(self):
+        acquire_gpu()
+        try:
+            assert gpu_lock_is_held() is True
+        finally:
+            release_gpu()
+
+    def test_does_not_take_the_lock(self):
+        """Calling the probe must not itself acquire the lock — a real
+        acquirer must still succeed immediately afterward."""
+        assert gpu_lock_is_held() is False
+        # If the probe had leaked an acquire, this would time out.
+        with gpu_lock_sync(timeout=0.1):
+            pass
+
+    def test_reflects_held_state_from_another_thread(self):
+        holder_ready = threading.Event()
+        release_now = threading.Event()
+
+        def _hold():
+            acquire_gpu()
+            holder_ready.set()
+            release_now.wait(timeout=2.0)
+            release_gpu()
+
+        t = threading.Thread(target=_hold, daemon=True)
+        t.start()
+        try:
+            assert holder_ready.wait(timeout=2.0)
+            assert gpu_lock_is_held() is True
+        finally:
+            release_now.set()
+            t.join(timeout=2.0)
+        assert gpu_lock_is_held() is False
 
 
 class TestDevicePlacement:

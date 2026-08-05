@@ -239,7 +239,7 @@ class ServerBackupsConfig:
     # installations should set artifacts: ["snapshot_bundle"] (or rely on the runner
     # default when kinds are not explicitly configured in server.yaml).
     artifacts: list[str] = field(default_factory=lambda: ["config", "graph", "registry"])
-    max_total_disk_gb: float = 20.0  # global cap; writes refused when usage reaches this
+    max_total_disk_gb: float = 20.0  # global cap (> 0); writes are refused at/over this
     adapter_scope: str = "live"
     """Controls which adapter slots are captured by ``write_bundle()``.
 
@@ -259,6 +259,17 @@ class ServerBackupsConfig:
     """
 
     def __post_init__(self) -> None:
+        if self.max_total_disk_gb <= 0:
+            raise ValueError(
+                f"security.backups.max_total_disk_gb must be > 0; "
+                f"got {self.max_total_disk_gb!r}. Non-positive values are always "
+                f"misconfiguration (0 or negative disk space is never a working "
+                f"cap) and are rejected here. Sub-byte positive values (e.g. "
+                f"1e-9) remain legal and expressible — they yield a cap_bytes of "
+                f"0 at the write door like any other exhausted cap, which is how "
+                f"tests pin the zero-cap-bytes branches. To stop taking backups "
+                f"use security.backups.schedule: 'off'."
+            )
         valid_scopes = {"live", "main"}
         if self.adapter_scope not in valid_scopes:
             raise ValueError(

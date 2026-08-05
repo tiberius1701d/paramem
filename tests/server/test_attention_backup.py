@@ -12,8 +12,12 @@ Tests cover:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from paramem.server.attention import _collect_backup_items
 from paramem.server.config import (
@@ -323,9 +327,12 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
 
         This is the exact condition observed in scenario 2 of the 2026-04-22 E2E
         baseline test: max_total_disk_gb=0 configured, 2 backup slots on disk
-        totalling 57141 bytes.
+        totalling 57141 bytes.  ``max_total_disk_gb`` must be strictly positive
+        (``ServerBackupsConfig.__post_init__``), so this uses a sub-byte
+        positive cap (``1e-12``) that still yields ``cap_bytes == 0`` —
+        the same guard-covering condition as a literal ``0.0``.
         """
-        config = _make_config(tmp_path, max_total_disk_gb=0.0)
+        config = _make_config(tmp_path, max_total_disk_gb=1e-12)
 
         backups_root = config.paths.data / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -355,8 +362,10 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
         """disk_cap_bytes=0, disk_used_bytes=0 → no disk pressure alert.
 
         cap=0 with zero usage is the empty-store case; it should not fire.
+        ``1e-12`` still yields ``cap_bytes == 0`` (see the previous test);
+        ``0.0`` itself is now rejected by ``ServerBackupsConfig.__post_init__``.
         """
-        config = _make_config(tmp_path, max_total_disk_gb=0.0)
+        config = _make_config(tmp_path, max_total_disk_gb=1e-12)
         # No backup slots on disk → disk_used=0.
         (config.paths.data / "backups").mkdir(parents=True, exist_ok=True)
 
@@ -366,3 +375,30 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
         assert pressure_items == [], (
             "cap=0 with zero disk usage must not emit a disk pressure alert."
         )
+
+
+# ---------------------------------------------------------------------------
+# Disk-usage scan failure: no crash, no silent skip — logged
+# ---------------------------------------------------------------------------
+
+
+class TestBackupItemsScanFailureLogged:
+    def test_disk_usage_scan_failure_skips_pressure_row_and_logs(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """compute_disk_usage raising → no backup_disk_pressure row, no crash,
+        and the scan failure is logged (the `_collect_backup_items` disk-usage
+        scan's twin of this same logging behaviour)."""
+        config = _make_config(tmp_path)
+
+        with (
+            caplog.at_level(logging.ERROR, logger="paramem.server.attention"),
+            patch(
+                "paramem.backup.retention.compute_disk_usage",
+                side_effect=OSError("scan failed"),
+            ),
+        ):
+            items = _collect_backup_items({}, config)
+
+        assert [i for i in items if i.kind == "backup_disk_pressure"] == []
+        assert any(r.exc_info is not None for r in caplog.records)

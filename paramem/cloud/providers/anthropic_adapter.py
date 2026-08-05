@@ -62,7 +62,9 @@ class AnthropicAgent(CloudAgent):
             logger.error("Anthropic agent timed out")
             return CloudResponse(text="I couldn't reach the cloud service in time.")
         except anthropic.APIStatusError as e:
-            logger.error("Anthropic agent API error: %s", e.status_code)
+            # e.message already begins "Error code: {status} - ..." — log it
+            # alone rather than prefixing the status again.
+            logger.error("Anthropic agent API error: %s", e.message[:500])
             return CloudResponse(text="I couldn't get an answer from the cloud service.")
         except anthropic.APIConnectionError as e:
             logger.error("Anthropic agent connection error: %s", e)

@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -38,6 +39,7 @@ from paramem.backup.types import (
     RestoreAbortedError,
     RestoreResult,
 )
+from paramem.server.config import ServerBackupsConfig
 
 _AGE_MAGIC = b"age-encryption.org/v1\n"
 
@@ -239,7 +241,8 @@ def _build_bundle(tmp_path: Path) -> tuple[Path, dict]:
         config_path=src_dict["config_path"],
         registry_path=src_dict["registry_path"],
         adapter_dirs=src_dict["adapter_dirs"],
-        base_dir=src_dict["bundle_base"],
+        backups_root=src_dict["bundle_base"].parent,
+        backups_cfg=ServerBackupsConfig(),
         meta_fields={"tier": "manual", "label": "test"},
         adapter_scope="live",
         speaker_profiles_path=src_dict["speaker_profiles_path"],
@@ -644,6 +647,35 @@ class TestSafetyBundle:
         new_slots = slots_after - slots_before
         assert len(new_slots) >= 1, "At least one new safety bundle slot must have been created"
 
+    def test_safety_bundle_written_when_store_already_over_cap(self, tmp_path) -> None:
+        """The safety bundle is written without ever consulting the disk cap
+        — it is the undo anchor, exempt from the cap by owner ruling.
+        ``restore_bundle`` takes no cap parameter at all (there is nothing to
+        seed "over cap" against), so the exemption is locked at the
+        mechanism level instead: the safety-bundle write's internal
+        ``write_bundle`` call passes ``backups_cfg=None``, which must keep
+        ``_enforce_disk_cap`` uncalled.  A later refactor that starts passing
+        a real ``backups_cfg`` at that call site would make this assertion
+        fail immediately.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # First restore: populates scratch with an episodic interim slot.
+        restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # Second restore: must take a safety bundle and complete without the
+        # disk-cap check ever running.
+        with patch("paramem.backup.backup._enforce_disk_cap") as mock_enforce_disk_cap:
+            result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        mock_enforce_disk_cap.assert_not_called()
+        assert result.safety_slot is not None
+        assert result.safety_slot.is_dir()
+
     def test_safety_bundle_skipped_gracefully_when_empty_target(self, tmp_path) -> None:
         """Safety bundle is skipped gracefully (safety_slot=None) on fresh empty target.
 
@@ -999,7 +1031,8 @@ class TestEncryptedRoundTrip:
             config_path=src["config_path"],
             registry_path=src["registry_path"],
             adapter_dirs=src["adapter_dirs"],
-            base_dir=src["bundle_base"],
+            backups_root=src["bundle_base"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual", "label": "enc-test"},
             adapter_scope="live",
             speaker_profiles_path=src["speaker_profiles_path"],
@@ -1150,7 +1183,8 @@ class TestCandidateSidecarPreservedNotRestored:
             config_path=src_dict["config_path"],
             registry_path=src_dict["registry_path"],
             adapter_dirs=src_dict["adapter_dirs"],
-            base_dir=src_dict["bundle_base"],
+            backups_root=src_dict["bundle_base"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "pre_base_swap", "label": "test_candidate"},
             adapter_scope="live",
             speaker_profiles_path=src_dict["speaker_profiles_path"],
@@ -1470,7 +1504,8 @@ class TestOrphanInterimPruning:
             config_path=config_path_src,
             registry_path=registry_path_src,
             adapter_dirs={"episodic": ep_dir},
-            base_dir=bundle_base,
+            backups_root=bundle_base.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual", "label": "ep-only-test"},
             adapter_scope="live",
             speaker_profiles_path=speaker_profiles_src,
@@ -1765,7 +1800,8 @@ class TestOrphanInterimPruning:
             config_path=config_path_src,
             registry_path=registry_path_src,
             adapter_dirs={"episodic": ep_dir, "procedural": proc_dir},
-            base_dir=bundle_base,
+            backups_root=bundle_base.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual", "label": "combined-test"},
             adapter_scope="live",
             speaker_profiles_path=speaker_profiles_src,

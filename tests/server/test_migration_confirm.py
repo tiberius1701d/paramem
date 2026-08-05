@@ -235,6 +235,31 @@ class TestConfirmStepFailures:
         # State must still be STAGING.
         assert state["migration"]["state"] == "STAGING"
 
+    def test_confirm_step2_disk_cap_refusal_rollback(self, client, state, tmp_path, monkeypatch):
+        """backup_live_config raising DiskCapExceeded → 500 backup_write_failed.
+
+        The pre-migration config backup is a gated door — subject to the
+        disk cap like any other write — so a refusal surfaces exactly like
+        any other ``backup_live_config`` failure — the live config is
+        untouched (Step 2 precedes ``promote_config``) and STAGING is
+        retained (nothing was promoted, nothing to roll back).
+        """
+        from paramem.backup.types import DiskCapExceeded
+
+        live_config_path = Path(state["config_path"])
+        live_bytes_before = live_config_path.read_bytes()
+
+        def _refuse(*args, **kwargs):
+            raise DiskCapExceeded("disk_pressure: max_total_disk_gb reached")
+
+        with patch("paramem.server.migration.backup_write", _refuse):
+            resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"]["error"] == "backup_write_failed"
+        assert state["migration"]["state"] == "STAGING"
+        assert live_config_path.read_bytes() == live_bytes_before
+
     def test_confirm_step3_failure_rollback(self, client, state, tmp_path, monkeypatch):
         """Patch write_trial_marker → 500 marker_write_failed; STAGING retained; backups deleted."""
 

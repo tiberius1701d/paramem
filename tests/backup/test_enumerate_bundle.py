@@ -19,6 +19,7 @@ from typing import Any
 from paramem.backup.backup import write as backup_write
 from paramem.backup.enumerate import enumerate_backups
 from paramem.backup.types import BUNDLE_SCHEMA_VERSION, ArtifactKind
+from paramem.server.config import ServerBackupsConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,7 +72,8 @@ def _make_regular_slot(backups_root: Path) -> Path:
         ArtifactKind.CONFIG,
         b"model: mistral\n",
         meta_fields={"tier": "daily"},
-        base_dir=backups_root / "config",
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
     )
 
 

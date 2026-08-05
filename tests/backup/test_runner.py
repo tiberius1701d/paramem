@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from paramem.backup.retention import DiskUsage
 from paramem.backup.runner import ScheduledBackupResult, run_scheduled_backup
 from paramem.server.config import (
     PathsConfig,
@@ -336,6 +337,45 @@ class TestRunnerFailurePaths:
         assert "disk_pressure" in (result.error or "")
         assert result.written_slots == {}
 
+    def test_runner_disk_pressure_mid_loop_preserves_written_slots_and_prunes(self, tmp_path):
+        """Cap reached AFTER the first artifact writes — a mid-loop refusal.
+
+        Regression for the blocking review fix: an early ``return`` on the
+        second artifact's refusal would report ``written_slots={}`` while a
+        real slot sat on disk, and would skip pruning — exactly the operation
+        that relieves the pressure just detected.  The first write's
+        ``compute_disk_usage`` call reports comfortably under cap; the second
+        (and every later call, including the two inside ``prune()``) reports
+        over cap.
+        """
+        loop = _mock_loop()
+        under = DiskUsage(total_bytes=10, by_tier={}, cap_bytes=20 * 1024**3, pct_of_cap=0.0)
+        over = DiskUsage(
+            total_bytes=25 * 1024**3, by_tier={}, cap_bytes=20 * 1024**3, pct_of_cap=1.25
+        )
+        calls = {"n": 0}
+
+        def _usage_side_effect(*args, **kwargs):
+            calls["n"] += 1
+            return under if calls["n"] == 1 else over
+
+        with patch("paramem.backup.retention.compute_disk_usage", side_effect=_usage_side_effect):
+            result, _, _, _ = _run(tmp_path, artifacts=["config", "graph", "registry"], loop=loop)
+
+        assert "config" in result.written_slots, (
+            "the first artifact's slot must not be lost by the later refusal"
+        )
+        skip_reasons = dict(result.skipped_artifacts)
+        assert skip_reasons.get("graph") == "disk_pressure"
+        assert skip_reasons.get("registry") == "disk_pressure"
+        assert "aborted after prior failure" not in skip_reasons.values()
+        assert result.success is False
+        assert "disk_pressure" in (result.error or "")
+        assert result.prune_result_summary is not None, (
+            "pruning must still run after a mid-loop cap refusal — it is what "
+            "relieves the pressure just detected"
+        )
+
     def test_runner_prune_failure_does_not_fail_backup(self, tmp_path):
         """prune() raises → success still True, prune_result_summary is None."""
         loop = _mock_loop()
@@ -622,3 +662,45 @@ class TestRunnerBundlePath:
 
         assert not result.success
         assert "disk_pressure" in (result.error or "")
+
+    def test_bundle_disk_pressure_on_first_artifact_still_prunes(self, tmp_path: Path):
+        """Cap refusal on the FIRST (and only) artifact still runs pruning.
+
+        ``artifacts=["snapshot_bundle"]`` is what config production defaults
+        to, so a store already over cap refuses the sole artifact and leaves
+        ``written_slots`` empty — the persistent over-cap case.  Pruning must
+        still run: it is the only thing that relieves the pressure, and
+        skipping it here would mean a single-artifact deployment can never
+        recover on its own.
+        """
+        config = _make_bundle_server_config(tmp_path, max_total_disk_gb=0.000001)
+        # Put a file over the cap in the backups dir.
+        bloat_dir = config.paths.data / "backups" / "snapshot" / "20260401-040000"
+        bloat_dir.mkdir(parents=True, exist_ok=True)
+        (bloat_dir / "data.bin").write_bytes(b"x" * 10240)
+
+        state_dir = (config.paths.data / "state").resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        live_config = tmp_path / "server.yaml"
+        live_config.write_bytes(b"model: mistral\n")
+        config.paths.data.mkdir(parents=True, exist_ok=True)
+        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.paths.key_metadata.write_text("{}")
+
+        result = run_scheduled_backup(
+            server_config=config,
+            loop=None,
+            state_dir=state_dir,
+            backups_root=(config.paths.data / "backups").resolve(),
+            live_config_path=live_config,
+        )
+
+        assert not result.success
+        assert result.written_slots == {}, "the sole artifact must have been refused"
+        skip_reasons = dict(result.skipped_artifacts)
+        assert skip_reasons.get("snapshot_bundle") == "disk_pressure"
+        assert result.prune_result_summary is not None, (
+            "pruning must still run when a refusal on the first artifact left "
+            "written_slots empty — this is the only case that relieves the "
+            "pressure for a single-artifact (snapshot_bundle) deployment"
+        )

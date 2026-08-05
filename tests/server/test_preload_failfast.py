@@ -15,8 +15,8 @@ All tests run CPU-only — no model loading or GPU required.
 
 from __future__ import annotations
 
-import inspect
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -369,6 +369,34 @@ class TestCrashLoopCounter:
         finally:
             restore()
 
+    def test_call_site_end_state_after_fail_fast(self, tmp_path):
+        """Driving _fail_fast_cuda with the crash-loop guard exhausted reaches
+        the full _degrade_to_cloud_only transition without booting a real
+        lifespan.  This is the shared call site behind both lifespan fault
+        branches (eager-consolidation-loop and post-preload canary) that
+        previously left ``mode`` stuck at "local" after a degrade — the
+        state ``/chat`` (app.py) and ``/gpu/release`` read.
+        """
+        config = _make_config(tmp_path)
+        restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())
+        prior_reason = app_module._state.get("cloud_only_reason")
+        prior_mode = app_module._state.get("mode")
+        try:
+            with (
+                patch.object(app_module, "_cuda_crashloop_exhausted", return_value=True),
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(app_module, "notify_server"),
+            ):
+                _fail_fast_cuda(RuntimeError("illegal memory access"), "test_phase")
+
+            assert app_module._state["mode"] == "cloud-only"
+            assert app_module._state["model"] is None
+            assert app_module._state["cloud_only_reason"] == "cuda_fault_persistent"
+        finally:
+            app_module._state["cloud_only_reason"] = prior_reason
+            app_module._state["mode"] = prior_mode
+            restore()
+
 
 class TestDegradeToCloudOnly:
     """_degrade_to_cloud_only sets model/tokenizer to None, sets reason, notifies."""
@@ -378,6 +406,7 @@ class TestDegradeToCloudOnly:
         config = _make_config(tmp_path)
         restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())
         prior_reason = app_module._state.get("cloud_only_reason")
+        prior_mode = app_module._state.get("mode")
         try:
             with (
                 patch.object(app_module, "_release_base_model_in_process"),
@@ -388,28 +417,54 @@ class TestDegradeToCloudOnly:
             assert app_module._state["cloud_only_reason"] == "cuda_fault_persistent"
             assert app_module._state["model"] is None
             assert app_module._state["tokenizer"] is None
+            assert app_module._state["mode"] == "cloud-only"
         finally:
             app_module._state["cloud_only_reason"] = prior_reason
+            app_module._state["mode"] = prior_mode
             restore()
 
-    def test_cuda_fault_persistent_in_permanent_cloud_only(self):
-        """'cuda_fault_persistent' must be in the permanent_cloud_only membership set.
+    def test_cuda_fault_persistent_in_permanent_cloud_only_reasons(self):
+        """'cuda_fault_persistent' (and its siblings) must be in the module-level
+        permanent-cloud-only membership set.
 
         If the reason is not in the set, the server would try to auto-reclaim
-        the GPU, re-poisoning the context.  Verified by inspecting the lifespan
-        source — a future refactor that removes the reason is caught here.
+        the GPU, re-poisoning the context.
         """
-        source = inspect.getsource(app_module.lifespan)
-        assert "cuda_fault_persistent" in source, (
-            "'cuda_fault_persistent' must appear in the lifespan permanent_cloud_only "
-            "membership set so the GPU is never auto-reclaimed after a fatal CUDA fault"
-        )
+        assert app_module._PERMANENT_CLOUD_ONLY_REASONS == {
+            "explicit",
+            "gpu_conflict",
+            "cuda_fault_persistent",
+        }
+
+    def test_degrade_cuda_fault_persistent_reason_is_permanent(self, tmp_path):
+        """After degrading with 'cuda_fault_persistent', the stored reason is a
+        member of the permanent-cloud-only set (behavioural companion to the
+        membership assertion above)."""
+        config = _make_config(tmp_path)
+        restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())
+        prior_reason = app_module._state.get("cloud_only_reason")
+        prior_mode = app_module._state.get("mode")
+        try:
+            with (
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(app_module, "notify_server"),
+            ):
+                _degrade_to_cloud_only("cuda_fault_persistent")
+
+            assert (
+                app_module._state["cloud_only_reason"] in app_module._PERMANENT_CLOUD_ONLY_REASONS
+            )
+        finally:
+            app_module._state["cloud_only_reason"] = prior_reason
+            app_module._state["mode"] = prior_mode
+            restore()
 
     def test_degrade_calls_release_and_notify(self, tmp_path):
         """_degrade_to_cloud_only calls _release_base_model_in_process and notify_server."""
         config = _make_config(tmp_path)
         restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())
         prior_reason = app_module._state.get("cloud_only_reason")
+        prior_mode = app_module._state.get("mode")
         try:
             release_calls: list[bool] = []
             notify_calls: list = []
@@ -432,4 +487,93 @@ class TestDegradeToCloudOnly:
             assert len(notify_calls) == 1
         finally:
             app_module._state["cloud_only_reason"] = prior_reason
+            app_module._state["mode"] = prior_mode
+            restore()
+
+    def test_lock_held_precondition_logs_error_and_still_completes(self, tmp_path, caplog):
+        """If gpu_lock is held (by another thread) while degrading, an ERROR
+        is logged but the degrade still completes (never raises, never
+        blocks) — the loud precondition check, not a lock."""
+        import logging
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        config = _make_config(tmp_path)
+        restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())
+        prior_reason = app_module._state.get("cloud_only_reason")
+        prior_mode = app_module._state.get("mode")
+
+        release_event = threading.Event()
+        acquired_event = threading.Event()
+
+        def _hold_lock():
+            _gpu_thread_lock.acquire()
+            acquired_event.set()
+            release_event.wait(timeout=5.0)
+            _gpu_thread_lock.release()
+
+        holder = threading.Thread(target=_hold_lock, daemon=True)
+        holder.start()
+        try:
+            # A failed wait here must still fall through to the finally block
+            # so release_event is set and the daemon holder does not keep the
+            # real _gpu_thread_lock (up to its own 5s self-release) after
+            # this test has already moved on, cascading into unrelated tests.
+            assert acquired_event.wait(timeout=5.0), "holder thread failed to acquire the lock"
+
+            _call_t0 = time.perf_counter()
+            with caplog.at_level(logging.ERROR):
+                with (
+                    patch.object(app_module, "_release_base_model_in_process"),
+                    patch.object(app_module, "notify_server"),
+                ):
+                    _degrade_to_cloud_only("insufficient_vram")
+            _call_duration = time.perf_counter() - _call_t0
+            # _degrade_to_cloud_only only takes a read-only gpu_lock_is_held()
+            # probe, never a real acquire — this bound is generous (the
+            # holder thread self-releases after 5s) but still proves the
+            # call did not block on the held lock.
+            assert _call_duration < 2.0, (
+                f"_degrade_to_cloud_only must not block on the held GPU lock; "
+                f"took {_call_duration:.2f}s"
+            )
+
+            error_records = [
+                r
+                for r in caplog.records
+                if r.levelno >= logging.ERROR and "GPU lock is held" in r.message
+            ]
+            assert error_records, "expected an ERROR log naming the held GPU lock"
+            assert app_module._state["model"] is None
+            assert app_module._state["tokenizer"] is None
+            assert app_module._state["mode"] == "cloud-only"
+            assert app_module._state["cloud_only_reason"] == "insufficient_vram"
+        finally:
+            release_event.set()
+            holder.join(timeout=5.0)
+            app_module._state["cloud_only_reason"] = prior_reason
+            app_module._state["mode"] = prior_mode
+            restore()
+
+    def test_lock_free_path_logs_no_lock_held_error(self, tmp_path, caplog):
+        """Lock-free path: no 'GPU lock is held' ERROR is logged."""
+        import logging
+
+        config = _make_config(tmp_path)
+        restore = _inject_config(config, model=MagicMock(), tokenizer=MagicMock())
+        prior_reason = app_module._state.get("cloud_only_reason")
+        prior_mode = app_module._state.get("mode")
+        try:
+            with caplog.at_level(logging.ERROR):
+                with (
+                    patch.object(app_module, "_release_base_model_in_process"),
+                    patch.object(app_module, "notify_server"),
+                ):
+                    _degrade_to_cloud_only("insufficient_vram")
+
+            lock_error_records = [r for r in caplog.records if "GPU lock is held" in r.message]
+            assert lock_error_records == []
+        finally:
+            app_module._state["cloud_only_reason"] = prior_reason
+            app_module._state["mode"] = prior_mode
             restore()

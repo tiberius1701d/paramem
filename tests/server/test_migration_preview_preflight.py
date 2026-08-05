@@ -183,7 +183,7 @@ class TestPreviewOverCapReturnsPreFlightFail:
         cand = _write_candidate(tmp_path)
         client.post("/migration/preview", json={"candidate_path": str(cand)})
 
-        # Direct inspection of live _state dict (A.7).
+        # Direct inspection of live _state dict.
         assert state["migration"]["state"] == "LIVE"
 
 
@@ -334,7 +334,7 @@ class TestPreFlightFailSurfacesInStatusAttentionItems:
     ) -> None:
         """End-to-end chain: preview disk_pressure fail → /status has migration_pre_flight_fail.
 
-        Steps (Acceptance A.6 step 5):
+        Steps:
         1. Configure a ServerConfig whose max_total_disk_gb is tiny (100 KB).
         2. Seed a backup slot (200 KB) so current usage exceeds the cap.
         3. POST /migration/preview → assert pre_flight_fail=="disk_pressure", state=="LIVE".
@@ -456,3 +456,64 @@ class TestPreviewPreFlightRaiseIsSurfacedNotSwallowed:
         assert resp2.status_code == 200, f"Second call got {resp2.status_code}: {resp2.text}"
         assert resp2.json()["pre_flight_fail"] is None
         assert resp2.json()["state"] == "STAGING"
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — component read failure (encrypted, no daily identity) → check_error
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewComponentReadFailureIsCheckError:
+    def test_read_maybe_encrypted_raise_returns_check_error(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """read_maybe_encrypted raising (e.g. no daily identity loaded) → 200,
+        pre_flight_fail='check_error', state stays LIVE, nothing staged."""
+        config = _make_config(tmp_path, max_total_disk_gb=20.0)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        state = _make_state(tmp_path, config=config)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        cand = _write_candidate(tmp_path)
+
+        with patch(
+            "paramem.backup.encryption.read_maybe_encrypted",
+            side_effect=RuntimeError("daily identity not loadable"),
+        ):
+            resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pre_flight_fail"] == "check_error"
+        assert body["state"] == "LIVE"
+        assert body.get("pre_flight_disk_used_gb") is None
+        assert state["migration"]["state"] == "LIVE"
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — config=None (production trigger) → check_error
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewConfigNoneIsCheckError:
+    def test_config_none_returns_check_error(self, tmp_path: Path, monkeypatch) -> None:
+        """_state['config'] is None (production trigger) → 200,
+        pre_flight_fail='check_error', state stays LIVE."""
+        state = _make_state(tmp_path, config=None)
+        state["config"] = None
+        monkeypatch.setattr(app_module, "_state", state)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        cand = _write_candidate(tmp_path)
+
+        resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["pre_flight_fail"] == "check_error"
+        assert body["state"] == "LIVE"
+        assert body.get("pre_flight_disk_used_gb") is None
+        assert state["migration"]["state"] == "LIVE"

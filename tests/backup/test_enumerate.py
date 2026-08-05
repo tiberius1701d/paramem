@@ -16,6 +16,7 @@ from pathlib import Path
 from paramem.backup.backup import write as backup_write
 from paramem.backup.enumerate import BackupRecord, enumerate_backups
 from paramem.backup.types import ArtifactKind
+from paramem.server.config import ServerBackupsConfig
 
 
 def _write_slot(
@@ -26,7 +27,11 @@ def _write_slot(
     pre_trial_hash: str | None = None,
     label: str | None = None,
 ) -> Path:
-    """Write a backup slot and return its slot directory path."""
+    """Write a backup slot and return its slot directory path.
+
+    ``base_dir`` here is the backups root — the per-kind directory
+    (``base_dir/<kind>/``) is derived internally by ``write()``.
+    """
     meta_fields: dict = {"tier": tier}
     if pre_trial_hash is not None:
         meta_fields["pre_trial_hash"] = pre_trial_hash
@@ -36,7 +41,8 @@ def _write_slot(
         kind,
         data,
         meta_fields=meta_fields,
-        base_dir=base_dir / kind.value,
+        backups_root=base_dir,
+        backups_cfg=ServerBackupsConfig(),
     )
 
 

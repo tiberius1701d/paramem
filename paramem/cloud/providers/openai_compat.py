@@ -119,7 +119,9 @@ class OpenAICompatAgent(CloudAgent):
             logger.error("Cloud agent timed out")
             return CloudResponse(text="I couldn't reach the cloud service in time.")
         except httpx.HTTPStatusError as e:
-            logger.error("Cloud agent HTTP error: %s", e.response.status_code)
+            logger.error(
+                "Cloud agent HTTP error: %s — %s", e.response.status_code, e.response.text[:500]
+            )
             return CloudResponse(text="I couldn't get an answer from the cloud service.")
         except httpx.RequestError as e:
             logger.error("Cloud agent connection error: %s", e)

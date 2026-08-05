@@ -203,8 +203,13 @@ class TestComputeDiskUsage:
         assert usage.cap_bytes == 1024**3
 
     def test_pct_of_cap_zero_when_cap_zero(self, tmp_path):
-        """pct_of_cap == 0.0 when cap_bytes == 0 (avoid division by zero)."""
-        config = _make_config(max_total_disk_gb=0.0)
+        """pct_of_cap == 0.0 when cap_bytes == 0 (avoid division by zero).
+
+        ``max_total_disk_gb`` must be strictly positive
+        (``ServerBackupsConfig.__post_init__``), so this uses a sub-byte
+        positive cap (``1e-12``) that still yields ``cap_bytes == 0``.
+        """
+        config = _make_config(max_total_disk_gb=1e-12)
         usage = compute_disk_usage(tmp_path / "x", config, bypass_cache=True)
         assert usage.pct_of_cap == 0.0
 

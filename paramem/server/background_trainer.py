@@ -142,6 +142,12 @@ class BackgroundTrainer:
         # skip the creation path entirely.
         self._worker_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
+        # Set to the worker thread a _WORKER_STOP sentinel was already queued
+        # for, so a second concurrent _stop_callable_worker() call observing
+        # the same still-current thread joins it without enqueueing a second
+        # sentinel (which would otherwise strand the next worker's first job —
+        # it would dequeue the leftover sentinel and exit immediately).
+        self._worker_stop_pending: threading.Thread | None = None
 
     @property
     def is_training(self) -> bool:
@@ -485,14 +491,34 @@ class BackgroundTrainer:
         thread exits cleanly.  Safe to call even if no worker has ever been
         started.
 
-        After joining, nulls ``self._worker_thread`` so the
+        After joining, nulls ``self._worker_thread`` — but only if it still
+        identifies the thread THIS call snapshotted — so the
         ``bt ↔ Thread._target (bound method)`` cycle dissolves on stop.
         CPython only deletes ``Thread._target`` after ``run()`` exits, and
         never clears our handle — without explicit nulling ``bt`` (and its
         ``bt.model`` = base model) remains reachable through the joined
-        thread handle even after the queue is drained.  Setting the handle
-        to ``None`` here is safe because :meth:`submit` lazily re-creates
-        the worker when ``self._worker_thread is None``.
+        thread handle even after the queue is drained.  Nulling the handle
+        here lets a LATER :meth:`submit` call lazily start a fresh worker
+        thread, since :meth:`submit` only creates one when it observes
+        ``self._worker_thread is None``.  This does not close the window
+        where a job is enqueued while the worker is consuming
+        :data:`_WORKER_STOP` but before this method nulls the handle: that
+        job sits in the queue unserviced until the NEXT :meth:`submit` call
+        finds the handle ``None`` and starts a new worker for it — it does
+        not run immediately.
+
+        Two concurrent callers (e.g. ``/gpu/release`` under ``gpu_lock`` and
+        an unlocked lifespan-shutdown release) are possible — the thread
+        reference is snapshotted under ``_worker_lock`` and the (possibly
+        multi-second) join runs outside it, since :meth:`submit` takes the
+        same lock and must not stall behind a concurrent join.  Only the
+        first caller to observe a given worker thread as still-current
+        enqueues its :data:`_WORKER_STOP` sentinel (tracked via
+        ``_worker_stop_pending``); a second, racing caller joins the same
+        thread without enqueueing a second sentinel — an unconsumed extra
+        sentinel would otherwise sit in the queue and make the NEXT worker
+        (started by a later :meth:`submit`) exit immediately, stranding its
+        first job.
 
         Args:
             timeout: Seconds to wait for the worker thread to join.  If the
@@ -500,14 +526,26 @@ class BackgroundTrainer:
                 the method returns — the daemon will be killed on process exit.
         """
         with self._worker_lock:
-            if self._worker_thread is None:
+            thread = self._worker_thread
+            if thread is None:
                 return
-            self._job_queue.put(_WORKER_STOP)
-        self._worker_thread.join(timeout=timeout)
-        if self._worker_thread.is_alive():
+            if self._worker_stop_pending is not thread:
+                self._job_queue.put(_WORKER_STOP)
+                self._worker_stop_pending = thread
+        # Join OUTSIDE the lock: submit() takes _worker_lock, and holding it
+        # across a multi-second join would stall a concurrent submit for the
+        # whole timeout.  _run_callable_queue itself never takes this lock.
+        thread.join(timeout=timeout)
+        if thread.is_alive():
             logger.warning(
                 "Callable worker did not exit within %.1fs; will be killed on process exit",
                 timeout,
             )
-        # Null our handle so the bt ↔ Thread._target cycle dissolves on stop.
-        self._worker_thread = None
+        with self._worker_lock:
+            # Only clear OUR handle: a concurrent release may already have
+            # nulled it and a later submit() may already have started a new
+            # worker.  Nulling unconditionally would orphan that worker.
+            if self._worker_thread is thread:
+                self._worker_thread = None
+            if self._worker_stop_pending is thread:
+                self._worker_stop_pending = None

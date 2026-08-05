@@ -1223,3 +1223,464 @@ class TestEagerConsolidationLoopBootDegrade:
                     app_module._state[key] = val
 
         assert app_module._state.get("consolidation_loop") is None
+
+
+# ---------------------------------------------------------------------------
+# TestReclaimLoopPermanentDegradeGate — auto-reclaim must never arm after a
+# permanent cloud-only degrade
+# ---------------------------------------------------------------------------
+
+
+class TestReclaimLoopPermanentDegradeGate:
+    """The reclaim-task creation at lifespan boot must consult
+    ``_PERMANENT_CLOUD_ONLY_REASONS`` at the point it actually creates the
+    task — not rely on a snapshot taken before a mid-boot degrade can change
+    ``cloud_only_reason``."""
+
+    def _make_defer_model_config(self, tmp_path):
+        from paramem.server.config import PathsConfig, ServerConfig, STTConfig, TTSConfig
+
+        config = ServerConfig(model_name="mistral")
+        config.cloud_only = False
+        config.stt = STTConfig(enabled=False)
+        config.tts = TTSConfig(enabled=False)
+        root = tmp_path / "data"
+        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+        return config
+
+    def _seeded_state_keys(self):
+        return (
+            "config",
+            "cloud_only_startup",
+            "defer_model",
+            "cloud_only_reason",
+            "mode",
+            "boot_completion_task",
+            "base_swap_task",
+            "reclaim_task",
+            "consolidation_loop",
+        )
+
+    def test_permanent_cuda_fault_degrade_leaves_no_reclaim_task(self, tmp_path):
+        """A --defer-model boot starts transiently cloud-only
+        (``cloud_only_reason='training'`` — not in
+        ``_PERMANENT_CLOUD_ONLY_REASONS``), but a fatal, crash-loop-exhausted
+        CUDA fault during eager consolidation-loop creation degrades it to
+        ``'cuda_fault_persistent'`` — a permanent reason minted AFTER the old
+        gate's ``cloud_only_startup``-only check would already have decided
+        to arm.  The gate must re-read the reason at task-creation time and
+        refuse to arm; auto-reclaiming would reload the base model straight
+        back into the same poisoned CUDA context.
+        """
+        import paramem.server.app as app_module
+
+        config = self._make_defer_model_config(tmp_path)
+
+        saved_state = {key: app_module._state.get(key) for key in self._seeded_state_keys()}
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = False
+        app_module._state["defer_model"] = True
+        app_module._state["cloud_only_reason"] = None
+        app_module._state["mode"] = "local"
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["reclaim_task"] = None
+        app_module._state["consolidation_loop"] = None
+
+        fatal_exc = RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        async def _run():
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_eager_create_consolidation_loop", side_effect=fatal_exc),
+                patch.object(app_module, "_cuda_crashloop_exhausted", return_value=True),
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(app_module, "notify_server"),
+                patch.object(app_module, "safe_empty_cache"),
+                patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup"),
+                patch.object(app_module, "_dispatch_consolidation"),
+                patch.dict(
+                    app_module._state,
+                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                    clear=False,
+                ),
+            ):
+                async with app_module.lifespan(app_module.app):
+                    assert app_module._state.get("cloud_only_reason") == "cuda_fault_persistent"
+                    assert app_module._state.get("reclaim_task") is None, (
+                        "reclaim_task must not be armed after a permanent "
+                        "cuda_fault_persistent degrade"
+                    )
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+    def test_transient_defer_model_boot_still_arms_reclaim_task(self, tmp_path):
+        """A --defer-model boot that hits no fault (``cloud_only_reason``
+        stays ``'training'``, never permanent) must still arm the
+        auto-reclaim loop — the permanence gate must not over-block a
+        legitimately reclaimable cloud-only boot."""
+        import paramem.server.app as app_module
+
+        config = self._make_defer_model_config(tmp_path)
+
+        saved_state = {key: app_module._state.get(key) for key in self._seeded_state_keys()}
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = False
+        app_module._state["defer_model"] = True
+        app_module._state["cloud_only_reason"] = None
+        app_module._state["mode"] = "local"
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["reclaim_task"] = None
+        app_module._state["consolidation_loop"] = None
+
+        task_holder: dict = {}
+
+        async def _run():
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup"),
+                patch.object(app_module, "_dispatch_consolidation"),
+                patch.dict(
+                    app_module._state,
+                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                    clear=False,
+                ),
+            ):
+                async with app_module.lifespan(app_module.app):
+                    assert app_module._state.get("cloud_only_reason") == "training"
+                    task = app_module._state.get("reclaim_task")
+                    task_holder["task"] = task
+                    assert task is not None, "reclaim_task must be armed for a transient reason"
+                    assert isinstance(task, asyncio.Task)
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+        assert task_holder["task"].cancelled(), "reclaim_task must be cancelled at shutdown"
+
+
+# ---------------------------------------------------------------------------
+# TestModeSlotHygiene — "mode" must reset to its pre-boot default at the
+# start of every lifespan
+# ---------------------------------------------------------------------------
+
+
+class TestModeSlotHygiene:
+    """A second lifespan in the same process (TestClient reuse, in-process
+    restart) must never inherit a stale ``mode="cloud-only"`` left behind by
+    a prior lifespan's degrade — the slot-hygiene block resets it to the
+    pre-boot default ("local", the module-level ``_state`` initializer's own
+    value) before the mode-write guard can see it.
+
+    The mode-write guard (``if _state.get("mode") != "cloud-only":``) only
+    WRITES when the current value differs from "cloud-only" — so a stale
+    "cloud-only" left by a prior run is indistinguishable from THIS run's own
+    in-progress degrade unless the hygiene block resets it first. The
+    regression only surfaces when this run's OWN boot-computed mode is
+    "local" (a healthy boot) while a prior run's stale value was
+    "cloud-only": without the reset, the guard sees "cloud-only" already
+    present and never overwrites it, permanently pinning a healthy boot into
+    cloud-only reporting.
+    """
+
+    def test_second_lifespan_resets_stale_cloud_only_mode_for_healthy_local_boot(self, tmp_path):
+        """Drives the REAL lifespan with a stale ``mode="cloud-only"``
+        seeded up front (as a prior lifespan's degrade would leave it) and
+        every condition that would otherwise compute ``cloud_only=True``
+        turned off (no ``--cloud-only``, no ``--defer-model``, no GPU
+        conflict) — the boot-computed value for THIS run is "local". The
+        hygiene reset must let that value win.
+        """
+        import paramem.server.app as app_module
+        from paramem.server.config import PathsConfig, ServerConfig, STTConfig, TTSConfig
+
+        config = ServerConfig(model_name="mistral")
+        config.cloud_only = False
+        config.stt = STTConfig(enabled=False)
+        config.tts = TTSConfig(enabled=False)
+        root = tmp_path / "data"
+        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+
+        saved_state = {
+            key: app_module._state.get(key)
+            for key in (
+                "config",
+                "cloud_only_startup",
+                "defer_model",
+                "cloud_only_reason",
+                "mode",
+                "boot_completion_task",
+                "base_swap_task",
+                "reclaim_task",
+                "consolidation_loop",
+            )
+        }
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = False
+        app_module._state["defer_model"] = False
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["reclaim_task"] = None
+        app_module._state["consolidation_loop"] = None
+        # Simulate the residue of a PRIOR lifespan's degrade: a stale
+        # "cloud-only" mode with no corresponding condition forcing THIS
+        # run's own boot-computed cloud_only to True.
+        app_module._state["mode"] = "cloud-only"
+        app_module._state["cloud_only_reason"] = "cuda_fault_persistent"
+
+        async def _run():
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+                patch.object(app_module, "_load_model_into_state"),
+                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(app_module, "safe_empty_cache"),
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup"),
+                patch.object(app_module, "_dispatch_consolidation"),
+                patch.dict(
+                    app_module._state,
+                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                    clear=False,
+                ),
+            ):
+                async with app_module.lifespan(app_module.app):
+                    assert app_module._state.get("mode") == "local", (
+                        "this run's own healthy boot must compute mode='local'; "
+                        "a lingering 'cloud-only' proves the hygiene reset did "
+                        "not run ahead of the mode-write guard"
+                    )
+                    assert app_module._state.get("cloud_only_reason") is None
+
+        try:
+            asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+
+# ---------------------------------------------------------------------------
+# TestShutdownGpuLockRelease — lifespan shutdown releases the base model
+# under a bounded gpu_lock_sync wait
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownGpuLockRelease:
+    """Lifespan shutdown's base-model release must run under
+    ``gpu_lock_sync`` with a bounded wait: locked when the lock is free,
+    logged-and-unlocked when a holder outlasts the wait — never a bare
+    unlocked release racing a legitimate in-fold lock holder, and never an
+    indefinite block."""
+
+    def _make_config(self, tmp_path):
+        from paramem.server.config import PathsConfig, ServerConfig, STTConfig, TTSConfig
+
+        config = ServerConfig(model_name="mistral")
+        config.cloud_only = True
+        config.stt = STTConfig(enabled=False)
+        config.tts = TTSConfig(enabled=False)
+        root = tmp_path / "data"
+        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+        return config
+
+    def _seeded_keys(self):
+        return (
+            "config",
+            "cloud_only_startup",
+            "defer_model",
+            "boot_completion_task",
+            "base_swap_task",
+            "reclaim_task",
+            "consolidation_loop",
+        )
+
+    def test_shutdown_with_lock_free_releases_under_lock_no_error(self, tmp_path, caplog):
+        """No contention: the release runs while the lock is held BY
+        shutdown itself, and no lock-timeout ERROR is logged."""
+        import logging
+
+        import paramem.server.app as app_module
+        from paramem.server.gpu_lock import gpu_lock_is_held
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+
+        config = self._make_config(tmp_path)
+        saved_state = {key: app_module._state.get(key) for key in self._seeded_keys()}
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = True
+        app_module._state["defer_model"] = False
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["reclaim_task"] = None
+        app_module._state["consolidation_loop"] = None
+
+        held_during_release: list[bool] = []
+
+        def _record_lock_state():
+            held_during_release.append(gpu_lock_is_held())
+
+        async def _run():
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                patch.object(
+                    app_module,
+                    "_release_base_model_in_process",
+                    side_effect=_record_lock_state,
+                ),
+                patch.object(app_module, "safe_empty_cache"),
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup"),
+                patch.object(app_module, "_dispatch_consolidation"),
+                patch.dict(
+                    app_module._state,
+                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                    clear=False,
+                ),
+            ):
+                async with app_module.lifespan(app_module.app):
+                    pass
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+        assert held_during_release == [True], (
+            "_release_base_model_in_process must run while shutdown holds the GPU lock"
+        )
+        assert not any("could not acquire GPU lock" in r.message for r in caplog.records), (
+            "no lock-timeout ERROR expected when the lock was free"
+        )
+        assert not gpu_lock_is_held(), "the lock must be released after shutdown completes"
+
+    def test_shutdown_with_lock_held_logs_error_and_still_releases(self, tmp_path, caplog):
+        """A holder thread outlasting the bounded wait: shutdown logs an
+        ERROR naming the timeout, then still calls the release (unlocked) —
+        shutdown must complete rather than block indefinitely."""
+        import logging
+        import threading
+
+        import paramem.server.app as app_module
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+
+        config = self._make_config(tmp_path)
+        saved_state = {key: app_module._state.get(key) for key in self._seeded_keys()}
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = True
+        app_module._state["defer_model"] = False
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["reclaim_task"] = None
+        app_module._state["consolidation_loop"] = None
+
+        release_calls: list[bool] = []
+        release_event = threading.Event()
+        acquired_event = threading.Event()
+
+        def _hold_lock():
+            _gpu_thread_lock.acquire()
+            acquired_event.set()
+            release_event.wait(timeout=5.0)
+            _gpu_thread_lock.release()
+
+        holder = threading.Thread(target=_hold_lock, daemon=True)
+        holder.start()
+        try:
+            # A failed wait here must still fall through to the finally
+            # block so release_event is set and the daemon holder does not
+            # keep the real lock past this test.
+            assert acquired_event.wait(timeout=5.0), "holder thread failed to acquire the lock"
+
+            async def _run():
+                with (
+                    patch.object(app_module, "predict_base_bytes", return_value=None),
+                    patch.object(app_module, "_gpu_occupied", return_value=False),
+                    patch.object(app_module, "_build_config_derived_state"),
+                    patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                    patch.object(
+                        app_module,
+                        "_release_base_model_in_process",
+                        side_effect=lambda: release_calls.append(True),
+                    ),
+                    patch.object(app_module, "safe_empty_cache"),
+                    patch.object(app_module, "_reconcile_scheduling_timers"),
+                    patch.object(app_module, "_create_backup"),
+                    patch.object(app_module, "_dispatch_consolidation"),
+                    # Bounded — well under the holder's 5s self-release —
+                    # so this test does not wait the full production timeout.
+                    patch.object(app_module, "_SHUTDOWN_GPU_LOCK_TIMEOUT_S", 0.2),
+                    patch.dict(
+                        app_module._state,
+                        {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                        clear=False,
+                    ),
+                ):
+                    async with app_module.lifespan(app_module.app):
+                        pass
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+
+            asyncio.run(_run())
+        finally:
+            release_event.set()
+            holder.join(timeout=5.0)
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+        assert release_calls == [True], (
+            "_release_base_model_in_process must still run after the lock-acquire timeout"
+        )
+        error_records = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.ERROR and "could not acquire GPU lock" in r.message
+        ]
+        assert error_records, "expected an ERROR log naming the lock-acquire timeout"

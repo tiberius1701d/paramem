@@ -38,7 +38,14 @@ import pytest
 
 from paramem.backup.backup import sweep_orphan_pending, write_bundle
 from paramem.backup.enumerate import enumerate_backups
-from paramem.backup.types import BUNDLE_SCHEMA_VERSION, ArtifactKind, BackupError, BundleManifest
+from paramem.backup.types import (
+    BUNDLE_SCHEMA_VERSION,
+    ArtifactKind,
+    BackupError,
+    BundleManifest,
+    DiskCapExceeded,
+)
+from paramem.server.config import ServerBackupsConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -267,7 +274,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -280,7 +288,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -293,7 +302,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -309,7 +319,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -328,7 +339,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -348,7 +360,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -364,7 +377,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -387,7 +401,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -407,7 +422,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -423,7 +439,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -439,7 +456,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -459,7 +477,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=reg_sha,
         )
@@ -475,7 +494,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -502,7 +522,8 @@ class TestWriteBundleHappyPath:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=reg_sha,
         )
@@ -533,7 +554,8 @@ class TestNoBundleDoubleEncrypt:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -553,7 +575,8 @@ class TestNoBundleDoubleEncrypt:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -603,7 +626,8 @@ class TestInterimSlotCapture:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=interim_hash,
@@ -651,7 +675,8 @@ class TestInterimSlotCapture:
                 config_path=config_path,
                 registry_path=registry_path,
                 adapter_dirs={"episodic": episodic_dir},
-                base_dir=base_dir,
+                backups_root=base_dir.parent,
+                backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
                 adapter_scope="main",
                 live_registry_sha256=interim_hash,
@@ -686,7 +711,8 @@ class TestInterimSlotCapture:
                 config_path=config_path,
                 registry_path=registry_path,
                 adapter_dirs={"episodic": episodic_dir},
-                base_dir=base_dir,
+                backups_root=base_dir.parent,
+                backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
                 adapter_scope="main",
                 live_registry_sha256=interim_hash,
@@ -723,7 +749,8 @@ class TestInterimSlotCapture:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=interim_hash,
@@ -770,7 +797,8 @@ class TestInterimSlotCapture:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=interim_hash,
@@ -869,7 +897,8 @@ class TestMultiAdapterBundle:
             config_path=fx["config_path"],
             registry_path=fx["registry_path"],
             adapter_dirs=fx["adapter_dirs"],
-            base_dir=fx["base_dir"],
+            backups_root=fx["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=fx["interim_hash"],
@@ -935,7 +964,8 @@ class TestMultiAdapterBundle:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir, "procedural": procedural_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=shared_hash,
@@ -994,7 +1024,8 @@ class TestMultiAdapterBundle:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=ep_main_hash,
@@ -1053,7 +1084,8 @@ class TestMultiAdapterBundle:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir, "procedural": procedural_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=ep_hash,
@@ -1103,7 +1135,8 @@ class TestScaffoldingExclusion:
             config_path=config_path,
             registry_path=registry_path,
             adapter_dirs={"episodic": episodic_dir},
-            base_dir=base_dir,
+            backups_root=base_dir.parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
             live_registry_sha256=interim_hash,
@@ -1135,7 +1168,8 @@ class TestScaffoldingExclusion:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="main",
             live_registry_sha256=fixtures["registry_sha256"],
@@ -1167,7 +1201,8 @@ class TestMissingOptionalArtifact:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -1189,7 +1224,8 @@ class TestMissingOptionalArtifact:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=adapter_dirs,
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -1214,7 +1250,8 @@ class TestSpeakerProfilesCapture:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
             speaker_profiles_path=fixtures["speaker_profiles_path"],
@@ -1233,7 +1270,8 @@ class TestSpeakerProfilesCapture:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
             speaker_profiles_path=None,
@@ -1271,7 +1309,8 @@ class TestFailLoudNoSlot:
                 config_path=fixtures["config_path"],
                 registry_path=fixtures["registry_path"],
                 adapter_dirs=fixtures["adapter_dirs"],
-                base_dir=fixtures["base_dir"],
+                backups_root=fixtures["base_dir"].parent,
+                backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
                 live_registry_sha256=fixtures["registry_sha256"],
             )
@@ -1292,7 +1331,8 @@ class TestFailLoudNoSlot:
                 config_path=fixtures["config_path"],
                 registry_path=fixtures["registry_path"],
                 adapter_dirs=fixtures["adapter_dirs"],
-                base_dir=base_dir,
+                backups_root=base_dir.parent,
+                backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
                 live_registry_sha256=fixtures["registry_sha256"],
             )
@@ -1327,7 +1367,8 @@ class TestCrashSafety:
                     config_path=fixtures["config_path"],
                     registry_path=fixtures["registry_path"],
                     adapter_dirs=fixtures["adapter_dirs"],
-                    base_dir=base_dir,
+                    backups_root=base_dir.parent,
+                    backups_cfg=ServerBackupsConfig(),
                     meta_fields={"tier": "manual"},
                     live_registry_sha256=fixtures["registry_sha256"],
                 )
@@ -1354,7 +1395,8 @@ class TestCrashSafety:
                     config_path=fixtures["config_path"],
                     registry_path=fixtures["registry_path"],
                     adapter_dirs=fixtures["adapter_dirs"],
-                    base_dir=base_dir,
+                    backups_root=base_dir.parent,
+                    backups_cfg=ServerBackupsConfig(),
                     meta_fields={"tier": "manual"},
                     live_registry_sha256=fixtures["registry_sha256"],
                 )
@@ -1380,7 +1422,8 @@ class TestEnumerateBundle:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -1400,7 +1443,8 @@ class TestEnumerateBundle:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             live_registry_sha256=fixtures["registry_sha256"],
         )
@@ -1434,7 +1478,8 @@ class TestCandidateConfigSidecar:
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
             adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
+            backups_root=fixtures["base_dir"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "pre_base_swap"},
             live_registry_sha256=fixtures["registry_sha256"],
             candidate_config_path=candidate_config_path,
@@ -1516,3 +1561,51 @@ class TestCandidateConfigSidecar:
         pending_root = base_dir / ".pending"
         residue = list(pending_root.glob("*")) if pending_root.exists() else []
         assert residue == [], f"missing-candidate raise left pending residue: {residue}"
+
+
+# ---------------------------------------------------------------------------
+# Disk-cap refusal
+# ---------------------------------------------------------------------------
+
+
+class TestWriteBundleDiskCapRefusal:
+    """write_bundle() refuses before touching disk when the store is at/over cap."""
+
+    def test_write_bundle_raises_disk_cap_exceeded_when_at_cap(self, tmp_path) -> None:
+        """total_bytes >= cap_bytes → DiskCapExceeded, no new bundle slot created.
+
+        Seeds the bundle-kind dir with an unrelated existing slot so
+        total_bytes > 0, pairs it with a 1e-12 GB cap (cap_bytes == 0), and
+        asserts the promoted-slot count is unchanged by the refused call.
+        """
+        fixtures = _make_fixtures(tmp_path)
+        backups_root = fixtures["base_dir"].parent
+        cfg = ServerBackupsConfig(max_total_disk_gb=1e-12)
+
+        # Seed one existing bundle slot so total_bytes > 0 >= cap_bytes (== 0).
+        write_bundle(
+            config_path=fixtures["config_path"],
+            registry_path=fixtures["registry_path"],
+            adapter_dirs=fixtures["adapter_dirs"],
+            backups_root=backups_root,
+            backups_cfg=None,  # bypass the cap to seed the store
+            meta_fields={"tier": "manual"},
+            live_registry_sha256=fixtures["registry_sha256"],
+        )
+
+        bundle_dir = fixtures["base_dir"]
+        slots_before = sorted(d.name for d in bundle_dir.iterdir() if d.is_dir())
+
+        with pytest.raises(DiskCapExceeded, match="disk_pressure"):
+            write_bundle(
+                config_path=fixtures["config_path"],
+                registry_path=fixtures["registry_path"],
+                adapter_dirs=fixtures["adapter_dirs"],
+                backups_root=backups_root,
+                backups_cfg=cfg,
+                meta_fields={"tier": "manual"},
+                live_registry_sha256=fixtures["registry_sha256"],
+            )
+
+        slots_after = sorted(d.name for d in bundle_dir.iterdir() if d.is_dir())
+        assert slots_after == slots_before

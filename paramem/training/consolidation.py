@@ -5044,17 +5044,13 @@ class ConsolidationLoop:
                     router=router,
                 )
 
-        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.server.gpu_lock import gpu_lock_is_held
 
-        # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
-        acquired = _gpu_thread_lock.acquire(blocking=False)
-        if acquired:
-            # The lock was NOT held — we just accidentally acquired it ourselves.
-            # Release immediately before raising so the process is recoverable.
-            _gpu_thread_lock.release()
+        # --- Entry guard: the caller must hold the GPU lock (leak-safe) ---
+        if not gpu_lock_is_held():
             raise RuntimeError(
                 "consolidate(mode='train') requires the caller to hold "
-                "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
+                "the GPU lock (submit via BackgroundTrainer.submit())"
             )
 
         # Every artifact the fold and its nested passes emit lands in this

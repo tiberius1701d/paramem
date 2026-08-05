@@ -45,6 +45,7 @@ from fastapi.testclient import TestClient
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
+from paramem.server.config import ServerBackupsConfig
 from paramem.server.migration import TrialStash, initial_migration_state
 from paramem.server.trial_state import (
     TRIAL_MARKER_SCHEMA_VERSION,
@@ -164,7 +165,8 @@ def _seed_trial_in_state(state: dict, tmp_path: Path) -> None:
         ArtifactKind.CONFIG,
         _LIVE_CONFIG_YAML,
         {"tier": "pre_migration"},
-        base_dir=backups_root / "config",
+        backups_root=backups_root,
+        backups_cfg=ServerBackupsConfig(),
     )
     artifact_files = [e for e in config_slot.iterdir() if not e.name.endswith(".meta.json")]
     assert len(artifact_files) == 1

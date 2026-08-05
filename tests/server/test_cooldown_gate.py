@@ -265,8 +265,10 @@ class TestFoldWorkerCooldownOrder:
     / ``_run_migration_on_worker``) no longer have their own gate.  These
     workers are nested closures; source inspection is the only viable CPU-only
     verification without fully driving the outer endpoint functions.  The
-    check mirrors the pattern in test_preload_failfast.py::
-    TestDegradeToCloudOnly::test_cuda_fault_persistent_in_permanent_cloud_only.
+    same "assert the invariant directly rather than driving the endpoint"
+    idiom is used in test_preload_failfast.py::TestDegradeToCloudOnly::
+    test_cuda_fault_persistent_in_permanent_cloud_only_reasons (a membership
+    assertion there, source inspection here).
     """
 
     def test_stage_b_cycle_has_cooldown_before_body_dispatch(self):

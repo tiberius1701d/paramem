@@ -13,8 +13,10 @@ from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
     BackupError,
+    DiskCapExceeded,
     FingerprintMismatchError,
 )
+from paramem.server.config import ServerBackupsConfig
 
 
 class TestWriteReadRoundtripPlain:
@@ -26,7 +28,8 @@ class TestWriteReadRoundtripPlain:
             ArtifactKind.CONFIG,
             payload,
             {"tier": "scheduled"},
-            base_dir=tmp_path / "backups" / "config",
+            backups_root=tmp_path / "backups",
+            backups_cfg=ServerBackupsConfig(),
         )
 
         assert slot_dir.is_dir()
@@ -44,7 +47,8 @@ class TestWriteReadRoundtripPlain:
             ArtifactKind.CONFIG,
             b"original data",
             {"tier": "scheduled"},
-            base_dir=tmp_path / "backups" / "config",
+            backups_root=tmp_path / "backups",
+            backups_cfg=ServerBackupsConfig(),
         )
 
         # Corrupt the artifact file
@@ -72,7 +76,8 @@ class TestWriteReadRoundtripPlain:
             ArtifactKind.REGISTRY,
             src_file,
             {"tier": "manual"},
-            base_dir=tmp_path / "backups" / "registry",
+            backups_root=tmp_path / "backups",
+            backups_cfg=ServerBackupsConfig(),
         )
 
         plaintext, _ = read(slot_dir)
@@ -82,11 +87,23 @@ class TestWriteReadRoundtripPlain:
         """Two sequential write() calls produce two distinct slot directories."""
         import time
 
-        base = tmp_path / "backups" / "config"
+        backups_root = tmp_path / "backups"
 
-        slot1 = write(ArtifactKind.CONFIG, b"a", {"tier": "manual"}, base_dir=base)
+        slot1 = write(
+            ArtifactKind.CONFIG,
+            b"a",
+            {"tier": "manual"},
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
+        )
         time.sleep(0.02)  # ensure different hundredths-of-a-second timestamp
-        slot2 = write(ArtifactKind.CONFIG, b"b", {"tier": "manual"}, base_dir=base)
+        slot2 = write(
+            ArtifactKind.CONFIG,
+            b"b",
+            {"tier": "manual"},
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
+        )
 
         assert slot1 != slot2
         assert slot1.is_dir()
@@ -126,7 +143,8 @@ class TestWriteFsyncsParentDirAfterRename:
             ArtifactKind.CONFIG,
             b"durability test payload",
             {"tier": "manual"},
-            base_dir=tmp_path / "backups" / "config",
+            backups_root=tmp_path / "backups",
+            backups_cfg=ServerBackupsConfig(),
         )
 
         # Belt-and-braces count: 1 artifact + 1 sidecar + 1 pending-dir + >=1 parent-dir
@@ -150,13 +168,14 @@ class TestWriteReadRoundtrip:
         This tests the partial-slot invariant: a sidecar present without its
         paired artifact is an integrity violation, not just a missing file.
         """
-        base = tmp_path / "backups" / "config"
+        backups_root = tmp_path / "backups"
 
         slot_dir = write(
             ArtifactKind.CONFIG,
             b"payload that will go missing",
             {"tier": "scheduled"},
-            base_dir=base,
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
         )
 
         # Delete the artifact file, leaving the sidecar intact
@@ -196,12 +215,24 @@ class TestWriteConcurrency:
 
         monkeypatch.setattr(backup_mod, "datetime", _PatchedDatetime)
 
-        base = tmp_path / "backups" / "config"
+        backups_root = tmp_path / "backups"
 
-        slot1 = write(ArtifactKind.CONFIG, b"first", {"tier": "manual"}, base_dir=base)
+        slot1 = write(
+            ArtifactKind.CONFIG,
+            b"first",
+            {"tier": "manual"},
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
+        )
         # Reset counter so second write also starts from the fixed time
         call_count[0] = 0
-        slot2 = write(ArtifactKind.CONFIG, b"second", {"tier": "manual"}, base_dir=base)
+        slot2 = write(
+            ArtifactKind.CONFIG,
+            b"second",
+            {"tier": "manual"},
+            backups_root=backups_root,
+            backups_cfg=ServerBackupsConfig(),
+        )
 
         assert slot1.is_dir()
         assert slot2.is_dir()
@@ -228,8 +259,9 @@ class TestWriteConcurrency:
 
         monkeypatch.setattr(backup_mod, "datetime", _FixedDatetime)
 
-        base = tmp_path / "backups" / "config"
-        base.mkdir(parents=True, exist_ok=True)
+        backups_root = tmp_path / "backups"
+        kind_dir = backups_root / "config"
+        kind_dir.mkdir(parents=True, exist_ok=True)
 
         # Pre-create the 10 final slot directories that the retry loop would try
         # (base_dt hh=00 plus bumps 1..9 → hh=01..09)
@@ -239,12 +271,52 @@ class TestWriteConcurrency:
             bumped = base_dt + timedelta(microseconds=10_000 * i)
             hh = bumped.microsecond // 10000
             slot_name = bumped.strftime("%Y%m%d-%H%M%S") + f"{hh:02d}"
-            (base / slot_name).mkdir()
+            (kind_dir / slot_name).mkdir()
 
         with pytest.raises(BackupError, match="unique pending slot"):
             write(
                 ArtifactKind.CONFIG,
                 b"should fail",
                 {"tier": "manual"},
-                base_dir=base,
+                backups_root=backups_root,
+                backups_cfg=ServerBackupsConfig(),
             )
+
+
+class TestWriteDiskCapRefusal:
+    """write() refuses before touching disk when the store is at/over cap."""
+
+    def test_write_raises_disk_cap_exceeded_when_at_cap(self, tmp_path):
+        """total_bytes >= cap_bytes → DiskCapExceeded, no new slot dir created.
+
+        Seeds the store already at/over a 1e-12 GB cap (cap_bytes == 0, so any
+        existing slot puts total_bytes >= cap_bytes), then asserts the kind
+        dir's child count is unchanged by the refused call — proving the
+        refusal happens before any bytes are written.
+        """
+        backups_root = tmp_path / "backups"
+        cfg = ServerBackupsConfig(max_total_disk_gb=1e-12)
+
+        # Seed one existing slot so total_bytes > 0 >= cap_bytes (== 0).
+        write(
+            ArtifactKind.CONFIG,
+            b"seed",
+            {"tier": "manual"},
+            backups_root=backups_root,
+            backups_cfg=None,  # bypass the cap to seed the store
+        )
+
+        kind_dir = backups_root / "config"
+        children_before = sorted(p.name for p in kind_dir.iterdir())
+
+        with pytest.raises(DiskCapExceeded, match="disk_pressure"):
+            write(
+                ArtifactKind.CONFIG,
+                b"refused",
+                {"tier": "manual"},
+                backups_root=backups_root,
+                backups_cfg=cfg,
+            )
+
+        children_after = sorted(p.name for p in kind_dir.iterdir())
+        assert children_after == children_before

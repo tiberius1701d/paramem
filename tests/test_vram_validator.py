@@ -747,8 +747,14 @@ def test_headroom_1_5_gib_fits_within_drain_time_free():
 
 
 def _permanent_cloud_only_from_reason(reason):
-    """Mirror the lifespan logic: permanent when reason in explicit/gpu_conflict."""
-    return reason in ("explicit", "gpu_conflict")
+    """Mirror the lifespan logic: permanent when reason is in the production set.
+
+    Derives from :data:`paramem.server.app._PERMANENT_CLOUD_ONLY_REASONS`
+    instead of duplicating the reason list, so the two cannot drift.
+    """
+    from paramem.server.app import _PERMANENT_CLOUD_ONLY_REASONS
+
+    return reason in _PERMANENT_CLOUD_ONLY_REASONS
 
 
 def test_lifespan_budget_includes_gpu_voice_bytes_under_defer_model():

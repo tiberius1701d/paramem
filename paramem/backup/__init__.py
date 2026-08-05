@@ -17,6 +17,7 @@ Types
 Errors
 ------
 - ``BackupError``              — base class.
+- ``DiskCapExceeded``          — write refused, backup store at/over its cap.
 - ``FingerprintMismatchError`` — content hash mismatch on read.
 - ``MetaSchemaError``          — sidecar schema validation failure.
 - ``FatalConfigError``         — startup refused (require_encryption / mode mismatch).
@@ -33,6 +34,7 @@ from paramem.backup.types import (
     ArtifactKind,
     ArtifactMeta,
     BackupError,
+    DiskCapExceeded,
     FatalConfigError,
     FingerprintMismatchError,
     MetaSchemaError,
@@ -54,6 +56,7 @@ __all__ = [
     "SCHEMA_VERSION",
     # Errors
     "BackupError",
+    "DiskCapExceeded",
     "FingerprintMismatchError",
     "MetaSchemaError",
     "FatalConfigError",

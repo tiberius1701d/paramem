@@ -312,6 +312,14 @@ class BackupError(Exception):
     """Base class for all backup-subsystem errors."""
 
 
+class DiskCapExceeded(BackupError):
+    """A write was refused because the backup store is at/over its global cap.
+
+    Raised by ``backup.write`` / ``backup.write_bundle`` BEFORE any bytes are
+    written, so a refusal never leaves a partial slot.
+    """
+
+
 class FingerprintMismatchError(BackupError):
     """Content hash of an artifact does not match its sidecar record.
 

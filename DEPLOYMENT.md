@@ -515,12 +515,14 @@ security:
   backups:
     schedule: "daily 04:00"     # "off" disables scheduled backups
     adapter_scope: live         # "live" = main + live interim slots; "main" = finalized mains only
-    max_total_disk_gb: 20       # global cap; oldest slots pruned first
+    max_total_disk_gb: 20       # global cap (must be > 0); oldest slots pruned first, writes refused at/over it
     retention:
       daily:   { keep: 7 }
       weekly:  { keep: 4 }
       monthly: { keep: 12 }
 ```
+
+A backup — scheduled, manual, or a pre-migration snapshot — is refused once the store has reached `max_total_disk_gb`; `paramem backup-prune` or raising the cap clears the refusal. A restore or a migration rollback is never blocked by it — those are undo anchors, not new accumulation. `max_total_disk_gb` must be greater than zero; to stop taking backups altogether use `schedule: "off"`.
 
 **Configuration migration.** For `server.yaml` changes that could affect memory quality — extraction prompts, adapter shape, consolidation cadence, base model — `paramem migrate` runs a guarded **trial**: it backs up the live state, applies the candidate, runs one consolidation cycle under the new config, and reports a before/after comparison so you can promote or roll back.
 

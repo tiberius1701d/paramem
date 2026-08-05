@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 from paramem.backup.backup import restore_bundle, write_bundle
+from paramem.server.config import ServerBackupsConfig
 from paramem.training.donor import (
     DONOR_META_FILENAME,
     DONOR_MIN_ENTRIES,
@@ -94,7 +95,8 @@ def _bundle_with_donor(tmp_path: Path) -> tuple[Path, dict, Path]:
         config_path=src["config_path"],
         registry_path=src["registry_path"],
         adapter_dirs=src["adapter_dirs"],
-        base_dir=src["bundle_base"],
+        backups_root=src["bundle_base"].parent,
+        backups_cfg=ServerBackupsConfig(),
         meta_fields={"tier": "manual", "label": "donor-test"},
         adapter_scope="live",
         speaker_profiles_path=src["speaker_profiles_path"],
@@ -182,7 +184,8 @@ class TestDonorStoreInBundle:
             config_path=src["config_path"],
             registry_path=src["registry_path"],
             adapter_dirs=src["adapter_dirs"],
-            base_dir=src["bundle_base"],
+            backups_root=src["bundle_base"].parent,
+            backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual", "label": "no-donor"},
             adapter_scope="live",
             speaker_profiles_path=src["speaker_profiles_path"],

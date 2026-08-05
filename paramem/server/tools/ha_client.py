@@ -298,6 +298,16 @@ class HAClient:
         agent pipeline (system prompt, tools, entity resolution) inside
         HA. Returns the speech response text, or None on failure.
 
+        An envelope with ``response_type == "error"`` is split by its
+        ``data.code``: ``no_intent_match`` and ``no_valid_targets`` are
+        routine semantic outcomes (HA understood the request and has
+        nothing to match) — HA's own speech is the correct user-facing
+        answer, so it is returned exactly like a success. Every other
+        error code (including a missing/unrecognized one — an agent-side
+        failure) returns None. A WebSocket/transport failure or an empty
+        speech string also return None. All None returns mean callers
+        fall through to their configured fallback chain.
+
         If language is provided but not in supported_languages, it is
         omitted so HA uses its configured default.
 
@@ -346,12 +356,51 @@ class HAClient:
                 msg = json_mod.loads(ws.recv(timeout=ws_timeout))
 
                 if msg.get("success"):
-                    response = msg.get("result", {}).get("response", {})
-                    speech = (
-                        response.get("response", {})
-                        .get("speech", {})
-                        .get("plain", {})
-                        .get("speech", "")
+                    service_response = (msg.get("result", {}) or {}).get("response", {}) or {}
+                    intent_response = service_response.get("response", {}) or {}
+                    response_type = intent_response.get("response_type")
+                    data = intent_response.get("data") or {}
+                    speech_block = intent_response.get("speech", {}) or {}
+                    plain_block = speech_block.get("plain", {}) or {}
+                    speech = plain_block.get("speech", "") or ""
+                    # Structured error gate — never a string match on the speech.
+                    # HA renders an agent-side failure as a normal 200 whose speech
+                    # IS the error text; without this gate the caller's fallback
+                    # chain never fires and the user is read the raw error.
+                    #
+                    # Two of HA's error-typed outcomes are routine intent
+                    # misses, not agent failures: no_intent_match ("I didn't
+                    # understand that") and no_valid_targets ("I couldn't
+                    # find that device"). HA's own speech is the correct
+                    # user-facing answer for both, so they pass through like
+                    # any success. Every other error (an unrecognized or
+                    # missing code — the class where the agent itself blew
+                    # up) is classified as a failure so the caller's
+                    # fallback chain fires.
+                    if response_type == "error":
+                        code = data.get("code")
+                        if code in ("no_intent_match", "no_valid_targets"):
+                            logger.info(
+                                "HA conversation agent returned a routine "
+                                "intent miss (agent_id=%s, code=%s)",
+                                agent_id,
+                                code,
+                            )
+                            return speech if speech else None
+                        logger.warning(
+                            "HA conversation agent returned an error response "
+                            "(agent_id=%s, response_type=%s, code=%s): %s",
+                            agent_id,
+                            response_type,
+                            code,
+                            json_mod.dumps(intent_response)[:500],
+                        )
+                        return None
+                    logger.debug(
+                        "HA conversation.process ok (agent_id=%s, response_type=%s): %s",
+                        agent_id,
+                        response_type,
+                        str(speech)[:200],
                     )
                     return speech if speech else None
                 else:
