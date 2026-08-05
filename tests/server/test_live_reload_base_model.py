@@ -237,6 +237,76 @@ def test_successful_reload_sets_local():
         assert app_module._state["cloud_only_reason"] is None
 
 
+def test_plain_reclaim_success_eagerly_creates_consolidation_loop():
+    """The tail of a successful plain-reclaim reload — the release→acquire
+    and auto-reclaim shape — re-creates the consolidation loop, so
+    /status's adapter_loaded reading does not depend on the next
+    consolidation door running first.  _release_base_model_in_process nulls
+    _state["consolidation_loop"] on release, so without this the reading
+    would revert to lazy after every release→acquire cycle.
+    """
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+    cfg = _server_config()
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": cfg,
+        "topology_assessment": fake_assessment,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_set_voice_pipeline_profile"),
+        patch.object(app_module, "_eager_create_consolidation_loop") as mock_eager,
+    ):
+        app_module._live_reload_base_model()
+
+        mock_eager.assert_called_once_with(cfg)
+
+
+def test_reload_failure_paths_do_not_eagerly_create_consolidation_loop():
+    """Load failure releases the partial allocation and stays cloud-only —
+    the eager-creation gate must not fire (no model resident)."""
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(
+            app_module,
+            "_load_model_into_state",
+            side_effect=RuntimeError("CUDA out of memory"),
+        ),
+        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_eager_create_consolidation_loop") as mock_eager,
+    ):
+        app_module._live_reload_base_model()
+
+        mock_eager.assert_not_called()
+        assert app_module._state["mode"] == "cloud-only"
+
+
 def test_load_failure_releases_and_stays_cloud_only():
     """Load OOMs after the pre-flight passed: the partial allocation is freed
     (a second release pass) and the server stays cloud-only with reason

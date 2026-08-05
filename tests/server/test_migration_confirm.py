@@ -2509,7 +2509,7 @@ class TestBaseSwapStep3ResumeReload:
 
 
 class TestBaseSwapActiveFlag:
-    """Tests for the R2 in-flight guard: base_swap_active flag.
+    """Tests for the base-swap in-flight guard: base_swap_active flag.
 
     Verifies that:
     - Rollback returns 409 while base_swap_active=True.
@@ -2842,8 +2842,9 @@ class TestBaseSwapActiveFlag:
 
 
 class TestGpuAcquireBaseSwapResume:
-    """Tests for the R1 hook: /gpu/acquire re-launches orchestration when
-    reload succeeds and a phaseA_done base-swap marker exists.
+    """Tests for the deferred base-swap re-launch hook: /gpu/acquire
+    re-launches orchestration when reload succeeds and a phaseA_done
+    base-swap marker exists.
     """
 
     def _make_cloud_only_state(self, tmp_path: Path) -> dict:
@@ -2921,7 +2922,7 @@ class TestGpuAcquireBaseSwapResume:
 
         monkeypatch.setattr(_app, "_run_base_swap_orchestration", _fake_orchestration)
 
-        def _fake_reload():
+        def _fake_reload(**_kw):
             # Simulate successful reload.
             state["mode"] = "local"
             state["cloud_only_reason"] = None
@@ -2951,10 +2952,12 @@ class TestGpuAcquireBaseSwapResume:
         assert call.get("new_model") == "qwen3-4b"
 
     def test_gpu_acquire_does_not_relaunch_when_active(self, tmp_path, monkeypatch):
-        """When base_swap_active=True, /gpu/acquire must not re-launch orchestration.
+        """When base_swap_active=True, /gpu/acquire refuses outright (409)
+        and never reaches the reload dispatch or the relaunch hook.
 
-        The orchestration is already running — re-launching would cause a
-        concurrent double-execution.
+        The orchestration is already running — reloading (let alone
+        re-launching it) while it is active would race a concurrent
+        double-execution.
         """
         import paramem.server.app as _app
 
@@ -2969,7 +2972,7 @@ class TestGpuAcquireBaseSwapResume:
 
         monkeypatch.setattr(_app, "_run_base_swap_orchestration", _fake_orchestration)
 
-        def _fake_reload():
+        def _fake_reload(**_kw):
             state["mode"] = "local"
             state["cloud_only_reason"] = None
 
@@ -2985,7 +2988,12 @@ class TestGpuAcquireBaseSwapResume:
             client = TestClient(_app.app, raise_server_exceptions=False)
             resp = client.post("/gpu/acquire")
 
-        assert resp.status_code == 200, resp.text
+        # /gpu/acquire now refuses outright (409 base_swap_active) while the
+        # orchestration is actively running — it never reaches the reload
+        # dispatch or the relaunch hook at all, so this is a stronger
+        # guarantee than "the hook itself declines to relaunch".
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "base_swap_active"
         assert len(orchestration_calls) == 0, (
             "Must not re-launch orchestration while base_swap_active=True"
         )

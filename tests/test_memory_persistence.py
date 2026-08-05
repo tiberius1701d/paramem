@@ -27,6 +27,7 @@ from paramem.memory.persistence import (
     erase_keys_from_graph_file,
     iter_entries,
     load_memory_from_disk,
+    reap_tier_artifacts,
     save_memory_to_disk,
 )
 
@@ -488,7 +489,7 @@ class TestBuildTierGraphKeyError:
 
 
 # ---------------------------------------------------------------------------
-# 9b. build_tier_graph_from_store: stale-key projection (R2-MAJOR / R3-1)
+# 9b. build_tier_graph_from_store: stale-key projection
 # ---------------------------------------------------------------------------
 
 
@@ -561,7 +562,9 @@ class TestBuildTierGraphStaleProjection:
     def test_existing_happy_path_still_works_replay_disabled(self):
         """Replay-disabled store (the existing happy-path pattern) still projects correctly.
 
-        R3-1 chose the is_stale-FILTER variant precisely to keep replay-disabled
+        The stale-key projection filters via the registry's own active/stale
+        distinction (``tier_simhashes(include_stale=False)``) rather than the
+        store's ``replay_enabled`` flag, precisely to keep replay-disabled
         stores working.  This test mirrors the existing TestBuildTierGraphFromStore
         setup (MemoryStore(replay_enabled=False), register=False) to confirm that
         path is unaffected.
@@ -778,3 +781,112 @@ class TestEraseKeysFromGraphFile:
         save_memory_to_disk(g, path)
         result = erase_keys_from_graph_file(path, {"graph1"})
         assert type(result) is int
+
+
+# ---------------------------------------------------------------------------
+# reap_tier_artifacts — shape derived from tier_root, never a caller flag
+# ---------------------------------------------------------------------------
+
+
+class TestReapTierArtifacts:
+    def test_main_tier_root_keeps_interim_children(self, tmp_path):
+        """A main tier root (e.g. ``episodic/``) keeps its ``interim_*``
+        children — those are separate tiers, not this tier's own artifacts."""
+        tier_root = tmp_path / "episodic"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+        interim = tier_root / "interim_20260417T0000"
+        interim.mkdir()
+        (interim / "adapter_model.safetensors").write_bytes(b"")
+
+        removed = reap_tier_artifacts(tier_root)
+
+        assert not slot.exists()
+        assert interim.exists()
+        assert tier_root.exists(), "root must survive — an interim child remains"
+        assert slot in removed
+        assert interim not in removed
+
+    def test_semantic_root_removes_interim_scratch_children(self, tmp_path):
+        """Only ``episodic/`` spares ``interim_*`` children — under
+        ``semantic``/``procedural`` an ``interim_<stamp>/`` dir is HF Trainer
+        scratch (``ConsolidationLoop._training_output_dir`` builds one for
+        any adapter's interim training scope), not a separate tier, so it
+        must be removed like any other child and the root must fully empty
+        (including rmdir'ing the root itself)."""
+        tier_root = tmp_path / "semantic"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+        scratch = tier_root / "interim_20260417T0000"
+        scratch.mkdir()
+        (scratch / "checkpoint-10").mkdir()
+
+        removed = reap_tier_artifacts(tier_root)
+
+        assert not tier_root.exists(), "root must be fully removed, not left with scratch"
+        assert not scratch.exists()
+        assert tier_root in removed
+        assert scratch in removed
+
+    def test_main_tier_root_rmdir_when_emptied(self, tmp_path):
+        """A main tier root with no ``interim_*`` children is removed itself
+        once its other children are gone."""
+        tier_root = tmp_path / "semantic"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+
+        removed = reap_tier_artifacts(tier_root)
+
+        assert not tier_root.exists()
+        assert tier_root in removed
+        assert slot in removed
+
+    def test_interim_slot_root_removed_whole(self, tmp_path):
+        """An interim slot root (name starts with ``interim_``) is removed
+        in its entirety, including nested content."""
+        episodic_root = tmp_path / "episodic"
+        interim_root = episodic_root / "interim_20260417T0000"
+        nested_slot = interim_root / "20260417-120000"
+        nested_slot.mkdir(parents=True)
+        (nested_slot / "adapter_model.safetensors").write_bytes(b"")
+
+        removed = reap_tier_artifacts(interim_root)
+
+        assert not interim_root.exists()
+        assert interim_root in removed
+        assert nested_slot in removed
+
+    def test_absent_root_returns_empty_list(self, tmp_path):
+        """A tier_root that does not exist on disk returns []."""
+        missing = tmp_path / "episodic"
+        assert reap_tier_artifacts(missing) == []
+
+    def test_idempotent_second_call(self, tmp_path):
+        """Calling reap_tier_artifacts a second time on an already-reaped
+        root is a safe no-op returning []."""
+        tier_root = tmp_path / "procedural"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+
+        first = reap_tier_artifacts(tier_root)
+        second = reap_tier_artifacts(tier_root)
+
+        assert first != []
+        assert second == []
+        assert not tier_root.exists()
+
+    def test_removed_paths_are_deepest_first(self, tmp_path):
+        """Returned paths order files/subdirs ahead of their parent so a
+        caller replaying the list top-to-bottom never orphans anything."""
+        tier_root = tmp_path / "episodic"
+        slot = tier_root / "20260417-120000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+
+        removed = reap_tier_artifacts(tier_root)
+
+        depths = [len(p.parts) for p in removed]
+        assert depths == sorted(depths, reverse=True)

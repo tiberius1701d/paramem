@@ -1,10 +1,13 @@
 """Tests for ``POST /speaker/forget``.
 
 Mocked — no GPU, no real model.  Mirrors the mocking style of
-``tests/server/test_gates.py`` and ``tests/server/test_integrity_endpoint.py``.
+``tests/server/test_gates.py`` and ``tests/server/test_interim_discard.py``.
 
 Coverage
 --------
+- Guard: the same four ``_consolidation_dispatch_guards`` verdicts as
+  ``POST /interim/discard`` (consolidating / bg-training / cloud-only /
+  trial-active) refuse with 409 and no store mutation.
 - ``store.discard_keys(keys, mode="erase")`` called with exactly the keys
   resolved via ``store.iter_bookkeeping()`` for the speaker: full retirement
   (entry payload, registry — GONE from both active and stale — and
@@ -13,11 +16,22 @@ Coverage
   ``graph.json`` has the erased keys' edges surgically removed
   (``persistence.erase_keys_from_graph_file``); ``loop.promoted_keys`` and
   on-disk ``key_metadata.json`` no longer carry the erased keys.
+- A tier reduced to zero known keys by the erase is reaped instead of
+  manifest re-stamped: live PEFT unmount (``detach_adapters``) plus on-disk
+  artifact removal (``reap_tier_artifacts``), for both interim and main
+  tiers, always leaving a serviceable model (``ensure_adapters`` + episodic
+  switch + ``_state["model"]`` re-publish).  A surviving tier keeps today's
+  registry-level posture (re-stamp, not reaped).
+- Ring-lifecycle incidents resolved only when this forget's reap empties the
+  interim ring entirely; untouched when a sibling interim tier survives.
 - Speaker profile removed: ``speaker_store.remove`` called; response reflects
   the bool return.
 - Pending sessions for the speaker discarded: ``discard_sessions`` called;
   response lists them.
-- ``consolidation_loop is None`` → 503 with ``"not_ready"`` status detail.
+- Router reloaded exactly once after the mutation.
+- ``_state["consolidating"]`` is ``True`` for the duration of the mutation
+  and cleared in a ``finally`` regardless of outcome (including a reap
+  failure, which propagates as a 500).
 - Auth: ``/speaker/forget`` carries the ``require_admin`` dependency in the
   real app route table.
 """
@@ -32,6 +46,7 @@ from unittest.mock import MagicMock, patch
 
 import networkx as nx
 from fastapi.testclient import TestClient
+from peft import PeftModel
 
 import paramem.server.app as app_module
 from paramem.adapters.manifest import (
@@ -52,6 +67,7 @@ from paramem.memory.persistence import (
     save_memory_to_disk,
 )
 from paramem.memory.store import MemoryStore
+from paramem.server.incidents import read_incidents, record_incident
 from paramem.training.key_registry import KeyRegistry
 
 # ---------------------------------------------------------------------------
@@ -72,6 +88,8 @@ def _make_config(tmp_path: Path) -> MagicMock:
     adapter_dir.mkdir(parents=True, exist_ok=True)
     cfg.adapter_dir = adapter_dir
     cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
+    cfg.paths = MagicMock()
+    cfg.paths.data = tmp_path / "data"
     return cfg
 
 
@@ -91,6 +109,21 @@ def _prep_loop_for_save_key_metadata(loop: MagicMock) -> None:
     loop.trial_key_metadata_path = None
 
 
+def _make_peft_model(*adapter_names: str) -> MagicMock:
+    """Stub PeftModel — mirrors ``_make_peft_model`` in
+    ``tests/server/test_interim_discard.py``: a real dict-backed
+    ``peft_config`` so membership/iteration/deletion behave like PEFT.
+    """
+    model = MagicMock(spec=PeftModel)
+    model.peft_config = {name: MagicMock() for name in adapter_names}
+
+    def _delete_adapter(name: str) -> None:
+        model.peft_config.pop(name, None)
+
+    model.delete_adapter.side_effect = _delete_adapter
+    return model
+
+
 def _make_loop_with_store(store: MemoryStore) -> MagicMock:
     """Build a MagicMock ConsolidationLoop wrapping a real MemoryStore.
 
@@ -101,10 +134,20 @@ def _make_loop_with_store(store: MemoryStore) -> MagicMock:
     post-erase ``loop.promoted_keys.difference_update(...)`` +
     ``_save_key_metadata(loop, config)`` call does not crash on mock
     plumbing unrelated to the behaviour under test.
+
+    Also wires ``loop.model`` (a bare, non-PEFT ``MagicMock`` by default —
+    ``detach_adapters`` no-ops on it) and ``loop.ensure_adapters`` (returns
+    whatever ``loop.model`` currently is, read dynamically at call time) so
+    the reap path (``_reap_emptied_tiers``) has something to call without
+    crashing on tests that never exercise a reap.  Tests exercising an
+    actual reap replace ``loop.model`` with a :func:`_make_peft_model` stub
+    before posting.
     """
     loop = MagicMock()
     loop.store = store
     _prep_loop_for_save_key_metadata(loop)
+    loop.model = MagicMock()
+    loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
     return loop
 
 
@@ -132,6 +175,8 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     """
     loop = MagicMock()
     _prep_loop_for_save_key_metadata(loop)
+    loop.model = MagicMock()
+    loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
 
     # iter_bookkeeping returns bookkeeping records keyed by speaker_id.
     # The handler iterates all records and filters by record.get("speaker_id").
@@ -186,13 +231,43 @@ def _make_state(
     speaker_store=None,
     buffer=None,
     config=None,
+    mode: str = "local",
+    consolidating: bool = False,
+    background_trainer=None,
+    migration=None,
+    router=None,
+    adapter_manifest_status=None,
 ) -> dict:
-    """Build a minimal _state dict for endpoint tests."""
+    """Build a minimal _state dict for endpoint tests.
+
+    Extended (2026-08-05) with the keys the guard/reap rework reads:
+    ``mode``/``consolidating``/``background_trainer``/``migration`` feed
+    ``_consolidation_dispatch_guards`` (plain ``dict[...]`` access, so every
+    caller of this helper must set them — the guard would otherwise
+    ``KeyError``); ``router`` is reloaded in the handler's no-await tail;
+    ``adapter_manifest_status`` is popped per reaped tier by
+    ``_reap_emptied_tiers``.  ``model``/``tokenizer``/``memory_store`` mirror
+    what the real lifespan publishes — ``memory_store`` is the SAME object as
+    ``loop.store`` so a caller inspecting either sees identical state, and
+    ``model`` is the same object as ``loop.model`` so a reap's
+    ``_state["model"]`` re-publish is observable via either handle.
+    """
     return {
         "config": config or _make_config(tmp_path),
         "consolidation_loop": loop,
         "speaker_store": speaker_store,
         "session_buffer": buffer or MagicMock(),
+        "mode": mode,
+        "consolidating": consolidating,
+        "background_trainer": background_trainer,
+        "migration": migration,
+        "router": router or MagicMock(),
+        "adapter_manifest_status": (
+            adapter_manifest_status if adapter_manifest_status is not None else {}
+        ),
+        "model": loop.model if loop is not None else MagicMock(),
+        "tokenizer": None,
+        "memory_store": loop.store if loop is not None else MagicMock(),
     }
 
 
@@ -231,7 +306,7 @@ class TestMarkStaleKeys:
         body = resp.json()
 
         # Response lists stale keys (sorted).
-        assert sorted(body["stale_keys"]) == sorted(keys)
+        assert sorted(body["erased_keys"]) == sorted(keys)
 
         # iter_bookkeeping was called (not keys_for_speaker which used merger.graph).
         loop.store.iter_bookkeeping.assert_called_once_with()
@@ -321,7 +396,7 @@ class TestMarkStaleKeys:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["stale_keys"] == []
+        assert body["erased_keys"] == []
         # No registry saves because there are no keys to process.
         mock_save.assert_not_called()
         loop.store.discard_keys.assert_not_called()
@@ -474,23 +549,26 @@ class TestPendingSessionDiscard:
 
 
 class TestErrorCases:
-    """consolidation_loop is None → 503."""
+    """Cloud-only mode (no local model / consolidation loop) refuses with 409."""
 
-    def test_consolidation_loop_none_returns_503(self, tmp_path, monkeypatch):
-        """When consolidation_loop is None, endpoint returns 503 with not_ready detail."""
+    def test_cloud_only_refuses_409(self, tmp_path, monkeypatch):
+        """When the server is cloud-only, the guard refuses before the loop
+        is ever touched — inverts the old "loop is None -> 503" behaviour:
+        the loop is now get-or-created lazily, so absence alone is no longer
+        an error condition; only the guard's cloud_only verdict is."""
         state = _make_state(
             tmp_path,
             loop=None,
             speaker_store=_make_speaker_store("speaker0"),
             buffer=MagicMock(),
+            mode="cloud-only",
         )
 
         client = _make_client(monkeypatch, state)
         resp = client.post("/speaker/forget", json={"speaker_id": "speaker0"})
 
-        assert resp.status_code == 503
-        detail = resp.json().get("detail", {})
-        assert detail.get("status") == "not_ready"
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "cloud_only"
 
     def test_legacy_strategy_field_is_ignored_not_rejected(self, tmp_path, monkeypatch):
         """A caller still sending a retired ``strategy`` field is unaffected: the
@@ -777,12 +855,16 @@ class TestLiveSlotManifestReStamp:
         """
         tier_name = "episodic"
         key_to_forget = "graph1"
+        key_to_keep = "graph2"
         speaker_id = "speaker0"
 
-        # Build a real KeyRegistry with the key.
+        # Build a real KeyRegistry with the key.  A survivor key keeps the
+        # tier non-empty after the erase so this test stays on the re-stamp
+        # branch under test rather than falling into the reap branch.
         real_store = MemoryStore(replay_enabled=True)
         ep_reg = real_store.registry(tier_name)
         ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
 
         # seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
         real_store.set_bookkeeping(
@@ -839,11 +921,15 @@ class TestLiveSlotManifestReStamp:
         """
         tier_name = "episodic"
         key_to_forget = "graph1"
+        key_to_keep = "graph2"
         speaker_id = "speaker0"
 
+        # A survivor key keeps the tier non-empty after the erase so this
+        # test stays on the re-stamp branch under test.
         real_store = MemoryStore(replay_enabled=True)
         ep_reg = real_store.registry(tier_name)
         ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
         real_store.set_bookkeeping(
             key_to_forget,
             speaker_id=speaker_id,
@@ -898,11 +984,15 @@ class TestLiveSlotManifestReStamp:
         "there is no slot to re-stamp".  Must not log an ERROR."""
         tier_name = "episodic"
         key_to_forget = "graph1"
+        key_to_keep = "graph2"
         speaker_id = "speaker0"
 
+        # A survivor key keeps the tier non-empty after the erase so this
+        # test stays on the re-stamp branch under test.
         real_store = MemoryStore(replay_enabled=True)
         ep_reg = real_store.registry(tier_name)
         ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
         real_store.set_bookkeeping(
             key_to_forget,
             speaker_id=speaker_id,
@@ -997,6 +1087,16 @@ class TestInterimTierForget:
             relation_type="episodic",
             first_seen="",
         )
+        # key_to_keep belongs to a different speaker — a deliberate survivor
+        # (not an un-bookkept orphan) so the tier is genuinely non-empty
+        # after the erase and this test stays on the re-stamp branch; the
+        # reap branch has its own sibling test right below.
+        real_store.set_bookkeeping(
+            key_to_keep,
+            speaker_id="speaker1",
+            relation_type="episodic",
+            first_seen="",
+        )
 
         # The REAL nested interim root: adapter_dir/episodic/interim_<stamp>/.
         interim_root = adapter_dir / "episodic" / f"interim_{stamp}"
@@ -1054,6 +1154,80 @@ class TestInterimTierForget:
         assert manifest_after.registry_sha256 == h_new
         assert find_live_slot(interim_root, h_new) == slot_dir
         assert find_live_slot(interim_root, h_old) is None
+
+    def test_interim_tier_fully_emptied_is_reaped_not_restamped(self, tmp_path, monkeypatch):
+        """Sibling of the test above: no survivor key this time, so the
+        nested interim root is reaped wholesale instead of re-stamped — the
+        on-disk dir is gone, not left with a re-stamped (but now-erased)
+        registry."""
+        from paramem.memory.interim_adapter import (
+            INTERIM_NAME_PREFIX,
+            detect_legacy_adapter_layout,
+        )
+
+        stamp = "20260803T1300"
+        tier_name = f"{INTERIM_NAME_PREFIX}{stamp}"
+        key_to_forget = "graph1"
+        speaker_id = "speaker0"
+
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+
+        real_store = MemoryStore(replay_enabled=True)
+        interim_reg = real_store.registry(tier_name)
+        interim_reg.add(key_to_forget)
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            relation_type="episodic",
+            first_seen="",
+        )
+
+        interim_root = adapter_dir / "episodic" / f"interim_{stamp}"
+        interim_reg.save(interim_root / "indexed_key_registry.json")
+        slot_dir = interim_root / "20260803-130000"
+        slot_dir.mkdir(parents=True)
+        write_manifest(
+            slot_dir,
+            _minimal_manifest_for_tier(
+                tier_name, hashlib.sha256(interim_reg.save_bytes()).hexdigest(), key_count=1
+            ),
+        )
+
+        cfg = _make_config(tmp_path)
+        assert cfg.adapter_dir == adapter_dir
+
+        model = _make_peft_model("episodic", "semantic", "procedural", tier_name)
+        loop = _make_loop_with_store(real_store)
+        loop.model = model
+        loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["reaped_tiers"] == [tier_name]
+        assert body["unloaded_adapters"] == [tier_name]
+        assert body["removed_dirs"] == [f"interim_{stamp}"]
+
+        # No legacy top-level dir was minted either.
+        assert detect_legacy_adapter_layout(adapter_dir) == []
+        assert not (adapter_dir / tier_name).exists()
+
+        # The whole nested interim root is gone — not left behind re-stamped.
+        assert not interim_root.exists()
+        assert tier_name not in real_store.tiers_with_registry()
+        assert tier_name not in model.peft_config
+        assert "episodic" in model.peft_config
 
     def test_malformed_interim_tier_name_aborts_before_mutation(self, tmp_path, monkeypatch):
         """A malformed interim tier name errors BEFORE the store is mutated."""
@@ -1150,17 +1324,24 @@ class TestFullRetirement:
 
         first = client.post("/speaker/forget", json={"speaker_id": speaker_id})
         assert first.status_code == 200, first.text
-        assert first.json()["stale_keys"] == [key]
+        assert first.json()["erased_keys"] == [key]
 
         second = client.post("/speaker/forget", json={"speaker_id": speaker_id})
         assert second.status_code == 200, second.text
         body = second.json()
-        assert body["stale_keys"] == []
+        assert body["erased_keys"] == []
         assert body["removed_speaker"] is False
 
     def test_bookkeeping_entries_and_router_index_cleared(self, tmp_path, monkeypatch):
         """After forget: bookkeeping gone, entry payload gone, and a QueryRouter
-        rebuilt on the same store indexes no keys for the speaker."""
+        rebuilt on the same store indexes no keys for the speaker.
+
+        The independent ``QueryRouter`` rebuild below proves the STORE state
+        is correct but says nothing about whether the handler itself reloads
+        the live ``_state["router"]`` — that used to be unverified here,
+        which masked the (now-fixed) missing reload; the state's own router
+        mock is asserted directly too.
+        """
         from paramem.server.router import QueryRouter
 
         speaker_id = "speaker0"
@@ -1195,6 +1376,9 @@ class TestFullRetirement:
 
         router = QueryRouter(cfg.adapter_dir, real_store)
         assert router._speaker_key_index.get(speaker_id, set()) == set()
+
+        # The live state's own router mock was reloaded by the handler.
+        state["router"].reload.assert_called_once_with()
 
     def test_promoted_keys_and_key_metadata_rewritten(self, tmp_path, monkeypatch):
         """loop.promoted_keys drops the forgotten key and key_metadata.json on
@@ -1449,7 +1633,7 @@ class TestForgetThenMigrateDoesNotResurrect:
         client = _make_client(monkeypatch, state)
         resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
         assert resp.status_code == 200, resp.text
-        assert resp.json()["stale_keys"] == [key_to_forget]
+        assert resp.json()["erased_keys"] == [key_to_forget]
 
         # --- run the real migrate() against the handler's own output dir,
         # with the GPU stack stubbed like test_happy_path_orchestration ---
@@ -1507,3 +1691,537 @@ class TestForgetThenMigrateDoesNotResurrect:
         on_disk_registry_path = cfg.adapter_dir / tier_name / "indexed_key_registry.json"
         on_disk = json.loads(on_disk_registry_path.read_bytes())
         assert key_to_forget not in on_disk.get("active_keys", [])
+
+
+# ---------------------------------------------------------------------------
+# Guard matrix — consolidating / bg-training / cloud-only / trial-active all
+# refuse with 409 and never touch the store.  Mirrors
+# tests/server/test_interim_discard.py::TestGuardMatrix.
+# ---------------------------------------------------------------------------
+
+
+class TestGuardMatrix:
+    def _assert_refused_without_mutation(self, monkeypatch, state):
+        speaker_id = "speaker0"
+        loop = _make_loop(speaker_id, ["graph1"])
+        state["consolidation_loop"] = loop
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        return resp, loop
+
+    def test_consolidating_refuses_409(self, tmp_path, monkeypatch):
+        state = _make_state(tmp_path, consolidating=True)
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, state)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidating"
+        loop.store.discard_keys.assert_not_called()
+
+    def test_bg_training_refuses_409(self, tmp_path, monkeypatch):
+        trainer = MagicMock()
+        trainer.is_training = True
+        state = _make_state(tmp_path, background_trainer=trainer)
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, state)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "training_active"
+        loop.store.discard_keys.assert_not_called()
+
+    def test_cloud_only_refuses_409(self, tmp_path, monkeypatch):
+        state = _make_state(tmp_path, mode="cloud-only")
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, state)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "cloud_only"
+        loop.store.discard_keys.assert_not_called()
+
+    def test_trial_active_refuses_409(self, tmp_path, monkeypatch):
+        state = _make_state(tmp_path, migration={"state": "TRIAL"})
+        resp, loop = self._assert_refused_without_mutation(monkeypatch, state)
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "trial_active"
+        loop.store.discard_keys.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Reap: a tier this forget reduces to zero known keys is unmounted and
+# deleted on the spot, instead of manifest re-stamped (owner decision,
+# 2026-08-04).
+# ---------------------------------------------------------------------------
+
+
+class TestReapEmptiedTiers:
+    def test_emptied_interim_slot_reaped(self, tmp_path, monkeypatch):
+        """Sole key in an interim tier: tier gone from the store, its PEFT
+        adapter deleted, its slot dir gone, its manifest_status row popped,
+        and the response lists it."""
+        stamp = "20260805T1200"
+        tier_name = f"episodic_interim_{stamp}"
+        key = "graph1"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        interim_reg = real_store.registry(tier_name)
+        interim_reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="episodic", first_seen=""
+        )
+
+        interim_root = cfg.adapter_dir / "episodic" / f"interim_{stamp}"
+        interim_reg.save(interim_root / "indexed_key_registry.json")
+        slot_dir = interim_root / "20260805-120000"
+        slot_dir.mkdir(parents=True)
+        write_manifest(
+            slot_dir,
+            _minimal_manifest_for_tier(
+                tier_name, hashlib.sha256(interim_reg.save_bytes()).hexdigest(), key_count=1
+            ),
+        )
+
+        model = _make_peft_model("episodic", "semantic", "procedural", tier_name)
+        loop = _make_loop_with_store(real_store)
+        loop.model = model
+        loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+        state["adapter_manifest_status"] = {
+            tier_name: {"status": "healthy"},
+            "episodic": {"status": "healthy"},
+        }
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["reaped_tiers"] == [tier_name]
+        assert body["unloaded_adapters"] == [tier_name]
+        assert body["removed_dirs"] == [f"interim_{stamp}"]
+
+        assert tier_name not in real_store.tiers_with_registry()
+        assert tier_name not in model.peft_config
+        assert not interim_root.exists()
+        assert tier_name not in state["adapter_manifest_status"]
+        assert "episodic" in state["adapter_manifest_status"]
+
+    def test_sibling_interim_slot_with_other_speaker_keys_survives(self, tmp_path, monkeypatch):
+        """Two interim tiers, each holding a different speaker's key: only
+        the forgotten speaker's tier is reaped; the sibling is untouched in
+        the store, on disk, and in PEFT."""
+        stamp_a = "20260805T1200"
+        stamp_b = "20260805T1300"
+        tier_a = f"episodic_interim_{stamp_a}"
+        tier_b = f"episodic_interim_{stamp_b}"
+        speaker_id = "speaker0"
+        other_speaker = "speaker1"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        reg_a = real_store.registry(tier_a)
+        reg_a.add("graph1")
+        real_store.set_bookkeeping(
+            "graph1", speaker_id=speaker_id, relation_type="episodic", first_seen=""
+        )
+        reg_b = real_store.registry(tier_b)
+        reg_b.add("graph2")
+        real_store.set_bookkeeping(
+            "graph2", speaker_id=other_speaker, relation_type="episodic", first_seen=""
+        )
+
+        root_a = cfg.adapter_dir / "episodic" / f"interim_{stamp_a}"
+        reg_a.save(root_a / "indexed_key_registry.json")
+        root_b = cfg.adapter_dir / "episodic" / f"interim_{stamp_b}"
+        reg_b.save(root_b / "indexed_key_registry.json")
+
+        model = _make_peft_model("episodic", tier_a, tier_b)
+        loop = _make_loop_with_store(real_store)
+        loop.model = model
+        loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["reaped_tiers"] == [tier_a]
+
+        assert tier_a not in real_store.tiers_with_registry()
+        assert tier_b in real_store.tiers_with_registry()
+        assert not root_a.exists()
+        assert root_b.exists()
+        assert tier_a not in model.peft_config
+        assert tier_b in model.peft_config
+
+    def test_emptied_main_tier_reaped_to_pristine_shape(self, tmp_path, monkeypatch):
+        """Sole key in a main tier: the tier root's registry + weight slot
+        are gone, but a sibling ``interim_*`` child under the same root
+        survives untouched — reap_tier_artifacts never removes an
+        ``interim_*`` child, and the root itself is left standing because
+        the child keeps it non-empty."""
+        tier_name = "episodic"
+        key = "graph1"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        tier_root = cfg.adapter_dir / tier_name
+        reg.save(tier_root / "indexed_key_registry.json")
+        slot_dir = tier_root / "20260805-120000"
+        slot_dir.mkdir(parents=True)
+        write_manifest(
+            slot_dir,
+            _minimal_manifest_for_tier(
+                tier_name, hashlib.sha256(reg.save_bytes()).hexdigest(), key_count=1
+            ),
+        )
+        # A sibling live interim tier nested under the same root — must survive.
+        interim_child = tier_root / "interim_20260805T1400"
+        interim_child.mkdir(parents=True)
+        (interim_child / "graph.json").write_text("{}")
+
+        loop = _make_loop_with_store(real_store)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["reaped_tiers"] == [tier_name]
+
+        assert not (tier_root / "indexed_key_registry.json").exists()
+        assert not slot_dir.exists()
+        assert tier_root.exists(), "root must survive — the interim child keeps it non-empty"
+        assert interim_child.exists()
+        assert (interim_child / "graph.json").exists()
+        loop.ensure_adapters.assert_called_once()
+
+    def test_total_wipe_leaves_serviceable_model(self, tmp_path, monkeypatch):
+        """All three main tiers emptied at once: every adapter is detached,
+        ensure_adapters is called exactly once to rebuild a serviceable
+        model, that fresh model is re-published to _state["model"], and its
+        active adapter is switched to episodic."""
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        for tier, key in (
+            ("episodic", "graph1"),
+            ("semantic", "graph2"),
+            ("procedural", "graph3"),
+        ):
+            reg = real_store.registry(tier)
+            reg.add(key)
+            real_store.set_bookkeeping(
+                key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+            )
+            reg.save(cfg.adapter_dir / tier / "indexed_key_registry.json")
+
+        original_model = _make_peft_model("episodic", "semantic", "procedural")
+        fresh_model = _make_peft_model("episodic")
+
+        loop = _make_loop_with_store(real_store)
+        loop.model = original_model
+        loop.ensure_adapters = MagicMock(return_value=fresh_model)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert sorted(body["reaped_tiers"]) == ["episodic", "procedural", "semantic"]
+        assert sorted(body["unloaded_adapters"]) == ["episodic", "procedural", "semantic"]
+
+        loop.ensure_adapters.assert_called_once()
+        assert state["model"] is fresh_model
+        fresh_model.set_adapter.assert_called_once_with("episodic")
+
+
+# ---------------------------------------------------------------------------
+# A surviving tier keeps today's registry-level posture — not reaped.
+# ---------------------------------------------------------------------------
+
+
+class TestPartialForgetKeepsPosture:
+    def test_survivor_tier_not_reaped(self, tmp_path, monkeypatch):
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key_to_forget)
+        reg.add(key_to_keep)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+        tier_root = cfg.adapter_dir / tier_name
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["reaped_tiers"] == []
+        assert body["unloaded_adapters"] == []
+        assert body["removed_dirs"] == []
+        assert tier_root.exists()
+        assert (tier_root / "indexed_key_registry.json").exists()
+        assert tier_name in real_store.tiers_with_registry()
+
+
+# ---------------------------------------------------------------------------
+# Router reload
+# ---------------------------------------------------------------------------
+
+
+class TestRouterReloadedOnce:
+    def test_router_reload_called_once(self, tmp_path, monkeypatch):
+        speaker_id = "speaker0"
+        loop = _make_loop(speaker_id, [])
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        state["router"].reload.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Ring-lifecycle incidents — resolved only when this forget's reap empties
+# the interim ring entirely.
+# ---------------------------------------------------------------------------
+
+
+class TestRingIncidentsOnReap:
+    def _record_ring_incidents(self, state_dir):
+        for t in (
+            "full_consolidation_overdue",
+            "interim_cap_reached",
+            "interim_overflow_pending",
+            "vram_exhausted",
+        ):
+            record_incident(
+                state_dir, type=t, key="k1", severity="warning", summary="test", detail={}
+            )
+
+    def test_incidents_resolved_when_ring_fully_emptied(self, tmp_path, monkeypatch):
+        stamp = "20260805T1200"
+        tier_name = f"episodic_interim_{stamp}"
+        key = "graph1"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        state_dir = cfg.paths.data / "state"
+        self._record_ring_incidents(state_dir)
+
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="episodic", first_seen=""
+        )
+        interim_root = cfg.adapter_dir / "episodic" / f"interim_{stamp}"
+        reg.save(interim_root / "indexed_key_registry.json")
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        incidents = {i.type: i for i in read_incidents(state_dir)}
+        for t in ("full_consolidation_overdue", "interim_cap_reached", "interim_overflow_pending"):
+            assert incidents[t].status == "resolved"
+        assert incidents["vram_exhausted"].status == "active"
+
+    def test_incidents_untouched_when_sibling_interim_survives(self, tmp_path, monkeypatch):
+        stamp_a = "20260805T1200"
+        stamp_b = "20260805T1300"
+        tier_a = f"episodic_interim_{stamp_a}"
+        tier_b = f"episodic_interim_{stamp_b}"
+        speaker_id = "speaker0"
+        other_speaker = "speaker1"
+
+        cfg = _make_config(tmp_path)
+        state_dir = cfg.paths.data / "state"
+        self._record_ring_incidents(state_dir)
+
+        real_store = MemoryStore(replay_enabled=True)
+        reg_a = real_store.registry(tier_a)
+        reg_a.add("graph1")
+        real_store.set_bookkeeping(
+            "graph1", speaker_id=speaker_id, relation_type="episodic", first_seen=""
+        )
+        reg_b = real_store.registry(tier_b)
+        reg_b.add("graph2")
+        real_store.set_bookkeeping(
+            "graph2", speaker_id=other_speaker, relation_type="episodic", first_seen=""
+        )
+        root_a = cfg.adapter_dir / "episodic" / f"interim_{stamp_a}"
+        root_b = cfg.adapter_dir / "episodic" / f"interim_{stamp_b}"
+        reg_a.save(root_a / "indexed_key_registry.json")
+        reg_b.save(root_b / "indexed_key_registry.json")
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        incidents = {i.type: i for i in read_incidents(state_dir)}
+        for t in ("full_consolidation_overdue", "interim_cap_reached", "interim_overflow_pending"):
+            assert incidents[t].status == "active"
+
+
+# ---------------------------------------------------------------------------
+# _state["consolidating"] lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidatingFlagLifecycle:
+    def test_flag_true_during_mutation_false_after(self, tmp_path, monkeypatch):
+        speaker_id = "speaker0"
+        key = "graph1"
+        real_store = MemoryStore(replay_enabled=True)
+        real_store.put(
+            "episodic",
+            key,
+            {"key": key, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            simhash=compute_simhash(key, "Alice", "lives_in", "Berlin"),
+        )
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        observed: list[bool] = []
+        orig_discard_keys = real_store.discard_keys
+
+        def _spy(*args, **kwargs):
+            observed.append(state["consolidating"])
+            return orig_discard_keys(*args, **kwargs)
+
+        monkeypatch.setattr(real_store, "discard_keys", _spy)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        assert observed == [True]
+        assert state["consolidating"] is False
+
+
+# ---------------------------------------------------------------------------
+# Failure path
+# ---------------------------------------------------------------------------
+
+
+class TestReapFailure:
+    def test_reap_failure_returns_500_and_clears_flag(self, tmp_path, monkeypatch):
+        tier_name = "episodic"
+        key = "graph1"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+        reg.save(cfg.adapter_dir / tier_name / "indexed_key_registry.json")
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("reap failed")
+
+        monkeypatch.setattr("paramem.memory.persistence.reap_tier_artifacts", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500
+        assert state["consolidating"] is False

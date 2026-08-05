@@ -134,6 +134,7 @@ def _make_staging_state(tmp_path: Path, tier_diff: list[TierDiffRow], candidate_
         trial=None,
         recovery_required=[],
         parsed_live={},
+        warnings=[],
     )
     state["migration"] = stash
     return state

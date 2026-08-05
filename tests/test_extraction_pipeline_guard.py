@@ -614,7 +614,7 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     }
 
     # Skip adapter wiring — we only care about flag storage on
-    # loop.extraction.config.  __class__ = PeftModel so _ensure_adapters'
+    # loop.extraction.config.  __class__ = PeftModel so ensure_adapters'
     # isinstance check short-circuits without restricting the mock's
     # attribute surface.
     model = MagicMock()

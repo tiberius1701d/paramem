@@ -648,20 +648,38 @@ class SpeakerForgetResponse(BaseModel):
         ``True`` when the speaker profile was found and removed from
         :class:`~paramem.server.speaker.SpeakerStore`.  ``False`` when the
         speaker ID was unknown to the store (no profile to delete).
-    stale_keys:
+    erased_keys:
         Indexed-memory keys that were removed from every per-tier
         :class:`~paramem.training.key_registry.KeyRegistry` and their
-        corresponding SimHash entries — the keys' weights decay naturally
-        through future training cycles.
+        corresponding SimHash entries — a hard erase, not a stale flip.
+        A tier that still holds other keys keeps its resident weights (they
+        decay only through a future training cycle or an operator-invoked
+        ``/reconsolidate``); a tier this erase reduced to zero known keys is
+        reaped immediately instead — see ``reaped_tiers``.
     discarded_sessions:
         Pending conversation IDs that were found in the
         :class:`~paramem.server.session_buffer.SessionBuffer` attributed to
         the speaker and discarded (JSONL deleted, turns dropped).
+    reaped_tiers:
+        Tier names (main or interim) that this erase reduced to zero known
+        keys and that were therefore unmounted and deleted on the spot
+        (owner decision, 2026-08-04) rather than left for a future cycle.
+    unloaded_adapters:
+        PEFT adapter names deleted from the live model as part of the reap
+        (:func:`~paramem.models.loader.detach_adapters`'s return) — empty
+        when no tier was reaped, or in the simulate/non-PEFT venue.
+    removed_dirs:
+        On-disk tier root directory names whose artifacts were removed by
+        the reap (:func:`~paramem.memory.persistence.reap_tier_artifacts`)
+        — empty when no tier was reaped.
     """
 
     removed_speaker: bool
-    stale_keys: list[str]
+    erased_keys: list[str]
     discarded_sessions: list[str]
+    reaped_tiers: list[str]
+    unloaded_adapters: list[str]
+    removed_dirs: list[str]
 
 
 # --- Interim discard schemas ---
@@ -816,6 +834,11 @@ class PreviewResponse(BaseModel):
         similar) when a pre-flight check rejects the preview.  Always present
         in the response so callers can check the field unconditionally
         (Condition 3).
+    warnings:
+        Human-readable rows for adapter tiers skipped during shape-change
+        detection (unreadable/undecryptable tier registry, or an unreadable
+        adapter manifest).  Always present; empty list when nothing was
+        skipped.
     """
 
     state: str
@@ -831,6 +854,7 @@ class PreviewResponse(BaseModel):
     pre_flight_disk_cap_gb: float | None = None
     mode_switch: dict | None = None
     base_change: dict | None = None
+    warnings: list[str] = []
 
 
 # MigrationDiffResponse is an alias — same shape as PreviewResponse.
@@ -1314,11 +1338,174 @@ def _dispatch_finalize(finalize: Callable[[], None]) -> None:
         finalize()
 
 
+def _sweep_keyless_tier_artifacts(config) -> list[str]:
+    """Reap every tier whose on-disk registry legitimately tracks zero keys.
+
+    Runs pre-mount, at the top of :func:`_mount_adapters_from_slots` — before
+    any slot is resolved for any tier, before ``find_live_slot`` is called,
+    and before the boot-degraded hash helper
+    (:func:`_tier_registry_sha256_boot_degraded`) reads any tier's registry.
+    Nothing this sweep removes is ever mounted, and it never unmounts a live
+    adapter — at this point in boot nothing has been mounted yet. The memory
+    store is hydrated later still (the lifespan calls
+    ``_build_config_derived_state`` only after ``_load_model_into_state``
+    returns), so no RAM-resident tier can ever outlive the files this sweep
+    removed. The same call also runs on every live reload —
+    :func:`_live_reload_base_model` reaches this function through its own
+    call to :func:`_load_model_into_state` — but never on a cloud-only boot,
+    because ``_load_model_into_state`` is only invoked when a local model is
+    about to be loaded; a cloud-only server serves nothing from any tier and
+    never reaches this code.
+
+    This is the self-heal for a crash between a hard key erase and the
+    on-disk reap that follows it (``POST /speaker/forget`` persists the
+    emptied registry to disk before it unmounts and deletes the tier's
+    artifacts — see that handler's docstring for the ordering rationale). A
+    kill in that window leaves an empty registry sitting next to a stale
+    slot directory whose manifest still carries the pre-erase hash, which
+    would otherwise permanently fail to match at ``find_live_slot`` and pin
+    a red ``no_matching_slot`` incident forever, since nothing else revisits
+    it. Sweeping first means the doomed slot is gone before mounting is ever
+    attempted, so no later step has to notice or recover from it.
+
+    Walks the three main tier roots UNCONDITIONALLY — this does not consult
+    ``adapters.<tier>.enabled``, unlike the mount loop below. A disabled
+    tier that still knows keys is left untouched regardless (nothing here
+    ever removes a tier with content); a disabled tier whose registry knows
+    zero keys holds only artifacts of zero value, so the disabled flag
+    changes nothing about whether it should be swept.
+
+    Per tier root:
+
+    1. No ``indexed_key_registry.json`` at all — skipped. A payload-bearing
+       directory with no registry is a fresh install, not this sweep's
+       business.
+    2. Registry present but unreadable (corrupt file, failed decrypt) —
+       preserved and logged as an ERROR. An unreadable registry is never
+       inferred to hold zero keys; only a registry that actually answers
+       and says so is swept.
+    3. ``list_known()`` (active ∪ stale) non-empty — preserved. When the
+       tier carries neither adapter weights nor a ``graph.json`` (no
+       payload at all) this is logged as an ERROR naming the known-key
+       count — the same shape a crash-interrupted erase or a torn training
+       write can both produce, and deleting facts that were never folded
+       anywhere else would be a silent data loss.
+    4. ``list_known()`` empty but the registry is NOT affirmatively
+       KeyRegistry-shaped (``KeyRegistry.load_simhashes`` rejects it — no
+       dict-valued ``"simhash"`` section, e.g. a parseable-but-foreign
+       payload like ``"{}"`` or a renamed schema) — preserved and logged as
+       an ERROR. ``KeyRegistry.load`` is tolerant by contract and would
+       otherwise read this shape as "zero known keys"; this check exists so
+       that inference is never trusted for the destructive branch, only for
+       the preserve branch above.
+    5. ``list_known()`` empty AND the registry affirmatively answers
+       KeyRegistry-shaped — the tier's on-disk artifacts are removed via
+       :func:`~paramem.memory.persistence.reap_tier_artifacts` (idempotent;
+       logged as a WARNING naming the tier and the trigger).
+
+    Args:
+        config: Loaded ``ServerConfig``; only ``adapter_dir`` is read.
+
+    Returns:
+        Sorted tier names whose artifacts were actually removed.
+    """
+    from paramem.memory.interim_adapter import (
+        INTERIM_NAME_PREFIX,
+        iter_interim_dirs,
+        slot_payload_kind,
+    )
+    from paramem.memory.persistence import reap_tier_artifacts
+    from paramem.training.key_registry import KeyRegistry
+
+    roots: list[tuple[str, Path]] = [
+        (name, config.adapter_dir / name) for name in ("episodic", "semantic", "procedural")
+    ] + list(iter_interim_dirs(config.adapter_dir))
+
+    reaped: list[str] = []
+    for name, root in roots:
+        reg_path = root / "indexed_key_registry.json"
+        if not reg_path.exists():
+            continue
+
+        try:
+            registry = KeyRegistry.load(reg_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Boot sweep: tier %s registry at %s is unreadable (%s) — preserving",
+                name,
+                reg_path,
+                exc,
+            )
+            continue
+
+        known = registry.list_known()
+        if known:
+            payload_kind = slot_payload_kind(root)
+            if payload_kind is None:
+                logger.error(
+                    "Boot sweep: tier %s has a registry with %d known key(s) but "
+                    "no payload (no adapter weights, no graph.json) — preserving; "
+                    "recover via consolidation fold or registry restore",
+                    name,
+                    len(known),
+                )
+            elif payload_kind == "simulate" and name.startswith(INTERIM_NAME_PREFIX):
+                logger.debug(
+                    "Boot sweep: interim tier %s is a simulate-mode slot "
+                    "(has graph.json, no safetensors) — preserving",
+                    name,
+                )
+            # payload_kind == "train": carries content — nothing to log here.
+            continue
+
+        # known reads empty — before treating that as "legitimately zero
+        # keys" and reaping, confirm the payload is affirmatively
+        # KeyRegistry-shaped. KeyRegistry.load is tolerant by contract (a
+        # parseable-but-foreign payload, e.g. "{}" or a renamed schema,
+        # loads as an empty registry rather than raising), so an unverified
+        # "known is empty" here could be a foreign file that merely looks
+        # empty. load_simhashes refuses anything without a dict-valued
+        # "simhash" section, so a foreign shape lands in the preserve+ERROR
+        # branch instead of a silent delete — deletion only ever happens
+        # when the registry affirmatively answers "zero known keys". This
+        # check is scoped to the empty-known case only: a registry that
+        # already has known keys is preserved above regardless of its
+        # shape, so gating it here as well would only change how that
+        # (already-preserved) case is logged.
+        try:
+            KeyRegistry.load_simhashes(reg_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Boot sweep: tier %s registry at %s reads zero known keys but is "
+                "not affirmatively KeyRegistry-shaped (%s) — preserving rather "
+                "than coercing a foreign schema into a delete",
+                name,
+                reg_path,
+                exc,
+            )
+            continue
+
+        removed = reap_tier_artifacts(root)
+        if removed:
+            reaped.append(name)
+            logger.warning(
+                "Boot sweep: tier %s registry lists zero known keys — removed %d "
+                "stale artifact path(s) (self-heals a crash between a hard key "
+                "erase and its reap, or a torn training write)",
+                name,
+                len(removed),
+            )
+
+    return sorted(reaped)
+
+
 def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     """Load enabled adapters from slot-dir layout with manifest verification.
 
-    Implements the startup validator that sweeps orphan pending dirs, resolves
-    For each enabled adapter kind:
+    Sweeps every tier down to its never-trained shape when its on-disk
+    registry legitimately tracks zero keys
+    (:func:`_sweep_keyless_tier_artifacts`, run first, before any slot is
+    resolved for any tier). For each enabled adapter kind:
 
     1. Sweep orphan ``.pending`` dirs.
     2. Resolve the live registry SHA-256.
@@ -1328,8 +1515,6 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
        ``state["adapter_manifest_status"]``.
 
     Interim adapters (``episodic_interim_*``) are handled with the same logic.
-    The registry consistency check (I5 / orphan-key cleanup) runs here after
-    all mounts complete.
 
     Args:
         model: Base model (or existing PeftModel) to load adapters onto.
@@ -1352,6 +1537,15 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     # tier's slot manifest is stamped with that tier's own registry hash, so
     # slot matching is per-tier (see tier_registry_sha256 /
     # _tier_registry_sha256_boot_degraded).
+
+    # Self-heal any tier whose on-disk registry has already dropped to zero
+    # known keys but whose slot directory/manifest still lingers (crash
+    # window between a hard key erase and its reap, or a torn training
+    # write). Must run BEFORE any slot below is resolved or mounted — see
+    # _sweep_keyless_tier_artifacts's docstring.
+    _swept_tiers = _sweep_keyless_tier_artifacts(config)
+    if _swept_tiers:
+        logger.info("Boot sweep: reaped keyless tier(s): %s", ", ".join(_swept_tiers))
 
     def _load_one(name: str, slot: Path):
         """Mount a single adapter from *slot* onto *model* (mutates nonlocal model).
@@ -1466,83 +1660,6 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             continue
 
         _load_one(_interim_name, slot)
-
-    # ---- I5 — Registry consistency check ----
-    # Drop orphan interim-tier registries that are genuinely torn: registry
-    # written but neither adapter weights NOR a simulate-mode graph.json
-    # landed on disk.
-    #
-    # Slot classification:
-    #   has_weights (adapter_model.safetensors anywhere under slot dir) →
-    #       train-mode slot — keep regardless of graph.json.
-    #   has_graph (graph.json at slot dir root) + no weights →
-    #       simulate-mode slot — keep; wiping it would destroy the prior
-    #       simulate cycle's persisted state on every restart.
-    #   neither →
-    #       genuinely torn write (crash between registry and payload writes)
-    #       — wipe.
-    #
-    # IMPORTANT: this is torn-save cleanup, NOT hash-mismatch cleanup.
-    # ``find_live_slot is None`` is not proof that weights are missing —
-    # it also returns None when slot dirs exist but their manifest's
-    # ``registry_sha256`` does not match the live hash (registry drift
-    # after a partial cycle).  Treating that case as "weights missing"
-    # would ``rmtree`` a fully-trained adapter.  The only legitimate
-    # trigger is "neither weights NOR graph.json present anywhere under
-    # the interim dir".  Hash mismatch is a separate failure mode and is
-    # surfaced via I4 ``manifest_status``.
-    #
-    # The payload predicate is NOT re-implemented here: ``iter_interim_dirs``
-    # owns it.  The two venue-filtered scans give the payload-bearing slots;
-    # the torn set is the complement — every interim dir that appears in
-    # neither.
-    _weight_slots = {_p for _n, _p in iter_interim_dirs(config.adapter_dir, mode="train")}
-    _graph_slots = {_p for _n, _p in iter_interim_dirs(config.adapter_dir, mode="simulate")}
-    for _interim_name, _interim_reg_dir in iter_interim_dirs(config.adapter_dir):
-        _interim_reg_path = _interim_reg_dir / "indexed_key_registry.json"
-        if not _interim_reg_path.exists():
-            continue
-        if _interim_reg_dir in _weight_slots:
-            # Train-mode slot (carries adapter weights) — already handled above.
-            continue
-        if _interim_reg_dir in _graph_slots:
-            # Simulate-mode slot — keep.
-            logger.debug(
-                "Startup registry check: interim adapter %s is a simulate-mode "
-                "slot (has graph.json, no safetensors) — preserving",
-                _interim_name,
-            )
-            continue
-        # Neither weights nor graph.  This is only a genuinely torn write when the
-        # registry carries NO active keys (the save was interrupted before any key
-        # was committed).  If the registry still lists active keys, those facts were
-        # never folded into a persisted main-tier slot — rmtree would permanently
-        # delete them and arm prune_key_metadata_orphans to drop their bookkeeping
-        # too (data-loss incident 2026-06-02).  Fold-or-refuse: preserve the dir and
-        # surface it loudly instead of silently deleting unfolded facts.
-        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
-
-        _active = _KeyRegistry.load(_interim_reg_path).list_active()
-        if _active:
-            logger.error(
-                "Startup registry check: interim adapter %s has a registry with %d "
-                "active key(s) but no weights and no graph.json — PRESERVING the "
-                "slot (these keys were never folded into a main tier; refusing to "
-                "delete unfolded facts). Re-run consolidation to fold or repair.",
-                _interim_name,
-                len(_active),
-            )
-            continue
-        # Empty registry, no weights, no graph — genuinely torn write.
-        logger.warning(
-            "Startup registry check: interim adapter %s has an empty registry, no "
-            "weights and no graph.json — removing its registry (adapter save was "
-            "interrupted before any key was committed)",
-            _interim_name,
-        )
-        import shutil as _shutil
-
-        _shutil.rmtree(_interim_reg_dir, ignore_errors=True)
 
     if hasattr(model, "peft_config") and model.peft_config:
         logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
@@ -2457,6 +2574,35 @@ async def lifespan(app: FastAPI):
         else:
             raise
 
+    # Eager consolidation-loop creation — mounts the adapters as soon as a
+    # local-mode model is resident (_build_config_derived_state's memory-store
+    # preload just populated _state["memory_store"]) so /status's
+    # adapter_loaded reading does not depend on the first consolidation door
+    # having run. No-op in cloud-only mode; a later post-load VRAM-overflow
+    # degrade below releases it along with every other base-model holder.
+    #
+    # ConsolidationLoop.__init__ -> ensure_adapters -> create_adapter
+    # allocates GPU memory BEFORE the post-load VRAM gate below runs, so a
+    # failure here (VramExhausted or otherwise) must degrade, not crash the
+    # boot: the lazy _get_or_create_consolidation_loop remains the fallback
+    # for every caller that needs the loop, so a swallowed failure here only
+    # costs /status reporting adapter_loaded=false until the first
+    # consolidation door creates it. Only a sticky, process-fatal CUDA fault
+    # gets the crash-loop treatment, mirroring _build_config_derived_state's
+    # handling just above.
+    try:
+        _eager_create_consolidation_loop(config)
+    except BaseException as _eager_exc:
+        if is_fatal_cuda_fault(_eager_exc):
+            _fail_fast_cuda(_eager_exc, "eager_consolidation_loop")
+        else:
+            logger.exception(
+                "Eager consolidation-loop creation failed at boot — continuing "
+                "without it; the lazy get-or-create remains the fallback and "
+                "/status will report adapter_loaded=false until the first "
+                "consolidation door runs"
+            )
+
     # Post-load authoritative gate. Runs AFTER _build_config_derived_state so
     # the measured allocation includes the STT/TTS GPU footprint. On failure,
     # release the partially-loaded GPU pair and continue in cloud-only mode —
@@ -3269,25 +3415,36 @@ async def chat(request: ChatRequest, http_request: Request):
                 # Local mode: forced routing selects the PROVIDER, it does not
                 # buy a policy bypass.  The turn goes through the one egress
                 # funnel, so cloud_mode and the personal verdict apply exactly
-                # as they do on the routed path.
+                # as they do on the routed path.  answer_via_cloud reaches the
+                # live model here (anonymizer's extract_graph/anonymize_turn
+                # calls generate() under base_model_inference — see
+                # inference.py:answer_via_cloud), so this dispatch needs the
+                # same GPU discipline as the routed local path: abort any
+                # in-flight background training, then hold the GPU lock for
+                # the duration.
                 _forced_is_personal = is_self_referential(
                     request.text,
                     personal_referent_config=_state["config"].personal_referent,
                 )
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: answer_via_cloud(
-                        request.text,
-                        agent,
-                        _state["config"],
-                        is_personal=_forced_is_personal,
-                        model=_state.get("model"),
-                        tokenizer=_state.get("tokenizer"),
-                        speaker=speaker,
-                        speaker_id=_speaker_id,
-                        history=_forced_history,
-                    ),
-                )
+                _abort_background_training_for_inference()
+
+                from paramem.server.gpu_lock import gpu_lock
+
+                async with gpu_lock():
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: answer_via_cloud(
+                            request.text,
+                            agent,
+                            _state["config"],
+                            is_personal=_forced_is_personal,
+                            model=_state.get("model"),
+                            tokenizer=_state.get("tokenizer"),
+                            speaker=speaker,
+                            speaker_id=_speaker_id,
+                            history=_forced_history,
+                        ),
+                    )
         if result and result.text:
             resolved_text = resolve_speaker_tokens(
                 result.text, _state.get("speaker_store"), current_speaker_id=_speaker_id
@@ -5151,7 +5308,37 @@ async def gpu_acquire():
     consumer holds the device), where a restart would only crash-loop on
     the lifespan VRAM budget gate. In that case the server stays cloud-only
     and the response carries ``deferred_insufficient_vram: true``.
+
+    Refuses (without touching hold state) while a consolidation cycle is
+    in flight (503 ``consolidating`` — same idiom as ``/gpu/release``) or
+    while a base-swap migration is actively running (409
+    ``base_swap_active`` — same idiom as ``/migration/confirm`` and
+    ``/migration/rollback``): reloading the base model out from under
+    either would race the GPU-touching work they hold the lock for.
     """
+    if _state.get("consolidating", False):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "consolidating",
+                "detail": (
+                    "GPU acquire refused: a consolidation cycle is in flight. "
+                    "Retry once /status reports consolidating=false."
+                ),
+            },
+        )
+    if (_state.get("migration") or {}).get("base_swap_active", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "base_swap_active",
+                "message": (
+                    "A base-swap migration is actively running. "
+                    "Wait for it to complete (or fail) before acquiring the GPU."
+                ),
+            },
+        )
+
     hold_before = _get_hold_state()
     cleared = _clear_hold_env()
     # Reload whenever ParaMem is in cloud-only mode UNLESS the operator
@@ -5167,7 +5354,20 @@ async def gpu_acquire():
     deferred_insufficient_vram = False
     if needs_reload:
         try:
-            await asyncio.get_running_loop().run_in_executor(None, _live_reload_base_model)
+            from paramem.server.gpu_lock import gpu_lock
+
+            # lock_held=True: gpu_lock() holds the non-reentrant threading.Lock
+            # across run_in_executor, mirroring the auto-reclaim loop — the
+            # primitive's internal _set_voice_pipeline_profile calls must not
+            # re-acquire it. CRITICAL BOUND: this wraps ONLY the reload
+            # dispatch — the insufficient-VRAM branch below also dispatches
+            # _set_voice_pipeline_profile("cpu") via executor with the
+            # default lock_held=False, and that call acquires the same lock;
+            # widening this wrap to cover it would deadlock.
+            async with gpu_lock():
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: _live_reload_base_model(lock_held=True)
+                )
             reloaded_live = _state.get("mode") == "local"
         except Exception:  # noqa: BLE001
             logger.exception(
@@ -6306,13 +6506,14 @@ def _live_reload_base_model(
     first so the rebuild starts from a clean slate.
 
     Caller responsibilities:
-    - ``_apply_config_live`` holds ``gpu_lock_sync()`` around this call and
-      MUST pass ``lock_held=True`` so the internal
-      ``_set_voice_pipeline_profile`` calls do not re-acquire the non-reentrant
-      lock (deadlock).  ``_auto_reclaim_loop`` holds ``gpu_lock()`` across this
-      call and likewise passes ``lock_held=True``.  Plain ``/gpu/acquire``
-      dispatches this WITHOUT holding ``gpu_lock`` (verified at ``app.py:3196``)
-      and keeps the default ``lock_held=False``.
+    - Every dispatching caller — ``_apply_config_live`` (via
+      ``gpu_lock_sync()``), ``_auto_reclaim_loop``, plain ``/gpu/acquire``,
+      and the base-swap orchestration's post-Phase-B reload (all three via
+      ``async with gpu_lock()`` around the ``run_in_executor`` dispatch) —
+      holds the GPU lock across this call and passes ``lock_held=True`` so
+      the internal ``_set_voice_pipeline_profile`` calls do not re-acquire
+      the non-reentrant lock (deadlock). ``lock_held=False`` (the default)
+      is for direct, non-dispatched callers that do not hold the lock.
     - Must accept ~25-30 s of model-load latency. Mode is flipped to
       cloud-only for the duration so any concurrent /chat handler
       routes to cloud rather than crashing on a None model.
@@ -6352,13 +6553,15 @@ def _live_reload_base_model(
         reclaim path (``refresh_config_from_disk=False``) — the session config
         did not change.
     lock_held:
-        When ``True``, the caller already holds ``gpu_lock_sync()`` (the shared
-        non-reentrant threading.Lock from ``paramem/server/gpu_lock.py``).
-        The internal ``_set_voice_pipeline_profile`` calls forward this flag so
-        they skip re-acquisition.  Must be ``True`` for ``_apply_config_live``
-        and ``_auto_reclaim_loop`` callers (both hold the lock); must be
-        ``False`` (default) for ``/gpu/acquire`` and base-swap Step 6 callers
-        (neither holds the lock).
+        When ``True``, the caller already holds the shared non-reentrant
+        threading.Lock from ``paramem/server/gpu_lock.py`` (``gpu_lock_sync()``
+        or ``async with gpu_lock()``).  The internal
+        ``_set_voice_pipeline_profile`` calls forward this flag so they skip
+        re-acquisition.  Every dispatching caller — ``_apply_config_live``,
+        ``_auto_reclaim_loop``, plain ``/gpu/acquire``, and the base-swap
+        orchestration's post-Phase-B reload — holds the lock and passes
+        ``True``.  ``False`` (the default) is for direct, non-dispatched
+        callers that do not hold the lock.
 
     Note on the synchronous maintenance guard:
     When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
@@ -6557,6 +6760,15 @@ def _live_reload_base_model(
                 "Live model reload: component rebuild failed after successful model load — "
                 "released allocation, staying cloud-only."
             )
+
+    # Eager consolidation-loop creation — both success branches above land
+    # mode="local" here; both failure branches released the model and left
+    # mode="cloud-only", so the gate inside _eager_create_consolidation_loop
+    # skips.  _release_base_model_in_process nulls _state["consolidation_loop"]
+    # on every release path, so a release→acquire cycle would otherwise revert
+    # to the lazy get-or-create — this call keeps adapter_loaded symmetric
+    # across that cycle too, not just across a restart.
+    _eager_create_consolidation_loop(config)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -7255,8 +7467,25 @@ async def gpu_release():
     Returns:
         200 ``{"mode": "cloud-only", "released": bool, "reason": str}``.
             ``released=False`` when the server was already cloud-only.
+        409 ``{"error": "base_swap_active", ...}`` when a base-swap migration
+            is actively running (checked first — a swap can transiently hold
+            ``_state["mode"] == "cloud-only"`` between its own Phase A → Phase
+            B reload, and this door must still refuse rather than take the
+            cloud-only idempotent short-circuit).
         503 ``{"error": "consolidating", ...}`` when a cycle is in flight.
     """
+    if (_state.get("migration") or {}).get("base_swap_active", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "base_swap_active",
+                "message": (
+                    "A base-swap migration is actively running. "
+                    "Wait for it to complete (or fail) before releasing the GPU."
+                ),
+            },
+        )
+
     if _state["mode"] == "cloud-only":
         return {
             "mode": "cloud-only",
@@ -7406,6 +7635,114 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     return {"status": "ok", "claimed": claimed, "speaker": sname, "speaker_id": sid}
 
 
+def _reap_emptied_tiers(loop, tier_roots: dict[str, Path]) -> tuple[list[str], list[str]]:
+    """Reap every tier in *tier_roots* down to its never-trained shape.
+
+    Called only for tiers whose ``KeyRegistry.list_known()`` reads empty
+    after a hard erase — see :func:`speaker_forget`'s docstring for the
+    trigger rationale. Handles interim and main tiers identically: the
+    on-disk shape (whole interim slot dir vs a main tier's root minus its
+    ``interim_*`` children) is decided by
+    :func:`~paramem.memory.persistence.reap_tier_artifacts` from
+    *tier_root* itself — this helper never branches on tier kind.
+
+    Order is load-bearing:
+
+    1. Drop each tier from the store
+       (:meth:`~paramem.memory.store.MemoryStore.drop_tier`) — RAM first,
+       so the tier is unroutable immediately.
+    2. Delete every reaped tier's PEFT adapter in ONE
+       :func:`~paramem.models.loader.detach_adapters` call, interim and
+       main tiers alike.
+    3. Immediately rebuild the production adapter set
+       (:meth:`~paramem.training.consolidation.ConsolidationLoop.ensure_adapters`)
+       and re-publish it to ``_state["model"]``. This closes the window
+       where the live model could hold an EMPTY ``peft_config`` before any
+       disk work runs — measured on peft 0.18.1, a ``PeftModel`` with no
+       resident adapter left ``active_adapter`` stale at zero survivors
+       and raised ``KeyError`` on ``forward()``. Re-creating a
+       never-trained tier's adapter here IS that tier's pristine in-RAM
+       shape, so there is nothing to preserve across the swap. The
+       re-publish is a defensive no-op on every path that reaches this
+       helper today (``loop.model`` already IS ``_state["model"]``) — it
+       exists so a future caller cannot reintroduce a stale reference.
+    4. Remove each reaped tier's on-disk artifacts
+       (:func:`~paramem.memory.persistence.reap_tier_artifacts`) and drop
+       its ``adapter_manifest_status`` row.
+
+    Args:
+        loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`.
+        tier_roots: Tier name -> already-resolved, validated slot-root
+            path. Never re-derived here — the caller resolved it before
+            any mutation ran.
+
+    Returns:
+        ``(unloaded, removed_dirs)``. ``unloaded`` is the sorted adapter
+        names :func:`~paramem.models.loader.detach_adapters` actually
+        deleted from the live model (may be a subset of ``tier_roots``
+        when a tier was never trained and had no live PEFT slot).
+        ``removed_dirs`` has one entry per tier whose on-disk artifacts
+        were non-empty before the reap — that tier's own root directory
+        name. Note a main tier's root directory can still exist on disk
+        afterward when a sibling ``interim_*`` child survives beneath it
+        (:func:`~paramem.memory.persistence.reap_tier_artifacts` only
+        removes a root once it is left empty); the tier is still listed
+        here because its own content was fully removed.
+    """
+    from peft import PeftModel
+
+    from paramem.memory.persistence import reap_tier_artifacts
+    from paramem.models.loader import detach_adapters, switch_adapter
+
+    for tier in tier_roots:
+        loop.store.drop_tier(tier)
+
+    unloaded = detach_adapters(loop.model, list(tier_roots))
+
+    loop.model = loop.ensure_adapters()
+    if isinstance(loop.model, PeftModel) and "episodic" in loop.model.peft_config:
+        switch_adapter(loop.model, "episodic")
+    _state["model"] = loop.model
+
+    manifest_status = _state.get("adapter_manifest_status", {})
+    removed_dirs: list[str] = []
+    for tier, tier_root in tier_roots.items():
+        removed = reap_tier_artifacts(tier_root)
+        if removed:
+            removed_dirs.append(tier_root.name)
+        manifest_status.pop(tier, None)
+
+    return unloaded, sorted(removed_dirs)
+
+
+# Verdict → (HTTP error code, human message) for POST /speaker/forget's busy
+# guard. Reuses _consolidation_dispatch_guards() — the single predicate for
+# "is a memory-mutating operation safe now" — rather than re-implementing the
+# four checks. Deliberately a SECOND map alongside
+# _INTERIM_DISCARD_GUARD_VERDICTS: the two doors have distinct operator-facing
+# prose (what to do next differs — forgetting a speaker vs. discarding a ring),
+# so the verdict->message mapping is not parameterized across doors.
+_SPEAKER_FORGET_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
+    "deferred_already_running": (
+        "consolidating",
+        "Consolidation is running; wait for completion before forgetting a speaker.",
+    ),
+    "deferred_cloud_only": (
+        "cloud_only",
+        "Server is in cloud-only mode; no local model or consolidation loop is available. "
+        "Reacquire the GPU (POST /gpu/acquire), then forget.",
+    ),
+    "deferred_bg_training": (
+        "training_active",
+        "Background training is active; wait for completion before forgetting a speaker.",
+    ),
+    "deferred_trial_active": (
+        "trial_active",
+        "A migration TRIAL is in progress. Accept or roll back the migration first.",
+    ),
+}
+
+
 @app.post(
     "/speaker/forget",
     response_model=SpeakerForgetResponse,
@@ -7419,12 +7756,18 @@ async def speaker_forget(request: SpeakerForgetRequest):
     ``mode="erase"``, which delegates to
     :meth:`~paramem.memory.store.MemoryStore.delete` per key) plus the
     on-disk fact content in every affected tier's ``graph.json`` — safe on a
-    live store, and does not trigger retraining. Forgetting still does not
-    trim resident adapter weights: the erased key is unservable immediately
-    at the SimHash gate, but a resident tier's weight encoding is not
-    automatically trimmed by ordinary (warm-init) consolidation cycles —
-    only an operator-invoked ``POST /reconsolidate`` (cold rebuild) does
-    that.
+    live store, and does not trigger retraining.  Whether a resident tier's
+    adapter weights are touched now depends on the erase's outcome for that
+    tier (owner decision, 2026-08-04):
+
+    - A tier that still holds other keys keeps its registry-level posture:
+      the erased key is unservable immediately at the SimHash gate, but the
+      tier's resident weight encoding is not trimmed by ordinary (warm-init)
+      consolidation cycles — only an operator-invoked ``POST /reconsolidate``
+      (cold rebuild) does that.
+    - A tier this erase reduces to zero known keys is reaped on the spot
+      instead: its PEFT adapter is unmounted and its on-disk weight/registry
+      artifacts are deleted, immediately, in the same request.
 
     Steps
     -----
@@ -7438,14 +7781,17 @@ async def speaker_forget(request: SpeakerForgetRequest):
        per-tier registry (active + stale + simhash), and the bookkeeping
        record for each key, in-memory.  For every affected tier the updated
        registry is persisted to disk (so a restart does not resurrect the
-       key), the fact content itself is erased from that tier's
+       key) and the fact content itself is erased from that tier's
        ``graph.json`` when one exists
-       (:func:`~paramem.memory.persistence.erase_keys_from_graph_file`), and
-       the live weight slot's manifest is re-stamped when the tier has one
-       on disk (train venue only — the simulate venue has no weight slot to
-       re-stamp).  ``loop.promoted_keys`` and the on-disk ``key_metadata.json``
-       are then rewritten once so a forgotten-but-promoted key does not
-       survive to the next restart.
+       (:func:`~paramem.memory.persistence.erase_keys_from_graph_file`).  A
+       tier that still knows at least one key afterward gets its live weight
+       slot's manifest re-stamped (train venue only); a tier reduced to zero
+       known keys is reaped instead
+       (:func:`_reap_emptied_tiers` — live PEFT unmount + on-disk artifact
+       removal).  ``loop.promoted_keys`` and the on-disk ``key_metadata.json``
+       are then rewritten once, after any reap, so a forgotten-but-promoted
+       key does not survive to the next restart and ``all_known_keys()``
+       reflects any dropped tiers.
 
     3. **Remove the speaker profile** from
        :class:`~paramem.server.speaker.SpeakerStore` (persisted immediately).
@@ -7453,46 +7799,57 @@ async def speaker_forget(request: SpeakerForgetRequest):
     4. **Discard any pending sessions** for the speaker from
        :class:`~paramem.server.session_buffer.SessionBuffer`.
 
+    5. **Reload** :attr:`_state`\\ ``["router"]`` so the speaker→key index
+       drops any erased or reaped keys immediately, rather than waiting for
+       the next fold.
+
+    Steps 3–5 run in a no-await tail after the executor call returns — see
+    the handler body for why that atomicity matters.
+
     Args:
         request: :class:`SpeakerForgetRequest` with ``speaker_id``.
 
     Returns:
-        :class:`SpeakerForgetResponse` reporting what was removed.
+        :class:`SpeakerForgetResponse` reporting what was removed and, when
+        applicable, what was reaped.
 
-    Raises:
-        HTTPException 503: When the consolidation loop is not initialised
-            (server not yet ready or in cloud-only mode without a loaded model).
-        HTTPException 500: When a stale key belongs to a tier whose on-disk
-            slot root cannot be resolved (malformed interim tier name).
-            Raised before ``store.discard_keys`` runs, so the store is left
-            untouched.
-        RuntimeError, pyrage.DecryptError, OSError: Uncaught and surfaced by
-            FastAPI as a bare 500 when a tier's on-disk registry EXISTS but
-            cannot be read/decrypted (age envelope with no daily identity
-            loaded, undecryptable ciphertext, or another read failure) while
-            reading the pre-erase hash (``tier_registry_sha256``). This is
-            read BEFORE ``store.discard_keys`` runs, so the store is left
-            untouched. Deliberately not caught here — see
-            ``tier_registry_sha256``'s docstring for why this boundary
-            propagates instead of degrading.
+    Errors
+    ------
+    409 ``consolidating`` | ``training_active`` | ``trial_active`` | ``cloud_only``
+        A fold, background training, or a migration TRIAL is in flight, or
+        the server has no local model loaded (:func:`_consolidation_dispatch_guards`,
+        mapped via ``_SPEAKER_FORGET_GUARD_VERDICTS``).  No mutation on any
+        of these.
+    500 ``malformed_tier_name``
+        A stale key belongs to a tier whose on-disk slot root cannot be
+        resolved.  Raised before ``store.discard_keys`` runs (from inside
+        the executor — see below), so the store is left untouched.
+    500 (uncaught)
+        Surfaced by FastAPI when a tier's on-disk registry EXISTS but cannot
+        be read/decrypted while reading the pre-erase hash
+        (``tier_registry_sha256`` — read BEFORE ``store.discard_keys`` runs,
+        so the store is left untouched), or when the reap fails mid-operation.
+        ``_state["consolidating"]`` is cleared in a ``finally`` regardless of
+        outcome.
 
     Note
     ----
     Discarding an interim slot wholesale (rather than erasing one speaker's
     keys within it) is ``POST /interim/discard`` — a separate admin door.
     """
-    loop = _state.get("consolidation_loop")
-    if loop is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "status": "not_ready",
-                "detail": "Consolidation loop is not initialised. "
-                "The server may be in cloud-only mode or not yet started.",
-            },
+    guard = _consolidation_dispatch_guards()
+    if guard is not None:
+        error, message = _SPEAKER_FORGET_GUARD_VERDICTS.get(
+            guard, (guard, "Cannot forget this speaker right now.")
         )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     config = _state["config"]
+    # Get-or-create rather than "loop is None -> 503": the guard above
+    # already proved mode == "local" (a model is loaded), so the loop can
+    # always be created here, mirroring POST /interim/discard.
+    loop = _get_or_create_consolidation_loop(config)
+
     # Canonicalize the incoming speaker_id so external cased input
     # (e.g. "Speaker0") matches the internally stored canonical form ("speaker0")
     # produced by set_bookkeeping's is_speaker_id gate.  Single normalization
@@ -7504,7 +7861,9 @@ async def speaker_forget(request: SpeakerForgetRequest):
 
     # Locate keys for this speaker via the registry bookkeeping (source of
     # truth) rather than the resident merger.graph (which is cleared at
-    # cycle-end and would be empty between cycles).
+    # cycle-end and would be empty between cycles).  Pure in-memory read —
+    # safe on the event loop, same as /interim/discard's own pure-read
+    # inventory step.
     # NOTE: keys minted before speaker_id attribution was introduced carry
     # speaker_id="" in bookkeeping (it was not applied retroactively).  Those
     # keys are a silent-miss here by accepted design — the live setup is for
@@ -7515,216 +7874,316 @@ async def speaker_forget(request: SpeakerForgetRequest):
         for key, record in loop.store.iter_bookkeeping()
         if record.get("speaker_id") == speaker_id
     }
-    stale_keys: list[str] = sorted(keys)
+    erased_keys: list[str] = sorted(keys)
 
-    # Remove keys from every per-tier KeyRegistry (in-memory + disk), their
-    # cached entry payload, and their bookkeeping record.  Uses
-    # store.discard_keys(mode="erase"), which now delegates to
-    # MemoryStore.delete per key: entries, registry (active + stale +
-    # simhash) and bookkeeping are dropped in lockstep across every tier,
-    # the same full retirement delete()/drop_tier() perform elsewhere.  This
-    # is a HARD erasure (privacy / right-to-forget); soft-stale is wrong here
-    # (the record must be GONE, including the simhash).  The per-tier loop
-    # below additionally erases the fact content from each tier's on-disk
-    # graph.json (persistence.erase_keys_from_graph_file) — the store-level
-    # erase above only ever mutated RAM/registry.
-    if stale_keys:
-        from paramem.adapters.manifest import tier_registry_sha256
-        from paramem.memory.interim_adapter import adapter_slot_root_for_name
-        from paramem.memory.persistence import erase_keys_from_graph_file
+    def _forget_sync() -> dict:
+        """The disk/PEFT-touching half of the forget, run off the event loop
+        under ``gpu_lock``.  Returns the response fields this half can
+        compute (``erased_keys``, ``reaped_tiers``, ``unloaded_adapters``,
+        ``removed_dirs``); the caller's no-await tail fills in
+        ``removed_speaker`` and ``discarded_sessions``.
+        """
+        reaped_tiers: list[str] = []
+        unloaded_adapters: list[str] = []
+        removed_dirs: list[str] = []
 
-        # Determine which tiers are affected BEFORE the erase so we know
-        # which registry files to persist after.  The erase removes the keys
-        # from _active_keys (and _stale); checking membership afterward returns
-        # False, making it impossible to detect the tiers post-mutation.
-        # _tier_root's keys ARE the affected-tier set — no separate list.
-        _tier_root: dict[str, Path] = {}
-        _tier_pre_sha: dict[str, str] = {}
-        for _tier_name in loop.store.tiers_with_registry():
-            _reg = loop.store.registry(_tier_name)
-            if any(_reg.knows(k) for k in stale_keys):
-                # Resolve the tier's on-disk slot root BEFORE the erase mutates
-                # RAM. adapter_slot_root_for_name raises ValueError on a
-                # malformed interim tier name — abort here, before any
-                # mutation, so a bad name never leaves the store half-erased
-                # with nothing persisted.
-                try:
-                    _root = adapter_slot_root_for_name(config.adapter_dir, _tier_name)
-                except ValueError as exc:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={
-                            "status": "malformed_tier_name",
-                            "detail": f"speaker/forget: cannot resolve slot root for "
-                            f"tier {_tier_name!r}: {exc}",
-                        },
-                    ) from exc
-                _tier_root[_tier_name] = _root
-                # Read the PRE-ERASE hash from disk, not from re-serialising the
-                # in-memory registry: the manifest was stamped against whatever
-                # bytes `_save_adapters` last wrote, and only the on-disk file
-                # is guaranteed to still hold that exact payload shape. Hashing
-                # the in-memory registry instead would silently diverge from
-                # the stamped manifest hash across ANY future KeyRegistry
-                # payload-shape change (e.g. a field added to or dropped from
-                # save_bytes()) landing between the last fold and this call —
-                # orphaning the slot (find_live_slot below returns None,
-                # unmountable at next restart) even though nothing on disk
-                # actually changed.
-                _tier_pre_sha[_tier_name] = tier_registry_sha256(_root)
-
-        loop.store.discard_keys(stale_keys, mode="erase")
-
-        # Persist updated registries for affected tiers.
-        for tier_name, tier_root in _tier_root.items():
-            registry = loop.store.registry(tier_name)
-            tier_reg_path = tier_root / "indexed_key_registry.json"
-            # ORDERING IS LOAD-BEARING: registry.save (durable privacy erase) FIRST,
-            # then manifest re-stamp.  A crash between the two leaves the slot in the
-            # same recoverable orphan state as today (find_live_slot returns None →
-            # preload 0/N), never in a slot bound to a registry that still lists the
-            # erased key.
-            registry.save(tier_reg_path)
-            # Erase the fact content itself from this tier's on-disk graph
-            # (simulate-mode venue; the train-mode venue is adapter weights,
-            # trimmed only by an operator-invoked /reconsolidate — see the
-            # WHY THIS IS HONEST note below).  Registry-first, content-second:
-            # the registry write above is already durable, so a crash between
-            # the two leaves an orphaned graph edge no reader can resolve
-            # (payload ⊇ registry is the only shape every reader — DiskMemorySource,
-            # build_tier_graph_from_store, boot preload — is defended against).
-            # A no-op (returns 0, no write) when graph.json does not exist.
-            erase_keys_from_graph_file(tier_root / "graph.json", keys)
-            # Re-stamp the live weight slot's manifest so find_live_slot rebinds on restart.
-            #
-            # INVARIANT: any out-of-fold registry mutation must re-stamp the hash-matching
-            # live slot, mirroring what the fold does via
-            # build_manifest_for(registry_sha256_override=sha256(save_bytes())) in
-            # consolidation.py::_save_adapters.
-            #
-            # WHY THIS IS HONEST: erase is removal-only; weights ⊇ active_keys remains
-            # a valid serviceable state.  Forgetting is registry-level, not weight-level
-            # (owner decision, 2026-07-25): the removed key is serve-filtered at the
-            # SimHash gate for good — under the warm-init default, a routine fold
-            # keeps a resident tier's weights, so it does NOT trim the erased key's
-            # residual weight encoding.  The only trim door is an operator-invoked
-            # RECONCILE (`/reconsolidate`), which cold-rebuilds each main tier from its
-            # live keys.  key_count in the manifest is `len(store.all_active_keys())`
-            # as computed at the LAST fold's `build_manifest_for` call
-            # (persistence.py:475) -- this out-of-fold `_replace` below patches only
-            # `registry_sha256`, so key_count is deliberately left at that
-            # last-fold value (now stale relative to the post-erase store) rather
-            # than force-synced here, which would require a full
-            # `build_manifest_for` call for a single-field patch.
-            #
-            # FUTURE: if a second out-of-fold registry-mutation caller is added (e.g. a
-            # single-fact stale endpoint), extract this block into a shared helper in
-            # paramem/adapters/manifest.py.
-            _pre_sha = _tier_pre_sha[tier_name]
-            # Venue gate: a weight-slot manifest (meta.json — the same signal
-            # find_live_slot itself scans for) can only exist in the train
-            # venue.  In the simulate venue (graph.json-only) tier_root holds
-            # no timestamped slot subdirs at all, so find_live_slot always
-            # returns None there — re-stamping is not "the slot is orphaned",
-            # it is "there is no slot to re-stamp".  Gated on disk content
-            # rather than config.consolidation.mode so an in-flight
-            # simulate<->train migration (whose per-tier venue can transiently
-            # differ from the configured mode) is judged by what is actually
-            # on disk for THIS tier.  The registry save and graph erase above
-            # are venue-agnostic and already ran regardless.
-            _has_weight_slot = tier_root.is_dir() and any(
-                child.is_dir() and not child.name.startswith(".") and (child / "meta.json").exists()
-                for child in tier_root.iterdir()
+        # Remove keys from every per-tier KeyRegistry (in-memory + disk), their
+        # cached entry payload, and their bookkeeping record.  Uses
+        # store.discard_keys(mode="erase"), which now delegates to
+        # MemoryStore.delete per key: entries, registry (active + stale +
+        # simhash) and bookkeeping are dropped in lockstep across every tier,
+        # the same full retirement delete()/drop_tier() perform elsewhere.  This
+        # is a HARD erasure (privacy / right-to-forget); soft-stale is wrong here
+        # (the record must be GONE, including the simhash).  The per-tier loop
+        # below additionally erases the fact content from each tier's on-disk
+        # graph.json (persistence.erase_keys_from_graph_file) — the store-level
+        # erase above only ever mutated RAM/registry.
+        if erased_keys:
+            from paramem.adapters.manifest import tier_registry_sha256
+            from paramem.memory.interim_adapter import (
+                INTERIM_NAME_PREFIX,
+                adapter_slot_root_for_name,
+                iter_interim_dirs,
             )
-            if not _has_weight_slot:
-                logger.debug(
-                    "speaker/forget: tier %s has no on-disk weight slot — skipping "
-                    "manifest re-stamp (simulate venue or never-trained tier)",
-                    tier_name,
-                )
-            elif _pre_sha == "":
-                # No readable pre-erase registry on disk (absent or corrupt).
-                # An empty hash would otherwise match any stray ""-stamped
-                # slot (the fresh-install convention in find_live_slot) —
-                # binding the re-stamp to the wrong slot is worse than
-                # skipping it, so skip and surface the gap instead.
-                logger.warning(
-                    "speaker/forget: tier %s had no readable pre-erase registry on disk "
-                    "(empty hash) — skipping manifest re-stamp to avoid binding a stray "
-                    '""-stamped slot; recover via consolidation fold or registry restore',
-                    tier_name,
-                )
-            else:
-                from dataclasses import replace as _replace
+            from paramem.memory.persistence import erase_keys_from_graph_file
 
-                from paramem.adapters.manifest import (
-                    find_live_slot as _find_live_slot,
-                )
-                from paramem.adapters.manifest import (
-                    read_manifest as _read_manifest,
-                )
-                from paramem.adapters.manifest import (
-                    write_manifest as _write_manifest,
-                )
+            # Determine which tiers are affected BEFORE the erase so we know
+            # which registry files to persist after.  The erase removes the keys
+            # from _active_keys (and _stale); checking membership afterward returns
+            # False, making it impossible to detect the tiers post-mutation.
+            # _tier_root's keys ARE the affected-tier set — no separate list.
+            _tier_root: dict[str, Path] = {}
+            _tier_pre_sha: dict[str, str] = {}
+            for _tier_name in loop.store.tiers_with_registry():
+                _reg = loop.store.registry(_tier_name)
+                if any(_reg.knows(k) for k in erased_keys):
+                    # Resolve the tier's on-disk slot root BEFORE the erase mutates
+                    # RAM. adapter_slot_root_for_name raises ValueError on a
+                    # malformed interim tier name — abort here, before any
+                    # mutation, so a bad name never leaves the store half-erased
+                    # with nothing persisted.
+                    try:
+                        _root = adapter_slot_root_for_name(config.adapter_dir, _tier_name)
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=500,
+                            detail={
+                                "status": "malformed_tier_name",
+                                "detail": f"speaker/forget: cannot resolve slot root for "
+                                f"tier {_tier_name!r}: {exc}",
+                            },
+                        ) from exc
+                    _tier_root[_tier_name] = _root
+                    # Read the PRE-ERASE hash from disk, not from re-serialising the
+                    # in-memory registry: the manifest was stamped against whatever
+                    # bytes `_save_adapters` last wrote, and only the on-disk file
+                    # is guaranteed to still hold that exact payload shape. Hashing
+                    # the in-memory registry instead would silently diverge from
+                    # the stamped manifest hash across ANY future KeyRegistry
+                    # payload-shape change (e.g. a field added to or dropped from
+                    # save_bytes()) landing between the last fold and this call —
+                    # orphaning the slot (find_live_slot below returns None,
+                    # unmountable at next restart) even though nothing on disk
+                    # actually changed.
+                    _tier_pre_sha[_tier_name] = tier_registry_sha256(_root)
 
-                _h_new = _hashlib.sha256(registry.save_bytes()).hexdigest()
-                _slot = _find_live_slot(tier_root, _pre_sha)
-                if _slot is None:
-                    logger.error(
-                        "speaker/forget: tier %s live slot for pre-erase hash %s… not found — "
-                        "slot already orphaned; recover via consolidation fold or registry restore",
+            loop.store.discard_keys(erased_keys, mode="erase")
+
+            # Persist updated registries for affected tiers, then fork per tier
+            # on whether it still knows any key: a survivor gets today's manifest
+            # re-stamp; a tier reduced to zero known keys has no slot left to
+            # bind, so it is reaped below instead of re-stamped.
+            for tier_name, tier_root in _tier_root.items():
+                registry = loop.store.registry(tier_name)
+                tier_reg_path = tier_root / "indexed_key_registry.json"
+                # ORDERING IS LOAD-BEARING: registry.save (durable privacy erase) FIRST,
+                # then manifest re-stamp/reap.  A crash between the two leaves the slot in
+                # the same recoverable orphan state as today (find_live_slot returns None →
+                # preload 0/N), never in a slot bound to a registry that still lists the
+                # erased key.
+                registry.save(tier_reg_path)
+                # Erase the fact content itself from this tier's on-disk graph
+                # (simulate-mode venue; the train-mode venue is adapter weights,
+                # trimmed for a SURVIVING tier only by an operator-invoked
+                # /reconsolidate — see the WHY THIS IS HONEST note below — or
+                # by the reap below for a tier this erase emptied).
+                # Registry-first, content-second: the registry write above is
+                # already durable, so a crash between the two leaves an
+                # orphaned graph edge no reader can resolve (payload ⊇
+                # registry is the only shape every reader — DiskMemorySource,
+                # build_tier_graph_from_store, boot preload — is defended
+                # against).  A no-op (returns 0, no write) when graph.json
+                # does not exist.
+                erase_keys_from_graph_file(tier_root / "graph.json", keys)
+
+                if registry.list_known():
+                    # SURVIVOR — re-stamp the live weight slot's manifest so
+                    # find_live_slot rebinds on restart.
+                    #
+                    # INVARIANT: any out-of-fold registry mutation must re-stamp the hash-matching
+                    # live slot, mirroring what the fold does via
+                    # build_manifest_for(registry_sha256_override=sha256(save_bytes())) in
+                    # consolidation.py::_save_adapters.
+                    #
+                    # WHY THIS IS HONEST: erase is removal-only; weights ⊇ active_keys remains
+                    # a valid serviceable state.  Forgetting a SURVIVING tier is
+                    # registry-level, not weight-level (owner decision, 2026-07-25): the
+                    # removed key is serve-filtered at the SimHash gate for good — under
+                    # the warm-init default, a routine fold keeps a resident tier's
+                    # weights, so it does NOT trim the erased key's residual weight
+                    # encoding.  The only trim door for a surviving tier is an
+                    # operator-invoked RECONCILE (`/reconsolidate`), which cold-rebuilds
+                    # each main tier from its live keys.  key_count in the manifest is
+                    # `len(store.all_active_keys())` as computed at the LAST fold's
+                    # `build_manifest_for` call (persistence.py:475) -- this out-of-fold
+                    # `_replace` below patches only `registry_sha256`, so key_count is
+                    # deliberately left at that last-fold value (now stale relative to the
+                    # post-erase store) rather than force-synced here, which would require
+                    # a full `build_manifest_for` call for a single-field patch.
+                    #
+                    # FUTURE: if a second out-of-fold registry-mutation caller is added (e.g. a
+                    # single-fact stale endpoint), extract this block into a shared helper in
+                    # paramem/adapters/manifest.py.
+                    _pre_sha = _tier_pre_sha[tier_name]
+                    # Venue gate: a weight-slot manifest (meta.json — the same signal
+                    # find_live_slot itself scans for) can only exist in the train
+                    # venue.  In the simulate venue (graph.json-only) tier_root holds
+                    # no timestamped slot subdirs at all, so find_live_slot always
+                    # returns None there — re-stamping is not "the slot is orphaned",
+                    # it is "there is no slot to re-stamp".  Gated on disk content
+                    # rather than config.consolidation.mode so an in-flight
+                    # simulate<->train migration (whose per-tier venue can transiently
+                    # differ from the configured mode) is judged by what is actually
+                    # on disk for THIS tier.  The registry save and graph erase above
+                    # are venue-agnostic and already ran regardless.
+                    _has_weight_slot = tier_root.is_dir() and any(
+                        child.is_dir()
+                        and not child.name.startswith(".")
+                        and (child / "meta.json").exists()
+                        for child in tier_root.iterdir()
+                    )
+                    if not _has_weight_slot:
+                        logger.debug(
+                            "speaker/forget: tier %s has no on-disk weight slot — skipping "
+                            "manifest re-stamp (simulate venue or never-trained tier)",
+                            tier_name,
+                        )
+                    elif _pre_sha == "":
+                        # No readable pre-erase registry on disk (absent or corrupt).
+                        # An empty hash would otherwise match any stray ""-stamped
+                        # slot (the fresh-install convention in find_live_slot) —
+                        # binding the re-stamp to the wrong slot is worse than
+                        # skipping it, so skip and surface the gap instead.
+                        logger.warning(
+                            "speaker/forget: tier %s had no readable pre-erase registry on disk "
+                            "(empty hash) — skipping manifest re-stamp to avoid binding a stray "
+                            '""-stamped slot; recover via consolidation fold or registry restore',
+                            tier_name,
+                        )
+                    else:
+                        from dataclasses import replace as _replace
+
+                        from paramem.adapters.manifest import (
+                            find_live_slot as _find_live_slot,
+                        )
+                        from paramem.adapters.manifest import (
+                            read_manifest as _read_manifest,
+                        )
+                        from paramem.adapters.manifest import (
+                            write_manifest as _write_manifest,
+                        )
+
+                        _h_new = _hashlib.sha256(registry.save_bytes()).hexdigest()
+                        _slot = _find_live_slot(tier_root, _pre_sha)
+                        if _slot is None:
+                            logger.error(
+                                "speaker/forget: tier %s live slot for pre-erase hash "
+                                "%s… not found — slot already orphaned; recover via "
+                                "consolidation fold or registry restore",
+                                tier_name,
+                                _pre_sha[:12],
+                            )
+                        else:
+                            _write_manifest(
+                                _slot, _replace(_read_manifest(_slot), registry_sha256=_h_new)
+                            )
+                    logger.info(
+                        "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
                         tier_name,
-                        _pre_sha[:12],
+                        speaker_id,
                     )
                 else:
-                    _write_manifest(_slot, _replace(_read_manifest(_slot), registry_sha256=_h_new))
-            logger.info(
-                "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
-                tier_name,
-                speaker_id,
-            )
+                    # EMPTIED — no slot left to bind; skip the re-stamp and reap
+                    # instead.  A soft-staled tier can never land here: the fold's
+                    # soft-stale sites use discard_keys(mode="stale"), which keeps
+                    # keys in the stale partition, and KeyRegistry.list_known is
+                    # active ∪ stale — only a tier THIS forget's own hard erase
+                    # touched can read as zero-known.
+                    logger.info(
+                        "speaker/forget: tier %s reduced to zero known keys for speaker %s — "
+                        "reaping instead of re-stamping",
+                        tier_name,
+                        speaker_id,
+                    )
+                    reaped_tiers.append(tier_name)
 
-        # Retire the forgotten keys from promoted_keys and rewrite
-        # key_metadata.json once, after the store is fully mutated.
-        # _save_key_metadata rebuilds "keys" from store.all_known_keys() (the
-        # erase already dropped them there), but writes sorted(loop.promoted_keys)
-        # verbatim — without this, a forgotten-but-promoted key survives on
-        # disk until restart (training/consolidation.py filters promoted_keys
-        # against is_known() on load, not on save).
-        loop.promoted_keys.difference_update(stale_keys)
-        from paramem.server.consolidation import _save_key_metadata
+            if reaped_tiers:
+                unloaded_adapters, removed_dirs = _reap_emptied_tiers(
+                    loop, {t: _tier_root[t] for t in reaped_tiers}
+                )
 
-        _save_key_metadata(loop, config)
+                # Resolve the ring-lifecycle incidents when this forget emptied
+                # the interim ring entirely — mirrors POST /interim/discard's own
+                # resolution; the full-fold absorb path is the only other clear
+                # site, and this forget deliberately bypasses it.
+                any_interim_reaped = any(t.startswith(INTERIM_NAME_PREFIX) for t in reaped_tiers)
+                if any_interim_reaped and next(iter_interim_dirs(config.adapter_dir), None) is None:
+                    state_dir = config.paths.data / "state"
+                    for _type in _RING_LIFECYCLE_INCIDENT_TYPES:
+                        try:
+                            resolve_incidents_by_type(
+                                state_dir,
+                                _type,
+                                reason="interim ring emptied by speaker forget",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "speaker/forget: ring-incident resolution failed for %s "
+                                "(non-fatal)",
+                                _type,
+                            )
 
-    # Remove the speaker profile.
-    speaker_store = _state.get("speaker_store")
-    removed_speaker = False
-    if speaker_store is not None:
-        removed_speaker = speaker_store.remove(speaker_id)
+            # Retire the forgotten keys from promoted_keys and rewrite
+            # key_metadata.json once, AFTER the reap so all_known_keys()
+            # reflects any dropped tiers.  _save_key_metadata rebuilds "keys"
+            # from store.all_known_keys() (the erase already dropped them
+            # there), but writes sorted(loop.promoted_keys) verbatim —
+            # without this, a forgotten-but-promoted key survives on disk
+            # until restart (training/consolidation.py filters promoted_keys
+            # against is_known() on load, not on save).
+            loop.promoted_keys.difference_update(erased_keys)
+            from paramem.server.consolidation import _save_key_metadata
 
-    # Discard pending sessions attributed to this speaker.
-    buffer = _state["session_buffer"]
-    speaker_conv_ids = [
-        conv_id
-        for conv_id, session_meta in buffer._sessions.items()
-        if session_meta.get("speaker_id") == speaker_id
-    ]
-    if speaker_conv_ids:
-        buffer.discard_sessions(speaker_conv_ids)
-    discarded_sessions = speaker_conv_ids
+            _save_key_metadata(loop, config)
 
-    logger.info(
-        "speaker/forget: speaker=%s keys=%d profile_removed=%s sessions=%d",
-        speaker_id,
-        len(stale_keys),
-        removed_speaker,
-        len(discarded_sessions),
-    )
-    return SpeakerForgetResponse(
-        removed_speaker=removed_speaker,
-        stale_keys=stale_keys,
-        discarded_sessions=discarded_sessions,
-    )
+        return {
+            "erased_keys": erased_keys,
+            "reaped_tiers": sorted(reaped_tiers),
+            "unloaded_adapters": unloaded_adapters,
+            "removed_dirs": removed_dirs,
+        }
+
+    from paramem.server.gpu_lock import gpu_lock
+
+    _state["consolidating"] = True
+    try:
+        async with gpu_lock():
+            loop_aio = asyncio.get_running_loop()
+            result = await loop_aio.run_in_executor(None, _forget_sync)
+
+        # NO-AWAIT TAIL — LOAD-BEARING.  From the run_in_executor above returning
+        # to the flag clear in `finally` there must be ZERO await points: this
+        # coroutine then runs the speaker-store removal, session discard, router
+        # reload, and response build without yielding, so no /chat turn can
+        # observe a store whose tiers were erased or reaped but whose router
+        # index / session buffer still reflect the pre-forget state.  Same
+        # argument as `_dispatch_to_executor` / POST /interim/discard's own tail:
+        # /chat mutates the session buffer outside gpu_lock (buffer.append) and
+        # SessionBuffer has no lock of its own, so this atomicity is what keeps
+        # the tail race-free — /chat never reads _state["consolidating"]; gpu_lock
+        # alone (acquired above, held across the executor call) keeps /chat off
+        # the PEFT mutation.  Adding an await here re-opens both windows at once.
+        speaker_store = _state.get("speaker_store")
+        removed_speaker = False
+        if speaker_store is not None:
+            removed_speaker = speaker_store.remove(speaker_id)
+
+        buffer = _state["session_buffer"]
+        speaker_conv_ids = [
+            conv_id
+            for conv_id, session_meta in buffer._sessions.items()
+            if session_meta.get("speaker_id") == speaker_id
+        ]
+        if speaker_conv_ids:
+            buffer.discard_sessions(speaker_conv_ids)
+        discarded_sessions = speaker_conv_ids
+
+        _state["router"].reload()
+
+        result["removed_speaker"] = removed_speaker
+        result["discarded_sessions"] = discarded_sessions
+
+        logger.info(
+            "speaker/forget: speaker=%s keys=%d profile_removed=%s sessions=%d reaped=%d",
+            speaker_id,
+            len(result["erased_keys"]),
+            removed_speaker,
+            len(discarded_sessions),
+            len(result["reaped_tiers"]),
+        )
+        return SpeakerForgetResponse(**result)
+    finally:
+        _state["consolidating"] = False
 
 
 def _interim_discard_inventory(loop, config) -> dict:
@@ -7784,6 +8243,17 @@ def _interim_discard_inventory(loop, config) -> dict:
         "stale_keys": {t: len(loop.store.stale_keys_in_tier(t)) for t in store_tiers},
         "empty": not store_tiers and not disk_dirs and not peft_names,
     }
+
+
+# The three ring-lifecycle incident types, resolved wherever the interim ring
+# is emptied without a fold — POST /interim/discard, and POST /speaker/forget
+# when a forget's own erase leaves no interim tier resident.  Single source so
+# a future fourth ring incident cannot be added to only one of the two sites.
+_RING_LIFECYCLE_INCIDENT_TYPES: tuple[str, ...] = (
+    "full_consolidation_overdue",
+    "interim_cap_reached",
+    "interim_overflow_pending",
+)
 
 
 # Verdict → (HTTP error code, human message) for POST /interim/discard's busy
@@ -7960,20 +8430,28 @@ async def interim_discard(request: InterimDiscardRequest):
         unloaded = unload_interim_adapters(loop.model, config.adapter_dir)
         # Step 3 — prune promoted_keys of the discarded tiers' keys (mirrors
         # POST /speaker/forget's pruning), then rebuild key_metadata.json now
-        # the discarded keys are gone from all_known_keys().
+        # the discarded keys are gone from all_known_keys().  Steps 1-2 above
+        # already dropped the tier from the store and reaped its adapter —
+        # that destructive ring drop is already complete, so a key-metadata
+        # write failure here must not surface as an HTTP 500 (same rationale
+        # as Step 6's swallow below).
         loop.promoted_keys.difference_update(discarded_keys)
-        _save_key_metadata(loop, config)
+        try:
+            _save_key_metadata(loop, config)
+        except Exception:
+            logger.exception("Post-discard key-metadata save failed (non-fatal)")
         # Step 4 — the ring's own incidents have no other clear site once
         # the ring is gone (_oldest_interim_stamp returns None post-discard).
+        # Same rationale as Step 3: the ring drop already happened, so a
+        # bookkeeping failure here must not turn it into an HTTP 500.
         resolved = 0
-        for _type in (
-            "full_consolidation_overdue",
-            "interim_cap_reached",
-            "interim_overflow_pending",
-        ):
-            resolved += resolve_incidents_by_type(
-                state_dir, _type, reason="interim ring discarded without absorption"
-            )
+        try:
+            for _type in _RING_LIFECYCLE_INCIDENT_TYPES:
+                resolved += resolve_incidents_by_type(
+                    state_dir, _type, reason="interim ring discarded without absorption"
+                )
+        except Exception:
+            logger.exception("Post-discard incident resolution failed (non-fatal)")
         # Step 5 — manifest rows describing slots that no longer exist.
         manifest_status = _state.get("adapter_manifest_status", {})
         for name in discarded_names:
@@ -9047,7 +9525,7 @@ async def migration_preview(request: PreviewRequest):
 
     # --- Shape-change detection ---
     adapter_dir = config.adapter_dir if config is not None else default_data_dir() / "adapters"
-    shape_changes = compute_shape_changes(parsed_candidate, adapter_dir)
+    shape_changes, shape_change_warnings = compute_shape_changes(parsed_candidate, adapter_dir)
 
     # --- Detect simulate-mode ---
     simulate_mode_override = detect_simulate_mode(parsed_candidate)
@@ -9103,6 +9581,7 @@ async def migration_preview(request: PreviewRequest):
             trial=None,
             recovery_required=list(_state.get("migration", {}).get("recovery_required", [])),
             parsed_live=live_yaml,
+            warnings=shape_change_warnings,
         )
         payload = render_preview_response(preview_stash, pre_flight_fail=pre_flight.fail_code)
         payload["pre_flight_disk_used_gb"] = pre_flight.disk_used_bytes / (1024**3)
@@ -9127,6 +9606,7 @@ async def migration_preview(request: PreviewRequest):
         trial=None,
         recovery_required=list(_state.get("migration", {}).get("recovery_required", [])),
         parsed_live=live_yaml,
+        warnings=shape_change_warnings,
     )
     _state["migration"] = stash
 
@@ -10633,15 +11113,20 @@ async def _run_base_swap_orchestration(
         # Same-config reload — no config delta to apply — so it routes through
         # _live_reload_base_model directly rather than _apply_config_live.
         # Drop our locals so they do not pin the old base graph (same pattern
-        # as the Phase A → Phase B reload at Step 3).  base_swap_active is
-        # still True throughout, so /gpu/release and /gpu/acquire cannot race
-        # us.
+        # as the Phase A → Phase B reload at Step 3).  /gpu/release and
+        # /gpu/acquire cannot race us here — both doors refuse with 409
+        # ``base_swap_active`` for as long as this coroutine is executing
+        # (the guards at the top of ``gpu_release`` and ``gpu_acquire``),
+        # not merely because this flag happens to still read True.
         #
         # Voice drain/restore is owned by _live_reload_base_model: the
         # primitive drains STT/TTS to CPU before its VRAM gate (preventing
         # the ~4.3 GiB voice footprint from blocking the gate) and restores
-        # to GPU after a successful partial reload.  This caller does not hold
-        # the GPU lock, so lock_held=False (default) is correct.
+        # to GPU after a successful partial reload.  ``async with gpu_lock()``
+        # holds the non-reentrant lock across the dispatch — the same
+        # discipline the plain-acquire and auto-reclaim reload callers use —
+        # so ``lock_held=True`` is passed to keep the internal
+        # ``_set_voice_pipeline_profile`` calls from re-acquiring it.
         #
         # If the reload fails internally it leaves the server cloud-only with
         # cloud_only_reason set; the swap is already complete on disk, so we
@@ -10649,8 +11134,11 @@ async def _run_base_swap_orchestration(
         loop_b = None
         bt_b = None
         try:
+            from paramem.server.gpu_lock import gpu_lock
+
             _loop = asyncio.get_running_loop()
-            await _loop.run_in_executor(None, _live_reload_base_model)
+            async with gpu_lock():
+                await _loop.run_in_executor(None, lambda: _live_reload_base_model(lock_held=True))
         except Exception:  # noqa: BLE001
             logger.exception(
                 "base-swap: post-Phase-B live reload raised; weights are on disk "
@@ -14843,6 +15331,40 @@ def _get_or_create_consolidation_loop(config):
     return loop
 
 
+def _eager_create_consolidation_loop(config) -> None:
+    """Create the consolidation loop as soon as a local-mode model is resident.
+
+    ``/status``'s ``adapter_loaded`` reading (``"episodic" in
+    model.peft_config``) only becomes true once a ``ConsolidationLoop``
+    exists — its ``__init__`` ensures the adapters are mounted.  Left to the
+    lazy get-or-create (:func:`_get_or_create_consolidation_loop`), a
+    freshly booted server with no trained slots reports
+    ``adapter_loaded=false`` until the first consolidation door runs, so the
+    same server flips the reading across a restart.  Calling this at every
+    site where a local-mode model lands in ``_state`` (lifespan boot,
+    ``_live_reload_base_model``'s tail) keeps the reading symmetric.
+
+    No-op in cloud-only mode (model/tokenizer absent) and a no-op when the
+    loop already exists — :func:`_get_or_create_consolidation_loop` is
+    itself idempotent.
+
+    Raises whatever ``ConsolidationLoop.__init__`` raises (e.g.
+    ``VramExhausted`` from ``ensure_adapters`` -> ``create_adapter``
+    allocating GPU memory) — this function does not catch. The lifespan
+    boot call site wraps this in a log-and-continue handler (mirroring
+    ``_build_config_derived_state``'s) so a failure here degrades rather
+    than crashing the boot; the ``_live_reload_base_model`` tail call is
+    unwrapped because that function's own callers already wrap the whole
+    reload.
+    """
+    if (
+        _state.get("model") is not None
+        and _state.get("tokenizer") is not None
+        and _state.get("memory_store") is not None
+    ):
+        _get_or_create_consolidation_loop(config)
+
+
 def _finalize_stage_b_failure() -> None:
     """Clear-only finalizer shared by every failed Stage-B cycle.
 
@@ -14984,7 +15506,15 @@ def _is_interim_clean_success(result: dict, cycle_mode: str, released_sids: list
     )
 
 
-def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: list) -> None:
+def _finalize_interim(
+    loop,
+    result: dict,
+    *,
+    session_ids: list,
+    released_sids: list,
+    episodic_rels: int = 0,
+    procedural_rels: int = 0,
+) -> None:
     """Success/terminal finalizer for the interim-training Stage-B cycle.
 
     Runs on the asyncio event loop via ``_dispatch_finalize``.  Reloads the
@@ -15003,6 +15533,13 @@ def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: l
             this cycle — a non-empty list blocks the clean-success
             incident resolution below (mirrors the crash-recorded incident
             still being live).
+        episodic_rels: Count of episodic relations the extraction stage
+            produced this cycle.  Carried into the run-status detail for
+            every outcome — one outcome label, one detail contract — so
+            ``scripts/dev/paramem-status.sh``'s ``simulated`` render (which
+            reads ``detail["episodic_rels"]``/``detail["procedural_rels"]``)
+            is populated regardless of which finalizer wrote the record.
+        procedural_rels: Count of procedural relations, same rationale.
     """
     loop.model.eval()
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
@@ -15019,6 +15556,8 @@ def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: l
         "sessions": len(session_ids),
         "total_keys": total_keys,
         "adapter": result.get("adapter_name"),
+        "episodic_rels": episodic_rels,
+        "procedural_rels": procedural_rels,
     }
     try:
         record_last_run(
@@ -15532,9 +16071,10 @@ def _extract_and_start_training():
         Runs on the BG trainer worker thread under the GPU lock (the entry
         cooldown gate, the try/except crash envelope, and the model-handle
         refresh are owned by ``_run_stage_b_cycle``).  The helper does its
-        own atomic I5 save of the interim slot + registry; we then run the
-        cross-cycle bookkeeping (promotion check, key-metadata save, session
-        marking, router reload, state updates) after each cycle.
+        own atomic ``commit_tier_slot`` save of the interim slot + registry;
+        we then run the cross-cycle bookkeeping (promotion check,
+        key-metadata save, session marking, router reload, state updates)
+        after each cycle.
         """
         # Callsite 4: BG-worker interim train.  Runs inside the BG worker
         # thread under ``gpu_lock_sync()`` (acquired by
@@ -15748,6 +16288,8 @@ def _extract_and_start_training():
             result,
             session_ids=session_ids,
             released_sids=_released_sids,
+            episodic_rels=len(all_episodic_rels),
+            procedural_rels=len(all_procedural_rels),
         )
         return _cycle_mode, finalizer
 

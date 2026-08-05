@@ -1026,7 +1026,7 @@ def build_donor(
     ``_drop_transient_slot`` call before the ``try`` is safe to leave outside
     it: it only clears a slot a PRIOR failed call left behind and switches to
     ``"episodic"`` first when needed — episodic is unconditionally created
-    at ``ConsolidationLoop`` construction (``_ensure_adapters``) and is never
+    at ``ConsolidationLoop`` construction (``ensure_adapters``) and is never
     itself deleted, so it is always resident and never the model's last
     adapter; switching to it can only fail if the model itself is broken,
     a condition this function cannot recover from regardless.

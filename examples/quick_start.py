@@ -286,11 +286,11 @@ def _cleanup_test_speaker(
             token=token,
         )
         removed = forget_resp.get("removed_speaker", False)
-        stale_keys = forget_resp.get("stale_keys", [])
+        erased_keys = forget_resp.get("erased_keys", [])
         discarded = forget_resp.get("discarded_sessions", [])
         print(
             f"[smoke]   cleanup: removed_speaker={removed}, "
-            f"stale_keys={len(stale_keys)}, "
+            f"erased_keys={len(erased_keys)}, "
             f"discarded_sessions={len(discarded)}"
         )
     except (ServerHTTPError, ServerUnreachable, Exception) as exc:  # noqa: BLE001

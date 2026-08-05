@@ -21,6 +21,8 @@ Public API
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
   as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
+- :func:`reap_tier_artifacts` — remove one tier's on-disk artifacts, shape derived
+  from the tier root itself (interim slot vs. main tier).
 
 Internal edge attribute naming
 -------------------------------
@@ -287,6 +289,95 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
     return graph
 
 
+def reap_tier_artifacts(tier_root: Path) -> list[Path]:
+    """Remove one tier's on-disk artifacts, leaving the never-trained shape.
+
+    The shape is derived from *tier_root* itself, never from a caller flag:
+
+      * interim slot root (dir name starts with ``INTERIM_DIR_PREFIX``) — the
+        whole directory is removed;
+      * ``episodic`` root — every child EXCEPT ``interim_*`` containers is
+        removed (those are separate interim tiers living under ``episodic/``
+        — see :func:`~paramem.memory.interim_adapter.interim_dir_for_name`,
+        the only place an interim tier container is ever created), then the
+        root itself is removed too when the removal left it empty;
+      * ``semantic``/``procedural`` root — every child, INCLUDING any
+        ``interim_*``-named one, is removed. Interim tier CONTAINERS live
+        only under ``episodic/``; an ``interim_<stamp>/`` dir under
+        ``semantic/`` or ``procedural/`` is HF Trainer scratch
+        (:meth:`paramem.training.consolidation.ConsolidationLoop._training_output_dir`
+        builds one for any adapter's interim training scope), not a tier —
+        sparing it here would leave scratch behind and the root would never
+        become empty enough to ``rmdir``.
+
+    ``INTERIM_DIR_PREFIX`` is imported lazily from
+    :mod:`paramem.memory.interim_adapter` — a top-level import would create
+    an import cycle now that :func:`paramem.memory.interim_adapter.unload_interim_adapters`
+    imports this module's :func:`reap_tier_artifacts` at module scope (mirrors
+    the existing lazy-import pattern used by :func:`commit_tier_slot` for
+    :func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`).
+
+    Args:
+        tier_root: Either an interim slot directory
+            (``<adapter_dir>/episodic/interim_<stamp>/``) or a main tier root
+            (``<adapter_dir>/<episodic|semantic|procedural>/``).
+
+    Returns:
+        The removed paths, deepest-first and sorted (files and directories
+        under the same parent are ordered so nothing is orphaned).  Empty
+        list when *tier_root* does not exist. No-op-safe; idempotent — a
+        second call on an already-reaped root returns ``[]``.
+    """
+    import os
+    import shutil
+
+    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
+
+    def _remove_tree(root: Path) -> list[Path]:
+        if not root.exists():
+            return []
+        # A main tier root's direct children are a mix of plain files
+        # (indexed_key_registry.json, graph.json) and directories (timestamped
+        # weight slots) — shutil.rmtree/os.walk both require a directory, so a
+        # file child is unlinked directly rather than routed through rmtree.
+        if not root.is_dir():
+            root.unlink()
+            return [root]
+        paths: list[Path] = [root]
+        for dirpath, dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            paths.extend(base / name for name in filenames)
+            paths.extend(base / name for name in dirnames)
+        shutil.rmtree(root)
+        return paths
+
+    tier_root = Path(tier_root)
+    if not tier_root.exists():
+        return []
+
+    removed: list[Path] = []
+    if tier_root.name.startswith(INTERIM_DIR_PREFIX):
+        removed.extend(_remove_tree(tier_root))
+    else:
+        # Interim tier containers (separate tiers, reaped by their own call)
+        # live only under episodic/ — an interim_*-named child anywhere else
+        # is training scratch, not a tier, and must not be spared.
+        spare_interim_children = tier_root.name == "episodic"
+        for child in sorted(tier_root.iterdir()):
+            if (
+                spare_interim_children
+                and child.is_dir()
+                and child.name.startswith(INTERIM_DIR_PREFIX)
+            ):
+                continue
+            removed.extend(_remove_tree(child))
+        if not any(tier_root.iterdir()):
+            tier_root.rmdir()
+            removed.append(tier_root)
+
+    return sorted(removed, key=lambda p: (-len(p.parts), str(p)))
+
+
 def erase_keys_from_graph_file(path: Path, keys: set[str]) -> int:
     """Remove every edge whose ``ik_key`` is in *keys* from the graph at *path*.
 
@@ -424,14 +515,17 @@ def commit_tier_slot(
        files are complete.
 
     Crash semantics: a kill after step 5 but before step 6 leaves the slot
-    present without the registry file.  The boot validator in
-    :func:`paramem.server.app._mount_adapters_from_slots` (via
-    :func:`paramem.server.app.find_live_slot` / ``iter_interim_dirs``) skips
-    any interim dir whose ``indexed_key_registry.json`` is absent and whose
-    slot contains neither ``adapter_model.safetensors`` (train) nor
-    ``graph.json`` (simulate).  A partial slot — payload written but registry
-    absent — is silently ignored on restart; the slot becomes eligible for
-    wipe by the boot validator's torn-write cleanup pass.
+    present without the registry file.  Nothing at boot deletes this shape:
+    the keyless-tier sweep
+    (:func:`paramem.server.app._sweep_keyless_tier_artifacts`) only acts on
+    a tier whose ``indexed_key_registry.json`` exists and affirmatively
+    reads zero known keys, so a registry-absent tier is skipped outright —
+    not this sweep's business, per its own docstring.  The mount loop in
+    :func:`paramem.server.app._mount_adapters_from_slots` then finds no
+    matching slot for the interim tier's (degraded) hash and logs the
+    payload-bearing-but-unmatched slot as an ERROR, leaving it on disk. The
+    partial slot survives across restarts until an operator or a later fold
+    reuses or clears it.
 
     Args:
         loop: The live :class:`paramem.training.consolidation.ConsolidationLoop`

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Singleton PEFT adapter name used as a scratch training slot.  Must match
-#: the name used in ``ConsolidationLoop._ensure_adapters``.
+#: the name used in ``ConsolidationLoop.ensure_adapters``.
 _STAGING_ADAPTER = "in_training"
 
 

@@ -984,7 +984,7 @@ class TestCleanupPartialSlots:
 
         The container has none of the 3 required flat-slot files at its root.
         cleanup_partial_slots must skip it entirely (interim integrity is owned
-        by find_live_slot + the I5 boot guard).
+        by find_live_slot + the boot registry-consistency sweep).
         """
         container = tmp_path / "episodic" / "interim_20260101T0000"
         inner_slot = container / "20260101-000000"
@@ -1003,7 +1003,7 @@ class TestCleanupPartialSlots:
         """Interim container with only graph.json + registry (simulate mode) is never deleted.
 
         cleanup_partial_slots must not judge interim containers — that is the
-        I5 boot guard's job.
+        boot registry-consistency sweep's job.
         """
         container = tmp_path / "episodic" / "interim_20260101T0000"
         container.mkdir(parents=True)
@@ -1019,8 +1019,8 @@ class TestCleanupPartialSlots:
         """Empty interim container (no inner slot, no registry) is never deleted by cleanup.
 
         Option B: cleanup_partial_slots skips all interim dirs unconditionally.
-        An empty interim container is the I5 guard's responsibility, not this
-        function's.
+        An empty interim container is the boot registry-consistency sweep's
+        responsibility, not this function's.
         """
         container = tmp_path / "episodic" / "interim_20260101T0000"
         container.mkdir(parents=True)

@@ -25,6 +25,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+
 
 def _call_gpu_acquire() -> object:
     from paramem.server.app import gpu_acquire
@@ -194,7 +198,7 @@ def test_acquire_defers_on_insufficient_vram_without_restart():
         "cloud_only_reason": "released",
     }
 
-    def fake_reload_declines():
+    def fake_reload_declines(**_kw):
         # Pre-flight declined inside _live_reload_base_model.
         app_module._state["mode"] = "cloud-only"
         app_module._state["cloud_only_reason"] = "insufficient_vram"
@@ -251,6 +255,128 @@ def test_acquire_falls_back_to_restart_on_reload_failure():
     mock_restart.assert_called_once()
     assert result["will_restart"] is True
     assert result["reloaded_live"] is False
+
+
+# ---------------------------------------------------------------------------
+# GPU-lock discipline + the consolidating/base-swap guards
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_holds_gpu_lock_across_reload():
+    """The reload dispatch runs with the shared GPU thread lock held — the
+    same discipline the auto-reclaim loop uses (``async with gpu_lock():``
+    around the ``run_in_executor`` dispatch)."""
+    from paramem.server import app as app_module
+    from paramem.server.gpu_lock import _gpu_thread_lock
+
+    lock_state_during_reload = []
+
+    def fake_reload(**_kw):
+        lock_state_during_reload.append(_gpu_thread_lock.locked())
+        app_module._state["mode"] = "local"
+
+    state_patch = {
+        "defer_model": True,
+        "mode": "cloud-only",
+        "cloud_only_reason": "training",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_clear_hold_env", return_value=True),
+        patch.object(
+            app_module,
+            "_get_hold_state",
+            return_value={"hold_active": True, "owner_pid": 1234, "owner_alive": True},
+        ),
+        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload),
+        patch.object(app_module, "_set_voice_pipeline_profile"),
+    ):
+        _call_gpu_acquire()
+
+    assert lock_state_during_reload == [True], (
+        "the reload dispatch must run with the GPU thread lock held"
+    )
+    assert not _gpu_thread_lock.locked(), "the lock must be released after the dispatch completes"
+
+
+def test_acquire_passes_lock_held_true():
+    """The reload primitive is invoked with lock_held=True — matches the
+    held lock so its internal voice-profile calls do not re-acquire it."""
+    from paramem.server import app as app_module
+
+    calls = []
+
+    def fake_reload(**kw):
+        calls.append(kw)
+        app_module._state["mode"] = "local"
+
+    state_patch = {
+        "defer_model": True,
+        "mode": "cloud-only",
+        "cloud_only_reason": "training",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_clear_hold_env", return_value=True),
+        patch.object(
+            app_module,
+            "_get_hold_state",
+            return_value={"hold_active": True, "owner_pid": 1234, "owner_alive": True},
+        ),
+        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload),
+        patch.object(app_module, "_set_voice_pipeline_profile"),
+    ):
+        _call_gpu_acquire()
+
+    assert calls == [{"lock_held": True}]
+
+
+def test_acquire_refuses_while_consolidating_503():
+    """A consolidation cycle in flight refuses with 503 — the same idiom as
+    /gpu/release — without touching hold state."""
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "training",
+        "consolidating": True,
+    }
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_get_hold_state") as mock_hold,
+    ):
+        result = _call_gpu_acquire()
+
+    mock_hold.assert_not_called()
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 503
+    assert "consolidating" in result.body.decode("utf-8")
+
+
+def test_acquire_refuses_during_base_swap_409():
+    """An actively running base-swap migration refuses with 409
+    base_swap_active — the same idiom as /migration/confirm and
+    /migration/rollback."""
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "training",
+        "consolidating": False,
+        "migration": {"base_swap_active": True},
+    }
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_get_hold_state") as mock_hold,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        _call_gpu_acquire()
+
+    mock_hold.assert_not_called()
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "base_swap_active"
 
 
 # ════════════════════════════════════════════════════════════════════════════

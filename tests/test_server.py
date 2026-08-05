@@ -625,7 +625,7 @@ class TestProbeAndReasonDispatch:
         """Regression: facts probed under ``episodic_interim_<stamp>`` must
         appear in the augmented_text under the ``[Recent knowledge]`` layer.
 
-        Before fix (R2): the hard-coded layer-iteration loop only checked
+        Before the fix, the hard-coded layer-iteration loop only checked
         ``["procedural", "episodic", "semantic"]`` and silently dropped any
         ``episodic_interim_<stamp>`` bucket from layers — so the cycle's
         freshly trained interim facts (attribute keys included) never

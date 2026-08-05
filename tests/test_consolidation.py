@@ -127,7 +127,7 @@ class TestExtractionPathParity:
             else _default_extract_procedural,
         )
 
-        # __class__ = PeftModel so _ensure_adapters' isinstance check
+        # __class__ = PeftModel so ensure_adapters' isinstance check
         # short-circuits without restricting the mock's attribute surface.
         model = MagicMock()
         model.__class__ = PeftModel
@@ -13428,7 +13428,9 @@ class TestSubtractiveRemovalsHelperInterim:
 
         # Step 2: soft-stale in memory (must precede commit).
         loop._apply_subtractive_removals_to_store(fold_name="interim")
-        assert loop.store.is_stale(_key), "Key must be stale in memory after M5 stage"
+        assert loop.store.is_stale(_key), (
+            "Key must be stale in memory after _apply_subtractive_removals_to_store"
+        )
 
         # Step 3: commit — serializes the already-staled registry to disk.
         commit_tier_slot(

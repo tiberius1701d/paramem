@@ -407,8 +407,12 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
     - Dotted entries (``.quarantine``, ``.tmp``).
     - Interim container directories (``interim_*`` under episodic/).  These
       are nested containers whose integrity is fully owned by
-      ``find_live_slot`` (manifest.py), the I5 boot guard (app.py), and the
-      post-consolidation teardown (``unload_interim_adapters``).  Applying
+      ``find_live_slot`` (manifest.py), the boot-time keyless-tier sweep
+      (``_sweep_keyless_tier_artifacts``, app.py — reaps a tier's on-disk
+      artifacts pre-mount only when its registry file exists and
+      affirmatively reads zero known keys; an unreadable or foreign-shaped
+      registry, or one that still lists a key, is preserved untouched), and
+      the post-consolidation teardown (``unload_interim_adapters``).  Applying
       the flat 3-file completeness check to an interim container is wrong
       because weights live in the inner ``<ts>/`` slot, not at the container
       root.  Passing judgment here would be a parallel-topology drift bug.
@@ -446,8 +450,13 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
                 continue
             if not entry.is_dir():
                 continue
-            # Interim containers are owned by find_live_slot + the I5 boot guard,
-            # not by flat-slot cleanup.  Skip unconditionally.
+            # Interim containers are owned by find_live_slot +
+            # _sweep_keyless_tier_artifacts's boot-time keyless-tier sweep
+            # (reaps a tier's on-disk artifacts pre-mount only when its
+            # registry file exists and affirmatively reads zero known keys;
+            # preserves an unreadable/foreign-shaped registry or one that
+            # still lists a key), not by flat-slot cleanup.  Skip
+            # unconditionally.
             if entry.name.startswith(INTERIM_DIR_PREFIX):
                 continue
             missing = [f for f in _REQUIRED_SLOT_FILES if not (entry / f).exists()]

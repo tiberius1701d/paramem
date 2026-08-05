@@ -380,7 +380,8 @@ class TestDiff:
     def test_diff_returns_preview_shape_when_staging(self, client, state, tmp_path):
         """After preview, /migration/diff returns the same shape as PreviewResponse."""
         cand = _write_candidate(tmp_path)
-        client.post("/migration/preview", json={"candidate_path": str(cand)})
+        preview_resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+        assert "warnings" in preview_resp.json()
         resp = client.get("/migration/diff")
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -389,6 +390,7 @@ class TestDiff:
         assert "tier_diff" in body
         assert "shape_changes" in body
         assert "pre_flight_fail" in body
+        assert "warnings" in body
 
     def test_diff_409_when_not_staging(self, client, state):
         """No candidate staged → 409 not_staging."""
@@ -408,6 +410,7 @@ class TestDiff:
         assert diff["candidate_hash"] == preview["candidate_hash"]
         assert diff["unified_diff"] == preview["unified_diff"]
         assert diff["tier_diff"] == preview["tier_diff"]
+        assert diff["warnings"] == preview["warnings"]
 
     def test_diff_409_after_cancel(self, client, state, tmp_path):
         """Cancel clears stash → diff returns 409."""

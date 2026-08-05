@@ -7,7 +7,7 @@ Swapping the base model requires only changing the model_id in config.
 import contextlib
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -591,6 +591,65 @@ def active_adapter_name(model: PeftModel) -> Optional[str]:
     if isinstance(raw, list):
         return raw[0] if raw else None
     return raw
+
+
+def detach_adapters(model: PeftModel, names: Iterable[str]) -> list[str]:
+    """Delete every adapter in *names* from a live PeftModel, deterministically.
+
+    Before the first delete, the active adapter is moved onto a survivor —
+    the first of ("episodic", "semantic", "procedural") that is resident and
+    NOT in *names*, else any resident adapter not in *names*, else no switch
+    (the caller is emptying peft_config deliberately and owns the restore).
+    PEFT's delete_adapter silently reassigns the active adapter when the
+    deleted one was active, and leaves it STALE when nothing survives, so the
+    switch-before-delete lives here rather than at each call site.
+
+    The switch runs unconditionally whenever a survivor exists — not only
+    when the current active adapter happens to be one of *names* — so the
+    post-reap active adapter is deterministic for every caller, not just the
+    ones that happen to already be sitting on the survivor.
+
+    Returns the sorted names actually deleted; [] when *model* is not a
+    PeftModel (the disk venue holds a bare base model) or none were resident.
+    Never raises on an absent name.
+
+    Args:
+        model: The live model.  Anything that is not a ``PeftModel`` (bare
+            base model, ``None``) short-circuits to a no-op.
+        names: Adapter names to delete.  Names absent from
+            ``model.peft_config`` are silently skipped — never raises.
+
+    Returns:
+        Sorted list of adapter names actually deleted from
+        ``model.peft_config``.
+    """
+    if not isinstance(model, PeftModel):
+        return []
+
+    names_set = set(names)
+    resident = sorted(n for n in names_set if n in model.peft_config)
+    if not resident:
+        return []
+
+    survivor: Optional[str] = None
+    for tier in ("episodic", "semantic", "procedural"):
+        if tier in model.peft_config and tier not in names_set:
+            survivor = tier
+            break
+    if survivor is None:
+        for candidate in model.peft_config:
+            if candidate not in names_set:
+                survivor = candidate
+                break
+    if survivor is not None:
+        model.set_adapter(survivor)
+        logger.debug("detach_adapters: switched active adapter to survivor '%s'", survivor)
+
+    for name in resident:
+        model.delete_adapter(name)
+        logger.info("Deleted adapter from PEFT: %s", name)
+
+    return resident
 
 
 def save_adapter(

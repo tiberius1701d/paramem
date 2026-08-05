@@ -723,6 +723,67 @@ class TestFailurePath:
         assert state["last_consolidation"] is not None
         datetime.fromisoformat(state["last_consolidation"])
 
+    def test_save_key_metadata_failure_does_not_500(self, tmp_path, monkeypatch):
+        """A ``_save_key_metadata`` failure (Step 3) must not turn an
+        already-completed destructive ring drop into an HTTP 500 — Steps 1-2
+        already dropped the tier from the store and reaped its adapter by
+        the time this bookkeeping step runs.
+        """
+        cfg = _make_config(tmp_path)
+        store = MemoryStore(replay_enabled=True)
+        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
+        model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
+        loop = _make_loop(store, model)
+        state = _make_state(tmp_path, loop=loop, config=cfg)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("key_metadata.json write failed")
+
+        # _save_key_metadata is imported locally inside the handler on every
+        # call (from paramem.server.consolidation) — patch the source, not
+        # an app_module attribute.
+        monkeypatch.setattr("paramem.server.consolidation._save_key_metadata", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/interim/discard", json={"confirm": True})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "discarded"
+        assert state["consolidating"] is False
+        # The mutation still happened despite the bookkeeping failure.
+        assert "episodic_interim_20260801T0000" not in store.tiers_with_registry()
+        # The tail (stamp + router reload) still ran despite the Step 3 failure.
+        assert state["last_consolidation"] is not None
+        datetime.fromisoformat(state["last_consolidation"])
+        state["router"].reload.assert_called_once()
+
+    def test_resolve_incidents_failure_does_not_500(self, tmp_path, monkeypatch):
+        """A ``resolve_incidents_by_type`` failure (Step 4) must not turn an
+        already-completed destructive ring drop into an HTTP 500.
+        """
+        cfg = _make_config(tmp_path)
+        store = MemoryStore(replay_enabled=True)
+        _seed_interim_slot(store, cfg.adapter_dir, "20260801T0000", "graph1")
+        model = _make_peft_model("episodic", "episodic_interim_20260801T0000")
+        loop = _make_loop(store, model)
+        state = _make_state(tmp_path, loop=loop, config=cfg)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("incidents.json write failed")
+
+        monkeypatch.setattr(app_module, "resolve_incidents_by_type", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/interim/discard", json={"confirm": True})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "discarded"
+        assert state["consolidating"] is False
+        assert "episodic_interim_20260801T0000" not in store.tiers_with_registry()
+        assert state["last_consolidation"] is not None
+        datetime.fromisoformat(state["last_consolidation"])
+        state["router"].reload.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Auth

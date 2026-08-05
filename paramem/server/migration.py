@@ -188,6 +188,12 @@ class MigrationStashState(TypedDict):
         LIVE or when the live config is absent.  Used by
         ``render_preview_response`` to derive the ``base_change`` block without
         re-reading the live file.
+    warnings:
+        Human-readable rows describing shape-change tiers that were skipped
+        during :func:`compute_shape_changes` (unreadable/undecryptable tier
+        registry, or an unreadable adapter manifest). Empty list when no
+        tier was skipped for those reasons; a tier with no live slot yet
+        (not-yet-trained) never contributes a row here.
     """
 
     state: MigrationStateLiteral
@@ -204,6 +210,7 @@ class MigrationStashState(TypedDict):
     trial: "TrialStash | None"
     recovery_required: list[str]
     parsed_live: dict
+    warnings: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +247,7 @@ def initial_migration_state() -> MigrationStashState:
         trial=None,
         recovery_required=[],
         parsed_live={},
+        warnings=[],
     )
 
 
@@ -486,8 +494,8 @@ _SHAPE_CONSEQUENCE: dict[str, str] = {
 def compute_shape_changes(
     candidate_yaml: dict,
     adapter_dir: Path,
-) -> list[ShapeChange]:
-    """Return shape-change rows for every enabled adapter that has a meta.json.
+) -> tuple[list[ShapeChange], list[str]]:
+    """Return shape-change rows and skip warnings for every enabled adapter.
 
     For each adapter name whose ``adapters.<name>.enabled`` is ``True`` in
     *candidate_yaml*:
@@ -526,14 +534,20 @@ def compute_shape_changes(
 
     Returns
     -------
-    list[ShapeChange]
-        All detected shape changes, ordered by adapter name then field name.
+    tuple[list[ShapeChange], list[str]]
+        ``(changes, warnings)``. ``changes`` holds all detected shape changes,
+        ordered by adapter name then field name. ``warnings`` holds one
+        human-readable string per adapter skipped because its tier registry
+        or manifest could not be read — the same substance as the WARNING
+        logged at each skip site. A tier skipped because it has no live slot
+        yet (not-yet-trained) contributes no warning.
     """
     adapters_cfg = candidate_yaml.get("adapters", {})
     if not isinstance(adapters_cfg, dict):
-        return []
+        return [], []
 
     changes: list[ShapeChange] = []
+    warnings: list[str] = []
 
     for adapter_name, adapter_vals in sorted(adapters_cfg.items()):
         if not isinstance(adapter_vals, dict):
@@ -552,6 +566,10 @@ def compute_shape_changes(
                 kind_dir,
                 exc,
             )
+            warnings.append(
+                f"adapter {adapter_name!r}: skipped shape-change check — cannot "
+                f"read/decrypt tier registry at {kind_dir}: {exc}"
+            )
             continue
 
         slot = find_live_slot(kind_dir, tier_hash)
@@ -568,6 +586,10 @@ def compute_shape_changes(
                 adapter_name,
                 slot,
                 exc,
+            )
+            warnings.append(
+                f"adapter {adapter_name!r}: skipped shape-change check — cannot "
+                f"read manifest from slot {slot}: {exc}"
             )
             continue
 
@@ -631,7 +653,7 @@ def compute_shape_changes(
                 )
             )
 
-    return changes
+    return changes, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -706,10 +728,16 @@ def render_preview_response(
     """Return the ``PreviewResponse`` payload dict from a stash.
 
     Single source of truth for what ``/migration/preview`` and
-    ``/migration/diff`` return.  Always includes ``pre_flight_fail``.
+    ``/migration/diff`` return.  Always includes ``pre_flight_fail`` and
+    ``warnings``.
 
     The ``base_change`` key is populated when the ``model:`` field differs
     between the live and candidate configs.  It is ``None`` otherwise.
+
+    The ``warnings`` key is the stash's ``warnings`` list verbatim — rows
+    populated by :func:`compute_shape_changes` when a tier's registry or
+    manifest could not be read during shape-change detection.  Empty list
+    when nothing was skipped.
 
     Parameters
     ----------
@@ -751,6 +779,7 @@ def render_preview_response(
         "pre_flight_fail": pre_flight_fail,
         "mode_switch": mode_switch,
         "base_change": base_change,
+        "warnings": list(stash["warnings"]),
     }
 
 

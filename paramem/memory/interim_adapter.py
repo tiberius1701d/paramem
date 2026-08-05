@@ -33,26 +33,22 @@ zero remaining adapters) does NOT apply here because the mains survive the
 call. Do NOT call unload_interim_adapters before confirming the main adapters
 are present in model.peft_config.
 
-ACTIVE-ADAPTER DETERMINISM: unload_interim_adapters switches the active
-adapter to "episodic" (when present) before deleting any interim adapter.
-PEFT's delete_adapter silently reassigns the active adapter to whichever
-resident adapter it meets first when the deleted one was active — the
-switch-before-delete makes the post-reap active adapter deterministic for
-every caller, not just the ones that happen to restore "episodic" themselves
-afterward.
+ACTIVE-ADAPTER DETERMINISM: see :func:`paramem.models.loader.detach_adapters`'s
+docstring — the switch-before-delete guard unload_interim_adapters relies on
+now lives there, not in this module.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from peft import PeftModel
 
-from paramem.models.loader import create_adapter, switch_adapter
+from paramem.memory.persistence import reap_tier_artifacts
+from paramem.models.loader import create_adapter, detach_adapters
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.utils.config import AdapterConfig
 
@@ -168,6 +164,50 @@ def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
     return adapter_dir / "episodic" / f"{INTERIM_DIR_PREFIX}{stamp}"
 
 
+def slot_payload_kind(path: Path) -> str | None:
+    """Classify the payload one adapter slot directory carries.
+
+    ``"train"`` when *path* (or any of its own subdirectories) carries
+    adapter weights (``adapter_model.safetensors`` anywhere beneath *path*),
+    ``"simulate"`` when it carries only a ``graph.json``, and ``None`` when
+    it carries neither. Weights win over a co-resident ``graph.json`` — a
+    slot only ever legitimately holds one venue's payload, so this ordering
+    exists to make an accidental mix classify sanely rather than to choose
+    between two valid shapes.
+
+    The weights scan prunes ``interim_*`` children before descending into
+    them, so a MAIN tier root's signal (``<adapter_dir>/<tier>/``) is never
+    satisfied by a sibling interim slot living underneath it — an episodic
+    root with no weights of its own reads as payload-less even when a child
+    ``interim_<stamp>/`` carries weights, because that child is a distinct
+    tier. The prune is a no-op for an interim slot root
+    (``<adapter_dir>/episodic/interim_<stamp>/``), which never nests another
+    ``interim_*`` directory, so this one predicate applies to both shapes.
+
+    THE single "does this slot carry content" predicate — both
+    :func:`iter_interim_dirs`'s ``mode`` filter and the boot-time
+    keyless-tier sweep
+    (:func:`paramem.server.app._sweep_keyless_tier_artifacts`) read this,
+    not a re-derived ``rglob``/``.exists()`` pair, so the venue -> payload
+    mapping cannot drift between the two callers.
+
+    Args:
+        path: Slot root directory to classify.
+
+    Returns:
+        ``"train"``, ``"simulate"``, or ``None``.
+    """
+    import os
+
+    for _root, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if not d.startswith(INTERIM_DIR_PREFIX)]
+        if "adapter_model.safetensors" in filenames:
+            return "train"
+    if (path / "graph.json").exists():
+        return "simulate"
+    return None
+
+
 def iter_interim_dirs(
     adapter_dir: Path,
     *,
@@ -181,9 +221,9 @@ def iter_interim_dirs(
     An interim *directory* is not the same thing as an interim slot that holds
     *content*: a slot whose payload write never landed (crash between the
     directory creation and the payload flush) is an empty shell that carries
-    nothing to fold.  ``mode`` selects which of the two sets the caller wants,
-    and the venue→payload mapping lives here — in one place — so no caller has
-    to re-implement it.
+    nothing to fold.  ``mode`` selects which of the two sets the caller wants;
+    the venue -> payload classification itself is :func:`slot_payload_kind`,
+    called from here so no caller has to re-implement it.
 
     Args:
         adapter_dir: Adapter root (``config.adapter_dir``).
@@ -192,12 +232,10 @@ def iter_interim_dirs(
             * ``None`` (default) — every interim directory on disk, regardless
               of payload.  Required by the reaper, backup, registry hydration
               and every other caller that must see the whole on-disk set.
-            * ``"simulate"`` — only slots carrying a ``graph.json`` (the
-              simulate venue's payload).
-            * ``"train"`` — only slots carrying ``adapter_model.safetensors``
-              anywhere beneath the slot dir (the train venue's payload).  Keyed
-              on the weights file, not ``adapter_config.json``: a config without
-              weights is a broken slot, hence payload-less.
+            * ``"simulate"`` — only slots :func:`slot_payload_kind` classifies
+              ``"simulate"`` (the simulate venue's payload).
+            * ``"train"`` — only slots :func:`slot_payload_kind` classifies
+              ``"train"`` (the train venue's payload).
 
     Raises:
         ValueError: On an unknown *mode* string.  Silently degrading to the
@@ -213,10 +251,12 @@ def iter_interim_dirs(
     for path in sorted(episodic.glob(f"{INTERIM_DIR_PREFIX}*")):
         if not path.is_dir():
             continue
-        if mode == "simulate" and not (path / "graph.json").exists():
-            continue
-        if mode == "train" and not any(path.rglob("adapter_model.safetensors")):
-            continue
+        if mode is not None:
+            kind = slot_payload_kind(path)
+            if mode == "simulate" and kind != "simulate":
+                continue
+            if mode == "train" and kind != "train":
+                continue
         stamp = path.name[len(INTERIM_DIR_PREFIX) :]
         yield f"{INTERIM_NAME_PREFIX}{stamp}", path
 
@@ -373,12 +413,14 @@ def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
     The three main adapters (episodic, semantic, procedural) remain loaded
     throughout — the sole-adapter trap does not apply.
 
-    Before any ``delete_adapter`` call, the active adapter is switched to
-    "episodic" (when present in ``model.peft_config``) so the post-reap
-    active adapter is deterministic regardless of which adapter happened to
-    be active when this was called — see the module docstring's
-    ACTIVE-ADAPTER DETERMINISM note for why the switch lives here rather
-    than at each call site.
+    The PEFT half delegates to :func:`paramem.models.loader.detach_adapters`,
+    which switches the active adapter onto a resident survivor (episodic
+    first) before deleting any interim adapter, so the post-reap active
+    adapter is deterministic regardless of which adapter happened to be
+    active when this was called — see that function's docstring for the
+    switch-before-delete rationale.  The disk half delegates to
+    :func:`paramem.memory.persistence.reap_tier_artifacts`, one call per
+    interim slot directory yielded by :func:`iter_interim_dirs`.
 
     Args:
         model: Live model.  A :class:`~peft.PeftModel` has its interim adapters
@@ -397,20 +439,18 @@ def unload_interim_adapters(model, adapter_dir: Path) -> list[str]:
         if isinstance(model, PeftModel)
         else []
     )
-    if interim_names and "episodic" in model.peft_config:
-        switch_adapter(model, "episodic")
-    for name in interim_names:
-        model.delete_adapter(name)
-        logger.info("Deleted interim adapter from PEFT: %s", name)
+    detach_adapters(model, interim_names)
 
     # UNFILTERED ON PURPOSE — never pass ``mode`` here.  The reap must see EVERY
     # interim directory, payload-bearing or not.  A payload-filtered reap would
     # leave empty/torn slot dirs behind on every fold and they would accumulate
     # forever.  ``mode`` narrows the set to slots that carry content; that is the
     # right question for the schedule gate and the fold collector, and the wrong
-    # question for a reaper.
+    # question for a reaper.  The path is the one ``iter_interim_dirs`` yields —
+    # never re-derived via ``interim_dir_for_name``, which raises on a stray dir
+    # whose stamp is malformed; the whole-ring reap must still remove those.
     for _name, path in iter_interim_dirs(adapter_dir):
-        shutil.rmtree(path)
-        logger.info("Removed interim adapter directory: %s", path)
+        removed = reap_tier_artifacts(path)
+        logger.info("Removed interim adapter directory: %s (%d paths)", path, len(removed))
 
     return interim_names

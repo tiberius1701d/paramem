@@ -431,7 +431,7 @@ class TestAbortTimeout:
 
 
 class TestStaleInTrainingCleanup:
-    """_ensure_adapters must remove stale in_training checkpoints on startup."""
+    """ensure_adapters must remove stale in_training checkpoints on startup."""
 
     def test_stale_in_training_dir_removed(self, tmp_path):
         from paramem.training.consolidation import ConsolidationLoop
@@ -447,7 +447,7 @@ class TestStaleInTrainingCleanup:
         (stale / "leftover.bin").write_bytes(b"stale garbage")
 
         # Build a loop with pre-wrapped mock model that has peft_config.
-        # __class__ = PeftModel so _ensure_adapters' isinstance check
+        # __class__ = PeftModel so ensure_adapters' isinstance check
         # short-circuits without restricting the mock's attribute surface.
         model = MagicMock()
         model.__class__ = PeftModel
@@ -456,7 +456,7 @@ class TestStaleInTrainingCleanup:
             "semantic": MagicMock(),
             "in_training": MagicMock(),
         }
-        # Bypass _ensure_adapters model re-wrapping — we just need to trigger cleanup
+        # Bypass ensure_adapters model re-wrapping — we just need to trigger cleanup
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
@@ -471,7 +471,7 @@ class TestStaleInTrainingCleanup:
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
         )
-        # _ensure_adapters runs in __init__; the stale dir should be gone
+        # ensure_adapters runs in __init__; the stale dir should be gone
         assert not (tmp_path / "in_training").exists(), (
             "Stale in_training directory was not cleaned up"
         )

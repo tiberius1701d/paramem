@@ -1141,3 +1141,85 @@ class TestBootCompletionTaskLifespan:
         assert first_task.cancelled()
         assert second_task.cancelled()
         assert app_module._state.get("boot_completion_task") is None
+
+
+# ---------------------------------------------------------------------------
+# Eager consolidation-loop creation must degrade the boot, not crash it —
+# ConsolidationLoop.__init__ allocates GPU memory before the post-load VRAM
+# gate runs, so a failure there (VramExhausted or otherwise) must not
+# propagate out of the lifespan.
+# ---------------------------------------------------------------------------
+
+
+class TestEagerConsolidationLoopBootDegrade:
+    def test_eager_loop_failure_does_not_crash_boot(self, tmp_path):
+        """A boot-time failure inside ``_eager_create_consolidation_loop``
+        (e.g. ``VramExhausted`` from ``ensure_adapters`` -> ``create_adapter``)
+        must degrade, not crash: the lifespan completes normally, no
+        ``consolidation_loop`` is installed, and the lazy get-or-create
+        remains the fallback for every later caller that needs one."""
+        import paramem.server.app as app_module
+        from paramem.server.config import PathsConfig, ServerConfig, STTConfig, TTSConfig
+
+        config = ServerConfig(model_name="mistral")
+        config.cloud_only = True
+        config.stt = STTConfig(enabled=False)
+        config.tts = TTSConfig(enabled=False)
+        root = tmp_path / "data"
+        config.paths = PathsConfig(data=root, sessions=root / "sessions", debug=root / "debug")
+
+        saved_state = {
+            key: app_module._state.get(key)
+            for key in (
+                "config",
+                "cloud_only_startup",
+                "defer_model",
+                "boot_completion_task",
+                "base_swap_task",
+                "consolidation_loop",
+            )
+        }
+        app_module._state["config"] = config
+        app_module._state["cloud_only_startup"] = True
+        app_module._state["defer_model"] = False
+        app_module._state["boot_completion_task"] = None
+        app_module._state["base_swap_task"] = None
+        app_module._state["consolidation_loop"] = None
+
+        async def _run():
+            with (
+                patch.object(app_module, "predict_base_bytes", return_value=None),
+                patch.object(app_module, "_gpu_occupied", return_value=False),
+                patch.object(app_module, "_build_config_derived_state"),
+                patch.object(app_module, "_arm_active_store_migration", return_value=False),
+                patch.object(app_module, "_release_base_model_in_process"),
+                patch.object(app_module, "safe_empty_cache"),
+                patch.object(app_module, "_reconcile_scheduling_timers"),
+                patch.object(app_module, "_create_backup"),
+                patch.object(app_module, "_dispatch_consolidation"),
+                patch.object(
+                    app_module,
+                    "_eager_create_consolidation_loop",
+                    side_effect=RuntimeError("boom — simulated eager-loop failure"),
+                ),
+                patch.dict(
+                    app_module._state,
+                    {"session_buffer": MagicMock(), "speaker_store": MagicMock()},
+                    clear=False,
+                ),
+            ):
+                async with app_module.lifespan(app_module.app):
+                    pass
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            for key, val in saved_state.items():
+                if val is None:
+                    app_module._state.pop(key, None)
+                else:
+                    app_module._state[key] = val
+
+        assert app_module._state.get("consolidation_loop") is None

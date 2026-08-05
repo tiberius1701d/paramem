@@ -470,6 +470,77 @@ class TestEnsureAdapterMatching:
 
 
 # ---------------------------------------------------------------------------
+# Test 3b — detach_adapters (paramem.models.loader)
+# ---------------------------------------------------------------------------
+
+
+class TestDetachAdapters:
+    def test_survivor_preference_prefers_episodic(self) -> None:
+        """Among multiple non-deleted resident adapters, episodic is picked
+        as the survivor ahead of semantic/procedural."""
+        from paramem.models.loader import detach_adapters
+
+        model = _make_stub_peft_model(
+            "episodic", "semantic", "procedural", "episodic_interim_20260417T0000"
+        )
+
+        deleted = detach_adapters(model, ["episodic_interim_20260417T0000"])
+
+        assert deleted == ["episodic_interim_20260417T0000"]
+        model.set_adapter.assert_called_once_with("episodic")
+        assert "episodic_interim_20260417T0000" not in model.peft_config
+
+    def test_survivor_falls_through_when_episodic_itself_is_deleted(self) -> None:
+        """When "episodic" is one of the deleted names, the next main tier
+        ("semantic") becomes the survivor."""
+        from paramem.models.loader import detach_adapters
+
+        model = _make_stub_peft_model("episodic", "semantic", "procedural")
+
+        deleted = detach_adapters(model, ["episodic"])
+
+        assert deleted == ["episodic"]
+        model.set_adapter.assert_called_once_with("semantic")
+
+    def test_no_survivor_leaves_peft_config_empty_without_raising(self) -> None:
+        """Deleting every resident adapter leaves peft_config empty; no
+        switch is attempted and nothing raises — the caller is emptying
+        peft_config deliberately and owns the restore."""
+        from paramem.models.loader import detach_adapters
+
+        model = _make_stub_peft_model("episodic_interim_a", "episodic_interim_b")
+
+        deleted = detach_adapters(model, ["episodic_interim_a", "episodic_interim_b"])
+
+        assert deleted == ["episodic_interim_a", "episodic_interim_b"]
+        model.set_adapter.assert_not_called()
+        assert model.peft_config == {}
+
+    def test_non_peft_model_returns_empty_list(self) -> None:
+        """A bare (non-PeftModel) object short-circuits to a no-op — the
+        disk venue holds a bare base model, not a PeftModel."""
+        from paramem.models.loader import detach_adapters
+
+        deleted = detach_adapters(object(), ["episodic"])
+
+        assert deleted == []
+
+    def test_absent_name_is_a_no_op(self) -> None:
+        """A name not resident in peft_config is silently skipped — never
+        raises, and no delete/switch call is made for it."""
+        from paramem.models.loader import detach_adapters
+
+        model = _make_stub_peft_model("episodic", "semantic", "procedural")
+
+        deleted = detach_adapters(model, ["episodic_interim_ghost"])
+
+        assert deleted == []
+        model.set_adapter.assert_not_called()
+        model.delete_adapter.assert_not_called()
+        assert set(model.peft_config.keys()) == {"episodic", "semantic", "procedural"}
+
+
+# ---------------------------------------------------------------------------
 # Test 4 — unload_interim_adapters removes interims, leaves mains intact
 # ---------------------------------------------------------------------------
 
@@ -621,9 +692,10 @@ class TestUnloadInterimAdapters:
             call_order.index(c) for c in delete_calls
         )
 
-    def test_no_switch_when_episodic_absent(self, tmp_path: Path) -> None:
-        """When "episodic" is not resident, set_adapter is never called and
-        the deletes still run (guard branch)."""
+    def test_falls_through_to_semantic_when_episodic_absent(self, tmp_path: Path) -> None:
+        """When "episodic" is not resident, the survivor search (delegated to
+        detach_adapters) falls through to the next main tier ("semantic")
+        rather than skipping the switch — the deletes still run."""
         model = _make_stub_peft_model(
             "semantic",
             "procedural",
@@ -633,8 +705,35 @@ class TestUnloadInterimAdapters:
 
         unload_interim_adapters(model, tmp_path)
 
-        model.set_adapter.assert_not_called()
+        model.set_adapter.assert_called_once_with("semantic")
         model.delete_adapter.assert_called_once_with("episodic_interim_20260417T0000")
+
+    def test_whole_ring_reap_removes_stray_malformed_stamp_dir(self, tmp_path: Path) -> None:
+        """A stray ``interim_*`` directory whose stamp suffix isn't a
+        well-formed stamp (e.g. ``interim_garbage/``) is still removed by the
+        whole-ring reap — ``iter_interim_dirs`` yields it regardless of stamp
+        validity, and the delegated reap (``reap_tier_artifacts``) must
+        consume that exact path rather than re-deriving it via
+        ``interim_dir_for_name``, which raises on a malformed stamp."""
+        model = _make_stub_peft_model(
+            "episodic",
+            "semantic",
+            "procedural",
+            "episodic_interim_20260417T0000",
+        )
+        episodic_root = tmp_path / "episodic"
+        episodic_root.mkdir()
+        valid_dir = episodic_root / "interim_20260417T0000"
+        valid_dir.mkdir()
+        malformed_dir = episodic_root / "interim_garbage"
+        malformed_dir.mkdir()
+        (malformed_dir / "adapter_config.json").write_text("{}")
+
+        unloaded = unload_interim_adapters(model, tmp_path)
+
+        assert unloaded == ["episodic_interim_20260417T0000"]
+        assert not valid_dir.exists()
+        assert not malformed_dir.exists()
 
 
 # ---------------------------------------------------------------------------

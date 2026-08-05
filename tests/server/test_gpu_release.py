@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import pytest
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 
@@ -36,6 +38,54 @@ def _call_gpu_release() -> object:
     from paramem.server.app import gpu_release
 
     return asyncio.run(gpu_release())
+
+
+def test_release_refuses_during_base_swap_409():
+    """An actively running base-swap migration refuses with 409
+    base_swap_active — checked before the cloud-only idempotent
+    short-circuit, since a swap can transiently hold mode='cloud-only'
+    between its own Phase A -> Phase B reload."""
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "mode": "local",
+        "consolidating": False,
+        "model": object(),
+        "tokenizer": object(),
+        "migration": {"base_swap_active": True},
+    }
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        _call_gpu_release()
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "base_swap_active"
+
+
+def test_release_refuses_during_base_swap_even_when_mode_is_cloud_only():
+    """The base-swap guard fires before the cloud-only idempotent
+    short-circuit — a transient cloud-only window mid-swap must not slip
+    through as a no-op 200."""
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "live_reload",
+        "consolidating": False,
+        "model": None,
+        "tokenizer": None,
+        "migration": {"base_swap_active": True},
+    }
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        _call_gpu_release()
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "base_swap_active"
 
 
 def test_already_cloud_only_is_idempotent_returns_released_false():

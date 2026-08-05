@@ -113,6 +113,46 @@ class TestForcedCloudRouting:
         assert mock_funnel.call_args.kwargs["model"] is not None
         assert mock_funnel.call_args.kwargs["tokenizer"] is not None
 
+    def test_forced_cloud_route_holds_gpu_lock(self, tmp_path, monkeypatch):
+        """The local-mode forced-cloud dispatch reaches the live model (the
+        anonymizer's extract_graph/anonymize_turn calls generate() under
+        base_model_inference), so it needs the same GPU discipline as the
+        routed local path: abort in-flight background training, then hold
+        the shared GPU thread lock for the duration of the dispatch."""
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        monkeypatch.setattr(app_module, "_state", _make_state(tmp_path, mode="local"))
+
+        call_order = []
+
+        def fake_abort():
+            call_order.append("abort")
+
+        def fake_funnel(*args, **kwargs):
+            call_order.append(("dispatch", _gpu_thread_lock.locked()))
+            return ChatResult(text="cloud answer", escalated=True)
+
+        with (
+            patch.object(app_module, "_resolve_speaker", return_value=("speaker0", "Alex")),
+            patch.object(
+                app_module, "_abort_background_training_for_inference", side_effect=fake_abort
+            ) as mock_abort,
+            patch.object(app_module, "answer_via_cloud", side_effect=fake_funnel),
+        ):
+            resp = _post_chat(
+                TestClient(app_module.app),
+                text="What's the population of Berlin?",
+                route="cloud",
+            )
+
+        assert resp.status_code == 200
+        mock_abort.assert_called_once()
+        assert call_order == ["abort", ("dispatch", True)], (
+            "the bg-training abort must run before the dispatch, and the "
+            "dispatch must run with the GPU thread lock held"
+        )
+        assert not _gpu_thread_lock.locked(), "the lock must be released after the dispatch"
+
     def test_local_mode_forwards_the_personal_verdict(self, tmp_path, monkeypatch):
         """A personal turn on the forced route carries ``is_personal=True``.
 

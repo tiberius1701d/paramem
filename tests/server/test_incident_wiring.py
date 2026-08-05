@@ -687,6 +687,86 @@ class TestInterimBookkeepingRegionCrash:
 
 
 # ---------------------------------------------------------------------------
+# _finalize_interim's run-status detail carries relation counts for every
+# outcome — one outcome label, one detail contract, so
+# scripts/dev/paramem-status.sh's "simulated" render (which reads
+# detail["episodic_rels"]/detail["procedural_rels"]) is populated regardless
+# of which finalizer wrote the record.
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeInterimDetailShape:
+    def _make_loop(self, state):
+        state["router"] = MagicMock()
+        loop = MagicMock()
+        loop.model = MagicMock()
+        loop.store.replay_enabled = True
+        loop.store.all_active_keys.return_value = {"k1", "k2"}
+        return loop
+
+    def test_simulated_outcome_carries_rel_counts(self, state):
+        """A ``result["mode"] == "simulated"`` cycle's run record carries
+        both relation counts — the exact shape
+        ``scripts/dev/paramem-status.sh``'s simulated branch renders."""
+        loop = self._make_loop(state)
+        result = {"mode": "simulated", "adapter_name": "episodic_interim_x"}
+
+        app_module._finalize_interim(
+            loop,
+            result,
+            session_ids=["sess-1"],
+            released_sids=[],
+            episodic_rels=3,
+            procedural_rels=2,
+        )
+
+        record = read_last_runs(_state_dir(state))["consolidation"]
+        assert record.outcome == "simulated"
+        assert record.detail["episodic_rels"] == 3
+        assert record.detail["procedural_rels"] == 2
+
+    def test_trained_outcome_carries_rel_counts_and_existing_keys_unchanged(self, state):
+        """The ``trained`` outcome's existing detail keys (sessions,
+        total_keys, adapter) are unchanged by adding the new counts."""
+        loop = self._make_loop(state)
+        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
+
+        app_module._finalize_interim(
+            loop,
+            result,
+            session_ids=["sess-1"],
+            released_sids=[],
+            episodic_rels=1,
+            procedural_rels=0,
+        )
+
+        record = read_last_runs(_state_dir(state))["consolidation"]
+        assert record.outcome == "trained"
+        assert record.detail["episodic_rels"] == 1
+        assert record.detail["procedural_rels"] == 0
+        assert record.detail["sessions"] == 1
+        assert record.detail["total_keys"] == 2
+        assert record.detail["adapter"] == "episodic_interim_x"
+
+    def test_rel_counts_default_to_zero_when_omitted(self, state):
+        """Callers that do not pass the new kwargs still get a valid,
+        zero-filled detail — no KeyError on the render side."""
+        loop = self._make_loop(state)
+        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
+
+        app_module._finalize_interim(
+            loop,
+            result,
+            session_ids=["sess-1"],
+            released_sids=[],
+        )
+
+        record = read_last_runs(_state_dir(state))["consolidation"]
+        assert record.detail["episodic_rels"] == 0
+        assert record.detail["procedural_rels"] == 0
+
+
+# ---------------------------------------------------------------------------
 # consolidation_retry_exhausted NOT resolved by the incident-wiring success paths
 # ---------------------------------------------------------------------------
 

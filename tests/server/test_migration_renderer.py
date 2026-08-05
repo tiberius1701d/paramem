@@ -6,8 +6,9 @@ Covers:
 - compute_shape_changes
 - detect_simulate_mode
 - compute_base_change
-- render_preview_response (including base_change)
+- render_preview_response (including base_change, warnings)
 - Byte-for-byte shape-change block rendering smoke test.
+- Warnings block CLI renderer.
 """
 
 from __future__ import annotations
@@ -187,22 +188,26 @@ class TestDetectSimulateMode:
 
 class TestComputeShapeChangesNoManifest:
     def test_empty_adapters_returns_empty(self, tmp_path):
-        """Empty adapters section → no shape changes."""
-        result = compute_shape_changes({}, tmp_path)
+        """Empty adapters section → no shape changes, no warnings."""
+        result, warnings = compute_shape_changes({}, tmp_path)
         assert result == []
+        assert warnings == []
 
     def test_disabled_adapter_is_skipped(self, tmp_path):
         """Adapter with enabled=False is not checked."""
         yaml = {"adapters": {"episodic": {"enabled": False, "rank": 16}}}
-        result = compute_shape_changes(yaml, tmp_path)
+        result, warnings = compute_shape_changes(yaml, tmp_path)
         assert result == []
+        assert warnings == []
 
     def test_missing_slot_skips_silently(self, tmp_path):
-        """No matching slot → no row emitted."""
+        """No matching slot → no row emitted, and no warning (not-yet-trained
+        is not a warning condition)."""
         yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
         # No slot directory created — find_live_slot returns None
-        result = compute_shape_changes(yaml, tmp_path)
+        result, warnings = compute_shape_changes(yaml, tmp_path)
         assert result == []
+        assert warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +238,7 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path)
+            result, _warnings = compute_shape_changes(yaml, tmp_path)
 
         assert any(r["field"] == "rank" and r["adapter"] == "episodic" for r in result), result
 
@@ -249,7 +254,7 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path)
+            result, _warnings = compute_shape_changes(yaml, tmp_path)
 
         assert any(r["field"] == "alpha" for r in result), result
 
@@ -265,15 +270,17 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path)
+            result, warnings = compute_shape_changes(yaml, tmp_path)
 
         assert result == []
+        assert warnings == []
 
     def test_unreadable_manifest_skips_with_warn(self, tmp_path):
-        """ManifestError on read → skip (no row emitted).
+        """ManifestError on read → skip (no row emitted), and a warning row
+        naming the adapter and slot is appended to the returned warnings list.
 
-        The warning is emitted via logger.warning; we verify the row is absent
-        and the function returns cleanly without raising.
+        The same failure is also emitted via logger.warning; we verify both
+        the row is absent and the returned warnings list carries the failure.
         """
         from paramem.adapters.manifest import ManifestSchemaError
 
@@ -288,10 +295,14 @@ class TestComputeShapeChangesWithManifest:
                 side_effect=ManifestSchemaError("bad json"),
             ),
         ):
-            result = compute_shape_changes(yaml_data, tmp_path)
+            result, warnings = compute_shape_changes(yaml_data, tmp_path)
 
         # No row emitted — the unreadable manifest is silently skipped.
         assert result == []
+        assert len(warnings) == 1
+        assert "episodic" in warnings[0]
+        assert "cannot read manifest" in warnings[0]
+        assert str(slot) in warnings[0]
 
     def test_target_modules_change_detected(self, tmp_path):
         """target_modules change → ShapeChange for target_modules field."""
@@ -316,7 +327,7 @@ class TestComputeShapeChangesWithManifest:
             patch("paramem.server.migration.find_live_slot", return_value=slot),
             patch("paramem.server.migration.read_manifest", return_value=manifest),
         ):
-            result = compute_shape_changes(yaml, tmp_path)
+            result, _warnings = compute_shape_changes(yaml, tmp_path)
 
         assert any(r["field"] == "target_modules" for r in result), result
 
@@ -389,11 +400,12 @@ class TestComputeShapeChangesLiveSlotIntegration:
         )
         yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16, "alpha": 16}}}
 
-        result = compute_shape_changes(yaml, tmp_path)
+        result, warnings = compute_shape_changes(yaml, tmp_path)
 
         assert len(result) == 1
         assert result[0]["adapter"] == "episodic"
         assert result[0]["field"] == "rank"
+        assert warnings == []
 
     def test_two_adapters_each_resolved_by_own_registry_hash(self, tmp_path):
         """Two enabled adapters with different registry content, each slot
@@ -420,17 +432,19 @@ class TestComputeShapeChangesLiveSlotIntegration:
             }
         }
 
-        result = compute_shape_changes(yaml, tmp_path)
+        result, warnings = compute_shape_changes(yaml, tmp_path)
 
         by_adapter = {(r["adapter"], r["field"]) for r in result}
         assert ("episodic", "rank") in by_adapter
         assert ("semantic", "alpha") in by_adapter
         assert len(result) == 2
+        assert warnings == []
 
     def test_decrypt_failure_skips_with_warn_other_adapter_still_returns(self, tmp_path, caplog):
         """A read/decrypt failure resolving one adapter's tier registry hash
         is skipped with a WARNING and no raise; a second healthy adapter
-        still yields its row."""
+        still yields its row. The skip also appends a matching row to the
+        returned warnings list."""
         self._write_slot_for(
             tmp_path,
             "semantic",
@@ -458,16 +472,21 @@ class TestComputeShapeChangesLiveSlotIntegration:
             patch("paramem.server.migration.tier_registry_sha256", side_effect=side_effect),
             caplog.at_level(logging.WARNING, logger="paramem.server.migration"),
         ):
-            result = compute_shape_changes(yaml, tmp_path)
+            result, warnings = compute_shape_changes(yaml, tmp_path)
 
         assert all(r["adapter"] != "episodic" for r in result)
         assert any(r["adapter"] == "semantic" and r["field"] == "alpha" for r in result)
 
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        warning_messages = [r.getMessage() for r in warnings]
-        assert any(
-            "episodic" in msg and "cannot read/decrypt" in msg for msg in warning_messages
-        ), f"expected a WARNING naming the skipped adapter; got: {warning_messages}"
+        log_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        log_messages = [r.getMessage() for r in log_records]
+        assert any("episodic" in msg and "cannot read/decrypt" in msg for msg in log_messages), (
+            f"expected a WARNING naming the skipped adapter; got: {log_messages}"
+        )
+
+        # The returned warnings list carries the same substance as the log line.
+        assert len(warnings) == 1
+        assert "episodic" in warnings[0]
+        assert "cannot read/decrypt" in warnings[0]
 
 
 # ---------------------------------------------------------------------------
@@ -506,9 +525,26 @@ class TestRenderPreviewResponse:
             "tier_diff",
             "shape_changes",
             "pre_flight_fail",
+            "warnings",
         ]
         for field in required:
             assert field in payload, f"Missing field: {field!r}"
+
+    def test_warnings_always_present(self):
+        """warnings is always in the payload, mirroring pre_flight_fail."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        payload = render_preview_response(stash)
+        assert "warnings" in payload
+        assert payload["warnings"] == []
+
+    def test_warnings_propagated_from_stash(self):
+        """warnings value is propagated verbatim from the stash."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        stash["warnings"] = ["adapter 'episodic': skipped shape-change check — ..."]
+        payload = render_preview_response(stash)
+        assert payload["warnings"] == ["adapter 'episodic': skipped shape-change check — ..."]
 
     def test_mode_switch_block_for_pure_mode_change(self):
         """A pure consolidation.mode change surfaces a mode_switch block."""
@@ -830,3 +866,38 @@ class TestRenderBaseChangePreview:
         )
         out = capsys.readouterr().out
         assert "restart" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# _render_warnings_block CLI renderer
+# ---------------------------------------------------------------------------
+
+
+class TestRenderWarningsBlock:
+    def test_renders_one_line_per_warning_to_stderr(self, capsys):
+        """Each warning string is printed on its own line to stderr."""
+        from paramem.cli.migrate import _render_warnings_block
+
+        _render_warnings_block(
+            [
+                "adapter 'episodic': skipped shape-change check — cannot read/decrypt "
+                "tier registry at /data/adapters/episodic: RuntimeError('boom')",
+                "adapter 'semantic': skipped shape-change check — cannot read manifest "
+                "from slot /data/adapters/semantic/ts: ManifestSchemaError('bad json')",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        lines = [line for line in captured.err.splitlines() if line]
+        assert len(lines) == 2
+        assert "episodic" in lines[0]
+        assert "semantic" in lines[1]
+
+    def test_suppressed_when_empty(self, capsys):
+        """No warnings → nothing printed to either stream."""
+        from paramem.cli.migrate import _render_warnings_block
+
+        _render_warnings_block([])
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""

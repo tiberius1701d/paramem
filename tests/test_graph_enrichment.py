@@ -73,14 +73,14 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
 
     Graph is transient (RAM-only). Model/tokenizer are mocks so no GPU
     is touched.  The mock model pre-populates ``peft_config`` with all
-    three required adapters so ``_ensure_adapters`` skips the real PEFT
+    three required adapters so ``ensure_adapters`` skips the real PEFT
     ``create_adapter`` calls.
 
     Keyword args forwarded to ConsolidationLoop override the defaults
     set here (e.g. pass ``extraction_enrichment_provider=""`` to test the
     no-provider skip path).
     """
-    # __class__ = PeftModel so _ensure_adapters' isinstance check
+    # __class__ = PeftModel so ensure_adapters' isinstance check
     # short-circuits without restricting the mock's attribute surface.
     model = MagicMock()
     model.__class__ = PeftModel
@@ -3477,7 +3477,7 @@ class TestHarvestKeylessEdges:
         branch of _build_all_edge_entries_into never fires in the other tests.
         This test constructs the loop the same way _make_loop does but adds a
         real AdapterConfig as procedural_adapter_config and pre-populates
-        "procedural" in model.peft_config so _ensure_adapters skips creation.
+        "procedural" in model.peft_config so ensure_adapters skips creation.
 
         filter_procedural_relations routes relation_type=="preference" to the
         procedural bucket (primary gate).  The minted key must carry prefix
@@ -3490,7 +3490,7 @@ class TestHarvestKeylessEdges:
         # Build the loop directly (mirror _make_loop) with a procedural config.
         model = MagicMock()
         model.__class__ = PeftModel
-        # Pre-populate "procedural" so _ensure_adapters skips create_adapter.
+        # Pre-populate "procedural" so ensure_adapters skips create_adapter.
         model.peft_config = {
             "episodic": MagicMock(),
             "semantic": MagicMock(),

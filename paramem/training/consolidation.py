@@ -699,7 +699,7 @@ class ConsolidationLoop:
         # loading it here would only populate ingest-time data that nobody reads.
 
         # Ensure both adapters exist on the model
-        self.model = self._ensure_adapters()
+        self.model = self.ensure_adapters()
 
         # Attach the live model to the merger so model-only contradiction
         # resolution is always-on during merge calls.
@@ -6831,7 +6831,7 @@ class ConsolidationLoop:
 
         return recall_rate
 
-    def _ensure_adapters(self):
+    def ensure_adapters(self):
         """Create production adapters that don't exist yet.
 
         Production adapters (episodic, semantic, procedural) are created based

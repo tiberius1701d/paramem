@@ -328,7 +328,8 @@ class SessionBuffer:
         # it if this is the session's first turn). retirable /
         # mark_consolidated / discard_sessions / bump_retry_and_release all
         # key off _sessions[session_id] — a session that never appears here
-        # would fail bump_retry_and_release's R3 buffered-session guard.
+        # would fail bump_retry_and_release's buffered-session guard (it
+        # silently skips ids that are not currently resident in _sessions).
         session_meta = self._sessions.setdefault(session_id, {"speaker": None, "state": STATE_NEW})
         if speaker_id is not None:
             session_meta["speaker"] = speaker
@@ -1083,8 +1084,9 @@ class SessionBuffer:
                 origdoc.unlink()
                 logger.info("Deleted origdoc for discarded doc: %s", doc_id)
 
-        # Clear durable retry-count rows for discarded sessions (same R3-guard
-        # as mark_consolidated; stale rows must not accumulate or mis-count).
+        # Clear durable retry-count rows for discarded sessions (same
+        # buffered-session guard as mark_consolidated; stale rows must not
+        # accumulate or mis-count).
         if session_ids:
             try:
                 _retry_state.clear_retry_counts(self._state_dir, list(session_ids))
@@ -1150,9 +1152,10 @@ class SessionBuffer:
         The corresponding incident is recorded by the caller (not here) so the
         caller owns the per-session ``key`` for dedup.
 
-        Session ids absent from :attr:`_sessions` are silently skipped (R3
-        guard: synthetic-id leakage protection — synthetic ids are never present
-        in the buffer).
+        Session ids absent from :attr:`_sessions` are silently skipped (the
+        buffered-session guard: only sessions currently resident in the
+        buffer take part in retry bookkeeping — synthetic ids are never
+        present in the buffer).
 
         Reset-on-recall-success: when a previously-counted session passes recall
         in a cycle, the caller calls :meth:`reset_retry_count_for` before

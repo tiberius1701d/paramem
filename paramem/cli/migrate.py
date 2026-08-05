@@ -215,6 +215,25 @@ def _render_shape_change_block(shape_changes: list[dict]) -> None:
                 print(f"             {consequence}")
 
 
+def _render_warnings_block(warnings: list[str]) -> None:
+    """Print skip warnings to stderr, one line per warning.
+
+    Mirrors the pre-flight-failure block in :func:`render_preview` — plain
+    ``print(..., file=sys.stderr)``, no header decoration.  Suppressed
+    entirely when *warnings* is empty.
+
+    Parameters
+    ----------
+    warnings:
+        Human-readable rows describing adapter tiers skipped during
+        shape-change detection (the ``PreviewResponse.warnings`` field).
+    """
+    if not warnings:
+        return
+    for warning in warnings:
+        print(f"paramem migrate: warning: {warning}", file=sys.stderr)
+
+
 def _render_tier_list(tier_diff: list[dict]) -> None:
     """Print tier-classified change rows grouped destructive → pipeline → operational."""
     if not tier_diff:
@@ -849,6 +868,7 @@ def render_preview(result: dict, server_url: str) -> int:
     shape_changes = result.get("shape_changes") or []
     tier_diff = result.get("tier_diff") or []
     unified_diff = result.get("unified_diff", "")
+    warnings = result.get("warnings") or []
 
     # 1. Header
     print(f"Migration preview: {candidate_path}")
@@ -877,6 +897,9 @@ def render_preview(result: dict, server_url: str) -> int:
     if shape_changes:
         _render_shape_change_block(shape_changes)
         print()
+
+    # 3b. Warnings — tiers skipped during shape-change detection.
+    _render_warnings_block(warnings)
 
     # 4. Tier-classified change list
     if tier_diff:

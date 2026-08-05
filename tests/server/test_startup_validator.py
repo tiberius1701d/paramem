@@ -16,7 +16,11 @@ Covers:
 - Migration-script slot (synthesized=True, UNKNOWN fields) → yellow even for episodic.
 - Fresh-built manifest with UNKNOWN fields (synthesized=False) → red.
 - episodic_interim_* uses same schema.
-- sweep_orphan_pending called before find_live_slot (mock order).
+- A keyless tier (main or interim) is reaped before any slot is resolved:
+  interim-child survival, stale-only preservation with the reworded ERROR,
+  an unreadable registry preserved and logged, an absent registry left
+  untouched, a reaped tier's fresh-install classification, and the
+  keyless-tier sweep running before any slot is resolved (mock order).
 """
 
 from __future__ import annotations
@@ -387,14 +391,20 @@ class TestInterimNoMatchingSlotLogLevel:
     """
 
     def test_no_weight_slot_candidate_is_warning_not_error(self, tmp_path: Path, caplog) -> None:
-        """Simulate-mode shape (graph.json only, no meta.json anywhere) → WARNING."""
+        """Simulate-mode shape (graph.json only, no meta.json anywhere) → WARNING.
+
+        The registry carries a known key so the boot-time keyless-tier sweep
+        preserves this slot instead of reaping it before mounting — an empty
+        registry here would be reaped pre-mount and the mount-loop log-level
+        gate under test would never run.
+        """
         import logging
 
         config = _make_config(tmp_path)
         interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
         interim_dir.mkdir(parents=True)
         (interim_dir / "graph.json").write_text("{}")
-        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
 
         caplog.set_level(logging.WARNING, logger="paramem.server.app")
         _run(config)
@@ -411,15 +421,21 @@ class TestInterimNoMatchingSlotLogLevel:
     def test_weight_slot_candidate_with_hash_mismatch_is_error(
         self, tmp_path: Path, caplog
     ) -> None:
-        """A real weight-slot candidate (meta.json) whose hash doesn't match → ERROR."""
+        """A real weight-slot candidate (meta.json) whose hash doesn't match → ERROR.
+
+        The registry carries a known key so the boot-time keyless-tier sweep
+        preserves this slot instead of reaping it before mounting — an empty
+        registry here would be reaped pre-mount and the mount-loop log-level
+        gate under test would never run.
+        """
         import logging
 
         config = _make_config(tmp_path)
         interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
         interim_dir.mkdir(parents=True)
-        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
         # Real weight-slot candidate whose registry_sha256 will not match the
-        # live (empty) registry's "" hash.
+        # live (non-empty, drifted) registry's hash.
         _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
 
         caplog.set_level(logging.WARNING, logger="paramem.server.app")
@@ -432,20 +448,23 @@ class TestInterimNoMatchingSlotLogLevel:
         ), f"Expected an ERROR naming the interim adapter, got: {error_messages}"
 
 
-class TestEmptiedInterimSlotSurvivesBoot:
+class TestEmptiedInterimSlotReapedAtBoot:
     """An interim simulate slot emptied by ``/speaker/forget`` (graph.json
-    rewritten to zero edges, registry rewritten to zero active keys) must
-    survive the boot validator as a preserved simulate-mode slot — not fall
-    through to the torn-write ``rmtree`` branch.  ``iter_interim_dirs``
-    filters on file PRESENCE, not content, so an all-erased slot still lands
-    in the interim mount path; deleting it here would be the wrong
-    classification for a slot the forget handler deliberately rewrites
-    rather than removes.
+    rewritten to zero edges, registry rewritten to zero known keys) is
+    removed by the boot-time keyless-tier sweep before mounting is
+    attempted.  This is the self-heal for a crash between the forget
+    handler's registry write (a durable hard erase) and its own on-disk
+    reap: ``POST /speaker/forget`` persists the emptied registry to disk
+    before it unmounts the tier and deletes its artifacts, so a kill in
+    that window leaves a stale, keyless slot directory behind whose
+    manifest still carries the pre-erase hash.  Sweeping any tier whose
+    registry legitimately tracks zero keys, unconditionally, at every boot,
+    means that window never needs a dedicated recovery path.
     """
 
-    def test_zero_edge_zero_key_interim_slot_dir_survives(self, tmp_path: Path) -> None:
-        """graph.json with no edges + registry with zero active keys → the
-        interim directory (and both files) still exist after mounting."""
+    def test_zero_edge_zero_key_interim_slot_dir_is_removed(self, tmp_path: Path) -> None:
+        """graph.json with no edges + registry with zero known keys → the
+        interim directory (and both files) are gone after mounting."""
         config = _make_config(tmp_path)
         interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
         interim_dir.mkdir(parents=True)
@@ -456,9 +475,7 @@ class TestEmptiedInterimSlotSurvivesBoot:
 
         _run(config)
 
-        assert interim_dir.exists(), "an emptied-but-registered interim slot must not be deleted"
-        assert (interim_dir / "graph.json").exists()
-        assert (interim_dir / "indexed_key_registry.json").exists()
+        assert not interim_dir.exists(), "a keyless interim slot must be reaped at boot"
 
 
 class TestMultipleRows:
@@ -641,3 +658,340 @@ class TestRevalidateMainAdapterManifests:
         state = {"config": config, "tokenizer": _make_tokenizer()}  # no "model" key
         _revalidate_main_adapter_manifests(state)  # must not raise
         assert state.get("adapter_manifest_status", {}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Eager consolidation-loop creation — keeps /status's adapter_loaded reading
+# symmetric across a restart (local-mode boot mounts the adapters
+# immediately, instead of only once the first consolidation door runs) and
+# across a release→acquire cycle (_live_reload_base_model's tail).
+# ---------------------------------------------------------------------------
+
+
+class TestEagerConsolidationLoopCreation:
+    def test_creates_loop_when_model_tokenizer_and_store_present(self) -> None:
+        """Local-mode state (model + tokenizer + memory_store all present)
+        creates the consolidation loop via the shared get-or-create."""
+        from paramem.server import app as app_module
+
+        config = MagicMock(name="config")
+        state = {
+            "model": MagicMock(name="model"),
+            "tokenizer": MagicMock(name="tokenizer"),
+            "memory_store": MagicMock(name="memory_store"),
+            "consolidation_loop": None,
+        }
+
+        with (
+            patch.object(app_module, "_state", state),
+            patch.object(app_module, "_get_or_create_consolidation_loop") as mock_get_or_create,
+        ):
+            app_module._eager_create_consolidation_loop(config)
+
+        mock_get_or_create.assert_called_once_with(config)
+
+    def test_noop_in_cloud_only_mode(self) -> None:
+        """No model resident (cloud-only) — the loop is never created."""
+        from paramem.server import app as app_module
+
+        config = MagicMock(name="config")
+        state = {
+            "model": None,
+            "tokenizer": None,
+            "memory_store": None,
+            "consolidation_loop": None,
+        }
+
+        with (
+            patch.object(app_module, "_state", state),
+            patch.object(app_module, "_get_or_create_consolidation_loop") as mock_get_or_create,
+        ):
+            app_module._eager_create_consolidation_loop(config)
+
+        mock_get_or_create.assert_not_called()
+
+    def test_noop_when_loop_already_exists(self) -> None:
+        """Idempotent: a second call (loop already resident) does not build
+        another one — proven through the real create_consolidation_loop
+        factory, not just a mocked get-or-create."""
+        from paramem.server import app as app_module
+
+        state = {
+            "model": MagicMock(name="model"),
+            "tokenizer": MagicMock(name="tokenizer"),
+            "memory_store": MagicMock(name="memory_store"),
+            "consolidation_loop": None,
+        }
+        fake_loop = MagicMock(name="loop")
+        fake_loop.model = state["model"]
+
+        with (
+            patch.object(app_module, "_state", state),
+            patch.object(
+                app_module, "create_consolidation_loop", return_value=fake_loop
+            ) as mock_create,
+        ):
+            app_module._eager_create_consolidation_loop(MagicMock(name="config"))
+            app_module._eager_create_consolidation_loop(MagicMock(name="config"))
+
+        mock_create.assert_called_once()
+
+
+class TestLifespanEagerLoopWiring:
+    def test_lifespan_invokes_eager_create_consolidation_loop(self) -> None:
+        """The lifespan boot path must call _eager_create_consolidation_loop
+        after config-derived state (memory_store) is built, so a refactor
+        that drops the call fails here rather than silently."""
+        import inspect
+
+        from paramem.server import app as app_module
+
+        source = inspect.getsource(app_module.lifespan)
+        assert "_eager_create_consolidation_loop(" in source, (
+            "lifespan must call _eager_create_consolidation_loop so "
+            "adapter_loaded is symmetric across a restart"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Boot-time keyless-tier sweep — self-heals a crash between a hard key erase
+# (POST /speaker/forget) and its own on-disk reap, and reclassifies any
+# payload-bearing tier whose registry legitimately tracks zero keys.
+# ---------------------------------------------------------------------------
+
+
+class TestKeylessTierSweep:
+    def test_main_tier_zero_known_keys_reaped_interim_child_survives(self, tmp_path: Path) -> None:
+        """A main tier reduced to zero known keys is reaped, but a sibling
+        interim slot living under it (a separate tier with its own known
+        keys) is untouched — reap_tier_artifacts never removes interim_*
+        children of a main tier root."""
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": [], "fidelity_history": {}, "stale": {}, "simhash": {}}'
+        )
+        interim_child = episodic_dir / "interim_20260803T1200"
+        interim_child.mkdir()
+        (interim_child / "graph.json").write_text('{"directed": true, "nodes": [], "links": []}')
+        (interim_child / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "fidelity_history": {}, "stale": {}, "simhash": {}}'
+        )
+
+        reaped = _sweep_keyless_tier_artifacts(config)
+
+        assert reaped == ["episodic"]
+        assert not (episodic_dir / "indexed_key_registry.json").exists()
+        assert episodic_dir.exists(), "root survives — the interim child keeps it non-empty"
+        assert interim_child.exists()
+        assert (interim_child / "graph.json").exists()
+        assert (interim_child / "indexed_key_registry.json").exists()
+
+    def test_main_tier_stale_only_registry_preserved_and_errors_when_payloadless(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A registry whose only known key is stale (known ⊇ active, active
+        is empty) is preserved, not reaped — list_known(), not list_active(),
+        is the sweep's emptiness test. With no adapter weights and no
+        graph.json at the tier root, this also fires the reworded ERROR
+        naming the known-key count."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        semantic_dir = config.adapter_dir / "semantic"
+        semantic_dir.mkdir(parents=True)
+        (semantic_dir / "indexed_key_registry.json").write_text(
+            json.dumps(
+                {
+                    "active_keys": [],
+                    "fidelity_history": {},
+                    "stale": {"k1": {"stale_since": "2026-08-01T00:00:00Z", "stale_cycles": 0}},
+                    "simhash": {},
+                }
+            )
+        )
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config)
+
+        assert reaped == []
+        assert semantic_dir.exists()
+        assert (semantic_dir / "indexed_key_registry.json").exists()
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("semantic" in msg and "known key" in msg for msg in error_messages), (
+            f"Expected a reworded 'known key(s)' ERROR, got: {error_messages}"
+        )
+
+    def test_interim_tier_active_keys_no_payload_preserved_and_errors(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """An INTERIM slot whose registry lists ACTIVE keys but carries
+        neither adapter weights nor a graph.json is preserved and logged as
+        an ERROR — unfolded facts must not be deleted. Pins the INTERIM
+        branch of the payload-less classification (the main-tier branch is
+        pinned by test_main_tier_stale_only_registry_preserved_and_errors_when_payloadless
+        above)."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "indexed_key_registry.json").write_text(
+            json.dumps(
+                {
+                    "active_keys": ["graph1"],
+                    "fidelity_history": {},
+                    "stale": {},
+                    "simhash": {},
+                }
+            )
+        )
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config)
+
+        assert reaped == []
+        assert interim_dir.exists(), "unfolded facts must not be deleted"
+        assert (interim_dir / "indexed_key_registry.json").exists()
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "episodic_interim_20260803T1200" in msg and "known key" in msg for msg in error_messages
+        ), f"Expected a reworded 'known key(s)' ERROR, got: {error_messages}"
+
+    def test_unreadable_registry_is_preserved_and_logged(self, tmp_path: Path, caplog) -> None:
+        """A registry that raises on load (corrupt file, failed decrypt) is
+        never inferred to hold zero keys — it is preserved and logged."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        reg_path = episodic_dir / "indexed_key_registry.json"
+        reg_path.write_text('{"active_keys": []}')
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        with patch(
+            "paramem.training.key_registry.KeyRegistry.load",
+            side_effect=RuntimeError("decrypt failed"),
+        ):
+            reaped = _sweep_keyless_tier_artifacts(config)
+
+        assert reaped == []
+        assert reg_path.exists(), "an unreadable registry must never be swept"
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("episodic" in msg and "unreadable" in msg for msg in error_messages), (
+            f"Expected an unreadable-registry ERROR, got: {error_messages}"
+        )
+
+    def test_foreign_shaped_registry_with_real_weights_is_preserved_and_errors(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A parseable-but-foreign registry payload (e.g. ``{}``) must never
+        be inferred to hold zero keys just because ``KeyRegistry.load`` is
+        tolerant by contract and shrugs it into an empty registry.
+        ``KeyRegistry.load_simhashes`` refuses anything that is not
+        affirmatively KeyRegistry-shaped, so a foreign shape is preserved
+        and logged rather than reaped — even with real trained weights
+        sitting right next to it, which the sweep must never delete."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        slot = episodic_dir / "20260421-000000"
+        slot.mkdir()
+        (slot / "adapter_config.json").write_text("{}")
+        (slot / "adapter_model.safetensors").write_bytes(b"weights")
+        reg_path = episodic_dir / "indexed_key_registry.json"
+        reg_path.write_text("{}")
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config)
+
+        assert reaped == []
+        assert reg_path.exists(), "a foreign-shaped registry must never be swept"
+        assert (slot / "adapter_model.safetensors").exists(), "trained weights must survive"
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("episodic" in msg and "KeyRegistry-shaped" in msg for msg in error_messages), (
+            f"Expected a not-affirmatively-KeyRegistry-shaped ERROR, got: {error_messages}"
+        )
+
+    def test_absent_registry_tier_is_untouched(self, tmp_path: Path) -> None:
+        """A tier directory with no indexed_key_registry.json at all (fresh
+        install) is not this sweep's business — left exactly as found."""
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        procedural_dir = config.adapter_dir / "procedural"
+        procedural_dir.mkdir(parents=True)
+        (procedural_dir / "some_other_file.txt").write_text("noop")
+
+        reaped = _sweep_keyless_tier_artifacts(config)
+
+        assert reaped == []
+        assert procedural_dir.exists()
+        assert (procedural_dir / "some_other_file.txt").exists()
+
+    def test_reaped_payload_bearing_tier_produces_no_manifest_row(self, tmp_path: Path) -> None:
+        """Behavioural reclassification: a tier that carries real adapter
+        weights but whose registry has already dropped to zero known keys
+        is reaped, not surfaced — the old post-mount check never even read
+        the registry for a payload-bearing dir, so this shape used to be
+        left mounted-but-orphaned. After the sweep reaps it pre-mount, the
+        boot validator sees a fresh install and emits no row."""
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        _write_slot(episodic_dir, registry_sha256="whatever-stale-hash")
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": [], "fidelity_history": {}, "stale": {}, "simhash": {}}'
+        )
+
+        _, state = _run(config)
+
+        assert "episodic" not in state["adapter_manifest_status"]
+        assert not episodic_dir.exists(), "the emptied tier is fully reaped, not just unmounted"
+
+    def test_sweep_runs_before_any_slot_is_resolved(self, tmp_path: Path) -> None:
+        """The keyless-tier sweep runs before find_live_slot resolves any
+        tier's slot — mirrors the sweep_orphan_pending-before-find_live_slot
+        ordering already load-bearing inside _validate_main_adapter_slot."""
+        from paramem.adapters.manifest import find_live_slot as real_find_live_slot
+        from paramem.server import app as app_module
+
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir(parents=True)
+        _write_slot(kind_dir, registry_sha256="")
+
+        call_order: list[str] = []
+        real_sweep = app_module._sweep_keyless_tier_artifacts
+
+        def _tracked_sweep(cfg):
+            call_order.append("sweep")
+            return real_sweep(cfg)
+
+        def _tracked_find_live_slot(*args, **kwargs):
+            call_order.append("find_live_slot")
+            return real_find_live_slot(*args, **kwargs)
+
+        with (
+            patch.object(app_module, "_sweep_keyless_tier_artifacts", side_effect=_tracked_sweep),
+            patch("paramem.adapters.manifest.find_live_slot", side_effect=_tracked_find_live_slot),
+        ):
+            _run(config)
+
+        assert call_order, "expected both the sweep and find_live_slot to be called"
+        assert call_order[0] == "sweep", "the sweep must run before any slot is resolved"
+        assert "find_live_slot" in call_order
