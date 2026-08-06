@@ -678,9 +678,13 @@ class TestProbeKeysGroupedByAdapter:
 class TestMemoryStoreProbe:
     """In-RAM probe path through :meth:`MemoryStore.probe`.
 
-    Equivalent to the retired ``probe_keys_from_cache`` but routes
-    through the canonical store API and exercises the speaker-filter
-    defense-in-depth + on-miss source delegation.
+    Equivalent to the retired ``probe_keys_from_cache`` but routes through
+    the canonical store API.  Exercises known/unknown-key resolution, an
+    empty store, and insertion-order preservation.  Speaker scoping is not
+    exercised here — it lives solely at the router
+    (:attr:`~paramem.server.router.QueryRouter._speaker_key_index`), never
+    in ``MemoryStore.probe`` itself; see ``tests/test_memory_store.py`` and
+    ``tests/test_router.py``.
     """
 
     def _store(self):
@@ -745,24 +749,6 @@ class TestMemoryStoreProbe:
 
         result = MemoryStore(replay_enabled=False).probe({"episodic": ["graph1", "graph2"]})
         assert result == {"graph1": None, "graph2": None}
-
-    def test_speaker_filter_drops_cross_speaker_key(self):
-        """Defense-in-depth: speaker_id mismatch → None."""
-        result = self._store().probe(
-            {"episodic": ["graph1", "graph3"]},
-            speaker_id="spk-alice",
-        )
-        assert result["graph1"] is not None
-        assert result["graph1"]["subject"] == "Alice"
-        assert result["graph3"] is None  # cross-speaker — filtered
-
-    def test_speaker_filter_none_passes_everything(self):
-        result = self._store().probe(
-            {"episodic": ["graph1", "graph3"]},
-            speaker_id=None,
-        )
-        assert result["graph1"] is not None
-        assert result["graph3"] is not None
 
     def test_insertion_order_preserved(self):
         result = self._store().probe(

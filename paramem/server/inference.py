@@ -936,7 +936,6 @@ def _probe_and_reason(
     probe_results = memory_store.probe(
         keys_by_adapter,
         source=source,
-        speaker_id=speaker_id,
         memoize=config.inference.preload_cache,
     )
 
@@ -1009,11 +1008,13 @@ def _probe_and_reason(
         # (``not layers`` means no facts were recalled), so generating an
         # answer would be unconditional confabulation.
         #
-        # ``router`` and ``speaker_id`` are not threaded into this function —
-        # default of ``None`` makes :func:`_abstain_if_applicable` return the
-        # canned response (cold-start can't apply: reaching here means the
-        # router built probes from the speaker's existing keys, so the
-        # speaker has facts and the coverage-gap response fits).
+        # ``router`` and ``speaker_id`` are deliberately NOT passed to this
+        # ``_abstain_if_applicable`` call (both default to ``None`` here) —
+        # cold-start can't apply: reaching here means the router already
+        # built probes from the speaker's existing keys, so the speaker has
+        # facts and the coverage-gap (canned) response fits.  ``speaker_id``
+        # itself IS a parameter of ``_probe_and_reason`` and is threaded to
+        # the escalation call above and to ``_base_model_answer`` below.
         abstention = _abstain_if_applicable(text, config, is_personal=is_personal)
         if abstention is not None:
             result, _label = abstention

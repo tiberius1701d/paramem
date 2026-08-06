@@ -424,7 +424,8 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
 
         # Case A — put entry_a into store, then probe (cache-hit path).
         mem_store.put("episodic", entry_a["key"], entry_a)
-        # Bookkeeping: set speaker_id so the mismatch filter does not drop it.
+        # Bookkeeping: probe reads no speaker field, but the registry still
+        # needs a valid speaker_id per the no-unattributed-keys invariant.
         mem_store.set_bookkeeping(
             entry_a["key"],
             speaker_id=alex_id,
@@ -490,8 +491,9 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         fact_anon_raw = entry_fact_text(entry_anon)
         fact_anon_resolved = resolve_speaker_tokens(fact_anon_raw, store)
 
-        # Also probe through MemoryStore (cache-hit path, no speaker filter,
-        # no resolver kwarg — resolve_speaker_tokens is applied afterward).
+        # Also probe through MemoryStore (cache-hit path — probe returns no
+        # speaker field and has no resolver kwarg; resolve_speaker_tokens is
+        # applied afterward).
         mem_store.put("episodic", entry_anon["key"], entry_anon)
         # allow_empty_speaker=True: anonymous speakers have a valid token but
         # no meaningful speaker_id restriction for this probe.

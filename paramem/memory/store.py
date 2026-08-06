@@ -353,13 +353,14 @@ class MemoryStore:
 
         ``speaker_id`` is canonicalized via
         :func:`~paramem.utils.identity.canonical` when it matches the
-        ``speaker{N}`` pattern (``is_speaker_id``).  This makes the probe
-        speaker-filter casing invariant hold for BOTH legacy-loaded and
-        runtime-set data: legacy cased ``Speaker0`` from ``key_metadata.json``
-        is silently coerced to ``speaker0`` at boot via the
-        :meth:`load_bookkeeping_from_disk` → :meth:`set_bookkeeping` path,
-        self-healing on the next save.  Empty strings and non-speaker values
-        pass through unchanged."""
+        ``speaker{N}`` pattern (``is_speaker_id``) so legacy-loaded and
+        runtime-set data both match the casing the router's
+        ``_speaker_key_index`` (:meth:`~paramem.server.router.QueryRouter.reload`,
+        the sole privacy boundary) is built from: legacy cased ``Speaker0``
+        from ``key_metadata.json`` is silently coerced to ``speaker0`` at
+        boot via the :meth:`load_bookkeeping_from_disk` →
+        :meth:`set_bookkeeping` path, self-healing on the next save.  Empty
+        strings and non-speaker values pass through unchanged."""
         if is_speaker_id(speaker_id):
             speaker_id = canonical(speaker_id)
         if not speaker_id and not allow_empty_speaker:
@@ -1018,7 +1019,6 @@ class MemoryStore:
         keys_by_adapter: dict[str, list[str]],
         *,
         source=None,
-        speaker_id: str | None = None,
         memoize: bool = True,
     ) -> dict[str, dict | None]:
         """Resolve *keys_by_adapter* to flat ``{key → result | None}``.
@@ -1040,16 +1040,21 @@ class MemoryStore:
         *memoize* is False (typically when ``inference.preload_cache`` is off
         and the operator wants the cache to stay empty).
 
-        *speaker_id* is a defense-in-depth filter: any entry whose
-        ``speaker_id`` mismatches the requested speaker is returned as
-        ``None`` and logged at WARN — the router should have intersected
-        upstream.
-
-        Returns the canonical inference result shape per hit:
-        ``{key, subject, predicate, object, speaker_id,
-        confidence=1.0, fact_text, raw_output}``.  Misses (or
-        source-failure dicts carrying ``failure_reason``) pass through
-        unrendered.
+        Contract: probe is a pure latency memo — it does not scope by
+        speaker.  Callers pass already speaker-scoped keys; the router's
+        per-speaker key intersection
+        (:attr:`~paramem.server.router.QueryRouter._speaker_key_index`) is
+        the single privacy boundary, and no dict probe returns carries a
+        ``speaker_id`` field.  Speaker attribution flows only source →
+        bookkeeping (the registry), never source → caller — the disk-source
+        provenance a source result may carry feeds only the bookkeeping
+        backfill below.  Cache hits render to exactly ``{key, subject,
+        predicate, object, confidence, fact_text, raw_output}``;
+        source-served hits pass through the source's own dict minus
+        ``speaker_id`` (a denylist strip, not an allowlist projection) and
+        so may carry other non-speaker fields the source attached (e.g.
+        ``answer``, see ``inference.py``).  Misses (or source-failure dicts
+        carrying ``failure_reason``) pass through unrendered.
 
         ``fact_text`` renders raw ``speaker{N}`` tokens verbatim in both
         render paths (cache-hit via ``entry_fact_text`` + source passthrough).
@@ -1057,17 +1062,6 @@ class MemoryStore:
         token space; a token is substituted for a display name exactly once,
         at the reply boundary, by
         :func:`~paramem.server.speaker.resolve_speaker_tokens`.
-
-        **speaker_id asymmetry (do not remove this comment):**
-        The CACHE-HIT branch reads ``speaker_id`` from ``_bookkeeping`` (the
-        single authoritative source — entries are SPO-only after this fix).
-        The SOURCE-RESULT branch reads ``src.get("speaker_id","")`` as-is.
-        On the train/weight path ``WeightMemorySource`` emits NO speaker_id
-        (``probe.py:87-99``), so the filter is a no-op there; scoping relies
-        on the router upstream + ``_render`` joining from ``_bookkeeping``.
-        The disk/simulate source DOES carry speaker_id — redundant belt-and-
-        suspenders for the simulate speaker filter.  Do NOT collapse the two
-        branches into one: the asymmetry is load-bearing.
         """
         import json as _json
 
@@ -1118,10 +1112,9 @@ class MemoryStore:
             return verify_confidence(candidate, {key: fp})
 
         def _render(key: str, entry: dict) -> dict | None:
-            # speaker_id / relation_type come from _bookkeeping — the single
-            # authoritative source.  Entries hold SPO only (inference cache
-            # contract); save-path working entries carry them for build_graph_for_tier
-            # but those are consumed within the cycle, not at inference time.
+            # Entries hold SPO only (inference cache contract); no speaker
+            # field is rendered — speaker attribution lives in bookkeeping
+            # (the registry), never in a probe result.
             #
             # SimHash confidence gate: when replay is enabled and the key has a
             # stored fingerprint, compute the real confidence and drop entries
@@ -1142,19 +1135,16 @@ class MemoryStore:
             # Use the computed confidence when the gate applied; fall back to
             # 1.0 when replay is off or no fingerprint exists (pass-through).
             rendered_confidence = confidence if confidence is not None else 1.0
-            bk = self.bookkeeping_for_key(key) or {}
             base = {
                 "key": key,
                 "subject": entry.get("subject", ""),
                 "predicate": entry.get("predicate", ""),
                 "object": entry.get("object", ""),
             }
-            spk = bk.get("speaker_id", "")
             return {
                 **base,
-                "speaker_id": spk,
                 "confidence": rendered_confidence,
-                "fact_text": entry_fact_text({**base, "speaker_id": spk}),
+                "fact_text": entry_fact_text(base),
                 "raw_output": _json.dumps(base),
             }
 
@@ -1166,19 +1156,6 @@ class MemoryStore:
                 entry = self.get(key)
                 if entry is None:
                     misses.setdefault(tier, []).append(key)
-                    continue
-                # Defense-in-depth speaker filter — read speaker from
-                # _bookkeeping (not from the entry: entries are SPO-only).
-                bk_spk = (self.bookkeeping_for_key(key) or {}).get("speaker_id", "")
-                if speaker_id is not None and bk_spk and bk_spk != speaker_id:
-                    logger.warning(
-                        "MemoryStore.probe: speaker_id mismatch for key %s "
-                        "(bookkeeping=%r, requested=%r) — returning None",
-                        key,
-                        bk_spk,
-                        speaker_id,
-                    )
-                    results[key] = None
                     continue
                 results[key] = _render(key, entry)
 
@@ -1196,20 +1173,11 @@ class MemoryStore:
                     if src is None:
                         results[key] = None
                         continue
-                    if isinstance(src, dict) and "failure_reason" in src:
+                    if not isinstance(src, dict):
                         results[key] = src
                         continue
-                    # SOURCE-RESULT speaker filter — reads src["speaker_id"]
-                    # directly.  See docstring asymmetry note: WeightMemorySource
-                    # emits no speaker_id so this is a no-op on the train path;
-                    # DiskMemorySource carries it for simulate-path belt-and-suspenders.
-                    if (
-                        speaker_id is not None
-                        and isinstance(src, dict)
-                        and src.get("speaker_id", "")
-                        and src["speaker_id"] != speaker_id
-                    ):
-                        results[key] = None
+                    if "failure_reason" in src:
+                        results[key] = src
                         continue
                     # SOURCE-RESULT confidence gate — mirrors the cache-hit gate
                     # so that entries admitted through the source path are also
@@ -1218,29 +1186,32 @@ class MemoryStore:
                     # path where WeightMemorySource is constructed without a
                     # registry (app.py belt-and-suspenders fix adds one, but the
                     # store-boundary gate is the hermetic authority).
-                    if isinstance(src, dict):
-                        src_confidence = _confidence_gate(key, src)
-                        if (
-                            src_confidence is not None
-                            and src_confidence < DEFAULT_CONFIDENCE_THRESHOLD
-                        ):
-                            logger.debug(
-                                "MemoryStore.probe: source-result key %r dropped by "
-                                "confidence gate (%.3f < %.3f threshold)",
-                                key,
-                                src_confidence,
-                                DEFAULT_CONFIDENCE_THRESHOLD,
-                            )
-                            results[key] = None
-                            continue
-                        # Patch the rendered confidence onto the source result so
-                        # callers always see the real score (not a stale 1.0 from
-                        # WeightMemorySource when it ran without a registry).
-                        if src_confidence is not None:
-                            src = dict(src)
-                            src["confidence"] = src_confidence
-                    results[key] = src
-                    if memoize and isinstance(src, dict):
+                    src_confidence = _confidence_gate(key, src)
+                    if src_confidence is not None and src_confidence < DEFAULT_CONFIDENCE_THRESHOLD:
+                        logger.debug(
+                            "MemoryStore.probe: source-result key %r dropped by "
+                            "confidence gate (%.3f < %.3f threshold)",
+                            key,
+                            src_confidence,
+                            DEFAULT_CONFIDENCE_THRESHOLD,
+                        )
+                        results[key] = None
+                        continue
+                    # Patch the rendered confidence onto the source result so
+                    # callers always see the real score (not a stale 1.0 from
+                    # WeightMemorySource when it ran without a registry).
+                    if src_confidence is not None:
+                        src = dict(src)
+                        src["confidence"] = src_confidence
+                    # No dict returned by probe carries a speaker_id key — a
+                    # denylist strip (not an allowlist projection) because
+                    # mocked/legacy source results may carry other provenance
+                    # fields (e.g. ``answer``, see inference.py).  ``src``
+                    # itself (with speaker_id intact) is still used below for
+                    # the bookkeeping backfill, the sanctioned source →
+                    # registry transport.
+                    results[key] = {k: v for k, v in src.items() if k != "speaker_id"}
+                    if memoize:
                         # Stash the raw SPO entry back into the cache (content only).
                         # Register=False — the registry was established at boot.
                         raw_entry = {

@@ -22,10 +22,19 @@ cycle, or sourced fresh but expensive per query).
 Naming
 ------
 ``entry`` is the shape-agnostic term for "one keyed record".  Today the
-schema is ``{subject, predicate, object, speaker_id}`` with the canonical
-fields ``{key, subject, predicate, object, speaker_id, confidence,
-fact_text, raw_output}``.  If the schema evolves the source's contract
-still holds.
+schema is ``{subject, predicate, object, speaker_id}``, and a source's own
+``probe()`` result carries provenance fields ``{key, subject, predicate,
+object, speaker_id, confidence, fact_text, raw_output}`` for two live
+consumers of ``speaker_id``: :class:`~paramem.memory.store.MemoryStore`'s
+bookkeeping backfill on cache miss, and boot preload (``app.py`` lifespan
+calls ``_source.probe(...)`` directly, bypassing ``MemoryStore.probe``, and
+stores the raw dict as a store entry) whose ``speaker_id`` is later read by
+:func:`~paramem.memory.persistence.build_tier_graph_from_store` when
+re-persisting a tier graph in simulate mode.  Do not delete the emission
+without checking both sites.  ``MemoryStore.probe`` — the caller-facing
+inference surface — strips ``speaker_id`` before returning, so a source
+result is not the same shape that surface returns.  If the schema evolves
+the source's contract still holds.
 """
 
 from __future__ import annotations

@@ -821,34 +821,72 @@ class TestBookkeeping:
         s.delete("graph1")
         assert s.bookkeeping_for_key("graph1") is None
 
-    def test_probe_hit_render_joins_store_bookkeeping(self):
-        """Fake source returns SPO with NO speaker_id.  _bookkeeping is the
-        authoritative render-time source (mirrors WeightMemorySource path).
-        The store has an entry for graph1 (cache-hit path)."""
+    def test_probe_results_never_carry_speaker_id(self):
+        """No dict returned by probe carries ``speaker_id`` — the privacy
+        boundary is the router's ``_speaker_key_index``, not probe.  Covers
+        cache-hit (graph1), plain source-served (graph2), confidence-patched
+        source-served (graphC — a stored fingerprint routes through the
+        patch arm's ``src = dict(src)`` copy) and failure-dict pass-through
+        (graphF); also pins the source → bookkeeping backfill for the
+        previously-unbookkept graph2."""
+        from paramem.memory.entry import entry_simhash
 
-        class _FakeSource:
+        carol = {"key": "graphC", "subject": "Carol", "predicate": "lives_in", "object": "Rome"}
+        fp = entry_simhash(carol)
+
+        class _StubSource:
             def probe(self, keys_by_tier):
-                # Weight-source style: SPO only, no speaker_id.
-                result = {}
-                for keys in keys_by_tier.values():
-                    for k in keys:
-                        result[k] = {
-                            "key": k,
-                            "subject": "Alice",
-                            "predicate": "lives_in",
-                            "object": "Berlin",
-                        }
-                return result
+                return {
+                    "graph2": {
+                        "key": "graph2",
+                        "subject": "Bob",
+                        "predicate": "lives_in",
+                        "object": "Paris",
+                        "speaker_id": "spk-bob",
+                        "fact_text": "Bob lives_in Paris",
+                    },
+                    "graphC": {
+                        **carol,
+                        "speaker_id": "spk-carol",
+                        "fact_text": "Carol lives_in Rome",
+                    },
+                    "graphF": {"raw_output": "garbled", "failure_reason": "parse_error"},
+                }
 
         s = MemoryStore()
+        # Cache-hit key: bookkeeping already present.
         s.put(
             "episodic",
             "graph1",
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
         )
         s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
-        results = s.probe({"episodic": ["graph1"]}, source=_FakeSource())
-        assert results["graph1"]["speaker_id"] == "spk-alice"
+        s.put_simhash("episodic", "graphC", fp)  # forces the confidence-patch arm
+        assert s.bookkeeping_for_key("graph2") is None  # backfill precondition
+
+        results = s.probe(
+            {"episodic": ["graph1", "graph2", "graphC", "graphF"]}, source=_StubSource()
+        )
+
+        for key in ("graph1", "graph2", "graphC"):
+            assert "speaker_id" not in results[key]
+        assert results["graph1"]["fact_text"] == "Alice lives_in Berlin"
+        assert results["graph2"]["subject"] == "Bob"
+        assert results["graphC"]["confidence"] == 1.0
+        # Failure dicts never carry speaker_id; the strip must not disturb them.
+        assert results["graphF"] == {"raw_output": "garbled", "failure_reason": "parse_error"}
+
+        # Source → registry transport survives even though it never reaches
+        # the caller-facing result dict.
+        bk = s.bookkeeping_for_key("graph2")
+        assert bk is not None
+        assert bk["speaker_id"] == "spk-bob"
+
+    def test_probe_has_no_speaker_id_parameter(self):
+        """MemoryStore.probe takes no speaker_id kwarg — passing one raises."""
+        s = MemoryStore()
+        with pytest.raises(TypeError):
+            s.probe({"episodic": []}, speaker_id="x")
 
     def test_cache_off_empty_store_always_probes(self):
         """Under cache-off the store has no entries.  Every key must miss
@@ -1501,15 +1539,15 @@ class TestSetBookkeepingGuard:
     def test_cased_speaker_id_normalized_to_lowercase(self):
         """set_bookkeeping normalizes is_speaker_id values to lowercase.
 
-        Cased ``Speaker0`` is coerced to ``speaker0``; probe filter and router
-        index receive the normalized form, eliminating the silent-drop regression
-        where legacy key_metadata.json held cased ids."""
+        Cased ``Speaker0`` is coerced to ``speaker0``; the router's
+        ``_speaker_key_index`` receives the normalized form, eliminating the
+        silent-drop regression where legacy key_metadata.json held cased ids."""
         s = MemoryStore()
         s.set_bookkeeping("g1", speaker_id="Speaker0", relation_type="factual", first_seen="")
         bk = s.bookkeeping_for_key("g1")
         assert bk is not None
         assert bk["speaker_id"] == "speaker0", (
-            "set_bookkeeping must lowercase Speaker0 → speaker0 to match the probe filter."
+            "set_bookkeeping must lowercase Speaker0 → speaker0 to match the router index."
         )
 
     def test_empty_speaker_id_passes_through_with_flag(self):
@@ -1538,10 +1576,11 @@ class TestSetBookkeepingGuard:
         """Legacy key_metadata.json with cased Speaker0 is lowercased at boot.
 
         :meth:`load_bookkeeping_from_disk` calls :meth:`set_bookkeeping`, which
-        normalizes ``Speaker0`` → ``speaker0`` via ``is_speaker_id``.  A subsequent
-        probe with the lowercase id must NOT drop the key (the live regression
-        this fix targets: 158 keys silently dropped after the speaker-identity
-        refactor)."""
+        normalizes ``Speaker0`` → ``speaker0`` via ``is_speaker_id`` — the same
+        normalization the router's ``_speaker_key_index`` (the sole privacy
+        boundary) relies on to route legacy-cased ids without dropping the key
+        (the live regression this fix targets: 158 keys silently dropped after
+        the speaker-identity refactor)."""
         import json
 
         path = tmp_path / "key_metadata.json"
@@ -1580,10 +1619,35 @@ class TestSetBookkeepingGuard:
             "Legacy cased Speaker0 must be normalized to speaker0 at boot."
         )
 
-        # Probe with lowercase id must NOT drop the key.
-        results = s.probe({"episodic": ["graph42"]}, speaker_id="speaker0")
-        assert results.get("graph42") is not None, (
-            "probe(speaker_id='speaker0') must find the key after legacy normalization."
+    def test_router_routes_by_legacy_cased_speaker_id_after_normalization(self, monkeypatch):
+        """Cased-bookkeeping → normalized → routable: ``QueryRouter``'s
+        ``_speaker_key_index`` (sole privacy boundary) is built from the
+        same normalized bookkeeping the preceding test locks, so
+        ``route(speaker_id="speaker0")`` finds a key bookkept as
+        ``Speaker0``."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from paramem.server.router import Intent, QueryRouter
+
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "graph42",
+            {"key": "graph42", "subject": "speaker0", "predicate": "lives_in", "object": "London"},
+        )
+        s.set_bookkeeping("graph42", speaker_id="Speaker0", relation_type="factual", first_seen="")
+
+        monkeypatch.setattr(
+            "paramem.server.intent.classify_intent", MagicMock(return_value=Intent.PERSONAL)
+        )
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=s)
+        plan = router.route("Where do I live?", speaker_id="speaker0")
+
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph42" in all_keys, (
+            "route(speaker_id='speaker0') must find a key bookkept under cased "
+            "'Speaker0' — the router index is the sole privacy boundary."
         )
 
 
@@ -1681,62 +1745,3 @@ class TestProbeRendersTokensVerbatim:
         s = MemoryStore()
         with pytest.raises(TypeError):
             s.probe({"episodic": []}, speaker_resolver=lambda t: t)
-
-
-# ---------------------------------------------------------------------------
-# Contract: probe speaker-filter lowercase invariant
-# ---------------------------------------------------------------------------
-
-
-class TestProbeFilterLowercaseInvariant:
-    """A cased request speaker_id must not silently drop a lowercase-bookkept key.
-
-    The probe speaker-filter at store.py::1010 compares
-    ``bk_spk != speaker_id``.  Both sides MUST be lowercase after the
-    speaker-identity refactor; a cased request id would cause a mismatch
-    that silently returns ``None`` for the key, losing the recalled fact.
-
-    This test seeds bookkeeping with lowercase ``speaker0`` and asserts that
-    ``probe(speaker_id="speaker0")`` (lowercase) hits the entry, while
-    confirming that the comparison is equality (not cased mismatch).
-    """
-
-    def test_lowercase_request_id_passes_filter(self):
-        """Lowercase request speaker_id matches lowercase bookkeeping speaker_id."""
-        s = MemoryStore()
-        s.put(
-            "episodic",
-            "k1",
-            {"key": "k1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
-        )
-        s.set_bookkeeping("k1", speaker_id="speaker0", relation_type="factual", first_seen="")
-
-        results = s.probe({"episodic": ["k1"]}, speaker_id="speaker0")
-        assert results.get("k1") is not None, (
-            "probe(speaker_id='speaker0') must not drop a key bookkeeping-owned by 'speaker0'."
-        )
-
-    def test_cased_id_mismatch_would_drop_key(self):
-        """Sanity: a cased request id does NOT match the lowercase bookkeeping id.
-
-        This documents the failure mode that the lowercase-uniform refactor
-        prevents: if a cased 'Speaker0' reaches the filter while bookkeeping
-        stores 'speaker0', the result is None (fact silently dropped).
-        The forward-only fix ensures this mismatch can no longer occur because
-        all speaker_id values are lowercase at their source.
-        """
-        s = MemoryStore()
-        s.put(
-            "episodic",
-            "k2",
-            {"key": "k2", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
-        )
-        s.set_bookkeeping("k2", speaker_id="speaker0", relation_type="factual", first_seen="")
-
-        # A cased 'Speaker0' reaching the filter would trigger a mismatch warning
-        # and return None — documenting why the upstream must always emit lowercase.
-        results = s.probe({"episodic": ["k2"]}, speaker_id="Speaker0")
-        assert results.get("k2") is None, (
-            "probe(speaker_id='Speaker0') must return None when bookkeeping stores 'speaker0' "
-            "— the casing mismatch protection is load-bearing; upstream must always emit lowercase."
-        )
