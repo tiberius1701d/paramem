@@ -258,52 +258,6 @@ class BundleManifest:
 
 
 # ---------------------------------------------------------------------------
-# PruneReport
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PruneReport:
-    """Result of a single prune() call.
-
-    ``invalid`` entries are slots where the sidecar is missing, unreadable,
-    or schema-mismatched.  They are *not* deleted by ``prune()`` — operator
-    visibility and remediation are the responsibility of the operator-attention
-    layer.
-
-    Fields
-    ------
-    kept : list[Path]
-        Slot directories retained after applying the retention policy.
-    deleted : list[Path]
-        Slot directories removed.
-    skipped_live : list[Path]
-        Slots that would have been pruned but were protected by the
-        ``live_slot`` parameter.  Typically zero or one entry.
-    invalid : list[tuple[Path, str]]
-        ``(slot_dir, reason)`` pairs for corrupt/missing/schema-mismatch
-        sidecars.  Surfaced by the operator-attention layer.
-    """
-
-    kept: list[Path] = field(default_factory=list)
-    deleted: list[Path] = field(default_factory=list)
-    skipped_live: list[Path] = field(default_factory=list)
-    invalid: list[tuple[Path, str]] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# RetentionPolicy — typed alias for the retention policy dict
-# ---------------------------------------------------------------------------
-
-RetentionPolicy = dict  # typed alias for {keep, max_disk_gb, immunity_days}
-# Callers may pass a plain dict with the keys documented below.
-#
-#   keep          : int | "unlimited"  — max slots to retain in the tier
-#   max_disk_gb   : float | None       — tier-level disk cap (None = no cap)
-#   immunity_days : int | None         — slots younger than this are immune
-#                                        from keep-count pruning
-
-# ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
 

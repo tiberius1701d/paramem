@@ -4,7 +4,7 @@ Mirrors ``paramem/server/systemd_timer.py`` for the ``paramem-backup`` timer,
 sharing its reconciliation core (``_reconcile_timer``) via a ``TimerTarget``
 instead of carrying a second copy of the render/reconcile logic. Reuses
 ``parse_schedule`` / ``TimerSpec`` from the consolidation timer module
-(Decision E — same grammar, same parser).
+(same grammar, same parser).
 
 Unit files point at ``python -m paramem.backup --tier daily`` (oneshot service).
 

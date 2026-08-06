@@ -1,10 +1,9 @@
-"""High-level backup API — write, read, prune.
+"""High-level backup API — write, read.
 
 Public surface
 --------------
 - ``write()``  — write an artifact + sidecar into a new slot directory.
 - ``read()``   — read an artifact from a slot, validate, decrypt if needed.
-- ``prune()``  — apply a retention policy to a kind directory.
 - ``sweep_orphan_pending()`` — startup sweep (re-exported from ``atomic``).
 
 **Filesystem requirement** — *base_dir* (and all slot directories) must live
@@ -61,10 +60,8 @@ from paramem.backup.types import (
     BundleManifestError,
     DiskCapExceeded,
     FingerprintMismatchError,
-    PruneReport,
     RestoreAbortedError,
     RestoreResult,
-    RetentionPolicy,
 )
 
 if TYPE_CHECKING:
@@ -1120,200 +1117,12 @@ def write_bundle(
     return slot_dir
 
 
-# ---------------------------------------------------------------------------
-# prune()
-# ---------------------------------------------------------------------------
-
-
-def prune(
-    kind: ArtifactKind,
-    retention_policy: RetentionPolicy,
-    *,
-    base_dir: Path,
-    live_slot: Path | None,
-) -> PruneReport:
-    """Enforce retention on *base_dir* for artifact *kind*.
-
-    Enumerates slots in ``<base_dir>/`` (timestamped directories), sorts by
-    timestamp descending (newest first), and deletes slots that exceed the
-    ``keep`` count in *retention_policy*.
-
-    The ``live_slot`` is **never deleted** — it is moved to
-    ``PruneReport.skipped_live`` even when the retention policy would otherwise
-    remove it.
-
-    Slots with missing or corrupt sidecars are recorded in
-    ``PruneReport.invalid`` but are *not* deleted.  Operator visibility and
-    remediation are the responsibility of the operator-attention layer.
-
-    **Idempotent** — calling ``prune`` multiple times with the same policy
-    produces the same retained set.
-
-    Retention policy keys
-    ----------------------------------------
-    - ``keep`` — ``int`` or ``"unlimited"``.  Maximum number of slots to
-      retain.  When ``"unlimited"``, no count-based pruning is performed.
-    - ``immunity_days`` — ``int | None``.  Slots whose ``timestamp`` is
-      younger than this many days are immune from count-based pruning.
-    - ``max_disk_gb`` — ``float | None``.  Per-tier disk cap.  When set,
-      oldest-first slots are deleted until total kept size is under the cap.
-      Disk pressure overrides immunity (spec rule 2 > rule 4).  The
-      currently-live slot is never deleted even under disk pressure.
-
-    Parameters
-    ----------
-    kind:
-        Artifact kind being pruned (informational; used only for logging).
-    retention_policy:
-        Dict with at least ``{"keep": int | "unlimited"}``.
-    base_dir:
-        Per-kind backup directory (e.g. ``data/ha/backups/config/``).
-    live_slot:
-        Caller-supplied live slot path.  Never deleted.  ``None`` means no
-        live slot protection (unusual; document intent at call site).
-
-    Returns
-    -------
-    PruneReport
-        Record of kept, deleted, skipped_live, and invalid slots.
-    """
-    base_dir = Path(base_dir)
-    report = PruneReport()
-
-    if not base_dir.exists():
-        return report
-
-    keep = retention_policy.get("keep", "unlimited")
-    immunity_days = retention_policy.get("immunity_days")
-
-    # Cutoff for immunity window
-    if immunity_days is not None:
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=immunity_days)
-    else:
-        cutoff = None
-
-    # Enumerate candidate slot directories (exclude .pending)
-    slots: list[Path] = []
-    for entry in base_dir.iterdir():
-        if entry.is_dir() and not entry.name.startswith("."):
-            slots.append(entry)
-
-    # Sort newest first (timestamp strings are lexicographically ordered)
-    slots.sort(key=lambda p: p.name, reverse=True)
-
-    # Validate each slot — populate invalid, segregate the rest
-    valid_slots: list[Path] = []
-    for slot in slots:
-        try:
-            meta = read_meta(slot)
-        except Exception as exc:  # noqa: BLE001
-            report.invalid.append((slot, str(exc)))
-            continue
-        # After a valid sidecar, verify the artifact file also exists.
-        # A slot with a sidecar but no artifact is a partial write that
-        # survived (e.g. sweep_orphan_pending missed it).  Treat as invalid
-        # so operators are alerted; do NOT delete automatically.
-        artifact_filename = _artifact_filename(meta.kind, meta.timestamp, meta.encrypted)
-        expected_artifact = slot / artifact_filename
-        if not expected_artifact.exists():
-            report.invalid.append((slot, f"artifact file missing: {expected_artifact}"))
-        else:
-            valid_slots.append(slot)
-
-    # Apply retention rules to valid slots
-    retained_count = 0
-    for slot in valid_slots:
-        is_live = live_slot is not None and slot.resolve() == Path(live_slot).resolve()
-
-        if is_live:
-            report.skipped_live.append(slot)
-            report.kept.append(slot)
-            continue
-
-        # Immunity check: if slot is younger than immunity cutoff, keep it.
-        # Immune slots are exempt from the tier count: the keep limit applies only
-        # to the non-immune tail (slots older than the 30-day window). Do NOT
-        # increment retained_count — immunity must not starve the non-immune tail.
-        if cutoff is not None:
-            slot_ts = _parse_slot_timestamp(slot.name)
-            if slot_ts is not None and slot_ts > cutoff:
-                report.kept.append(slot)
-                continue
-
-        # Count-based check
-        if keep == "unlimited":
-            report.kept.append(slot)
-            retained_count += 1
-        elif retained_count < int(keep):
-            report.kept.append(slot)
-            retained_count += 1
-        else:
-            # Prune this slot
-            try:
-                shutil.rmtree(slot)
-                report.deleted.append(slot)
-                logger.debug("prune: removed %s slot %s", kind.value, slot)
-            except OSError as exc:
-                logger.warning("prune: could not remove %s: %s", slot, exc)
-                report.kept.append(slot)
-
-    # --- Per-tier disk-cap enforcement (spec retention rule 2) ---
-    # Applied after the keep + immunity pass.  Oldest-first slots are deleted
-    # until total size of kept slots is within max_disk_gb.  Disk pressure
-    # overrides immunity (spec rule 2 > rule 4) but NEVER deletes live_slot.
-    max_disk_gb = retention_policy.get("max_disk_gb")
-    if max_disk_gb is not None:
-        max_disk_bytes = int(max_disk_gb * 1024**3)
-
-        def _slot_size(p: Path) -> int:
-            """Return total byte size of all files in slot directory *p*."""
-            return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-
-        # Build ordered list of kept slots oldest-first (lowest timestamp first)
-        # to find deletion candidates when over cap.
-        live_resolved = Path(live_slot).resolve() if live_slot is not None else None
-        candidates = sorted(
-            [s for s in report.kept if s.resolve() != live_resolved],
-            key=lambda p: p.name,  # ascending = oldest first
-        )
-
-        total_bytes = sum(_slot_size(s) for s in report.kept)
-
-        for slot in candidates:
-            if total_bytes <= max_disk_bytes:
-                break
-            slot_bytes = _slot_size(slot)
-            try:
-                shutil.rmtree(slot)
-                report.kept.remove(slot)
-                report.deleted.append(slot)
-                total_bytes -= slot_bytes
-                # Check whether this slot had immunity (was in skipped_live is
-                # already guarded above; here we log if it was immune from
-                # count-based pruning by being inside the immunity window).
-                if cutoff is not None:
-                    slot_ts = _parse_slot_timestamp(slot.name)
-                    if slot_ts is not None and slot_ts > cutoff:
-                        logger.warning(
-                            "prune: deleted immune slot %s under max_disk_gb pressure", slot
-                        )
-                logger.debug(
-                    "prune: removed %s slot %s under max_disk_gb=%.4f pressure",
-                    kind.value,
-                    slot,
-                    max_disk_gb,
-                )
-            except OSError as exc:
-                logger.warning("prune: could not remove %s under disk pressure: %s", slot, exc)
-
-    return report
-
-
 def _parse_slot_timestamp(name: str) -> datetime | None:
     """Parse a slot directory name ``YYYYMMDD-HHMMSSff`` into a UTC datetime.
 
-    Returns ``None`` if the name does not match the expected format (so
-    malformed slots are not accidentally protected by the immunity window).
+    Returns ``None`` if the name does not match the expected format, so
+    callers (``enumerate_backups``) skip the malformed slot from enumeration
+    entirely rather than mis-dating it.
     """
     try:
         # Slot name format: YYYYMMDD-HHMMSSff (17 chars: 8 date + 1 dash + 8 time+hundredths)

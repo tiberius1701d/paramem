@@ -9763,7 +9763,7 @@ async def migration_preview(request: PreviewRequest):
         )
 
     if pre_flight.fail_code is not None:
-        # State stays LIVE (Decision A) — do NOT store the stash.
+        # State stays LIVE — do NOT store the stash.
         # Build a preview-only (non-stored) stash for render_preview_response.
         now_iso = datetime.now(timezone.utc).isoformat()
         preview_stash = MigrationStashState(

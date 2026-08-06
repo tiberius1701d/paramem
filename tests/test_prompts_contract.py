@@ -1089,7 +1089,7 @@ class TestPlausibilityPromptContract:
 
         Why this is structural, not stylistic: the previous "echo every
         kept fact" contract had Mistral 7B emit EOS mid-array on long
-        inputs (the closing ``]`` never arrived; ``_parse_facts_response``
+        inputs (the closing ``]`` never arrived, so the response parser
         couldn't recover the envelope; the gate fail-opened with 0 facts
         filtered).  The drop-set output is bounded by the count of
         actual rule matches — typically 0–5 indices for clean inputs —
