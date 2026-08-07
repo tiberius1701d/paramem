@@ -482,7 +482,6 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
-        config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
@@ -542,7 +541,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.voice.load_prompt.return_value = "You are a helper."
 
         # Mock HA client that returns None (simulates HA unavailable)
         ha_client = MagicMock()
@@ -594,7 +592,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.voice.load_prompt.return_value = "You are a helper."
         # agent_id is JSON-serialized into the WS service call payload — must
         # be a real string, not a MagicMock attribute.
         config.ha_agent_id = "conversation.groq"
@@ -686,7 +683,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.voice.load_prompt.return_value = "You are a helper."
 
         # Mock HA client that returns None (simulates HA unavailable) so the
         # cloud fallback is the next stop — same shape as the GENERAL case
@@ -728,7 +724,6 @@ class TestPrivacyRouting:
 
         config = MagicMock()
         config.registry_path = MagicMock()
-        config.voice.load_prompt.return_value = "You are a helper."
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
         config.inference.max_response_tokens = 512
 
@@ -778,7 +773,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.voice.load_prompt.return_value = "You are a helper."
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fails
@@ -815,7 +809,6 @@ class TestPrivacyRouting:
         tokenizer = MagicMock()
 
         config = MagicMock()
-        config.voice.load_prompt.return_value = "You are a helper."
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fails
@@ -861,7 +854,6 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
-        config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
@@ -926,7 +918,6 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
-        config.voice.load_prompt.return_value = "You are a helper."
         # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
         config.vram.cooldown_gate_threshold_c = 0
         # _generate_local_reply's cap-hit arithmetic needs a real int here.
@@ -1063,7 +1054,6 @@ class TestCloudModePolicy:
     def _config(self, cloud_mode: str):
         config = MagicMock()
         config.sanitization.cloud_mode = cloud_mode
-        config.voice.load_prompt.return_value = "You are a helper."
         return config
 
     def _personal_router(self):

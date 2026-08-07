@@ -595,73 +595,22 @@ class TestClassifyViaLLM:
         result = classify_intent("anything", has_ha_match=False, config=config)
         assert result == Intent.UNKNOWN
 
-    def test_missing_classifier_section_returns_unknown(self, tmp_path, monkeypatch):
-        """When ``voice.prompt_file`` lacks the
-        ``##---INTENT-CLASSIFIER-SECTION---`` marker, the LLM path
-        cannot find a system prompt and returns ``Intent.UNKNOWN``."""
-        from paramem.server.config import IntentConfig as _Cfg
-        from paramem.server.config import VoiceConfig as _VoiceConfig
+    def test_missing_classifier_section_returns_unknown(self, monkeypatch):
+        """When ``configs/prompts/intent_classifier.txt`` is missing, the
+        LLM path cannot find a system prompt and returns
+        ``Intent.UNKNOWN`` — the missing-file case is caught by the same
+        ``except Exception`` as a generation failure."""
 
-        prompt_path = tmp_path / "no_classifier_section.txt"
-        prompt_path.write_text("PA path instructions only.\n[ESCALATE] etc.\n")
+        def _raise():
+            raise FileNotFoundError("intent_classifier.txt")
 
-        # Patch the voice-config factory used by _classify_via_llm so it
-        # returns a VoiceConfig pointing at the marker-less prompt file.
-        monkeypatch.setattr(
-            intent_module,
-            "_build_voice_config",
-            lambda _config: _VoiceConfig(prompt_file=str(prompt_path)),
-        )
+        monkeypatch.setattr(intent_module, "intent_classifier_prompt", _raise)
 
         handle = _stub_classifier_model("COMMAND")
         set_classifier_model(handle.model, handle.tokenizer)
-        config = _Cfg(mode="llm")
+        config = IntentConfig(mode="llm")
 
         result = classify_intent("anything", has_ha_match=False, config=config)
         assert result == Intent.UNKNOWN
         # generate() should not have been invoked — we bailed before then.
         handle.model.generate.assert_not_called()
-
-
-class TestVoiceConfigClassifierSection:
-    """Sentinel-marker semantics in VoiceConfig."""
-
-    def test_load_prompt_strips_classifier_section(self, tmp_path):
-        from paramem.server.config import VoiceConfig
-
-        path = tmp_path / "prompt.txt"
-        path.write_text(
-            "Personal-reasoning instructions.\n"
-            "##---INTENT-CLASSIFIER-SECTION---\n"
-            "Classifier instructions.\n"
-        )
-        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
-        assert vc.load_prompt() == "Personal-reasoning instructions."
-
-    def test_load_classifier_returns_section(self, tmp_path):
-        from paramem.server.config import VoiceConfig
-
-        path = tmp_path / "prompt.txt"
-        path.write_text(
-            "Personal-reasoning instructions.\n"
-            "##---INTENT-CLASSIFIER-SECTION---\n"
-            "Classifier instructions.\n"
-        )
-        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
-        assert vc.load_intent_classifier_prompt() == "Classifier instructions."
-
-    def test_load_classifier_returns_none_without_marker(self, tmp_path):
-        from paramem.server.config import VoiceConfig
-
-        path = tmp_path / "prompt.txt"
-        path.write_text("Just personal-reasoning instructions.\n")
-        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
-        assert vc.load_intent_classifier_prompt() is None
-
-    def test_load_prompt_full_file_when_no_marker(self, tmp_path):
-        from paramem.server.config import VoiceConfig
-
-        path = tmp_path / "prompt.txt"
-        path.write_text("Just personal-reasoning instructions.\n")
-        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
-        assert vc.load_prompt() == "Just personal-reasoning instructions."

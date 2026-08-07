@@ -240,8 +240,8 @@ class TestCloudFullFlow:
             # (SanitizationConfig.scrub) — required kwarg, no code-side
             # default (the prompt is the sole scope authority).
             scrub=set(SanitizationConfig().scrub),
-            user_prompt_template=_load_prompt("anonymization_facts.txt", required=True),
-            system_prompt=_load_prompt("anonymization_system.txt", required=True),
+            user_prompt_template=_load_prompt("anonymization_facts.txt"),
+            system_prompt=_load_prompt("anonymization_system.txt"),
         )
         # Mistral may or may not produce valid anonymization
         # Just verify no crash and correct return types
@@ -1505,24 +1505,23 @@ class TestIntentClassifierLLMModeGPU:
     def test_missing_classifier_section_returns_unknown_no_generate(
         self, model_and_tokenizer, tmp_path, monkeypatch
     ):
-        """Real model/tokenizer handle, but the classifier-prompt section is
-        missing from voice.prompt_file: must return Intent.UNKNOWN and must
-        NOT call generate() (bails before touching the GPU)."""
+        """Real model/tokenizer handle, but
+        ``configs/prompts/intent_classifier.txt`` is missing: must return
+        Intent.UNKNOWN and must NOT call generate() (bails before touching
+        the GPU) — the missing-file case is caught by the same
+        ``except Exception`` as a generation failure."""
         from paramem.server import intent as intent_module
-        from paramem.server.config import IntentConfig, VoiceConfig
+        from paramem.server.config import IntentConfig
         from paramem.server.intent import classify_intent, set_classifier_model
         from paramem.server.router import Intent
 
         model, tokenizer = model_and_tokenizer
         set_classifier_model(model, tokenizer)
 
-        prompt_path = tmp_path / "no_classifier_section.txt"
-        prompt_path.write_text("PA path instructions only.\n[ESCALATE] etc.\n")
-        monkeypatch.setattr(
-            intent_module,
-            "_build_voice_config",
-            lambda _config: VoiceConfig(prompt_file=str(prompt_path)),
-        )
+        def _raise():
+            raise FileNotFoundError("intent_classifier.txt")
+
+        monkeypatch.setattr(intent_module, "intent_classifier_prompt", _raise)
         # Spy on generate — this branch must bail out before calling it, so
         # the spy is never invoked and never touches the GPU.
         generate_spy = MagicMock()
@@ -1536,3 +1535,43 @@ class TestIntentClassifierLLMModeGPU:
         finally:
             set_classifier_model(None, None)
             intent_module._classifier_model_singleton = None
+
+
+class TestDateGroupSelectionGPU:
+    def test_real_generate_selection_round_trip(self, model_and_tokenizer):
+        """select_date_groups against the real model completes a genuine
+        parse without raising — exercises the weekday_name()-built prompt
+        header through apply_chat_template → tokenizer() → generate() →
+        decode() → _parse_response end to end. ``fail_open is False`` is
+        the assertion that proves the round trip actually completed
+        (select_date_groups never raises, so every other assertion here
+        would also pass on the fail-open shape); the fail-open arm itself
+        is not exercised by this test."""
+        from datetime import date
+
+        from paramem.server.config import load_server_config
+        from paramem.server.temporal_selection import select_date_groups
+
+        model, tokenizer = model_and_tokenizer
+        config = load_server_config("tests/fixtures/server.yaml")
+
+        result = select_date_groups(
+            "What do you know about me overall?",
+            {},
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            today=date(2026, 8, 6),  # a Thursday — rendered via weekday_name()
+        )
+
+        assert result.fail_open is False, (
+            "a fail-open result here means the real generate/parse round "
+            "trip did not complete — every other assertion below would "
+            "also pass on the fail-open shape"
+        )
+        assert isinstance(result.all, bool)
+        assert isinstance(result.ranges, tuple)
+        assert isinstance(result.include_undated, bool)
+        # An empty key inventory with a broad question is the "recall
+        # everything" case regardless of which path produced it.
+        assert result.selects(date(2026, 8, 1)) is True

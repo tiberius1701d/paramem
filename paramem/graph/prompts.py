@@ -24,8 +24,7 @@ _DEFAULT_PROMPT_DIR = (
     / "prompts"
 )
 
-_SPEAKER_DIRECTIVE_FILE = "speaker_directive.txt"
-_SPEAKER_DIRECTIVE_SENTINEL = "==="
+_SECTION_SENTINEL = "==="
 
 # ContextVar holding an active calibration prompt-override mapping
 # (``{basename: content}``), consulted as the first act of ``_load_prompt``.
@@ -68,13 +67,21 @@ def prompt_overrides(mapping: dict[str, str]) -> Iterator[None]:
         _PROMPT_OVERRIDES.reset(token)
 
 
-# Load-bearing prompt files. Absent, ``_load_prompt`` silently returns the empty
-# default (``required=False``), so the extraction pipeline degrades quietly
-# rather than failing. ``ensure_prompt_assets`` validates them at startup.
+# Load-bearing prompt files, checked eagerly at startup by
+# ``ensure_prompt_assets`` so a missing file surfaces at boot rather than at
+# the first request that needs it — every one of these is loaded with no
+# fallback: absence raises ``FileNotFoundError`` from ``_load_prompt``.
 _REQUIRED_PROMPT_FILES = (
     "extraction.txt",
     "extraction_system.txt",
     "extraction_procedural.txt",
+    "speaker_directive.txt",
+    "trained_recall.txt",
+    "serving_system.txt",
+    "serving_directives.txt",
+    "cloud_serving_system.txt",
+    "intent_classifier.txt",
+    "recall_selection.txt",
 )
 
 
@@ -106,35 +113,46 @@ def ensure_prompt_assets() -> None:
         )
 
 
-def _load_speaker_directive_section(section_name: str) -> str:
-    """Load a named section from ``configs/prompts/speaker_directive.txt``.
+def _load_prompt_section(filename: str, section: str) -> str:
+    """Load a named section from a sentinel-delimited prompt file.
 
     The file contains sentinel-delimited sections::
 
-        === EXTRACTION-DIRECTIVE ===
-        ...directive text...
+        === SECTION-ONE ===
+        ...section one text...
 
-        === THIRD-PARTY-DESCRIPTOR ===
-        ...descriptor text...
+        === SECTION-TWO ===
+        ...section two text...
 
-    Sections are loaded individually by name.  Currently defined:
+    Any text above the first sentinel (e.g. a behaviour-level header
+    comment) is never picked up by any section — it is discarded before
+    the first sentinel line is seen.
 
-    * ``EXTRACTION-DIRECTIVE`` — loaded by ``build_speaker_context`` for
-      the extraction user prompt.
-    * ``THIRD-PARTY-DESCRIPTOR`` — loaded at module import by
-      ``paramem.server.speaker`` as the fallback label when a ``speaker{N}``
-      token has no display name (e.g. anonymous or unknown profile).
+    Sectioned files in this codebase:
 
-    The file is read via :func:`_load_prompt` (``required=True``) rather
-    than a bare ``Path.read_text()`` — this is the SAME chokepoint every
-    other prompt in the extraction pipeline resolves through, so the file
-    is overridable via :func:`prompt_overrides` (a calibration probe can
-    substitute the whole file's content) and its resolution is recorded
-    via :func:`~paramem.graph.phase_trace.record_prompt` like any other
-    prompt load.  Section parsing below is unchanged — only the read.
+    * ``speaker_directive.txt`` — ``EXTRACTION-DIRECTIVE`` (loaded by
+      ``build_speaker_context`` for the extraction user prompt) and
+      ``THIRD-PARTY-DESCRIPTOR`` (loaded at module import by
+      ``paramem.server.speaker`` as the fallback label when a
+      ``speaker{N}`` token has no display name).
+    * ``trained_recall.txt`` — ``SYSTEM`` and ``RECALL``, the weight-coupled
+      training/probe interface (:mod:`paramem.training.dataset`).
+    * ``serving_directives.txt`` — ``IDENTITY-LINE``, ``LANGUAGE-LINE``,
+      ``REASONING-TURN``, ``RECORDED-DATES-SUFFIX``, ``EMPTY-PERIOD-NOTE``,
+      the serving turn's slot-bearing fragments (:mod:`paramem.server.prompts`).
+
+    The file is read via :func:`_load_prompt` rather than a bare
+    ``Path.read_text()`` — this is the SAME chokepoint every other prompt
+    in the codebase resolves through, so the file is overridable via
+    :func:`prompt_overrides` (a calibration probe can substitute the whole
+    file's content) and its resolution is recorded via
+    :func:`~paramem.graph.phase_trace.record_prompt` like any other prompt
+    load.  Section parsing below is unchanged — only the read.
 
     Args:
-        section_name: Name of the section to load (e.g.
+        filename: Basename of the sectioned prompt file (e.g.
+            ``"speaker_directive.txt"``).
+        section: Name of the section to load (e.g.
             ``"EXTRACTION-DIRECTIVE"``).  The sentinel format is
             ``=== <NAME> ===`` (leading/trailing ``===`` with spaces).
 
@@ -142,54 +160,47 @@ def _load_speaker_directive_section(section_name: str) -> str:
         The section body as a stripped string.
 
     Raises:
-        FileNotFoundError: When ``speaker_directive.txt`` is absent from
-            ``configs/prompts/`` and no override or fallback is registered.
-        KeyError: When the requested section is not found in the file.
+        FileNotFoundError: When *filename* is absent from
+            ``configs/prompts/`` and no override is registered.
+        KeyError: When *section* is not found in the file.
     """
-    raw = _load_prompt(_SPEAKER_DIRECTIVE_FILE, required=True)
+    raw = _load_prompt(filename)
     sections: dict[str, str] = {}
     current_name: str | None = None
     current_lines: list[str] = []
     for line in raw.splitlines():
         stripped = line.strip()
-        if stripped.startswith(_SPEAKER_DIRECTIVE_SENTINEL) and stripped.endswith(
-            _SPEAKER_DIRECTIVE_SENTINEL
-        ):
+        if stripped.startswith(_SECTION_SENTINEL) and stripped.endswith(_SECTION_SENTINEL):
             # Sentinel line: flush previous section, start a new one.
             if current_name is not None:
                 sections[current_name] = "\n".join(current_lines).strip()
-            current_name = (
-                stripped[len(_SPEAKER_DIRECTIVE_SENTINEL) :]
-                .rstrip(_SPEAKER_DIRECTIVE_SENTINEL)
-                .strip()
-            )
+            current_name = stripped[len(_SECTION_SENTINEL) :].rstrip(_SECTION_SENTINEL).strip()
             current_lines = []
         else:
             if current_name is not None:
                 current_lines.append(line)
     if current_name is not None:
         sections[current_name] = "\n".join(current_lines).strip()
-    if section_name not in sections:
+    if section not in sections:
         raise KeyError(
-            f"Section {section_name!r} not found in {_SPEAKER_DIRECTIVE_FILE}. "
-            f"Available sections: {list(sections)}"
+            f"Section {section!r} not found in {filename}. Available sections: {list(sections)}"
         )
-    return sections[section_name]
+    return sections[section]
 
 
 def _load_prompt(
     filename: str,
-    default: str = "",
+    *,
     prompts_dir: Path | None = None,
     model: str | None = None,
-    *,
-    required: bool = False,
 ) -> str:
-    """Load a prompt file, falling back to hardcoded default.
+    """Load a prompt file. Every parameter after *filename* is keyword-only.
 
-    Single chokepoint for ALL prompt loading in the extraction pipeline
+    Single chokepoint for ALL model-facing prompt text in the codebase
     (extraction.txt, extraction_system.txt, extraction_procedural.txt,
-    anonymization.txt, cloud_enrichment.txt, cloud_plausibility.txt, …).
+    anonymization.txt, cloud_enrichment.txt, cloud_plausibility.txt,
+    trained_recall.txt, serving_system.txt, …). No inline prompt literals
+    live in Python; every string a model sees resolves through here.
 
     Resolution is per-file, per-model.  When *model* is provided, the
     search order is::
@@ -212,12 +223,17 @@ def _load_prompt(
     transcript machinery) are model-independent by design and always
     call this function with ``model=None``.
 
-    When *required* is ``True`` and the file is not found in any search
-    directory, raises :exc:`FileNotFoundError` with the searched paths
-    listed in the message.  When *required* is ``False`` (default),
-    returns *default* unchanged.  Use ``required=True`` for production
-    enrollment paths where a missing prompt file must surface immediately
-    rather than silently yielding an empty prompt.
+    Keyword-only after *filename* is deliberate: earlier positional
+    parameters (a hardcoded-default string, ``prompts_dir``) were deleted
+    from this signature, and a positional call site written against the
+    old signature would otherwise silently rebind into the wrong
+    parameter instead of raising ``TypeError``.
+
+    Two outcomes only: found → the file's stripped content; not found in
+    any search directory → :exc:`FileNotFoundError` with the searched
+    paths listed in the message. There is no fallback and no empty-string
+    default — a missing prompt file always surfaces immediately rather
+    than silently degrading behaviour.
 
     Before editing any file under ``configs/prompts/`` — or adding a new
     template slot here — note the empirical rules that govern these files:
@@ -231,20 +247,23 @@ def _load_prompt(
     override's content — ``prompts_dir``/``model`` resolution never runs —
     and is reported via :func:`~paramem.graph.phase_trace.record_prompt`
     with a synthetic ``<override:{filename}>`` path so provenance clearly
-    marks it as substituted rather than resolved from disk.  ``required``
-    is satisfied by an override the same as by a found file — the
-    "missing" case only fires when no override matched AND the normal
-    search exhausted every directory.
+    marks it as substituted rather than resolved from disk.  An override
+    satisfies the load the same as a found file — the "missing" case only
+    fires when no override matched AND the normal search exhausted every
+    directory.
 
-    Every resolution — the override case, the found-file case, AND the
-    not-found-anywhere fallback to *default* — is reported via
-    :func:`paramem.graph.phase_trace.record_prompt`, so a
+    Every resolution — the override case and the found-file case — is
+    reported via :func:`paramem.graph.phase_trace.record_prompt`, so a
     :class:`~paramem.graph.phase_trace.PhaseRecord` for the calling phase
     always reflects the path/content this function actually returned,
     never a re-derivation of it.  ``record_prompt`` no-ops when no
     :func:`~paramem.graph.phase_trace.phase_trace` scope is active (e.g.
     a caller invoked at module import time, before any phase scope can
     exist), so this call is always safe.
+
+    Raises:
+        FileNotFoundError: When *filename* is not found in any search
+            directory and no :func:`prompt_overrides` mapping matched it.
     """
     override = _PROMPT_OVERRIDES.get()
     if override is not None and filename in override:
@@ -266,10 +285,5 @@ def _load_prompt(
             content = path.read_text(encoding="utf-8").strip()
             record_prompt(path=str(path), content=content)
             return content
-    if required:
-        searched = ", ".join(str(d / filename) for d in search_dirs)
-        raise FileNotFoundError(
-            f"Required prompt file {filename!r} not found. Searched: {searched}"
-        )
-    record_prompt(path=None, content=default)
-    return default
+    searched = ", ".join(str(d / filename) for d in search_dirs)
+    raise FileNotFoundError(f"Required prompt file {filename!r} not found. Searched: {searched}")

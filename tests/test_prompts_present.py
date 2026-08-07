@@ -160,12 +160,18 @@ class TestPromptFilesPresent:
 
 
 class TestSystemPromptFilesPresent:
-    """Presence + brace guard for the seven externalized SYSTEM-prompt files.
+    """Presence + brace guard for the ten externalized SYSTEM-prompt files.
 
-    Each file is the companion ``<base>_system.txt`` for an already-external
-    USER template, following the ``extraction.txt`` / ``extraction_system.txt``
-    pattern.  See :func:`test_extraction_system_txt_no_braces` for the
-    rationale on the brace guard — system prompts receive no slot
+    Seven follow the companion ``<base>_system.txt`` pattern for an
+    already-external USER template (``extraction.txt`` /
+    ``extraction_system.txt``); three are serving-path system prompts
+    (``serving_system.txt``, ``intent_classifier.txt``,
+    ``cloud_serving_system.txt``) that carry verbatim system-role content
+    with no slot substitution, so they belong on the same brace guard.
+    ``recall_selection.txt`` is deliberately excluded — it carries JSON
+    literal braces by design (see ``TestServingPrompts`` in
+    ``test_prompts_contract.py``). See :func:`test_extraction_system_txt_no_braces`
+    for the rationale on the brace guard — system prompts receive no slot
     substitution, so a stray ``{`` would leak raw template syntax into the
     model context.
     """
@@ -178,6 +184,9 @@ class TestSystemPromptFilesPresent:
         "cloud_enrichment_system.txt",
         "predicate_normalization_system.txt",
         "cloud_graph_enrichment_system.txt",
+        "serving_system.txt",
+        "intent_classifier.txt",
+        "cloud_serving_system.txt",
     )
 
     def test_entity_correction_system_txt_exists(self):
@@ -201,6 +210,15 @@ class TestSystemPromptFilesPresent:
     def test_cloud_graph_enrichment_system_txt_exists(self):
         assert (_PROMPTS_DIR / "cloud_graph_enrichment_system.txt").exists()
 
+    def test_serving_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "serving_system.txt").exists()
+
+    def test_intent_classifier_txt_exists(self):
+        assert (_PROMPTS_DIR / "intent_classifier.txt").exists()
+
+    def test_cloud_serving_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "cloud_serving_system.txt").exists()
+
     def test_all_system_prompt_files_no_braces(self):
         for filename in self._SYSTEM_PROMPT_FILES:
             content = (_PROMPTS_DIR / filename).read_text()
@@ -211,7 +229,8 @@ class TestSystemPromptFilesPresent:
 
 
 class TestSystemPromptGoldens:
-    """Byte-for-byte preservation goldens for the seven externalized files.
+    """Byte-for-byte preservation goldens for the eight externalized files
+    that were single Python literals before being externalized.
 
     Each golden string was captured programmatically from the pre-change
     inline literal/constant (single-line literals copied verbatim from
@@ -219,6 +238,10 @@ class TestSystemPromptGoldens:
     ``repr(extractor._CLOUD_*_SYSTEM_PROMPT)`` before the constants were
     replaced with ``_load_prompt(...)`` calls) — never hand-retyped against
     the new ``.txt`` file, so a shared typo cannot silently pass both sides.
+    ``serving_system.txt`` and ``intent_classifier.txt`` carry no golden
+    here — they were split from multi-paragraph prose
+    (``configs/prompts/pa_voice.txt``), not a single Python literal; their
+    content is covered by ``test_serving_prompt_contract.py`` instead.
     """
 
     def test_entity_correction_system_golden(self):
@@ -259,6 +282,81 @@ class TestSystemPromptGoldens:
             "pre-merged cross-transcript graph. Emit cross-session second-order "
             "relations and same_as pairs for duplicate entities. Output valid "
             "JSON only."
+        )
+
+    def test_cloud_serving_system_golden(self):
+        content = (_PROMPTS_DIR / "cloud_serving_system.txt").read_text().strip()
+        assert content == (
+            "You are continuing a conversation as a personal assistant. "
+            "Derive your persona, tone, and conversational style from the "
+            "preceding conversation. Answer clearly and concisely in 1-3 spoken "
+            "sentences. Do not use markdown, lists, or structured formatting."
+        )
+
+
+class TestTrainedRecallInterfacePin:
+    """Pin the trained-recall interface — the weight-coupled training/probe
+    pair every adapter in production was trained on
+    (``configs/prompts/trained_recall.txt``).
+
+    The expected strings below were captured programmatically from the
+    live ``SYSTEM_PROMPT`` / ``RECALL_TEMPLATE`` Python constants before
+    they were deleted and their text moved into
+    ``configs/prompts/trained_recall.txt`` — never hand-retyped against
+    the new file, so a shared typo cannot silently pass both sides.
+
+    _PIN_FAILURE_MESSAGE below is asserted on every failure: the trained
+    recall interface is weight-coupled, so a text change here invalidates
+    every adapter in production until it is retrained.
+    """
+
+    _PIN_FAILURE_MESSAGE = (
+        "The trained recall interface is weight-coupled: every adapter in "
+        "production was trained on this exact text. Changing it invalidates "
+        "all trained adapters until they are retrained. If the change is "
+        "intended, retrain every adapter and update this pin in the same change."
+    )
+
+    def test_trained_recall_system_prompt_pin(self):
+        from paramem.training.dataset import trained_recall_system_prompt
+
+        expected = (
+            "You are a personal assistant with memory of your user's life. "
+            "Answer questions about the user based on what you know about them."
+        )
+        assert trained_recall_system_prompt() == expected, self._PIN_FAILURE_MESSAGE
+
+    def test_trained_recall_template_pin(self):
+        from paramem.training.dataset import trained_recall_template
+
+        expected = "Recall the fact stored under key '{key}'."
+        assert trained_recall_template() == expected, self._PIN_FAILURE_MESSAGE
+
+    def test_trained_recall_template_slot_pin(self):
+        """Catches a slot rename (e.g. ``{key}`` -> ``{recall_key}``) that
+        the exact-text pin above would also catch, but this makes the
+        render-time failure mode explicit."""
+        from paramem.training.dataset import trained_recall_template
+
+        rendered = trained_recall_template().format(key="graph1")
+        assert rendered == "Recall the fact stored under key 'graph1'.", self._PIN_FAILURE_MESSAGE
+
+
+class TestRetiredServingPromptFilesAbsent:
+    """``pa_voice.txt`` and its marker convention are retired — six new
+    files replace it (``serving_system.txt``, ``serving_directives.txt``,
+    ``cloud_serving_system.txt``, ``intent_classifier.txt``,
+    ``recall_selection.txt``, ``trained_recall.txt``). Its absence is the
+    guard against silently reviving the ``##---SECTION---`` marker
+    convention alongside the ``=== NAME ===`` sentinel convention that
+    replaced it everywhere.
+    """
+
+    def test_pa_voice_txt_absent(self):
+        assert not (_PROMPTS_DIR / "pa_voice.txt").exists(), (
+            "pa_voice.txt has been re-introduced — the marker convention it "
+            "carried is retired; serving prompts now live in their own files "
+            "under the === NAME === sentinel convention."
         )
 
 

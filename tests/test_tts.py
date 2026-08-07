@@ -292,48 +292,51 @@ class TestBuildSpeakerPrefix:
 
 
 class TestBuildSystemPrompt:
-    def _config(self, tmp_path, base_text="You are an assistant."):
-        from paramem.server.config import ServerConfig, VoiceConfig
-
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text(base_text)
-        config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
-        return config
-
-    def test_speaker_id_gates_prefix(self, tmp_path):
+    def test_speaker_id_gates_prefix(self):
         """speaker_id present → prefix included, regardless of display name."""
+        from paramem.graph.prompts import prompt_overrides
+        from paramem.server.config import ServerConfig
         from paramem.server.inference import _build_system_prompt
 
-        config = self._config(tmp_path)
-        result = _build_system_prompt("speaker0", None, config)
+        config = ServerConfig()
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            result = _build_system_prompt("speaker0", None, config)
         assert "speaker0" in result
         assert "You are an assistant." in result
 
-    def test_speaker_id_gates_prefix_even_with_no_display_name(self, tmp_path):
+    def test_speaker_id_gates_prefix_even_with_no_display_name(self):
         """Re-spec (B-form prefix from speaker_id presence): the display
         name is gone as a parameter entirely — an anonymous/undisclosed
         speaker's raw speaker_id still produces the identity line.  Only
         ``speaker_id is None`` suppresses it now."""
+        from paramem.graph.prompts import prompt_overrides
+        from paramem.server.config import ServerConfig
         from paramem.server.inference import _build_system_prompt
 
-        config = self._config(tmp_path)
-        result = _build_system_prompt("speaker0", None, config)
+        config = ServerConfig()
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            result = _build_system_prompt("speaker0", None, config)
         assert "speaker0" in result
         assert "You are an assistant." in result
 
-    def test_no_prefix_returns_bare_base_prompt(self, tmp_path):
+    def test_no_prefix_returns_bare_base_prompt(self):
+        from paramem.graph.prompts import prompt_overrides
+        from paramem.server.config import ServerConfig
         from paramem.server.inference import _build_system_prompt
 
-        config = self._config(tmp_path)
-        result = _build_system_prompt(None, None, config)
+        config = ServerConfig()
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            result = _build_system_prompt(None, None, config)
         assert result == "You are an assistant."
 
-    def test_language_instruction_included(self, tmp_path):
+    def test_language_instruction_included(self):
+        from paramem.graph.prompts import prompt_overrides
+        from paramem.server.config import ServerConfig
         from paramem.server.inference import _build_system_prompt
 
-        config = self._config(tmp_path)
-        result = _build_system_prompt("speaker0", "de", config)
+        config = ServerConfig()
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            result = _build_system_prompt("speaker0", "de", config)
         assert "speaker0" in result
         assert "Respond in German" in result
         assert "You are an assistant." in result
@@ -1404,8 +1407,10 @@ class TestCloudCarriesNoIdentity:
 
     def test_escalate_to_cloud_system_prompt_has_no_identity_line(self) -> None:
         """The prompt sent to the cloud agent carries no "You are speaking
-        with" line and no speaker{N} token — cloud gets the bare CLOUD_PROMPT."""
-        from paramem.server.inference import CLOUD_PROMPT, _escalate_to_cloud
+        with" line and no speaker{N} token — cloud gets the bare
+        cloud_serving_system_prompt()."""
+        from paramem.server.inference import _escalate_to_cloud
+        from paramem.server.prompts import cloud_serving_system_prompt
 
         cloud_agent = MagicMock()
         cloud_agent.call.return_value = MagicMock(text="answer")
@@ -1413,6 +1418,6 @@ class TestCloudCarriesNoIdentity:
         _escalate_to_cloud("hi", cloud_agent, config=None, language=None)
 
         sent_prompt = cloud_agent.call.call_args.kwargs["system_prompt"]
-        assert sent_prompt == CLOUD_PROMPT
+        assert sent_prompt == cloud_serving_system_prompt()
         assert "You are speaking with" not in sent_prompt
         assert "speaker" not in sent_prompt.lower()

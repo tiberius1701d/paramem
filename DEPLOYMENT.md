@@ -358,13 +358,13 @@ options. A short map of the top-level sections:
 | `agents` | Cloud provider, model and credentials (`agents.cloud` + `agents.cloud_providers`) — these carry **no on-off of their own**; use `cloud.enabled`. Also `agents.ha_agent_id`, which **must point at a LOCAL HA conversation agent** — a cloud-backed one turns the hop ParaMem treats as on-premise into unsanitized cloud egress. See `SECURITY.md §3`. |
 | `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
 | `sanitization` | Cloud-egress policy. `cloud_mode` (`block` / `anonymize` / `both`, default `block`) decides what may leave: `block` drops personal queries and sends the rest verbatim, `anonymize` placeholders outbound text via the local LLM and de-anonymizes the reply, `both` does both. `scrub` is the PII vocabulary the anonymizer works from. A query counts as personal when either the intent classifier or the known-entity / first-person detector says so — one verdict, computed once. The first-person check is encoder-based and multilingual when the encoder is loaded; falls back to an English token-set. See `personal_referent` below. |
-| `intent` | Intent classifier — HA fast-path + content-driven residual. `intent.mode: llm` (default) uses the loaded local LLM with a focused classifier prompt; robust to paraphrase and novel phrasings, no exemplar maintenance. `intent.mode: embeddings` uses the multilingual sentence encoder (`intfloat/multilingual-e5-small`) vs per-class exemplar bank under `configs/intents/<class>.<lang>.txt`; cheaper per query but brittle on shapes the operator hasn't anticipated. In local mode the encoder is loaded regardless of `intent.mode` and reused by `sentence_type` and `personal_referent`, and `llm` mode auto-falls back to `embeddings` when no local model is registered. In **cloud-only** mode none of these encoders is loaded at all, so `classify_intent` returns `UNKNOWN` — cloud-only mode holds no reachable stored knowledge and applies no egress policy, by design (`architecture.md` AD-21). |
+| `intent` | Intent classifier — HA fast-path + content-driven residual. `intent.mode: llm` (default) uses the loaded local LLM with `configs/prompts/intent_classifier.txt`; robust to paraphrase and novel phrasings, no exemplar maintenance. `intent.mode: embeddings` uses the multilingual sentence encoder (`intfloat/multilingual-e5-small`) vs per-class exemplar bank under `configs/intents/<class>.<lang>.txt`; cheaper per query but brittle on shapes the operator hasn't anticipated. In local mode the encoder is loaded regardless of `intent.mode` and reused by `sentence_type` and `personal_referent`, and `llm` mode auto-falls back to `embeddings` when no local model is registered. In **cloud-only** mode none of these encoders is loaded at all, so `classify_intent` returns `UNKNOWN` — cloud-only mode holds no reachable stored knowledge and applies no egress policy, by design (`architecture.md` AD-21). |
 | `sentence_type` | Encoder-based interrogative-vs-non-interrogative classifier with exemplars under `configs/sentence_types/<class>.<lang>.txt`. Adding a language is one new file pair, no code change. Falls back to terminal-punctuation + English first-word lexicon when the encoder isn't available. |
 | `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. Closes the multilingual hole in the sanitizer: German / Mandarin / Spanish / etc. self-referential queries are blocked at the cloud-egress gate even though the legacy English token-set wouldn't match. Falls back to that token-set when the encoder isn't available. |
 | `abstention` | Deterministic canned-response guard against confabulation on a personal interrogative parametric memory cannot answer. `enabled` (default `true`). Three messages, each `*_file` (default under `configs/prompts/`) with a `*_override` that pins the text inline instead: `response_file` (a known speaker, coverage gap — this query missed their facts), `cold_start_response_file` (a known speaker with no facts yet), `no_identity_response_file` (no speaker resolved at all — fired on the relay path; NOT gated on `enabled`, since refusing there is a structural impossibility — no identity, no store — not a feature toggle). |
 | `text_lang_detection` | fastText `lid.176` detector for the text-only `/chat` path. STT carries Whisper's language signal on audio; pure-text requests had no equivalent and fell through to English regardless of input language. Eager-loaded at server startup when `enabled` is true (CPU-only, ~126 MB resident, zero VRAM cost). One-time setup: `bash scripts/setup/download-langid-model.sh`. Disabled by default so deployments without the model file do not warn. |
 | `mobile_pwa` | Progressive Web App configuration. `enabled` (default `false`): serve the static PWA shell at `/app` and activate per-user cookie/bearer-token auth (see `SECURITY.md §5`). `static_dir` (default: bundled `paramem/web/static`): filesystem path to the compiled static bundle. `cookie_name` (default: `paramem_token`): name of the cookie the middleware will accept if the client presents one; the server does not issue this cookie — tokens are carried via the `Authorization: Bearer` header in practice. `push_enabled` (default `false`): enable Web Push lock-screen notifications — set to `true` together with `enabled` to activate the `/push/subscribe` endpoint; the VAPID keypair is auto-generated and persisted (see `SECURITY.md §5`). `vapid_contact` (default `mailto:admin@localhost`): operator contact URI in the VAPID JWT; set to your own `mailto:` address. |
-| `voice` | Voice prompt file, per-speaker greeting cadence, per-language greeting text (`voice.greetings`). |
+| `voice` | Per-speaker greeting cadence and per-language greeting text (`voice.greetings`). |
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
 
@@ -984,10 +984,30 @@ ParaMem includes a local voice pipeline for privacy-first operation:
 ## Prompt Engineering
 
 The extraction pipeline's behaviour is shaped almost entirely by the prompt
-files under `configs/prompts/`. This section captures the principles that
+files under `configs/prompts/`. The serving-path prompts (the local and
+cloud reasoning system prompts, the intent classifier, and the
+date-selection stage) live in the same directory and resolve from the
+checkout at request time — editing them in place takes effect on the next
+request, no restart required. This section captures the principles that
 govern those files and the calibration loop used to iterate on them. **Read
 this before editing any prompt** — most of the principles below were learned
 empirically and contradict natural intuition about how to write LLM prompts.
+
+Two files carry hazards specific to this directory and deserve a read before
+editing:
+
+- **`trained_recall.txt` is the trained interface, not a tunable prompt.**
+  Every adapter currently in production was trained on this exact text.
+  Editing it degrades recall for every existing adapter until each one is
+  retrained on the new text — there is no compatibility path. A test pins
+  this file's content and will fail on any change, as a deliberate guard.
+- **`serving_directives.txt` sections carry an exact placeholder set.**
+  Adding, removing, or misspelling a `{placeholder}` in any section breaks
+  the serving turn it renders — some of these sections are formatted with no
+  surrounding error handling, so a stray literal brace surfaces as a
+  request-time failure rather than a controlled fallback. A test guards the
+  placeholder set for the shipped copy of this file, but an operator's own
+  edit is not covered by it.
 
 ### Principles
 

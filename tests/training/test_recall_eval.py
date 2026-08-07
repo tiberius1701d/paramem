@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 # ---------------------------------------------------------------------------
@@ -185,8 +186,8 @@ class TestBatchedFinalizeHandlesFailures:
         tokenizer.decode.side_effect = _fake_decode
 
         with patch(
-            "paramem.training.dataset.format_inference_prompt",
-            side_effect=lambda q, t: q,
+            "paramem.training.dataset.build_inference_prompts",
+            side_effect=lambda qs, t: list(qs),
         ):
             pairs = list(_generate_recall_batch(model, tokenizer, entries, registry, batch_size=4))
 
@@ -279,8 +280,8 @@ class TestLeftPaddingCorrectness:
         tokenizer.return_value = MagicMock(**{"to.return_value": inputs_dict})
 
         with patch(
-            "paramem.training.dataset.format_inference_prompt",
-            side_effect=lambda q, t: q,
+            "paramem.training.dataset.build_inference_prompts",
+            side_effect=lambda qs, t: list(qs),
         ):
             results = list(
                 _generate_recall_batch(model, tokenizer, entries, registry, batch_size=2)
@@ -330,8 +331,8 @@ class TestPaddingSideRestored:
         tokenizer.decode.return_value = raw
 
         with patch(
-            "paramem.training.dataset.format_inference_prompt",
-            side_effect=lambda q, t: q,
+            "paramem.training.dataset.build_inference_prompts",
+            side_effect=lambda qs, t: list(qs),
         ):
             list(_generate_recall_batch(model, tokenizer, entries, None, batch_size=4))
 
@@ -342,6 +343,28 @@ class TestPaddingSideRestored:
 
     def test_restored_from_left(self):
         assert self._run_with_side("left") == "left"
+
+    def test_restored_when_prompt_load_raises(self):
+        """A raising prompt load (missing/renamed section, or a
+        prompt_overrides substitution lacking the section) must still
+        restore padding_side via the try/finally — the loads were moved
+        INSIDE the try specifically so this holds.  A shared tokenizer
+        left permanently left-padded would corrupt every later user,
+        including the training collator."""
+        from paramem.training.recall_eval import probe_entries as _generate_recall_batch
+
+        entries = [_entry("graph1")]
+        model = _make_model_mock()
+        tokenizer = _make_tokenizer_mock(padding_side="right")
+
+        with patch(
+            "paramem.training.dataset.trained_recall_template",
+            side_effect=FileNotFoundError("trained_recall.txt"),
+        ):
+            with pytest.raises(FileNotFoundError):
+                list(_generate_recall_batch(model, tokenizer, entries, None, batch_size=4))
+
+        assert tokenizer.padding_side == "right"
 
 
 # ---------------------------------------------------------------------------
@@ -386,8 +409,8 @@ class TestRegistryLowConfidenceBatched:
         tokenizer.decode.side_effect = _fake_decode
 
         with patch(
-            "paramem.training.dataset.format_inference_prompt",
-            side_effect=lambda q, t: q,
+            "paramem.training.dataset.build_inference_prompts",
+            side_effect=lambda qs, t: list(qs),
         ):
             pairs = list(_generate_recall_batch(model, tokenizer, entries, registry, batch_size=2))
 
@@ -497,8 +520,8 @@ class TestBatchSizeExceedsEntries:
         with (
             patch("paramem.models.loader.switch_adapter"),
             patch(
-                "paramem.training.dataset.format_inference_prompt",
-                side_effect=lambda q, t: q,
+                "paramem.training.dataset.build_inference_prompts",
+                side_effect=lambda qs, t: list(qs),
             ),
         ):
             result = evaluate_indexed_recall(
@@ -578,8 +601,8 @@ class TestPerKeyRawOutputInBothBranches:
         with (
             patch("paramem.models.loader.switch_adapter"),
             patch(
-                "paramem.training.dataset.format_inference_prompt",
-                side_effect=lambda q, t: q,
+                "paramem.training.dataset.build_inference_prompts",
+                side_effect=lambda qs, t: list(qs),
             ),
         ):
             result = evaluate_indexed_recall(
@@ -639,8 +662,8 @@ class TestPerKeyRawOutputInBothBranches:
         with (
             patch("paramem.models.loader.switch_adapter"),
             patch(
-                "paramem.training.dataset.format_inference_prompt",
-                side_effect=lambda q, t: q,
+                "paramem.training.dataset.build_inference_prompts",
+                side_effect=lambda qs, t: list(qs),
             ),
         ):
             result = evaluate_indexed_recall(model, tokenizer, entries, registry, batch_size=1)

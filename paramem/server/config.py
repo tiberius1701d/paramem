@@ -849,8 +849,8 @@ class IntentConfig:
     Two residual backends:
 
     * ``mode="llm"`` (production default).  Single-token generation
-      from the loaded local model using the intent-classifier section
-      of ``voice.prompt_file``.  Handles paraphrase, named entities,
+      from the loaded local model using
+      ``configs/prompts/intent_classifier.txt``.  Handles paraphrase, named entities,
       compound noisy transcripts, and synonyms without exemplar
       maintenance.  ~2–4 forward passes through the local LLM per
       query.  Automatically falls back to the encoder path when no
@@ -899,7 +899,7 @@ class IntentConfig:
     # Classifier backend.  "embeddings" uses the sentence-encoder + per-class
     # exemplar bank at ``exemplars_dir`` (cheap, ~1 ms; needs curated exemplars
     # per class per language).  "llm" generates one token from the loaded local
-    # model using the intent-classifier section of ``voice.prompt_file``
+    # model using ``configs/prompts/intent_classifier.txt``
     # (~50–200 ms; no exemplar curation, handles paraphrase / named entities
     # the encoder bank misses).  When "llm" is selected but no local model has
     # been registered with the intent module (cloud-only mode, model load
@@ -975,20 +975,17 @@ class SentenceTypeConfig:
     confidence_margin: float = 0.05
 
 
-_INTENT_CLASSIFIER_MARKER = "##---INTENT-CLASSIFIER-SECTION---"
-_RECALL_SELECTION_MARKER = "##---RECALL-SELECTION-SECTION---"
-# Every marked section in configs/prompts/pa_voice.txt. load_prompt() strips
-# all of them (the reasoning prompt must never see a later section's
-# instructions); each per-section accessor below stops at whichever marker
-# in this tuple appears first after its own, so appending a new section
-# never leaks into an earlier accessor's return value.
-_SECTION_MARKERS = (_INTENT_CLASSIFIER_MARKER, _RECALL_SELECTION_MARKER)
-
-
 @dataclass
 class VoiceConfig:
-    prompt_file: str = "configs/prompts/pa_voice.txt"
-    system_prompt: str = ""
+    """Per-speaker greeting cadence and per-language greeting text.
+
+    "Voice" here means greetings only — the serving system prompt, the
+    intent-classifier prompt, and the recall-selection prompt all resolve
+    through :mod:`paramem.server.prompts` instead, independent of this
+    config (see :func:`paramem.server.prompts.serving_system_prompt` and
+    friends).
+    """
+
     greeting_interval_hours: int = 24  # hours between greetings per speaker (0 = disabled)
     # Per-language, per-period greetings (period = morning|afternoon|evening),
     # prepended app-side in the detected language. Operator-editable in server.yaml;
@@ -1009,90 +1006,6 @@ class VoiceConfig:
             },
         }
     )
-
-    def _read_prompt_file(self) -> str | None:
-        """Read the raw prompt file, or ``None`` if absent / unconfigured."""
-        if not self.prompt_file:
-            return None
-        path = Path(self.prompt_file)
-        if not path.exists():
-            return None
-        return path.read_text()
-
-    def load_prompt(self) -> str:
-        """Load the PA-path system prompt.
-
-        If the prompt file contains any marker in ``_SECTION_MARKERS``
-        (``##---INTENT-CLASSIFIER-SECTION---``,
-        ``##---RECALL-SELECTION-SECTION---``), only the content **before**
-        the earliest such marker is returned — downstream callers
-        (PA-path reasoning) must not see any later section's
-        instructions, regardless of marker order in the file.  Files
-        without any marker are returned whole (back-compat with prompts
-        authored before LLM intent classification existed).
-        """
-        raw = self._read_prompt_file()
-        if raw is not None:
-            marker_positions = [raw.index(m) for m in _SECTION_MARKERS if m in raw]
-            head = raw[: min(marker_positions)] if marker_positions else raw
-            return head.strip()
-        if self.system_prompt:
-            return self.system_prompt
-        return (
-            "You are a personal memory assistant. Answer concisely in 1-2 spoken sentences. "
-            "Use only facts that appear in the context above. Never invent personal details."
-        )
-
-    def _load_marked_section(self, marker: str) -> str | None:
-        """Return the content between *marker* and the next marker in
-        ``_SECTION_MARKERS`` (or end of file), or ``None`` if the prompt
-        file is absent or *marker* is missing.
-
-        Shared by :meth:`load_intent_classifier_prompt` and
-        :meth:`load_recall_selection_prompt` so a section never leaks a
-        trailing section appended after it.
-        """
-        raw = self._read_prompt_file()
-        if raw is None:
-            return None
-        parts = raw.split(marker, 1)
-        if len(parts) != 2:
-            return None
-        tail = parts[1]
-        next_marker_positions = [
-            tail.index(m) for m in _SECTION_MARKERS if m != marker and m in tail
-        ]
-        if next_marker_positions:
-            tail = tail[: min(next_marker_positions)]
-        tail = tail.strip()
-        return tail or None
-
-    def load_intent_classifier_prompt(self) -> str | None:
-        """Return the intent-classifier section of the prompt file, or
-        ``None`` if the file is absent or the marker is missing.
-
-        Used by :func:`paramem.server.intent._classify_via_llm` when
-        ``IntentConfig.mode == "llm"``.  Operators tune the classifier
-        prompt by editing the section after the
-        ``##---INTENT-CLASSIFIER-SECTION---`` marker in
-        ``configs/prompts/pa_voice.txt``; no code change required. Stops
-        at the next marked section (if any) so a later section's content
-        never leaks into the classifier prompt.
-        """
-        return self._load_marked_section(_INTENT_CLASSIFIER_MARKER)
-
-    def load_recall_selection_prompt(self) -> str | None:
-        """Return the recall date-selection section of the prompt file,
-        or ``None`` if the file is absent or the marker is missing.
-
-        Used by :func:`paramem.server.temporal_selection.select_date_groups`
-        as the system prompt for the model-selected date-group filtering
-        stage (decide which recorded dates a query needs before probing).
-        Operators tune the selection prompt by editing the section after
-        the ``##---RECALL-SELECTION-SECTION---`` marker in
-        ``configs/prompts/pa_voice.txt``; no code change required.
-        """
-        return self._load_marked_section(_RECALL_SELECTION_MARKER)
 
 
 @dataclass

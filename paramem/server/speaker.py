@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
-from paramem.graph.prompts import _load_speaker_directive_section
+from paramem.graph.prompts import _load_prompt_section
 from paramem.utils.identity import (
     SPEAKER_ID_PREFIX,
     SPEAKER_NEAR_MISS_RE,
@@ -41,7 +41,9 @@ _PROFILE_VERSION = 6
 # missing.  This is the fallback label substituted at the reply boundary
 # (:func:`resolve_speaker_tokens`) for a ``speaker{N}`` token that cannot be
 # resolved to a display name (unknown id, or an anonymous-enrolled profile).
-THIRD_PARTY_DESCRIPTOR: str = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+THIRD_PARTY_DESCRIPTOR: str = _load_prompt_section(
+    "speaker_directive.txt", "THIRD-PARTY-DESCRIPTOR"
+)
 
 
 def resolve_speaker_tokens(

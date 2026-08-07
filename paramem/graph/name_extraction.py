@@ -24,9 +24,9 @@ def extract_name_via_llm(
     """Extract a speaker's self-introduced name from conversation turns.
 
     Loads the system and user prompts from external files via
-    :func:`paramem.graph.prompts._load_prompt` with ``required=True``.
-    A missing prompt file raises :exc:`FileNotFoundError` immediately —
-    no inline fallback, no silent empty-prompt production path.
+    :func:`paramem.graph.prompts._load_prompt`. A missing prompt file
+    raises :exc:`FileNotFoundError` immediately — no inline fallback, no
+    silent empty-prompt production path.
 
     Args:
         turns: List of turn dicts, each with ``"role"`` and ``"text"`` keys.
@@ -84,17 +84,13 @@ def extract_name_via_llm(
     # calibration alike, and neither caller has to synthesise a phase
     # record around it.
     with phase_trace("name_extract") as t:
-        # required=True: a missing prompt file surfaces immediately rather
-        # than silently yielding an empty prompt in production.
         system_msg = _load_prompt(
             system_filename,
             prompts_dir=prompts_dir_path,
-            required=True,
         )
         user_template = _load_prompt(
             prompt_filename,
             prompts_dir=prompts_dir_path,
-            required=True,
         )
 
         user_msg = user_template.format(transcript=transcript_text)

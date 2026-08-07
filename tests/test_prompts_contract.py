@@ -27,16 +27,17 @@ class TestLoadPromptPerModelResolution:
     """Unit tests for _load_prompt per-model, per-file resolution.
 
     The search order is: prompts_dir/<model>/<filename> (if model),
-    prompts_dir/<filename>, _DEFAULT_PROMPT_DIR/<filename>, hardcoded default.
-    A model overrides only the files it provides; everything else inherits
-    the shared directory.
+    prompts_dir/<filename>, _DEFAULT_PROMPT_DIR/<filename>. A model overrides
+    only the files it provides; everything else inherits the shared
+    directory. A file absent from every directory raises
+    ``FileNotFoundError`` — there is no fallback and no default value.
     """
 
     def test_per_model_file_wins_when_present(self, tmp_path):
         """prompts_dir/<model>/filename is returned when it exists."""
         (tmp_path / "qwen3-4b").mkdir()
         (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
-        result = _load_prompt("extraction.txt", "default", tmp_path, model="qwen3-4b")
+        result = _load_prompt("extraction.txt", prompts_dir=tmp_path, model="qwen3-4b")
         assert result == "qwen-specific"
 
     def test_per_model_falls_back_to_base_when_file_absent(self, tmp_path):
@@ -44,57 +45,43 @@ class TestLoadPromptPerModelResolution:
         (tmp_path / "qwen3-4b").mkdir()
         # extraction.txt in qwen3-4b/ is ABSENT; extraction_system.txt is in base
         (tmp_path / "extraction_system.txt").write_text("base-system")
-        result = _load_prompt("extraction_system.txt", "default", tmp_path, model="qwen3-4b")
+        result = _load_prompt("extraction_system.txt", prompts_dir=tmp_path, model="qwen3-4b")
         assert result == "base-system"
 
     def test_model_none_uses_base(self, tmp_path):
-        """model=None: only prompts_dir/ and default are searched."""
+        """model=None: only prompts_dir/ and _DEFAULT_PROMPT_DIR are searched."""
         (tmp_path / "qwen3-4b").mkdir()
         (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
         (tmp_path / "extraction.txt").write_text("base")
-        result = _load_prompt("extraction.txt", "default", tmp_path, model=None)
+        result = _load_prompt("extraction.txt", prompts_dir=tmp_path, model=None)
         assert result == "base"
 
     def test_unknown_model_falls_back_to_base(self, tmp_path):
-        """A model with no subdir falls through to prompts_dir/ and then default."""
+        """A model with no subdir falls through to prompts_dir/."""
         (tmp_path / "extraction.txt").write_text("base")
-        result = _load_prompt("extraction.txt", "default", tmp_path, model="unknown-model")
+        result = _load_prompt("extraction.txt", prompts_dir=tmp_path, model="unknown-model")
         assert result == "base"
 
-    def test_both_model_and_base_absent_returns_hardcoded_default(self, tmp_path):
-        """When no file exists anywhere, the hardcoded default is returned."""
-        result = _load_prompt("no_such_file.txt", "hardcoded-default", tmp_path, model="qwen3-4b")
-        assert result == "hardcoded-default"
-
-    def test_required_true_raises_file_not_found_when_absent(self, tmp_path):
-        """required=True raises FileNotFoundError when file is absent from all search dirs."""
+    def test_raises_file_not_found_when_absent_everywhere(self, tmp_path):
+        """A file absent from every search directory raises FileNotFoundError —
+        there is no fallback and no default value."""
         with pytest.raises(FileNotFoundError) as exc_info:
-            _load_prompt("missing_prompt.txt", prompts_dir=tmp_path, required=True)
+            _load_prompt("missing_prompt.txt", prompts_dir=tmp_path)
         msg = str(exc_info.value)
         assert "missing_prompt.txt" in msg
         assert "Searched" in msg
 
-    def test_required_true_succeeds_when_file_present(self, tmp_path):
-        """required=True returns content normally when file is found."""
+    def test_succeeds_when_file_present(self, tmp_path):
+        """Returns content normally when the file is found."""
         (tmp_path / "present.txt").write_text("hello")
-        result = _load_prompt("present.txt", prompts_dir=tmp_path, required=True)
+        result = _load_prompt("present.txt", prompts_dir=tmp_path)
         assert result == "hello"
-
-    def test_required_false_default_returns_empty_when_absent(self, tmp_path):
-        """required=False (default) returns the default value when file is absent."""
-        result = _load_prompt("absent.txt", "fallback", tmp_path)
-        assert result == "fallback"
 
     def test_qwen3_4b_extraction_txt_resolved_from_real_prompts_dir(self):
         """Sanity: the real qwen3-4b/extraction.txt is found under _DEFAULT_PROMPT_DIR."""
-        result = _load_prompt(
-            "extraction.txt",
-            "hardcoded-default",
-            _DEFAULT_PROMPT_DIR,
-            model="qwen3-4b",
-        )
+        result = _load_prompt("extraction.txt", prompts_dir=_DEFAULT_PROMPT_DIR, model="qwen3-4b")
         # The per-model file exists and differs from the base; it must be chosen.
-        base = _load_prompt("extraction.txt", "hardcoded-default", _DEFAULT_PROMPT_DIR)
+        base = _load_prompt("extraction.txt", prompts_dir=_DEFAULT_PROMPT_DIR)
         assert result != base, (
             "qwen3-4b/extraction.txt should differ from the shared base prompt; "
             "if they are identical, the per-model file is redundant and should be removed."
@@ -103,12 +90,9 @@ class TestLoadPromptPerModelResolution:
     def test_qwen3_4b_extraction_system_inherits_base(self):
         """qwen3-4b provides no extraction_system.txt override; the base file is inherited."""
         per_model = _load_prompt(
-            "extraction_system.txt",
-            "hardcoded-default",
-            _DEFAULT_PROMPT_DIR,
-            model="qwen3-4b",
+            "extraction_system.txt", prompts_dir=_DEFAULT_PROMPT_DIR, model="qwen3-4b"
         )
-        base = _load_prompt("extraction_system.txt", "hardcoded-default", _DEFAULT_PROMPT_DIR)
+        base = _load_prompt("extraction_system.txt", prompts_dir=_DEFAULT_PROMPT_DIR)
         assert per_model == base, (
             "qwen3-4b must inherit the shared extraction_system.txt; "
             "a per-model override for this file should not exist."
@@ -207,27 +191,21 @@ class TestLoadPromptPhaseTraceRecording:
             }
         ]
 
-    def test_required_false_absent_everywhere_records_path_none_and_default(self, tmp_path):
-        """When no file exists anywhere and required=False, the record
-        reports the caller's hardcoded default with path=None — an
-        embedded default silently standing in for a prompt file is
-        precisely the dishonesty this mechanism exists to expose."""
+    def test_absent_everywhere_raises_and_records_nothing(self, tmp_path):
+        """When no file exists anywhere, ``_load_prompt`` raises
+        ``FileNotFoundError`` and never calls ``record_prompt`` — there is
+        no default value to report, so the phase-trace record for the
+        enclosing scope carries no entry for the attempted load."""
         with extraction_trace() as trace:
             with phase_trace("local_extract"):
-                _load_prompt(
-                    "definitely_not_a_real_prompt_file.txt",
-                    default="fallback-default",
-                    prompts_dir=tmp_path,
-                )
+                with pytest.raises(FileNotFoundError):
+                    _load_prompt(
+                        "definitely_not_a_real_prompt_file.txt",
+                        prompts_dir=tmp_path,
+                    )
             record = trace.records[-1]
 
-        assert record.prompts == [
-            {
-                "path": None,
-                "sha": hashlib.sha256(b"fallback-default").hexdigest()[:12],
-                "template": "fallback-default",
-            }
-        ]
+        assert record.prompts is None
 
 
 class TestPromptOverrides:
@@ -252,12 +230,12 @@ class TestPromptOverrides:
             result = _load_prompt("extraction.txt", prompts_dir=tmp_path)
         assert result == "on-disk content"
 
-    def test_override_satisfies_required_even_when_file_absent_everywhere(self, tmp_path):
-        """``required=True`` is satisfied by a matching override the same
-        as by a found file — the loader never reaches its "search every
-        directory, then raise" branch when an override matched."""
+    def test_override_satisfies_load_even_when_file_absent_everywhere(self, tmp_path):
+        """A matching override is satisfied the same as by a found file —
+        the loader never reaches its "search every directory, then raise"
+        branch when an override matched."""
         with prompt_overrides({"nonexistent_prompt.txt": "override content"}):
-            result = _load_prompt("nonexistent_prompt.txt", prompts_dir=tmp_path, required=True)
+            result = _load_prompt("nonexistent_prompt.txt", prompts_dir=tmp_path)
         assert result == "override content"
 
     def test_prompts_dir_and_model_resolution_unchanged_when_inactive(self, tmp_path):
@@ -267,10 +245,11 @@ class TestPromptOverrides:
         (tmp_path / "qwen3-4b").mkdir()
         (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
         (tmp_path / "extraction.txt").write_text("base")
-        assert _load_prompt("extraction.txt", "default", tmp_path, model="qwen3-4b") == (
-            "qwen-specific"
+        assert (
+            _load_prompt("extraction.txt", prompts_dir=tmp_path, model="qwen3-4b")
+            == "qwen-specific"
         )
-        assert _load_prompt("extraction.txt", "default", tmp_path, model=None) == "base"
+        assert _load_prompt("extraction.txt", prompts_dir=tmp_path, model=None) == "base"
 
     def test_override_recorded_in_provenance_with_synthetic_path(self):
         """A matched override is recorded via ``record_prompt`` exactly
@@ -298,7 +277,7 @@ class TestPromptOverrides:
         with extraction_trace() as trace:
             with phase_trace("local_extract"):
                 with prompt_overrides({"some_other_file.txt": "x"}):
-                    _load_prompt("extraction.txt", required=True)
+                    _load_prompt("extraction.txt")
             record = trace.records[-1]
 
         assert record.prompts[0]["path"] == str(_DEFAULT_PROMPT_DIR / "extraction.txt")
@@ -339,7 +318,7 @@ def _render(template: str, **values) -> str:
 
 class TestExtractionPrompt:
     def test_renders_with_speaker_context_empty(self):
-        tmpl = _load_prompt("extraction.txt", required=True)
+        tmpl = _load_prompt("extraction.txt")
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context(None, None),
@@ -351,7 +330,7 @@ class TestExtractionPrompt:
 
     def test_renders_with_speaker_context_set(self):
         """Directive pins speaker0 as subject; display name injected as comprehension context."""
-        tmpl = _load_prompt("extraction.txt", required=True)
+        tmpl = _load_prompt("extraction.txt")
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("speaker0", "Alex"),
@@ -363,7 +342,7 @@ class TestExtractionPrompt:
 
     def test_renders_with_speaker_id_no_display_name(self):
         """Anonymous speaker: id used for both subject and context; no KeyError."""
-        tmpl = _load_prompt("extraction.txt", required=True)
+        tmpl = _load_prompt("extraction.txt")
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("speaker0", None),
@@ -382,9 +361,7 @@ def _extraction_prompt(model: str | None) -> str:
     ``_load_prompt`` docstring) — omitting it silently falls back to the
     shared base file even when ``model="qwen3-4b"`` is passed.
     """
-    return _load_prompt(
-        "extraction.txt", required=True, model=model, prompts_dir=_DEFAULT_PROMPT_DIR
-    )
+    return _load_prompt("extraction.txt", model=model, prompts_dir=_DEFAULT_PROMPT_DIR)
 
 
 def _positive_blocks(tmpl: str) -> list[str]:
@@ -704,9 +681,7 @@ def _second_order_prompt(model: str | None) -> str:
     Mirrors :func:`_extraction_prompt` — ``_DEFAULT_PROMPT_DIR`` must be
     passed explicitly for per-model resolution to engage.
     """
-    return _load_prompt(
-        "extraction_second_order.txt", required=True, model=model, prompts_dir=_DEFAULT_PROMPT_DIR
-    )
+    return _load_prompt("extraction_second_order.txt", model=model, prompts_dir=_DEFAULT_PROMPT_DIR)
 
 
 class TestExtractionSecondOrderPromptContract:
@@ -764,7 +739,7 @@ class TestExtractionSecondOrderPromptContract:
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         # Must not raise KeyError — every literal brace pair escaped as
         # `{{` / `}}`.  ``str.format`` itself validates this.
         rendered = tmpl.format(
@@ -783,7 +758,7 @@ class TestEnrichmentPromptContract:
         letting CI miss it silently (a caller that forgets to thread
         ``speaker_id`` would otherwise only fail at the first live cloud
         enrichment call)."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         with pytest.raises(KeyError):
             tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
 
@@ -792,7 +767,7 @@ class TestEnrichmentPromptContract:
         bare placeholders bare. Regressing the prompt to 'always emit braced'
         silently breaks de-anonymization.
         """
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         # Must instruct model to leave existing bare placeholders bare.
         # Specifically: not to re-brace incoming Person_1/City_1 tokens.
         keywords = ["bare", "leave", "existing", "NOT re-brace"]
@@ -814,7 +789,7 @@ class TestEnrichmentPromptContract:
         protocol — reconstructed locally from bindings + anon transcript)
         so the contract is now solely "facts ↔ bindings".
         """
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         # Bindings is the grounding contract; the prompt must name it.
         assert "bindings" in tmpl
         # Look for a hard requirement that braced placeholders appear in
@@ -848,7 +823,7 @@ class TestEnrichmentPromptContract:
         production graph snapshots (data/ha/debug/run_*/), even though
         the brace-binding contract itself is honoured for ``Event_*``.
         """
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         # Structural assertion: a Role_N braced placeholder must appear
         # in a positive-example block alongside multiple bound facts —
         # at minimum a date attribute and a company/location attribute.
@@ -887,7 +862,7 @@ class TestEnrichmentPromptContract:
         placeholder.  Structural, phrasing-tolerant: the exact wording is
         free to evolve; the pre-return check binding minted tokens to
         ``bindings`` is not."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         assert "Before returning" in tmpl, (
             "Enrichment prompt must contain a 'Before returning' self-audit clause."
         )
@@ -919,7 +894,7 @@ class TestEnrichmentPromptContract:
         names the speaker.  A test that only checked the literal
         substring passed for months while three few-shots taught the
         opposite; this one cannot pass while any block does."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
         blocks = re.split(r"\n\s*\n", rendered)
         for block in blocks:
@@ -946,7 +921,7 @@ class TestEnrichmentPromptContract:
         RENDERED ``{speaker_id}`` slot (per-session speaker binding), so this
         renders with ``speaker_id="speaker0"`` before checking, rather
         than scanning the raw (un-rendered) template text."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
         for anchor in (
             '"my wife is also a teacher"',
@@ -966,7 +941,7 @@ class TestEnrichmentPromptContract:
         positionally even without an explicit rule saying so.  Checked
         on the RENDERED prompt (``speaker_id="speaker0"``) since the
         subject is now the ``{speaker_id}`` slot."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
         idx = rendered.index('"we went there last summer"')
         window = rendered[idx : idx + 400]
@@ -987,7 +962,7 @@ class TestEnrichmentPromptContract:
         Person_2/Person_3 with no binding at all.  NEGATIVE/WRONG blocks
         are exempt — they deliberately demonstrate the unbound-mint
         failure as the thing NOT to do."""
-        tmpl = _load_prompt("cloud_enrichment.txt", required=True)
+        tmpl = _load_prompt("cloud_enrichment.txt")
         rendered = tmpl.format(transcript="x", facts_json="[]", speaker_id="speaker0")
         blocks = re.split(r"\n\s*\n", rendered)
         checked_any = False
@@ -1016,7 +991,7 @@ class TestEnrichmentPromptContract:
 
 class TestPlausibilityPromptContract:
     def test_renders_without_format_errors(self):
-        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt")
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
         assert "{transcript}" not in rendered
         assert "{facts_json}" not in rendered
@@ -1040,7 +1015,7 @@ class TestPlausibilityPromptContract:
         Verify each rule's identifying substring still exists so a
         prompt edit that removes a rule is caught at unit-test time.
         """
-        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt")
         required_rules = [
             "self-loop",  # R1
             "name-swap",  # R2
@@ -1063,7 +1038,7 @@ class TestPlausibilityPromptContract:
         Surface wording — "Default action", "IGNORE", a "## KEEP" header — is
         free to evolve; the keep-by-default semantics and the ordering are not.
         """
-        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt")
         lower = tmpl.lower()
         # The default action must KEEP the fact (IGNORE), not drop it.
         assert "default action" in lower, (
@@ -1098,7 +1073,7 @@ class TestPlausibilityPromptContract:
         Regressing to "echo every fact" silently re-introduces the
         truncation failure mode, so this assertion locks the contract.
         """
-        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt")
         # Must specify the drop-index-set object shape.
         assert '"drop"' in tmpl, (
             'Plausibility prompt must specify the drop-set output shape ({"drop": [<index>, ...]}).'
@@ -1131,7 +1106,7 @@ class TestPlausibilityPromptContract:
         (`judge_plausibility`, `paramem/graph/extractor.py`) — no
         separate judge-specific override text exists.
         """
-        tmpl = _load_prompt("cloud_plausibility.txt", required=True)
+        tmpl = _load_prompt("cloud_plausibility.txt")
         r4_start = tmpl.index("R4.")
         r4_end = tmpl.index("R5.")
         r4_text = tmpl[r4_start:r4_end]
@@ -1158,7 +1133,7 @@ class TestProceduralPrompt:
         file-based prompt and collapses cleanly to an empty string so no
         dangling placeholder or extra blank lines remain.
         """
-        tmpl = _load_prompt("extraction_procedural.txt", required=True)
+        tmpl = _load_prompt("extraction_procedural.txt")
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context(None, None),
@@ -1176,7 +1151,7 @@ class TestProceduralPrompt:
         main-extraction facts use the speaker id, creating two nodes for
         the same person.
         """
-        tmpl = _load_prompt("extraction_procedural.txt", required=True)
+        tmpl = _load_prompt("extraction_procedural.txt")
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context("speaker0", "Alex"),
@@ -1223,14 +1198,14 @@ class TestAnonymizationPrompt:
 
     def test_default_renders_without_format_errors(self):
         """anonymization.txt must render with all expected kwargs without KeyError."""
-        rendered = self._render(_load_prompt("anonymization.txt", required=True))
+        rendered = self._render(_load_prompt("anonymization.txt"))
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
         assert "{scrub_categories}" not in rendered
 
     def test_file_based_renders_without_format_errors(self):
         """File-based anonymization.txt must render with all expected kwargs without KeyError."""
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         rendered = self._render(tmpl)
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
@@ -1239,7 +1214,7 @@ class TestAnonymizationPrompt:
     def test_shape_contract_present_in_default(self):
         """anonymization.txt must teach the four parts of the shape contract:
         well-formed shape, uniqueness, totality, direction."""
-        rendered = self._render(_load_prompt("anonymization.txt", required=True))
+        rendered = self._render(_load_prompt("anonymization.txt"))
         # Shape clause — `<Prefix>_<N>` or equivalent shape language.
         assert "PascalCase" in rendered or "Prefix" in rendered, (
             "Anonymization prompt must teach the placeholder shape (PascalCase + _<N>)."
@@ -1259,7 +1234,7 @@ class TestAnonymizationPrompt:
         like ``University_1`` / ``Project_1`` and the recovery helper had to
         patch the gap).
         """
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         rendered = self._render(tmpl)
         assert "PascalCase" in rendered or "Prefix" in rendered
         assert "UNIQUE" in rendered or "unique" in rendered
@@ -1280,7 +1255,7 @@ class TestAnonymizationPrompt:
         """After rendering, no stray {word} tokens should remain (only JSON literal braces)."""
         import re
 
-        rendered = self._render(_load_prompt("anonymization.txt", required=True))
+        rendered = self._render(_load_prompt("anonymization.txt"))
         # JSON literal braces are escaped as {{ }} in the template and appear as { } after render.
         # A simple check: no single { immediately followed by a letter (unrendered placeholder).
         stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
@@ -1299,7 +1274,7 @@ class TestAnonymizationPrompt:
         Person_N (i.e. re-anonymizing the anchor itself) anywhere in
         THIS file's own examples.
         """
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         lower = tmpl.lower()
         assert "speaker" in lower and "verbatim" in lower, (
             "anonymization.txt must state the speaker{N}-stays-verbatim rule."
@@ -1323,7 +1298,7 @@ class TestAnonymizationPrompt:
     def test_scrub_categories_slot_present(self):
         """The prompt must accept a {scrub_categories} slot and echo the
         rendered value — the config-driven scope authority."""
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         assert "{scrub_categories}" in tmpl, (
             "anonymization.txt must declare a {scrub_categories} format slot."
         )
@@ -1343,7 +1318,7 @@ class TestAnonymizationPrompt:
         """The output contract must ask for BOTH `mapping` and
         `anonymized_transcript` — the prior 'mapping — nothing else' /
         'do NOT rewrite the transcript' contract is retired."""
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         assert "anonymized_transcript" in tmpl, (
             "anonymization.txt must request the anonymized_transcript artifact."
         )
@@ -1365,7 +1340,7 @@ class TestAnonymizationPrompt:
         gone — the prompt is the only scope boundary. None of them may
         appear as a placeholder-mapping VALUE (i.e. actually scrubbed) in
         the prompt body."""
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         for forbidden in ("City_1", "Org_1", "Product_1"):
             assert forbidden not in tmpl, (
                 f"anonymization.txt must not positively scrub-example {forbidden!r} — "
@@ -1376,7 +1351,7 @@ class TestAnonymizationPrompt:
     def test_phone_and_email_positive_examples_present(self):
         """Add phone/email POSITIVE examples now that
         structured values (not just names) are scrubbed by the prompt."""
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         examples_section = tmpl[tmpl.index("## Examples") :]
         assert "Phone_1" in examples_section, (
             "anonymization.txt must include a positive phone-number scrub example."
@@ -1389,7 +1364,7 @@ class TestAnonymizationPrompt:
         """The prompt must instruct the model to rewrite the
         transcript changing ONLY the listed PII, using the SAME
         placeholders as `mapping` (fidelity + consistency)."""
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         lower = tmpl.lower()
         assert "anonymized_transcript" in lower
         assert "same placeholder" in lower, (
@@ -1416,7 +1391,7 @@ class TestAnonymizationSpeakerAnchorPrompt:
         return tmpl.format(speaker_id=speaker_id)
 
     def test_renders_without_format_errors(self):
-        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt")
         rendered = self._render(tmpl)
         assert "{speaker_id}" not in rendered
 
@@ -1426,7 +1401,7 @@ class TestAnonymizationSpeakerAnchorPrompt:
         it is rendered standalone with only ``speaker_id``, then inserted
         as an opaque string into the base template's
         ``{speaker_anchor_section}`` slot."""
-        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt")
         for other_slot in ("{facts_json}", "{transcript}", "{scrub_categories}"):
             assert other_slot not in tmpl, (
                 f"anonymization_speaker_anchor.txt must not declare {other_slot!r} — "
@@ -1434,7 +1409,7 @@ class TestAnonymizationSpeakerAnchorPrompt:
             )
 
     def test_fold_onto_token_rule_and_worked_example_present(self):
-        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt")
         rendered = self._render(tmpl)
         assert "speaker0" in rendered
         assert "anchor" in rendered.lower()
@@ -1449,7 +1424,7 @@ class TestAnonymizationSpeakerAnchorPrompt:
         session fold onto the SAME anchor, and at least one worked
         example must demonstrate two distinct real-value keys mapping to
         the identical anchor value."""
-        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt")
         lower = tmpl.lower()
         assert "same anchor" in lower or "same" in lower and "anchor" in lower, (
             "anonymization_speaker_anchor.txt must instruct that multiple "
@@ -1464,7 +1439,7 @@ class TestAnonymizationSpeakerAnchorPrompt:
         )
 
     def test_no_example_maps_an_existing_speaker_token_onto_person_n(self):
-        tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        tmpl = _load_prompt("anonymization_speaker_anchor.txt")
         rendered = self._render(tmpl)
         assert not re.search(r'"speaker\d+"\s*:\s*"Person_\d+"', rendered)
 
@@ -1477,8 +1452,8 @@ class TestAnonymizationPromptSpeakerAnchorSlotIntegration:
     """
 
     def _render_combined(self, speaker_id: str | None) -> str:
-        base = _load_prompt("anonymization.txt", required=True)
-        anchor_tmpl = _load_prompt("anonymization_speaker_anchor.txt", required=True)
+        base = _load_prompt("anonymization.txt")
+        anchor_tmpl = _load_prompt("anonymization_speaker_anchor.txt")
         section = anchor_tmpl.format(speaker_id=speaker_id) if speaker_id else ""
         return base.format(
             scrub_categories="person name",
@@ -1526,7 +1501,7 @@ class TestAnonymizationFactsPrompt:
         """Renders with {scrub_categories} and {facts_json} and
         declares no {transcript} slot; no stray unrendered {word} after
         formatting."""
-        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        tmpl = _load_prompt("anonymization_facts.txt")
         assert "{transcript}" not in tmpl, (
             "anonymization_facts.txt must not declare a {transcript} slot — "
             "there is no transcript at the graph tier."
@@ -1542,7 +1517,7 @@ class TestAnonymizationFactsPrompt:
         + `_<N>`), uniqueness, totality, direction, and the
         `speaker{N}`-verbatim rule, with no example mapping a `speaker{N}`
         token."""
-        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        tmpl = _load_prompt("anonymization_facts.txt")
         rendered = self._render(tmpl)
         assert "PascalCase" in rendered or "Prefix" in rendered
         assert "UNIQUE" in rendered or "unique" in rendered
@@ -1562,7 +1537,7 @@ class TestAnonymizationFactsPrompt:
         """Examples use fictional entities only and contain no
         city/org/product positive scrub example (City_1/Org_1/Product_1
         absent)."""
-        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        tmpl = _load_prompt("anonymization_facts.txt")
         for forbidden in ("City_1", "Org_1", "Product_1"):
             assert forbidden not in tmpl, (
                 f"anonymization_facts.txt must not positively scrub-example {forbidden!r}."
@@ -1576,7 +1551,7 @@ class TestAnonymizationFactsPrompt:
         keyword."""
         from paramem.cloud.anonymize import _render_anonymize_prompt
 
-        tmpl = _load_prompt("anonymization_facts.txt", required=True)
+        tmpl = _load_prompt("anonymization_facts.txt")
         assert "anonymized_transcript" not in tmpl, (
             "anonymization_facts.txt must not request anonymized_transcript — "
             "there is no transcript at the graph tier."
@@ -1650,32 +1625,32 @@ class TestEntityCorrectionPrompt:
         return tmpl.format(context="place", value="Frankfrut")
 
     def test_renders_without_format_errors(self):
-        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        rendered = self._render(_load_prompt("entity_correction.txt"))
         assert "{context}" not in rendered
         assert "{value}" not in rendered
 
     def test_no_stray_unescaped_placeholders(self):
         """No stray {word} tokens remain after render (only JSON literal braces)."""
-        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        rendered = self._render(_load_prompt("entity_correction.txt"))
         stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
         assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
 
     def test_contains_output_contract_tokens(self):
         """The output-contract keys `kind` and `is_known_entity` must appear."""
-        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        rendered = self._render(_load_prompt("entity_correction.txt"))
         assert "kind" in rendered
         assert "is_known_entity" in rendered
 
     def test_contains_strict_kind_enum_values(self):
         """All five `kind` enum values must be named in the prompt."""
-        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        rendered = self._render(_load_prompt("entity_correction.txt"))
         for value in ("place", "organization", "concept", "person", "other"):
             assert value in rendered, f"kind enum value {value!r} missing from prompt"
 
     def test_contains_all_three_example_markers(self):
         """All three few-shot examples (real correction, person unchanged,
         fiction unchanged) must be present and render cleanly."""
-        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        rendered = self._render(_load_prompt("entity_correction.txt"))
         assert "POSITIVE" in rendered
         assert rendered.count("NEGATIVE") >= 2
         # The positive example must actually change the surface.
@@ -1697,7 +1672,7 @@ class TestMergerCoexistencePrompt:
     """
 
     def _load(self):
-        return _load_prompt("merger_coexistence.txt", required=True)
+        return _load_prompt("merger_coexistence.txt")
 
     def test_renders_without_leftover_slots(self):
         """The ``{predicate}`` slot fills; no leftover ``{slot}`` tokens remain."""
@@ -1803,11 +1778,10 @@ class TestSpeakerDirectiveFile:
       substituted by :func:`~paramem.server.speaker.resolve_speaker_tokens`
       at the reply boundary.
 
-    ``INFERENCE-IDENTITY`` was deleted in Phase B (speaker-identity refactor):
-    id-to-name resolution is not a prompt injection and does not happen at
-    the fact-render boundary either — it happens exactly once, at the reply
-    boundary, via ``resolve_speaker_tokens``.  Tests verify the new section
-    layout.
+    ``INFERENCE-IDENTITY`` is deleted: id-to-name resolution is not a
+    prompt injection and does not happen at the fact-render boundary
+    either — it happens exactly once, at the reply boundary, via
+    ``resolve_speaker_tokens``.  Tests verify the current section layout.
     """
 
     def test_file_exists(self):
@@ -1819,37 +1793,37 @@ class TestSpeakerDirectiveFile:
         """INFERENCE-IDENTITY section is deleted; loading it must raise KeyError."""
         import pytest
 
-        from paramem.graph.prompts import _load_speaker_directive_section
+        from paramem.graph.prompts import _load_prompt_section
 
         with pytest.raises(KeyError, match="INFERENCE-IDENTITY"):
-            _load_speaker_directive_section("INFERENCE-IDENTITY")
+            _load_prompt_section("speaker_directive.txt", "INFERENCE-IDENTITY")
 
     def test_third_party_descriptor_loads_non_empty(self):
         """THIRD-PARTY-DESCRIPTOR section loads successfully and is non-empty."""
-        from paramem.graph.prompts import _load_speaker_directive_section
+        from paramem.graph.prompts import _load_prompt_section
 
-        descriptor = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+        descriptor = _load_prompt_section("speaker_directive.txt", "THIRD-PARTY-DESCRIPTOR")
         assert descriptor, "THIRD-PARTY-DESCRIPTOR section must be non-empty"
 
     def test_third_party_descriptor_value(self):
         """THIRD-PARTY-DESCRIPTOR must be 'another speaker'."""
-        from paramem.graph.prompts import _load_speaker_directive_section
+        from paramem.graph.prompts import _load_prompt_section
 
-        descriptor = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+        descriptor = _load_prompt_section("speaker_directive.txt", "THIRD-PARTY-DESCRIPTOR")
         assert descriptor == "another speaker"
 
     def test_extraction_directive_intact(self):
         """EXTRACTION-DIRECTIVE section is intact and non-empty after refactor."""
-        from paramem.graph.prompts import _load_speaker_directive_section
+        from paramem.graph.prompts import _load_prompt_section
 
-        extraction = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
+        extraction = _load_prompt_section("speaker_directive.txt", "EXTRACTION-DIRECTIVE")
         assert extraction, "EXTRACTION-DIRECTIVE section must be non-empty"
 
     def test_extraction_directive_renders_slots(self):
         """EXTRACTION-DIRECTIVE section renders {speaker_id} and {speaker_name} slots."""
-        from paramem.graph.prompts import _load_speaker_directive_section
+        from paramem.graph.prompts import _load_prompt_section
 
-        tmpl = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
+        tmpl = _load_prompt_section("speaker_directive.txt", "EXTRACTION-DIRECTIVE")
         rendered = tmpl.format(speaker_id="speaker0", speaker_name="Alice")
         assert "speaker0" in rendered
         assert "Alice" in rendered
@@ -1861,10 +1835,10 @@ class TestSpeakerDirectiveFile:
         """Requesting a non-existent section raises KeyError immediately."""
         import pytest
 
-        from paramem.graph.prompts import _load_speaker_directive_section
+        from paramem.graph.prompts import _load_prompt_section
 
         with pytest.raises(KeyError, match="NONEXISTENT"):
-            _load_speaker_directive_section("NONEXISTENT")
+            _load_prompt_section("speaker_directive.txt", "NONEXISTENT")
 
     def test_build_speaker_context_two_arg_renders_speaker_id(self):
         """build_speaker_context(speaker_id, speaker_name) pins id as subject."""
@@ -1907,7 +1881,7 @@ class TestSpeakerDirectiveFile:
         appear verbatim — the prompt must not claim every
         ``subject``/``object`` is a token.
         """
-        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt")
         lower = tmpl.lower()
         # The note must reference speaker endpoints and the token/system framing.
         assert "speaker" in lower and ("identifier" in lower or "system" in lower), (
@@ -1933,7 +1907,7 @@ class TestSpeakerDirectiveFile:
         illustrate an unreachable task. See
         ``TestSpeakerDirectiveFile::test_cloud_graph_enrichment_part2_examples_are_not_person_names``.
         """
-        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt")
         part1 = tmpl.split("## Part 1")[1].split("## Part 2")[0]
         for leaked_name in ("Alice", "Bob", "Acme", "Stanford", "Portland"):
             assert leaked_name not in part1, (
@@ -1954,7 +1928,7 @@ class TestSpeakerDirectiveFile:
         Mutation: reintroduce a person-name SAME_AS example (e.g. ``"Yang
         Ming"`` / ``"Mr. Yang"``) in Part 2 -> this test fails.
         """
-        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt")
         part2 = tmpl.split("## Part 2")[1].split("## Input triples")[0]
         for leaked_person_name in (
             "Yang Ming",
@@ -1981,7 +1955,7 @@ class TestSpeakerDirectiveFile:
         the ordering-and-survivor-rule guarantee (a
         prompt instruction alone is not a guarantee, which is why this is a
         `SHOULD`-strength nudge, not the enforcement mechanism)."""
-        tmpl = _load_prompt("cloud_graph_enrichment.txt", "")
+        tmpl = _load_prompt("cloud_graph_enrichment.txt")
         lower = tmpl.lower()
         assert "reuse" in lower and "predicate" in lower, (
             "cloud_graph_enrichment.txt must instruct the model to reuse an "
@@ -2009,12 +1983,12 @@ class TestNameExtractionPrompt:
     def _load_system(self) -> str:
         from paramem.graph.prompts import _load_prompt
 
-        return _load_prompt("name_extraction_system.txt", "")
+        return _load_prompt("name_extraction_system.txt")
 
     def _load_user(self) -> str:
         from paramem.graph.prompts import _load_prompt
 
-        return _load_prompt("name_extraction.txt", "")
+        return _load_prompt("name_extraction.txt")
 
     def test_system_file_exists_and_is_non_empty(self):
         """name_extraction_system.txt must exist and be non-empty."""
@@ -2088,4 +2062,76 @@ class TestNameExtractionPrompt:
         assert "Extract the speaker's self-introduced name from this transcript." not in app_src, (
             "Inline name-extraction user prompt detected in app.py — "
             "it must be removed and loaded from name_extraction.txt instead."
+        )
+
+
+class TestServingPrompts:
+    """Contract tests for the serving-path prompt accessors
+    (:mod:`paramem.server.prompts`) and the file they render from,
+    ``configs/prompts/serving_directives.txt``.
+    """
+
+    # Per-section EXACT slot set (regex over ``\\{[^}]*\\}``). A stray
+    # literal brace in this operator-editable file must fail here, in a
+    # test — not as a request-time KeyError on a reasoning leg with no
+    # enclosing try.
+    _EXPECTED_SLOTS = {
+        "IDENTITY-LINE": {"{speaker_id}"},
+        "LANGUAGE-LINE": {"{language_name}"},
+        "REASONING-TURN": {"{today_prefix}", "{context}", "{question}"},
+        "RECORDED-DATES-SUFFIX": {"{dates}"},
+        "EMPTY-PERIOD-NOTE": set(),
+    }
+
+    def test_serving_directives_sections_all_load(self):
+        from paramem.graph.prompts import _load_prompt_section
+
+        for section in self._EXPECTED_SLOTS:
+            content = _load_prompt_section("serving_directives.txt", section)
+            assert content, f"{section} section must be non-empty"
+
+    def test_serving_directives_exact_slot_set_per_section(self):
+        from paramem.graph.prompts import _load_prompt_section
+
+        for section, expected in self._EXPECTED_SLOTS.items():
+            content = _load_prompt_section("serving_directives.txt", section)
+            actual = set(re.findall(r"\{[^}]*\}", content))
+            assert actual == expected, (
+                f"{section} section slot set drifted: expected {expected}, got {actual}"
+            )
+
+    def test_empty_period_note_and_serving_system_prompt_co_located(self):
+        """Co-location guard: the empty-period note and the serving system
+        prompt's own "nothing was recorded" language must agree — both
+        surfaces describe the same no-data condition to the model."""
+        from paramem.server.prompts import empty_period_note, serving_system_prompt
+
+        assert empty_period_note().startswith("Nothing was recorded")
+        assert "nothing was recorded" in serving_system_prompt().lower()
+
+    def test_recall_selection_prompt_never_formatted(self):
+        """``recall_selection.txt`` carries literal JSON example braces and
+        is passed verbatim as system content — it must never reach a
+        ``.format()`` call. This assertion is the tripwire: a future
+        author who adds one gets a KeyError here, in an adjacent test,
+        rather than in production."""
+        from paramem.server.prompts import recall_selection_prompt
+
+        content = recall_selection_prompt()
+        assert '{"all": true}' in content
+        assert "{" in content
+
+    def test_reasoning_turn_renders_undated_shape_byte_identical_to_legacy(self):
+        from paramem.server.prompts import reasoning_turn
+
+        result = reasoning_turn(today_prefix="", context="CTX", question="Q?")
+        assert result == "What you know about the speaker:\n\nCTX\n\nQuestion: Q?"
+
+    def test_reasoning_turn_renders_dated_shape_byte_identical_to_legacy(self):
+        from paramem.server.prompts import reasoning_turn
+
+        today_prefix = "Today is Monday, 2026-08-03. "
+        result = reasoning_turn(today_prefix=today_prefix, context="CTX", question="Q?")
+        assert result == (
+            "Today is Monday, 2026-08-03. What you know about the speaker:\n\nCTX\n\nQuestion: Q?"
         )

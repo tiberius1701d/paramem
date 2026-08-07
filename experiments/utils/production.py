@@ -52,7 +52,6 @@ from paramem.graph.schema import Entity, Relation, SessionGraph
 # --- memory ---------------------------------------------------------------
 from paramem.memory.entry import (
     DEFAULT_CONFIDENCE_THRESHOLD,
-    RECALL_TEMPLATE,
     assign_keys,
     build_registry,
     format_entry_training,
@@ -78,6 +77,7 @@ from paramem.server.gpu_lock import gpu_lock_sync
 
 # --- training -------------------------------------------------------------
 from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.dataset import trained_recall_template
 from paramem.training.donor import (
     DONOR_RECIPE_ID,
     donor_slot_valid,
@@ -85,7 +85,11 @@ from paramem.training.donor import (
 )
 from paramem.training.early_stop import EarlyStopPolicy
 from paramem.training.recall_eval import evaluate_indexed_recall, probe_entries
-from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
+from paramem.training.thermal_throttle import (
+    ThermalPolicy,
+    ThermalThrottleCallback,
+    wait_for_cooldown,
+)
 from paramem.training.trainer import TrainingHooks, train_adapter
 
 # --- artifacts ------------------------------------------------------------
@@ -113,7 +117,6 @@ __all__ = [
     "SessionGraph",
     # memory
     "DEFAULT_CONFIDENCE_THRESHOLD",
-    "RECALL_TEMPLATE",
     "assign_keys",
     "build_registry",
     "format_entry_training",
@@ -141,8 +144,10 @@ __all__ = [
     "probe_entries",
     "ThermalPolicy",
     "ThermalThrottleCallback",
+    "trained_recall_template",
     "TrainingHooks",
     "train_adapter",
+    "wait_for_cooldown",
     # config
     "AdapterConfig",
     "ModelConfig",

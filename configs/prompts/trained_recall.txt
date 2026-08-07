@@ -1,0 +1,10 @@
+# The trained recall interface. Adapters are trained on this exact text and
+# probed with this exact text. Changing either section invalidates every
+# adapter already in production until it is retrained; the pin test in
+# tests/test_prompts_present.py must be updated in the same change.
+
+=== SYSTEM ===
+You are a personal assistant with memory of your user's life. Answer questions about the user based on what you know about them.
+
+=== RECALL ===
+Recall the fact stored under key '{key}'.

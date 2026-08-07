@@ -280,13 +280,6 @@ def test_consolidation_retry_cap_loads_from_consolidation_section(config_path):
     )
 
 
-def test_voice_prompt_loads(example_config):
-    """Voice prompt file referenced by the example must exist and be non-empty."""
-    text = example_config.voice.load_prompt()
-    assert text, "voice.load_prompt() returned empty — check configs/prompts/pa_voice.txt"
-    assert len(text) > 50, "voice prompt is suspiciously short"
-
-
 def test_abstention_messages_load(example_config):
     """All three abstention prompt files referenced by the example must exist and be non-empty."""
     response = example_config.abstention.load_response()
@@ -320,7 +313,7 @@ def test_prompts_dir_contains_extraction_templates(example_config):
     """The prompts directory must hold the extraction templates the pipeline depends on."""
     prompts = example_config.paths.prompts
     assert prompts.is_dir(), f"paths.prompts does not exist: {prompts}"
-    expected = {"extraction.txt", "extraction_system.txt", "pa_voice.txt"}
+    expected = {"extraction.txt", "extraction_system.txt"}
     actual = {p.name for p in prompts.iterdir()}
     missing = expected - actual
     assert not missing, f"prompts dir missing required templates: {missing}"

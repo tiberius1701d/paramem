@@ -62,7 +62,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import BENCHMARK_MODELS, setup_logging  # noqa: E402
 from paramem.backup.encryption import read_maybe_encrypted  # noqa: E402
-from paramem.graph.prompts import _load_speaker_directive_section  # noqa: E402
+from paramem.graph.prompts import _load_prompt_section  # noqa: E402
 from paramem.memory.entry import entry_fact_text  # noqa: E402
 from paramem.memory.store import MemoryStore  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
@@ -91,7 +91,9 @@ EMB_ANON = [0.0, 0.0, 1.0] + [0.0] * 253
 
 # THIRD_PARTY_DESCRIPTOR — loaded the same way inference.py loads it so the
 # assertion is decoupled from the raw string.
-THIRD_PARTY_DESCRIPTOR: str = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+THIRD_PARTY_DESCRIPTOR: str = _load_prompt_section(
+    "speaker_directive.txt", "THIRD-PARTY-DESCRIPTOR"
+)
 
 # Turns for the GPU extraction phase.
 # Alex (speaker0) talks about Dana (speaker1) as a third-party subject and object.

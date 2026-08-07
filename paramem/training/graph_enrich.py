@@ -479,8 +479,8 @@ def enrich_graph(
     # contract, no transcript-rewrite half, output contract
     # ``{"mapping": {...}}`` only — is the correct template; the mapping-validity
     # rule is satisfied via the transcript-empty leg.
-    anon_prompt = _load_prompt("anonymization_facts.txt", required=True)
-    anon_system = _load_prompt("anonymization_system.txt", required=True)
+    anon_prompt = _load_prompt("anonymization_facts.txt")
+    anon_system = _load_prompt("anonymization_system.txt")
     max_entities = max(1, max_entities_per_pass)
     hops = max(1, neighborhood_hops)
 

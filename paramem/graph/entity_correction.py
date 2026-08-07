@@ -151,13 +151,11 @@ def _verdict(
         "entity_correction.txt",
         prompts_dir=prompts_dir,
         model=model_alias,
-        required=True,
     )
     system_prompt = _load_prompt(
         "entity_correction_system.txt",
         prompts_dir=prompts_dir,
         model=model_alias,
-        required=True,
     )
     prompt = template.format(context=context, value=value)
     messages = [

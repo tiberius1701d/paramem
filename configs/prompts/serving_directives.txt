@@ -1,0 +1,18 @@
+=== IDENTITY-LINE ===
+You are speaking with {speaker_id}.
+
+=== LANGUAGE-LINE ===
+Respond in {language_name}.
+
+=== REASONING-TURN ===
+{today_prefix}What you know about the speaker:
+
+{context}
+
+Question: {question}
+
+=== RECORDED-DATES-SUFFIX ===
+Recorded dates: {dates}.
+
+=== EMPTY-PERIOD-NOTE ===
+Nothing was recorded for the requested period.

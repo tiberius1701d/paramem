@@ -2812,8 +2812,8 @@ class TestScrubCategoriesReachPrompt:
                 # The real production prompt — the point of this test is
                 # that the ``{scrub_categories}`` slot in the SHIPPED
                 # template renders sorted, not a synthetic template.
-                user_prompt_template=_load_prompt("anonymization.txt", required=True),
-                system_prompt=_load_prompt("anonymization_system.txt", required=True),
+                user_prompt_template=_load_prompt("anonymization.txt"),
+                system_prompt=_load_prompt("anonymization_system.txt"),
             )
 
         assert "prompt" in captured, "generate_answer was never called with a prompt"
@@ -3766,12 +3766,13 @@ class TestSpeakerContextInjection:
 
     def test_extraction_directive_overridable_and_recorded_in_provenance(self):
         """``speaker_directive.txt`` used to be read via a bare
-        ``Path.read_text()`` inside ``_load_speaker_directive_section`` —
-        unreachable by a calibration override and never recorded via
-        ``record_prompt``.  It now routes through ``_load_prompt``, so
-        both become possible.  ``build_speaker_context`` feeds this
-        section into the ``{speaker_context}`` slot of the extraction
-        user template — it is part of the prompt under test."""
+        ``Path.read_text()`` inside its section reader — unreachable by a
+        calibration override and never recorded via ``record_prompt``.
+        It now routes through ``_load_prompt`` (via
+        ``_load_prompt_section``), so both become possible.
+        ``build_speaker_context`` feeds this section into the
+        ``{speaker_context}`` slot of the extraction user template — it is
+        part of the prompt under test."""
         from paramem.graph.extractor import build_speaker_context
         from paramem.graph.phase_trace import extraction_trace, phase_trace
         from paramem.graph.prompts import prompt_overrides

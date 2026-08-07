@@ -1,26 +1,73 @@
 """Dataset utilities for personal memory training."""
 
-SYSTEM_PROMPT = (
-    "You are a personal assistant with memory of your user's life. "
-    "Answer questions about the user based on what you know about them."
-)
+from paramem.graph.prompts import _load_prompt_section
+
+_TRAINED_RECALL_FILE = "trained_recall.txt"
 
 
-def format_inference_prompt(question: str, tokenizer) -> str:
-    """Format a question for inference using the model's native chat template.
+def trained_recall_system_prompt() -> str:
+    """Load the trained-recall system prompt (``trained_recall.txt`` § SYSTEM).
 
-    No fact context is provided — the model must recall from its adapted weights.
+    This is one half of the weight-coupled training/probe interface — every
+    adapter in production was trained with this exact text as the system
+    message.  Loaded at call time (never cached), so it participates in
+    :func:`~paramem.graph.prompts.prompt_overrides` like every other prompt.
+
+    Returns:
+        The system prompt string, verbatim.
+    """
+    return _load_prompt_section(_TRAINED_RECALL_FILE, "SYSTEM")
+
+
+def trained_recall_template() -> str:
+    """Load the trained-recall user template (``trained_recall.txt`` § RECALL).
+
+    Returns the raw ``{key}``-bearing template — callers format it with the
+    specific key being recalled.  The other half of the weight-coupled
+    training/probe interface; see :func:`trained_recall_system_prompt`.
+
+    Returns:
+        The template string with one ``{key}`` slot, e.g.
+        ``"Recall the fact stored under key '{key}'."``.
+    """
+    return _load_prompt_section(_TRAINED_RECALL_FILE, "RECALL")
+
+
+def build_inference_prompts(questions: list[str], tokenizer) -> list[str]:
+    """Render inference prompts for N questions, sharing one system-prompt load.
+
+    No fact context is provided — the model must recall from its adapted
+    weights.  The trained-recall system prompt is loaded exactly once
+    regardless of ``len(questions)``, so a caller building N prompts (batched
+    probing, batched recall evaluation) does not re-read the prompt file —
+    and does not emit N ``record_prompt`` provenance entries — for what is
+    a single, shared load.  This is the ONE message-construction site in the
+    package; every caller, single-question or batched, renders through here.
+
+    Args:
+        questions: User-turn question strings, one per prompt to render.
+        tokenizer: HuggingFace tokenizer supporting ``apply_chat_template``.
+
+    Returns:
+        Rendered prompt strings, same order and length as *questions*.
     """
     from paramem.models.loader import adapt_messages
 
-    messages = adapt_messages(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
-        tokenizer,
-    )
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    system_prompt = trained_recall_system_prompt()
+    return [
+        tokenizer.apply_chat_template(
+            adapt_messages(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": question},
+                ],
+                tokenizer,
+            ),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for question in questions
+    ]
 
 
 def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: int) -> dict:

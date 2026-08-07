@@ -120,7 +120,7 @@ paths:
   data: tests/fixtures/sandbox/data/ha                # persistent artifacts (adapters, registry, key_metadata)
   sessions: tests/fixtures/sandbox/data/ha/sessions    # conversation transcripts pending consolidation
   debug: tests/fixtures/sandbox/data/ha/debug          # cycle snapshots, diagnostic output (debug=true)
-  prompts: configs/prompts                              # extraction and voice prompt templates (read-only, shared with live)
+  prompts: configs/prompts                              # extraction prompt templates (read-only, shared with live)
   telemetry: tests/fixtures/sandbox/data/ha/telemetry  # bounded fold VRAM/adapter telemetry ring (always written)
 
 adapters:
@@ -519,7 +519,8 @@ sanitization:
 abstention:
   enabled: true
   # Messages live in dedicated prompt files so they can be tuned without
-  # code changes — same pattern as voice.prompt_file. The *_override
+  # code changes — same pattern as the prompt templates under
+  # configs/prompts/. The *_override
   # fields take precedence when set; an empty override falls back to the
   # file, and a missing file falls back to a module-level constant in
   # paramem/server/config.py.
@@ -572,7 +573,6 @@ personal_referent:
   confidence_margin: 0.05
 
 voice:
-  prompt_file: configs/prompts/pa_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
   # Per-language greetings (period: morning|afternoon|evening), prepended in the
   # detected language; unknown languages fall back to "en". Operator-editable.

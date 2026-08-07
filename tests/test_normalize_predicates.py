@@ -369,6 +369,6 @@ class TestPromptProvenance:
         filter_records = [p for p in prompts if p["path"].endswith("predicate_normalization.txt")]
         assert len(filter_records) == 1
         expected_sha = hashlib.sha256(
-            _load_prompt("predicate_normalization.txt", required=True).encode("utf-8")
+            _load_prompt("predicate_normalization.txt").encode("utf-8")
         ).hexdigest()[:12]
         assert filter_records[0]["sha"] == expected_sha

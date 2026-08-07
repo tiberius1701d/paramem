@@ -246,7 +246,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.memory.entry",
             "DEFAULT_CONFIDENCE_THRESHOLD",
         ),
-        ("experiments/test18_probe_batching.py", "paramem.memory.entry", "RECALL_TEMPLATE"),
         ("experiments/test18_probe_batching.py", "paramem.memory.entry", "build_registry"),
         ("experiments/test18_probe_batching.py", "paramem.memory.entry", "finalize_recalled"),
         (
@@ -261,7 +260,12 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         (
             "experiments/test18_probe_batching.py",
             "paramem.training.dataset",
-            "format_inference_prompt",
+            "build_inference_prompts",
+        ),
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.training.dataset",
+            "trained_recall_template",
         ),
         (
             "experiments/test18_probe_batching.py",

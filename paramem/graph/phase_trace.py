@@ -101,8 +101,12 @@ it.  Each entry is ``{"path", "sha", "template"}``:
 * ``path`` is the file actually resolved (which may be the shipped
   default under ``_DEFAULT_PROMPT_DIR`` even when the caller requested
   an operator-supplied ``prompts_dir`` — that fallback is exactly the
-  divergence this mechanism exists to make visible), or ``None`` when no
-  file was found anywhere and the caller's hardcoded default was used.
+  divergence this mechanism exists to make visible), or the synthetic
+  ``<override:{filename}>`` string when an active
+  :func:`~paramem.graph.prompts.prompt_overrides` mapping supplied the
+  content instead of a file.  ``_load_prompt`` never resolves a file AND
+  fails: a not-found file raises :exc:`FileNotFoundError` instead of
+  returning a fallback, so ``path`` is never ``None`` in practice.
 * ``sha`` is the first 12 hex characters of the SHA-256 of ``template``.
 
 :func:`record_prompt` is a no-op when called with no active
@@ -665,9 +669,14 @@ def record_prompt(*, path: str | None, content: str) -> None:
     that resolution.
 
     Args:
-        path: The resolved file path as a string, or ``None`` when no file
-            was found anywhere and the caller's hardcoded ``default`` was
-            used instead.
+        path: The resolved file path as a string, or the synthetic
+            ``<override:{filename}>`` string when a
+            :func:`~paramem.graph.prompts.prompt_overrides` mapping
+            supplied the content instead of a file.  ``None`` is accepted
+            by the signature for callers that have genuinely no path to
+            report, but ``_load_prompt`` never passes it — a not-found
+            file raises :exc:`FileNotFoundError` instead of calling this
+            with a fallback.
         content: The exact text the loader is about to return — the
             template with slots such as ``{transcript}`` still
             UNSUBSTITUTED.  Never the rendered prompt (see the module
@@ -677,9 +686,10 @@ def record_prompt(*, path: str | None, content: str) -> None:
     which raises in the analogous situation.  This is intentional, not an
     oversight to "fix" into a raise:
 
-    * ``_load_prompt`` (transitively, via :func:`paramem.graph.prompts.
-      _load_speaker_directive_section`) is called at MODULE IMPORT TIME to
-      build ``paramem.server.speaker.THIRD_PARTY_DESCRIPTOR`` — long before
+    * ``_load_prompt`` (transitively, via
+      :func:`paramem.graph.prompts._load_prompt_section`) is called at
+      MODULE IMPORT TIME to build
+      ``paramem.server.speaker.THIRD_PARTY_DESCRIPTOR`` — long before
       any :func:`extraction_trace`/:func:`phase_trace` scope can exist.  A
       raise here would break ``import paramem.server.speaker`` outright;
       this is the decisive reason a raise is not an option, independent of

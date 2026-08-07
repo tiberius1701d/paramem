@@ -8759,7 +8759,9 @@ class DebugRecallRequest(BaseModel):
 
     text: str
     adapter: str  # adapter name in model.peft_config, or "none" to disable all
-    system_prompt: str | None = None  # None → paramem.training.dataset.SYSTEM_PROMPT
+    system_prompt: str | None = (
+        None  # None → paramem.training.dataset.trained_recall_system_prompt()
+    )
     max_new_tokens: int = 256
     temperature: float = 0.0
 
@@ -8833,9 +8835,13 @@ async def debug_recall(request: DebugRecallRequest):
     from paramem.memory.entry import parse_recalled_entry
     from paramem.models.loader import adapt_messages, grad_checkpointing_disabled, switch_adapter
     from paramem.server.gpu_lock import gpu_lock
-    from paramem.training.dataset import SYSTEM_PROMPT
+    from paramem.training.dataset import trained_recall_system_prompt
 
-    system_prompt = request.system_prompt if request.system_prompt is not None else SYSTEM_PROMPT
+    system_prompt = (
+        request.system_prompt
+        if request.system_prompt is not None
+        else trained_recall_system_prompt()
+    )
     messages = adapt_messages(
         [
             {"role": "system", "content": system_prompt},

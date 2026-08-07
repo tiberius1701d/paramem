@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.memory.entry import (
-    RECALL_TEMPLATE,
     SIMHASH_BITS,
     _build_response,
     assign_keys,
@@ -24,6 +23,7 @@ from paramem.memory.entry import (
     simhash_confidence,
     verify_confidence,
 )
+from paramem.training.dataset import trained_recall_template
 
 # --- assign_keys ---
 
@@ -529,16 +529,16 @@ class TestBuildRegistry:
         assert build_registry([]) == {}
 
 
-# --- RECALL_TEMPLATE ---
+# --- trained_recall_template ---
 
 
 class TestQuadRecallTemplate:
     def test_template_format(self):
-        result = RECALL_TEMPLATE.format(key="graph5")
+        result = trained_recall_template().format(key="graph5")
         assert result == "Recall the fact stored under key 'graph5'."
 
     def test_template_with_arbitrary_key(self):
-        result = RECALL_TEMPLATE.format(key="custom_key")
+        result = trained_recall_template().format(key="custom_key")
         assert "custom_key" in result
 
 

@@ -268,8 +268,9 @@ Platform-specific notes for Blackwell GPUs and WSL2 live under [Platform notes](
 
 ## Prompt Engineering
 
-Extraction pipeline behaviour is governed by the prompt files under
-`configs/prompts/`. The governing principles — few-shot examples as the
+Extraction, serving, and classification behaviour are all governed by the
+prompt files under `configs/prompts/` — every string a model sees resolves
+from a file there. The governing principles — few-shot examples as the
 primary schema carrier, minimal declarative prose, section-split multi-task
 prompts, and load-bearing contracts at the top — were all learned empirically
 and contradict natural intuitions about how to write LLM prompts. The

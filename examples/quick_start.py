@@ -98,7 +98,7 @@ import sys
 import time
 from pathlib import Path
 
-from paramem.memory.entry import RECALL_TEMPLATE
+from paramem.training.dataset import trained_recall_template
 
 # ---------------------------------------------------------------------------
 # Minimal .env loader — read PARAMEM_API_TOKEN before imports hit the network
@@ -540,13 +540,14 @@ def _recall_key(
     token: str | None,
     key: str,
     adapter: str,
+    template: str,
     post_json: object,
     ServerHTTPError: type,
     ServerUnreachable: type,
 ) -> dict | None:
     """Recall a single key via POST /debug/recall.
 
-    Sends the canonical RECALL_TEMPLATE prompt at temperature 0 and returns
+    Sends the canonical trained-recall template prompt at temperature 0 and returns
     ``resp["parsed_entry"]`` (a dict or None).  Exits non-zero on error:
     exit 3 on 403, exit 1 on other HTTP errors or unreachable.
 
@@ -560,6 +561,11 @@ def _recall_key(
         Registry key to recall (e.g. ``"graph1"``).
     adapter:
         Adapter name to activate during recall (typically the entry tier).
+    template:
+        The trained-recall template string (``trained_recall_template()``),
+        loaded once by the caller and passed in — this function is called
+        once per key, so a per-call load would re-read the prompt file once
+        per key instead of once per recall check.
     post_json:
         Bound reference to the post_json helper.
     ServerHTTPError:
@@ -568,7 +574,7 @@ def _recall_key(
         Bound reference to the ServerUnreachable exception class.
     """
     body = {
-        "text": RECALL_TEMPLATE.format(key=key),
+        "text": template.format(key=key),
         "adapter": adapter,
         "temperature": 0.0,
         "max_new_tokens": 128,
@@ -620,7 +626,7 @@ def _keyed_recall_check(
     """Verify every registry entry via deterministic keyed recall.
 
     For each entry fetched from ``/debug/dump``, calls ``POST /debug/recall``
-    with the canonical RECALL_TEMPLATE at temperature 0.  A key PASSES when
+    with the canonical trained-recall template at temperature 0.  A key PASSES when
     ``parsed_entry`` is not None and its ``object`` field exactly matches the
     registry entry's ``object`` (both normalized via ``_norm``).
 
@@ -652,11 +658,16 @@ def _keyed_recall_check(
     """
     passes = 0
     total = len(entries)
+    # Loaded once for the whole check rather than once per key — _recall_key
+    # is called once per entry below.
+    template = trained_recall_template()
     for entry in entries:
         key = entry.get("key", "")
         tier = entry.get("tier", "")
         expected_obj = entry.get("object", "")
-        parsed = _recall_key(base, token, key, tier, post_json, ServerHTTPError, ServerUnreachable)
+        parsed = _recall_key(
+            base, token, key, tier, template, post_json, ServerHTTPError, ServerUnreachable
+        )
         if parsed is not None and _norm(parsed.get("object")) == _norm(expected_obj):
             mark = "PASS"
             passes += 1

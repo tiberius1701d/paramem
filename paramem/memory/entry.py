@@ -9,7 +9,9 @@ Key properties:
   training time.
 * **JSON envelope is** ``{"key", "subject", "predicate", "object"}`` —
   round-trip-clean, deterministic reconstruction.
-* **Recall template is** ``"Recall the fact stored under key '{key}'."``
+* **Recall template** lives in ``configs/prompts/trained_recall.txt``
+  § RECALL, accessed via
+  :func:`~paramem.training.dataset.trained_recall_template`.
 * **No natural-language recall path** — by design. The keyed prompt is the
   only guaranteed interface; natural-language questions are not trained.
 
@@ -24,7 +26,11 @@ import json
 import logging
 from itertools import groupby
 
-from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
+from paramem.training.dataset import (
+    _tokenize_with_prompt_masking,
+    trained_recall_system_prompt,
+    trained_recall_template,
+)
 from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
@@ -116,9 +122,6 @@ def _clean_generation_artifacts(text: str) -> str:
     return "".join(out)
 
 
-RECALL_TEMPLATE = "Recall the fact stored under key '{key}'."
-
-
 # --- Key assignment ---
 
 
@@ -200,13 +203,16 @@ def format_entry_training(
     """
     from paramem.models.loader import adapt_messages
 
+    system = trained_recall_system_prompt()
+    template = trained_recall_template()
+
     examples = []
     for entry in entries:
-        recall_prompt = RECALL_TEMPLATE.format(key=entry["key"])
+        recall_prompt = template.format(key=entry["key"])
         recall_response = _build_response(entry)
         messages = adapt_messages(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": recall_prompt},
                 {"role": "assistant", "content": recall_response},
             ],

@@ -1063,10 +1063,11 @@ def anonymize_turn(
             return _failed
 
         try:
-            anon_prompt = _load_prompt("anonymization.txt", prompts_dir=prompts_dir, required=True)
-            anon_system = _load_prompt("anonymization_system.txt", required=True)
+            anon_prompt = _load_prompt("anonymization.txt", prompts_dir=prompts_dir)
+            anon_system = _load_prompt("anonymization_system.txt")
             anon_anchor_prompt = _load_prompt(
-                "anonymization_speaker_anchor.txt", prompts_dir=prompts_dir, required=True
+                "anonymization_speaker_anchor.txt",
+                prompts_dir=prompts_dir,
             )
             # The anonymizer's speaker-anchor slot may only carry a value
             # that satisfies is_speaker_id — every other case (no speaker,

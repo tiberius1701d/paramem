@@ -22,6 +22,7 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 from paramem.models.loader import generate_adapter_off
+from paramem.server.prompts import recall_selection_prompt
 from paramem.server.temporal import DateWindow, weekday_name
 
 if TYPE_CHECKING:
@@ -162,21 +163,21 @@ def select_date_groups(
 ) -> DateSelection:
     """Ask the local model which recorded date groups *text* needs.
 
-    Builds the selection prompt from the recall-selection section of
-    ``configs/prompts/pa_voice.txt`` (``config.voice.load_recall_selection_prompt()``,
-    system role) plus a rendered ``Today is {weekday}, {ISO date}.`` line,
-    the date inventory (:func:`_render_inventory`), and *text* (user
-    role), then runs one adapter-off, temperature-0 generate
-    (:func:`generate_adapter_off`, reached through the module-level
-    :data:`_generate` seam so tests can stub it without a model). The
-    response is parsed by :func:`_parse_response`.
+    Builds the selection prompt from
+    :func:`~paramem.server.prompts.recall_selection_prompt`
+    (``configs/prompts/recall_selection.txt``, system role) plus a
+    rendered ``Today is {weekday}, {ISO date}.`` line, the date inventory
+    (:func:`_render_inventory`), and *text* (user role), then runs one
+    adapter-off, temperature-0 generate (:func:`generate_adapter_off`,
+    reached through the module-level :data:`_generate` seam so tests can
+    stub it without a model). The response is parsed by
+    :func:`_parse_response`.
 
     Fails open to ``DateSelection(all=True, ..., fail_open=True)`` —
     today's unfiltered full probe — on ANY failure: the recall-selection
-    section absent (file missing or marker missing), generate raising, no
-    parseable JSON, a non-ISO date, ``start > end``, or a wrong type
-    anywhere in the shape. Exactly one WARNING is logged on that path.
-    This function never raises.
+    file missing, generate raising, no parseable JSON, a non-ISO date,
+    ``start > end``, or a wrong type anywhere in the shape. Exactly one
+    WARNING is logged on that path. This function never raises.
 
     Args:
         text: The user's current turn.
@@ -189,9 +190,12 @@ def select_date_groups(
         model: The loaded local model (keyword-only).
         tokenizer: The model's tokenizer (keyword-only).
         config: The server config — supplies
-            ``config.inference.temporal_selection_max_new_tokens`` and
-            ``config.voice`` (:class:`~paramem.server.config.VoiceConfig`,
-            for the recall-selection prompt section) (keyword-only).
+            ``config.inference.temporal_selection_max_new_tokens``
+            (keyword-only). The recall-selection prompt itself resolves
+            through :func:`~paramem.server.prompts.recall_selection_prompt`
+            independent of *config* (serving prompts do not thread
+            ``prompts_dir``; operators tune them by editing the file
+            under ``configs/prompts/`` in the checkout).
         today: The calendar date to render as "Today" and resolve
             relative phrasing against — the caller's single ``date.today()``
             read, passed in so tests can pin it and so the selection prompt
@@ -202,11 +206,7 @@ def select_date_groups(
         fail-open ``all=True`` shape (``fail_open=True``) on any error.
     """
     try:
-        template = config.voice.load_recall_selection_prompt()
-        if template is None:
-            raise ValueError(
-                "recall-selection prompt section missing from configs/prompts/pa_voice.txt"
-            )
+        template = recall_selection_prompt()
         today_line = f"Today is {weekday_name(today)}, {today.isoformat()}."
         inventory = _render_inventory(date_by_key)
         messages = [

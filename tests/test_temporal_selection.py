@@ -243,15 +243,16 @@ class TestSelectDateGroupsFailOpen:
         )
 
     def test_missing_recall_selection_section_falls_open(self, config, monkeypatch):
-        """``config.voice.load_recall_selection_prompt()`` returning
-        ``None`` (prompt file absent, or the
-        ``##---RECALL-SELECTION-SECTION---`` marker missing) fails open
-        exactly like a missing prompt file did before the prompt
-        consolidation — the generate seam must not even be reached."""
-        monkeypatch.setattr(config.voice, "load_recall_selection_prompt", lambda: None)
+        """A missing ``configs/prompts/recall_selection.txt`` fails open —
+        the generate seam must not even be reached."""
+
+        def _raise():
+            raise FileNotFoundError("recall_selection.txt")
+
+        monkeypatch.setattr("paramem.server.temporal_selection.recall_selection_prompt", _raise)
 
         def _unreachable(*args, **kwargs):
-            raise AssertionError("generate must not run when the selection section is missing")
+            raise AssertionError("generate must not run when the selection prompt is missing")
 
         monkeypatch.setattr("paramem.server.temporal_selection._generate", _unreachable)
         result = select_date_groups(

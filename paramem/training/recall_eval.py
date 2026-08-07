@@ -203,11 +203,8 @@ def probe_entries(
     """
     import torch
 
-    from paramem.memory.entry import (
-        RECALL_TEMPLATE,
-        finalize_recalled,
-    )
-    from paramem.training.dataset import format_inference_prompt
+    from paramem.memory.entry import finalize_recalled
+    from paramem.training.dataset import build_inference_prompts, trained_recall_template
 
     device = next(model.parameters()).device
     stop_ids = derive_stop_ids(tokenizer)
@@ -215,13 +212,25 @@ def probe_entries(
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     try:
+        # Every entry's prompt is rendered up front, in one call, so the
+        # trained-recall system prompt is loaded exactly once for this whole
+        # probe regardless of how many chunks ``batch_size`` splits *entries*
+        # into (a per-chunk or per-entry load would re-read the same file N
+        # times and emit N redundant ``record_prompt`` provenance entries).
+        # Inside the try so a raising load (missing/renamed section, or a
+        # prompt_overrides substitution lacking the section) still restores
+        # ``padding_side`` via the finally below — a shared tokenizer left
+        # permanently left-padded would corrupt every later user, including
+        # the training collator.
+        template = trained_recall_template()
+        all_prompts = build_inference_prompts(
+            [template.format(key=e["key"]) for e in entries], tokenizer
+        )
         for start in range(0, len(entries), batch_size):
             chunk = entries[start : start + batch_size]
-            prompts = [
-                format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer)
-                for e in chunk
-            ]
+            prompts = all_prompts[start : start + batch_size]
             inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
             with torch.no_grad():
                 outputs = model.generate(

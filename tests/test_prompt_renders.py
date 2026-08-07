@@ -168,7 +168,7 @@ class TestSecondOrderExtractionPromptRender:
     """
 
     def _load(self):
-        return _load_prompt("extraction_second_order.txt", required=True)
+        return _load_prompt("extraction_second_order.txt")
 
     def _render(self):
         tmpl = self._load()
@@ -268,7 +268,7 @@ class TestAnonymizationPromptRender:
     the config-driven ``sanitization.scrub`` scope authority."""
 
     def _render(self):
-        tmpl = _load_prompt("anonymization.txt", required=True)
+        tmpl = _load_prompt("anonymization.txt")
         return tmpl.format(
             scrub_categories="person name, email address, phone number",
             facts_json="[]",
@@ -304,7 +304,7 @@ class TestPredicateNormalizationPromptRender:
     def _load(self):
         from paramem.graph.prompts import _load_prompt
 
-        return _load_prompt("predicate_normalization.txt", "", None)
+        return _load_prompt("predicate_normalization.txt")
 
     def test_renders_without_exception(self):
         import json

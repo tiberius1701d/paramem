@@ -14,7 +14,7 @@ Routing decisions follow a tiered model:
      exemplar bank, gated by top-1/top-2 margin.  ~1 ms.  Brittle on
      paraphrase / named entities outside the bank.
    * ``"llm"`` — single-token generation from the loaded local model
-     using the intent-classifier section of ``voice.prompt_file``.
+     using ``configs/prompts/intent_classifier.txt``.
      ~50–200 ms.  No exemplar curation needed; handles paraphrase and
      named entities directly.  Automatically falls back to the encoder
      path when no classifier model is registered (cloud-only mode,
@@ -47,6 +47,7 @@ from pathlib import Path
 
 from paramem.models.loader import generate_adapter_off
 from paramem.server.config import IntentConfig
+from paramem.server.prompts import intent_classifier_prompt
 from paramem.server.router import Intent
 
 logger = logging.getLogger(__name__)
@@ -406,17 +407,6 @@ def _parse_intent_label(text: str) -> Intent | None:
     return best_label
 
 
-def _build_voice_config(config: IntentConfig):
-    """Lazy import of VoiceConfig to read the classifier-prompt section.
-
-    The dependency on ``server.config`` is module-level circular; lazy
-    import keeps the load order clean.
-    """
-    from paramem.server.config import VoiceConfig
-
-    return VoiceConfig()
-
-
 def _classify_via_llm(
     text: str,
     handle: _ClassifierModelHandle,
@@ -424,26 +414,23 @@ def _classify_via_llm(
 ) -> Intent:
     """Classify *text* by generating one short label from the local LLM.
 
-    Uses the intent-classifier section of ``configs/prompts/pa_voice.txt``
-    (loaded via :meth:`VoiceConfig.load_intent_classifier_prompt`) as the
-    system prompt.  Generation is deterministic (``temperature=0``,
-    ``do_sample=False``, via :func:`generate_adapter_off`) and bounded to
+    Uses :func:`~paramem.server.prompts.intent_classifier_prompt`
+    (``configs/prompts/intent_classifier.txt``) as the system prompt.
+    Generation is deterministic (``temperature=0``, ``do_sample=False``,
+    via :func:`generate_adapter_off`) and bounded to
     :attr:`IntentConfig.llm_max_new_tokens` tokens — enough for one
     label plus possible whitespace.
 
     Failure modes (prompt missing, generation error, unparseable
-    output) all return ``Intent.UNKNOWN``; the function never raises.
+    output) all return ``Intent.UNKNOWN``; the function never raises. A
+    missing prompt file is caught by the same ``except Exception`` as a
+    generation failure — it fails closed to ``Intent.UNKNOWN`` at request
+    time (``ensure_prompt_assets`` already catches a missing file loudly
+    at server startup, so this path only covers a file deleted under a
+    running server).
     """
-    voice = _build_voice_config(config)
-    classifier_prompt = voice.load_intent_classifier_prompt()
-    if classifier_prompt is None:
-        logger.warning(
-            "LLM intent classification requested but classifier prompt section "
-            "is missing from voice.prompt_file; falling back"
-        )
-        return Intent.UNKNOWN
-
     try:
+        classifier_prompt = intent_classifier_prompt()
         tokenizer = handle.tokenizer
         model = handle.model
 

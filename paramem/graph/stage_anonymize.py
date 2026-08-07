@@ -118,13 +118,16 @@ def _stage_anonymize(ctx: StageContext, state: StageState) -> StageState:
         # prompt variants on the anonymizer in isolation.
         with phase_trace("anonymize") as t:
             anon_prompt = _load_prompt(
-                "anonymization.txt", prompts_dir=ctx.prompts_dir, required=True
+                "anonymization.txt",
+                prompts_dir=ctx.prompts_dir,
             )
             anon_system = _load_prompt(
-                "anonymization_system.txt", prompts_dir=ctx.prompts_dir, required=True
+                "anonymization_system.txt",
+                prompts_dir=ctx.prompts_dir,
             )
             anon_anchor_prompt = _load_prompt(
-                "anonymization_speaker_anchor.txt", prompts_dir=ctx.prompts_dir, required=True
+                "anonymization_speaker_anchor.txt",
+                prompts_dir=ctx.prompts_dir,
             )
             payload = anonymize(
                 facts_from_relations(graph.relations),

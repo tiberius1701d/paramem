@@ -89,11 +89,11 @@ def check_predicate_coexistence(
         model: LLM to use for the cardinality judgment.
         tokenizer: Tokenizer paired with *model*.
         prompt: Prompt template with a ``{predicate}`` slot.  Load from
-            ``merger_coexistence.txt`` via ``_load_prompt(..., required=True)``
+            ``merger_coexistence.txt`` via ``_load_prompt(...)``
             and pass here — no inline fallback constant exists.
         system_prompt: System-role content for the classification call.  Load
             from ``merger_coexistence_system.txt`` via
-            ``_load_prompt(..., required=True)`` and pass here.
+            ``_load_prompt(...)`` and pass here.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -305,10 +305,12 @@ class GraphMerger:
         # Resolve prompts once at construction so a file edit takes effect next cycle.
         _pd = Path(prompts_dir) if prompts_dir else None
         self._coexistence_prompt = _load_prompt(
-            "merger_coexistence.txt", prompts_dir=_pd, required=True
+            "merger_coexistence.txt",
+            prompts_dir=_pd,
         )
         self._coexistence_system = _load_prompt(
-            "merger_coexistence_system.txt", prompts_dir=_pd, required=True
+            "merger_coexistence_system.txt",
+            prompts_dir=_pd,
         )
 
     def merge(

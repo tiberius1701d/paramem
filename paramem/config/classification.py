@@ -169,7 +169,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "inference.preload_cache": Tier.OPERATIONAL,
     "inference.max_response_tokens": Tier.OPERATIONAL,
     # --- voice ---
-    "voice.prompt_file": Tier.OPERATIONAL,
     "voice.greeting_interval_hours": Tier.OPERATIONAL,
     # --- speaker ---
     "speaker.enabled": Tier.OPERATIONAL,

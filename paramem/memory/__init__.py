@@ -13,7 +13,6 @@ submodule — that would create an import-time cycle through this file.
 
 from paramem.memory.entry import (
     DEFAULT_CONFIDENCE_THRESHOLD,
-    RECALL_TEMPLATE,
     SIMHASH_BITS,
     assign_keys,
     build_registry,
@@ -56,7 +55,6 @@ from paramem.memory.store import MemoryStore
 __all__ = [
     "DEFAULT_CONFIDENCE_THRESHOLD",
     "INTERIM_NAME_PREFIX",
-    "RECALL_TEMPLATE",
     "SIMHASH_BITS",
     "DiskMemorySource",
     "MemorySource",

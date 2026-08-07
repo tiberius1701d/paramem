@@ -707,7 +707,7 @@ class TestChainProductionParity:
         seen: dict = {}
 
         def _capture(*_args, **_kwargs):
-            seen["loaded"] = _load_prompt("extraction.txt", required=True)
+            seen["loaded"] = _load_prompt("extraction.txt")
 
         state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect(
             "local_extract", _capture
@@ -1360,7 +1360,7 @@ class TestCalibrateName:
 
         by_path = {p["path"]: p for p in result["prompts"]}
         variant = (variants / "my_name_extraction.txt").read_text()
-        shipped_sys = _load_prompt("name_extraction_system.txt", required=True)
+        shipped_sys = _load_prompt("name_extraction_system.txt")
         assert (
             by_path["<override:name_extraction.txt>"]["sha"]
             == (hashlib.sha256(variant.encode("utf-8")).hexdigest()[:12])
@@ -1562,7 +1562,7 @@ class TestExtractNameViaLlmUserTurnFilter:
         assert "too many words" in raw_output
 
     def test_required_raises_file_not_found(self, tmp_path):
-        """_load_prompt(required=True) raises FileNotFoundError when file is absent everywhere.
+        """_load_prompt raises FileNotFoundError when file is absent everywhere.
 
         We test this via the prompts module directly (with a nonexistent filename) rather than
         via extract_name_via_llm, because the production prompt files exist in _DEFAULT_PROMPT_DIR
@@ -1571,6 +1571,6 @@ class TestExtractNameViaLlmUserTurnFilter:
         from paramem.graph.prompts import _load_prompt
 
         with pytest.raises(FileNotFoundError) as exc_info:
-            _load_prompt("no_such_prompt_xyz.txt", prompts_dir=tmp_path, required=True)
+            _load_prompt("no_such_prompt_xyz.txt", prompts_dir=tmp_path)
         assert "no_such_prompt_xyz.txt" in str(exc_info.value)
         assert "Searched" in str(exc_info.value)

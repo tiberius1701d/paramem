@@ -84,7 +84,7 @@ class TestOperationalSamples:
             "tts.voices.en.engine",
             "headless_boot",
             "sanitization.cloud_mode",
-            "voice.prompt_file",
+            "voice.greeting_interval_hours",
         ]
         for path in operational_paths:
             assert classify(path) == Tier.OPERATIONAL, (

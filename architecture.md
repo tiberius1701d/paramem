@@ -270,8 +270,8 @@ two-tier classifier:
 2. **Content-driven residual.** When the HA fast path misses, the
    residual classifier runs, selected by `intent.mode`:
    - `"llm"` (production default) — a single-token generation from
-     the loaded local Mistral 7B using the intent-classifier section
-     of `configs/prompts/pa_voice.txt`. The prompt is name-free: the
+     the loaded local Mistral 7B using
+     `configs/prompts/intent_classifier.txt`. The prompt is name-free: the
      identity-injection helpers (`_build_speaker_prefix`,
      `_build_system_prompt`) used by the local reasoning leg are not
      invoked for classification, so no speaker identity reaches the

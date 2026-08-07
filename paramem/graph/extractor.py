@@ -366,9 +366,9 @@ def build_speaker_context(
     """
     if not speaker_id:
         return ""
-    from paramem.graph.prompts import _load_speaker_directive_section
+    from paramem.graph.prompts import _load_prompt_section
 
-    template = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
+    template = _load_prompt_section("speaker_directive.txt", "EXTRACTION-DIRECTIVE")
     # When no display name is known, use the id itself as comprehension
     # context so the placeholder reference is consistent throughout.
     effective_name = speaker_name or speaker_id
@@ -382,7 +382,7 @@ def load_extraction_prompts(
     user_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     model: str | None = None,
 ) -> tuple[str, str]:
-    """Load extraction prompts from a directory, with hardcoded fallbacks.
+    """Load extraction prompts from a directory.
 
     The prompts this function loads are external config — edit the files
     under ``configs/prompts/`` to tune extraction behaviour; no code
@@ -390,8 +390,7 @@ def load_extraction_prompts(
 
     Args:
         prompts_dir: Directory containing the prompt files.  Falls back to
-                     ``configs/prompts/`` in the project root, then to
-                     hardcoded defaults.
+                     ``configs/prompts/`` in the project root.
         system_filename: Filename of the system prompt.  Defaults to
                          :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
                          (``"extraction_system.txt"``).  Used for every
@@ -413,8 +412,8 @@ def load_extraction_prompts(
         ``(system_prompt, extraction_prompt)`` tuple.
     """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt(system_filename, prompts_dir=pd, model=model, required=True)
-    prompt = _load_prompt(user_filename, prompts_dir=pd, model=model, required=True)
+    system = _load_prompt(system_filename, prompts_dir=pd, model=model)
+    prompt = _load_prompt(user_filename, prompts_dir=pd, model=model)
     return system, prompt
 
 
@@ -1321,7 +1320,7 @@ def _filter_anthropic(
     serves a direct caller (e.g. a test) that omits it.
     """
     if system_prompt is None:
-        system_prompt = _load_prompt("cloud_enrichment_system.txt", required=True)
+        system_prompt = _load_prompt("cloud_enrichment_system.txt")
     try:
         import anthropic
     except ImportError:
@@ -1372,7 +1371,7 @@ def _filter_openai_compat(
     for why.
     """
     if system_prompt is None:
-        system_prompt = _load_prompt("cloud_enrichment_system.txt", required=True)
+        system_prompt = _load_prompt("cloud_enrichment_system.txt")
     try:
         import httpx
     except ImportError:
@@ -1552,8 +1551,8 @@ def request_enrichment(
     always threads ``ctx.speaker_id``, itself a required, non-empty field
     (:class:`~paramem.graph.flow.StageContext`).
     """
-    enrichment_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
-    system_prompt = _load_prompt("cloud_enrichment_system.txt", required=True)
+    enrichment_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir)
+    system_prompt = _load_prompt("cloud_enrichment_system.txt")
     facts_json, transcript_text = _cloud_facing_payload(anon_facts, anon_transcript)
     prompt = enrichment_prompt.format(
         facts_json=facts_json, transcript=transcript_text, speaker_id=speaker_id
@@ -1785,8 +1784,8 @@ def request_graph_enrichment(
     """
     anon_triples = insert_placeholders(payload.facts, payload.forward)
 
-    enrichment_prompt = _load_prompt("cloud_graph_enrichment.txt", required=True)
-    system_prompt = _load_prompt("cloud_graph_enrichment_system.txt", required=True)
+    enrichment_prompt = _load_prompt("cloud_graph_enrichment.txt")
+    system_prompt = _load_prompt("cloud_graph_enrichment_system.txt")
     # No try/except: a KeyError here means the prompt template has an
     # un-doubled literal brace (a template bug, not a runtime condition).
     # Swallowing it turned a missed brace-doubling into a permanent,
@@ -2438,8 +2437,8 @@ def request_plausibility(
     :func:`_load_prompt`) so a calibration override actually reaches the
     judge; it defaults to the production template.
     """
-    plaus_prompt = _load_prompt("cloud_plausibility.txt", prompts_dir=prompts_dir, required=True)
-    system_prompt = _load_prompt("cloud_plausibility_system.txt", required=True)
+    plaus_prompt = _load_prompt("cloud_plausibility.txt", prompts_dir=prompts_dir)
+    system_prompt = _load_prompt("cloud_plausibility_system.txt")
     facts_json, transcript_text = _cloud_facing_payload(enriched_anon_facts, anon_transcript)
     prompt = plaus_prompt.format(facts_json=facts_json, transcript=transcript_text)
     raw = _cloud_call(
@@ -2493,8 +2492,8 @@ def judge_plausibility(
     production template.
     """
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
-    plaus_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
-    system_prompt = _load_prompt("cloud_plausibility_system.txt", required=True)
+    plaus_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir)
+    system_prompt = _load_prompt("cloud_plausibility_system.txt")
     prompt = plaus_prompt.format(
         facts_json=_render_indexed_facts(facts),
         transcript=transcript or "(not available)",
@@ -2642,9 +2641,10 @@ def normalize_predicates(
     # production pass and a calibration run alike.  The enclosing
     # ``extraction_trace`` scope belongs to the pass that calls this.
     with phase_trace("normalize") as t:
-        normalization_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
+        normalization_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir)
         normalization_system_prompt = _load_prompt(
-            system_filename, prompts_dir=prompts_dir, required=True
+            system_filename,
+            prompts_dir=prompts_dir,
         )
 
         # --- Build canonical grouping -------------------------------------------

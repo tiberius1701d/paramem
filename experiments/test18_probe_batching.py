@@ -10,8 +10,8 @@ How much of the per-cycle recall-probe wall-clock can be cut by:
       padding, single ``model.generate(...)`` per batch.  Padding +
       max-length-dominates-batch-wallclock are the costs; KV-cache
       duplication grows linearly with ``B``.
-  (c) **Prefix-cache reuse + batched generate** — ``RECALL_TEMPLATE``
-      shares a long static prefix across all 137 keys (the only varying
+  (c) **Prefix-cache reuse + batched generate** — the trained-recall
+      template shares a long static prefix across all 137 keys (the only varying
       tail is ``key='graphN'.``).  Prefill the prefix once, expand the
       resulting ``past_key_values`` to batch width ``B``, and decode only
       the suffix.  Eliminates ``(N-1)/N`` of prefill compute, on top of
@@ -80,7 +80,6 @@ from experiments.utils.test_harness import (  # noqa: E402
 )
 from paramem.memory.entry import (  # noqa: E402
     DEFAULT_CONFIDENCE_THRESHOLD,
-    RECALL_TEMPLATE,
     build_registry,
     finalize_recalled,
     format_entry_training,
@@ -91,7 +90,7 @@ from paramem.models.loader import (  # noqa: E402
     save_adapter,
     switch_adapter,
 )
-from paramem.training.dataset import format_inference_prompt  # noqa: E402
+from paramem.training.dataset import build_inference_prompts, trained_recall_template  # noqa: E402
 from paramem.training.recall_eval import (  # noqa: E402
     derive_stop_ids,
     evaluate_indexed_recall,
@@ -168,7 +167,7 @@ def _synthetic_entries(n: int) -> list[dict]:
 
 
 def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
-    """Prefill ``RECALL_TEMPLATE``'s static prefix once; decode only the
+    """Prefill the trained-recall template's static prefix once; decode only the
     per-key suffix.
 
     The shared prefix is everything before the variable ``key=`` slot.  We
@@ -205,9 +204,10 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
     # the whole probe set, not per-chunk.  With per-chunk prefix detection
     # the cache would be invalidated each iteration; with global detection
     # we pay one prefill across the entire 137-key sweep.
-    all_prompts = [
-        format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer) for e in entries
-    ]
+    template = trained_recall_template()
+    all_prompts = build_inference_prompts(
+        [template.format(key=e["key"]) for e in entries], tokenizer
+    )
     all_row_ids = [tokenizer.encode(p, add_special_tokens=False) for p in all_prompts]
     global_prefix_len = _longest_common_prefix_len(all_row_ids)
 

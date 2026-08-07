@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from paramem.graph.prompts import prompt_overrides
 from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import MODEL_REGISTRY, ServerConfig, load_server_config
 from paramem.server.escalation import detect_escalation
@@ -501,21 +502,6 @@ class TestKeyMetadata:
         assert "graph1" in loaded["promoted_keys"]
         assert loaded["keys"]["graph3"]["reinforcement_count"] == 1
 
-    def test_voice_prompt_from_file(self, tmp_path):
-        from paramem.server.config import VoiceConfig
-
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are a test assistant.")
-
-        vc = VoiceConfig(prompt_file=str(prompt_file))
-        assert vc.load_prompt() == "You are a test assistant."
-
-    def test_voice_prompt_fallback(self):
-        from paramem.server.config import VoiceConfig
-
-        vc = VoiceConfig(prompt_file="nonexistent.txt", system_prompt="Fallback prompt")
-        assert vc.load_prompt() == "Fallback prompt"
-
 
 class TestProbeAndReasonDispatch:
     """Test that _probe_and_reason dispatches to probe_keys_grouped_by_adapter."""
@@ -536,12 +522,10 @@ class TestProbeAndReasonDispatch:
         model.peft_config = {name: MagicMock() for name in adapter_names}
         return model
 
-    def test_dispatches_to_grouped_probe_with_correct_groups(self, monkeypatch, tmp_path):
+    def test_dispatches_to_grouped_probe_with_correct_groups(self, monkeypatch):
         """_probe_and_reason builds keys_by_adapter in step order and passes
         them through to MemoryStore.probe → WeightMemorySource.probe in train
         mode → probe_keys_grouped_by_adapter."""
-        from paramem.server.config import ServerConfig, VoiceConfig
-
         captured = {}
 
         def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
@@ -585,11 +569,7 @@ class TestProbeAndReasonDispatch:
 
         model = self._make_model(["episodic", "procedural"])
 
-        # Write a minimal voice prompt file.
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are an assistant.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         plan = self._make_plan(
             [
@@ -600,15 +580,16 @@ class TestProbeAndReasonDispatch:
 
         from paramem.server.inference import _probe_and_reason
 
-        _probe_and_reason(
-            text="What do I like?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=_MS(replay_enabled=False),
-        )
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            _probe_and_reason(
+                text="What do I like?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=_MS(replay_enabled=False),
+            )
 
         assert "keys_by_adapter" in captured, "probe_keys_grouped_by_adapter was not called"
         kba = captured["keys_by_adapter"]
@@ -619,15 +600,13 @@ class TestProbeAndReasonDispatch:
         assert kba["procedural"] == ["p1", "p2"]
         assert kba["episodic"] == ["e1"]
 
-    def test_per_turn_probe_requests_cached_registry(self, monkeypatch, tmp_path):
+    def test_per_turn_probe_requests_cached_registry(self, monkeypatch):
         """_probe_and_reason's on-miss source build must opt into the
         process-wide simhash-registry cache (``cached_registry=True``) —
         the per-turn probe is the one caller allowed to skip the disk
         re-walk; hydration callers (``app._build_store_contents``,
         ``ConsolidationLoop._hydrate_store_for_fold``) stay on the
         disk-truth default and are not this call site."""
-        from paramem.server.config import ServerConfig, VoiceConfig
-
         captured = {}
 
         class _FakeSource:
@@ -668,28 +647,26 @@ class TestProbeAndReasonDispatch:
 
         model = self._make_model(["episodic"])
 
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are an assistant.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         plan = self._make_plan([("episodic", ["e1"])])
 
         from paramem.server.inference import _probe_and_reason
 
-        _probe_and_reason(
-            text="What do I like?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=_MS(replay_enabled=False),
-        )
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            _probe_and_reason(
+                text="What do I like?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=_MS(replay_enabled=False),
+            )
 
         assert captured.get("cached_registry") is True
 
-    def test_interim_episodic_facts_reach_prompt(self, monkeypatch, tmp_path):
+    def test_interim_episodic_facts_reach_prompt(self, monkeypatch):
         """Regression: facts probed under ``episodic_interim_<stamp>`` must
         appear in the augmented_text under the ``[Recent knowledge]`` layer.
 
@@ -700,8 +677,6 @@ class TestProbeAndReasonDispatch:
         reached Mistral's prompt despite ``Total recalled: N facts`` showing
         them as successfully probed.
         """
-        from paramem.server.config import ServerConfig, VoiceConfig
-
         captured = {}
 
         def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
@@ -752,10 +727,7 @@ class TestProbeAndReasonDispatch:
 
         model = self._make_model(["episodic", "procedural", "episodic_interim_20260516T1200"])
 
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are an assistant.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         plan = self._make_plan(
             [
@@ -766,15 +738,16 @@ class TestProbeAndReasonDispatch:
 
         from paramem.server.inference import _probe_and_reason
 
-        _probe_and_reason(
-            text="What is my phone number?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=_MS(replay_enabled=False),
-        )
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            _probe_and_reason(
+                text="What is my phone number?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=_MS(replay_enabled=False),
+            )
 
         assert "augmented_text" in captured, "_build_messages was not called"
         text = captured["augmented_text"]
@@ -839,12 +812,10 @@ class TestProbeAndReasonDispatch:
             lambda model, tokenizer, prompt, **kwargs: "final answer",
         )
 
-    def test_local_reasoning_prompt_carries_speaker_token_not_name(self, monkeypatch, tmp_path):
+    def test_local_reasoning_prompt_carries_speaker_token_not_name(self, monkeypatch):
         """The system prompt reaching _build_messages for a named speaker
         contains the raw speaker{N} token and ZERO occurrences of the display
         name — identity stays in token space on the LOCAL reasoning leg."""
-        from paramem.server.config import ServerConfig, VoiceConfig
-
         self._stub_common(monkeypatch, fact_prefix="speaker0")
 
         captured = {}
@@ -860,26 +831,24 @@ class TestProbeAndReasonDispatch:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self._make_model(["episodic"])
 
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are an assistant.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         plan = self._make_plan([("episodic", ["e1"])])
 
         from paramem.server.inference import _probe_and_reason
 
-        _probe_and_reason(
-            text="What do I like?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=_MS(replay_enabled=False),
-            speaker="Alice",
-            speaker_id="speaker0",
-        )
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            _probe_and_reason(
+                text="What do I like?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=_MS(replay_enabled=False),
+                speaker="Alice",
+                speaker_id="speaker0",
+            )
 
         assert "system_prompt" in captured, "_build_messages was not called"
         system_prompt = captured["system_prompt"]
@@ -891,7 +860,7 @@ class TestProbeAndReasonDispatch:
         assert "speaker0" in full_prompt
         assert "Alice" not in full_prompt
 
-    def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch, tmp_path):
+    def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch):
         """Re-spec (B-form prefix from speaker_id presence): the local
         system-prompt identity line is now gated on ``speaker_id`` alone —
         anonymous/undisclosed speakers included.  ``speaker=None`` (the
@@ -899,8 +868,6 @@ class TestProbeAndReasonDispatch:
         only a ``speaker_id`` of ``None`` would.  The raw token is the
         payload — never the display name, which stays absent from the
         prompt regardless."""
-        from paramem.server.config import ServerConfig, VoiceConfig
-
         self._stub_common(monkeypatch, fact_prefix="speaker3")
 
         captured = {}
@@ -915,26 +882,24 @@ class TestProbeAndReasonDispatch:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = self._make_model(["episodic"])
 
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are an assistant.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         plan = self._make_plan([("episodic", ["e1"])])
 
         from paramem.server.inference import _probe_and_reason
 
-        _probe_and_reason(
-            text="What do I like?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            memory_store=_MS(replay_enabled=False),
-            speaker=None,
-            speaker_id="speaker3",
-        )
+        with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+            _probe_and_reason(
+                text="What do I like?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=_MS(replay_enabled=False),
+                speaker=None,
+                speaker_id="speaker3",
+            )
 
         assert "system_prompt" in captured, "_build_messages was not called"
         system_prompt = captured["system_prompt"]
@@ -947,9 +912,7 @@ class TestBaseModelAnswerSystemPrompt:
     (previously two byte-identical inline blocks with zero coverage on this
     leg — a drift between the two would have been invisible to CI)."""
 
-    def test_speaker_token_and_language_reach_system_prompt(self, monkeypatch, tmp_path):
-        from paramem.server.config import ServerConfig, VoiceConfig
-
+    def test_speaker_token_and_language_reach_system_prompt(self, monkeypatch):
         captured = {}
 
         def capture_messages(text, history, system_prompt, tokenizer):
@@ -966,23 +929,21 @@ class TestBaseModelAnswerSystemPrompt:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = MagicMock()
 
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("Base voice prompt.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         from paramem.server.inference import _base_model_answer
 
-        result = _base_model_answer(
-            text="hello",
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            speaker="Alice",
-            speaker_id="speaker0",
-            language="de",
-        )
+        with prompt_overrides({"serving_system.txt": "Base voice prompt."}):
+            result = _base_model_answer(
+                text="hello",
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                speaker="Alice",
+                speaker_id="speaker0",
+                language="de",
+            )
 
         assert "system_prompt" in captured, "_build_messages was not called"
         system_prompt = captured["system_prompt"]
@@ -992,12 +953,10 @@ class TestBaseModelAnswerSystemPrompt:
         assert "Base voice prompt." in system_prompt
         assert result.text == "a plain answer"
 
-    def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch, tmp_path):
+    def test_anonymous_speaker_prefix_from_speaker_id(self, monkeypatch):
         """Re-spec (B-form prefix from speaker_id presence): ``speaker=None``
         no longer suppresses the identity token when ``speaker_id`` is set —
         the prefix is gated on ``speaker_id`` alone, anonymous included."""
-        from paramem.server.config import ServerConfig, VoiceConfig
-
         captured = {}
 
         def capture_messages(text, history, system_prompt, tokenizer):
@@ -1014,22 +973,20 @@ class TestBaseModelAnswerSystemPrompt:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
         model = MagicMock()
 
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("Base voice prompt.")
         config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
 
         from paramem.server.inference import _base_model_answer
 
-        _base_model_answer(
-            text="hello",
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            speaker=None,
-            speaker_id="speaker3",
-        )
+        with prompt_overrides({"serving_system.txt": "Base voice prompt."}):
+            _base_model_answer(
+                text="hello",
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                speaker=None,
+                speaker_id="speaker3",
+            )
 
         system_prompt = captured["system_prompt"]
         assert "You are speaking with speaker3." in system_prompt

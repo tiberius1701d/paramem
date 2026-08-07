@@ -1173,8 +1173,8 @@ def calibrate_anonymize_facts(state: dict, req: CalibrateAnonymizeFactsRequest) 
             | {str(f.get("object", "")) for f in facts if f.get("object")}
         )
         with phase_trace("anonymize") as t, prompt_overrides(resolved["overrides"]):
-            anon_prompt = _load_prompt("anonymization_facts.txt", required=True)
-            anon_system = _load_prompt("anonymization_system.txt", required=True)
+            anon_prompt = _load_prompt("anonymization_facts.txt")
+            anon_system = _load_prompt("anonymization_system.txt")
             payload = anonymize(
                 facts,
                 loop.model,

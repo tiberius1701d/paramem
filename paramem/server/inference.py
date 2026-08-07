@@ -54,6 +54,15 @@ from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
 from paramem.models.loader import adapt_messages, base_model_inference, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
+from paramem.server.prompts import (
+    cloud_serving_system_prompt,
+    empty_period_note,
+    identity_line,
+    language_line,
+    reasoning_turn,
+    recorded_dates_suffix,
+    serving_system_prompt,
+)
 from paramem.server.router import Intent, RoutingPlan, RoutingStep
 from paramem.server.sanitizer import is_self_referential
 from paramem.server.temporal import build_date_by_key, weekday_name
@@ -80,7 +89,7 @@ def _language_instruction(language: str | None, config: ServerConfig | None = No
         from paramem.server.config import ISO_LANGUAGE_NAMES
 
         name = ISO_LANGUAGE_NAMES.get(language, language)
-    return f"Respond in {name}."
+    return language_line(name)
 
 
 def _build_speaker_prefix(
@@ -119,7 +128,7 @@ def _build_speaker_prefix(
     """
     parts: list[str] = []
     if speaker_id:
-        parts.append(f"You are speaking with {speaker_id}.")
+        parts.append(identity_line(speaker_id))
     lang_instr = _language_instruction(language, config)
     if lang_instr:
         parts.append(lang_instr)
@@ -134,10 +143,10 @@ def _build_system_prompt(
     """Assemble the complete system prompt for a LOCAL reasoning generate call.
 
     THE single assembly point for the identity + language prefix on top of
-    ``config.voice.load_prompt()``.  Both :func:`_probe_and_reason` and
-    :func:`_base_model_answer` call this — collapsing what were previously
-    two byte-identical four-line blocks — so the two legs cannot drift from
-    each other.
+    :func:`~paramem.server.prompts.serving_system_prompt`.  Both
+    :func:`_probe_and_reason` and :func:`_base_model_answer` call this —
+    collapsing what were previously two byte-identical four-line blocks —
+    so the two legs cannot drift from each other.
 
     Identity for the LOCAL reasoning prompt is the raw ``speaker{N}`` token,
     not the display name (see :func:`_build_speaker_prefix`).  The prefix is
@@ -153,15 +162,15 @@ def _build_system_prompt(
             at all.
         language: BCP-47 language code, or ``None``/``"en"`` for no
             instruction.
-        config: Server config — supplies the language display name and the
-            base voice prompt (``config.voice.load_prompt()``).
+        config: Server config — supplies the language display name via
+            ``config.tts.language_name``.
 
     Returns:
         The complete system prompt: the identity/language prefix (when any)
-        followed by the base voice prompt.
+        followed by the base serving prompt.
     """
     prefix = _build_speaker_prefix(speaker_id, language, config)
-    base_prompt = config.voice.load_prompt()
+    base_prompt = serving_system_prompt()
     return f"{prefix} {base_prompt}" if prefix else base_prompt
 
 
@@ -502,14 +511,6 @@ def _escalate_to_ha_agent(
     return None
 
 
-CLOUD_PROMPT = (
-    "You are continuing a conversation as a personal assistant. "
-    "Derive your persona, tone, and conversational style from the "
-    "preceding conversation. Answer clearly and concisely in 1-3 spoken "
-    "sentences. Do not use markdown, lists, or structured formatting."
-)
-
-
 def _sanitize_history(history: list[dict] | None) -> list[dict]:
     """Drop-gate conversation history for cloud: self-referential turns are removed.
 
@@ -745,8 +746,9 @@ def _escalate_to_cloud(
     The system prompt carries NO identity line at all — no ``speaker_id``
     token and no display name.  Unlike the local reasoning leg
     (:func:`_build_speaker_prefix`, fed the ``speaker{N}`` token), the cloud
-    system prompt is the bare :data:`CLOUD_PROMPT` plus only the language
-    instruction.  This is scoped to the system prompt only: sanitized
+    system prompt is the bare
+    :func:`~paramem.server.prompts.cloud_serving_system_prompt` plus only
+    the language instruction.  This is scoped to the system prompt only: sanitized
     history (:func:`_sanitize_history`) can still carry a ``speaker{N}``
     token verbatim through ``answer_via_cloud``'s history-substitution path —
     an accepted posture, not a leak — so "cloud never learns who it is
@@ -767,7 +769,8 @@ def _escalate_to_cloud(
     sanitized_history = sanitized_history or []
 
     lang_instr = _language_instruction(language, config)
-    prompt = (lang_instr + " " + CLOUD_PROMPT) if lang_instr else CLOUD_PROMPT
+    base = cloud_serving_system_prompt()
+    prompt = (lang_instr + " " + base) if lang_instr else base
 
     logger.info(
         "cloud escalation (%d history turns): %s",
@@ -922,16 +925,21 @@ def _render_augmented_text(
 ) -> str:
     """Render the reasoning-turn prompt from the assembled tier context.
 
-    Byte-identical to today's plain rendering
-    (``"What you know about the speaker:\\n\\n{layered_context}\\n\\n"
-    "Question: {text}"``) when *today* is ``None`` — the
-    ``temporal_selection_enabled=False`` no-op contract; "dated" is not a
-    separate flag, it is *today* being present (the date-group selection
-    stage is the only caller that resolves it). When *today* is given, the
+    Byte-identical to the undated rendering of
+    :func:`~paramem.server.prompts.reasoning_turn` (``today_prefix=""``)
+    when *today* is ``None`` — the ``temporal_selection_enabled=False``
+    no-op contract; "dated" is not a separate flag, it is *today* being
+    present (the date-group selection stage is the only caller that
+    resolves it). When *today* is given, the
     header carries its weekday and ISO date, and *note* (the deterministic
     nothing-in-period note the date-group selection stage may have built)
     renders as its own line above *layered_context* — or alone when
-    *layered_context* is empty (the zero-survivor case).
+    *layered_context* is empty (the zero-survivor case). Rendering itself
+    is a single call to :func:`~paramem.server.prompts.reasoning_turn`
+    (``configs/prompts/serving_directives.txt`` § REASONING-TURN) — the
+    ``today is None``/``today is given`` split only computes the
+    ``today_prefix``/``context`` values fed into it, so there is exactly
+    one prompt-rendering call site for both shapes.
 
     Args:
         layered_context: The assembled, already-rendered tier sections
@@ -946,13 +954,11 @@ def _render_augmented_text(
         The full augmented prompt text passed to the reasoning generate.
     """
     if today is None:
-        return f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
-
-    header = (
-        f"Today is {weekday_name(today)}, {today.isoformat()}. What you know about the speaker:"
-    )
-    body = "\n\n".join(part for part in (note, layered_context) if part)
-    return f"{header}\n\n{body}\n\nQuestion: {text}"
+        today_prefix, body = "", layered_context
+    else:
+        today_prefix = f"Today is {weekday_name(today)}, {today.isoformat()}. "
+        body = "\n\n".join(part for part in (note, layered_context) if part)
+    return reasoning_turn(today_prefix=today_prefix, context=body, question=text)
 
 
 def _probe_and_reason(
@@ -1090,9 +1096,9 @@ def _probe_and_reason(
             if not dated_kept:
                 existing_dates = sorted({day for day in date_by_key.values() if day is not None})
                 available_dates = ", ".join(day.isoformat() for day in existing_dates)
-                period_note = "Nothing was recorded for the requested period."
+                period_note = empty_period_note()
                 if available_dates:
-                    period_note += f" Recorded dates: {available_dates}."
+                    period_note += recorded_dates_suffix(available_dates)
 
         logger.info(
             "Date-group selection: %s, kept %d/%d key(s)",

@@ -33,8 +33,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from paramem.graph.prompts import prompt_overrides
 from paramem.memory.store import MemoryStore as _MS
-from paramem.server.config import ServerConfig, VoiceConfig
+from paramem.server.config import ServerConfig
 from paramem.server.inference import (
     _CAP_HIT_TOKEN_TOLERANCE,
     ChatResult,
@@ -48,12 +49,16 @@ from paramem.server.temporal import weekday_name
 from tests._guard_utils import call_inside_context_manager, find_function
 
 
-def _voice_config(tmp_path, text: str = "You are an assistant.") -> VoiceConfig:
-    """A VoiceConfig whose load_prompt() returns *text* verbatim, without
-    touching the real configs/prompts/pa_voice.txt file (prompt_file must
-    be explicitly empty — the dataclass default points at the real file,
-    which would otherwise win over ``system_prompt``)."""
-    return VoiceConfig(prompt_file="", system_prompt=text)
+@pytest.fixture(autouse=True)
+def _serving_system_prompt_override():
+    """Every test in this module runs with a fixed base serving system
+    prompt — none of them assert on its text, only on the identity/
+    language prefix and the reasoning-turn body built around it, so a
+    single override keeps every test isolated from the real
+    ``configs/prompts/serving_system.txt`` content without threading a
+    per-test fixture through 20 call sites."""
+    with prompt_overrides({"serving_system.txt": "You are an assistant."}):
+        yield
 
 
 class TestTrimIncompleteSentence:
@@ -264,7 +269,7 @@ class TestTokenBudgetPin(_PlanBuilder):
     """max_new_tokens is fed by config.inference.max_response_tokens — the
     plan's explicit gap: no test pinned this before the tail collapse."""
 
-    def test_probe_and_reason_uses_configured_max_response_tokens(self, monkeypatch, tmp_path):
+    def test_probe_and_reason_uses_configured_max_response_tokens(self, monkeypatch):
         self.stub_probe(monkeypatch)
         captured = {}
 
@@ -279,7 +284,6 @@ class TestTokenBudgetPin(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.max_response_tokens = 64
 
         plan = self.make_plan([("episodic", ["e1"])])
@@ -296,7 +300,7 @@ class TestTokenBudgetPin(_PlanBuilder):
 
         assert captured["max_new_tokens"] == 64
 
-    def test_base_model_answer_uses_configured_max_response_tokens(self, monkeypatch, tmp_path):
+    def test_base_model_answer_uses_configured_max_response_tokens(self, monkeypatch):
         captured = {}
 
         def fake_generate(model, tokenizer, prompt, **kwargs):
@@ -310,7 +314,6 @@ class TestTokenBudgetPin(_PlanBuilder):
         model = MagicMock()
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.max_response_tokens = 64
 
         _base_model_answer(
@@ -323,7 +326,7 @@ class TestTokenBudgetPin(_PlanBuilder):
 
         assert captured["max_new_tokens"] == 64
 
-    def test_default_max_response_tokens_is_512(self, monkeypatch, tmp_path):
+    def test_default_max_response_tokens_is_512(self, monkeypatch):
         """At ServerConfig() defaults (no override), the same capture sees
         512 — the shipped ceiling."""
         captured = {}
@@ -339,7 +342,6 @@ class TestTokenBudgetPin(_PlanBuilder):
         model = MagicMock()
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         _base_model_answer(
             text="hello",
@@ -368,14 +370,13 @@ class TestGenerateLocalReplyTruncationDetection:
         }
         return tokenizer
 
-    def test_reply_well_under_the_cap_is_not_truncated(self, monkeypatch, tmp_path):
+    def test_reply_well_under_the_cap_is_not_truncated(self, monkeypatch):
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a short answer."
         )
         tokenizer = self._tokenizer_with_ids(10)
         model = MagicMock()
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.max_response_tokens = 64
 
         _reply, is_truncated = _generate_local_reply(
@@ -383,14 +384,13 @@ class TestGenerateLocalReplyTruncationDetection:
         )
         assert is_truncated is False
 
-    def test_reply_at_the_cap_is_truncated(self, monkeypatch, tmp_path):
+    def test_reply_at_the_cap_is_truncated(self, monkeypatch):
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a cut-off reply"
         )
         tokenizer = self._tokenizer_with_ids(64)
         model = MagicMock()
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.max_response_tokens = 64
 
         _reply, is_truncated = _generate_local_reply(
@@ -398,7 +398,7 @@ class TestGenerateLocalReplyTruncationDetection:
         )
         assert is_truncated is True
 
-    def test_reply_within_tolerance_of_the_cap_is_truncated(self, monkeypatch, tmp_path):
+    def test_reply_within_tolerance_of_the_cap_is_truncated(self, monkeypatch):
         """Within _CAP_HIT_TOKEN_TOLERANCE of the cap still counts —
         decode->re-encode round-trip drift must not under-detect a real
         cap hit."""
@@ -408,7 +408,6 @@ class TestGenerateLocalReplyTruncationDetection:
         tokenizer = self._tokenizer_with_ids(64 - _CAP_HIT_TOKEN_TOLERANCE)
         model = MagicMock()
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.max_response_tokens = 64
 
         _reply, is_truncated = _generate_local_reply(
@@ -416,14 +415,13 @@ class TestGenerateLocalReplyTruncationDetection:
         )
         assert is_truncated is True
 
-    def test_reply_just_outside_tolerance_is_not_truncated(self, monkeypatch, tmp_path):
+    def test_reply_just_outside_tolerance_is_not_truncated(self, monkeypatch):
         monkeypatch.setattr(
             "paramem.server.inference.generate_answer", lambda *a, **kw: "a complete reply."
         )
         tokenizer = self._tokenizer_with_ids(64 - _CAP_HIT_TOKEN_TOLERANCE - 1)
         model = MagicMock()
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.max_response_tokens = 64
 
         _reply, is_truncated = _generate_local_reply(
@@ -454,7 +452,7 @@ class TestGenerateLocalReplyStructuralGuard:
             "is still present) must fail this check."
         )
 
-    def test_disables_adapter_exactly_once_for_a_peft_model(self, monkeypatch, tmp_path):
+    def test_disables_adapter_exactly_once_for_a_peft_model(self, monkeypatch):
         from peft import PeftModel
 
         monkeypatch.setattr(
@@ -471,7 +469,6 @@ class TestGenerateLocalReplyStructuralGuard:
         tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         reply, _is_truncated = _generate_local_reply(
             "hello",
@@ -537,7 +534,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         monkeypatch.setattr("paramem.server.inference._generate_local_reply", fake)
         return captured
 
-    def test_disabled_is_byte_identical_noop(self, monkeypatch, tmp_path):
+    def test_disabled_is_byte_identical_noop(self, monkeypatch):
         """temporal_selection_enabled=False: no clock read, no bookkeeping
         read, no selection call — the context string and the probe's
         keys_by_adapter are byte-identical to the pre-feature shape."""
@@ -554,7 +551,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         config.inference.temporal_selection_enabled = False
 
         memory_store = _MS(replay_enabled=False)
@@ -580,7 +576,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         )
         assert result.text == "final answer."
 
-    def test_memory_store_none_gate_skips_stage(self, monkeypatch, tmp_path):
+    def test_memory_store_none_gate_skips_stage(self, monkeypatch):
         """``memory_store=None`` alone gates the stage off — even with
         ``temporal_selection_enabled`` at its True default and a
         non-empty plan. ``select_date_groups`` must never be called; the
@@ -599,7 +595,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
         assert config.inference.temporal_selection_enabled is True
 
         plan = self.make_plan([("episodic", ["e1"])])
@@ -615,9 +610,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
                 memory_store=None,
             )
 
-    def test_selection_all_true_probe_set_identical_context_gains_headers(
-        self, monkeypatch, tmp_path
-    ):
+    def test_selection_all_true_probe_set_identical_context_gains_headers(self, monkeypatch):
         """Selection stub returns ``all=True``: the probed key set is
         unchanged, and the only rendering delta is the Today header plus
         per-fact date headers."""
@@ -636,7 +629,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -669,7 +661,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         e1_day = date(2026, 8, 1)
         assert f"On {weekday_name(e1_day)}, 2026-08-01:\n- fact about e1" in text
 
-    def test_single_day_range_excludes_non_matching_and_undated_keys(self, monkeypatch, tmp_path):
+    def test_single_day_range_excludes_non_matching_and_undated_keys(self, monkeypatch):
         """Selection stub returns a single-day range: only the keys last
         seen on that day are probed; a key seen another day, and an
         undated key, are both excluded when ``include_undated=False``."""
@@ -693,7 +685,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -731,7 +722,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
 
         assert probed["keys_by_adapter"] == {"episodic": ["e_match"]}
 
-    def test_single_day_range_includes_undated_when_flagged(self, monkeypatch, tmp_path):
+    def test_single_day_range_includes_undated_when_flagged(self, monkeypatch):
         """Same range, ``include_undated=True``: the undated key now
         survives alongside the matching dated key."""
         from paramem.server.temporal import DateWindow
@@ -754,7 +745,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -786,7 +776,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         kba = probed["keys_by_adapter"]
         assert set(kba["episodic"]) == {"e_match", "e_undated"}
 
-    def test_zero_survivors_skips_probe_and_escalation_plain_reply(self, monkeypatch, tmp_path):
+    def test_zero_survivors_skips_probe_and_escalation_plain_reply(self, monkeypatch):
         """A selection range matching zero keys at all: no probe call, no
         HA/cloud/base-model call, and the reasoning turn runs directly off
         the deterministic nothing-in-period note. Plain (non-[ESCALATE])
@@ -822,7 +812,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -849,9 +838,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert "2026-08-01" in text
         assert result.text == "Nothing to add."
 
-    def test_zero_survivors_escalate_tag_never_reaches_cloud_or_base_model(
-        self, monkeypatch, tmp_path
-    ):
+    def test_zero_survivors_escalate_tag_never_reaches_cloud_or_base_model(self, monkeypatch):
         """Same zero-survivor setup, but the local model escalates anyway
         (``[ESCALATE] ...``): HA is stubbed unreachable, ``answer_via_cloud``
         is invoked (receiving ``is_personal=True``) but stubbed to return
@@ -899,7 +886,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -927,7 +913,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert result.text == "Intro sentence."
 
     def test_mixed_zero_dated_matches_with_undated_survivors_probes_and_renders_both(
-        self, monkeypatch, tmp_path
+        self, monkeypatch
     ):
         """Ranges + include_undated=True + zero dated matches + undated
         keys present: the probe runs for the undated keys only, and the
@@ -953,7 +939,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -988,9 +973,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert "2026-08-01" in text
         assert "- fact about e_undated" in text
 
-    def test_bookkeeping_none_and_int_last_seen_land_undated_without_raising(
-        self, monkeypatch, tmp_path
-    ):
+    def test_bookkeeping_none_and_int_last_seen_land_undated_without_raising(self, monkeypatch):
         """A bookkeeping record with ``last_seen=None`` or an int — the
         shape real disk-splatting can produce — lands in the undated
         group and raises nothing."""
@@ -1010,7 +993,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -1042,7 +1024,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert probed["keys_by_adapter"] == {"episodic": ["e_none", "e_int"]}
         assert result.text == "a reply."
 
-    def test_dated_facts_render_once_per_tier_in_tier_order(self, monkeypatch, tmp_path):
+    def test_dated_facts_render_once_per_tier_in_tier_order(self, monkeypatch):
         """Each dated fact appears exactly once, under its date header,
         within its tier section — and tier order (procedural → episodic →
         semantic) is preserved."""
@@ -1061,7 +1043,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["procedural", "episodic", "semantic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -1127,7 +1108,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert f"On {weekday_name(aug_02)}, 2026-08-02:\n- fact about e1" in text
         assert f"On {weekday_name(aug_01)}, 2026-08-01:\n- fact about s1" in text
 
-    def test_fail_open_selection_marks_the_info_log(self, monkeypatch, tmp_path, caplog):
+    def test_fail_open_selection_marks_the_info_log(self, monkeypatch, caplog):
         """The date-group-selection INFO log appends ``" (fail-open)"``
         when the selection came back with ``fail_open=True``, and carries
         no such marker for a genuine model ``all`` verdict — the log line
@@ -1150,7 +1131,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
@@ -1179,7 +1159,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert len(selection_records) == 1
         assert "(fail-open)" in selection_records[0]
 
-    def test_genuine_all_selection_does_not_mark_the_info_log(self, monkeypatch, tmp_path, caplog):
+    def test_genuine_all_selection_does_not_mark_the_info_log(self, monkeypatch, caplog):
         """The mirror case: a genuine model ``all`` verdict
         (``fail_open=False``) leaves the INFO log without the marker."""
         import logging
@@ -1199,7 +1179,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         model = self.make_model(["episodic"])
 
         config = ServerConfig()
-        config.voice = _voice_config(tmp_path)
 
         memory_store = _MS(replay_enabled=False)
         memory_store.set_bookkeeping(
