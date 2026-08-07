@@ -323,26 +323,35 @@ class TestSimulateTrainParity:
         self._run_sim(loop_sim)
         self._run_train(loop_train)
 
+        # speaker_id is attribution bookkeeping, not store-entry content — the
+        # store's content cache is content-only ({key, subject, predicate,
+        # object}); MemoryStore.bookkeeping_for_key is the sole authority.
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
-                assert "speaker_id" in entry, f"Entry {key} missing speaker_id"
+                assert set(entry) == {"key", "subject", "predicate", "object"}, (
+                    f"Entry {key} must be content-only; got {entry!r}"
+                )
+                bk = loop.store.bookkeeping_for_key(key)
+                assert bk is not None, f"Entry {key} missing a bookkeeping record"
+                assert "speaker_id" in bk, f"Bookkeeping for {key} missing speaker_id"
 
         # Subject node with NO speaker_id attribute → terminal fallback "".
         # Acme Corp's node has no speaker_id attr; no relation stamped it.
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("subject") == "Acme Corp" and entry.get("object") == "Germany":
-                    assert entry["speaker_id"] == "", (
-                        f"Terminal fallback failed for {key}: expected '', "
-                        f"got {entry['speaker_id']!r}"
+                    bk = loop.store.bookkeeping_for_key(key)
+                    assert bk["speaker_id"] == "", (
+                        f"Terminal fallback failed for {key}: expected '', got {bk['speaker_id']!r}"
                     )
 
         # The relation with explicit speaker_id=sp_explicit must keep it.
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("object") == "Acme Corp":
-                    assert entry["speaker_id"] == "sp_explicit", (
-                        f"Explicit speaker_id overwritten in {key}: {entry['speaker_id']!r}"
+                    bk = loop.store.bookkeeping_for_key(key)
+                    assert bk["speaker_id"] == "sp_explicit", (
+                        f"Explicit speaker_id overwritten in {key}: {bk['speaker_id']!r}"
                     )
 
         # The relation with explicit speaker_id="" must keep the empty string.
@@ -351,8 +360,9 @@ class TestSimulateTrainParity:
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("subject") == "Carol" and entry.get("object") == "London":
-                    assert entry["speaker_id"] == "", (
-                        f"Explicit empty speaker_id overwritten in {key}: {entry['speaker_id']!r}"
+                    bk = loop.store.bookkeeping_for_key(key)
+                    assert bk["speaker_id"] == "", (
+                        f"Explicit empty speaker_id overwritten in {key}: {bk['speaker_id']!r}"
                     )
 
     def test_active_keys_in_tier_match(self, loop_sim, loop_train):
@@ -809,10 +819,12 @@ def _write_graph(path, quads: list[dict]) -> None:
 class TestProbeKeysFromGraph:
     """DiskMemorySource.probe reads graph.json matching the grouped-probe shape.
 
-    Under perfect recall, hit results return::
+    Content-only contract: hit results carry no ``speaker_id`` and no
+    fabricated ``confidence`` — a source never carries attribution or
+    invents a confidence score; the store-boundary SimHash gate is the sole
+    confidence authority.  Under perfect recall, hit results return::
 
         {"key": str, "subject": str, "predicate": str, "object": str,
-         "confidence": 1.0, "format": "quad",
          "fact_text": str, "raw_output": str}
 
     Missing tiers / missing keys → ``None``.
@@ -837,7 +849,8 @@ class TestProbeKeysFromGraph:
         assert results["graph1"]["subject"] == "Alex"
         assert results["graph1"]["object"] == "Berlin"
         assert results["graph1"]["predicate"] == "lives_in"
-        assert results["graph1"]["confidence"] == 1.0
+        assert "confidence" not in results["graph1"]
+        assert "speaker_id" not in results["graph1"]
 
     def test_reads_semantic_from_subdir(self, tmp_path):
         """Semantic tier reads from semantic/ subdir."""
@@ -922,7 +935,9 @@ class TestProbeKeysFromGraph:
         assert raw["object"] == "Munich"
 
     def test_result_shape_has_required_fields(self, tmp_path):
-        """Hit results contain key/subject/predicate/object/confidence/format/fact_text/raw_output fields."""  # noqa: E501
+        """Hit results contain exactly the content-only field set — no
+        ``speaker_id`` (attribution lives in bookkeeping) and no fabricated
+        ``confidence`` (the store-boundary gate is the sole authority)."""
         quad = {
             "key": "graph1",
             "subject": "Alice",
@@ -941,15 +956,59 @@ class TestProbeKeysFromGraph:
             "subject",
             "predicate",
             "object",
-            "speaker_id",
-            "confidence",
             "fact_text",
             "raw_output",
         }
         assert expected_keys == set(graph_result["graph1"].keys()), (
-            "DiskMemorySource.probe must return the canonical result shape.\n"
+            "DiskMemorySource.probe must return the canonical content-only result shape.\n"
             f"actual keys: {sorted(graph_result['graph1'].keys())}"
         )
+
+
+class TestDiskSourceConfidenceGate:
+    """DiskMemorySource no longer fabricates a confidence, so admission of a
+    simulate-mode entry through ``MemoryStore.probe`` depends entirely on the
+    store-boundary SimHash gate — the sole confidence authority."""
+
+    def test_fingerprint_mismatch_drops_disk_source_entry(self, tmp_path):
+        """A stored fingerprint that does not match the disk content's SPO
+        fields fails the gate and the key is served as None, exactly as a
+        weights-venue miss would be."""
+        from paramem.memory.entry import compute_simhash
+
+        _write_graph(
+            tmp_path / "episodic" / "graph.json",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "",
+                }
+            ],
+        )
+        store = MemoryStore(replay_enabled=True)
+        # Fingerprint minted for a DIFFERENT fact — mismatches the disk content.
+        store.put_simhash(
+            "episodic", "graph1", compute_simhash("graph1", "Wrong", "predicate", "Value")
+        )
+        results = store.probe({"episodic": ["graph1"]}, source=DiskMemorySource(tmp_path))
+        assert results["graph1"] is None
+
+    def test_fingerprint_match_admits_disk_source_entry_with_real_confidence(self, tmp_path):
+        """A matching fingerprint admits the entry and the store computes the
+        real confidence — never the DiskMemorySource-fabricated 1.0 that has
+        been removed."""
+        from paramem.memory.entry import entry_simhash
+
+        quad = {"key": "graph1", "subject": "Alex", "predicate": "lives_in", "object": "Berlin"}
+        _write_graph(tmp_path / "episodic" / "graph.json", [{**quad, "speaker_id": ""}])
+        store = MemoryStore(replay_enabled=True)
+        store.put_simhash("episodic", "graph1", entry_simhash(quad))
+        results = store.probe({"episodic": ["graph1"]}, source=DiskMemorySource(tmp_path))
+        assert results["graph1"] is not None
+        assert results["graph1"]["confidence"] > 0.99
 
 
 # ---------------------------------------------------------------------------

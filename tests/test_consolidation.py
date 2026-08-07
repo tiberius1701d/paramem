@@ -1647,7 +1647,7 @@ class TestSaveAdaptersManifest:
 
 
 class TestAtomicJsonWriteHonoursSecurityPosture:
-    """_atomic_json_write always routes through the infrastructure envelope.
+    """write_infra_json always routes through the infrastructure envelope.
 
     There is no per-call plaintext override: the operator's posture
     (``security.require_encryption`` + key material) is the only thing that
@@ -1659,6 +1659,7 @@ class TestAtomicJsonWriteHonoursSecurityPosture:
     """
 
     def test_writes_age_envelope_under_security_on(self, tmp_path, monkeypatch):
+        from paramem.backup.encryption import write_infra_json
         from paramem.backup.key_store import (
             DAILY_PASSPHRASE_ENV_VAR,
             _clear_daily_identity_cache,
@@ -1666,7 +1667,6 @@ class TestAtomicJsonWriteHonoursSecurityPosture:
             wrap_daily_identity,
             write_daily_key_file,
         )
-        from paramem.server.consolidation import _atomic_json_write
 
         # Genuine Security ON: a real daily identity is loadable.
         ident = mint_daily_identity()
@@ -1677,7 +1677,7 @@ class TestAtomicJsonWriteHonoursSecurityPosture:
         _clear_daily_identity_cache()
 
         out = tmp_path / "state.json"
-        _atomic_json_write({"debug": True, "n": 42}, out)
+        write_infra_json(out, {"debug": True, "n": 42})
 
         assert out.read_bytes().startswith(b"age-encryption.org/v1"), (
             "infrastructure JSON must be age-wrapped when a daily identity is loaded"
@@ -2386,8 +2386,10 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
 
         ``consolidate`` returns ``tiers_rebuilt=["episodic"]``
         so the full-trained bookkeeping path is exercised (not noop).
-        ``_save_key_metadata`` is mocked at the consolidation module level so
-        no real loop or filesystem is needed.
+        ``consolidation_loop`` is a ``MagicMock`` so no real loop or
+        filesystem is needed — key-metadata persistence now happens inside
+        the (real, unmocked-in-production) fold itself, not via a call this
+        app-layer path makes.
         ``session_buffer`` holds one pending session to verify it is untouched.
         """
         mock_config = MagicMock()
@@ -2435,10 +2437,11 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         Calling mark_consolidated here would permanently discard it.
 
         Non-vacuity contract: the test first asserts that the BG job actually
-        ran (``_save_key_metadata`` called — a witness that
-        ``_run_full_cycle`` executed past the ``full_trained`` path).  If the
-        job did NOT run, the first assertion fails, preventing a false green on
-        ``mark_consolidated.assert_not_called()``.
+        ran (``state["router"].reload()`` called — a witness that
+        ``_finalize_full`` executed past the ``full_trained`` path; key-metadata
+        persistence moved inside the fold itself, so it is no longer a usable
+        app-layer witness here).  If the job did NOT run, the first assertion
+        fails, preventing a false green on ``mark_consolidated.assert_not_called()``.
 
         Patch path: ``paramem.server.app.BackgroundTrainer`` — the name that
         ``_build_bg_trainer`` in app.py resolves at call time (imported at
@@ -2458,50 +2461,14 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         mock_bt = MagicMock()
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
-        save_spy = MagicMock()
-
-        with (
-            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
-            patch("paramem.server.consolidation._save_key_metadata", save_spy),
-        ):
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
             app_module._run_full_consolidation_sync("all_tiers")
 
-        # Non-vacuity witness: the BG job ran and reached the full_trained bookkeeping
-        # path.  If the job did not run, this assertion fails before the guard below.
-        save_spy.assert_called_once()
+        # Non-vacuity witness: the BG job ran and reached _finalize_full (the
+        # full_trained terminal). If the job did not run, this assertion
+        # fails before the guard below.
+        state["router"].reload.assert_called_once()
         state["session_buffer"].mark_consolidated.assert_not_called()
-
-    def test_full_trained_save_key_metadata_still_called(self, monkeypatch):
-        """_save_key_metadata is called even though mark_consolidated is not.
-
-        The key-metadata file must be updated after a successful fold; the fix
-        must not accidentally remove that call.
-
-        Patching ``paramem.server.app.BackgroundTrainer`` (the name imported at
-        module level in app.py) rather than the class in its own module ensures
-        ``_build_bg_trainer`` creates the mock BT whose ``submit.side_effect``
-        executes the job synchronously, so the assertion runs after the job
-        completes.
-        """
-        from unittest.mock import patch
-
-        import paramem.server.app as app_module
-
-        state = self._make_state_full_trained()
-        monkeypatch.setattr(app_module, "_state", state)
-
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        save_spy = MagicMock()
-
-        with (
-            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
-            patch("paramem.server.consolidation._save_key_metadata", save_spy),
-        ):
-            app_module._run_full_consolidation_sync("all_tiers")
-
-        save_spy.assert_called_once()
 
     def test_full_trained_pending_sessions_remain_in_buffer(self, monkeypatch):
         """get_pending() still returns the pending session after a full cycle.
@@ -2510,10 +2477,10 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         mark_consolidated is not called, so the pending session survives.
 
         Non-vacuity contract: the test first asserts that the BG job actually
-        ran (``_save_key_metadata`` called) before asserting on the buffer
-        state.  Without this witness the pending-sessions assertion is trivially
-        true because the MagicMock's ``get_pending.return_value`` is unchanged
-        regardless of whether the job ran.
+        ran (``state["router"].reload()`` called) before asserting on the
+        buffer state.  Without this witness the pending-sessions assertion is
+        trivially true because the MagicMock's ``get_pending.return_value``
+        is unchanged regardless of whether the job ran.
 
         Patch path: ``paramem.server.app.BackgroundTrainer`` — same rationale
         as ``test_full_trained_does_not_mark_pending_consolidated``.
@@ -2528,17 +2495,13 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         mock_bt = MagicMock()
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
-        save_spy = MagicMock()
-
-        with (
-            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
-            patch("paramem.server.consolidation._save_key_metadata", save_spy),
-        ):
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
             app_module._run_full_consolidation_sync("all_tiers")
 
-        # Non-vacuity witness: the BG job ran and reached the full_trained bookkeeping
-        # path.  If the job did not run, this assertion fails before the buffer check.
-        save_spy.assert_called_once()
+        # Non-vacuity witness: the BG job ran and reached _finalize_full (the
+        # full_trained terminal). If the job did not run, this assertion
+        # fails before the buffer check.
+        state["router"].reload.assert_called_once()
 
         # mark_consolidated must not have been called — pending sessions survive the fold.
         state["session_buffer"].mark_consolidated.assert_not_called()
@@ -7706,8 +7669,9 @@ class TestBookkeepingSchema:
 
     def test_load_bookkeeping_from_disk_round_trip(self, tmp_path):
         """Full-record round-trip: save via the same ``dict(bk)`` shape
-        ``_save_key_metadata`` writes, reload via load_bookkeeping_from_disk,
-        assert every field survives unchanged (write/read symmetry)."""
+        ``ConsolidationLoop.write_key_metadata`` writes, reload via
+        load_bookkeeping_from_disk, assert every field survives unchanged
+        (write/read symmetry)."""
         import json
 
         from paramem.memory.store import MemoryStore
@@ -7736,7 +7700,7 @@ class TestBookkeepingSchema:
             allow_empty_speaker=True,
         )
 
-        # Simulate _save_key_metadata output format: dump the whole record.
+        # Simulate write_key_metadata output format: dump the whole record.
         bk5 = store.bookkeeping_for_key("graph5")
         bk6 = store.bookkeeping_for_key("graph6")
         payload = {
@@ -8180,6 +8144,30 @@ class TestAttributeGateNodeWalk:
         stored = loop.store.get(minted_key)
         assert stored["object"] == "+1 555 123 4567"
 
+    def test_non_deferred_mint_still_returns_minted_record(self, tmp_path):
+        """``defer=False`` (fold discipline) commits the store write
+        immediately AND still returns the minted record in the second
+        return value -- the main-tiers fold needs it regardless of venue to
+        enrich the crash-resume marker via ``_persisted_from_entry_and_rec``.
+        Previously this list was always empty when ``defer=False``."""
+        loop = self._make_loop(tmp_path)
+        loop.merger.merge_relations([self._attr_relation()], session_id="s0", log_label="test")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        minted_by_tier, minted_records = loop._build_all_edge_entries_into(tier_keyed, defer=False)
+
+        assert minted_by_tier["episodic"] == 1
+        assert len(minted_records) == 1, (
+            "a minted record must be returned even when defer=False (immediate commit)"
+        )
+        rec = minted_records[0]
+        assert rec["entry"]["key"] == tier_keyed["episodic"][0]["key"]
+        assert rec["tier"] == "episodic"
+        assert rec["relation_type"] == "attribute"
+        # The store write already happened immediately (defer=False) -- the
+        # record is additional, not a substitute for the immediate commit.
+        assert loop.store.get(rec["entry"]["key"]) is not None
+
     def test_full_reconsolidation_round_trip_reuses_key(self, tmp_path):
         """Simulates a full fold: mint once, reset the merger's keying
         graph, re-merge the registry-true relation with indexed_key set
@@ -8607,6 +8595,8 @@ def _run_full_fold_mocked(
     unload_spy=None,
     create_adapter_side_effect=None,
     copy_adapter_weights_side_effect=None,
+    mode="train",
+    consume_pending=False,
 ):
     """Run consolidate with heavy ops mocked.
 
@@ -8635,6 +8625,12 @@ def _run_full_fold_mocked(
         tier needs a fake that raises on a real shape mismatch (the real
         function's own failure mode, see ``loader.py``'s
         ``copy_adapter_weights`` docstring).
+    mode: ``"train"`` (default) or ``"simulate"`` — forwarded to
+        ``loop.consolidate``.
+    consume_pending: Forwarded to ``loop.consolidate``.  ``True`` lets a
+        caller-seeded keyless edge in ``loop.merger.graph`` (mimicking
+        app.py's consume-pending pre-stage) survive the graph reset and
+        mint a new key, exercising the fresh-mint path of a main-tiers fold.
     """
     from unittest.mock import MagicMock, patch
 
@@ -8704,9 +8700,529 @@ def _run_full_fold_mocked(
             ),
             patch("paramem.memory.interim_adapter.unload_interim_adapters", unload_spy),
         ):
-            return loop.consolidate(mode="train", keys_from=keys_from, trainer=None, router=None)
+            return loop.consolidate(
+                mode=mode,
+                keys_from=keys_from,
+                consume_pending=consume_pending,
+                trainer=None,
+                router=None,
+            )
     finally:
         _gpu_thread_lock.release()
+
+
+# =============================================================================
+# TestMainTiersCrashResumeBookkeeping — a main-tiers fold that resumes from a
+# crash-durable fold_resume.json marker must re-establish every marker key's
+# store entry, bookkeeping record, and mint-index counters -- not just replay
+# the bare (subject, predicate, object) tuple.
+#
+# The crash is simulated by hand-crafting the exact fold_resume.json marker a
+# real crash would leave behind (matching fold_stamp + scope +
+# train_assignment shape) rather than orchestrating two full fold calls:
+# _run_fold recomputes and compares the fold_stamp fresh on every call, so a
+# hand-crafted marker with a matching stamp drives the SAME resume fast-path
+# a genuine crash-then-restart would.
+# =============================================================================
+
+
+def _craft_main_tiers_marker(loop, *, tier: str, entry: dict, rec_bearing: bool) -> str:
+    """Write a fold_resume.json marker matching what _persist_fold_assignment
+    would have produced pre-crash, for a single key under *tier*.
+
+    Args:
+        loop: The loop the marker will be read back by -- the fold_stamp is
+            computed fresh off its CURRENT store state (``_compute_fold_stamp``),
+            matching what a real ``_run_fold`` entry recomputes and compares
+            against the marker.
+        entry: The uniform ``tier_keyed`` shape (``key``/``subject``/
+            ``predicate``/``object``/``speaker_id``).
+        rec_bearing: When ``True``, enriches *entry* exactly as
+            ``_persisted_from_entry_and_rec`` does for a key minted THIS
+            fold (``relation_type``/``session_ids``/``last_seen``/
+            ``first_seen``) -- the pre-crash-mint case.  When ``False``,
+            leaves it bare, matching an existing (anti-forgetting-replay)
+            key.
+
+    Returns:
+        The fold_stamp written into the marker.
+    """
+    stamp = loop._compute_fold_stamp(tier=None)
+    persisted = dict(entry)
+    persisted["tier"] = tier
+    if rec_bearing:
+        persisted["relation_type"] = "factual"
+        persisted["session_ids"] = ["s1"]
+        persisted["last_seen"] = "2026-02-01T00:00:00Z"
+        persisted["first_seen"] = "2026-02-01T00:00:00Z"
+    train_assignment: dict = {"episodic": [], "semantic": [], "procedural": []}
+    train_assignment[tier] = [persisted]
+    marker = {
+        "version": loop._FOLD_RESUME_VERSION,
+        "scope": "main_tiers",
+        "fold_stamp": stamp,
+        "completed_tiers": [],
+        "tier_checkpoints": {},
+        "in_flight_tier": tier,
+        "train_assignment": train_assignment,
+        "dataset_fingerprint": {},
+        "pending_session_ids": [],
+    }
+    loop._write_fold_resume(marker)
+    return stamp
+
+
+class TestMainTiersCrashResumeBookkeeping:
+    """A resumed main-tiers fold must re-establish every marker key's store
+    entry, bookkeeping record, and mint-index counters -- both for a key
+    newly minted pre-crash (the "rec"-bearing branch) and for a pre-existing
+    key replayed into this fold (the bare branch).
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Real GraphMerger + MemoryStore, no GPU.
+
+        The resume fast-path never touches the merger (it skips hydrate/
+        materialize/refine/promote entirely), so ``_make_fold_loop``'s
+        MagicMock merger is fine here.
+        """
+        return _make_fold_loop(tmp_path)
+
+    def _run_resumed_fold(self, loop, *, mode="simulate", keys_from="all_tiers"):
+        """Call ``consolidate()`` once against a pre-written fold_resume.json
+        marker.
+
+        No GPU-lock and no model mocking is needed for a resumed simulate
+        (disk-venue) fold: the resume fast-path skips hydrate/materialize/
+        refine/promote, and the disk venue trains nothing (the per-tier
+        training loop in ``ConsolidationLoop._run_fold`` is gated on
+        ``scope.source == "weights"``).  ``unload_interim_adapters`` is
+        patched defensively (``keys_from="all_tiers"`` reaps interim slots
+        at fold end; none exist in this fixture, so it is a no-op either
+        way).
+        """
+        from unittest.mock import patch
+
+        with patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]):
+            return loop.consolidate(mode=mode, keys_from=keys_from, trainer=None, router=None)
+
+    def test_resumed_mint_gets_store_entry_and_bookkeeping(self, tmp_path):
+        """A key minted pre-crash (rec-bearing marker entry) gets a real
+        store entry AND a bookkeeping record carrying the pre-crash speaker
+        after the resumed fold runs."""
+        loop = self._make_loop(tmp_path)
+        entry = {
+            "key": "graph42",
+            "subject": "alice",
+            "predicate": "lives in",
+            "object": "berlin",
+            "speaker_id": "spk-a",
+        }
+        _craft_main_tiers_marker(loop, tier="episodic", entry=entry, rec_bearing=True)
+
+        self._run_resumed_fold(loop)
+
+        stored = loop.store.get("graph42")
+        assert stored is not None, "resume must re-establish the store entry for a pre-crash mint"
+        assert stored["subject"] == "alice"
+        assert stored["predicate"] == "lives in"
+        assert stored["object"] == "berlin"
+
+        bk = loop.store.bookkeeping_for_key("graph42")
+        assert bk is not None, "resume must re-establish bookkeeping for a pre-crash mint"
+        assert bk["speaker_id"] == "spk-a", (
+            f"bookkeeping speaker_id must be the pre-crash speaker; got {bk!r}"
+        )
+        assert bk["relation_type"] == "factual"
+
+    def test_resume_advances_mint_counters_past_marker_key(self, tmp_path):
+        """After resume adoption, the mint-index counter is advanced past
+        the marker's key id -- a subsequent mint cannot collide with it.
+
+        The marker key id (500) is chosen above DONOR_KEY_FLOOR (200) so the
+        counter's post-resume value is driven by the scan over this key,
+        not by the donor floor alone.
+        """
+        loop = self._make_loop(tmp_path)
+        assert loop._indexed_next_index <= 500, (
+            "fixture precondition: the counter must start at or below the marker key's id"
+        )
+        entry = {
+            "key": "graph500",
+            "subject": "alice",
+            "predicate": "lives in",
+            "object": "berlin",
+            "speaker_id": "spk-a",
+        }
+        _craft_main_tiers_marker(loop, tier="episodic", entry=entry, rec_bearing=True)
+
+        self._run_resumed_fold(loop)
+
+        assert loop._indexed_next_index > 500, (
+            f"counter must be advanced past the marker key's id 500; got {loop._indexed_next_index}"
+        )
+
+    def test_resumed_pre_existing_key_re_puts_content_defensively(self, tmp_path):
+        """A pre-existing (anti-forgetting-replay) marker entry -- no rec/
+        relation_type -- also gets its content re-put on resume, so a
+        simulate-venue persist never KeyErrors on a registry-active key the
+        restarted process's store cache never hydrated."""
+        loop = self._make_loop(tmp_path)
+        entry = {
+            "key": "graph7",
+            "subject": "bob",
+            "predicate": "works at",
+            "object": "acme",
+            "speaker_id": "spk-b",
+        }
+        # A pre-existing key's bookkeeping was durably committed by a prior
+        # cycle and restored at boot -- the resume fast-path intentionally
+        # leaves it untouched for the bare (non-rec-bearing) branch, so
+        # seed it here to model that boot-time restore.
+        loop.store.set_bookkeeping(
+            "graph7", speaker_id="spk-b", relation_type="factual", first_seen=""
+        )
+        _craft_main_tiers_marker(loop, tier="episodic", entry=entry, rec_bearing=False)
+
+        result = self._run_resumed_fold(loop)
+
+        stored = loop.store.get("graph7")
+        assert stored is not None, "resume must re-put content for a pre-existing marker key"
+        assert stored["object"] == "acme"
+        assert "episodic" in result["tiers_rebuilt"]
+
+    def test_resumed_pre_existing_key_relocates_ownership_from_stale_tier(self, tmp_path):
+        """Single-tier ownership on resume: a key still active in episodic per
+        the on-disk registry (a crashed prior attempt at THIS fold promoted it
+        via store.move() and re-put new content, then failed before the
+        registry rewrite reached disk) must be relocated to the marker's tier
+        — never duplicated across both.
+
+        Models the promotion-crash sequence: seed the key active in episodic
+        with real (STALE) content and bookkeeping -- the state a fresh
+        process boots into when the crashed process's in-RAM move/re-put
+        never persisted -- then craft the marker under semantic (the tier
+        the crashed attempt had already promoted to) with the NEW content.
+        """
+        loop = self._make_loop(tmp_path)
+        key = "graph55"
+        loop.store.put(
+            "episodic",
+            key,
+            {"key": key, "subject": "dana", "predicate": "old pred", "object": "old obj"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(key, speaker_id="spk-d", relation_type="factual", first_seen="")
+        entry = {
+            "key": key,
+            "subject": "dana",
+            "predicate": "new pred",
+            "object": "new obj",
+            "speaker_id": "spk-d",
+        }
+        _craft_main_tiers_marker(loop, tier="semantic", entry=entry, rec_bearing=False)
+
+        self._run_resumed_fold(loop)
+
+        # Single active-registry membership: semantic only, never episodic too.
+        assert loop.store.tier_for_active_key(key) == "semantic"
+        assert key not in loop.store.active_keys_in_tier("episodic")
+
+        # The content cache must not carry the key under both tiers either —
+        # store.get() scans tier-first-match, so a leftover stale episodic
+        # entry would silently shadow the correct semantic one.
+        assert len(loop.store) == 1, (
+            f"key must be counted once across tiers, not once per tier; "
+            f"store has {len(loop.store)} entries"
+        )
+        stored = loop.store.get(key)
+        assert stored["predicate"] == "new pred", (
+            f"store.get must return the marker's (post-promotion) SPO, not the "
+            f"stale pre-promotion copy; got {stored!r}"
+        )
+        assert stored["object"] == "new obj"
+
+    def test_simulate_venue_resume_completes_without_keyerror(self, tmp_path):
+        """The simulate (disk) venue's persist step
+        (``build_tier_graph_from_store``) must not KeyError on a resumed
+        fold -- the documented failure mode when the resume path leaves the
+        store's content cache empty for an active-registry key."""
+        loop = self._make_loop(tmp_path)
+        entry = {
+            "key": "graph9",
+            "subject": "carol",
+            "predicate": "has hobby",
+            "object": "chess",
+            "speaker_id": "spk-c",
+        }
+        _craft_main_tiers_marker(loop, tier="episodic", entry=entry, rec_bearing=True)
+
+        # Must not raise -- this is the exact call shape that KeyErrors
+        # without the resume-path content re-put.
+        result = self._run_resumed_fold(loop, mode="simulate")
+
+        assert result["tiers_rebuilt"] == ["episodic"]
+        graph_path = loop.output_dir / "episodic" / "graph.json"
+        assert graph_path.exists(), "simulate persist must have written graph.json"
+
+
+# =============================================================================
+# TestMainTiersKeyMetadataCoCommit — the fold itself is the durable writer of
+# key bookkeeping (key_metadata.json), ordered strictly before the per-tier
+# indexed_key_registry.json rewrite that is the fold's commit signal.
+# =============================================================================
+
+
+class TestMainTiersKeyMetadataCoCommit:
+    """A main-tiers fold must write key_metadata.json (via
+    ConsolidationLoop.write_key_metadata) before the per-tier registry
+    rewrite, and every active registry key must have a bookkeeping row in
+    that file once the fold completes.
+    """
+
+    def test_write_key_metadata_precedes_registry_save(self, tmp_path):
+        """ConsolidationLoop.write_key_metadata must be called before
+        KeyRegistry.save (the per-tier indexed_key_registry.json rewrite)."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_fold_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+        ep_keys = ["ep0", "ep1"]
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        call_order: list[str] = []
+
+        def _record_write_key_metadata(self):
+            call_order.append("write_key_metadata")
+
+        def _record_registry_save(self, path):
+            call_order.append("registry_save")
+
+        with (
+            patch.object(ConsolidationLoop, "write_key_metadata", _record_write_key_metadata),
+            patch.object(KeyRegistry, "save", _record_registry_save),
+        ):
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert "write_key_metadata" in call_order, "write_key_metadata was not called"
+        assert "registry_save" in call_order, "KeyRegistry.save was not called"
+        write_meta_idx = call_order.index("write_key_metadata")
+        registry_save_idx = call_order.index("registry_save")
+        assert write_meta_idx < registry_save_idx, (
+            f"write_key_metadata must precede the registry rewrite (the fold's "
+            f"commit signal); order was: {call_order}"
+        )
+
+    def test_every_active_registry_key_has_a_bookkeeping_row(self, tmp_path):
+        """After a full cycle, every active on-disk registry key has a row
+        in the on-disk key_metadata.json bookkeeping file -- the co-commit
+        invariant."""
+        import json
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_fold_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+        ep_keys = ["ep0", "ep1", "ep2"]
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        registry = KeyRegistry.load(loop.output_dir / "episodic" / "indexed_key_registry.json")
+        active_on_disk = set(registry.list_active())
+        assert active_on_disk, "fixture precondition: at least one key must be active on disk"
+
+        metadata = json.loads(loop._key_metadata_path.read_text())
+        keys_in_metadata = set(metadata.get("keys", {}))
+        missing = active_on_disk - keys_in_metadata
+        assert not missing, (
+            f"every active on-disk registry key must have a bookkeeping row "
+            f"in key_metadata.json; missing: {missing}"
+        )
+
+
+# =============================================================================
+# TestRegistryBookkeepingDivergenceGate — the main-tiers fold's integrity gate
+# (ConsolidationLoop._assert_registry_bookkeeping_parity), run immediately
+# before _reset_main_tier_registries_and_simhashes so a divergence fails the
+# cycle before any in-RAM registry mutation or durable write.
+# =============================================================================
+
+
+class TestRegistryBookkeepingDivergenceGate:
+    def test_divergent_key_raises_before_registry_mutation_or_disk_write(self, tmp_path):
+        """A candidate key with a store entry but NO bookkeeping record raises
+        RegistryBookkeepingDivergence before _reset_main_tier_registries_and_simhashes
+        mutates the in-RAM registry and before any durable write for this fold."""
+        from paramem.training.consolidation import RegistryBookkeepingDivergence
+
+        loop = _make_fold_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+
+        # Pre-existing, fully-bookkept key -- establishes the FORMER durable state.
+        _seed_keys(loop, "episodic", ["ep_old"], relation_type="factual")
+        registry_path = loop.output_dir / "episodic" / "indexed_key_registry.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        loop.store.registry("episodic").save(registry_path)
+        former_registry_bytes = registry_path.read_bytes()
+
+        # A key registered in the store (entry + registry) but with no
+        # bookkeeping row -- the divergence this gate exists to catch.
+        loop.store.put(
+            "episodic",
+            "ep_divergent",
+            {
+                "key": "ep_divergent",
+                "subject": "Bob",
+                "predicate": "p",
+                "object": "o",
+                "speaker_id": "S1",
+            },
+            register=True,
+        )
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": "ep_old",
+                    "subject": "Alice",
+                    "object": "obj_ep_old",
+                    "predicate": "pred_ep_old",
+                    "relation_type": "factual",
+                },
+                {
+                    "key": "ep_divergent",
+                    "subject": "Bob",
+                    "object": "o",
+                    "predicate": "p",
+                    "relation_type": "factual",
+                },
+            ],
+        )
+
+        active_before_fold = set(loop.store.registry("episodic").list_active())
+
+        with pytest.raises(RegistryBookkeepingDivergence) as excinfo:
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert "ep_divergent" in str(excinfo.value.divergent_keys)
+
+        # The in-RAM registry is exactly as it was going in -- the gate fired
+        # before _reset_main_tier_registries_and_simhashes ran, so the fold
+        # never rebuilt (and never emptied-then-repopulated) the registry.
+        assert set(loop.store.registry("episodic").list_active()) == active_before_fold
+
+        # Nothing durable changed: the on-disk registry is byte-identical,
+        # and key_metadata.json (written by write_key_metadata, which never
+        # runs) does not exist.
+        assert registry_path.read_bytes() == former_registry_bytes
+        assert not loop._key_metadata_path.exists()
+
+    def test_every_candidate_key_paired_passes_and_fold_completes(self, tmp_path):
+        """A candidate set where every key has both an entry and a
+        bookkeeping record passes the gate and the fold completes normally."""
+        loop = _make_fold_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+        ep_keys = ["ep0", "ep1"]
+        _seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert "episodic" in result["tiers_rebuilt"]
+        assert set(loop.store.registry("episodic").list_active()) == set(ep_keys)
+
+    def test_reinforce_fabricated_bookkeeping_passes_with_warning(self, tmp_path, caplog):
+        """A key whose bookkeeping record is the minimal shape
+        MemoryStore.reinforce writes for a never-bookkept key (empty
+        speaker_id, relation_type=unknown) passes the gate -- it is a
+        legitimate provenance row -- but logs a WARNING naming the key."""
+        import logging
+
+        loop = _make_fold_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+
+        loop.store.put(
+            "episodic",
+            "ep_reinforced",
+            {
+                "key": "ep_reinforced",
+                "subject": "Carol",
+                "predicate": "p",
+                "object": "o",
+                "speaker_id": "",
+            },
+            register=True,
+        )
+        # reinforce() on a key with no existing record fabricates the
+        # minimal {speaker_id: "", relation_type: "unknown"} shape.
+        loop.store.reinforce("ep_reinforced", cycle=1, first_seen="")
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": "ep_reinforced",
+                    "subject": "Carol",
+                    "object": "o",
+                    "predicate": "p",
+                    "relation_type": "factual",
+                },
+            ],
+        )
+
+        caplog.set_level(logging.WARNING, logger="paramem.training.consolidation")
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert "episodic" in result["tiers_rebuilt"]
+        assert any(
+            "ep_reinforced" in r.message and "registry_bookkeeping_divergence" in r.message
+            for r in caplog.records
+        ), (
+            f"expected a registry_bookkeeping_divergence WARNING naming ep_reinforced; "
+            f"caplog had: {[r.message for r in caplog.records]}"
+        )
 
 
 # =============================================================================
@@ -9701,6 +10217,35 @@ class TestCollectKeyedEdgesInto:
             f"Minted entry speaker_id should be 'spk-new'; got {minted_entry['speaker_id']!r}"
         )
 
+    def test_keyless_mint_store_entry_is_content_only(self, tmp_path):
+        """The store.put call at a mint site writes exactly the content-only
+        shape ({key, subject, predicate, object}) -- never speaker_id,
+        relation_type, or the _new sentinel, even though tier_keyed's OWN
+        entry (a separate dict) carries speaker_id for the marker/dump
+        boundary.  A fresh fold and a resumed fold must write the identical
+        store entry shape."""
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+        g.add_node("bob", speaker_id="spk-new", attributes={"name": "Bob"})
+        g.add_node("paris", attributes={"name": "Paris"})
+        g.add_edge("bob", "paris", predicate="visits", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1, (
+            f"expected exactly one minted (keyless) entry; got {tier_keyed['episodic']}"
+        )
+        minted_entry = tier_keyed["episodic"][0]
+
+        stored = loop.store.get(minted_entry["key"])
+        assert stored == {
+            "key": minted_entry["key"],
+            "subject": minted_entry["subject"],
+            "predicate": minted_entry["predicate"],
+            "object": minted_entry["object"],
+        }, f"store entry must be content-only (no speaker_id/relation_type/_new); got {stored!r}"
+
 
 # ---------------------------------------------------------------------------
 # _build_registry_true_relations — optional keys filter
@@ -10246,13 +10791,11 @@ class TestMaterializeInterimExtraRelations:
             f"Cycle did not complete as expected; result={result!r}"
         )
         if result.get("mode") == "simulated":
-            # Verify all minted keys have the correct speaker_id.
+            # Verify all minted keys have the correct speaker_id -- store
+            # entries are content-only, so speaker_id lives exclusively in
+            # bookkeeping.
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("subject") in ("speaker0", "speaker0"):
-                    assert entry.get("speaker_id") == "speaker0", (
-                        f"Key {key!r} minted with wrong speaker_id: "
-                        f"expected 'speaker0', got {entry.get('speaker_id')!r}"
-                    )
                     bk = loop.store.bookkeeping_for_key(key)
                     if bk is not None:
                         assert bk.get("speaker_id") == "speaker0", (
@@ -16760,6 +17303,23 @@ class TestFoldResumeHelpers:
             "k2",
             {"key": "k2", "subject": "Bob", "predicate": "knows", "object": "Alice"},
         )
+        # Both marker entries below are pre-existing (bare, no relation_type) --
+        # their bookkeeping was durably committed by a prior cycle and
+        # restored at boot; seed it here to model that boot-time restore.
+        loop.store.set_bookkeeping(
+            "k1",
+            speaker_id="",
+            relation_type="factual",
+            first_seen="",
+            allow_empty_speaker=True,
+        )
+        loop.store.set_bookkeeping(
+            "k2",
+            speaker_id="",
+            relation_type="factual",
+            first_seen="",
+            allow_empty_speaker=True,
+        )
 
         # Compute the stable fold_stamp so we can forge a matching marker.
         fold_stamp = loop._compute_fold_stamp()
@@ -16976,6 +17536,153 @@ class TestFoldResumeHelpers:
             assert new_state["fold_stamp"] != "stale_stamp_does_not_match", (
                 "fold_resume.json must carry the fresh stamp, not the stale one"
             )
+
+
+# ---------------------------------------------------------------------------
+# _derive_key_counters / write_key_metadata unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestKeyBookkeepingHelpers:
+    """Unit tests for the extracted counter-derivation method and the
+    relocated durable key-bookkeeping writer.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Reuses TestFoldResumeHelpers' minimal stub."""
+        return TestFoldResumeHelpers._make_loop(tmp_path)
+
+    def test_derive_key_counters_raises_past_highest_known_key(self, tmp_path):
+        """_derive_key_counters raises both counters to one past the
+        highest numeric suffix among all_known_keys() (active AND stale)."""
+        loop = self._make_loop(tmp_path)
+        loop.store.put(
+            "episodic",
+            "graph41",
+            {"key": "graph41", "subject": "a", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        loop.store.put(
+            "episodic",
+            "graph500",
+            {"key": "graph500", "subject": "a", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        loop.store.put(
+            "procedural",
+            "proc300",
+            {"key": "proc300", "subject": "a", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        # A soft-staled key must still bump the floor -- see the docstring's
+        # stale-slot collision rationale.
+        loop.store.put(
+            "episodic",
+            "graph999",
+            {"key": "graph999", "subject": "a", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        loop.store.discard_keys(["graph999"], mode="stale")
+
+        loop._derive_key_counters()
+
+        assert loop._indexed_next_index == 1000, (
+            f"must be one past the highest known (incl. stale) graph key; "
+            f"got {loop._indexed_next_index}"
+        )
+        assert loop._procedural_next_index == 301, (
+            f"must be one past the highest known proc key; got {loop._procedural_next_index}"
+        )
+
+    def test_derive_key_counters_never_drops_below_donor_floor(self, tmp_path):
+        """With no known keys, both counters land exactly at DONOR_KEY_FLOOR."""
+        from paramem.training.donor import DONOR_KEY_FLOOR
+
+        loop = self._make_loop(tmp_path)
+        loop._indexed_next_index = 999999
+        loop._procedural_next_index = 999999
+
+        loop._derive_key_counters()
+
+        assert loop._indexed_next_index == DONOR_KEY_FLOOR
+        assert loop._procedural_next_index == DONOR_KEY_FLOOR
+
+    def test_write_key_metadata_is_noop_without_a_destination(self, tmp_path):
+        """A loop with no key_metadata_path (the experiment/test default)
+        writes nothing -- write_key_metadata must not raise or fabricate a
+        path."""
+        loop = self._make_loop(tmp_path)
+        assert loop._key_metadata_path is None
+        assert not hasattr(loop, "trial_key_metadata_path")
+
+        loop.write_key_metadata()  # must not raise
+
+    def test_write_key_metadata_persists_bookkeeping_for_known_keys(self, tmp_path):
+        """write_key_metadata writes cycle_count, promoted_keys, and a
+        bookkeeping row per known key (active AND stale) to the configured
+        destination -- keys with no bookkeeping record are skipped."""
+        import json
+
+        loop = self._make_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+        loop.cycle_count = 5
+        loop.promoted_keys = {"graph1"}
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "a", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen="2026-01-01T00:00:00Z"
+        )
+        # A registered key with no bookkeeping record must be skipped, not
+        # fabricated.
+        loop.store.put(
+            "episodic",
+            "graph2",
+            {"key": "graph2", "subject": "b", "predicate": "p", "object": "o"},
+            register=True,
+        )
+
+        loop.write_key_metadata()
+
+        written = json.loads(loop._key_metadata_path.read_text())
+        assert written["cycle_count"] == 5
+        assert written["promoted_keys"] == ["graph1"]
+        assert set(written["keys"]) == {"graph1"}, (
+            f"only keys with a bookkeeping record may be persisted; got {written['keys']}"
+        )
+        assert written["keys"]["graph1"]["speaker_id"] == "spk-a"
+
+    def test_write_key_metadata_prefers_trial_path_override(self, tmp_path):
+        """A ``trial_key_metadata_path`` set externally (the trial-migration
+        isolation mechanism) takes priority over the construction-time
+        destination."""
+        import json
+
+        loop = self._make_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "live" / "key_metadata.json"
+        loop.trial_key_metadata_path = tmp_path / "trial" / "key_metadata.json"
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "a", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        loop.write_key_metadata()
+
+        assert not loop._key_metadata_path.exists(), (
+            "the live path must not be written while a trial override is set"
+        )
+        assert loop.trial_key_metadata_path.exists()
+        written = json.loads(loop.trial_key_metadata_path.read_text())
+        assert "graph1" in written["keys"]
 
 
 # =============================================================================
@@ -18496,7 +19203,6 @@ class TestRunFullCycleConsumePending:
         with (
             patch("paramem.server.app.check_vram_headroom"),
             patch("paramem.server.app.vram_scope"),
-            patch("paramem.server.consolidation._save_key_metadata"),
             patch("paramem.server.app._dispatch_finalize"),
             patch("paramem.server.consolidation.session_retention_dir", return_value=None),
         ):
@@ -18522,7 +19228,6 @@ class TestRunFullCycleConsumePending:
         with (
             patch("paramem.server.app.check_vram_headroom"),
             patch("paramem.server.app.vram_scope"),
-            patch("paramem.server.consolidation._save_key_metadata"),
             patch("paramem.server.app._dispatch_finalize"),
             patch("paramem.server.consolidation.session_retention_dir", return_value=None),
         ):
@@ -18546,10 +19251,7 @@ class TestRunFullCycleConsumePending:
         sb.get_pending.return_value = []
         sb.pending_facts.return_value = []
 
-        with (
-            patch("paramem.server.consolidation._save_key_metadata"),
-            patch("paramem.server.app._dispatch_finalize"),
-        ):
+        with patch("paramem.server.app._dispatch_finalize"):
             self._run_sync(state, monkeypatch)
 
         call_kwargs = loop.consolidate.call_args
@@ -18583,7 +19285,6 @@ class TestRunFullCycleConsumePending:
         with (
             patch("paramem.server.app.check_vram_headroom"),
             patch("paramem.server.app.vram_scope"),
-            patch("paramem.server.consolidation._save_key_metadata"),
             patch("paramem.server.app._dispatch_finalize"),
         ):
             self._run_sync(state, monkeypatch)
@@ -18703,7 +19404,6 @@ class TestRunFullCycleConsumePending:
         with (
             patch("paramem.server.app.check_vram_headroom"),
             patch("paramem.server.app.vram_scope"),
-            patch("paramem.server.consolidation._save_key_metadata"),
             patch("paramem.server.app._dispatch_finalize"),
             patch("paramem.server.consolidation.session_retention_dir", return_value=None),
         ):

@@ -1660,10 +1660,7 @@ class TestFullConsolidationFoldEntry:
         """
         state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
 
-        with (
-            patch("paramem.server.consolidation._save_key_metadata"),
-            patch("paramem.server.app._revalidate_main_adapter_manifests"),
-        ):
+        with patch("paramem.server.app._revalidate_main_adapter_manifests"):
             self._run_sync(state, monkeypatch)
 
         loop = state["consolidation_loop"]
@@ -1683,10 +1680,7 @@ class TestFullConsolidationFoldEntry:
         """A reconcile reaches the fold as ``keys_from="main_tiers"``."""
         state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
 
-        with (
-            patch("paramem.server.consolidation._save_key_metadata"),
-            patch("paramem.server.app._revalidate_main_adapter_manifests"),
-        ):
+        with patch("paramem.server.app._revalidate_main_adapter_manifests"):
             self._run_sync(state, monkeypatch, keys_from="main_tiers")
 
         _, kwargs = state["consolidation_loop"].consolidate.call_args
@@ -1715,7 +1709,6 @@ class TestFullConsolidationFoldEntry:
         )
 
         with (
-            patch("paramem.server.consolidation._save_key_metadata"),
             patch("paramem.server.app._revalidate_main_adapter_manifests"),
             patch.object(app_module, "_extract_pending_sessions", _record_extract),
         ):
@@ -1728,7 +1721,6 @@ class TestFullConsolidationFoldEntry:
         # Same config, absorbing fold: consume_pending is back on, so the
         # False above is the key source's doing and not the config's.
         with (
-            patch("paramem.server.consolidation._save_key_metadata"),
             patch("paramem.server.app._revalidate_main_adapter_manifests"),
             patch.object(
                 app_module,
@@ -1755,10 +1747,7 @@ class TestFullConsolidationFoldEntry:
         """Simulate mode routes through the identical call — only ``mode`` differs."""
         state = _make_dispatch_state(consolidation_mode="simulate", tmp_path=tmp_path)
 
-        with (
-            patch("paramem.server.consolidation._save_key_metadata"),
-            patch("paramem.server.app._revalidate_main_adapter_manifests"),
-        ):
+        with patch("paramem.server.app._revalidate_main_adapter_manifests"):
             self._run_sync(state, monkeypatch)
 
         loop = state["consolidation_loop"]
@@ -1777,14 +1766,9 @@ class TestFullConsolidationFoldEntry:
         state = _make_dispatch_state(tmp_path=tmp_path)
         state["consolidating"] = True  # set by the dispatcher before submit
 
-        with (
-            patch("paramem.server.consolidation._save_key_metadata") as mock_save_meta,
-            patch("paramem.server.app._revalidate_main_adapter_manifests"),
-        ):
+        with patch("paramem.server.app._revalidate_main_adapter_manifests"):
             self._run_sync(state, monkeypatch)
 
-        # The noop terminal returns before the key-metadata persist.
-        mock_save_meta.assert_not_called()
         assert state["consolidating"] is False, (
             "_state['consolidating'] must be cleared after the fold completes"
         )

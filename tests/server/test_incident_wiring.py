@@ -17,6 +17,9 @@ Covers:
   owns that conditional resolve)
 - resolve_incident idempotency fix: already-resolved returns False
 - Ack endpoint: acknowledged incident omitted from attention items
+- _run_stage_b_cycle's crash envelope: RegistryBookkeepingDivergence's
+  divergent_keys merged into the recorded incident detail; any other
+  exception keeps the plain detail
 """
 
 from __future__ import annotations
@@ -689,6 +692,125 @@ class TestInterimBookkeepingRegionCrash:
 
 
 # ---------------------------------------------------------------------------
+# A session-retirement (mark_consolidated) failure is a transcript-retirement
+# I/O problem, not a training crash — by the time it can fire, commit_tier_slot
+# has already durably committed the interim slot inside run_consolidation_cycle.
+# It must be caught locally, recorded as its own incident, and the cycle must
+# still finalize as a committed success (router reload, run-status row).
+# ---------------------------------------------------------------------------
+
+
+class TestInterimSessionRetirementFailure:
+    def _drive(self, state, tmp_path, *, mark_consolidated_error):
+        """Run _extract_and_start_training end to end with a mocked BG trainer.
+
+        Mirrors TestInterimBookkeepingRegionCrash._drive_extract_and_start_training
+        but injects the failure into session_buffer.mark_consolidated — the
+        interim body's post-train retirement call — instead of
+        bump_retry_and_release.
+        """
+        cfg = state["config"]
+        cfg.vram.cooldown_gate_threshold_c = 0
+        cfg.vram.vram_cache_headroom_gib = 0.5
+        cfg.consolidation.mode = "train"
+        cfg.consolidation.refresh_cadence = ""
+        cfg.consolidation.interim_overflow_slack = 0
+
+        state["router"] = MagicMock()
+
+        loop = MagicMock()
+        loop.model = MagicMock(name="model")
+        loop.config.indexed_key_replay = True
+        loop.shutdown_requested = False
+        # replay disabled on the finalize-time store read so the success
+        # finalizer (_finalize_interim) does not need all_active_keys() wired.
+        loop.store.replay_enabled = False
+        loop.extract_session.return_value = (
+            [
+                {
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": "Millfield",
+                    "relation_type": "factual",
+                }
+            ],
+            [],
+        )
+        # Clean recall (no recall-failed sessions) -- isolates the injected
+        # failure to mark_consolidated alone, not the retry-bump branch.
+        loop.run_consolidation_cycle.return_value = {
+            "mode": "trained",
+            "adapter_name": "episodic_interim_20260417T0000",
+            "new_keys": [],
+            "recall_failed_session_ids": [],
+            "overflow_slot": False,
+        }
+        state["consolidation_loop"] = loop
+
+        sb = state["session_buffer"]
+        sb.pending_facts.return_value = [
+            {"session_id": "sess-1", "speaker_id": "speaker0", "has_voice_embedding": False}
+        ]
+        sb.get_pending.return_value = [
+            {
+                "session_id": "sess-1",
+                "speaker_id": "speaker0",
+                "transcript": "hi",
+                "source_type": "transcript",
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        sb._consolidation_retry_cap = 3
+        sb._sessions = {}
+        sb.mark_consolidated.side_effect = mark_consolidated_error
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        with (
+            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.app._set_voice_pipeline_profile"),
+            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
+        ):
+            app_module._extract_and_start_training()
+
+    def test_mark_consolidated_failure_still_finalizes_as_committed(self, state, tmp_path):
+        """The cycle finalizes normally (consolidating cleared, router reloaded)
+        despite the retirement failure -- the interim slot was already
+        committed by commit_tier_slot before mark_consolidated ran."""
+        state["consolidating"] = True
+        self._drive(state, tmp_path, mark_consolidated_error=OSError("disk full"))
+
+        assert state["consolidating"] is False, (
+            "a session-retirement failure must not leave the cycle stuck as "
+            "'consolidating' — the fold itself already committed"
+        )
+        state["router"].reload.assert_called_once_with()
+
+    def test_mark_consolidated_failure_records_retirement_incident_not_training_crash(
+        self, state, tmp_path
+    ):
+        """Records a session_retirement_failed incident, never training_crash --
+        the cycle succeeded; only the retirement I/O step failed."""
+        state["consolidating"] = True
+        self._drive(state, tmp_path, mark_consolidated_error=OSError("disk full"))
+
+        incidents = read_incidents(_state_dir(state))
+        training_crashes = [i for i in incidents if i.type == "training_crash"]
+        assert training_crashes == [], (
+            f"a committed cycle's retirement failure must NOT surface as a "
+            f"training_crash incident; got {incidents}"
+        )
+        retirement_incidents = [i for i in incidents if i.type == "session_retirement_failed"]
+        assert len(retirement_incidents) == 1, (
+            f"expected exactly one session_retirement_failed incident; got {incidents}"
+        )
+        assert retirement_incidents[0].status == "active"
+
+
+# ---------------------------------------------------------------------------
 # _finalize_interim's run-status detail carries relation counts for every
 # outcome — one outcome label, one detail contract, so
 # scripts/dev/paramem-status.sh's "simulated" render (which reads
@@ -1039,3 +1161,80 @@ class TestSameTypeDifferentKeysStaySeparate:
             ).incident_id
             is None
         )
+
+
+# ---------------------------------------------------------------------------
+# _run_stage_b_cycle's crash envelope: RegistryBookkeepingDivergence's
+# divergent_keys must survive into the recorded incident's detail; any other
+# exception keeps the caller-supplied detail unchanged.
+# ---------------------------------------------------------------------------
+
+
+class TestStageBCycleDivergentKeysIncidentDetail:
+    """``_run_stage_b_cycle``'s crash envelope (``paramem/server/app.py``,
+    the ``except Exception`` block inside its ``_worker`` closure) merges a
+    ``RegistryBookkeepingDivergence``'s ``divergent_keys`` into the incident
+    detail it records, so the incident names exactly what diverged instead
+    of leaving that only in the log traceback.  Any other exception type
+    records the caller-supplied ``failure_detail`` verbatim."""
+
+    def _drive(self, state, *, exc):
+        """Call ``_run_stage_b_cycle`` directly with a body that raises *exc*.
+
+        Mirrors ``TestInterimBookkeepingRegionCrash``'s synchronous-submit
+        idiom: ``consolidation_loop`` and ``background_trainer`` are
+        pre-seeded ``MagicMock``s so ``_get_or_create_consolidation_loop`` /
+        ``_active_bg_trainer`` short-circuit to them without touching a real
+        model, and ``bt.submit`` runs the worker inline rather than on a
+        background thread.
+        """
+        state["consolidation_loop"] = MagicMock()
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+        state["background_trainer"] = mock_bt
+
+        def _body(loop, bt):
+            raise exc
+
+        with patch("paramem.server.app._set_voice_pipeline_profile"):
+            app_module._run_stage_b_cycle(
+                kind="consolidation_crash",
+                incident_key="full",
+                failure_summary="full consolidation crashed",
+                failure_detail={"phase": "fold"},
+                body=_body,
+            )
+
+    def test_divergent_keys_merged_into_incident_detail(self, state):
+        """A RegistryBookkeepingDivergence's divergent_keys is folded into
+        the incident detail alongside the caller-supplied fields."""
+        from paramem.training.consolidation import RegistryBookkeepingDivergence
+
+        divergent = {"episodic": ["g0", "g1"]}
+        exc = RegistryBookkeepingDivergence(
+            "registry/bookkeeping divergence", divergent_keys=divergent
+        )
+        self._drive(state, exc=exc)
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert crashes[0].detail["divergent_keys"] == divergent
+        assert crashes[0].detail["phase"] == "fold", (
+            "caller-supplied detail fields must survive the merge"
+        )
+
+    def test_generic_exception_keeps_plain_detail(self, state):
+        """A non-divergence exception records the failure_detail unchanged --
+        no divergent_keys key is synthesized."""
+        self._drive(state, exc=RuntimeError("boom"))
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert "divergent_keys" not in crashes[0].detail
+        assert crashes[0].detail == {"phase": "fold"}

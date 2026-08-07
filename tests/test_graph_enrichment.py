@@ -3773,8 +3773,18 @@ class TestHarvestApplySplit:
     """
 
     def test_defer_false_produces_writes_and_count(self, tmp_path):
-        """defer=False (default) must write to the store, advance counters, and
-        return (minted_by_tier, []) — no deferred writes.
+        """defer=False (default) must write to the store exactly once per
+        minted key, advance counters, and return (minted_by_tier,
+        [<one record per minted key>]).
+
+        The returned record is NOT a second write instruction — ``defer``
+        governs only WHEN the store write happens (immediately here, vs.
+        deferred to the caller's own flush when ``defer=True``); the record
+        itself is always returned so a caller building a crash-resume marker
+        (the main-tiers fold) can enrich it, without that caller ever
+        re-applying ``store.put``/``set_bookkeeping`` from it.  See
+        ``test_defer_false_store_writes_happen_exactly_once`` for the
+        call-count proof.
         """
         from paramem.training.key_registry import KeyRegistry
 
@@ -3787,14 +3797,20 @@ class TestHarvestApplySplit:
         initial_indexed = loop._indexed_next_index
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        minted_by_tier, _deferred = loop._build_all_edge_entries_into(tier_keyed)
+        minted_by_tier, records = loop._build_all_edge_entries_into(tier_keyed)
 
-        # Exactly one episodic key minted.  defer=False → no deferred writes.
+        # Exactly one episodic key minted.  defer=False → the immediate
+        # commit still happened AND the harvest record is still returned.
         assert minted_by_tier == {"episodic": 1, "procedural": 0}
-        assert _deferred == [], "defer=False must produce empty deferred_writes"
+        assert len(records) == 1, (
+            f"defer=False must return one harvest record per minted key "
+            f"(the round-trip contract with _persisted_from_entry_and_rec, "
+            f"used by the main-tiers crash-resume marker); got {records}"
+        )
+        entry = tier_keyed["episodic"][0]
+        assert records[0]["entry"]["key"] == entry["key"]
         assert len(tier_keyed["episodic"]) == 1
 
-        entry = tier_keyed["episodic"][0]
         key = entry["key"]
         assert key.startswith("graph")
         assert entry["subject"] == "Carol"
@@ -3812,6 +3828,43 @@ class TestHarvestApplySplit:
 
         # Counter advanced by 1.
         assert loop._indexed_next_index == initial_indexed + 1
+
+    def test_defer_false_store_writes_happen_exactly_once(self, tmp_path):
+        """defer=False must write each minted key to the store exactly once —
+        the immediate commit inside the walk, never a second write from the
+        returned record.
+
+        Pins the "one invocation per transformation" contract: the only
+        production consumer of the returned record for a defer=False call
+        (the main-tiers fold) uses it solely to enrich the fold_resume.json
+        crash-resume marker (``_persisted_from_entry_and_rec``) and never
+        re-applies it to the store — see the module docstring for the
+        companion defer=True proof
+        (``test_defer_true_no_store_writes_no_counter_advance``).
+        """
+        from unittest.mock import patch
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.merger.graph.add_edge("Carol", "London", predicate="visited", relation_type="factual")
+
+        with (
+            patch.object(loop.store, "put", wraps=loop.store.put) as mock_put,
+            patch.object(
+                loop.store, "set_bookkeeping", wraps=loop.store.set_bookkeeping
+            ) as mock_bk,
+        ):
+            tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+            minted_by_tier, records = loop._build_all_edge_entries_into(tier_keyed)
+
+        assert minted_by_tier["episodic"] == 1
+        assert len(records) == 1
+        mock_put.assert_called_once()
+        mock_bk.assert_called_once()
 
     def test_sequential_indices_two_edges(self, tmp_path):
         """Two keyless edges get sequential keys (graphN, graphN+1) and counters

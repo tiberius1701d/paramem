@@ -381,6 +381,33 @@ def entry_simhash(entry: dict) -> int:
     )
 
 
+def content_only_entry(entry: dict) -> dict:
+    """Project *entry* down to the store's content-only shape.
+
+    :attr:`~paramem.memory.store.MemoryStore._entries` slots carry exactly
+    ``{key, subject, predicate, object}`` — never provenance fields such as
+    ``speaker_id`` or ``relation_type``, which live in
+    :attr:`~paramem.memory.store.MemoryStore._bookkeeping` instead. Every
+    ``store.put`` call site must pass an entry through this projection (or an
+    already content-only dict) so a fresh fold and a resumed fold write the
+    identical shape.
+
+    Args:
+        entry: A working entry dict carrying at least ``key``, ``subject``,
+            ``predicate``, and ``object`` — extra fields (e.g. ``speaker_id``,
+            ``relation_type``, ``_new``) are dropped.
+
+    Returns:
+        A new dict with exactly the four content fields.
+    """
+    return {
+        "key": entry["key"],
+        "subject": entry["subject"],
+        "predicate": entry["predicate"],
+        "object": entry["object"],
+    }
+
+
 def verify_confidence(
     recalled: dict,
     registry: dict[str, int] | dict[str, dict] | None = None,

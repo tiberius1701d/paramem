@@ -79,9 +79,10 @@ def _make_config(tmp_path: Path) -> MagicMock:
     """Minimal config mock with adapter_dir and key_metadata_path under tmp_path.
 
     ``key_metadata_path`` must be a real ``Path`` (not a bare MagicMock
-    attribute) — the handler now calls ``_save_key_metadata(loop, config)``
-    once per forget, which writes to
-    ``getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path``.
+    attribute) — tests that use a REAL ``ConsolidationLoop`` stub (rather
+    than the ``MagicMock`` loops built by :func:`_make_loop_with_store` /
+    :func:`_make_loop`) thread it into ``loop._key_metadata_path`` so
+    ``loop.write_key_metadata()`` has somewhere to write.
     """
     cfg = MagicMock()
     adapter_dir = tmp_path / "adapters"
@@ -93,20 +94,17 @@ def _make_config(tmp_path: Path) -> MagicMock:
     return cfg
 
 
-def _prep_loop_for_save_key_metadata(loop: MagicMock) -> None:
-    """Set the three attributes ``_save_key_metadata`` needs on a mock loop.
+def _prep_loop_promoted_keys(loop: MagicMock) -> None:
+    """Set ``loop.promoted_keys`` to a real ``set`` on a mock loop.
 
-    ``_save_key_metadata`` (called once per forget after the store is fully
-    mutated) reads ``loop.cycle_count``, ``loop.promoted_keys`` (a real
-    ``set`` — it calls ``.difference_update`` on it before the save), and
-    ``getattr(loop, "trial_key_metadata_path", None)``.  A bare
-    ``MagicMock()`` attribute is truthy, so leaving
-    ``trial_key_metadata_path`` unset would silently route the write to a
-    mock path instead of ``config.key_metadata_path``.
+    The handler calls ``loop.promoted_keys.difference_update(erased_keys)``
+    directly (independent of the key-metadata write), so this must be a real
+    ``set`` rather than an auto-generated ``MagicMock`` attribute.  The
+    subsequent ``loop.write_key_metadata()`` call is itself a mock on these
+    ``MagicMock`` loops and never touches the filesystem, so no destination
+    wiring is needed here.
     """
     loop.promoted_keys = set()
-    loop.cycle_count = 0
-    loop.trial_key_metadata_path = None
 
 
 def _make_peft_model(*adapter_names: str) -> MagicMock:
@@ -129,11 +127,12 @@ def _make_loop_with_store(store: MemoryStore) -> MagicMock:
 
     Used by tests that need real store mutation semantics (registry, entry,
     bookkeeping, simhash) but drive everything else on the loop through a
-    mock.  Pre-wires the three attributes ``_save_key_metadata`` requires
-    (see :func:`_prep_loop_for_save_key_metadata`) so the handler's
-    post-erase ``loop.promoted_keys.difference_update(...)`` +
-    ``_save_key_metadata(loop, config)`` call does not crash on mock
-    plumbing unrelated to the behaviour under test.
+    mock.  Pre-wires ``loop.promoted_keys`` as a real ``set`` (see
+    :func:`_prep_loop_promoted_keys`) so the handler's post-erase
+    ``loop.promoted_keys.difference_update(...)`` call does not crash on mock
+    plumbing unrelated to the behaviour under test; the subsequent
+    ``loop.write_key_metadata()`` call is itself a mock on this ``MagicMock``
+    loop.
 
     Also wires ``loop.model`` (a bare, non-PEFT ``MagicMock`` by default —
     ``detach_adapters`` no-ops on it) and ``loop.ensure_adapters`` (returns
@@ -145,7 +144,7 @@ def _make_loop_with_store(store: MemoryStore) -> MagicMock:
     """
     loop = MagicMock()
     loop.store = store
-    _prep_loop_for_save_key_metadata(loop)
+    _prep_loop_promoted_keys(loop)
     loop.model = MagicMock()
     loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
     return loop
@@ -166,15 +165,14 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     ``store.discard_keys(keys, mode="erase")`` (the shared helper).  Tests verify
     that the helper is called with the correct arguments.
 
-    Also pre-wires what the handler's post-erase ``_save_key_metadata(loop,
-    config)`` call needs: the three attributes from
-    :func:`_prep_loop_for_save_key_metadata`, plus
-    ``store.all_known_keys.return_value = []`` (``_save_key_metadata``
-    iterates it; an unconfigured ``MagicMock()`` call result is not
-    iterable).
+    Also pre-wires what the handler's post-erase
+    ``loop.promoted_keys.difference_update(...)`` call needs (see
+    :func:`_prep_loop_promoted_keys`); the subsequent
+    ``loop.write_key_metadata()`` call is itself a mock on this ``MagicMock``
+    loop.
     """
     loop = MagicMock()
-    _prep_loop_for_save_key_metadata(loop)
+    _prep_loop_promoted_keys(loop)
     loop.model = MagicMock()
     loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
 
@@ -182,7 +180,6 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     # The handler iterates all records and filters by record.get("speaker_id").
     bk_records = [(k, {"speaker_id": speaker_id, "relation_type": "episodic"}) for k in keys]
     loop.store.iter_bookkeeping.return_value = iter(bk_records)
-    loop.store.all_known_keys.return_value = []
 
     # Per-tier KeyRegistry mocks.
     ep_registry = MagicMock(spec=KeyRegistry)
@@ -1382,8 +1379,18 @@ class TestFullRetirement:
 
     def test_promoted_keys_and_key_metadata_rewritten(self, tmp_path, monkeypatch):
         """loop.promoted_keys drops the forgotten key and key_metadata.json on
-        disk is rewritten without it; a surviving key is untouched."""
+        disk is rewritten without it; a surviving key is untouched.
+
+        Uses a real ``ConsolidationLoop`` stub (``object.__new__``) rather
+        than ``_make_loop_with_store``'s ``MagicMock``: the handler's
+        post-erase call now calls ``ConsolidationLoop.write_key_metadata``
+        directly (the fold's own durable writer), and a ``MagicMock``'s
+        ``write_key_metadata`` is itself a mock that never touches the store
+        or the filesystem, so no file would be written at all — this test
+        needs the real method to run.
+        """
         from paramem.backup.encryption import read_maybe_encrypted
+        from paramem.training.consolidation import ConsolidationLoop
 
         speaker_id = "speaker0"
         forgotten = "graph1"
@@ -1409,10 +1416,23 @@ class TestFullRetirement:
             surviving, speaker_id="speaker1", relation_type="factual", first_seen=""
         )
 
-        loop = _make_loop_with_store(real_store)
-        loop.promoted_keys = {forgotten, surviving}
-
         cfg = _make_config(tmp_path)
+
+        # Minimal real ConsolidationLoop stub — object.__new__ so no model
+        # or GPU is needed.  Wires the same attributes _make_loop_with_store
+        # pre-wires (store, model, ensure_adapters) so _reap_emptied_tiers'
+        # dependencies resolve identically if this erase ever empties a
+        # tier.  ``_key_metadata_path`` is threaded explicitly from
+        # ``cfg.key_metadata_path`` — the same resolution every production
+        # construction site performs via ``create_consolidation_loop`` —
+        # since ``write_key_metadata`` has no config-fallback of its own.
+        loop = object.__new__(ConsolidationLoop)
+        loop.store = real_store
+        loop.cycle_count = 0
+        loop.model = MagicMock()
+        loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
+        loop.promoted_keys = {forgotten, surviving}
+        loop._key_metadata_path = cfg.key_metadata_path
         state = _make_state(
             tmp_path,
             loop=loop,

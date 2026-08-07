@@ -17,6 +17,7 @@ from paramem.memory.entry import (
     assign_keys,
     build_registry,
     compute_simhash,
+    content_only_entry,
     entry_simhash,
     format_entry_training,
     parse_recalled_entry,
@@ -334,6 +335,69 @@ class TestEntrySimhash:
         registry = {entry["key"]: divergent_surface_fp}
         assert verify_confidence(entry, registry) < 1.0
         assert entry_simhash(entry) != divergent_surface_fp
+
+
+# --- content_only_entry ---
+
+
+class TestContentOnlyEntry:
+    """content_only_entry projects a working entry down to the store's
+    content-only shape — every store.put call site routes through it so a
+    fresh fold and a resumed fold write the identical entry shape."""
+
+    def test_drops_provenance_fields(self):
+        """speaker_id, relation_type, and any other extra field (e.g. the
+        _new mint sentinel) are dropped; only the four content fields survive."""
+        entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+            "speaker_id": "speaker0",
+            "relation_type": "factual",
+            "_new": True,
+        }
+        assert content_only_entry(entry) == {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
+
+    def test_already_content_only_entry_is_unchanged(self):
+        """A dict that already carries only the four content fields round-trips
+        through unchanged (content-only puts already have this shape)."""
+        entry = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
+        assert content_only_entry(entry) == entry
+
+    def test_returns_a_new_dict_not_the_same_object(self):
+        """The projection must not alias the input — mutating the result must
+        not mutate the caller's working entry (e.g. tier_keyed's own copy)."""
+        entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+            "speaker_id": "speaker0",
+        }
+        projected = content_only_entry(entry)
+        projected["subject"] = "Bob"
+        assert entry["subject"] == "Alice", "projection must not alias the input entry"
+
+    def test_simhash_of_projection_matches_original(self):
+        """entry_simhash reads only key/subject/predicate/object, so the
+        projected entry hashes identically to the fat working entry it was
+        built from — the invariant every mint-site store.put call relies on
+        (project first, hash the same content either way)."""
+        entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+            "speaker_id": "speaker0",
+            "relation_type": "factual",
+        }
+        assert entry_simhash(content_only_entry(entry)) == entry_simhash(entry)
 
 
 # --- verify_confidence ---

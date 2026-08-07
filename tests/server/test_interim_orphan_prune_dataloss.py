@@ -152,7 +152,7 @@ class TestInterimOrphanPruneDataLoss:
 
 class TestSoftStaleBookkeepingRetention:
     """Soft-staled keys' bookkeeping must survive prune_key_metadata_orphans
-    and be persisted by _save_key_metadata.
+    and be persisted by ConsolidationLoop.write_key_metadata.
 
     A stale key is absent from list_active() but present in list_stale().  Before
     the soft-stale fix, the retention union only included active keys, so a
@@ -212,17 +212,24 @@ class TestSoftStaleBookkeepingRetention:
         assert "active1" in kept, "active1 must be retained by prune"
         assert "stale1" in kept, "stale1 (soft-staled) must NOT be pruned"
 
-    def test_save_key_metadata_persists_stale_key_bookkeeping(self, tmp_path):
-        """_save_key_metadata persists bookkeeping for both active and stale keys.
+    def test_write_key_metadata_persists_stale_key_bookkeeping(self, tmp_path):
+        """write_key_metadata persists bookkeeping for both active and stale keys.
 
         Builds a MemoryStore with one active key and one stale key, sets bookkeeping
-        for both, then calls _save_key_metadata and verifies the output file carries
-        both.
-        """
-        from unittest.mock import MagicMock
+        for both, then calls loop.write_key_metadata() and verifies the output file
+        carries both.
 
+        ``ConsolidationLoop.write_key_metadata`` is the fold's own durable
+        writer (see paramem/training/consolidation.py), so *loop* must be a
+        real instance (or a bare object.__new__ stub carrying the attributes
+        that method reads), not a MagicMock: a MagicMock's
+        ``write_key_metadata`` is itself a mock and never touches the store,
+        so no file would be written at all.  ``write_key_metadata`` iterates
+        ``store.all_known_keys()`` (active UNION stale — see
+        MemoryStore.all_known_keys).
+        """
         from paramem.memory.store import MemoryStore
-        from paramem.server.consolidation import _save_key_metadata
+        from paramem.training.consolidation import ConsolidationLoop
 
         store = MemoryStore(replay_enabled=True)
         store.put(
@@ -249,22 +256,23 @@ class TestSoftStaleBookkeepingRetention:
         km_path = tmp_path / "registry" / "key_metadata.json"
         km_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build a minimal ConsolidationLoop mock.
-        loop = MagicMock()
+        # Minimal real ConsolidationLoop stub — object.__new__ so no model
+        # or GPU is needed.  ``_key_metadata_path`` is threaded explicitly
+        # from *km_path* — the same resolution every production construction
+        # site performs via ``create_consolidation_loop`` — since
+        # ``write_key_metadata`` has no config-fallback of its own.
+        loop = object.__new__(ConsolidationLoop)
         loop.store = store
         loop.cycle_count = 1
         loop.promoted_keys = set()
-        loop.trial_key_metadata_path = None
+        loop._key_metadata_path = km_path
 
-        cfg = MagicMock()
-        cfg.key_metadata_path = km_path
-
-        _save_key_metadata(loop, cfg)
+        loop.write_key_metadata()
 
         saved = _read_key_metadata(km_path)
         keys = saved["keys"]
-        assert "active1" in keys, "active1 must be persisted by _save_key_metadata"
-        assert "stale1" in keys, "stale1 (soft-staled) must be persisted by _save_key_metadata"
+        assert "active1" in keys, "active1 must be persisted by write_key_metadata"
+        assert "stale1" in keys, "stale1 (soft-staled) must be persisted by write_key_metadata"
         assert keys["stale1"]["relation_type"] == "preference", (
             "stale1 bookkeeping must include the original relation_type"
         )

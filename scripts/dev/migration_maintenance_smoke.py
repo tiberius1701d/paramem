@@ -502,7 +502,7 @@ def _registry_key_count(config: Any) -> int:
     """Return the number of indexed keys in the sandbox registry.
 
     Reads ``key_metadata.json`` (written by
-    ``paramem.server.consolidation._save_key_metadata``) from
+    ``ConsolidationLoop.write_key_metadata``) from
     ``config.key_metadata_path``.  The on-disk schema is
     ``{"cycle_count", "promoted_keys", "keys": {<key>: {...}}}`` — the indexed
     key count is ``len(data["keys"])``, NOT ``len(data)`` (which is the number
@@ -513,7 +513,7 @@ def _registry_key_count(config: Any) -> int:
     from paramem.backup.encryption import read_maybe_encrypted
 
     # config.key_metadata_path is <data>/registry/key_metadata.json — the exact
-    # path _save_key_metadata writes (config.py:393).
+    # path write_key_metadata writes (config.py:393).
     key_metadata_path = config.key_metadata_path
     if not key_metadata_path.exists():
         return 0

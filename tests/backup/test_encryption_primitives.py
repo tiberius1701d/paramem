@@ -208,6 +208,72 @@ class TestSecurityOffRoundtrip:
 
 
 # ---------------------------------------------------------------------------
+# write_infra_json — the one chokepoint for JSON-shaped infrastructure files
+# ---------------------------------------------------------------------------
+
+
+class TestWriteInfraJson:
+    """write_infra_json = json.dumps(..., indent=2) + parent mkdir +
+    write_infra_bytes — the single writer collapsed from the former
+    byte-identical duplicates in paramem.server.consolidation and
+    paramem.training.consolidation."""
+
+    def test_roundtrip_dict_plaintext(self, tmp_path, monkeypatch):
+        import json
+
+        from paramem.backup.encryption import write_infra_json
+
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", tmp_path / "absent.age"
+        )
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+        _clear_daily_identity_cache()
+
+        target = tmp_path / "infra.json"
+        data = {"cycle_count": 5, "promoted_keys": ["graph1"], "keys": {}}
+        write_infra_json(target, data)
+
+        assert target.read_text() == json.dumps(data, indent=2)
+        assert json.loads(read_maybe_encrypted(target).decode("utf-8")) == data
+
+    def test_roundtrip_list_encrypted_when_daily_loaded(self, tmp_path, monkeypatch):
+        """Same envelope posture as write_infra_bytes -- age-wrapped when a
+        daily identity is loaded -- for a list payload too."""
+        import json
+
+        from paramem.backup.age_envelope import AGE_MAGIC
+
+        _setup_daily(tmp_path, monkeypatch)
+
+        from paramem.backup.encryption import write_infra_json
+
+        target = tmp_path / "infra.json"
+        write_infra_json(target, [1, 2, 3])
+
+        assert target.read_bytes().startswith(AGE_MAGIC)
+        assert json.loads(read_maybe_encrypted(target).decode("utf-8")) == [1, 2, 3]
+
+    def test_creates_missing_parent_directory(self, tmp_path, monkeypatch):
+        """write_infra_bytes requires the parent to already exist;
+        write_infra_json's whole reason to exist is doing that for the
+        caller."""
+        from paramem.backup.encryption import write_infra_json
+
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", tmp_path / "absent.age"
+        )
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+        _clear_daily_identity_cache()
+
+        target = tmp_path / "nested" / "registry" / "key_metadata.json"
+        assert not target.parent.exists()
+
+        write_infra_json(target, {"ok": True})
+
+        assert target.exists()
+
+
+# ---------------------------------------------------------------------------
 # assert_mode_consistency — age-only two-case matrix
 # ---------------------------------------------------------------------------
 

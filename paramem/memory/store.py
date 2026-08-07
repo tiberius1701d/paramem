@@ -49,18 +49,19 @@ last_seen, first_seen}}`` dict SEPARATE from ``_entries``.  Populated by
 :meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
 Never enters :meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash path.
 
-**ARCHITECTURAL NOTE — save-path working entries:**
-The "pure content cache" rule binds the INFERENCE cache (boot preload +
-on-miss memoize).  The consolidation cycle's own TRAIN/SIMULATE working
-entries — written by :meth:`put` at ``consolidation.py:1488,2555,2785,2874``
-from ``_cache_entry`` — DO legitimately carry ``speaker_id``.
-They are working entries consumed by :func:`persistence.build_graph_for_tier`
-within the same cycle.  A future reader must NOT "purify" save-path entries by
-stripping those fields — that would break ``build_graph_for_tier``.
+**Content-only invariant:**
+Every ``_entries`` slot — whether written by the INFERENCE cache (boot
+preload + on-miss memoize) or by consolidation's own mint/resume/promotion
+writes — carries exactly ``{key, subject, predicate, object}``, projected via
+:func:`~paramem.memory.entry.content_only_entry` at every ``store.put`` call
+site.  Per-key provenance (``speaker_id``, ``relation_type``, ...) lives
+exclusively in :attr:`MemoryStore._bookkeeping`:
+:func:`~paramem.memory.persistence.build_tier_graph_from_store` reads
+``speaker_id`` from ``store.bookkeeping_for_key``, never from the entry.
 
-All ``store.get`` readers in ``consolidation.py`` were audited.  The
-SPO-only readers at ``:1819``, ``:2167``, ``:3474`` are NOT bookkeeping sites
-and become strictly safer post-fix (they can only find a real content entry).
+All ``store.get`` readers in ``consolidation.py`` are SPO-only readers, not
+bookkeeping sites; a fresh fold and a resumed fold write the identical entry
+shape.
 
 Snapshot / restore (:meth:`snapshot`, :meth:`restore`) capture the entry and
 simhash fingerprint state for the cycle-resume rollback rope.  The simhash map
@@ -156,11 +157,10 @@ class MemoryStore:
         # (not plain Lock) is required because compound mutators call wrapped
         # leaf methods reentrantly (move→tier_of, delete→leaf readers, etc.).
         self._lock = threading.RLock()
-        # tier -> key -> entry payload dict.  PURE INFERENCE CONTENT CACHE —
-        # an entry slot exists only when SPO is materialised.  See module
-        # docstring for the "save-path working entries" exception.
-        # SAVE-PATH SITES (authorised store.put callers that write entries):
-        #   1. consolidation.py run_cycle / ingest path — new key registration.
+        # tier -> key -> entry payload dict.  PURE CONTENT CACHE — an entry
+        # slot exists only when SPO is materialised, and it is always
+        # content-only ({key, subject, predicate, object}).  See the module
+        # docstring's "Content-only invariant" section.
         self._entries: dict[str, dict[str, dict]] = {}
         # tier -> KeyRegistry — ALWAYS present (never None).  replay_enabled
         # controls whether key lifecycle is recorded, not whether the structure
@@ -1029,10 +1029,10 @@ class MemoryStore:
         work would stall every concurrent store reader for the duration of the
         GPU call.  All reads inside probe go through individually locked leaf
         methods — ``self.get``, ``self.bookkeeping_for_key``, ``self.simhash``,
-        ``self._tier_for_simhash``, ``self.put``, ``self.set_bookkeeping`` —
-        so no raw access to ``_entries``, ``_registry``, or ``_bookkeeping``
-        is made.  Each read acquires and releases the lock independently; the
-        lock is never held across the GPU call.
+        ``self._tier_for_simhash``, ``self.put`` — so no raw access to
+        ``_entries``, ``_registry``, or ``_bookkeeping`` is made.  Each read
+        acquires and releases the lock independently; the lock is never held
+        across the GPU call.
 
         Cache hits are served directly from the store.  Misses are delegated
         to *source* (a :class:`paramem.memory.source.MemorySource`)
@@ -1044,17 +1044,16 @@ class MemoryStore:
         speaker.  Callers pass already speaker-scoped keys; the router's
         per-speaker key intersection
         (:attr:`~paramem.server.router.QueryRouter._speaker_key_index`) is
-        the single privacy boundary, and no dict probe returns carries a
-        ``speaker_id`` field.  Speaker attribution flows only source →
-        bookkeeping (the registry), never source → caller — the disk-source
-        provenance a source result may carry feeds only the bookkeeping
-        backfill below.  Cache hits render to exactly ``{key, subject,
-        predicate, object, confidence, fact_text, raw_output}``;
-        source-served hits pass through the source's own dict minus
-        ``speaker_id`` (a denylist strip, not an allowlist projection) and
-        so may carry other non-speaker fields the source attached (e.g.
-        ``answer``, see ``inference.py``).  Misses (or source-failure dicts
-        carrying ``failure_reason``) pass through unrendered.
+        the single privacy boundary.  No memory source emits ``speaker_id``
+        — a source result is content only (plus its own derived fields), so
+        no dict probe returns carries one either.  Speaker attribution lives
+        exclusively in ``_bookkeeping``, written by consolidation at fold
+        time; probe never writes it.  Cache hits render to exactly ``{key,
+        subject, predicate, object, confidence, fact_text, raw_output}``;
+        source-served hits pass through the source's own dict (which may
+        carry other fields the source attached, e.g. ``answer``, see
+        ``inference.py``).  Misses (or source-failure dicts carrying
+        ``failure_reason``) pass through unrendered.
 
         ``fact_text`` renders raw ``speaker{N}`` tokens verbatim in both
         render paths (cache-hit via ``entry_fact_text`` + source passthrough).
@@ -1203,14 +1202,10 @@ class MemoryStore:
                     if src_confidence is not None:
                         src = dict(src)
                         src["confidence"] = src_confidence
-                    # No dict returned by probe carries a speaker_id key — a
-                    # denylist strip (not an allowlist projection) because
-                    # mocked/legacy source results may carry other provenance
-                    # fields (e.g. ``answer``, see inference.py).  ``src``
-                    # itself (with speaker_id intact) is still used below for
-                    # the bookkeeping backfill, the sanctioned source →
-                    # registry transport.
-                    results[key] = {k: v for k, v in src.items() if k != "speaker_id"}
+                    # No source emits speaker_id (content-only contract, see
+                    # MemorySource docstring), so no denylist strip is needed
+                    # here — the source result passes through as-is.
+                    results[key] = dict(src)
                     if memoize:
                         # Stash the raw SPO entry back into the cache (content only).
                         # Register=False — the registry was established at boot.
@@ -1221,26 +1216,6 @@ class MemoryStore:
                             "object": src.get("object", ""),
                         }
                         self.put(tier, key, raw_entry, register=False)
-                        # Back-fill _bookkeeping when the source carried provenance
-                        # and the key wasn't already bookkept (cold key not in
-                        # key_metadata.json at boot — disk source path).  No-op on
-                        # the weight path (WeightMemorySource carries no speaker_id).
-                        # relation_type is not carried by the probe source; default
-                        # to "unknown" — the backfill job corrects it on first
-                        # consolidation cycle.
-                        if self.bookkeeping_for_key(key) is None:
-                            src_spk = src.get("speaker_id", "")
-                            if src_spk:
-                                self.set_bookkeeping(
-                                    key,
-                                    speaker_id=src_spk,
-                                    relation_type=src.get("relation_type", "unknown"),
-                                    reinforcement_count=1,
-                                    last_reinforced_cycle=0,
-                                    last_seen=src.get("last_seen", ""),
-                                    first_seen=src.get("first_seen", ""),
-                                    allow_empty_speaker=True,
-                                )
 
         return results
 
@@ -1413,7 +1388,7 @@ class MemoryStore:
 
         Each persisted record is splatted whole into :meth:`set_bookkeeping`
         (``self.set_bookkeeping(key, **key_meta, allow_empty_speaker=True)``).
-        The write side (``_save_key_metadata``) persists ``dict(bk)`` from
+        The write side (``ConsolidationLoop.write_key_metadata``) persists ``dict(bk)`` from
         :meth:`bookkeeping_for_key` verbatim, so the on-disk record always
         carries exactly the fields :meth:`set_bookkeeping` requires — there
         is no hand-listed field projection or legacy-fill tolerance on either

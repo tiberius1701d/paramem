@@ -12,7 +12,6 @@ GPU lifecycle (service-level):
 import argparse
 import asyncio
 import functools
-import hashlib as _hashlib
 import json
 import logging
 import os
@@ -100,7 +99,10 @@ from paramem.server.vram_validator import (
     estimate_tts_bytes,
     format_baseline_fit,
 )
-from paramem.training.consolidation import AbortedDuringConsolidation
+from paramem.training.consolidation import (
+    AbortedDuringConsolidation,
+    RegistryBookkeepingDivergence,
+)
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
 from paramem.utils.identity import canonical as _canonical
 from paramem.utils.identity import is_speaker_id as _is_speaker_id
@@ -5608,7 +5610,8 @@ def _build_store_contents(
         ``new_registry``: ``dict[tier, KeyRegistry]``
         ``new_bookkeeping``: ``dict[key, bookkeeping_record]``
         ``stats``: ``{"boot_degraded": dict | None, "store_load_degraded": bool,
-                      "meta_loaded": int, "meta_orphaned": int}``
+                      "meta_loaded": int, "meta_orphaned": int,
+                      "meta_unbookkept": int}``
     """
     from paramem.memory.source import build_memory_source as _build_memory_source
     from paramem.memory.store import MemoryStore as _MemoryStore
@@ -5618,6 +5621,7 @@ def _build_store_contents(
         "store_load_degraded": False,
         "meta_loaded": 0,
         "meta_orphaned": 0,
+        "meta_unbookkept": 0,
     }
 
     # ------------------------------------------------------------------ #
@@ -5730,7 +5734,18 @@ def _build_store_contents(
                         if _entry is None or "failure_reason" in _entry:
                             _missed_by_tier.setdefault(_tier, []).append(_key)
                             continue
-                        new_entries.setdefault(_tier, {})[_key] = _entry
+                        # Content-only projection — the source result may carry
+                        # provenance/derived fields (confidence, fact_text,
+                        # raw_output, and historically speaker_id); the store's
+                        # entry cache holds SPO content only, exactly as the
+                        # probe-time memoize path writes it, so this staging
+                        # write and every ``store.probe`` write agree on shape.
+                        new_entries.setdefault(_tier, {})[_key] = {
+                            "key": _key,
+                            "subject": _entry.get("subject", ""),
+                            "predicate": _entry.get("predicate", ""),
+                            "object": _entry.get("object", ""),
+                        }
                         _hits += 1
                 logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
                 if _hits < _total:
@@ -5789,10 +5804,19 @@ def _build_store_contents(
         new_bookkeeping = dict(_tmp_store.iter_bookkeeping())
         stats["meta_loaded"] = _meta_stats["loaded"]
         stats["meta_orphaned"] = _meta_stats["orphaned"]
+        # Inverse direction of "orphaned": active registry keys that have NO
+        # bookkeeping row at all (registry_bookkeeping_divergence surfaced
+        # at boot).  Detect-and-surface only — never blocks or degrades
+        # boot; the fold-time integrity gate
+        # (ConsolidationLoop._assert_registry_bookkeeping_parity) is what
+        # prevents new divergence from being written.
+        _active_keys = {key for _reg in new_registry.values() for key in _reg.list_active()}
+        stats["meta_unbookkept"] = len(_active_keys - set(new_bookkeeping))
         logger.info(
-            "load_bookkeeping_from_disk: loaded=%d orphaned=%d",
+            "load_bookkeeping_from_disk: loaded=%d orphaned=%d unbookkept=%d",
             _meta_stats["loaded"],
             _meta_stats["orphaned"],
+            stats["meta_unbookkept"],
         )
     except Exception:
         logger.exception(
@@ -7868,6 +7892,127 @@ def _reap_emptied_tiers(loop, tier_roots: dict[str, Path]) -> tuple[list[str], l
     return unloaded, sorted(removed_dirs)
 
 
+def _erase_keys_with_reap(*, loop, config, erased_keys: list[str], label: str) -> dict:
+    """Hard-erase *erased_keys* from the store and settle every downstream
+    bookkeeping consequence — the shared post-erase sequence used by both
+    ``POST /speaker/forget`` and ``POST /debug/erase-keys``.
+
+    Remove keys from every per-tier ``KeyRegistry`` (in-memory + disk), their
+    cached entry payload, and their bookkeeping record.  Uses
+    ``store.discard_keys(mode="erase")``, which delegates to
+    :meth:`~paramem.memory.store.MemoryStore.delete` per key: entries,
+    registry (active + stale + simhash) and bookkeeping are dropped in
+    lockstep across every tier — the same full retirement ``delete()``/
+    ``drop_tier()`` perform elsewhere.  This is a HARD erasure (privacy /
+    right-to-forget); soft-stale is wrong here (the record must be GONE,
+    including the simhash).  ``erase_keys_and_restamp_manifest`` additionally
+    erases the fact content from each affected tier's on-disk ``graph.json``
+    (:func:`~paramem.memory.persistence.erase_keys_from_graph_file`) and
+    re-stamps a surviving tier's weight-slot manifest so ``find_live_slot``
+    rebinds it on restart — the single shared implementation for every
+    out-of-fold registry-mutation caller (see its docstring for the full
+    ordering and the venue/empty-hash guards near the re-stamp).
+
+    A tier the erase reduces to zero known keys is reaped instead of
+    re-stamped (:func:`_reap_emptied_tiers`) — EMPTIED tiers have no slot
+    left to bind.  A soft-staled tier can never land here: the fold's
+    soft-stale sites use ``discard_keys(mode="stale")``, which keeps keys in
+    the stale partition, and ``KeyRegistry.list_known`` is active ∪ stale —
+    only a tier THIS erase's own hard erase touched can read as zero-known.
+    Ring-lifecycle incidents are resolved when the erase empties the interim
+    ring entirely, mirroring ``POST /interim/discard``'s own resolution.
+
+    Retires the erased keys from ``loop.promoted_keys`` and rewrites
+    ``key_metadata.json`` once, AFTER the reap so ``all_known_keys()``
+    reflects any dropped tiers — without this a forgotten-but-promoted key
+    survives on disk until restart (``training/consolidation.py`` filters
+    ``promoted_keys`` against ``is_known()`` on load, not on save).  A no-op
+    (no store mutation, no metadata write) when *erased_keys* is empty.
+
+    Args:
+        loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`,
+            re-resolved by the caller against the current ``_state["config"]``
+            (door-staleness safe).
+        config: The live server config the caller re-resolved alongside *loop*.
+        erased_keys: Keys to hard-erase; sorted, may be empty.
+        label: Short caller identifier folded into the malformed-tier-name
+            error detail, the ring-incident resolution reason, and its
+            failure log line — so a divergence-repair erase and a speaker
+            forget are distinguishable in logs and error bodies without a
+            second copy of this sequence.
+
+    Returns:
+        dict with ``erased_keys`` (echoes the input), ``reaped_tiers``,
+        ``unloaded_adapters``, and ``removed_dirs`` — the same shape
+        :func:`_reap_emptied_tiers` reports, empty when nothing was reaped.
+
+    Raises:
+        HTTPException: 500 ``malformed_tier_name`` when a key belongs to a
+            tier whose on-disk slot root cannot be resolved
+            (:func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`
+            propagated from
+            :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`),
+            raised before any mutation.
+    """
+    reaped_tiers: list[str] = []
+    unloaded_adapters: list[str] = []
+    removed_dirs: list[str] = []
+
+    if erased_keys:
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_interim_dirs
+        from paramem.memory.persistence import erase_keys_and_restamp_manifest
+
+        try:
+            emptied_tiers = erase_keys_and_restamp_manifest(
+                store=loop.store,
+                adapter_dir=config.adapter_dir,
+                keys=erased_keys,
+            )
+        except ValueError as exc:
+            # adapter_slot_root_for_name raises ValueError on a malformed
+            # interim tier name — resolved (and this raised) BEFORE any
+            # mutation, so a bad name never leaves the store half-erased
+            # with nothing persisted.
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "malformed_tier_name",
+                    "detail": f"{label}: {exc}",
+                },
+            ) from exc
+
+        if emptied_tiers:
+            reaped_tiers = sorted(emptied_tiers)
+            unloaded_adapters, removed_dirs = _reap_emptied_tiers(loop, emptied_tiers)
+
+            any_interim_reaped = any(t.startswith(INTERIM_NAME_PREFIX) for t in reaped_tiers)
+            if any_interim_reaped and next(iter_interim_dirs(config.adapter_dir), None) is None:
+                state_dir = config.paths.data / "state"
+                for _type in _RING_LIFECYCLE_INCIDENT_TYPES:
+                    try:
+                        resolve_incidents_by_type(
+                            state_dir,
+                            _type,
+                            reason=f"interim ring emptied by {label}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "%s: ring-incident resolution failed for %s (non-fatal)",
+                            label,
+                            _type,
+                        )
+
+        loop.promoted_keys.difference_update(erased_keys)
+        loop.write_key_metadata()
+
+    return {
+        "erased_keys": erased_keys,
+        "reaped_tiers": sorted(reaped_tiers),
+        "unloaded_adapters": unloaded_adapters,
+        "removed_dirs": removed_dirs,
+    }
+
+
 # Verdict → (HTTP error code, human message) for POST /speaker/forget's busy
 # guard. Reuses _consolidation_dispatch_guards() — the single predicate for
 # "is a memory-mutating operation safe now" — rather than re-implementing the
@@ -8050,251 +8195,9 @@ async def speaker_forget(request: SpeakerForgetRequest):
         # a stale pre-lock capture (door staleness race).
         config = _state["config"]
         loop = _get_or_create_consolidation_loop(config)
-
-        reaped_tiers: list[str] = []
-        unloaded_adapters: list[str] = []
-        removed_dirs: list[str] = []
-
-        # Remove keys from every per-tier KeyRegistry (in-memory + disk), their
-        # cached entry payload, and their bookkeeping record.  Uses
-        # store.discard_keys(mode="erase"), which now delegates to
-        # MemoryStore.delete per key: entries, registry (active + stale +
-        # simhash) and bookkeeping are dropped in lockstep across every tier,
-        # the same full retirement delete()/drop_tier() perform elsewhere.  This
-        # is a HARD erasure (privacy / right-to-forget); soft-stale is wrong here
-        # (the record must be GONE, including the simhash).  The per-tier loop
-        # below additionally erases the fact content from each tier's on-disk
-        # graph.json (persistence.erase_keys_from_graph_file) — the store-level
-        # erase above only ever mutated RAM/registry.
-        if erased_keys:
-            from paramem.adapters.manifest import count_slot_candidates, tier_registry_sha256
-            from paramem.memory.interim_adapter import (
-                INTERIM_NAME_PREFIX,
-                adapter_slot_root_for_name,
-                iter_interim_dirs,
-            )
-            from paramem.memory.persistence import erase_keys_from_graph_file
-
-            # Determine which tiers are affected BEFORE the erase so we know
-            # which registry files to persist after.  The erase removes the keys
-            # from _active_keys (and _stale); checking membership afterward returns
-            # False, making it impossible to detect the tiers post-mutation.
-            # _tier_root's keys ARE the affected-tier set — no separate list.
-            _tier_root: dict[str, Path] = {}
-            _tier_pre_sha: dict[str, str] = {}
-            for _tier_name in loop.store.tiers_with_registry():
-                _reg = loop.store.registry(_tier_name)
-                if any(_reg.knows(k) for k in erased_keys):
-                    # Resolve the tier's on-disk slot root BEFORE the erase mutates
-                    # RAM. adapter_slot_root_for_name raises ValueError on a
-                    # malformed interim tier name — abort here, before any
-                    # mutation, so a bad name never leaves the store half-erased
-                    # with nothing persisted.
-                    try:
-                        _root = adapter_slot_root_for_name(config.adapter_dir, _tier_name)
-                    except ValueError as exc:
-                        raise HTTPException(
-                            status_code=500,
-                            detail={
-                                "status": "malformed_tier_name",
-                                "detail": f"speaker/forget: cannot resolve slot root for "
-                                f"tier {_tier_name!r}: {exc}",
-                            },
-                        ) from exc
-                    _tier_root[_tier_name] = _root
-                    # Read the PRE-ERASE hash from disk, not from re-serialising the
-                    # in-memory registry: the manifest was stamped against whatever
-                    # bytes `_save_adapters` last wrote, and only the on-disk file
-                    # is guaranteed to still hold that exact payload shape. Hashing
-                    # the in-memory registry instead would silently diverge from
-                    # the stamped manifest hash across ANY future KeyRegistry
-                    # payload-shape change (e.g. a field added to or dropped from
-                    # save_bytes()) landing between the last fold and this call —
-                    # orphaning the slot (find_live_slot below returns None,
-                    # unmountable at next restart) even though nothing on disk
-                    # actually changed.
-                    _tier_pre_sha[_tier_name] = tier_registry_sha256(_root)
-
-            loop.store.discard_keys(erased_keys, mode="erase")
-
-            # Persist updated registries for affected tiers, then fork per tier
-            # on whether it still knows any key: a survivor gets today's manifest
-            # re-stamp; a tier reduced to zero known keys has no slot left to
-            # bind, so it is reaped below instead of re-stamped.
-            for tier_name, tier_root in _tier_root.items():
-                registry = loop.store.registry(tier_name)
-                tier_reg_path = tier_root / "indexed_key_registry.json"
-                # ORDERING IS LOAD-BEARING: registry.save (durable privacy erase) FIRST,
-                # then manifest re-stamp/reap.  A crash between the two leaves the slot in
-                # the same recoverable orphan state as today (find_live_slot returns None →
-                # preload 0/N), never in a slot bound to a registry that still lists the
-                # erased key.
-                registry.save(tier_reg_path)
-                # Erase the fact content itself from this tier's on-disk graph
-                # (simulate-mode venue; the train-mode venue is adapter weights,
-                # trimmed for a SURVIVING tier only by an operator-invoked
-                # /reconsolidate — see the WHY THIS IS HONEST note below — or
-                # by the reap below for a tier this erase emptied).
-                # Registry-first, content-second: the registry write above is
-                # already durable, so a crash between the two leaves an
-                # orphaned graph edge no reader can resolve (payload ⊇
-                # registry is the only shape every reader — DiskMemorySource,
-                # build_tier_graph_from_store, boot preload — is defended
-                # against).  A no-op (returns 0, no write) when graph.json
-                # does not exist.
-                erase_keys_from_graph_file(tier_root / "graph.json", keys)
-
-                if registry.list_known():
-                    # SURVIVOR — re-stamp the live weight slot's manifest so
-                    # find_live_slot rebinds on restart.
-                    #
-                    # INVARIANT: any out-of-fold registry mutation must re-stamp the hash-matching
-                    # live slot, mirroring what the fold does via
-                    # build_manifest_for(registry_sha256_override=sha256(save_bytes())) in
-                    # consolidation.py::_save_adapters.
-                    #
-                    # WHY THIS IS HONEST: erase is removal-only; weights ⊇ active_keys remains
-                    # a valid serviceable state.  Forgetting a SURVIVING tier is
-                    # registry-level, not weight-level (owner decision, 2026-07-25): the
-                    # removed key is serve-filtered at the SimHash gate for good — under
-                    # the warm-init default, a routine fold keeps a resident tier's
-                    # weights, so it does NOT trim the erased key's residual weight
-                    # encoding.  The only trim door for a surviving tier is an
-                    # operator-invoked RECONCILE (`/reconsolidate`), which cold-rebuilds
-                    # each main tier from its live keys.  key_count in the manifest is
-                    # `len(store.all_active_keys())` as computed at the LAST fold's
-                    # `build_manifest_for` call (persistence.py:475) -- this out-of-fold
-                    # `_replace` below patches only `registry_sha256`, so key_count is
-                    # deliberately left at that last-fold value (now stale relative to the
-                    # post-erase store) rather than force-synced here, which would require
-                    # a full `build_manifest_for` call for a single-field patch.
-                    #
-                    # FUTURE: if a second out-of-fold registry-mutation caller is added (e.g. a
-                    # single-fact stale endpoint), extract this block into a shared helper in
-                    # paramem/adapters/manifest.py.
-                    _pre_sha = _tier_pre_sha[tier_name]
-                    # Venue gate: a weight-slot manifest (meta.json — the same signal
-                    # find_live_slot itself scans for) can only exist in the train
-                    # venue.  In the simulate venue (graph.json-only) tier_root holds
-                    # no timestamped slot subdirs at all, so find_live_slot always
-                    # returns None there — re-stamping is not "the slot is orphaned",
-                    # it is "there is no slot to re-stamp".  Gated on disk content
-                    # rather than config.consolidation.mode so an in-flight
-                    # simulate<->train migration (whose per-tier venue can transiently
-                    # differ from the configured mode) is judged by what is actually
-                    # on disk for THIS tier.  The registry save and graph erase above
-                    # are venue-agnostic and already ran regardless.
-                    _has_weight_slot = count_slot_candidates(tier_root) > 0
-                    if not _has_weight_slot:
-                        logger.debug(
-                            "speaker/forget: tier %s has no on-disk weight slot — skipping "
-                            "manifest re-stamp (simulate venue or never-trained tier)",
-                            tier_name,
-                        )
-                    elif _pre_sha == "":
-                        # No readable pre-erase registry on disk (absent or corrupt).
-                        # An empty hash would otherwise match any stray ""-stamped
-                        # slot (the fresh-install convention in find_live_slot) —
-                        # binding the re-stamp to the wrong slot is worse than
-                        # skipping it, so skip and surface the gap instead.
-                        logger.warning(
-                            "speaker/forget: tier %s had no readable pre-erase registry on disk "
-                            "(empty hash) — skipping manifest re-stamp to avoid binding a stray "
-                            '""-stamped slot; recover via consolidation fold or registry restore',
-                            tier_name,
-                        )
-                    else:
-                        from dataclasses import replace as _replace
-
-                        from paramem.adapters.manifest import (
-                            find_live_slot as _find_live_slot,
-                        )
-                        from paramem.adapters.manifest import (
-                            read_manifest as _read_manifest,
-                        )
-                        from paramem.adapters.manifest import (
-                            write_manifest as _write_manifest,
-                        )
-
-                        _h_new = _hashlib.sha256(registry.save_bytes()).hexdigest()
-                        _slot = _find_live_slot(tier_root, _pre_sha)
-                        if _slot is None:
-                            logger.error(
-                                "speaker/forget: tier %s live slot for pre-erase hash "
-                                "%s… not found — slot already orphaned; recover via "
-                                "consolidation fold or registry restore",
-                                tier_name,
-                                _pre_sha[:12],
-                            )
-                        else:
-                            _write_manifest(
-                                _slot, _replace(_read_manifest(_slot), registry_sha256=_h_new)
-                            )
-                    logger.info(
-                        "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
-                        tier_name,
-                        speaker_id,
-                    )
-                else:
-                    # EMPTIED — no slot left to bind; skip the re-stamp and reap
-                    # instead.  A soft-staled tier can never land here: the fold's
-                    # soft-stale sites use discard_keys(mode="stale"), which keeps
-                    # keys in the stale partition, and KeyRegistry.list_known is
-                    # active ∪ stale — only a tier THIS forget's own hard erase
-                    # touched can read as zero-known.
-                    logger.info(
-                        "speaker/forget: tier %s reduced to zero known keys for speaker %s — "
-                        "reaping instead of re-stamping",
-                        tier_name,
-                        speaker_id,
-                    )
-                    reaped_tiers.append(tier_name)
-
-            if reaped_tiers:
-                unloaded_adapters, removed_dirs = _reap_emptied_tiers(
-                    loop, {t: _tier_root[t] for t in reaped_tiers}
-                )
-
-                # Resolve the ring-lifecycle incidents when this forget emptied
-                # the interim ring entirely — mirrors POST /interim/discard's own
-                # resolution; the full-fold absorb path is the only other clear
-                # site, and this forget deliberately bypasses it.
-                any_interim_reaped = any(t.startswith(INTERIM_NAME_PREFIX) for t in reaped_tiers)
-                if any_interim_reaped and next(iter_interim_dirs(config.adapter_dir), None) is None:
-                    state_dir = config.paths.data / "state"
-                    for _type in _RING_LIFECYCLE_INCIDENT_TYPES:
-                        try:
-                            resolve_incidents_by_type(
-                                state_dir,
-                                _type,
-                                reason="interim ring emptied by speaker forget",
-                            )
-                        except Exception:
-                            logger.exception(
-                                "speaker/forget: ring-incident resolution failed for %s "
-                                "(non-fatal)",
-                                _type,
-                            )
-
-            # Retire the forgotten keys from promoted_keys and rewrite
-            # key_metadata.json once, AFTER the reap so all_known_keys()
-            # reflects any dropped tiers.  _save_key_metadata rebuilds "keys"
-            # from store.all_known_keys() (the erase already dropped them
-            # there), but writes sorted(loop.promoted_keys) verbatim —
-            # without this, a forgotten-but-promoted key survives on disk
-            # until restart (training/consolidation.py filters promoted_keys
-            # against is_known() on load, not on save).
-            loop.promoted_keys.difference_update(erased_keys)
-            from paramem.server.consolidation import _save_key_metadata
-
-            _save_key_metadata(loop, config)
-
-        return {
-            "erased_keys": erased_keys,
-            "reaped_tiers": sorted(reaped_tiers),
-            "unloaded_adapters": unloaded_adapters,
-            "removed_dirs": removed_dirs,
-        }
+        return _erase_keys_with_reap(
+            loop=loop, config=config, erased_keys=erased_keys, label="speaker/forget"
+        )
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -8570,7 +8473,6 @@ async def interim_discard(request: InterimDiscardRequest):
         )
 
     from paramem.memory.interim_adapter import unload_interim_adapters
-    from paramem.server.consolidation import _save_key_metadata
     from paramem.server.gpu_lock import gpu_lock
 
     state_dir = config.paths.data / "state"
@@ -8617,7 +8519,7 @@ async def interim_discard(request: InterimDiscardRequest):
         # as Step 6's swallow below).
         loop.promoted_keys.difference_update(discarded_keys)
         try:
-            _save_key_metadata(loop, config)
+            loop.write_key_metadata()
         except Exception:
             logger.exception("Post-discard key-metadata save failed (non-fatal)")
         # Step 4 — the ring's own incidents have no other clear site once
@@ -9090,6 +8992,241 @@ async def debug_dump():
         tiers=tiers,
         bookkeeping_total=store.bookkeeping_count(),
     )
+
+
+# --------------------------------------------------------------------------
+# Debug erase-keys endpoint — sanctioned repair tool for registry<->bookkeeping
+# divergence.  A key that is active in a registry but carries no bookkeeping
+# record is unreachable via POST /speaker/forget (it resolves its key set from
+# store.iter_bookkeeping()) and fails the consolidation integrity gate
+# (RegistryBookkeepingDivergence) while it exists.  This door takes the
+# explicit key list the operator already has (from /debug/dump output or the
+# boot "meta_unbookkept" log line — a count logged at startup, not exposed
+# through any endpoint) and erases exactly those — no wildcard, no speaker
+# derivation, no "erase everything divergent" mode.
+# --------------------------------------------------------------------------
+
+
+# Status code for POST /debug/erase-keys' unconfirmed refusal — the same
+# owner's-ruling reasoning as _INTERIM_DISCARD_UNCONFIRMED_STATUS: named here
+# rather than hard-coded so the handler, tests, and docs read one definition.
+_DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS: int = 409
+
+# Verdict → (HTTP error code, human message) for POST /debug/erase-keys' busy
+# guard.  Reuses _consolidation_dispatch_guards() — the single predicate for
+# "is a memory-mutating operation safe now" — rather than re-implementing the
+# four checks.  A THIRD map alongside _SPEAKER_FORGET_GUARD_VERDICTS and
+# _INTERIM_DISCARD_GUARD_VERDICTS: same reasoning — distinct operator-facing
+# prose per door.
+_DEBUG_ERASE_KEYS_GUARD_VERDICTS: dict[str, tuple[str, str]] = {
+    "deferred_already_running": (
+        "consolidating",
+        "Consolidation is running; wait for completion before erasing keys.",
+    ),
+    "deferred_cloud_only": (
+        "cloud_only",
+        "Server is in cloud-only mode; no local model or consolidation loop is available. "
+        "Reacquire the GPU (POST /gpu/acquire), then erase.",
+    ),
+    "deferred_bg_training": (
+        "training_active",
+        "Background training is active; wait for completion before erasing keys.",
+    ),
+    "deferred_trial_active": (
+        "trial_active",
+        "A migration TRIAL is in progress. Accept or roll back the migration first.",
+    ),
+    "deferred_base_swap_active": (
+        "base_swap_active",
+        "A base-swap migration is actively running. "
+        "Wait for it to complete (or fail) before erasing keys.",
+    ),
+}
+
+
+class DebugEraseKeysRequest(BaseModel):
+    """Request body for ``POST /debug/erase-keys``.
+
+    Attributes
+    ----------
+    keys:
+        Explicit indexed-memory keys to hard-erase.  Production source of
+        this value is the operator, reading divergence diagnostics
+        (``GET /debug/dump`` output or the boot "meta_unbookkept" log line) —
+        there is no wildcard or "all divergent" expansion; the caller names
+        exactly the keys to erase.
+    confirm:
+        Must be ``True`` to actually erase the keys.  ``False`` (default)
+        refuses with ``confirmation_required`` — mirrors
+        ``POST /interim/discard``'s ``confirm`` field: the operator's own
+        invocation is the only source for this value; the system cannot
+        derive it.
+    """
+
+    keys: list[str]
+    confirm: bool = False
+
+
+class DebugEraseKeysResponse(BaseModel):
+    """Response body for ``POST /debug/erase-keys``.
+
+    Attributes
+    ----------
+    erased:
+        Requested keys that were known to the store (registry active or
+        stale, regardless of bookkeeping presence) and were hard-erased.
+    unknown:
+        Requested keys the store's registries did not recognise — reported,
+        never an error; a repeat request with the same list is idempotent.
+    total, tiers, bookkeeping_total:
+        Post-erase store counts, same vocabulary as
+        :class:`DebugDumpResponse` — the live content cache size, its
+        per-tier breakdown, and the bookkeeping record count.
+    """
+
+    erased: list[str]
+    unknown: list[str]
+    total: int
+    tiers: dict[str, int]
+    bookkeeping_total: int
+
+
+@app.post(
+    "/debug/erase-keys",
+    response_model=DebugEraseKeysResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def debug_erase_keys(request: DebugEraseKeysRequest):
+    """Hard-erase an explicit list of indexed-memory keys from the live store.
+
+    Sanctioned repair tool for registry<->bookkeeping divergence — see the
+    module comment above this route for why ``POST /speaker/forget`` cannot
+    reach an un-bookkept key.  Shares its erase/reap/bookkeeping-settle
+    sequence with ``/speaker/forget`` via :func:`_erase_keys_with_reap`; the
+    only new logic here is partitioning the caller's explicit list into
+    known (erased) vs. unknown (reported, not an error) against
+    ``store.all_known_keys()`` — registry active ∪ stale, so a key with no
+    bookkeeping record (the repair case) is still erasable.
+
+    Returns ``forbidden_not_debug`` (403) when ``config.debug=false``.
+    Returns ``invalid_keys`` (400) when *request.keys* is empty or contains
+    a non-string/empty entry (pydantic's ``list[str]`` typing already
+    rejects a non-string body value with 422; this catches the empty-list
+    and empty-string cases pydantic's plain type does not).  Refuses with
+    409 (:data:`_DEBUG_ERASE_KEYS_GUARD_VERDICTS`) under the same conditions
+    ``/speaker/forget`` refuses under — consolidation running, background
+    training active, cloud-only mode, an active migration TRIAL, or an
+    active base-swap migration — mirroring
+    :func:`_consolidation_dispatch_guards`, the shared predicate for "is a
+    memory-mutating operation safe now".  Refuses with
+    :data:`_DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS` (409) ``confirmation_required``
+    when ``request.confirm`` is not ``True`` — mirrors ``POST
+    /interim/discard``'s confirmation gate: this door irreversibly destroys
+    facts, so nothing is mutated without the operator's explicit confirm.
+
+    Router reload runs in the same no-await tail ``/speaker/forget`` uses
+    (see that handler's comment) so no concurrent ``/chat`` turn can observe
+    a store whose keys were erased but whose router index still reflects the
+    pre-erase state.  The response's store counts (``total``/``tiers``/
+    ``bookkeeping_total``) are computed earlier, inside ``_erase_sync``
+    itself under the GPU lock, so they reflect exactly this request's
+    mutation with no window for a concurrent one to land in between.
+    """
+    config = _state["config"]
+    if not getattr(config, "debug", False):
+        return JSONResponse({"status": "forbidden_not_debug"}, status_code=403)
+
+    if not request.keys or any(not isinstance(k, str) or not k for k in request.keys):
+        return JSONResponse(
+            {"status": "invalid_keys", "detail": "keys must be a non-empty list of strings"},
+            status_code=400,
+        )
+
+    guard = _consolidation_dispatch_guards()
+    if guard is not None:
+        error, message = _DEBUG_ERASE_KEYS_GUARD_VERDICTS.get(
+            guard, (guard, "Cannot erase keys right now.")
+        )
+        raise HTTPException(status_code=409, detail={"error": error, "message": message})
+
+    # The operator sees exactly what they asked to destroy before committing;
+    # nothing is written on this path.  Status code is the owner's ruling
+    # (_DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS), not a hard-coded literal —
+    # mirrors POST /interim/discard's Step 0d.
+    if request.confirm is not True:
+        raise HTTPException(
+            status_code=_DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS,
+            detail={
+                "error": "confirmation_required",
+                "message": (
+                    "Erasing keys destroys the only copy of their facts. "
+                    'Resend with {"confirm": true} to proceed.'
+                ),
+                "would_erase": sorted(request.keys),
+            },
+        )
+
+    def _erase_sync() -> dict:
+        # Re-resolve config/loop rather than close over the handler's
+        # pre-lock capture — same door-staleness argument as
+        # /speaker/forget's _forget_sync.
+        config = _state["config"]
+        loop = _get_or_create_consolidation_loop(config)
+
+        known = set(loop.store.all_known_keys())
+        requested = set(request.keys)
+        to_erase = sorted(requested & known)
+        unknown = sorted(requested - known)
+
+        result = _erase_keys_with_reap(
+            loop=loop, config=config, erased_keys=to_erase, label="debug/erase-keys"
+        )
+        result["unknown"] = unknown
+
+        # Post-erase store counts, computed here (not after the executor
+        # call returns) so the count reflects exactly the mutation this
+        # request just made — no window for a concurrent mutation to land
+        # between the erase and the read.
+        total = 0
+        tiers: dict[str, int] = {}
+        for tier, _key, _entry in loop.store.iter_entries():
+            tiers[tier] = tiers.get(tier, 0) + 1
+            total += 1
+        result["total"] = total
+        result["tiers"] = tiers
+        result["bookkeeping_total"] = loop.store.bookkeeping_count()
+        return result
+
+    from paramem.server.gpu_lock import gpu_lock
+
+    _state["consolidating"] = True
+    try:
+        async with gpu_lock():
+            loop_aio = asyncio.get_running_loop()
+            result = await loop_aio.run_in_executor(None, _erase_sync)
+
+        # NO-AWAIT TAIL — same atomicity argument as /speaker/forget: from the
+        # executor call returning to the flag clear in `finally` there must be
+        # ZERO await points, so no /chat turn observes a store whose keys were
+        # erased but whose router speaker->key index still lists them.
+        _state["router"].reload()
+
+        logger.info(
+            "debug/erase-keys: erased=%d unknown=%d reaped=%d",
+            len(result["erased_keys"]),
+            len(result["unknown"]),
+            len(result["reaped_tiers"]),
+        )
+
+        return DebugEraseKeysResponse(
+            erased=result["erased_keys"],
+            unknown=result["unknown"],
+            total=result["total"],
+            tiers=result["tiers"],
+            bookkeeping_total=result["bookkeeping_total"],
+        )
+    finally:
+        _state["consolidating"] = False
 
 
 # --------------------------------------------------------------------------
@@ -10503,7 +10640,7 @@ async def _run_trial_consolidation() -> None:
 
         # CRITICAL: do NOT override trial_config.paths.data here.
         # Previously this was set to trial_adapter_dir.parent.parent (= data/ha), causing
-        # _save_registry / _save_key_metadata to resolve to the LIVE registry paths.
+        # _save_registry / write_key_metadata to resolve to the LIVE registry paths.
         # Registry path isolation is now handled entirely inside _build_trial_loop via
         # loop.trial_registry_path / loop.trial_key_metadata_path overrides.
 
@@ -11371,7 +11508,7 @@ async def _run_base_swap_orchestration(
         # from the preserved key_metadata.json so promotion momentum carries
         # across the swap — a key at reinforcement_count=N does not reset to 0, and the
         # already-promoted set is restored.  Without this, the next consolidation's
-        # _save_key_metadata would overwrite the on-disk counts with loop_b's empty
+        # write_key_metadata would overwrite the on-disk counts with loop_b's empty
         # in-memory state.  seed_key_metadata SETs (not increments) so it is
         # idempotent; the keys match by construction so there is no orphan-drop now.
         from paramem.server.consolidation import _load_key_metadata as _carry_load_meta
@@ -11640,7 +11777,7 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
     Registry isolation:
     ``loop.trial_registry_path`` and ``loop.trial_key_metadata_path`` are set
     to paths inside a ``trial_registry/`` sibling of ``trial_adapter/`` so that
-    ``_save_registry`` / ``_save_key_metadata`` in consolidation.py write to
+    ``_save_registry`` / ``write_key_metadata`` in consolidation.py write to
     the trial-isolated directory instead of the live ``data/ha/registry.json``
     / ``data/ha/registry/key_metadata.json``.
 
@@ -11678,7 +11815,7 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
 
         # Redirect registry writes to a trial-isolated directory
         # (sibling of trial_adapter/, e.g. data/ha/state/trial_registry/).
-        # _save_registry / _save_key_metadata check these attributes and use them
+        # _save_registry / write_key_metadata check these attributes and use them
         # instead of config.registry_path / config.key_metadata_path.
         trial_registry_dir = trial_adapter_dir.parent / "trial_registry"
         loop.trial_registry_path = trial_registry_dir / "registry.json"
@@ -15443,7 +15580,6 @@ def _run_extraction_phase(
         SessionClass,
         _dedup_episodic,
         _dedup_procedural,
-        _save_key_metadata,
         classify_session,
         session_retention_dir,
     )
@@ -15589,7 +15725,7 @@ def _run_extraction_phase(
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
             )
-            _save_key_metadata(loop, config)
+            loop.write_key_metadata()
         except Exception:
             logger.exception(
                 "Simulated consolidation failed — leaving %d sessions pending",
@@ -15652,7 +15788,7 @@ def _run_extraction_phase(
         # _save_adapters performs its own main-tier disk-integrity verify (step
         # 4a in its docstring).  Do not collapse them into one.
         loop._save_adapters()
-        _save_key_metadata(loop, config)
+        loop.write_key_metadata()
     except Exception:
         logger.exception(
             "Consolidation failed during train/save — leaving %d sessions pending",
@@ -15865,8 +16001,16 @@ def _run_stage_b_cycle(
         )
         try:
             outcome, finalizer = body(loop, bt)
-        except Exception:
+        except Exception as exc:
             logger.exception("%s crashed", kind)
+            # RegistryBookkeepingDivergence names the divergent keys on the
+            # exception itself; fold them into the incident detail so the
+            # incident record — not just the log traceback — identifies what
+            # diverged.  Every other exception keeps the generic detail
+            # unchanged.
+            incident_detail = dict(failure_detail)
+            if isinstance(exc, RegistryBookkeepingDivergence):
+                incident_detail["divergent_keys"] = exc.divergent_keys
             try:
                 record_incident(
                     config.paths.data / "state",
@@ -15874,7 +16018,7 @@ def _run_stage_b_cycle(
                     key=incident_key,
                     severity="failed",
                     summary=failure_summary,
-                    detail=failure_detail,
+                    detail=incident_detail,
                 )
             except Exception:
                 logger.exception("Failed to record %s incident (non-fatal)", kind)
@@ -16297,7 +16441,7 @@ def _extract_and_start_training():
     slot.  Main adapters are only updated by the full-cycle path that
     calls ``loop.consolidate(...)``.
     """
-    from paramem.server.consolidation import _save_key_metadata, session_retention_dir
+    from paramem.server.consolidation import session_retention_dir
 
     config = _state["config"]
     session_buffer = _state["session_buffer"]
@@ -16407,7 +16551,14 @@ def _extract_and_start_training():
         # Per-adapter indexed_key_registry.json files carry the unified simhash
         # map; MemoryStore.read_simhash_registry_from_disk merges the "simhash"
         # key out of each one for the source factory.
-        _save_key_metadata(loop, config)
+        if sim_result.get("mode") == "noop":
+            # The only terminal where this write is load-bearing: cycle_count
+            # was already bumped in RAM (run_consolidation_cycle increments it
+            # before either early-return guard), but a noop result means
+            # commit_tier_slot never ran, so nothing durable persisted that
+            # counter.  Every other outcome already wrote identical bytes
+            # inside commit_tier_slot's own key-metadata step.
+            loop.write_key_metadata()
         # Per-tier graph.json is written by commit_tier_slot inside
         # run_consolidation_cycle; cycle_<N>/ snapshots are dropped.
 
@@ -16684,20 +16835,60 @@ def _extract_and_start_training():
                     if _existing > 0:
                         session_buffer.reset_retry_count_for(_sid)
 
-        # Disk I/O — safe from any thread.  Key-metadata persistence mirrors the
-        # previous main-write callback; the interim helper already handled the
-        # registry / simhash writes atomically.  Promotion runs at the full fold
-        # rather than here, so the key is still in episodic when its adapter
-        # weights are probed during reconstruction.
+        # Disk I/O — safe from any thread.  Key-metadata persistence is now
+        # written durably inside the fold itself, ahead of the interim
+        # helper's registry / simhash commit signal (see
+        # ConsolidationLoop.write_key_metadata / commit_tier_slot).
+        # Promotion runs at the full fold rather than here, so the key is
+        # still in episodic when its adapter weights are probed during
+        # reconstruction.
+        #
+        # This cycle's interim slot is ALREADY durably committed by
+        # commit_tier_slot inside run_consolidation_cycle above, so a
+        # transcript-retirement failure here is honest boundary I/O, not a
+        # training crash — letting it propagate to _run_stage_b_cycle's crash
+        # envelope would misreport a committed cycle as "still pending".
+        # Record the incident locally and continue to the finalizer (router
+        # reload, run-status row, retry bookkeeping still need to run).
         try:
-            _save_key_metadata(loop, config)
             session_buffer.mark_consolidated(
                 extraction.completed_session_ids(session_buffer),
                 retention_dir=session_retention_dir(loop, config),
                 retired_session_ids=set(_released_sids),
             )
         except Exception:
-            logger.exception("Post-interim bookkeeping failed (non-fatal)")
+            logger.exception(
+                "_run_interim_training: session-retirement failed after a "
+                "successfully committed cycle (non-fatal — cycle itself "
+                "succeeded, sessions remain pending retirement)"
+            )
+            try:
+                record_incident(
+                    _state["config"].paths.data / "state",
+                    type="session_retirement_failed",
+                    key=result.get("adapter_name") or "interim",
+                    severity="failed",
+                    summary="Interim cycle committed but session retirement failed",
+                    detail={"session_ids": session_ids, "cycle_mode": _cycle_mode},
+                )
+            except Exception:
+                logger.exception(
+                    "_run_interim_training: also failed to record "
+                    "session_retirement_failed incident"
+                )
+        else:
+            # The write that failed is the write that clears it — a
+            # successful retirement IS the recovery from a prior cycle's
+            # failure, and this is the only site that observes it.
+            try:
+                resolve_incidents_by_type(
+                    _state["config"].paths.data / "state", "session_retirement_failed"
+                )
+            except Exception:
+                logger.exception(
+                    "_run_interim_training: failed to resolve "
+                    "session_retirement_failed incident (non-fatal)"
+                )
 
         # Restore voice pipeline on the BG worker thread, before returning the
         # terminal — voice load is multi-second GPU work; running it on the
@@ -16919,7 +17110,7 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
               are left pending, so ``consume_pending`` is ``False`` here no
               matter what ``max_interim_count`` says.
     """
-    from paramem.server.consolidation import _save_key_metadata, session_retention_dir
+    from paramem.server.consolidation import session_retention_dir
 
     config = _state["config"]
 
@@ -17067,7 +17258,9 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # crash envelope (consolidation_crash incident, sessions left pending) —
         # so reaching here means main is durable.
 
-        # Persist key metadata.
+        # Key metadata is now persisted durably inside the fold itself, ahead
+        # of the per-tier registry rewrite (see
+        # ConsolidationLoop.write_key_metadata) — no app-layer call needed.
         #
         # When max_interim_count > 0 (standard mode): the full consolidation run
         # folds interim-adapter content into main; it does NOT run the extraction
@@ -17081,10 +17274,6 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # capture trained them into the main tiers.  MF-A Site B: mark
         # extraction-succeeded sessions consolidated now that the fold has persisted
         # their knowledge to the main tiers.  Extraction-failed sessions stay pending.
-        try:
-            _save_key_metadata(loop, config)
-        except Exception:
-            logger.exception("Post-full-cycle bookkeeping failed (non-fatal)")
 
         # MF-A Site B: mark extraction-succeeded sessions consolidated after
         # successful fold training (count==0 consume-pending mode only).

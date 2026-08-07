@@ -75,7 +75,8 @@ def _no_real_sleep_in_mount(monkeypatch):
 def _make_registry(n: int, tmp_path: Path, fname: str = "key_metadata.json") -> Path:
     """Write the REAL production ``key_metadata.json`` schema with ``n`` keys.
 
-    Matches ``_save_key_metadata`` (``paramem/server/consolidation.py:436-440``):
+    Matches ``ConsolidationLoop.write_key_metadata``
+    (``paramem/training/consolidation.py``):
     ``{"cycle_count": int, "promoted_keys": [...], "keys": {key: bookkeeping}}``.
     Per-key bookkeeping mirrors ``MemoryStore.bookkeeping_for_key``
     (``paramem/memory/store.py:435-445``) — ``speaker_id``, ``relation_type``,

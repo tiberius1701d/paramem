@@ -14,7 +14,7 @@ import json
 import logging
 from pathlib import Path
 
-from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+from paramem.backup.encryption import read_maybe_encrypted, write_infra_json
 from paramem.server.config import ServerConfig
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.thermal_throttle import ThermalPolicy
@@ -204,6 +204,7 @@ def create_consolidation_loop(
         ),
         telemetry_dir=config.telemetry_dir,
         incidents_state_dir=config.paths.data / "state",
+        key_metadata_path=config.key_metadata_path,
     )
 
     # Wire the base-model weight-hash cache from server _state into the loop so
@@ -276,19 +277,6 @@ _dedup_procedural = ConsolidationLoop.dedup_procedural
 
 
 # --- Persistence ---
-
-
-def _atomic_json_write(data: dict | list, path: Path) -> None:
-    """Write infrastructure JSON atomically through ``write_infra_bytes``.
-
-    One chokepoint, so every infrastructure JSON file respects the operator's
-    ``security.require_encryption`` posture — age-encrypted when a daily
-    identity is loaded, plaintext otherwise.  Inspection output is not written
-    here: that is an artifact, and goes through
-    :func:`paramem.utils.artifacts.write_artifact`.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_infra_bytes(path, json.dumps(data, indent=2).encode("utf-8"))
 
 
 def _load_key_metadata(path: Path) -> dict | None:
@@ -395,47 +383,10 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
 
     raw["keys"] = pruned_keys
     raw["promoted_keys"] = pruned_promoted
-    _atomic_json_write(raw, path)
+    write_infra_json(path, raw)
     logger.info(
         "prune_key_metadata_orphans: removed %d orphan key(s) from %s",
         removed,
         path,
     )
     return removed
-
-
-def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save key metadata for cross-restart persistence.
-
-    Per the wipe invariant (2026-05-14): ``key_metadata.json`` is
-    bookkeeping for active keys, not a recovery source.  Saved entries
-    reflect only :meth:`MemoryStore.all_active_keys` — keys absent from
-    every tier registry are orphans and never persisted.
-
-    When ``loop.trial_key_metadata_path`` is set (trial consolidation path),
-    writes to that isolated path instead of the live ``config.key_metadata_path``.
-    This ensures trial runs never touch the live
-    ``data/ha/registry/key_metadata.json``.
-    """
-    keys_payload: dict = {}
-    # Persist bookkeeping for BOTH active and stale keys so that stale-echo
-    # probes can resolve speaker/relation_type for a soft-staled key.
-    # A key with no bookkeeping record is skipped rather than given a
-    # fabricated record — it stays recordless on reload, which every
-    # bookkeeping read site already tolerates via ``bookkeeping_for_key(k)
-    # or {}`` / ``.get(...)``.
-    all_keys = loop.store.all_known_keys()
-    for key in all_keys:
-        bk = loop.store.bookkeeping_for_key(key)
-        if bk is None:
-            continue
-        keys_payload[key] = dict(bk)
-    metadata = {
-        "cycle_count": loop.cycle_count,
-        "promoted_keys": sorted(loop.promoted_keys),
-        "keys": keys_payload,
-    }
-    # Honor the loop-level override set by _build_trial_loop so the trial never
-    # writes to the live registry paths.
-    dest = getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path
-    _atomic_json_write(metadata, dest)

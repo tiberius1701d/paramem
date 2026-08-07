@@ -51,6 +51,11 @@ def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
     cfg.consolidation.mode = mode
     cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
     cfg.simulate_dir.mkdir(parents=True, exist_ok=True)
+    # A real Path (matching ServerConfig.key_metadata_path) -- the
+    # simulate_to_train hot-load loop resolves bookkeeping fallback rows
+    # from this file when the live store does not already carry them.
+    # Absent (the default here) means "no on-disk fallback available".
+    cfg.key_metadata_path = cfg.adapter_dir / "key_metadata.json"
     return cfg
 
 
@@ -1228,6 +1233,200 @@ class TestMigrateTierSimulateToTrain:
 
         # Nothing was trained.
         loop._train_tier_adapter.assert_not_called()
+
+    def test_hot_load_pairs_every_key_with_bookkeeping(self, tmp_path):
+        """Every key hot-loaded by the migration has a bookkeeping record
+        afterward -- an active key with no provenance row trips the
+        main-tiers fold's registry_bookkeeping_divergence integrity gate on
+        the next full consolidation.  No key_metadata.json and no
+        pre-existing live-store bookkeeping here, so the hot-load loop falls
+        back to the source graph entry's own speaker_id (``_full_quad``
+        writes ``"speaker0"`` onto the graph edge, and ``iter_entries``
+        carries it back out) rather than discarding it; relation_type has no
+        graph-carried counterpart, so it still defaults to ``"unknown"``."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0"), _full_quad("g1")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        for key in ("g0", "g1"):
+            bk = loop.store.bookkeeping_for_key(key)
+            assert bk is not None, f"key {key} has no bookkeeping record after migration"
+            assert bk["speaker_id"] == "speaker0"
+            assert bk["relation_type"] == "unknown"
+
+    def test_hot_load_falls_back_to_empty_when_graph_entry_also_unattributed(self, tmp_path):
+        """When the live store, on-disk key_metadata.json, AND the source
+        graph entry itself carry no speaker_id, the hot-load loop still
+        falls back to the empty-speaker default rather than raising -- the
+        last-resort arm of the priority chain (live store -> disk ->
+        graph entry -> empty)."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [
+            {
+                "key": "g0",
+                "subject": "Subject",
+                "predicate": "related_to",
+                "object": "Object",
+                "speaker_id": "",
+            }
+        ]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        bk = loop.store.bookkeeping_for_key("g0")
+        assert bk is not None, "key g0 has no bookkeeping record after migration"
+        assert bk["speaker_id"] == ""
+        assert bk["relation_type"] == "unknown"
+
+    def test_hot_load_reuses_disk_key_metadata_when_live_store_is_empty(self, tmp_path):
+        """When the live store carries no bookkeeping (the base-swap Phase B
+        shape: loop constructed against an empty store), the hot-load loop
+        reuses the on-disk key_metadata.json row for a migrated key rather
+        than falling back to an empty-speaker default."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        cfg.key_metadata_path.write_text(
+            json.dumps(
+                {
+                    "keys": {
+                        "g0": {
+                            "speaker_id": "speaker3",
+                            "relation_type": "preference",
+                            "reinforcement_count": 4,
+                            "last_reinforced_cycle": 2,
+                            "last_seen": "2026-01-01T00:00:00+00:00",
+                            "first_seen": "2025-12-01T00:00:00+00:00",
+                        }
+                    }
+                }
+            )
+        )
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        bk = loop.store.bookkeeping_for_key("g0")
+        assert bk is not None
+        assert bk["speaker_id"] == "speaker3"
+        assert bk["relation_type"] == "preference"
+        assert bk["reinforcement_count"] == 4
+
+    def test_hot_load_prefers_live_store_bookkeeping_over_disk(self, tmp_path):
+        """When the live store already carries a bookkeeping record for a
+        migrated key (the ordinary mode-switch path -- loop is the live
+        singleton, hydrated at boot), that record wins over an on-disk
+        key_metadata.json row for the same key."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        cfg.key_metadata_path.write_text(
+            json.dumps(
+                {
+                    "keys": {
+                        "g0": {
+                            "speaker_id": "speaker_disk",
+                            "relation_type": "unknown",
+                            "reinforcement_count": 1,
+                            "last_reinforced_cycle": 0,
+                            "last_seen": "",
+                            "first_seen": "",
+                        }
+                    }
+                }
+            )
+        )
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+        loop.store.set_bookkeeping(
+            "g0",
+            speaker_id="speaker_live",
+            relation_type="factual",
+            reinforcement_count=9,
+            last_reinforced_cycle=5,
+            first_seen="",
+        )
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        bk = loop.store.bookkeeping_for_key("g0")
+        assert bk is not None
+        assert bk["speaker_id"] == "speaker_live"
+        assert bk["reinforcement_count"] == 9
+
+    def test_hot_load_store_entry_is_content_only(self, tmp_path):
+        """The hot-loaded store entry carries exactly the four content
+        fields (key, subject, predicate, object) -- no speaker_id or
+        relation_type.  A fatter entry here would leave a migrated key with
+        a different shape than every other store.put site in the fold
+        (the shared paramem.memory.entry.content_only_entry projection) and
+        would leak attribution fields through /debug/dump.  Attribution
+        lives only in the bookkeeping record (asserted separately by the
+        sibling priority-arm tests)."""
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        stored = loop.store.get("g0")
+        assert stored is not None
+        assert stored == {
+            "key": "g0",
+            "subject": "Subject",
+            "predicate": "related_to",
+            "object": "Object",
+        }
 
 
 # ---------------------------------------------------------------------------

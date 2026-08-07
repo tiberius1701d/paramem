@@ -7,6 +7,7 @@ reap_tier_artifacts' rename-then-delete crash safety (+ resume_pending_reaps).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -28,6 +29,7 @@ from paramem.memory.persistence import (
     _PENDING_DELETE_DIR_NAME,
     build_tier_graph_from_store,
     entry_by_key,
+    erase_keys_and_restamp_manifest,
     erase_keys_from_graph_file,
     iter_entries,
     load_memory_from_disk,
@@ -387,18 +389,30 @@ class TestEntryByKey:
 
 
 class TestBuildTierGraphFromStore:
-    def _make_store(self, *, simhash: dict, cache: dict, tier: str = "episodic"):
-        """Build a minimal MemoryStore for testing build_tier_graph_from_store."""
+    def _make_store(
+        self, *, simhash: dict, cache: dict, bookkeeping: dict | None = None, tier: str = "episodic"
+    ):
+        """Build a minimal MemoryStore for testing build_tier_graph_from_store.
+
+        *bookkeeping* maps ``key -> speaker_id``, installed via
+        ``set_bookkeeping``: ``build_tier_graph_from_store`` sources
+        ``speaker_id`` from bookkeeping, never from the entry, so tests that
+        want a non-empty ``speaker_id`` on the persisted edge must seed it
+        here rather than on the cache entry passed to ``store.put``.
+        """
         from paramem.memory.store import MemoryStore
 
         store = MemoryStore(replay_enabled=False)
         store.replace_simhashes_in_tier(tier, simhash)
         for k, q in cache.items():
             store.put(tier, k, q, register=False)
+        for k, speaker_id in (bookkeeping or {}).items():
+            store.set_bookkeeping(k, speaker_id=speaker_id, relation_type="factual", first_seen="")
         return store
 
     def test_happy_path_single_key(self):
-        """build_tier_graph_from_store produces a graph with the expected edge."""
+        """build_tier_graph_from_store produces a graph with the expected edge,
+        with speaker_id sourced from bookkeeping rather than the entry."""
         store = self._make_store(
             simhash={"graph1": 0xABCDEF},
             cache={
@@ -407,9 +421,9 @@ class TestBuildTierGraphFromStore:
                     "subject": "Alice",
                     "predicate": "lives_in",
                     "object": "Berlin",
-                    "speaker_id": "speaker0",
                 }
             },
+            bookkeeping={"graph1": "speaker0"},
         )
         g = build_tier_graph_from_store(store, "episodic")
         assert g.number_of_edges() == 1
@@ -432,16 +446,15 @@ class TestBuildTierGraphFromStore:
                     "subject": "Alice",
                     "predicate": "lives_in",
                     "object": "Berlin",
-                    "speaker_id": "S0",
                 },
                 "graph2": {
                     "key": "graph2",
                     "subject": "Bob",
                     "predicate": "has_job",
                     "object": "Engineer",
-                    "speaker_id": "S0",
                 },
             },
+            bookkeeping={"graph1": "S0", "graph2": "S0"},
         )
         g = build_tier_graph_from_store(store, "episodic")
         assert g.number_of_edges() == 2
@@ -465,15 +478,72 @@ class TestBuildTierGraphFromStore:
                     "subject": "X",
                     "predicate": "q",
                     "object": "Y",
-                    "speaker_id": "S",
                 },
             },
+            bookkeeping={"graph10": "S"},
             tier="semantic",
         )
         g = build_tier_graph_from_store(store, "semantic")
         assert g.number_of_edges() == 1
         entries = list(iter_entries(g))
         assert entries[0]["key"] == "graph10"
+
+    def test_no_bookkeeping_persists_empty_speaker_id(self):
+        """A key with no bookkeeping record falls back to speaker_id=''."""
+        store = self._make_store(
+            simhash={"graph1": 0xABCDEF},
+            cache={
+                "graph1": {
+                    "key": "graph1",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                }
+            },
+        )
+        assert store.bookkeeping_for_key("graph1") is None
+        g = build_tier_graph_from_store(store, "episodic")
+        entries = list(iter_entries(g))
+        assert entries[0]["speaker_id"] == ""
+
+    def test_memoized_cache_miss_entry_preserves_bookkeeping_speaker_id(self):
+        """Regression lock for the simulate-mode fold-persist bug: a key whose
+        entry is re-materialised as a content-only miss (the shape
+        ``MemoryStore.probe`` memoizes back on a source-served cache miss)
+        must still persist with its real speaker_id, because attribution is
+        read from bookkeeping and never from the entry."""
+        from paramem.memory.entry import entry_simhash
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        ep_reg = store.registry("episodic")
+        ep_reg.add("graph1")
+
+        entry = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
+
+        class _StubSource:
+            def probe(self, keys_by_tier):
+                return {"graph1": dict(entry)}
+
+        # Matching fingerprint so the store's confidence gate admits the
+        # source-served result on this cache miss.
+        store.put_simhash("episodic", "graph1", entry_simhash(entry))
+        store.probe({"episodic": ["graph1"]}, source=_StubSource(), memoize=True)
+        # The memoized entry is content-only — no speaker_id on it.
+        assert "speaker_id" not in store.get("graph1")
+
+        g = build_tier_graph_from_store(store, "episodic")
+        entries = list(iter_entries(g))
+        assert len(entries) == 1
+        assert entries[0]["speaker_id"] == "speaker0"
 
 
 # ---------------------------------------------------------------------------
@@ -1148,3 +1218,309 @@ class TestResumePendingReaps:
         resume_pending_reaps(tmp_path)
 
         assert not pending.exists()
+
+
+# ---------------------------------------------------------------------------
+# erase_keys_and_restamp_manifest — key-erase / registry-save / graph-erase /
+# manifest-re-stamp sequence shared by every out-of-fold registry-mutation
+# caller (extracted from POST /speaker/forget).
+# ---------------------------------------------------------------------------
+
+
+class TestEraseKeysAndRestampManifest:
+    def test_empty_keys_is_a_noop(self, tmp_path):
+        """No keys -> {} and no store mutation."""
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.registry("episodic").add("graph1")
+
+        result = erase_keys_and_restamp_manifest(store=store, adapter_dir=tmp_path, keys=[])
+
+        assert result == {}
+        assert store.registry("episodic").knows("graph1")
+
+    def test_erases_keys_saves_registry_and_erases_graph(self, tmp_path):
+        """The erased key is gone from the store, the saved registry file,
+        and the tier's on-disk graph.json; a surviving key is untouched in
+        all three, and the survivor is not in the result."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry("episodic")
+        reg.add("graph1")
+        reg.add("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / "episodic"
+        tier_root.mkdir(parents=True)
+
+        g = nx.MultiDiGraph()
+        _add_keyed_edge(
+            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        )
+        _add_keyed_edge(
+            g, "Bob", "Engineer", indexed_key="graph2", predicate="has_job", speaker_id="S1"
+        )
+        save_memory_to_disk(g, tier_root / "graph.json")
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {}
+
+        assert not reg.knows("graph1")
+        assert reg.knows("graph2")
+
+        on_disk = KeyRegistry.load(tier_root / "indexed_key_registry.json")
+        assert not on_disk.knows("graph1")
+        assert on_disk.knows("graph2")
+
+        g2 = load_memory_from_disk(tier_root / "graph.json")
+        keys_on_disk = {e["key"] for e in iter_entries(g2)}
+        assert keys_on_disk == {"graph2"}
+
+    def test_emptied_tier_is_returned_not_restamped(self, tmp_path):
+        """A tier reduced to zero known keys is returned in the result (for
+        the caller to reap), not re-stamped."""
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.registry("episodic").add("graph1")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / "episodic"
+        tier_root.mkdir(parents=True)
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {"episodic": tier_root}
+        assert not store.registry("episodic").knows("graph1")
+
+    def test_survivor_restamp_makes_slot_mountable(self, tmp_path):
+        """After the helper runs on a surviving slot, find_live_slot accepts
+        the re-stamped meta.json against the rewritten registry's hash and
+        rejects the pre-erase hash — the fix for the "slot unmountable after
+        an out-of-fold registry mutation" failure mode."""
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            find_live_slot,
+            write_manifest,
+        )
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+        reg.add("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+        tier_root.mkdir(parents=True)
+
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        slot_dir.mkdir()
+        manifest = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=tier_name,
+            trained_at="2026-06-12T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
+            registry_sha256=h_old,
+            key_count=2,
+        )
+        write_manifest(slot_dir, manifest)
+        assert find_live_slot(tier_root, h_old) == slot_dir
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {}
+        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
+        assert find_live_slot(tier_root, h_new) == slot_dir
+        assert find_live_slot(tier_root, h_old) is None
+
+    def test_malformed_interim_tier_name_raises_before_mutation(self, tmp_path):
+        """A malformed interim tier name raises ValueError BEFORE
+        store.discard_keys runs — the store is left untouched."""
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+        from paramem.memory.store import MemoryStore
+
+        tier_name = f"{INTERIM_NAME_PREFIX}foo"  # does not parse as a stamp
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+
+        with pytest.raises(ValueError):
+            erase_keys_and_restamp_manifest(
+                store=store, adapter_dir=tmp_path / "adapters", keys=["graph1"]
+            )
+
+        assert reg.knows("graph1")
+
+    def test_no_weight_slot_skips_restamp_without_error(self, tmp_path, caplog):
+        """Simulate venue: a non-empty on-disk registry but no weight-slot
+        manifest anywhere under the tier root — no ERROR is logged and the
+        tier is reported as a survivor."""
+        import logging
+
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+        reg.add("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+        tier_root.mkdir(parents=True)
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        caplog.set_level(logging.DEBUG, logger="paramem.memory.persistence")
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {}
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records == []
+        debug_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("no on-disk weight slot" in msg for msg in debug_messages)
+
+    def test_empty_pre_erase_hash_skips_restamp(self, tmp_path, caplog):
+        """A tier with in-memory keys but no on-disk registry (pre-erase
+        hash == "") is not re-stamped and never consults find_live_slot; a
+        WARNING is logged instead of an ERROR."""
+        import logging
+        from unittest.mock import patch
+
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            write_manifest,
+        )
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+        reg.add("graph2")
+        # Deliberately NOT saved to disk — tier_registry_sha256 reads "".
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+
+        # A weight-slot manifest must exist for the pre_sha == "" branch to be
+        # reached at all — with zero slot candidates the venue gate fires
+        # first (see test_no_weight_slot_skips_restamp_without_error). Its
+        # registry_sha256 is irrelevant: find_live_slot is never consulted
+        # for a "" pre-erase hash.
+        slot_dir = tier_root / "20260101-000000"
+        slot_dir.mkdir(parents=True)
+        write_manifest(
+            slot_dir,
+            AdapterManifest(
+                schema_version=MANIFEST_SCHEMA_VERSION,
+                name=tier_name,
+                trained_at="2026-01-01T00:00:00Z",
+                base_model=BaseModelFingerprint(
+                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
+                ),
+                tokenizer=TokenizerFingerprint(
+                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+                ),
+                lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
+                registry_sha256="unrelated" * 8,
+                key_count=0,
+            ),
+        )
+
+        caplog.set_level(logging.WARNING, logger="paramem.memory.persistence")
+        with patch("paramem.adapters.manifest.find_live_slot") as mock_find_live_slot:
+            result = erase_keys_and_restamp_manifest(
+                store=store, adapter_dir=adapter_dir, keys=["graph1"]
+            )
+
+        assert result == {}
+        mock_find_live_slot.assert_not_called()
+        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("had no readable pre-erase registry" in msg for msg in warning_messages)
+
+    def test_orphaned_slot_logs_error_without_raising(self, tmp_path, caplog):
+        """A pre-erase hash that no on-disk slot matches (already orphaned,
+        e.g. from a prior crash) logs an ERROR but does not raise — the
+        forget must still succeed."""
+        import logging
+
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            write_manifest,
+        )
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+        reg.add("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+        tier_root.mkdir(parents=True)
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        # A slot exists, but its registry_sha256 does not match the pre-erase
+        # hash — find_live_slot returns None for it.
+        slot_dir = tier_root / "20260612-000000"
+        slot_dir.mkdir()
+        write_manifest(
+            slot_dir,
+            AdapterManifest(
+                schema_version=MANIFEST_SCHEMA_VERSION,
+                name=tier_name,
+                trained_at="2026-06-12T00:00:00Z",
+                base_model=BaseModelFingerprint(
+                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
+                ),
+                tokenizer=TokenizerFingerprint(
+                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+                ),
+                lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
+                registry_sha256="deadbeef" * 8,
+                key_count=1,
+            ),
+        )
+
+        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {}
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("slot already orphaned" in msg for msg in error_messages)

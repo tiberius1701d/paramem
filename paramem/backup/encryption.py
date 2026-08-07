@@ -26,6 +26,7 @@ Services provided:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -218,6 +219,23 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
         On any filesystem error.
     """
     _atomic_write_bytes(Path(path), envelope_encrypt_bytes(plaintext))
+
+
+def write_infra_json(path: Path, data: dict | list) -> None:
+    """Atomically write *data* as indented JSON to *path* via :func:`write_infra_bytes`.
+
+    The one chokepoint for JSON-shaped infrastructure files, so every one of
+    them respects the operator's ``security.require_encryption`` posture
+    identically — age-encrypted when a daily identity is loaded, plaintext
+    otherwise.  Creates the parent directory (:func:`write_infra_bytes`
+    requires it to already exist) and serializes *data* with
+    ``json.dumps(..., indent=2)`` before handing the bytes off.  Inspection
+    output is not written here: that is an artifact, and goes through
+    :func:`paramem.utils.artifacts.write_artifact`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_infra_bytes(path, json.dumps(data, indent=2).encode("utf-8"))
 
 
 def write_plaintext_atomic(path: Path, plaintext: bytes) -> None:

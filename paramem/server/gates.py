@@ -170,8 +170,8 @@ def _registry_key_population(parsed: dict) -> list[str]:
            "stale": {...}, "simhash": {key: int}}
 
     - ``key_metadata.json`` schema
-      (:func:`~paramem.server.consolidation._save_key_metadata`) — the file
-      gate 4's ``live_registry_path`` actually points at
+      (:meth:`~paramem.training.consolidation.ConsolidationLoop.write_key_metadata`)
+      — the file gate 4's ``live_registry_path`` actually points at
       (:attr:`~paramem.server.config.PathsConfig.key_metadata`)::
 
           {"cycle_count": int, "promoted_keys": [...], "keys": {key: bookkeeping}}

@@ -21,20 +21,18 @@ cycle, or sourced fresh but expensive per query).
 
 Naming
 ------
-``entry`` is the shape-agnostic term for "one keyed record".  Today the
-schema is ``{subject, predicate, object, speaker_id}``, and a source's own
-``probe()`` result carries provenance fields ``{key, subject, predicate,
-object, speaker_id, confidence, fact_text, raw_output}`` for two live
-consumers of ``speaker_id``: :class:`~paramem.memory.store.MemoryStore`'s
-bookkeeping backfill on cache miss, and boot preload (``app.py`` lifespan
-calls ``_source.probe(...)`` directly, bypassing ``MemoryStore.probe``, and
-stores the raw dict as a store entry) whose ``speaker_id`` is later read by
-:func:`~paramem.memory.persistence.build_tier_graph_from_store` when
-re-persisting a tier graph in simulate mode.  Do not delete the emission
-without checking both sites.  ``MemoryStore.probe`` — the caller-facing
-inference surface — strips ``speaker_id`` before returning, so a source
-result is not the same shape that surface returns.  If the schema evolves
-the source's contract still holds.
+``entry`` is the shape-agnostic term for "one keyed record" and is
+content-only: ``{key, subject, predicate, object}`` plus a source's own
+derived fields (``fact_text``, ``raw_output``, and — for
+:class:`WeightMemorySource` only — a real SimHash-verified ``confidence``).
+No source emits ``speaker_id`` or a fabricated confidence.  Speaker
+attribution lives exclusively in
+:attr:`~paramem.memory.store.MemoryStore._bookkeeping`, written by
+consolidation at fold time (never derived from a probe result), and is read
+back by :func:`~paramem.memory.persistence.build_tier_graph_from_store` when
+re-persisting a tier graph.  The store-boundary SimHash gate in
+:meth:`~paramem.memory.store.MemoryStore.probe` is the sole confidence
+authority for both cache hits and source-served results.
 """
 
 from __future__ import annotations
@@ -213,8 +211,6 @@ class DiskMemorySource:
                     "subject": entry.get("subject", ""),
                     "predicate": entry.get("predicate", ""),
                     "object": entry.get("object", ""),
-                    "speaker_id": entry.get("speaker_id", ""),
-                    "confidence": 1.0,
                     "fact_text": entry_fact_text(entry),
                     "raw_output": json.dumps(
                         {

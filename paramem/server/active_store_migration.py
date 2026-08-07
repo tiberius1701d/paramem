@@ -531,7 +531,13 @@ def _migrate_tier_simulate_to_train(
        entry dicts via ``iter_entries``.
     2. Hot-load into ``loop.store`` + register keys into the per-store
        registry inside ``loop.store`` with ``adapter_id=name`` so the recall
-       probe can find them.
+       probe can find them.  The store entry itself is content-only
+       (``{key, subject, predicate, object}``) — attribution lives only in
+       bookkeeping.  Each registration is paired with a bookkeeping record
+       (``store.set_bookkeeping``), sourced from the live store, then the
+       on-disk ``key_metadata.json``, then the source graph entry's own
+       ``speaker_id``, then an empty-speaker default when none of the three
+       has a value — see the hot-load loop for the priority order.
     3. Reset the adapter to LoRA-zero
        (``delete_adapter`` + ``create_adapter`` from the resolved config),
        then ``switch_adapter`` so training writes into this adapter.
@@ -551,9 +557,8 @@ def _migrate_tier_simulate_to_train(
        leave half-trained weights resident, raise ``RuntimeError``.
     """
     from paramem.adapters.manifest import build_manifest_for
-    from paramem.memory.entry import (
-        build_registry as _build_reg,
-    )
+    from paramem.memory.entry import build_registry as _build_reg
+    from paramem.memory.entry import content_only_entry
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
     from paramem.memory.persistence import iter_entries, load_memory_from_disk
     from paramem.models.loader import (
@@ -633,20 +638,66 @@ def _migrate_tier_simulate_to_train(
 
     tier_config = _tier_adapter_config(loop, name)
 
+    # Bookkeeping source for the hot-load loop below, resolved once (not
+    # per key).  ``iter_entries`` only carries {key, subject, predicate,
+    # object, speaker_id} — no relation_type/reinforcement_count/timestamps
+    # — so a registered key needs its provenance row from elsewhere.  The
+    # ordinary mode-switch path reuses ``loop`` (the live singleton, whose
+    # store already carries bookkeeping loaded at boot); a base-swap Phase B
+    # loop is constructed against an empty live store, so its bookkeeping is
+    # read from the on-disk key_metadata.json instead — ik_key is stable
+    # across a base swap, so a key's old-model bookkeeping row is its
+    # correct provenance under the new model too.
+    from paramem.server.consolidation import _load_key_metadata
+
+    _disk_metadata = _load_key_metadata(config.key_metadata_path)
+    _disk_bookkeeping: dict = _disk_metadata.get("keys", {}) if _disk_metadata else {}
+
     # Step 2: hot-load into the loop's memory store so the recall probe
     # (which reads from loop.store) can find the keys.  Mirrors the
     # seed_<tier>_cache methods in consolidation.py.
     loop.store.replace_simhashes_in_tier(name, _build_reg(entries))
     for kp in entries:
         key = kp["key"]
-        entry = loop._cache_entry(
-            key=key,
-            subject=kp.get("subject", ""),
-            predicate=kp.get("predicate", ""),
-            object=kp.get("object", ""),
-            speaker_id=kp.get("speaker_id", ""),
+        # Store-entry shape is content-only ({key, subject, predicate,
+        # object}) throughout this migration, matching the shape every other
+        # store.put site in the fold writes (the shared
+        # paramem.memory.entry.content_only_entry projection) — a fatter
+        # entry here would leave a migrated key with residual
+        # speaker_id/relation_type fields that /debug/dump would leak.
+        # Attribution is carried only in the bookkeeping record set below.
+        # iter_entries always yields all five fields (persistence.py), so
+        # the projection applies directly without a defaulting pass.
+        loop.store.put(name, key, content_only_entry(kp))
+
+        # Pair the registration with a bookkeeping record — an active key
+        # with no provenance row trips the main-tiers fold's
+        # registry_bookkeeping_divergence integrity gate on the next full
+        # consolidation.  Priority: an already-loaded live-store record,
+        # then the on-disk key_metadata.json row, then the source graph
+        # entry's own speaker_id (``iter_entries`` carries it — the same
+        # quantity ``build_tier_graph_from_store`` wrote from bookkeeping
+        # when the graph was produced, so it is in-hand attribution, not a
+        # guess), then an empty-speaker / unknown-relation-type default only
+        # when none of the three has a value for this key (the same minimal
+        # shape MemoryStore.reinforce writes for a never-bookkept key, so it
+        # reads as a legitimate — if unattributed — provenance row rather
+        # than a divergence).  A discarded graph attribution here would mint
+        # an unattributed key that the router never indexes (router.py only
+        # indexes non-empty speaker ids) — trained but unreachable at
+        # inference.
+        bk = loop.store.bookkeeping_for_key(key) or _disk_bookkeeping.get(key) or {}
+        bk_speaker_id = bk.get("speaker_id") or kp.get("speaker_id", "")
+        loop.store.set_bookkeeping(
+            key,
+            speaker_id=bk_speaker_id,
+            relation_type=bk.get("relation_type", "unknown"),
+            reinforcement_count=bk.get("reinforcement_count", 1),
+            last_reinforced_cycle=bk.get("last_reinforced_cycle", 0),
+            last_seen=bk.get("last_seen", ""),
+            first_seen=bk.get("first_seen", ""),
+            allow_empty_speaker=(bk_speaker_id == ""),
         )
-        loop.store.put(name, key, entry)
 
     # Step 3: reset adapter to LoRA-zero (delete + recreate) -- the explicit
     # cold-rebuild semantics this migration is documented to use

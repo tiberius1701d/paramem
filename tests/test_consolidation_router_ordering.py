@@ -221,6 +221,18 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     seed = indexed_key_cache if indexed_key_cache is not None else {}
     for k, entry in seed.items():
         loop.store.put("episodic", k, entry, register=False)
+        # Every key seeded here is registered (active) in one of the tier
+        # registries above -- model the boot-time bookkeeping restore that
+        # a real pre-existing active key always carries, so the main-tiers
+        # fold's registry_bookkeeping_divergence gate does not wedge these
+        # ordering tests on an unrelated fixture gap.
+        loop.store.set_bookkeeping(
+            k,
+            speaker_id="",
+            relation_type="factual",
+            first_seen="",
+            allow_empty_speaker=True,
+        )
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     # Enrichment sizing scalars.  A GraphTierRefiner is constructed for BOTH

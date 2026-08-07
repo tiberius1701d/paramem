@@ -822,13 +822,12 @@ class TestBookkeeping:
         assert s.bookkeeping_for_key("graph1") is None
 
     def test_probe_results_never_carry_speaker_id(self):
-        """No dict returned by probe carries ``speaker_id`` — the privacy
-        boundary is the router's ``_speaker_key_index``, not probe.  Covers
-        cache-hit (graph1), plain source-served (graph2), confidence-patched
-        source-served (graphC — a stored fingerprint routes through the
-        patch arm's ``src = dict(src)`` copy) and failure-dict pass-through
-        (graphF); also pins the source → bookkeeping backfill for the
-        previously-unbookkept graph2."""
+        """No dict returned by probe carries ``speaker_id`` — no memory source
+        emits it (content-only source-result contract), so there is nothing
+        to strip.  Covers cache-hit (graph1), plain source-served (graph2),
+        confidence-patched source-served (graphC — a stored fingerprint
+        routes through the patch arm's ``src = dict(src)`` copy) and
+        failure-dict pass-through (graphF)."""
         from paramem.memory.entry import entry_simhash
 
         carol = {"key": "graphC", "subject": "Carol", "predicate": "lives_in", "object": "Rome"}
@@ -842,12 +841,10 @@ class TestBookkeeping:
                         "subject": "Bob",
                         "predicate": "lives_in",
                         "object": "Paris",
-                        "speaker_id": "spk-bob",
                         "fact_text": "Bob lives_in Paris",
                     },
                     "graphC": {
                         **carol,
-                        "speaker_id": "spk-carol",
                         "fact_text": "Carol lives_in Rome",
                     },
                     "graphF": {"raw_output": "garbled", "failure_reason": "parse_error"},
@@ -862,7 +859,6 @@ class TestBookkeeping:
         )
         s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
         s.put_simhash("episodic", "graphC", fp)  # forces the confidence-patch arm
-        assert s.bookkeeping_for_key("graph2") is None  # backfill precondition
 
         results = s.probe(
             {"episodic": ["graph1", "graph2", "graphC", "graphF"]}, source=_StubSource()
@@ -873,14 +869,32 @@ class TestBookkeeping:
         assert results["graph1"]["fact_text"] == "Alice lives_in Berlin"
         assert results["graph2"]["subject"] == "Bob"
         assert results["graphC"]["confidence"] == 1.0
-        # Failure dicts never carry speaker_id; the strip must not disturb them.
+        # Failure dicts never carry speaker_id; nothing disturbs them.
         assert results["graphF"] == {"raw_output": "garbled", "failure_reason": "parse_error"}
 
-        # Source → registry transport survives even though it never reaches
-        # the caller-facing result dict.
-        bk = s.bookkeeping_for_key("graph2")
-        assert bk is not None
-        assert bk["speaker_id"] == "spk-bob"
+    def test_probe_cold_disk_source_key_does_not_backfill_bookkeeping(self):
+        """A cold (previously-unbookkept) key served by a disk source on a
+        cache miss must NOT gain a bookkeeping record from that probe — the
+        fold publishes bookkeeping durably itself, and probe is no longer a
+        bookkeeping writer."""
+        from paramem.memory.entry import entry_simhash
+
+        entry = {"key": "graph9", "subject": "Dana", "predicate": "lives_in", "object": "Oslo"}
+
+        class _DiskLikeSource:
+            def probe(self, keys_by_tier):
+                # Content-only — matches DiskMemorySource's post-fix contract.
+                return {"graph9": dict(entry)}
+
+        s = MemoryStore()
+        s.put_simhash("episodic", "graph9", entry_simhash(entry))
+        assert s.bookkeeping_for_key("graph9") is None
+
+        results = s.probe({"episodic": ["graph9"]}, source=_DiskLikeSource(), memoize=True)
+
+        assert results["graph9"]["subject"] == "Dana"
+        assert s.get("graph9") is not None  # content still memoized
+        assert s.bookkeeping_for_key("graph9") is None  # no backfill
 
     def test_probe_has_no_speaker_id_parameter(self):
         """MemoryStore.probe takes no speaker_id kwarg — passing one raises."""

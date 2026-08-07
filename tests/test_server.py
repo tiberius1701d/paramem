@@ -455,10 +455,10 @@ class TestSessionBuffer:
 
 class TestKeyMetadata:
     def test_atomic_json_write(self, tmp_path):
-        from paramem.server.consolidation import _atomic_json_write
+        from paramem.backup.encryption import write_infra_json
 
         path = tmp_path / "test.json"
-        _atomic_json_write({"key": "value"}, path)
+        write_infra_json(path, {"key": "value"})
 
         with open(path) as f:
             data = json.load(f)
@@ -466,10 +466,10 @@ class TestKeyMetadata:
         assert not (tmp_path / "test.tmp").exists()
 
     def test_atomic_json_write_list(self, tmp_path):
-        from paramem.server.consolidation import _atomic_json_write
+        from paramem.backup.encryption import write_infra_json
 
         path = tmp_path / "test.json"
-        _atomic_json_write([1, 2, 3], path)
+        write_infra_json(path, [1, 2, 3])
 
         with open(path) as f:
             data = json.load(f)
@@ -482,10 +482,8 @@ class TestKeyMetadata:
         assert result is None
 
     def test_key_metadata_round_trip(self, tmp_path):
-        from paramem.server.consolidation import (
-            _atomic_json_write,
-            _load_key_metadata,
-        )
+        from paramem.backup.encryption import write_infra_json
+        from paramem.server.consolidation import _load_key_metadata
 
         metadata = {
             "cycle_count": 5,
@@ -496,7 +494,7 @@ class TestKeyMetadata:
             },
         }
         path = tmp_path / "key_metadata.json"
-        _atomic_json_write(metadata, path)
+        write_infra_json(path, metadata)
 
         loaded = _load_key_metadata(path)
         assert loaded["cycle_count"] == 5
@@ -1118,6 +1116,65 @@ class TestBuildStoreContents:
         # probe returns quickly regardless, but the call must not raise.
         result = _build_store_contents(cfg, model=None, tokenizer=None, should_abort=lambda: True)
         assert len(result) == 4
+
+    def test_meta_unbookkept_counts_active_keys_without_bookkeeping(self, tmp_path) -> None:
+        """meta_unbookkept counts active registry keys with no bookkeeping row —
+        the inverse of meta_orphaned (a bookkeeping row with no registry key).
+        Detect-and-surface only: the build must still succeed (no raise, no
+        degrade)."""
+        from paramem.server.app import _build_store_contents
+        from paramem.training.key_registry import KeyRegistry
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.save(tmp_path / "episodic" / "indexed_key_registry.json")
+
+        # key_metadata.json carries no row for graph1 -- registry/bookkeeping
+        # divergence at boot.
+        (tmp_path / "key_metadata.json").write_text(json.dumps({"keys": {}}))
+
+        cfg = self._make_config(tmp_path)
+        _, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
+
+        assert stats["meta_unbookkept"] == 1
+        assert stats["store_load_degraded"] is False
+
+    def test_meta_unbookkept_zero_when_every_active_key_has_bookkeeping(self, tmp_path) -> None:
+        """A registry/bookkeeping pair that agrees reports meta_unbookkept=0."""
+        from paramem.server.app import _build_store_contents
+        from paramem.training.key_registry import KeyRegistry
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.save(tmp_path / "episodic" / "indexed_key_registry.json")
+
+        (tmp_path / "key_metadata.json").write_text(
+            json.dumps(
+                {
+                    "keys": {
+                        "graph1": {
+                            "speaker_id": "S0",
+                            "relation_type": "factual",
+                            "reinforcement_count": 1,
+                            "last_reinforced_cycle": 0,
+                            "last_seen": "",
+                            "first_seen": "",
+                        }
+                    }
+                }
+            )
+        )
+
+        cfg = self._make_config(tmp_path)
+        _, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
+
+        assert stats["meta_unbookkept"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,10 @@ Public API
   the edges for a set of keys from an on-disk tier graph (used by
   ``POST /speaker/forget`` to retire the underlying fact content, not just
   the registry pointer).
+- :func:`erase_keys_and_restamp_manifest` — hard-erases a key set from every
+  affected tier's registry, graph, and (for a surviving tier) weight-slot
+  manifest in one atomic-ordered sequence; shared by every out-of-fold
+  registry-mutation caller (``POST /speaker/forget`` today).
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
   as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
@@ -267,7 +271,12 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
     ``(subject → object)`` with edge-data
     ``{ik_key, predicate, speaker_id}`` (the indexed-memory key is stored as
     ``"ik_key"`` to avoid the NetworkX ``"key"`` collision;
-    :func:`iter_entries` maps it back to ``"key"`` for callers).
+    :func:`iter_entries` maps it back to ``"key"`` for callers).  The store's
+    entry cache carries content only (``subject``/``predicate``/``object``);
+    ``speaker_id`` is attribution bookkeeping, so it is read from
+    ``store.bookkeeping_for_key(indexed_key)`` instead — the single
+    authority for who introduced a key.  A key with no bookkeeping record
+    persists with ``speaker_id=""``.
 
     The caller is responsible for persisting the returned graph with
     :func:`save_memory_to_disk`.
@@ -291,13 +300,15 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
         entry = store.get(indexed_key)
         if entry is None:
             raise KeyError(indexed_key)
+        bookkeeping = store.bookkeeping_for_key(indexed_key)
+        speaker_id = bookkeeping.get("speaker_id", "") if bookkeeping is not None else ""
         _add_keyed_edge(
             graph,
             entry["subject"],
             entry["object"],
             indexed_key=indexed_key,
             predicate=entry.get("predicate", ""),
-            speaker_id=entry.get("speaker_id", ""),
+            speaker_id=speaker_id,
         )
     return graph
 
@@ -590,6 +601,150 @@ def erase_keys_from_graph_file(path: Path, keys: set[str]) -> int:
     return len(to_remove)
 
 
+def erase_keys_and_restamp_manifest(
+    *,
+    store,
+    adapter_dir: Path,
+    keys: list[str],
+) -> dict[str, Path]:
+    """Hard-erase *keys* from every tier that knows one, keeping registry,
+    graph content, and (for a surviving tier) the weight-slot manifest in
+    lockstep.
+
+    Per affected tier, in order:
+
+    1. Resolve the on-disk slot root
+       (:func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`)
+       and read the pre-erase registry hash
+       (:func:`~paramem.adapters.manifest.tier_registry_sha256`) — both
+       BEFORE ``store.discard_keys`` runs, so a malformed tier name aborts
+       before any mutation and the hash reflects exactly what the last save
+       wrote to disk (not a re-serialisation of the in-memory registry,
+       which could diverge from the stamped manifest hash across a future
+       payload-shape change).
+    2. ``store.discard_keys(keys, mode="erase")`` — hard erase from every
+       tier's ``KeyRegistry`` (active + stale + simhash) and bookkeeping in
+       one call, across every tier at once.
+    3. ``registry.save(...)`` (durable erase) then
+       :func:`erase_keys_from_graph_file` (fact content) — registry first,
+       content second, so a crash between the two never leaves an orphaned
+       graph edge no reader can resolve.
+    4. A surviving tier (still knows a key after the erase) gets its live
+       weight slot's manifest re-stamped so
+       :func:`~paramem.adapters.manifest.find_live_slot` rebinds it on
+       restart. Gated by a venue check
+       (:func:`~paramem.adapters.manifest.count_slot_candidates` — a weight
+       slot can only exist in the train venue; zero candidates means there
+       is no slot to re-stamp, not that one is orphaned) and an empty-hash
+       guard (an unreadable/absent pre-erase registry must never bind a
+       stray ``""``-stamped slot). A tier emptied by the erase is not
+       re-stamped — it is returned in the result for the caller to reap.
+
+    A no-op — returns ``{}``, calls nothing — when *keys* is empty.
+
+    Args:
+        store: A :class:`~paramem.memory.store.MemoryStore` (duck-typed:
+            only ``tiers_with_registry``, ``registry``, and ``discard_keys``
+            are used). Production caller passes
+            :attr:`~paramem.training.consolidation.ConsolidationLoop.store`.
+        adapter_dir: Adapter store root the tier slot roots are resolved
+            under. Production caller passes ``config.adapter_dir``.
+        keys: Indexed-memory keys to erase. Production caller passes the
+            keys resolved for the target speaker via
+            ``store.iter_bookkeeping()``.
+
+    Returns:
+        Tier name -> resolved slot-root path, one entry per tier the erase
+        reduced to zero known keys. Empty when every affected tier still
+        knows at least one key (or *keys* was empty).
+
+    Raises:
+        ValueError: A tier name under *adapter_dir* does not parse as a
+            valid slot path (propagated from
+            :func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`),
+            raised before ``discard_keys`` runs so no mutation has happened
+            yet.
+    """
+    if not keys:
+        return {}
+
+    import hashlib as _hashlib
+    from dataclasses import replace as _replace
+
+    from paramem.adapters.manifest import (
+        count_slot_candidates,
+        find_live_slot,
+        read_manifest,
+        tier_registry_sha256,
+        write_manifest,
+    )
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+    keys_set = set(keys)
+
+    tier_root: dict[str, Path] = {}
+    tier_pre_sha: dict[str, str] = {}
+    for tier_name in store.tiers_with_registry():
+        registry = store.registry(tier_name)
+        if any(registry.knows(k) for k in keys):
+            root = adapter_slot_root_for_name(adapter_dir, tier_name)
+            tier_root[tier_name] = root
+            tier_pre_sha[tier_name] = tier_registry_sha256(root)
+
+    store.discard_keys(keys, mode="erase")
+
+    emptied_tiers: dict[str, Path] = {}
+    for tier_name, root in tier_root.items():
+        registry = store.registry(tier_name)
+        registry.save(root / "indexed_key_registry.json")
+        erase_keys_from_graph_file(root / "graph.json", keys_set)
+
+        if not registry.list_known():
+            logger.info(
+                "erase_keys_and_restamp_manifest: tier %s reduced to zero known keys",
+                tier_name,
+            )
+            emptied_tiers[tier_name] = root
+            continue
+
+        pre_sha = tier_pre_sha[tier_name]
+        has_weight_slot = count_slot_candidates(root) > 0
+        if not has_weight_slot:
+            logger.debug(
+                "erase_keys_and_restamp_manifest: tier %s has no on-disk weight slot — "
+                "skipping manifest re-stamp (simulate venue or never-trained tier)",
+                tier_name,
+            )
+        elif pre_sha == "":
+            logger.warning(
+                "erase_keys_and_restamp_manifest: tier %s had no readable pre-erase "
+                "registry on disk (empty hash) — skipping manifest re-stamp to avoid "
+                'binding a stray ""-stamped slot; recover via consolidation fold or '
+                "registry restore",
+                tier_name,
+            )
+        else:
+            new_hash = _hashlib.sha256(registry.save_bytes()).hexdigest()
+            slot = find_live_slot(root, pre_sha)
+            if slot is None:
+                logger.error(
+                    "erase_keys_and_restamp_manifest: tier %s live slot for pre-erase "
+                    "hash %s… not found — slot already orphaned; recover via "
+                    "consolidation fold or registry restore",
+                    tier_name,
+                    pre_sha[:12],
+                )
+            else:
+                write_manifest(slot, _replace(read_manifest(slot), registry_sha256=new_hash))
+
+        logger.info(
+            "erase_keys_and_restamp_manifest: removed key(s) from KeyRegistry tier %s",
+            tier_name,
+        )
+
+    return emptied_tiers
+
+
 # ---------------------------------------------------------------------------
 # Registry I/O and lifecycle helpers
 # (relocated from paramem.training.indexed_memory on 2026-05-20)
@@ -679,13 +834,19 @@ def commit_tier_slot(
          (encrypted/plaintext depending on daily-key state).  No PEFT weights
          are written.  *verify* is not called in simulate mode.
 
-    6. Flush the exact registry bytes from step 1 to
+    6. ``loop.write_key_metadata()`` — durably persist per-key bookkeeping
+       (speaker_id, relation_type, reinforcement_count, ...) to
+       ``key_metadata.json``, ordered before the registry flush (step 7) so a
+       newly-minted key's bookkeeping row is on disk before the registry
+       write that makes the key discoverable on the next boot.
+
+    7. Flush the exact registry bytes from step 1 to
        ``<slot_root>/indexed_key_registry.json`` as the commit signal (both
        modes) via :meth:`paramem.training.key_registry.KeyRegistry.save_from_bytes`.
        This is the last write — its presence on disk signals that all preceding
        files are complete.
 
-    Crash semantics: a kill after step 5 but before step 6 leaves the slot
+    Crash semantics: a kill after step 5 but before step 7 leaves the slot
     present without the registry file.  Nothing at boot deletes this shape:
     the keyless-tier sweep
     (:func:`paramem.server.app._sweep_keyless_tier_artifacts`) only acts on
@@ -833,7 +994,15 @@ def commit_tier_slot(
                 graph.number_of_edges(),
             )
 
-        # --- Step 6: Registry flush — commit signal (both modes, LAST write) ---
+        # --- Step 6: Bookkeeping — durable BEFORE the registry flush (step 7) ---
+        # The registry flush below is the commit signal that makes this
+        # slot's keys discoverable on the next boot, so their bookkeeping
+        # rows in key_metadata.json must already be on disk by the time that
+        # signal lands.  A raise here fires before _registry_flushed is set,
+        # so the finally block below removes the (still-orphan) slot dir.
+        loop.write_key_metadata()
+
+        # --- Step 7: Registry flush — commit signal (both modes, LAST write) ---
         # The registry now carries the unified simhash map (active∪stale) in its
         # "simhash" key, so a separate simhash_registry.json is no longer written.
         # After this returns the slot is live on disk.  Any exception before

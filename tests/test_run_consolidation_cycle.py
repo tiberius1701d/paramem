@@ -272,6 +272,66 @@ class TestRegistryLastWriteOrder:
             f"save_adapter must come before save_from_bytes; order was: {call_order}"
         )
 
+    def test_key_metadata_written_before_registry_flush(self, tmp_path: Path) -> None:
+        """commit_tier_slot must call loop.write_key_metadata() BEFORE the
+        registry flush (save_from_bytes) -- the registry write is the commit
+        signal, so bookkeeping for a key it makes discoverable on the next
+        boot must already be durable.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_mock_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+        stamp = "20260418T1430"
+        loop.model.peft_config[f"episodic_interim_{stamp}"] = _matching_interim_config(
+            loop.episodic_config
+        )
+
+        call_order: list[str] = []
+
+        def _record_write_key_metadata(self):
+            call_order.append("write_key_metadata")
+
+        def _record_save_from_bytes(payload, path, **kwargs):
+            call_order.append("save_from_bytes")
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(type(loop), "write_key_metadata", _record_write_key_metadata),
+            patch.object(KeyRegistry, "save_from_bytes", side_effect=_record_save_from_bytes),
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(2),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-002",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        assert "write_key_metadata" in call_order, "write_key_metadata was not called"
+        assert "save_from_bytes" in call_order, "registry save_from_bytes was not called"
+        write_meta_idx = call_order.index("write_key_metadata")
+        save_from_bytes_idx = call_order.index("save_from_bytes")
+        assert write_meta_idx < save_from_bytes_idx, (
+            f"write_key_metadata must come before the registry flush "
+            f"(save_from_bytes); order was: {call_order}"
+        )
+
     def test_interim_telemetry_records_derived_epochs(self, tmp_path: Path) -> None:
         """The interim fold's telemetry `record["epochs"]` must carry the
         DERIVED budget (paramem.utils.config.budget_for), not

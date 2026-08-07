@@ -155,6 +155,46 @@ class TestProbeReraise:
             restore()
 
 
+class TestPreloadContentOnlyProjection:
+    """_build_store_contents must project every staged entry to the
+    content-only shape before it enters ``new_entries`` — the source result
+    may carry provenance/derived fields (confidence, fact_text, raw_output,
+    and historically speaker_id), but the store's entry cache holds SPO
+    content only, exactly as the probe-time memoize path writes it."""
+
+    def test_source_result_extra_fields_stripped_at_staging(self, tmp_path):
+        """A source result carrying extra fields (speaker_id, confidence,
+        fact_text, raw_output) is projected down to {key, subject,
+        predicate, object} before it reaches new_entries."""
+        config = _make_config(tmp_path)
+        restore = _inject_config(config)
+        try:
+            source_mock = MagicMock()
+            source_mock.probe.return_value = {
+                "key_001": {
+                    "key": "key_001",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "speaker0",
+                    "confidence": 0.97,
+                    "fact_text": "Alice lives_in Berlin",
+                    "raw_output": "{}",
+                }
+            }
+            new_entries, _, _, _ = TestProbeReraise._run_build_store_contents_with_source(
+                config, source_mock
+            )
+            assert new_entries["episodic"]["key_001"] == {
+                "key": "key_001",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+            }
+        finally:
+            restore()
+
+
 # ---------------------------------------------------------------------------
 # _fail_fast_cuda / _cuda_liveness_canary
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 import torch
 from torch.utils.data import Dataset
 
+from paramem.backup.encryption import write_infra_json
 from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
@@ -31,6 +32,7 @@ from paramem.graph.schema import Relation, SessionGraph
 from paramem.memory.entry import (
     assign_keys,
     build_registry,
+    content_only_entry,
     entry_simhash,
     format_entry_training,
 )
@@ -167,24 +169,25 @@ def _relation_to_entry_dict(r: "Relation") -> dict:
 
 
 def _persisted_from_entry_and_rec(entry: "dict", tier: str, rec: "dict | None") -> "dict":
-    """Build one ``fold_resume.json`` train_assignment entry for the interim fold.
+    """Build one ``fold_resume.json`` train_assignment entry.
 
     Serialize half of the round-trip pair with :func:`_rec_from_persisted`
     (the deserialize half) — together they are the single place the
-    interim-slot ``deferred_writes``/``new_keyed_interim`` "rec" shape (built
-    by the graph-walk in
-    :meth:`ConsolidationLoop._build_all_edge_entries_into` — see the
-    cross-link comment at that ``rec = {...}`` construction) is projected to
-    and reconstructed from the persisted marker.  *entry* is the uniform
-    ``tier_keyed`` shape (``{key, subject, predicate, object, speaker_id}``);
-    *rec* is the matching deferred-write record — present only for keys
-    newly minted THIS cycle (``None`` for anti-forgetting-replay entries,
-    which carry no rec).
+    ``deferred_writes``/``new_keyed_interim`` "rec" shape (built by the
+    graph-walk in :meth:`ConsolidationLoop._build_all_edge_entries_into` —
+    see the cross-link comment at that ``rec = {...}`` construction) is
+    projected to and reconstructed from the persisted marker.  Used by both
+    fold scopes: the interim path (``adapter_name`` outer key, single flat
+    list) and the main-tiers path (``episodic``/``semantic``/``procedural``
+    outer keys). *entry* is the uniform ``tier_keyed`` shape (``{key,
+    subject, predicate, object, speaker_id}``); *rec* is the matching
+    deferred-write record — present only for keys newly minted THIS cycle
+    (``None`` for anti-forgetting-replay entries, which carry no rec).
 
     Args:
         entry: One uniform ``tier_keyed`` entry.
-        tier: ``"episodic"`` or ``"procedural"`` — which ``_tier_keyed`` list
-            *entry* came from.
+        tier: ``"episodic"``, ``"semantic"``, or ``"procedural"`` — which
+            ``tier_keyed``/``_tier_keyed`` list *entry* came from.
         rec: The matching ``deferred_writes`` record, or ``None`` when
             *entry* is an existing (already-keyed) key.
 
@@ -221,7 +224,12 @@ def _rec_from_persisted(pe: "dict") -> "dict":
         A rec dict shaped like one element of ``deferred_writes`` — no
         ``canon_subj``/``canon_obj``: the interim commit window never reads
         those two graph-walk-only fields, so they are not part of the
-        round-trip contract.
+        round-trip contract.  The returned ``"tier"`` defaults to
+        ``"episodic"`` when *pe* carries no ``"tier"`` field — a degenerate
+        fallback only, never authoritative placement. The main-tiers
+        crash-resume path stores its ``train_assignment`` as one list per
+        tier (the OUTER dict key), which is the true tier; it ignores this
+        field for placement rather than relying on the default.
     """
     entry = {
         "key": pe["key"],
@@ -361,6 +369,33 @@ class AbortedDuringConsolidation(Exception):
     ``mode="aborted"``.  Partial progress is lost but VRAM state is consistent
     with the pre-cycle baseline.
     """
+
+
+class RegistryBookkeepingDivergence(RuntimeError):
+    """Raised by the main-tiers fold's integrity gate
+    (:meth:`ConsolidationLoop._assert_registry_bookkeeping_parity`) when a key
+    about to become active in a rebuilt tier registry has no paired store
+    entry and/or no bookkeeping record.
+
+    Fired BEFORE :meth:`ConsolidationLoop._reset_main_tier_registries_and_simhashes`
+    mutates any in-RAM registry and before any durable write to serving state
+    for this fold, so the former (pre-fold) registries and on-disk state stay
+    live and servable when it fires.  Fold-scratch writes made earlier in the
+    same fold — ``fold_resume.json`` and per-tier training checkpoints — may
+    already be on disk; they are recoverable resume scratch, not serving
+    state, and are compensated by fold resume on the next run.  The caller's
+    crash envelope (``paramem.server.app._run_stage_b_cycle``) records an
+    incident and fails the cycle for any exception escaping a fold, and reads
+    ``divergent_keys`` off this exception so the incident names exactly what
+    diverged.
+
+    Carries the divergent key list keyed by tier so the incident names
+    exactly what diverged.
+    """
+
+    def __init__(self, message: str, *, divergent_keys: "dict[str, list[str]]"):
+        super().__init__(message)
+        self.divergent_keys = divergent_keys
 
 
 @dataclass(frozen=True)
@@ -512,6 +547,12 @@ class ConsolidationLoop:
     # tests/test_adapter_verification.py) still resolve this attribute.
     _telemetry_dir: "Path | None" = None
 
+    # Same reason: the durable key-bookkeeping write destination (see
+    # :meth:`write_key_metadata`) must resolve on instances built via
+    # ``object.__new__``.  ``None`` makes the write a no-op, matching
+    # experiment/test constructions that never pass ``key_metadata_path``.
+    _key_metadata_path: "Path | None" = None
+
     # Same reason: ``cloud_enabled`` must resolve on instances built via
     # ``object.__new__``.  Default OFF — a harness that skips ``__init__``
     # gets no cloud egress unless it says so.
@@ -562,6 +603,7 @@ class ConsolidationLoop:
         keep_prior_slots: int = 3,
         telemetry_dir: str | Path | None = None,
         incidents_state_dir: str | Path | None = None,
+        key_metadata_path: str | Path | None = None,
     ):
         # Optional callable that returns the server ``_state`` dict.  When
         # provided, ``run_cycle`` calls ``self.guard_trial_state(state_provider())``
@@ -590,6 +632,17 @@ class ConsolidationLoop:
         # ``_save_adapters`` calls ``save_adapter``.
         self._incidents_state_dir: Path | None = (
             Path(incidents_state_dir) if incidents_state_dir is not None else None
+        )
+        # Destination for the durable key-bookkeeping write (see
+        # :meth:`write_key_metadata`).  Threaded from the bootstrap call site
+        # exactly like ``telemetry_dir``/``incidents_state_dir``; ``None`` for
+        # experiment/test constructions, which persist no bookkeeping.  The
+        # trial-migration path overrides this per-instance via the ad hoc
+        # ``trial_key_metadata_path`` attribute (set post-construction by
+        # ``paramem.server.app._build_trial_loop``), which
+        # :meth:`write_key_metadata` prefers when present.
+        self._key_metadata_path: Path | None = (
+            Path(key_metadata_path) if key_metadata_path is not None else None
         )
         self._keep_prior_slots = keep_prior_slots
         # ``ServerConfig.cloud.enabled``, passed in at the bootstrap call site
@@ -715,38 +768,14 @@ class ConsolidationLoop:
         # Real (non-donor) minting floor: paramem.training.donor reserves
         # graph1-graph{DONOR_KEY_BAND_WIDTH} and proc1-proc{DONOR_KEY_BAND_WIDTH}
         # for the donor's synthetic training population, so counters seed at
-        # DONOR_KEY_FLOOR (= width + 1) rather than 1, and the max() below
-        # (against the store's own high-water key) can only raise it further —
-        # never below the floor.
+        # DONOR_KEY_FLOOR (= width + 1) rather than 1.  The caller is
+        # responsible for having hydrated registries before this point (via
+        # ``MemoryStore.load_registries_from_disk`` or by injecting the
+        # lifespan-loaded store) — see :meth:`_derive_key_counters` for the
+        # scan that raises these off the floor.
         self._indexed_next_index: int = DONOR_KEY_FLOOR
         self._procedural_next_index: int = DONOR_KEY_FLOOR
-        # Derive next-index counters from every KNOWN key in the store — active
-        # AND stale (paramem.training.donor's DONOR_KEY_FLOOR is a starting
-        # value, not a replacement for this scan). Root fix: scanning
-        # all_active_keys() alone excludes the stale partition, so a
-        # soft-staled highest key plus a restart would re-mint its id and
-        # set_simhash would then route the new fingerprint into the stale
-        # record (paramem.training.key_registry — the stale slot has no live
-        # simhash reader, so the collision surfaces as a silent recall miss on
-        # the NEW key, not an error). all_known_keys() is active ∪ stale, so a
-        # stale highest key still bumps the floor and the id is never reissued.
-        # The caller is responsible for having hydrated registries before
-        # this point (via ``MemoryStore.load_registries_from_disk`` or by
-        # injecting the lifespan-loaded store).
-        if self.store.replay_enabled:
-            for key in self.store.all_known_keys():
-                if key.startswith("graph"):
-                    try:
-                        idx = int(key.removeprefix("graph"))
-                        self._indexed_next_index = max(self._indexed_next_index, idx + 1)
-                    except ValueError:
-                        pass
-                elif key.startswith("proc"):
-                    try:
-                        idx = int(key.removeprefix("proc"))
-                        self._procedural_next_index = max(self._procedural_next_index, idx + 1)
-                    except ValueError:
-                        pass
+        self._derive_key_counters()
 
         self.cycle_count = 0
 
@@ -886,7 +915,7 @@ class ConsolidationLoop:
             if tier is None:
                 # No tier knows this key (not active, not stale) — slot was
                 # wiped or never existed.  Drop the metadata entry; the next
-                # _save_key_metadata write will not re-emit it.
+                # write_key_metadata write will not re-emit it.
                 orphan_count += 1
                 continue
         # promoted_keys is similarly slot-owned — drop entries whose tier is
@@ -904,6 +933,94 @@ class ConsolidationLoop:
             self.cycle_count,
             len(self.promoted_keys),
         )
+
+    def _derive_key_counters(self) -> None:
+        """(Re)derive the mint-index counters from every known key in the store.
+
+        Raises ``_indexed_next_index``/``_procedural_next_index`` to one past
+        the highest numeric suffix found among ``self.store.all_known_keys()``
+        (active AND stale — a soft-staled key still has to keep its id
+        reserved, since the stale slot has no live SimHash reader and a
+        reissued id would silently misroute the new key's fingerprint onto
+        the stale record). Never lowers either counter — both start at
+        :data:`DONOR_KEY_FLOOR` and only ``max()`` upward from there.
+
+        Called once from ``__init__`` (fresh construction, scanning whatever
+        the injected store was hydrated with) and again from the main-tiers
+        crash-resume path after it re-establishes the store content for keys
+        minted in the crashed process — otherwise a resumed fold's local
+        running counters would restart from the pre-crash floor and could
+        re-issue a key id the crashed run already committed to the marker.
+        """
+        self._indexed_next_index = DONOR_KEY_FLOOR
+        self._procedural_next_index = DONOR_KEY_FLOOR
+        if not self.store.replay_enabled:
+            return
+        for key in self.store.all_known_keys():
+            if key.startswith("graph"):
+                try:
+                    idx = int(key.removeprefix("graph"))
+                    self._indexed_next_index = max(self._indexed_next_index, idx + 1)
+                except ValueError:
+                    pass
+            elif key.startswith("proc"):
+                try:
+                    idx = int(key.removeprefix("proc"))
+                    self._procedural_next_index = max(self._procedural_next_index, idx + 1)
+                except ValueError:
+                    pass
+
+    def write_key_metadata(self) -> None:
+        """Durably persist per-key bookkeeping to ``key_metadata.json``.
+
+        The sole ADDITIVE writer for cross-restart key bookkeeping
+        (``speaker_id``, ``relation_type``, ``reinforcement_count``,
+        ``last_reinforced_cycle``, ``last_seen``, ``first_seen``) —
+        :func:`~paramem.server.consolidation.prune_key_metadata_orphans` is a
+        separate, boot-only, subtractive writer that only removes rows for
+        keys no tier registry still knows.  Called from inside the fold's own
+        commit sequence — the main-tiers finalize, ahead of the per-tier
+        ``indexed_key_registry.json`` rewrite, and the interim path, ahead of
+        :func:`~paramem.memory.persistence.commit_tier_slot`'s registry flush
+        — so a newly-minted key's bookkeeping row is durable before the
+        registry write that makes the key discoverable on the next boot.
+        Also called directly, as a public method, by every caller outside the
+        fold that needs the on-disk bookkeeping to reflect an in-RAM change:
+        the key-erase repair door, ``POST /interim/discard``, both branches of
+        the trial-migration extraction path, and the scheduled-tick noop
+        terminal (a noop cycle bumps ``cycle_count`` in RAM but never reaches
+        a fold commit, so nothing else would flush it).
+
+        Per the wipe invariant (2026-05-14): ``key_metadata.json`` is
+        bookkeeping for active keys, not a recovery source.  Persists
+        bookkeeping for BOTH active and stale keys — stale-echo probes need
+        to resolve speaker/relation_type for a soft-staled key.  A key with
+        no bookkeeping record is skipped rather than given a fabricated one;
+        it stays recordless on reload, which every bookkeeping read site
+        already tolerates via ``bookkeeping_for_key(k) or {}``.
+
+        Resolves the destination path from ``self.trial_key_metadata_path``
+        (set externally by the trial-migration path to isolate its writes
+        from the live registry) or, absent that, ``self._key_metadata_path``
+        (set at construction from ``ServerConfig.key_metadata_path``). A
+        no-op when neither is set — the default for experiment/test
+        constructions that never pass ``key_metadata_path``.
+        """
+        dest = getattr(self, "trial_key_metadata_path", None) or self._key_metadata_path
+        if dest is None:
+            return
+        keys_payload: dict = {}
+        for key in self.store.all_known_keys():
+            bk = self.store.bookkeeping_for_key(key)
+            if bk is None:
+                continue
+            keys_payload[key] = dict(bk)
+        metadata = {
+            "cycle_count": self.cycle_count,
+            "promoted_keys": sorted(self.promoted_keys),
+            "keys": keys_payload,
+        }
+        write_infra_json(Path(dest), metadata)
 
     @staticmethod
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
@@ -1115,6 +1232,67 @@ class ConsolidationLoop:
             batch_size=self.training_config.recall_probe_batch_size,
         )
         return {r["key"] for r in result["per_key"] if r["exact_match"]}
+
+    def _assert_registry_bookkeeping_parity(
+        self, candidate_keyed_by_tier: "dict[str, list[dict]]"
+    ) -> None:
+        """Fail closed when a candidate active key has no store entry or no
+        bookkeeping record.
+
+        Called from the main-tiers fold's atomic finalize, immediately BEFORE
+        :meth:`_reset_main_tier_registries_and_simhashes`, against the exact
+        per-tier key set that call is about to admit into the rebuilt
+        registries (post recall-gate filtering, pre-mutation).  Firing here
+        — ahead of any in-RAM registry mutation and any durable write to
+        serving state for this fold — means the former registries stay live
+        and servable when the gate trips.  Earlier fold-scratch writes
+        (``fold_resume.json``, per-tier training checkpoints) may already be
+        on disk; they are recoverable resume scratch, not serving state.
+
+        Predicate per key: a store entry exists (``store.get(key)``) AND a
+        bookkeeping record exists (``store.bookkeeping_for_key(key)``).
+        Non-empty ``speaker_id`` is NOT required — ``allow_empty_speaker``
+        bookkeeping is a legitimate production state for unattributed facts.
+
+        A key whose bookkeeping record looks reinforce-fabricated (empty
+        ``speaker_id`` AND ``relation_type == "unknown"`` — the minimal shape
+        :meth:`~paramem.memory.store.MemoryStore.reinforce` writes when no
+        record exists yet) passes the gate; it is reported via a WARNING log
+        naming the key rather than failed, since a real record does exist.
+
+        Args:
+            candidate_keyed_by_tier: Per-tier list of entry dicts that are
+                about to become the tier's new active registry set.
+
+        Raises:
+            RegistryBookkeepingDivergence: when any candidate key has no
+                store entry and/or no bookkeeping record.
+        """
+        divergent: dict[str, list[str]] = {}
+        for tier, keyed in candidate_keyed_by_tier.items():
+            for kp in keyed:
+                key = kp["key"]
+                has_entry = self.store.get(key) is not None
+                bk = self.store.bookkeeping_for_key(key)
+                if has_entry and bk is not None:
+                    if bk.get("speaker_id", "") == "" and bk.get("relation_type") == "unknown":
+                        logger.warning(
+                            "registry_bookkeeping_divergence gate: key %s (tier %s) carries "
+                            "a reinforce-fabricated bookkeeping record (empty speaker_id, "
+                            "relation_type=unknown) — passes the gate, no real attribution",
+                            key,
+                            tier,
+                        )
+                    continue
+                divergent.setdefault(tier, []).append(key)
+
+        if divergent:
+            total = sum(len(v) for v in divergent.values())
+            raise RegistryBookkeepingDivergence(
+                f"registry_bookkeeping_divergence: {total} candidate key(s) about to "
+                f"become active have no store entry and/or bookkeeping record: {divergent}",
+                divergent_keys=divergent,
+            )
 
     def _reset_main_tier_registries_and_simhashes(
         self,
@@ -2209,7 +2387,13 @@ class ConsolidationLoop:
                 (interim-slot fold).
             fold_stamp: SHA-256 from ``_compute_fold_stamp`` (pre-mutation).
             train_assignment: Per-tier lists of entry dicts
-                (``key/subject/predicate/object/speaker_id``).
+                (``key/subject/predicate/object/speaker_id``), enriched via
+                ``_persisted_from_entry_and_rec`` with ``tier`` and, for keys
+                newly minted THIS fold, ``relation_type``/``session_ids``/
+                ``last_seen``/``first_seen`` — both scopes pass entries
+                through that helper so a crash-resume can fully re-establish
+                a pre-crash mint (content + bookkeeping), not just replay the
+                bare triple.
             dataset_fingerprints: Per-tier ``_fingerprint_entries`` hexdigest.
             pending_session_ids: Sorted list of session ids the current
                 pending-session batch was extracted from (``scope_name ==
@@ -3771,7 +3955,7 @@ class ConsolidationLoop:
                         self.store.put(
                             adapter_name,
                             _key,
-                            _entry,
+                            content_only_entry(_entry),
                             simhash=entry_simhash(_entry),
                         )
                         self.store.set_bookkeeping(
@@ -4004,9 +4188,97 @@ class ConsolidationLoop:
                 _marker_ta: "dict[str, list[dict]]" = _resume_marker.get(  # type: ignore[union-attr]
                     "train_assignment", {}
                 )
-                tier_keyed = {
-                    t: list(_marker_ta.get(t, [])) for t in ("episodic", "semantic", "procedural")
-                }
+
+                tier_keyed = {"episodic": [], "semantic": [], "procedural": []}
+                for _t in ("episodic", "semantic", "procedural"):
+                    for _pe in _marker_ta.get(_t, []):
+                        if "relation_type" in _pe:
+                            # Newly minted pre-crash: the crashed process's
+                            # store.put/set_bookkeeping calls were RAM-only and
+                            # never reached disk, so THIS (restarted) process's
+                            # store has no record of the key at all — reconstitute
+                            # both from the marker's rec data.  The OUTER key
+                            # (_t) is the true tier: _rec_from_persisted defaults
+                            # an absent "tier" field to "episodic", which would
+                            # misplace a procedural/semantic key — never used for
+                            # placement here.
+                            _rec = _rec_from_persisted(_pe)
+                            _entry = _rec["entry"]
+                            _content_entry = content_only_entry(_entry)
+                            self.store.put(
+                                _t,
+                                _entry["key"],
+                                _content_entry,
+                                simhash=entry_simhash(_content_entry),
+                            )
+                            self.store.set_bookkeeping(
+                                _entry["key"],
+                                speaker_id=_rec["speaker_id"],
+                                relation_type=_rec["relation_type"],
+                                reinforcement_count=1,
+                                last_reinforced_cycle=self.cycle_count,
+                                last_seen=_rec["last_seen"],
+                                first_seen=_rec["first_seen"],
+                                allow_empty_speaker=(_rec["speaker_id"] == ""),
+                            )
+                        else:
+                            # Pre-existing key (anti-forgetting replay): content
+                            # and bookkeeping were already durable before this
+                            # fold began.  Re-put the content defensively
+                            # (store.put is an idempotent overwrite) so a
+                            # resumed simulate fold's later
+                            # build_tier_graph_from_store never KeyErrors on a
+                            # registry-active key this restarted process's store
+                            # cache never hydrated — the resume fast-path below
+                            # skips _hydrate_store_for_fold entirely. Bookkeeping
+                            # is left untouched: it was durably committed by a
+                            # prior cycle and boot-time load already restored it.
+                            _entry = {
+                                "key": _pe["key"],
+                                "subject": _pe["subject"],
+                                "predicate": _pe["predicate"],
+                                "object": _pe["object"],
+                                "speaker_id": _pe["speaker_id"],
+                            }
+                            _content_entry = content_only_entry(_entry)
+                            # A crashed prior attempt at THIS fold may already
+                            # have moved the key to a different tier (e.g.
+                            # _promote_mature_keys_inline -> store.move()) and
+                            # written the marker under the new tier before
+                            # failing to persist the registry rewrite.  The
+                            # registry loaded from disk on restart still
+                            # reflects the pre-move tier, so re-putting under
+                            # _t without first relocating ownership would
+                            # leave the key active in BOTH tiers.  Detect via
+                            # the registry (not store.tier_of/_entries — the
+                            # resume fast-path never hydrates _entries) and
+                            # relocate through store.move() before the put so
+                            # the key is never observed active in two tiers.
+                            _existing_tier = self.store.tier_for_active_key(_entry["key"])
+                            if _existing_tier is not None and _existing_tier != _t:
+                                logger.info(
+                                    "_run_fold[main_tiers]: resume re-put relocating"
+                                    " %s from %s to %s (registry ownership drift from"
+                                    " a partially persisted prior attempt)",
+                                    _entry["key"],
+                                    _existing_tier,
+                                    _t,
+                                )
+                                self.store.move(_entry["key"], _t)
+                            self.store.put(
+                                _t,
+                                _entry["key"],
+                                _content_entry,
+                                simhash=entry_simhash(_content_entry),
+                            )
+                        tier_keyed[_t].append(_entry)
+
+                # Re-derive the mint-index counters now that every marker key
+                # has a store entry again — otherwise a resumed fold's local
+                # running counters would restart from the pre-crash floor and
+                # could re-issue an id the crashed run already committed.
+                self._derive_key_counters()
+
                 recall_miss_keys: list[str] = []
                 minted_by_tier: dict = {}
                 _train_active_before: dict[str, int] = {
@@ -4082,7 +4354,7 @@ class ConsolidationLoop:
                     "procedural": [],
                 }
 
-                minted_by_tier, _ = self._build_all_edge_entries_into(
+                minted_by_tier, _minted_records = self._build_all_edge_entries_into(
                     tier_keyed,
                     defer=scope.defer,
                     tag_new=scope.tag_new,
@@ -4117,8 +4389,24 @@ class ConsolidationLoop:
                     _ta_entries = tier_keyed[_t]
                     if _ta_entries:
                         _dataset_fingerprints[_t] = _fingerprint_entries(_ta_entries)
+                # Enrich each entry with "tier" and, for keys minted THIS fold,
+                # the deferred-write metadata (relation_type/session_ids/
+                # last_seen/first_seen) via the same round-trip contract the
+                # interim path uses (_persisted_from_entry_and_rec) — so a
+                # main-tiers crash-resume can fully re-establish a pre-crash
+                # mint (content + bookkeeping), not just replay the bare
+                # key/subject/predicate/object tuple.  Runs in both venues:
+                # main_tiers persists this marker regardless of scope.source.
+                _new_meta_by_key = {r["entry"]["key"]: r for r in _minted_records}
+                _persisted_ta: "dict[str, list[dict]]" = {
+                    _t: [
+                        _persisted_from_entry_and_rec(_pe, _t, _new_meta_by_key.get(_pe["key"]))
+                        for _pe in tier_keyed[_t]
+                    ]
+                    for _t in ("episodic", "semantic", "procedural")
+                }
                 self._persist_fold_assignment(
-                    "main_tiers", _fold_stamp_c, tier_keyed, _dataset_fingerprints
+                    "main_tiers", _fold_stamp_c, _persisted_ta, _dataset_fingerprints
                 )
 
             # --- Drift partition (fresh-fold only; skipped on crash-resume) ---
@@ -4823,11 +5111,46 @@ class ConsolidationLoop:
                         else:
                             passing_sets_by_tier[_tier] = None
 
+                # Resolve the exact per-tier candidate key set the reset call
+                # below is about to admit — the identical admission rule
+                # _reset_main_tier_registries_and_simhashes applies internally
+                # (pass every key through for a None whole-dict venue, filter
+                # by a concrete per-tier passing set, or probe-resolve a
+                # per-tier None verdict) — computed here so the integrity
+                # gate can run BEFORE that call mutates any in-RAM registry.
+                # A tier whose verdict resolves to a concrete set here is
+                # written back into passing_sets_by_tier so the reset call
+                # below does not re-run the probe.
+                candidate_keyed_by_tier: dict[str, list[dict]] = {}
+                for _tier in ("episodic", "semantic", "procedural"):
+                    _cand_keyed = tier_keyed.get(_tier, [])
+                    if not _cand_keyed:
+                        candidate_keyed_by_tier[_tier] = []
+                        continue
+                    if passing_sets_by_tier is None:
+                        candidate_keyed_by_tier[_tier] = _cand_keyed
+                        continue
+                    _cand_passing = passing_sets_by_tier.get(_tier)
+                    if _cand_passing is None:
+                        _cand_passing = self._probe_passing_keys(_tier, _cand_keyed)
+                        passing_sets_by_tier[_tier] = _cand_passing
+                    candidate_keyed_by_tier[_tier] = [
+                        kp for kp in _cand_keyed if kp["key"] in _cand_passing
+                    ]
+
+                self._assert_registry_bookkeeping_parity(candidate_keyed_by_tier)
+
                 self._reset_main_tier_registries_and_simhashes(
                     tier_keyed,
                     passing_sets_by_tier,
                     soft_stale_by_tier=soft_stale_by_tier,
                 )
+                # Bookkeeping durable BEFORE the registry rewrite below: the
+                # registry is the commit signal that makes a key discoverable
+                # on the next boot, so its row in key_metadata.json must
+                # already be on disk by the time that signal lands — never
+                # the other way round (see write_key_metadata).
+                self.write_key_metadata()
                 if _absorbed_interims:
                     self._drop_interim_tier_registries()
                 for _reg_tier in ("episodic", "semantic", "procedural"):
@@ -5198,7 +5521,9 @@ class ConsolidationLoop:
               speaker attribution — allowed via ``allow_empty_speaker=True`` at the
               mint site).
             - When ``defer=False`` (fold discipline): ``store.put``,
-              ``store.set_bookkeeping``, and counter advances are applied immediately.
+              ``store.set_bookkeeping``, and counter advances are applied immediately
+              — and the harvest record is still added to ``deferred_writes``, for
+              the crash-resume marker (see the return-value docs below).
             - When ``defer=True`` (interim atomicity): all store writes and counter
               advances are SKIPPED; the harvest record is added to ``deferred_writes``
               so the caller can flush after recall-confirmed training.
@@ -5230,10 +5555,14 @@ class ConsolidationLoop:
         Args:
             tier_keyed: Mutable mapping of tier name → list of training-entry dicts.
                 Both branches append in-place.
-            defer: When ``True`` (interim path), all store writes and counter
-                advances for NEW (keyless/minted) entries are deferred and returned
-                in ``deferred_writes``.  Existing keyed entries are never written
-                regardless of this flag.  Default ``False`` (fold discipline).
+            defer: When ``True`` (interim path), store writes and counter
+                advances for NEW (keyless/minted) entries are skipped here — the
+                caller applies them later from ``deferred_writes`` (e.g. after a
+                recall-confirmed training pass).  When ``False`` (fold
+                discipline, main-tiers default), the write and counter advance
+                happen immediately, in addition to the same record being
+                returned.  Existing keyed entries are never written regardless
+                of this flag.  Default ``False``.
             tag_new: When ``True``, each minted entry receives ``entry["_new"] =
                 True`` so the caller can identify newly-minted entries in
                 ``tier_keyed``.  Default ``False``.
@@ -5258,9 +5587,12 @@ class ConsolidationLoop:
             - ``minted_by_tier`` — per-tier count of newly minted keys,
               e.g. ``{"episodic": 2, "procedural": 1}``.  Existing keyed entries
               do NOT contribute to this count.
-            - ``deferred_writes`` — harvest records for new entries whose store
-              writes have not yet been applied.  When ``defer=False`` this is
-              always ``[]``; when ``defer=True`` this is one record per minted key.
+            - ``deferred_writes`` — one harvest record per newly minted key,
+              returned regardless of ``defer`` (the flag governs only WHEN the
+              store write happens, never whether the record exists — callers
+              that persist immediately, e.g. the main-tiers fold, still need
+              this list to enrich the ``fold_resume.json`` crash-resume marker
+              via ``_persisted_from_entry_and_rec``).
               Each record has: ``"entry"``, ``"tier"``, ``"canon_subj"``,
               ``"canon_obj"``, ``"predicate"``, ``"relation_type"``, ``"speaker_id"``,
               ``"session_ids"`` (sorted list of real contributing session ids,
@@ -5403,7 +5735,7 @@ class ConsolidationLoop:
                 self.store.put(
                     tier,
                     minted_key,
-                    entry,
+                    content_only_entry(entry),
                     simhash=entry_simhash(entry),
                 )
                 self.store.set_bookkeeping(
@@ -5421,9 +5753,14 @@ class ConsolidationLoop:
                     self._procedural_next_index += 1
                 else:
                     self._indexed_next_index += 1
-            else:
-                # Interim atomicity: defer all store writes + counter advances.
-                deferred_writes.append(rec)
+            # `defer` above governs WHEN the store write happens (`interim
+            # atomicity` skips it here and lets the caller flush after
+            # recall-confirmed training) — never whether this record exists.
+            # It is appended unconditionally: the round-trip contract with
+            # _persisted_from_entry_and_rec / _rec_from_persisted
+            # (fold_resume.json crash-resume) needs one record per minted
+            # key regardless of venue.
+            deferred_writes.append(rec)
 
             # Append to tier_keyed (uniform shape, same as the keyed branch).
             result_entry = {

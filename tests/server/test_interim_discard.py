@@ -609,15 +609,10 @@ class TestOperationOrder:
 
         state["router"].reload.side_effect = _spy_reload
 
-        import paramem.server.consolidation as consolidation_module
+        def _spy_write_key_metadata():
+            call_order.append("write_key_metadata")
 
-        orig_save_key_metadata = consolidation_module._save_key_metadata
-
-        def _spy_save_key_metadata(loop_arg, config_arg):
-            call_order.append("save_key_metadata")
-            return orig_save_key_metadata(loop_arg, config_arg)
-
-        monkeypatch.setattr(consolidation_module, "_save_key_metadata", _spy_save_key_metadata)
+        loop.write_key_metadata.side_effect = _spy_write_key_metadata
 
         client = _make_client(monkeypatch, state)
         resp = client.post("/interim/discard", json={"confirm": True})
@@ -631,7 +626,7 @@ class TestOperationOrder:
         assert call_order == [
             "drop_tier",
             "unload_interim_adapters",
-            "save_key_metadata",
+            "write_key_metadata",
             "router_reload",
         ]
 
@@ -845,8 +840,8 @@ class TestFailurePath:
         assert state["last_consolidation"] is not None
         datetime.fromisoformat(state["last_consolidation"])
 
-    def test_save_key_metadata_failure_does_not_500(self, tmp_path, monkeypatch):
-        """A ``_save_key_metadata`` failure (Step 3) must not turn an
+    def test_write_key_metadata_failure_does_not_500(self, tmp_path, monkeypatch):
+        """A ``loop.write_key_metadata()`` failure (Step 3) must not turn an
         already-completed destructive ring drop into an HTTP 500 — Steps 1-2
         already dropped the tier from the store and reaped its adapter by
         the time this bookkeeping step runs.
@@ -861,10 +856,8 @@ class TestFailurePath:
         def _boom(*args, **kwargs):
             raise RuntimeError("key_metadata.json write failed")
 
-        # _save_key_metadata is imported locally inside the handler on every
-        # call (from paramem.server.consolidation) — patch the source, not
-        # an app_module attribute.
-        monkeypatch.setattr("paramem.server.consolidation._save_key_metadata", _boom)
+        # write_key_metadata is called directly on the loop instance.
+        loop.write_key_metadata.side_effect = _boom
 
         client = _make_client(monkeypatch, state)
         resp = client.post("/interim/discard", json={"confirm": True})

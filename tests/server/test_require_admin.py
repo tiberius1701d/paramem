@@ -248,6 +248,7 @@ _ADMIN_PATHS = {
     "/debug/probe",
     "/debug/recall",
     "/debug/dump",
+    "/debug/erase-keys",
     "/calibrate/extract",
     "/calibrate/anonymize",
     "/calibrate/plausibility",
