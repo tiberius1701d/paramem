@@ -333,7 +333,7 @@ mechanism itself.
 
 ## Test 8: Large-Scale Incremental (550 Keys, No Ceiling Observed)
 
-**Script:** `experiments/test8_large_scale.py`
+**Script:** `archive/experiments/test8_large_scale.py`
 **Status:** CLOSED 2026-05-11 — scaling target (550 keys) reached at cycle 56, 100% recall, no ceiling indicator observed in the training signal. Test 8 used the QA-pair encoding with incremental full-replay (56 cycles, 280 sessions across 11 characters, multi-day wall time). The closure answers the immediate research question (does the indexed-key mechanism scale past 100 keys under the legacy QA-pair encoding? — yes) and is not a negative result on Test 8. Test 17 is a separate scaling effort under the production quadruple encoding on a different source graph (LongMemEval); it settled the production-encoding decision and is the canonical reference for the quadruple path. Test 8 remains the reference for the QA-pair path. The capacity ceiling remains unmeasured and is open future work.
 
 
@@ -448,7 +448,7 @@ row-level norms computed across all LoRA matrices.
 4. Constrained approaches (O-LoRA, OSRM) enforce orthogonal subspaces by
    construction and are not addressed by this experiment.
 
-**Script:** `experiments/weight_diff_analysis.py`
+**Script:** `archive/experiments/weight_diff_analysis.py`
 **Raw data:** `outputs/weight_diff_analysis/results.json`, `row_level_diffs.json`
 
 ### Probing Experiments (2026-03-24)
@@ -576,7 +576,7 @@ miss.
 
 ## Test 9: Natural Recall Emergence
 
-**Script:** `experiments/test9_natural_recall.py`
+**Script:** `archive/experiments/test9_natural_recall.py`
 **Status:** COMPLETE — Mistral 7B, 41 cycles evaluated (21→550 keys). Latest run 2026-04-08.
 
 ### Objective
@@ -706,7 +706,7 @@ primary retrieval mechanism.
 
 ## Test 3: Reasoning Quality Parity with RAG
 
-**Script:** `experiments/test3_inference.py`
+**Script:** `archive/experiments/test3_inference.py`
 **Status:** COMPLETE — both models (2026-03-20)
 
 **Objective:** Verify that reasoning over parametrically recalled facts achieves
@@ -780,7 +780,7 @@ topic, or recency would be needed at larger scales.
 
 ## Test 6: Parametric vs RAG Head-to-Head
 
-**Script:** `experiments/test6_footprint.py`
+**Script:** `archive/experiments/test6_footprint.py`
 **Status:** COMPLETE — both models (2026-03-21)
 
 **Objective:** Head-to-head comparison of parametric retrieval (indexed keys)
@@ -911,7 +911,7 @@ repetition_penalty=1.1.
 
 ## Test 7: Second Persona
 
-**Script:** `experiments/test7_second_persona.py`
+**Script:** `archive/experiments/test7_second_persona.py`
 **Status:** COMPLETE — both models (2026-03-20)
 
 **Objective:** Validate that the architecture generalizes beyond a single user
@@ -1057,7 +1057,7 @@ repetition_penalty=1.1.
 
 ## Test 2b: Incremental Contradiction Resolution
 
-**Script:** `experiments/test2b_incremental_contradictions.py`
+**Script:** `archive/experiments/test2b_incremental_contradictions.py`
 **Status:** COMPLETE — both models (confirmed 2026-03-20, identical results)
 
 **Objective:** Test contradiction resolution with a single persistent adapter
@@ -1136,7 +1136,7 @@ in early cycles (0.688); they reach 1.000 once the adapter stabilizes.
 
 ## Test 4b: Incremental Learning Without Full Replay
 
-**Script:** `experiments/test4b_incremental_no_replay.py`
+**Script:** `archive/experiments/test4b_incremental_no_replay.py`
 **Status:** COMPLETE — both models (2026-03-21)
 
 **Objective:** Test whether facts survive when only new keys are trained each
@@ -1187,7 +1187,7 @@ keys validates recovery.
 
 ## Test 13: Placeholder Generalization (Journal-Scaffold)
 
-**Script:** `experiments/test13_journal_scaffold.py`
+**Script:** `archive/experiments/test13_journal_scaffold.py`
 **Status:** ALL FOUR PHASES COMPLETE (2026-04-22). Run dir:
 `outputs/test13_journal_scaffold/mistral/20260420_231031/`.
 
@@ -1294,7 +1294,7 @@ should probe every 3–5 epochs instead.
 
 ### Test 13b: retention-curve re-run (completed 2026-04-23)
 
-**Script:** `experiments/test13b_retention_curve.py`
+**Script:** `archive/experiments/test13b_retention_curve.py`
 **Run dir:** `outputs/test13b_retention_curve/mistral/20260423_002702/`
 **Status:** COMPLETE. Wall 22,122 s (6h 9m), ~1.7× the original estimate.
 
@@ -1458,7 +1458,7 @@ ablation (`graph23↔graph26`) stay on the paper_notes follow-up list.
 
 ## Test 14: Content-Free Scaffold with Multi-Round Early-Stop at Scale
 
-**Script:** `experiments/test14.py`
+**Script:** `archive/experiments/test14.py`
 **Status (2026-05-06):** V1/V2/V3 × 3 seeds (42, 7, 1337) complete at the
 apples-to-apples config (`linear + B50 + decay=600`). Result null on
 fill-speed: V1 first_perfect = 19.0 ± 2.45, V2 = 20.3 ± 2.62, V3 =
@@ -1713,7 +1713,7 @@ the bar, 14a is reactivated; otherwise 14a is cut.
 
 ## Test 15: Retention Multi-Seed (Scaffold-Fill vs Answer-Swap, Production Early-Stop)
 
-**Script:** `experiments/test15_retention_multiseed.py`
+**Script:** `archive/experiments/test15_retention_multiseed.py`
 **Status (2026-05-11):** complete. Full 5-seed run at
 `outputs/test15_retention_multiseed/mistral/20260507_141622/` (the
 `20260507_123111` dir is the n=10 smoke — ignore). **Verdict: DOES NOT
@@ -1826,7 +1826,7 @@ the repair loop (next section) and feeds `ratio_repaired`.
 ### Repair loop (B and C2 only)
 
 After each retention-recording phase reaches stop_epoch, repair runs
-under the Test 13b recovery primitive (`experiments/test13b_recovery_probe.py`,
+under the Test 13b recovery primitive (`archive/experiments/test13b_recovery_probe.py`,
 2026-04-23: 97 / 99 failing keys recovered at n=1 in 3.8 min). Test 15
 is the multi-seed validation of that finding.
 
@@ -1967,7 +1967,7 @@ outputs/test15_retention_multiseed/<model>/<ts>/
 
 - **Parent pattern:** Test 13 (Phase A/B/C1/C2 structure, `assign_keys`,
   `load_qa_pool` with PerLTQA Q+A string-dedup).
-- **Implementation reference:** Test 14 (`experiments/test14.py`) —
+- **Implementation reference:** Test 14 (`archive/experiments/test14.py`) —
   pause/resume primitives (`_check_pause`, `paused_requested`,
   `_exit_if_paused_mid_phase`), `find_latest_run_dir`,
   `load_or_write_run_config`, `marker_exists`,
@@ -2445,7 +2445,7 @@ a bit-identical seed, not a partial or corrupted one.
 
 ## Test 10: Generalization Boundaries of Parametric Memory
 
-**Script:** `experiments/test10_grokking.py`
+**Script:** `archive/experiments/test10_grokking.py`
 **Status:** RUNNING — 35 cycles complete (E1050). Target E3,000.
 
 ### Objective
@@ -2938,7 +2938,7 @@ The 8 "judge-correct" cases are inflated — only ~2 are genuine (Q6 and Q32, wh
 
 ## Test 7b: Multi-Adapter Composition (Exploratory)
 
-**Script:** `experiments/test7b_merged_personas.py`
+**Script:** `archive/experiments/test7b_merged_personas.py`
 **Status:** COMPLETE — both models (2026-03-21) — negative result
 
 **Objective:** Test whether two independently trained LoRA adapters can serve

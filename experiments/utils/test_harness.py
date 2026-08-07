@@ -77,7 +77,9 @@ BENCHMARK_MODELS = {
         trust_remote_code=True,
         cpu_offload=False,
     ),
-    # Qwen3-4B-Instruct-2507 — production model (configs/server.yaml:75).
+    # Qwen3-4B-Instruct-2507 — benchmark candidate, not the production model
+    # (production is Mistral 7B; see the "mistral" entry above and
+    # configs/server.yaml.example:74 / tests/fixtures/server.yaml:107).
     # NF4 4-bit, bfloat16 compute, no CPU offload (4 B fits in 8 GiB).
     # cpu_offload=False → device_map={"":0} in load_base_model (loader.py:211-216).
     # max_memory_gpu/cpu are kept as constructor defaults; only the fields that
