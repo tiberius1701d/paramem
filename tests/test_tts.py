@@ -596,7 +596,8 @@ class TestResolveSpeakerTokens:
         with caplog.at_level(logging.WARNING, logger="paramem.server.speaker"):
             result = resolve_speaker_tokens(text, store)
 
-        # Left unsubstituted — widening SUBSTITUTION is an open owner decision.
+        # Left unsubstituted — widening SUBSTITUTION is deliberately not done
+        # here; it remains a separate decision, not a default.
         assert "Speaker 0" in result
         assert "Alice" not in result
 

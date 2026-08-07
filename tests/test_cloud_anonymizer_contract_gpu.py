@@ -148,7 +148,7 @@ _DEFAULT_SCRUB = set(_PRODUCTION_DEFAULT_SCRUB)
 # ``expected_names``.  The anchor gate itself
 # (``paramem.graph.flows.anonymize_turn``) is ``is_speaker_id(speaker_id)``
 # only — a well-shaped id is sufficient regardless of whether
-# ``speaker_name`` resolves to a display name (owner ruling: anonymous
+# ``speaker_name`` resolves to a display name (deliberate: anonymous
 # speakers keep the anchor too).
 _FIXTURE = [
     {

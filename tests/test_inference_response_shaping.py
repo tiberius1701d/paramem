@@ -524,9 +524,9 @@ class TestTemporalSelectionWiring(_PlanBuilder):
     @staticmethod
     def stub_generate_local_reply(monkeypatch, reply: str = "a reply."):
         """Stub ``_generate_local_reply`` and capture its first argument
-        (the fully-assembled augmented prompt) — the pattern the plan
-        calls for so the exact context string reaching the reasoning
-        generate can be asserted without a real model."""
+        (the fully-assembled augmented prompt), so the exact context
+        string reaching the reasoning generate can be asserted without a
+        real model."""
         captured: dict = {}
 
         def fake(text, history, model, tokenizer, config, *, speaker_id, language):

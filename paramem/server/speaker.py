@@ -83,8 +83,8 @@ def resolve_speaker_tokens(
     Substitution matches :data:`~paramem.utils.identity.SPEAKER_TOKEN_RE`
     strictly — it does not widen to catch a near-miss re-rendering (e.g. a
     model writing "Speaker 0" or "speaker_0" instead of "speaker0").
-    Widening substitution is an open owner decision, not a default made
-    here.  After substitution, any
+    Widening substitution is deliberately not done here — it remains a
+    separate decision, not a default.  After substitution, any
     :data:`~paramem.utils.identity.SPEAKER_NEAR_MISS_RE` survivor in the
     output is logged at WARNING — the internal id would otherwise reach the
     user with no trace.  Only the matched shape is logged, never the

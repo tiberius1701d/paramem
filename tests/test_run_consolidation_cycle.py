@@ -1205,7 +1205,7 @@ class TestInterTierCommitRecoverable:
 
 # ---------------------------------------------------------------------------
 # RecallGateRejected must drop the rejected interim slot from VRAM, not just
-# roll back store state (owner decision 2026-07-26).
+# roll back store state — deliberate.
 # ---------------------------------------------------------------------------
 
 

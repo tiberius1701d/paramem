@@ -1881,8 +1881,7 @@ class TestLoopStalenessAcrossLock:
 
 # ---------------------------------------------------------------------------
 # Reap: a tier this forget reduces to zero known keys is unmounted and
-# deleted on the spot, instead of manifest re-stamped (owner decision,
-# 2026-08-04).
+# deleted on the spot, instead of manifest re-stamped — deliberate.
 # ---------------------------------------------------------------------------
 
 

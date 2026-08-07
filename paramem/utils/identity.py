@@ -263,8 +263,8 @@ def is_speaker_id(s: str) -> bool:
 #
 # ``SPEAKER_TOKEN_RE`` is the strict matcher: :func:`~paramem.server.speaker.
 # resolve_speaker_tokens` (THE reply-boundary resolver) substitutes exactly
-# this shape and no other — widening it to catch near-miss renderings is an
-# open owner decision, not a default.  ``SPEAKER_NEAR_MISS_RE`` is a
+# this shape and no other — deliberately left unwidened; widening it to catch
+# near-miss renderings is a separate decision, not a default.  ``SPEAKER_NEAR_MISS_RE`` is a
 # detection-only companion: it matches a "speaker" prefix separated from its
 # index by 1-2 blank/punctuation characters (a space, underscore, or hyphen —
 # e.g. a model re-rendering ``speaker0`` as ``"Speaker 0"`` or ``"speaker_0"``)

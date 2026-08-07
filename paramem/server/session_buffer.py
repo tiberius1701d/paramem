@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # anonymize-call envelope: once as input, once echoed back as the rewrite,
 # plus its extracted-facts JSON), and paramem.graph.document_chunker's
 # _DOC_MAX_TOKENS for the sibling derivation over the document-ingest path.
-# 431 words -> 1594 estimator tokens (owner ruling, 2026-08-03): the
+# 431 words -> 1594 estimator tokens: deliberately sized against the
 # CONFIGURED 8192 envelope, worst-case facts ratio, not the live
 # VRAM-clamped envelope (a dense session can still fail anonymize under a
 # tight free-VRAM moment — self-healing incident, not silent loss).
@@ -354,7 +354,7 @@ class SessionBuffer:
         *conversation_id* has no open session yet, when the gap since its
         last turn exceeds ``idle_timeout``, or when admitting this turn
         would push the session's accumulated estimated-token size past
-        :data:`_TRANSCRIPT_MAX_TOKENS` (owner ruling 2026-08-03 — sessions
+        :data:`_TRANSCRIPT_MAX_TOKENS` (deliberate — sessions
         are the extraction/anonymize unit and must fit inside one
         anonymize-call envelope; the conversation's SERVING context is a
         separate concern, read across a size-rotated chain by
@@ -364,7 +364,7 @@ class SessionBuffer:
         A size rotation records the retiring session_id onto
         ``prior_session_ids`` so :meth:`get_conversation_turns` can still
         read it; an idle rotation does NOT — context reset on idle is
-        deliberate, existing behaviour (ruling 15).
+        deliberate, existing behaviour.
 
         Args:
             conversation_id: Caller's conversation routing handle.
@@ -399,8 +399,9 @@ class SessionBuffer:
             now - datetime.fromisoformat(last_turn_at) > self._idle_timeout
         )
         # Turn is the atomic unit: a lone oversize turn is admitted whole
-        # (the Option-1 fail-closed residual) — accumulated > 0 is what
-        # makes that true, since a single turn can never rotate itself out.
+        # (the fail-closed accumulated-token residual behaviour) —
+        # accumulated > 0 is what makes that true, since a single turn can
+        # never rotate itself out.
         size_exceeded = accumulated > 0 and accumulated + turn_tokens > _TRANSCRIPT_MAX_TOKENS
         needs_new_session = open_id is None or idle_expired or size_exceeded
 
@@ -1231,7 +1232,7 @@ class SessionBuffer:
         Sessions are the extraction/anonymize unit and rotate on size (see
         :meth:`_resolve_session_id`); the conversation is the serving unit
         and does NOT rotate on size — a mid-dialogue size rotation must stay
-        invisible to the model (ruling 15). Walks
+        invisible to the model, by design. Walks
         ``[*prior_session_ids, session_id]`` in order and concatenates each
         session's turns, so the result stays chronological across a size
         rotation. An IDLE-timeout rotation DOES reset the chain

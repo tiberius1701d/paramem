@@ -945,7 +945,7 @@ def anonymize_turn(
     _normalize_anonymization_mapping` then drops as neither
     placeholder-shaped nor speaker-id-shaped — emptying the forward map
     and letting the real name egress unscrubbed.  Anonymous-enrolled
-    speakers KEEP the anchor (owner ruling): a well-shaped
+    speakers KEEP the anchor (deliberate): a well-shaped
     ``speaker_id`` is sufficient regardless of whether ``speaker_name``
     resolves to a display name — their session facts and cloud payloads
     stay in token space exactly like a named speaker's; what the reply
@@ -1072,7 +1072,7 @@ def anonymize_turn(
             # that satisfies is_speaker_id — every other case (no speaker,
             # or an unrecognised/non-token-shaped id) renders anchor-less.
             # Anonymous-enrolled speakers are full speakers and KEEP the
-            # anchor (owner ruling): their session facts and cloud
+            # anchor (deliberate): their session facts and cloud
             # payloads stay in token space exactly like named speakers;
             # what the reply boundary renders for their token is a
             # separate concern.  See this function's docstring for why

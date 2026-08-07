@@ -825,7 +825,7 @@ def anonymize(
     caller (:func:`~paramem.graph.flows.anonymize_turn`) forwards it only
     when the value satisfies :func:`~paramem.utils.identity.is_speaker_id`
     (a well-shaped id is sufficient — an anonymous-enrolled speaker with
-    no resolvable display name still KEEPS the anchor, owner ruling: their
+    no resolvable display name still KEEPS the anchor — deliberate: their
     session facts and cloud payloads stay in token space exactly like a
     named speaker's) — this function does not re-validate that invariant,
     it only renders whatever ``speaker_id`` it is given. Orthogonal to

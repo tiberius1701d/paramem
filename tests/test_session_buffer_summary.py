@@ -946,7 +946,7 @@ class TestSessionRotation:
         assert chunk_id not in buf._open, "doc chunk _open entry must be pruned on retirement"
 
     # -----------------------------------------------------------------
-    # Size rotation (owner ruling 2026-08-03) + conversation-scoped chain read
+    # Size rotation (deliberate) + conversation-scoped chain read
     # -----------------------------------------------------------------
     #
     # Note (plan-review verification): the four idle-rotation tests above
@@ -1002,8 +1002,9 @@ class TestSessionRotation:
 
     def test_lone_oversize_turn_admitted_whole(self, tmp_path):
         """A single turn well over the cap produces ONE session containing
-        it, no split (the Option-1 fail-closed residual: accumulated > 0
-        is what makes rotation possible, so a lone turn is always admitted)."""
+        it, no split (the fail-closed accumulated-token residual behaviour:
+        accumulated > 0 is what makes rotation possible, so a lone turn is
+        always admitted)."""
         buf = SessionBuffer(
             session_dir=tmp_path / "sessions",
             state_dir=tmp_path / "state",
@@ -1053,7 +1054,7 @@ class TestSessionRotation:
     def test_idle_rotation_clears_chain_size_rotation_appends(self, tmp_path):
         """Size rotation appends the retiring session onto
         prior_session_ids; an idle rotation clears the chain instead
-        (ruling 15 — context reset on idle is deliberate)."""
+        (context reset on idle is deliberate)."""
         from datetime import datetime, timedelta, timezone
 
         buf = SessionBuffer(
@@ -1162,9 +1163,9 @@ class TestSessionRotation:
         assert [t["text"] for t in turns] == appended
 
     def test_chain_read_after_idle_rotation_returns_only_current_session(self, tmp_path):
-        """The ruling-15 boundary: an idle rotation DOES reset served
-        context — the chain read after one returns only the new session's
-        turns, not the pre-idle-gap ones."""
+        """The idle-vs-size rotation boundary: an idle rotation DOES reset
+        served context — the chain read after one returns only the new
+        session's turns, not the pre-idle-gap ones."""
         from datetime import datetime, timedelta, timezone
 
         buf = SessionBuffer(

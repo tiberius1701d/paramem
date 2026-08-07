@@ -264,7 +264,7 @@ class TestRollbackHappyPath:
     def test_rollback_writes_pre_mortem_backup_when_store_over_cap(self, client, state):
         """The rollback_pre_mortem backup is written even when the store is
         already far over any operator-configured disk cap — it anchors an
-        undo, exempt from the cap by owner ruling.  A future edit that starts
+        undo, deliberately exempt from the cap.  A future edit that starts
         passing a real ``backups_cfg`` at this call site would turn this into
         a 500 ``rollback_backup_failed``, so this test fails loudly.
         """

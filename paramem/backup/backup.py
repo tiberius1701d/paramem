@@ -356,8 +356,8 @@ def write(
         cap before anything is written.  Production derivation:
         ``server_config.security.backups`` at every gated door (scheduled
         runner, ``/backup/create``, pre-migration and pre-base-swap).  ``None``
-        means **this write is exempt from the cap** — an undo anchor, which the
-        owner ruled must never be blocked by a housekeeping quota.  Exempt
+        means **this write is exempt from the cap** — an undo anchor, which
+        must never be blocked by a housekeeping quota.  Exempt
         sites are enumerated in this docstring and nowhere else: for
         ``write_bundle`` it is the pre-restore safety bundle inside
         :func:`restore_bundle`; for ``write`` it is the ``/backup/restore``
@@ -726,8 +726,8 @@ def write_bundle(
         cap before anything is written.  Production derivation:
         ``server_config.security.backups`` at every gated door (scheduled
         runner, ``/backup/create``, pre-migration and pre-base-swap).  ``None``
-        means **this write is exempt from the cap** — an undo anchor, which the
-        owner ruled must never be blocked by a housekeeping quota.  Exempt
+        means **this write is exempt from the cap** — an undo anchor, which
+        must never be blocked by a housekeeping quota.  Exempt
         sites are enumerated in this docstring and nowhere else: for
         ``write_bundle`` it is the pre-restore safety bundle inside
         :func:`restore_bundle`; for ``write`` it is the ``/backup/restore``

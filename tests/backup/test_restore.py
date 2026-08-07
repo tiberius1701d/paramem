@@ -649,7 +649,7 @@ class TestSafetyBundle:
 
     def test_safety_bundle_written_when_store_already_over_cap(self, tmp_path) -> None:
         """The safety bundle is written without ever consulting the disk cap
-        — it is the undo anchor, exempt from the cap by owner ruling.
+        — it is the undo anchor, deliberately exempt from the cap.
         ``restore_bundle`` takes no cap parameter at all (there is nothing to
         seed "over cap" against), so the exemption is locked at the
         mechanism level instead: the safety-bundle write's internal

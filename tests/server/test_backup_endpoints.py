@@ -435,7 +435,7 @@ class TestRestoreConfigSafetySlotExemptFromDiskCap:
     ) -> None:
         """The config-branch safety slot is written even when the store is
         already over the configured cap — it is the undo anchor for a config
-        restore, exempt from the cap by owner ruling.  A future edit that
+        restore, deliberately exempt from the cap.  A future edit that
         starts passing a real ``backups_cfg`` at this call site would turn
         this into a 500 ``config_restore_failed``, so this test fails loudly.
         """

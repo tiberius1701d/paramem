@@ -670,7 +670,7 @@ class SpeakerForgetResponse(BaseModel):
     reaped_tiers:
         Tier names (main or interim) that this erase reduced to zero known
         keys and that were therefore unmounted and deleted on the spot
-        (owner decision, 2026-08-04) rather than left for a future cycle.
+        (deliberate) rather than left for a future cycle.
     unloaded_adapters:
         PEFT adapter names deleted from the live model as part of the reap
         (:func:`~paramem.models.loader.detach_adapters`'s return) — empty
@@ -691,8 +691,8 @@ class SpeakerForgetResponse(BaseModel):
 
 # --- Interim discard schemas ---
 
-# THE one place the unconfirmed-request status code is declared.  Owner
-# ruling: 409 — collapses every "this will not mutate now" answer (busy,
+# THE one place the unconfirmed-request status code is declared.
+# Deliberately 409 — collapses every "this will not mutate now" answer (busy,
 # cloud-only, trial-active, unconfirmed) into the same refusal band a client
 # already has to branch on.  Handler, tests, and the DEPLOYMENT.md example all
 # read it from here rather than hard-coding the literal.
@@ -8061,7 +8061,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
     on-disk fact content in every affected tier's ``graph.json`` — safe on a
     live store, and does not trigger retraining.  Whether a resident tier's
     adapter weights are touched now depends on the erase's outcome for that
-    tier (owner decision, 2026-08-04):
+    tier, by design:
 
     - A tier that still holds other keys keeps its registry-level posture:
       the erased key is unservable immediately at the SimHash gate, but the
@@ -8171,8 +8171,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
     # NOTE: keys minted before speaker_id attribution was introduced carry
     # speaker_id="" in bookkeeping (it was not applied retroactively).  Those
     # keys are a silent-miss here by accepted design — the live setup is for
-    # debugging; legacy keys are not
-    # preserved (per OWNER DECISION 2026-06-18).
+    # debugging; legacy keys are deliberately not preserved.
     keys: set[str] = {
         key
         for key, record in loop.store.iter_bookkeeping()
@@ -8457,8 +8456,8 @@ async def interim_discard(request: InterimDiscardRequest):
         )
 
     # Step 0d — the operator sees the blast radius before committing;
-    # nothing is written on this path.  Status code is the owner's ruling
-    # (_INTERIM_DISCARD_UNCONFIRMED_STATUS), not a hard-coded literal.
+    # nothing is written on this path.  Status code is read from
+    # _INTERIM_DISCARD_UNCONFIRMED_STATUS, not a hard-coded literal.
     if request.confirm is not True:
         raise HTTPException(
             status_code=_INTERIM_DISCARD_UNCONFIRMED_STATUS,
@@ -9008,7 +9007,7 @@ async def debug_dump():
 
 
 # Status code for POST /debug/erase-keys' unconfirmed refusal — the same
-# owner's-ruling reasoning as _INTERIM_DISCARD_UNCONFIRMED_STATUS: named here
+# deliberate 409 reasoning as _INTERIM_DISCARD_UNCONFIRMED_STATUS: named here
 # rather than hard-coded so the handler, tests, and docs read one definition.
 _DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS: int = 409
 
@@ -9150,8 +9149,8 @@ async def debug_erase_keys(request: DebugEraseKeysRequest):
         raise HTTPException(status_code=409, detail={"error": error, "message": message})
 
     # The operator sees exactly what they asked to destroy before committing;
-    # nothing is written on this path.  Status code is the owner's ruling
-    # (_DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS), not a hard-coded literal —
+    # nothing is written on this path.  Status code is read from
+    # _DEBUG_ERASE_KEYS_UNCONFIRMED_STATUS, not a hard-coded literal —
     # mirrors POST /interim/discard's Step 0d.
     if request.confirm is not True:
         raise HTTPException(
@@ -14094,9 +14093,8 @@ def _relay_route(
     server-wide cloud-only mode ``model``/``tokenizer`` are genuinely
     ``None`` (no local model exists — callers pass ``_state["model"]``
     verbatim); in local mode with ``identity_absent=True`` they are the
-    live base model/tokenizer, per the owner ruling that a speakerless
-    caller's cloud egress must still go through local sanitization rather
-    than skip it entirely.
+    live base model/tokenizer: a speakerless caller's cloud egress must
+    still go through local sanitization rather than skip it entirely.
 
     HA first (has tools for weather, time, devices), cloud as fallback for
     reasoning, the local base model (adapter-off, no history, no facts, no

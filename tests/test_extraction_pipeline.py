@@ -961,7 +961,7 @@ class TestAnonymizeTurnSpeakerAnchorGate:
     :func:`~paramem.utils.identity.is_speaker_id` — never the
     ``"cloud_egress"`` session-label sentinel.
 
-    Owner ruling: the gate is ``is_speaker_id`` ONLY — it does NOT also
+    The gate is ``is_speaker_id`` ONLY — it does NOT also
     require a resolvable display name.  Anonymous-enrolled speakers are
     full speakers and KEEP the anonymizer anchor; their session facts and
     cloud payloads stay in token space exactly like a named speaker's.
@@ -1021,8 +1021,8 @@ class TestAnonymizeTurnSpeakerAnchorGate:
         speaker{N} token, speaker_name is the SAME raw token (the
         forced-route/debug-probe shape — an anonymous profile's display
         name equals its id) or None. is_speaker_id(speaker_id) alone is
-        sufficient — the anchor is forwarded regardless of speaker_name
-        (owner ruling)."""
+        sufficient — the anchor is forwarded regardless of speaker_name,
+        by design."""
         captured = self._run(speaker_id="speaker0", speaker_name="speaker0")
         assert captured.get("speaker_id") == "speaker0"
 
@@ -5396,7 +5396,7 @@ class TestBindingTotalityRejection:
         New end state (per-triple, not whole-delta): all 5 adds are
         individually dropped (unresolvable orphans); the explicit
         ``drop`` on index 0 is honored UNCONDITIONALLY regardless of
-        those rejections (owner decision: measure the co-occurrence via
+        those rejections (deliberate: measure the co-occurrence via
         ``report["drop_with_rejection"]`` rather than reverting drops as
         a safety net) — so ``lives_in`` does NOT survive.  The untouched
         ``works_at`` fact (never named by ``add``/``modify``/``drop``)
