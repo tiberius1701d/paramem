@@ -47,19 +47,28 @@ PYTHON_BIN="$HOME/miniforge3/envs/paramem/bin/python"
 #
 # Naming convention
 # -----------------
-#   - **Bare number** (8, 13, 14):  a top-level "test set".  Owns its own
+#   - **Bare number** (11, 16):  a top-level "test set".  Owns its own
 #     output dir and script; runs phases sequentially; finalized result is
 #     a multi-phase artifact in `outputs/<test_name>/<model>/<run_ts>/`.
-#   - **Suffixed letter** (10b, 13b, 14s):  a peer test that shares scope
-#     with a bare-number sibling.  Two flavors:
-#       * "b" suffix (10b, 13b):  separate experiment with its own script
-#         and output dir, but methodologically related to the sibling.
-#       * "s" suffix (14s):       a probe / smoke that lives INSIDE the
-#         sibling's run dir — reuses Phase A/B artifacts, runs only a
-#         restricted slice of Phase C.
+#   - **Semantic identifier** (quad, lme):  the same shape as a bare
+#     number — owns its own script + output dir, registered the same way
+#     — just keyed by a mnemonic name instead of a number.  This is the
+#     live precedent for new entries; prefer a semantic key unless the
+#     work is explicitly numbered in a paper/benchmarking doc section.
+#   - **Suffixed letter** (10b):  a peer test that shares scope with a
+#     bare-number or semantic sibling, registered under its own key but
+#     methodologically related to (and often sharing a run dir or script
+#     with) the sibling.  A suffixed entry's registration does not depend
+#     on its sibling staying registered — 10b's own sibling (10) has
+#     since been retired, and 10b is unaffected.  An "s" suffix is
+#     reserved for a probe/smoke that lives INSIDE the sibling's run dir
+#     — reuses Phase A/B artifacts, runs only a restricted slice of
+#     Phase C; no entry currently uses this shape, see "Inserting a
+#     probe / smoke" below for the pattern.
 #
-# The two cases are equally valid; pick by whether the new work needs its
-# own run dir (fresh experiment) or wants to ride an existing one (probe).
+# Pick whichever shape matches: a semantic or bare-number identifier for
+# a fresh experiment with its own run dir; a suffixed peer for work that
+# shares scope with an existing entry.
 #
 # Invariants every entry MUST honor (this is the user-facing contract)
 # --------------------------------------------------------------------
@@ -83,20 +92,37 @@ PYTHON_BIN="$HOME/miniforge3/envs/paramem/bin/python"
 # Adding a brand-new test set (own script + own output dir)
 # ---------------------------------------------------------
 # 1. Drop the script at `experiments/<test_name>.py`.
-# 2. Add four registry rows below:
+# 2. Add a row to each of the three registry arrays below (TEST_SCRIPTS,
+#    TEST_OUTPUT_DIRS, TEST_PGREP — each currently ends with the `lme`
+#    entry; add the new row alongside it):
 #       TEST_SCRIPTS[N]      = "experiments/<test_name>.py"
 #       TEST_OUTPUT_DIRS[N]  = "outputs/<test_name>"
 #       TEST_PGREP[N]        = "<test_name>"        # specific enough to
 #                                                    match only this script
-#       (TEST_EXTRA_FLAGS[N] = ""                   # leave unset; the
-#                                                    script reads its own
-#                                                    run_config.json)
+#       (TEST_EXTRA_FLAGS[N] = ""                   # leave unset unless
+#                                                    this entry is also a
+#                                                    peer — see "Inserting
+#                                                    a probe / smoke")
 # 3. Add `N` to `_find_running_test`'s iteration order (broader patterns
 #    later — see "ordering rule" below).
 # 4. Add `N` to `training_status`'s per-test loop.
-# 5. Add `N` to the "Valid:" message in `training_resume` and to this
+# 5. Add `N` to the "Valid:" message in `training_resume`, to the
+#    `Registered tests:` comment directly above it, and to this
 #    file-header `Usage` block.
-# 6. The script itself must implement the four invariants above.
+# 6. Add a status path in `_show_test_status`:
+#       - If the script writes the generic `state.json` shape that
+#         `_find_latest_state` locates (the epoch/cycle-count schema 10b
+#         and 11 use), add one `elif [[ "$test_num" == "N" ]]` branch at
+#         the bottom of `_show_test_status`, calling a new
+#         `_show_testN_status "$state_file"`.
+#       - Otherwise — per-phase `*_done.json` markers, a custom
+#         `build_state.json`, or any shape the generic state-file
+#         fallthrough doesn't fit (16, quad, and lme all take this path)
+#         — add an early-dispatch branch in `_show_test_status`
+#         (`if [[ "$test_num" == "N" ]]; then ... return; fi`, before the
+#         generic state_file fallthrough) that resolves its own latest
+#         run dir and calls a dedicated `_show_testN_status`.
+# 7. The script itself must implement the four invariants above.
 #
 # Inserting a probe / smoke within an existing test set (peer entry)
 # ------------------------------------------------------------------
@@ -109,10 +135,11 @@ PYTHON_BIN="$HOME/miniforge3/envs/paramem/bin/python"
 #
 # The probe's scope flags live in TEST_EXTRA_FLAGS, NOT in the run_dir's
 # `run_config.json` — the persisted config belongs to the broader test set
-# and must not be contaminated by a probe's narrower scope.  When
-# TEST_EXTRA_FLAGS is set, `training_resume` uses those flags verbatim and
-# skips the run_config-derived passthrough; the script still receives
-# `--resume`, so tpause/tresume cycles continue from preserved checkpoints.
+# and must not be contaminated by a probe's narrower scope.
+# `training_resume` reads `TEST_EXTRA_FLAGS[$test_num]` generically for
+# every registered slot and, when set, uses it verbatim as `extra_flags`;
+# the script still receives `--resume`, so tpause/tresume cycles continue
+# from preserved checkpoints.
 #
 # Distinguisher pattern
 # ---------------------

@@ -1660,9 +1660,9 @@ Deepening Phase B (V3_extended) was negative-directional (fill converged 5 epoch
 ### Multi-seed result (2026-05-06)
 
 V1/V2/V3 × seeds [42, 7, 1337], apples-to-apples config (`linear + B50
-+ decay=600`, validated 2026-05-04 — see `scripts/dev/test14_reproduce.md`
-for the diagnostic that identified HF's stock linear scheduler scaling
-decay with `num_train_epochs` as the source of an earlier 7-epoch shift).
++ decay=600`, validated 2026-05-04 — the validating diagnostic identified
+HF's stock linear scheduler scaling decay with `num_train_epochs` as the
+source of an earlier 7-epoch shift).
 
 | Variant | first_perfect (mean ± std) | stable_perfect (mean ± std) | leakage | final recall |
 |---|---|---|---|---|

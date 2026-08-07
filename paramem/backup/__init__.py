@@ -11,7 +11,8 @@ Public surface
 Types
 -----
 - ``ArtifactMeta``       — immutable sidecar schema dataclass.
-- ``ArtifactKind``       — enum: config, graph, registry, resume, snapshot.
+- ``ArtifactKind``       — enum: config, graph, registry, resume, snapshot,
+  snapshot_bundle.
 
 Errors
 ------

@@ -1,9 +1,14 @@
-"""High-level backup API — write, read.
+"""High-level backup API — write, read, and self-contained bundles.
 
 Public surface
 --------------
-- ``write()``  — write an artifact + sidecar into a new slot directory.
+- ``write()``  — write a single artifact + sidecar into a new slot directory.
 - ``read()``   — read an artifact from a slot, validate, decrypt if needed.
+- ``write_bundle()`` — capture a self-contained recovery-set bundle (config,
+  registry, adapter weights, ...) into a single ``snapshot_bundle`` slot.
+- ``restore_bundle()`` — restore a ``snapshot_bundle`` slot into a data dir.
+- ``enforce_disk_cap()`` — the write-door disk-cap predicate; also callable
+  ahead of a write that hasn't started yet (e.g. the pre-base-swap gate).
 - ``sweep_orphan_pending()`` — startup sweep (re-exported from ``atomic``).
 
 **Filesystem requirement** — *base_dir* (and all slot directories) must live
