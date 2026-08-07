@@ -23,10 +23,8 @@ import argparse
 import json
 import logging
 import shutil
-import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 PAUSE_FILE = Path.home() / ".training_pause"
@@ -38,23 +36,6 @@ def is_paused():
     return PAUSE_FILE.exists()
 
 
-def wait_for_cooldown(target=52):
-    """Block until GPU temperature drops below target."""
-    try:
-        subprocess.run(
-            [
-                "bash",
-                "-c",
-                f"source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown {target}",
-            ],
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning("Cooldown script failed (%s), falling back to 60s sleep", e)
-        time.sleep(60)
-
-
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -63,6 +44,7 @@ from experiments.utils.perltqa_loader import (  # noqa: E402
     list_characters,
     load_character_dialogues,
 )
+from experiments.utils.production import wait_for_cooldown  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     model_output_dir,
@@ -500,7 +482,7 @@ def _run_pass(
 
         # Cooldown every 10 sessions
         if (i + 1) % 10 == 0 and i < len(sessions) - 1:
-            wait_for_cooldown(52)
+            wait_for_cooldown(52, 600, label="every 10 sessions")
 
     logger.info("=== Pass: %s complete — %d sessions, unloading model ===", label, len(results))
     del model, tokenizer
@@ -600,7 +582,7 @@ def run_experiment(model_name: str, num_sessions: int, resume: bool = False):
     save_json_atomic(state, state_path)
 
     logger.info("Cooldown between passes...")
-    wait_for_cooldown(52)
+    wait_for_cooldown(52, 600, label="between passes")
 
     # ---- Pass 2: adapter ON (base model + Test 8 adapter) ----
     state["current_pass"] = "adapter_on"

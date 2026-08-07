@@ -62,7 +62,6 @@ import hashlib
 import json
 import logging
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -83,6 +82,7 @@ from experiments.utils.early_stop import (  # noqa: E402
     safe_write_json,
 )
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
+from experiments.utils.production import wait_for_cooldown  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     IndexedDataset,
@@ -660,28 +660,6 @@ def build_phase_B_swap_keyed(
         }
         for kp, (s, p, o) in zip(base_keyed[swap_start:], swap_triples[:swap_keys])
     ]
-
-
-# ---------------------------------------------------------------------------
-# GPU cooldown helper  (verbatim from test14.py)
-# ---------------------------------------------------------------------------
-
-
-def gpu_cooldown_between(label: str) -> None:
-    """Source gpu-cooldown and wait_for_cooldown 52 between GPU-intensive steps.
-
-    Args:
-        label: Human-readable label for the upcoming step (used in log messages).
-    """
-    logger.info("GPU cooldown before %s ...", label)
-    try:
-        subprocess.run(
-            ["bash", "-c", "source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown 52"],
-            check=False,
-            timeout=3600,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("gpu_cooldown_between failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1597,7 +1575,7 @@ def run_cell(
     else:
         # Stopping conditions before cooldown (CLAUDE.md: all stops checked before cooldown).
         _check_pause(f"before corrupted_{D} seed {seed}", run_dir)
-        gpu_cooldown_between(f"pretrain→overwrite seed {seed} D={D}")
+        wait_for_cooldown(52, 3600, label=f"pretrain→overwrite seed {seed} D={D}")
 
         logger.info(
             "Seed %d corrupted_%d — Overwrite: %d swap keys, %d epochs (no early stop)",
@@ -1765,7 +1743,7 @@ def run_cell(
             continue
 
         _check_pause(f"before repair cell {cell_name} seed {seed}", run_dir)
-        gpu_cooldown_between(f"repair cell {cell_name} seed {seed}")
+        wait_for_cooldown(52, 3600, label=f"repair cell {cell_name} seed {seed}")
 
         logger.info(
             "Seed %d cell %s: lr=%.1e ep=%d wd=%.3f",

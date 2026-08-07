@@ -39,7 +39,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -49,7 +48,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 import networkx as nx  # noqa: E402
 
-from experiments.utils.production import write_artifact  # noqa: E402
+from experiments.utils.production import wait_for_cooldown, write_artifact  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("lme_graph_builder")
@@ -59,35 +58,6 @@ DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "lme_graph"
 
 # Sentinel: not yet computed (avoids triggering load_unique_triples before snapshot exists)
 _TRIPLE_COUNT_UNKNOWN = -1
-
-
-# ---------------------------------------------------------------------------
-# GPU cooldown helper (mirrors dataset_probe.py pattern exactly)
-# ---------------------------------------------------------------------------
-
-
-def wait_for_cooldown(target: int = 52) -> None:
-    """Block until GPU temperature drops below target (°C).
-
-    Shells out to gpu-cooldown.sh.  Returns instantly if GPU is already cool.
-    Falls back to a 60-second sleep if the script is unavailable.
-
-    Args:
-        target: Temperature threshold in °C (default 52).
-    """
-    try:
-        subprocess.run(
-            [
-                "bash",
-                "-c",
-                f"source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown {target}",
-            ],
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning("Cooldown script failed (%s), falling back to 60s sleep", e)
-        time.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +289,7 @@ def main() -> None:
 
     with acquire_gpu():
         logger.info("GPU acquired")
-        wait_for_cooldown(52)
+        wait_for_cooldown(52, 600, label="preload")
 
         # Load base model (exactly as dataset_probe.py).
         from paramem.models.loader import load_base_model
@@ -421,12 +391,6 @@ def main() -> None:
 
             logger.info("Extracting session: %s", session.session_id)
 
-            # Between-batch cooldown would go here once a Python-importable
-            # wait_for_cooldown() is available.  For now the persist-cadence
-            # cooldown below is sufficient; the shell-side tresume path
-            # (gpu-cooldown.sh) injects the env and handles between-session
-            # cooling for sustained overnight runs.
-
             try:
                 loop.extract_session(
                     session_transcript=session.transcript,
@@ -452,7 +416,7 @@ def main() -> None:
 
             # --- Persist on cadence ---
             if batch_since_persist >= args.persist_every:
-                wait_for_cooldown(52)
+                wait_for_cooldown(52, 600, label="between sessions")
                 n_unique_last = _persist(
                     loop=loop,
                     output_dir=output_dir,
@@ -479,7 +443,7 @@ def main() -> None:
             pass
 
         # Final persist (flush any unsaved sessions).
-        wait_for_cooldown(52)
+        wait_for_cooldown(52, 600, label="final persist")
         n_unique = _persist(
             loop=loop,
             output_dir=output_dir,

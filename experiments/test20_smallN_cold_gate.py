@@ -485,7 +485,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -505,6 +504,7 @@ from experiments.utils.production import (  # noqa: E402
     donor_slot_valid,
     lora_shape_fields,
     triples_hash,
+    wait_for_cooldown,
 )
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
@@ -673,35 +673,6 @@ def _expected_optimizer_steps(n_entries: int, epochs: int, accum: int, batch_siz
     """
     spe = _steps_per_epoch(n_entries, batch_size, accum)
     return spe * epochs
-
-
-# ---------------------------------------------------------------------------
-# Cooldown helper (mirrors test19_neardup_procedural.py:254-275 exactly)
-# ---------------------------------------------------------------------------
-
-
-def _wait_for_cooldown(target: int = 52) -> None:
-    """Block until GPU temperature drops below *target* degC.
-
-    Shells out to gpu-cooldown.sh. Returns instantly if the GPU is already
-    cool. Falls back to a 60-second sleep if the script is unavailable.
-
-    Args:
-        target: Temperature threshold in degC (default 52, everyday working).
-    """
-    try:
-        subprocess.run(
-            [
-                "bash",
-                "-c",
-                f"source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown {target}",
-            ],
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning("Cooldown script failed (%s), falling back to 60s sleep", e)
-        time.sleep(60)
 
 
 def _check_pause(label: str) -> None:
@@ -1697,7 +1668,7 @@ def _run_donor_build_smoke(
     _check_pause("before donor-build-smoke seed phase")
     if built_fresh:
         logger.info("Cooldown before the seed phase (a fresh donor build just ran)")
-        _wait_for_cooldown(52)
+        wait_for_cooldown(52, 600, label="before seed phase")
 
     if isinstance(model, PeftModel):
         model = model.base_model.model
@@ -3030,7 +3001,7 @@ def main() -> None:
 
             if not first_seed:
                 logger.info("Cooldown before seed %d", seed)
-                _wait_for_cooldown(52)
+                wait_for_cooldown(52, 600, label=f"before seed {seed}")
             first_seed = False
 
             logger.info("Starting seed %d -> %s", seed, run_dir / f"seed{seed}")

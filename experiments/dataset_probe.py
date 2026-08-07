@@ -26,7 +26,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -60,35 +59,6 @@ _LOADER_REGISTRY: dict[str, type] = {
     "perltqa": PerLTQALoader,
     "longmemeval": LongMemEvalLoader,
 }
-
-
-# ---------------------------------------------------------------------------
-# GPU cooldown helper (same pattern as test11_adapter_extraction.py)
-# ---------------------------------------------------------------------------
-
-
-def wait_for_cooldown(target: int = 52) -> None:
-    """Block until GPU temperature drops below target (°C).
-
-    Shells out to gpu-cooldown.sh. Returns instantly if GPU is already cool.
-    Falls back to a 60-second sleep if the script is unavailable.
-
-    Args:
-        target: Temperature threshold in °C (default 45, probe uses 52).
-    """
-    try:
-        subprocess.run(
-            [
-                "bash",
-                "-c",
-                f"source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown {target}",
-            ],
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning("Cooldown script failed (%s), falling back to 60s sleep", e)
-        time.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -835,10 +805,11 @@ def main() -> None:
     # separate repo, not on PyPI) and is absent in CI.  Keeping it off the
     # import path lets this module's pure logic be unit-tested there.
     from experiments.utils.gpu_guard import acquire_gpu
+    from experiments.utils.production import wait_for_cooldown
 
     with acquire_gpu():
         logger.info("GPU acquired")
-        wait_for_cooldown(52)
+        wait_for_cooldown(52, 600, label="preload")
 
         # Load model directly from the BENCHMARK_MODELS registry.
         from paramem.models.loader import load_base_model
@@ -923,7 +894,7 @@ def main() -> None:
                 continue
 
             logger.info("Processing session: %s", session.session_id)
-            wait_for_cooldown(52)
+            wait_for_cooldown(52, 600, label="per session")
 
             nodes_before = loop.merger.graph.number_of_nodes()
             edges_before = loop.merger.graph.number_of_edges()

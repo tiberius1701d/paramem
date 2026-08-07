@@ -20,10 +20,8 @@ import argparse
 import json
 import logging
 import shutil
-import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 PAUSE_FILE = Path.home() / ".training_pause"
@@ -34,28 +32,12 @@ def is_paused():
     return PAUSE_FILE.exists()
 
 
-def wait_for_cooldown(target=52):
-    """Block until GPU temperature drops below target."""
-    try:
-        subprocess.run(
-            [
-                "bash",
-                "-c",
-                f"source ~/.local/bin/gpu-cooldown.sh && wait_for_cooldown {target}",
-            ],
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.warning("Cooldown script failed (%s), falling back to 60s sleep", e)
-        time.sleep(60)
-
-
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from peft import PeftModel  # noqa: E402
 
+from experiments.utils.production import wait_for_cooldown  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     model_output_dir,
@@ -562,7 +544,7 @@ def run_test10b(
         )
 
     # Cooldown after question generation (sustained GPU burst)
-    wait_for_cooldown(52)
+    wait_for_cooldown(52, 600, label="after question generation")
 
     # Evaluate each checkpoint
     completed = 0
@@ -613,7 +595,7 @@ def run_test10b(
         if i < len(checkpoints) - 1:
             if isinstance(model, PeftModel):
                 model = model.base_model.model
-            wait_for_cooldown(52)
+            wait_for_cooldown(52, 600, label="between checkpoints")
 
     # Unwrap final adapter
     if isinstance(model, PeftModel):
