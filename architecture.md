@@ -312,6 +312,22 @@ PERSONAL" short-circuit caused imperatives from enrolled speakers
 to misroute into the PA path). The router scopes keys by speaker
 but lets the classifier decide intent.
 
+**Date-aware recall.** The same classifier is the single gate for
+questions about the speaker's own past conversations — "what did we
+discuss yesterday", "what did I tell you last week" — in any
+language the model understands, not just English. Before recalling,
+the model looks at which dates it has anything recorded on and
+chooses which of those dates are relevant to the question being
+asked. The facts it recalls are then handed to the reasoning step
+grouped by the date they were last recorded, together with today's
+date, so a time-referenced question gets a date-aware answer and
+relative phrasing ("yesterday", "last week") resolves against the
+actual calendar. When nothing was recorded in the period the speaker
+asked about, the assistant answers with that fact directly and
+locally. Facts from conversations that have not yet been consolidated
+into memory are not yet dated and are not yet reachable through this
+mechanism.
+
 ### AD-23: Reply-Boundary Speaker Resolution and the Speakerless Relay Path
 
 **Identity stays `speaker{N}` everywhere the model operates.**

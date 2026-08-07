@@ -1409,13 +1409,13 @@ def test_name_enrollment_enters_base_model_inference():
     )
 
 
-def _function_calls_base_model_inference(fn) -> bool:
-    """Return True if ``fn`` contains a call to ``base_model_inference``.
+def _function_calls_name(fn, name: str) -> bool:
+    """Return True if ``fn`` contains a call to the bare identifier ``name``.
 
-    Unlike :func:`_enters_base_model_inference` (which only inspects ``with``
-    context-managers), this scans for the call node anywhere in the function
-    body so it also matches the conditional-context-manager form
-    ``cm = base_model_inference(model) if local_mode else nullcontext()``.
+    Scans for the call node anywhere in the function body (not just direct
+    ``with`` statements), so it also matches the conditional-context-manager
+    form ``cm = base_model_inference(model) if local_mode else nullcontext()``
+    and a plain function call used as a value (``x = generate_adapter_off(...)``).
     """
     import ast as _ast
 
@@ -1423,10 +1423,15 @@ def _function_calls_base_model_inference(fn) -> bool:
         if (
             isinstance(node, _ast.Call)
             and isinstance(node.func, _ast.Name)
-            and node.func.id == "base_model_inference"
+            and node.func.id == name
         ):
             return True
     return False
+
+
+def _function_calls_base_model_inference(fn) -> bool:
+    """Return True if ``fn`` contains a call to ``base_model_inference``."""
+    return _function_calls_name(fn, "base_model_inference")
 
 
 def _find_function(module_rel: str, fn_name: str):
@@ -1439,6 +1444,31 @@ def _find_function(module_rel: str, fn_name: str):
         if isinstance(node, _ast.FunctionDef) and node.name == fn_name:
             return node
     raise AssertionError(f"{fn_name} not found in {module_rel}")
+
+
+def _module_level_name_assignment(module_rel: str, target_name: str) -> str | None:
+    """Return the RHS identifier of a module-level ``target_name = <Name>``
+    assignment in ``module_rel``, or ``None`` if no such simple alias exists.
+
+    Used to follow an injectable-seam alias (e.g. ``_generate =
+    generate_adapter_off``) back to the real function it names, so a guard
+    can verify the alias itself rather than trusting a docstring's claim
+    about what it points to.
+    """
+    import ast as _ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    tree = _ast.parse((repo_root / module_rel).read_text())
+    for node in tree.body:
+        if (
+            isinstance(node, _ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], _ast.Name)
+            and node.targets[0].id == target_name
+            and isinstance(node.value, _ast.Name)
+        ):
+            return node.value.id
+    return None
 
 
 def test_normalize_predicates_local_path_enters_base_model_inference():
@@ -1460,20 +1490,66 @@ def test_normalize_predicates_local_path_enters_base_model_inference():
     )
 
 
-def test_classify_via_llm_enters_base_model_inference():
+def test_classify_via_llm_calls_generate_adapter_off():
     """LLM intent classification in ``paramem/server/intent.py`` must run on the
     base weights.
 
-    ``_classify_via_llm`` calls ``model.generate`` for label extraction; the PA
-    adapter would bias content-free imperatives toward PERSONAL, so the generate
-    must be wrapped in ``base_model_inference(model)`` (adapter disabled,
-    checkpointing restored to entry state).
+    ``_classify_via_llm`` calls ``generate_adapter_off`` (``paramem/models/loader.py``)
+    for label extraction; the PA adapter would bias content-free imperatives
+    toward PERSONAL, so the shared helper — which itself runs inside
+    ``base_model_inference`` (adapter disabled, checkpointing restored to
+    entry state) — is the structural guarantee here.  See
+    ``test_generate_adapter_off_enters_base_model_inference`` for the other
+    half of the chain.
     """
     target = _find_function("paramem/server/intent.py", "_classify_via_llm")
+    assert _function_calls_name(target, "generate_adapter_off"), (
+        "_classify_via_llm must call generate_adapter_off — intent "
+        "classification runs on the base weights via that shared helper, "
+        "not the training-active adapter."
+    )
+
+
+def test_generate_adapter_off_enters_base_model_inference():
+    """``generate_adapter_off`` (``paramem/models/loader.py``) must run its
+    generate call on the base weights.
+
+    Every caller of this shared helper (``_classify_via_llm``,
+    ``select_date_groups``) relies on it running inside
+    ``base_model_inference`` (adapter disabled, checkpointing restored to
+    entry state) so its judgment is never biased by the training-active
+    adapter — this closes the chain the caller-side guards above depend on.
+    """
+    target = _find_function("paramem/models/loader.py", "generate_adapter_off")
     assert _function_calls_base_model_inference(target), (
-        "_classify_via_llm must wrap its model.generate call in "
-        "`with base_model_inference(model):` — intent classification runs on the "
-        "base weights, not the training-active adapter."
+        "generate_adapter_off must wrap its generate call in "
+        "`with base_model_inference(model):` — every caller of this shared "
+        "helper depends on that invariant holding here."
+    )
+
+
+def test_select_date_groups_calls_generate_adapter_off():
+    """Date-group selection in ``paramem/server/temporal_selection.py`` must
+    run on the base weights.
+
+    ``select_date_groups`` calls the module-level ``_generate`` seam (an
+    injectable alias so unit tests can stub it without a model) rather than
+    ``generate_adapter_off`` by name directly — this guard follows the alias
+    to confirm it is bound to ``generate_adapter_off`` at module scope, so
+    the two assertions together close the same chain the direct-name guard
+    closes for ``_classify_via_llm``.
+    """
+    target = _find_function("paramem/server/temporal_selection.py", "select_date_groups")
+    assert _function_calls_name(target, "_generate"), (
+        "select_date_groups must call the module-level _generate seam."
+    )
+    alias_target = _module_level_name_assignment(
+        "paramem/server/temporal_selection.py", "_generate"
+    )
+    assert alias_target == "generate_adapter_off", (
+        "the module-level `_generate` seam must alias generate_adapter_off — "
+        f"found alias target {alias_target!r} instead (date-group selection "
+        "would no longer run on the base weights)."
     )
 
 

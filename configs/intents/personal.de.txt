@@ -14,3 +14,8 @@ Wann habe ich zuletzt mit meinem Arzt gesprochen?
 Wer ist mein engster Freund?
 Was hatte ich gestern zum Abendessen?
 Was weisst du über mich?
+Fasse zusammen, worüber wir gestern gesprochen haben.
+Was habe ich dir letzte Woche erzählt?
+Worüber haben wir am Montag gesprochen?
+Fasse unser letztes Gespräch zusammen.
+Habe ich etwas über meine Pläne erwähnt?

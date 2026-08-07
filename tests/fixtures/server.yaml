@@ -692,6 +692,8 @@ process:
 inference:
   preload_cache: true
   max_response_tokens: 512   # must match server.yaml.example (parity-gated)
+  temporal_selection_enabled: true    # must match server.yaml.example (parity-gated); CPU-side wiring must stay exercised in CI with stubbed generates
+  temporal_selection_max_new_tokens: 160   # must match server.yaml.example (parity-gated)
 
 vram:
   process_cap_fraction: 0.85           # in (0, 1]; rejected at startup otherwise

@@ -25,8 +25,11 @@ Covers:
 from __future__ import annotations
 
 import ast
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import ServerConfig, VoiceConfig
@@ -471,3 +474,683 @@ class TestGenerateLocalReplyStructuralGuard:
         assert reply == "an answer."
         model.disable_adapter.assert_called_once()
         model.disable_adapter.return_value.__enter__.assert_called_once()
+
+
+class TestTemporalSelectionWiring(_PlanBuilder):
+    """The date-group selection stage wired into ``_probe_and_reason``
+    (:mod:`paramem.server.temporal`, :mod:`paramem.server.temporal_selection`).
+
+    ``select_date_groups`` is stubbed via the module-level name
+    ``paramem.server.inference.select_date_groups`` — the exact binding
+    ``_probe_and_reason`` calls — so no test loads a model or touches the
+    GPU. Bookkeeping-dependent tests use a real ``MemoryStore`` (never a
+    ``MagicMock`` store, which would fabricate ``bookkeeping_for_key``).
+    """
+
+    @staticmethod
+    def stub_probe_capturing(monkeypatch, fact_prefix: str = "fact about"):
+        """Stub the grouped-probe primitive, returning a dict the caller
+        can read ``["keys_by_adapter"]`` from after ``_probe_and_reason``
+        returns — the exact set of keys the probe call received."""
+        captured: dict = {}
+
+        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
+            captured["keys_by_adapter"] = {k: list(v) for k, v in keys_by_adapter.items()}
+            results = {}
+            for keys in keys_by_adapter.values():
+                for k in keys:
+                    results[k] = {"key": k, "fact_text": f"{fact_prefix} {k}", "confidence": 1.0}
+            return results
+
+        monkeypatch.setattr("paramem.memory.probe.probe_keys_grouped_by_adapter", fake_grouped)
+        monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
+        monkeypatch.setattr(
+            "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
+            staticmethod(lambda path: {}),
+        )
+        return captured
+
+    @staticmethod
+    def stub_generate_local_reply(monkeypatch, reply: str = "a reply."):
+        """Stub ``_generate_local_reply`` and capture its first argument
+        (the fully-assembled augmented prompt) — the pattern the plan
+        calls for so the exact context string reaching the reasoning
+        generate can be asserted without a real model."""
+        captured: dict = {}
+
+        def fake(text, history, model, tokenizer, config, *, speaker_id, language):
+            captured["augmented_text"] = text
+            return reply, False
+
+        monkeypatch.setattr("paramem.server.inference._generate_local_reply", fake)
+        return captured
+
+    def test_disabled_is_byte_identical_noop(self, monkeypatch, tmp_path):
+        """temporal_selection_enabled=False: no clock read, no bookkeeping
+        read, no selection call — the context string and the probe's
+        keys_by_adapter are byte-identical to the pre-feature shape."""
+        probed = self.stub_probe_capturing(monkeypatch)
+        generated = self.stub_generate_local_reply(monkeypatch, reply="final answer.")
+
+        def exploding_select(*args, **kwargs):
+            raise AssertionError("select_date_groups must not be called when the stage is disabled")
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", exploding_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+        config.inference.temporal_selection_enabled = False
+
+        memory_store = _MS(replay_enabled=False)
+        # Bookkeeping deliberately left unseeded — the disabled stage must
+        # never read it.
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        result = _probe_and_reason(
+            text="What do I like?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        assert probed["keys_by_adapter"] == {"episodic": ["e1"]}
+        assert generated["augmented_text"] == (
+            "What you know about the speaker:\n\n"
+            "[Recent knowledge]\n- fact about e1\n\n"
+            "Question: What do I like?"
+        )
+        assert result.text == "final answer."
+
+    def test_memory_store_none_gate_skips_stage(self, monkeypatch, tmp_path):
+        """``memory_store=None`` alone gates the stage off — even with
+        ``temporal_selection_enabled`` at its True default and a
+        non-empty plan. ``select_date_groups`` must never be called; the
+        function then fails exactly where pre-feature code always would
+        (``memory_store.probe`` needs a real store), never inside the
+        temporal block — proof the gate, not an accident of call order,
+        is what skipped the stage."""
+
+        def exploding_select(*args, **kwargs):
+            raise AssertionError("select_date_groups must not be called when memory_store is None")
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", exploding_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+        assert config.inference.temporal_selection_enabled is True
+
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        with pytest.raises(AttributeError):
+            _probe_and_reason(
+                text="What do I like?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=None,
+            )
+
+    def test_selection_all_true_probe_set_identical_context_gains_headers(
+        self, monkeypatch, tmp_path
+    ):
+        """Selection stub returns ``all=True``: the probed key set is
+        unchanged, and the only rendering delta is the Today header plus
+        per-fact date headers."""
+        from paramem.server.temporal_selection import DateSelection
+
+        probed = self.stub_probe_capturing(monkeypatch)
+        generated = self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(all=True, ranges=(), include_undated=True)
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        _probe_and_reason(
+            text="What do you know about me?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        assert probed["keys_by_adapter"] == {"episodic": ["e1"]}
+
+        today = date.today()
+        expected_header = (
+            f"Today is {today.strftime('%A')}, {today.isoformat()}. "
+            "What you know about the speaker:"
+        )
+        text = generated["augmented_text"]
+        assert text.startswith(expected_header)
+        e1_day = date(2026, 8, 1)
+        assert f"On {e1_day.strftime('%A')}, 2026-08-01:\n- fact about e1" in text
+
+    def test_single_day_range_excludes_non_matching_and_undated_keys(self, monkeypatch, tmp_path):
+        """Selection stub returns a single-day range: only the keys last
+        seen on that day are probed; a key seen another day, and an
+        undated key, are both excluded when ``include_undated=False``."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        probed = self.stub_probe_capturing(monkeypatch)
+        self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 5), end=date(2026, 8, 5)),),
+                include_undated=False,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e_match",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-05T09:00:00",
+            last_seen="2026-08-05T09:00:00",
+        )
+        memory_store.set_bookkeeping(
+            "e_other_day",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        memory_store.set_bookkeeping(
+            "e_undated",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="",
+            last_seen="",
+        )
+        plan = self.make_plan([("episodic", ["e_match", "e_other_day", "e_undated"])])
+
+        _probe_and_reason(
+            text="What did we discuss on August 5th?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        assert probed["keys_by_adapter"] == {"episodic": ["e_match"]}
+
+    def test_single_day_range_includes_undated_when_flagged(self, monkeypatch, tmp_path):
+        """Same range, ``include_undated=True``: the undated key now
+        survives alongside the matching dated key."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        probed = self.stub_probe_capturing(monkeypatch)
+        self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 5), end=date(2026, 8, 5)),),
+                include_undated=True,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e_match",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-05T09:00:00",
+            last_seen="2026-08-05T09:00:00",
+        )
+        memory_store.set_bookkeeping(
+            "e_undated",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="",
+            last_seen="",
+        )
+        plan = self.make_plan([("episodic", ["e_match", "e_undated"])])
+
+        _probe_and_reason(
+            text="What did we discuss on August 5th, and what's my job?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        kba = probed["keys_by_adapter"]
+        assert set(kba["episodic"]) == {"e_match", "e_undated"}
+
+    def test_zero_survivors_skips_probe_and_escalation_plain_reply(self, monkeypatch, tmp_path):
+        """A selection range matching zero keys at all: no probe call, no
+        HA/cloud/base-model call, and the reasoning turn runs directly off
+        the deterministic nothing-in-period note. Plain (non-[ESCALATE])
+        reply flows straight through as the result text."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        def exploding_probe(self, *args, **kwargs):
+            raise AssertionError("MemoryStore.probe must not be called when zero keys survive")
+
+        monkeypatch.setattr("paramem.memory.store.MemoryStore.probe", exploding_probe)
+
+        for name in ("_escalate_to_ha_agent", "answer_via_cloud", "_base_model_answer"):
+
+            def exploding(*args, _name=name, **kwargs):
+                raise AssertionError(f"{_name} must not be called on the zero-survivor path")
+
+            monkeypatch.setattr(f"paramem.server.inference.{name}", exploding)
+
+        generated = self.stub_generate_local_reply(monkeypatch, reply="Nothing to add.")
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
+                include_undated=False,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        result = _probe_and_reason(
+            text="What did we discuss on August 10th?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        text = generated["augmented_text"]
+        assert "Nothing was recorded for the requested period." in text
+        assert "2026-08-01" in text
+        assert result.text == "Nothing to add."
+
+    def test_zero_survivors_escalate_tag_never_reaches_cloud_or_base_model(
+        self, monkeypatch, tmp_path
+    ):
+        """Same zero-survivor setup, but the local model escalates anyway
+        (``[ESCALATE] ...``): HA is stubbed unreachable, ``answer_via_cloud``
+        is invoked (receiving ``is_personal=True``) but stubbed to return
+        ``None`` exactly as the ``block`` cloud-mode gate does in
+        production, ``_base_model_answer`` is never reached, and the result
+        is the pre-tag / fallback text."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        def exploding_probe(self, *args, **kwargs):
+            raise AssertionError("MemoryStore.probe must not be called when zero keys survive")
+
+        monkeypatch.setattr("paramem.memory.store.MemoryStore.probe", exploding_probe)
+
+        def exploding_base_model(*args, **kwargs):
+            raise AssertionError("_base_model_answer must not be called on the zero-survivor path")
+
+        monkeypatch.setattr("paramem.server.inference._base_model_answer", exploding_base_model)
+        monkeypatch.setattr("paramem.server.inference._escalate_to_ha_agent", lambda *a, **kw: None)
+        monkeypatch.setattr("paramem.server.inference.is_self_referential", lambda *a, **kw: False)
+
+        cloud_calls = []
+
+        def fake_answer_via_cloud(text, cloud_agent, config, **kwargs):
+            cloud_calls.append(kwargs)
+            return None
+
+        monkeypatch.setattr("paramem.server.inference.answer_via_cloud", fake_answer_via_cloud)
+
+        self.stub_generate_local_reply(
+            monkeypatch, reply="Intro sentence. [ESCALATE] what did we discuss then"
+        )
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
+                include_undated=False,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        result = _probe_and_reason(
+            text="What did we discuss on August 10th?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+            is_personal=True,
+        )
+
+        assert len(cloud_calls) == 1
+        assert cloud_calls[0]["is_personal"] is True
+        assert result.text == "Intro sentence."
+
+    def test_mixed_zero_dated_matches_with_undated_survivors_probes_and_renders_both(
+        self, monkeypatch, tmp_path
+    ):
+        """Ranges + include_undated=True + zero dated matches + undated
+        keys present: the probe runs for the undated keys only, and the
+        context carries BOTH the nothing-in-period note and the undated
+        facts."""
+        from paramem.server.temporal import DateWindow
+        from paramem.server.temporal_selection import DateSelection
+
+        probed = self.stub_probe_capturing(monkeypatch)
+        generated = self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(
+                all=False,
+                ranges=(DateWindow(start=date(2026, 8, 10), end=date(2026, 8, 10)),),
+                include_undated=True,
+            )
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e_dated",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        memory_store.set_bookkeeping(
+            "e_undated",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="",
+            last_seen="",
+        )
+        plan = self.make_plan([("episodic", ["e_dated", "e_undated"])])
+
+        _probe_and_reason(
+            text="What did we discuss on August 10th, and what's my job?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        assert probed["keys_by_adapter"] == {"episodic": ["e_undated"]}
+        text = generated["augmented_text"]
+        assert "Nothing was recorded for the requested period." in text
+        assert "2026-08-01" in text
+        assert "- fact about e_undated" in text
+
+    def test_bookkeeping_none_and_int_last_seen_land_undated_without_raising(
+        self, monkeypatch, tmp_path
+    ):
+        """A bookkeeping record with ``last_seen=None`` or an int — the
+        shape real disk-splatting can produce — lands in the undated
+        group and raises nothing."""
+        from paramem.server.temporal_selection import DateSelection
+
+        probed = self.stub_probe_capturing(monkeypatch)
+        self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            assert {key for key, day in date_by_key.items() if day is None} == {"e_none", "e_int"}
+            return DateSelection(all=True, ranges=(), include_undated=True)
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e_none",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="",
+            last_seen=None,
+        )
+        memory_store.set_bookkeeping(
+            "e_int",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="",
+            last_seen=12345,
+        )
+        plan = self.make_plan([("episodic", ["e_none", "e_int"])])
+
+        result = _probe_and_reason(
+            text="What do you know about me?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        assert probed["keys_by_adapter"] == {"episodic": ["e_none", "e_int"]}
+        assert result.text == "a reply."
+
+    def test_dated_facts_render_once_per_tier_in_tier_order(self, monkeypatch, tmp_path):
+        """Each dated fact appears exactly once, under its date header,
+        within its tier section — and tier order (procedural → episodic →
+        semantic) is preserved."""
+        from paramem.server.temporal_selection import DateSelection
+
+        probed = self.stub_probe_capturing(monkeypatch)
+        generated = self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(all=True, ranges=(), include_undated=True)
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["procedural", "episodic", "semantic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "p1",
+            speaker_id="speaker0",
+            relation_type="preference",
+            first_seen="2026-08-02T09:00:00",
+            last_seen="2026-08-02T09:00:00",
+        )
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-02T09:00:00",
+            last_seen="2026-08-02T09:00:00",
+        )
+        memory_store.set_bookkeeping(
+            "s1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        plan = self.make_plan(
+            [
+                ("procedural", ["p1"]),
+                ("episodic", ["e1"]),
+                ("semantic", ["s1"]),
+            ]
+        )
+
+        _probe_and_reason(
+            text="What do you know about me?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=memory_store,
+        )
+
+        assert probed["keys_by_adapter"] == {
+            "procedural": ["p1"],
+            "episodic": ["e1"],
+            "semantic": ["s1"],
+        }
+        text = generated["augmented_text"]
+
+        # Tier order preserved.
+        proc_idx = text.index("[Behavioral preferences]")
+        epi_idx = text.index("[Recent knowledge]")
+        sem_idx = text.index("[Consolidated knowledge]")
+        assert proc_idx < epi_idx < sem_idx
+
+        # Each dated fact appears exactly once, under its own date header,
+        # within its own tier section.
+        assert text.count("fact about p1") == 1
+        assert text.count("fact about e1") == 1
+        assert text.count("fact about s1") == 1
+        aug_02 = date(2026, 8, 2)
+        aug_01 = date(2026, 8, 1)
+        assert f"On {aug_02.strftime('%A')}, 2026-08-02:\n- fact about p1" in text
+        assert f"On {aug_02.strftime('%A')}, 2026-08-02:\n- fact about e1" in text
+        assert f"On {aug_01.strftime('%A')}, 2026-08-01:\n- fact about s1" in text
+
+
+class TestRenderTierFactsDateGrouping:
+    """``_render_tier_facts``'s date-grouping in isolation — no probe, no
+    model, no store; "dated" is derived from ``date_by_key`` being
+    non-``None``, not a separate flag."""
+
+    def test_no_date_map_is_the_flat_bullet_list(self):
+        from paramem.server.inference import _render_tier_facts
+
+        facts = [("k1", "fact one"), ("k2", "fact two")]
+        assert _render_tier_facts(facts) == "- fact one\n- fact two"
+
+    def test_one_tier_mixed_dated_and_undated_undated_listed_first(self):
+        """A single tier carrying both an undated and a dated fact:
+        the undated bullet renders first, ungrouped, ahead of the date
+        header."""
+        from paramem.server.inference import _render_tier_facts
+
+        facts = [("k1", "dated fact"), ("k2", "undated fact")]
+        day = date(2026, 8, 5)
+        date_by_key = {"k1": day, "k2": None}
+        rendered = _render_tier_facts(facts, date_by_key=date_by_key)
+        assert rendered == f"- undated fact\nOn {day.strftime('%A')}, 2026-08-05:\n- dated fact"
+
+    def test_two_distinct_dates_in_one_tier_rendered_descending(self):
+        """Two facts in one tier on different dates: the more recent date
+        heads the section, per the ``sorted(..., reverse=True)`` contract."""
+        from paramem.server.inference import _render_tier_facts
+
+        older = date(2026, 8, 1)
+        newer = date(2026, 8, 5)
+        facts = [("k1", "older fact"), ("k2", "newer fact")]
+        date_by_key = {"k1": older, "k2": newer}
+        rendered = _render_tier_facts(facts, date_by_key=date_by_key)
+        assert rendered == (
+            f"On {newer.strftime('%A')}, 2026-08-05:\n- newer fact\n"
+            f"On {older.strftime('%A')}, 2026-08-01:\n- older fact"
+        )

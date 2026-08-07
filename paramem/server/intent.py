@@ -45,6 +45,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from paramem.models.loader import generate_adapter_off
 from paramem.server.config import IntentConfig
 from paramem.server.router import Intent
 
@@ -426,7 +427,7 @@ def _classify_via_llm(
     Uses the intent-classifier section of ``configs/prompts/pa_voice.txt``
     (loaded via :meth:`VoiceConfig.load_intent_classifier_prompt`) as the
     system prompt.  Generation is deterministic (``temperature=0``,
-    ``do_sample=False``) and bounded to
+    ``do_sample=False``, via :func:`generate_adapter_off`) and bounded to
     :attr:`IntentConfig.llm_max_new_tokens` tokens — enough for one
     label plus possible whitespace.
 
@@ -450,40 +451,13 @@ def _classify_via_llm(
             {"role": "system", "content": classifier_prompt},
             {"role": "user", "content": text},
         ]
-        # Two-step tokenization mirrors the production inference path
-        # (paramem/server/inference.py:900-908):
-        #   1. apply_chat_template with tokenize=False → string prompt;
-        #   2. tokenizer(prompt, return_tensors="pt") → BatchEncoding;
-        #   3. model.generate(**inputs).
-        # The earlier shortcut of passing apply_chat_template's tensor result
-        # directly to generate() crashes on transformers >= 5 because the
-        # call returns a BatchEncoding (no .shape attribute).
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-        # Intent classification runs on the bare base model with the KV cache
-        # live.  The PA adapter is trained on personal-key recall and would bias
-        # the classifier toward PERSONAL on content-free imperatives; gradient
-        # checkpointing must be off during generate() (HF silently disables the
-        # KV cache when checkpointing is active).  ``base_model_inference``
-        # disables the adapter and restores checkpointing to its entry state.
-        from paramem.models.loader import base_model_inference
-
-        with base_model_inference(model):
-            import torch as _torch
-
-            with _torch.no_grad():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=config.llm_max_new_tokens,
-                    do_sample=False,
-                    temperature=config.llm_temperature,
-                    pad_token_id=getattr(tokenizer, "pad_token_id", None)
-                    or getattr(tokenizer, "eos_token_id", None),
-                )
-
-        generated = output_ids[0][inputs["input_ids"].shape[-1] :]
-        response = tokenizer.decode(generated, skip_special_tokens=True)
+        response = generate_adapter_off(
+            model,
+            tokenizer,
+            messages,
+            max_new_tokens=config.llm_max_new_tokens,
+            temperature=config.llm_temperature,
+        )
     except Exception:
         logger.exception("LLM intent classification failed; falling back")
         return Intent.UNKNOWN

@@ -976,6 +976,13 @@ class SentenceTypeConfig:
 
 
 _INTENT_CLASSIFIER_MARKER = "##---INTENT-CLASSIFIER-SECTION---"
+_RECALL_SELECTION_MARKER = "##---RECALL-SELECTION-SECTION---"
+# Every marked section in configs/prompts/pa_voice.txt. load_prompt() strips
+# all of them (the reasoning prompt must never see a later section's
+# instructions); each per-section accessor below stops at whichever marker
+# in this tuple appears first after its own, so appending a new section
+# never leaks into an earlier accessor's return value.
+_SECTION_MARKERS = (_INTENT_CLASSIFIER_MARKER, _RECALL_SELECTION_MARKER)
 
 
 @dataclass
@@ -1015,16 +1022,19 @@ class VoiceConfig:
     def load_prompt(self) -> str:
         """Load the PA-path system prompt.
 
-        If the prompt file contains an ``##---INTENT-CLASSIFIER-SECTION---``
-        marker, only the content **before** that marker is returned —
-        downstream callers (PA-path reasoning) must not see the
-        classifier section's instructions.  Files without the marker are
-        returned whole (back-compat with prompts authored before LLM
-        intent classification existed).
+        If the prompt file contains any marker in ``_SECTION_MARKERS``
+        (``##---INTENT-CLASSIFIER-SECTION---``,
+        ``##---RECALL-SELECTION-SECTION---``), only the content **before**
+        the earliest such marker is returned — downstream callers
+        (PA-path reasoning) must not see any later section's
+        instructions, regardless of marker order in the file.  Files
+        without any marker are returned whole (back-compat with prompts
+        authored before LLM intent classification existed).
         """
         raw = self._read_prompt_file()
         if raw is not None:
-            head = raw.split(_INTENT_CLASSIFIER_MARKER, 1)[0]
+            marker_positions = [raw.index(m) for m in _SECTION_MARKERS if m in raw]
+            head = raw[: min(marker_positions)] if marker_positions else raw
             return head.strip()
         if self.system_prompt:
             return self.system_prompt
@@ -1033,23 +1043,56 @@ class VoiceConfig:
             "Use only facts that appear in the context above. Never invent personal details."
         )
 
+    def _load_marked_section(self, marker: str) -> str | None:
+        """Return the content between *marker* and the next marker in
+        ``_SECTION_MARKERS`` (or end of file), or ``None`` if the prompt
+        file is absent or *marker* is missing.
+
+        Shared by :meth:`load_intent_classifier_prompt` and
+        :meth:`load_recall_selection_prompt` so a section never leaks a
+        trailing section appended after it.
+        """
+        raw = self._read_prompt_file()
+        if raw is None:
+            return None
+        parts = raw.split(marker, 1)
+        if len(parts) != 2:
+            return None
+        tail = parts[1]
+        next_marker_positions = [
+            tail.index(m) for m in _SECTION_MARKERS if m != marker and m in tail
+        ]
+        if next_marker_positions:
+            tail = tail[: min(next_marker_positions)]
+        tail = tail.strip()
+        return tail or None
+
     def load_intent_classifier_prompt(self) -> str | None:
         """Return the intent-classifier section of the prompt file, or
         ``None`` if the file is absent or the marker is missing.
 
         Used by :func:`paramem.server.intent._classify_via_llm` when
         ``IntentConfig.mode == "llm"``.  Operators tune the classifier
-        prompt by editing the section after the marker in
+        prompt by editing the section after the
+        ``##---INTENT-CLASSIFIER-SECTION---`` marker in
+        ``configs/prompts/pa_voice.txt``; no code change required. Stops
+        at the next marked section (if any) so a later section's content
+        never leaks into the classifier prompt.
+        """
+        return self._load_marked_section(_INTENT_CLASSIFIER_MARKER)
+
+    def load_recall_selection_prompt(self) -> str | None:
+        """Return the recall date-selection section of the prompt file,
+        or ``None`` if the file is absent or the marker is missing.
+
+        Used by :func:`paramem.server.temporal_selection.select_date_groups`
+        as the system prompt for the model-selected date-group filtering
+        stage (decide which recorded dates a query needs before probing).
+        Operators tune the selection prompt by editing the section after
+        the ``##---RECALL-SELECTION-SECTION---`` marker in
         ``configs/prompts/pa_voice.txt``; no code change required.
         """
-        raw = self._read_prompt_file()
-        if raw is None:
-            return None
-        parts = raw.split(_INTENT_CLASSIFIER_MARKER, 1)
-        if len(parts) != 2:
-            return None
-        tail = parts[1].strip()
-        return tail or None
+        return self._load_marked_section(_RECALL_SELECTION_MARKER)
 
 
 @dataclass
@@ -1808,10 +1851,26 @@ class InferenceConfig:
     read, so only a lower bound (``> 0``) is enforced. A reply that reaches
     the cap is trimmed to its last complete sentence rather than delivered
     mid-word (:func:`paramem.server.inference._trim_incomplete_sentence`).
+
+    ``temporal_selection_enabled`` / ``temporal_selection_max_new_tokens``:
+    govern the date-group selection stage
+    (:func:`paramem.server.temporal_selection.select_date_groups`) that
+    runs before a personal-history probe. See the two fields' own
+    comments below for their operator-level effect.
     """
 
     preload_cache: bool = True
     max_response_tokens: int = 512
+    # Kill switch for the date-group selection stage that runs before a
+    # personal-history probe (paramem/server/temporal_selection.py); false
+    # skips it entirely and reproduces today's unfiltered full probe exactly
+    # — the operator's escape hatch and the A/B lever for measuring the
+    # stage's added latency.
+    temporal_selection_enabled: bool = True
+    # Cap on the selection generate's output — one JSON object (either
+    # {"all": true} or a date-ranges array plus an undated flag), sized with
+    # headroom over a worst-case multi-range response.
+    temporal_selection_max_new_tokens: int = 160
 
     def __post_init__(self) -> None:
         """Reject a non-positive response-length ceiling.
@@ -1823,6 +1882,11 @@ class InferenceConfig:
         if self.max_response_tokens <= 0:
             raise ValueError(
                 f"inference.max_response_tokens must be > 0; got {self.max_response_tokens!r}"
+            )
+        if self.temporal_selection_max_new_tokens <= 0:
+            raise ValueError(
+                "inference.temporal_selection_max_new_tokens must be > 0; got "
+                f"{self.temporal_selection_max_new_tokens!r}"
             )
 
 

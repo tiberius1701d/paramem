@@ -86,6 +86,79 @@ def base_model_inference(model):
             yield
 
 
+def generate_adapter_off(
+    model,
+    tokenizer,
+    messages: list[dict],
+    *,
+    max_new_tokens: int,
+    temperature: float = 0.0,
+) -> str:
+    """Run one deterministic, adapter-off generate and return the decoded text.
+
+    THE one adapter-off raw-generate implementation shared by every local
+    structured-output call that is not a full conversational reply
+    (:func:`paramem.server.intent._classify_via_llm` and
+    :func:`paramem.server.temporal_selection.select_date_groups`) — a
+    second raw copy of this block previously lived only in
+    ``_classify_via_llm``; lives here, alongside :func:`base_model_inference`
+    (the primitive it runs inside), rather than mirrored a third time.
+    :func:`paramem.server.inference._generate_local_reply` is a separate,
+    larger reply-shaping pipeline (system prompt assembly, cap-hit
+    detection) and is not folded in.
+
+    Two-step tokenization (chat template → string → tensors) mirrors the
+    production inference path: feeding ``apply_chat_template``'s tensor
+    output straight into ``generate()`` crashes on transformers >= 5
+    because that call now returns a ``BatchEncoding`` (no ``.shape``
+    attribute), so the template is rendered to a string first and
+    tokenized as its own step.
+
+    Runs inside :func:`base_model_inference`, which disables gradient
+    checkpointing (so the KV cache stays live, since HF silently disables
+    it while checkpointing is active) and, on a ``PeftModel``, disables
+    the active adapter for the duration — every caller of this function
+    runs its judgment on the base weights, never biased by an adapter
+    trained for a different objective (e.g. the PA adapter's personal-key
+    recall bias).
+
+    Args:
+        model: The (optionally PEFT-wrapped) model to generate from.
+        tokenizer: The model's tokenizer.
+        messages: Chat-template messages (``[{"role", "content"}, ...]``).
+        max_new_tokens: Generation cap.
+        temperature: Sampling temperature; ``0.0`` selects greedy decode
+            (``do_sample=False`` always — every caller of this function
+            wants deterministic structured output).
+
+    Returns:
+        The decoded generated tail (prompt tokens excluded), with special
+        tokens stripped.
+
+    Raises:
+        Exception: Any tokenization, generation, or decode failure
+            propagates — this function has no fail-open contract of its
+            own; each caller owns its own try/except and its own
+            fail-shape (``Intent.UNKNOWN``, ``DateSelection(all=True, ...)``).
+    """
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    with base_model_inference(model):
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=temperature,
+                pad_token_id=getattr(tokenizer, "pad_token_id", None)
+                or getattr(tokenizer, "eos_token_id", None),
+            )
+
+    generated = output_ids[0][inputs["input_ids"].shape[-1] :]
+    return tokenizer.decode(generated, skip_special_tokens=True)
+
+
 @dataclass
 class _BackupScope:
     """Handle yielded by :func:`main_tier_backup_scope`.

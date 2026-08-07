@@ -74,6 +74,56 @@ class TestPaVoicePromptFile:
         assert "##---INTENT-CLASSIFIER-SECTION---" not in head
         assert vc.load_intent_classifier_prompt() is not None
 
+    def test_both_section_markers_present(self, prompt_text: str):
+        """Both marked sections must exist — the classifier section and
+        the recall date-selection section relocated from the former
+        standalone temporal_selection.txt."""
+        assert "##---INTENT-CLASSIFIER-SECTION---" in prompt_text
+        assert "##---RECALL-SELECTION-SECTION---" in prompt_text
+
+    def test_load_prompt_excludes_recall_selection_section(self):
+        """The reasoning prompt (PA-path system prompt) must not see
+        either the classifier section or the recall date-selection
+        section — only the reasoning section itself."""
+        vc = VoiceConfig(prompt_file=str(PROMPT_FILE))
+        head = vc.load_prompt()
+        assert "##---RECALL-SELECTION-SECTION---" not in head
+        assert "date-selection stage" not in head
+        assert '{"all": true}' not in head
+
+    def test_load_intent_classifier_prompt_excludes_recall_selection_section(self):
+        """The classifier accessor must stop at the next marker — it
+        returns only the classifier section, not the trailing
+        recall-selection section appended after it."""
+        vc = VoiceConfig(prompt_file=str(PROMPT_FILE))
+        classifier = vc.load_intent_classifier_prompt()
+        assert classifier is not None
+        assert "##---RECALL-SELECTION-SECTION---" not in classifier
+        assert "date-selection stage" not in classifier
+
+    def test_load_recall_selection_prompt_returns_selection_content(self):
+        """The new accessor returns the recall date-selection section:
+        the rules and few-shot examples relocated from the former
+        standalone temporal_selection.txt, with none of the classifier
+        section's content."""
+        vc = VoiceConfig(prompt_file=str(PROMPT_FILE))
+        selection = vc.load_recall_selection_prompt()
+        assert selection is not None
+        assert "date-selection stage" in selection
+        assert '{"all": true}' in selection
+        assert "PERSONAL" not in selection
+        assert "COMMAND" not in selection
+
+    def test_recall_selection_examples_carry_own_dates(self, prompt_text: str):
+        """Each few-shot example in the recall-selection section states
+        its own labeled example date, so no example is anchored to a
+        hardcoded 'Today' that could collide with the real injected
+        Today line at inference time."""
+        selection = VoiceConfig(prompt_file=str(PROMPT_FILE)).load_recall_selection_prompt()
+        assert selection is not None
+        assert re.search(r"Example \(today is \w+, \d{4}-\d{2}-\d{2}\):", selection) is not None
+        assert "Examples (Today is Thursday, 2026-08-06)" not in selection
+
 
 class TestVoiceConfigFallback:
     def test_fallback_does_not_prime_confabulation(self, tmp_path):

@@ -914,6 +914,8 @@ process:
 inference:
   preload_cache: true
   max_response_tokens: 512   # ceiling on tokens generated per local conversational reply; sized so a worst-case reply still returns inside the 30s Home Assistant conversation timeout. A reply that reaches the ceiling is trimmed to its last complete sentence rather than delivered mid-word. See DEPLOYMENT.md's inference section for the full derivation.
+  temporal_selection_enabled: true    # kill switch for the date-group selection stage that runs before a personal-history probe; false reproduces today's unfiltered full probe exactly (no selection generate, no date headers in context)
+  temporal_selection_max_new_tokens: 160   # cap on the selection generate's output — one JSON object (either {"all": true} or a date-ranges array plus an undated flag)
 
 vram:
   process_cap_fraction: 0.85           # in (0, 1]; rejected at startup otherwise

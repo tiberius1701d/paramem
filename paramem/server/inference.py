@@ -46,6 +46,7 @@ callers own the cloud fallback.
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 
 from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
@@ -53,8 +54,10 @@ from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
 from paramem.models.loader import adapt_messages, base_model_inference, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
-from paramem.server.router import Intent, RoutingPlan
+from paramem.server.router import Intent, RoutingPlan, RoutingStep
 from paramem.server.sanitizer import is_self_referential
+from paramem.server.temporal import build_date_by_key
+from paramem.server.temporal_selection import select_date_groups
 from paramem.server.tools.ha_client import HAClient
 from paramem.utils.tokens import estimate_tokens
 
@@ -328,12 +331,7 @@ def handle_chat(
         with grad_checkpointing_disabled(model):
             plan = None
 
-            # Dual-graph entity routing.  The temporal-query branch (filter
-            # keys by date range) was retired — its data source (combined
-            # registry with last_seen_at / status fields) was never populated
-            # by production paths, so the filter always returned an empty
-            # list and the branch was inert.  If we re-introduce temporal
-            # queries, the writer side needs to be designed first.
+            # Dual-graph entity routing.
             if router is not None:
                 plan = router.route(text, speaker_id=speaker_id)
             if plan is not None:
@@ -863,6 +861,100 @@ def _generate_local_reply(
     return reply, is_truncated
 
 
+def _render_tier_facts(
+    facts: list[tuple[str, str]],
+    *,
+    date_by_key: dict[str, date | None] | None = None,
+) -> str:
+    """Render one tier's recalled ``(key, fact_text)`` pairs as bullet lines.
+
+    Byte-identical to a plain ``"- {fact_text}"`` bullet list joined by
+    newlines when *date_by_key* is ``None`` — the
+    ``temporal_selection_enabled=False`` no-op contract; "dated" is not a
+    separate flag, it is *date_by_key* being present. When a map is
+    supplied, facts are grouped under ``"On {Weekday}, YYYY-MM-DD:"``
+    headers (dates descending; weekday via ``date.strftime('%A')``,
+    matching the shape of the ``"Today is {Weekday}, {YYYY-MM-DD}."``
+    header line built in :func:`_render_augmented_text`); facts whose key
+    has no parseable date render first, ungrouped. *date_by_key* is the
+    request's single :func:`~paramem.server.temporal.build_date_by_key`
+    parse — no second bookkeeping read, no second clock read, no re-parse
+    of the raw value.
+
+    Args:
+        facts: ``(key, fact_text)`` pairs recalled for one tier, in probe
+            order.
+        date_by_key: ``{key: parsed date or None}`` for every key probed
+            this request, or ``None`` when the date-group selection stage
+            did not run — reproduces the original flat rendering exactly.
+
+    Returns:
+        The rendered tier body (bullet lines, optionally under date
+        headers) — without the ``"[Label]"`` section wrapper.
+    """
+    if date_by_key is None:
+        return "\n".join(f"- {fact_text}" for _key, fact_text in facts)
+
+    undated_lines: list[str] = []
+    by_date: dict[date, list[str]] = {}
+    for key, fact_text in facts:
+        day = date_by_key.get(key)
+        if day is None:
+            undated_lines.append(f"- {fact_text}")
+        else:
+            by_date.setdefault(day, []).append(f"- {fact_text}")
+
+    sections: list[str] = []
+    if undated_lines:
+        sections.append("\n".join(undated_lines))
+    for day in sorted(by_date, reverse=True):
+        sections.append(f"On {day.strftime('%A')}, {day.isoformat()}:\n" + "\n".join(by_date[day]))
+
+    return "\n".join(sections)
+
+
+def _render_augmented_text(
+    layered_context: str,
+    text: str,
+    *,
+    today: date | None = None,
+    note: str | None = None,
+) -> str:
+    """Render the reasoning-turn prompt from the assembled tier context.
+
+    Byte-identical to today's plain rendering
+    (``"What you know about the speaker:\\n\\n{layered_context}\\n\\n"
+    "Question: {text}"``) when *today* is ``None`` — the
+    ``temporal_selection_enabled=False`` no-op contract; "dated" is not a
+    separate flag, it is *today* being present (the date-group selection
+    stage is the only caller that resolves it). When *today* is given, the
+    header carries its weekday and ISO date, and *note* (the deterministic
+    nothing-in-period note the date-group selection stage may have built)
+    renders as its own line above *layered_context* — or alone when
+    *layered_context* is empty (the zero-survivor case).
+
+    Args:
+        layered_context: The assembled, already-rendered tier sections
+            (may be empty).
+        text: The user's current turn.
+        today: The calendar date to render in the header, or ``None``
+            when the date-group selection stage did not run.
+        note: The nothing-in-period note, or ``None`` when none was
+            built.
+
+    Returns:
+        The full augmented prompt text passed to the reasoning generate.
+    """
+    if today is None:
+        return f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
+
+    header = (
+        f"Today is {today.strftime('%A')}, {today.isoformat()}. What you know about the speaker:"
+    )
+    body = "\n\n".join(part for part in (note, layered_context) if part)
+    return f"{header}\n\n{body}\n\nQuestion: {text}"
+
+
 def _probe_and_reason(
     text: str,
     plan: RoutingPlan,
@@ -881,27 +973,52 @@ def _probe_and_reason(
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
-    Builds a ``keys_by_adapter`` dict from ``plan.steps`` (preserving router
-    order: procedural → episodic → semantic → session adapters newest-first),
-    dispatches to ``MemoryStore.probe`` for cache resolution + on-miss source
-    delegation, then reassembles per-layer facts for context augmentation.
+    Builds a ``keys_by_adapter`` dict from the routing plan's steps
+    (preserving router order: procedural → episodic → semantic → session
+    adapters newest-first), dispatches to ``MemoryStore.probe`` for cache
+    resolution + on-miss source delegation, then reassembles per-layer
+    facts for context augmentation.
 
     Cache hits return in O(1).  On cache miss the :class:`MemorySource` built
     by :func:`~paramem.memory.source.build_memory_source` resolves the entry and
     the result is memoized back into the cache when
     ``config.inference.preload_cache`` is True.
 
-    After probing, restores the model to the ``episodic`` adapter so the next
-    query starts from a predictable state. The reasoning phase uses
-    ``model.disable_adapter()`` so the active adapter during generation does
-    not matter — only the post-return state (restored here) does.
+    After weight probing, restores the model to the ``episodic`` adapter so
+    the next query starts from a predictable state — this restore runs only
+    on the paths that actually probed; the zero-survivor date-selection path
+    below returns before probing and never touches adapter state, and the
+    reasoning generate that follows (here or on that path) restores its own
+    adapter state via ``base_model_inference`` regardless. The reasoning
+    phase uses ``model.disable_adapter()`` so the active adapter during
+    generation does not matter — only the post-probe state (restored here,
+    when reached) does.
 
     Privacy gate: ``is_personal`` flows through to every internal cloud
     fallback site (no-layers branch, base-model fallthrough, post-reason
     [ESCALATE]).  Personal-class queries never reach the cloud.
 
-    Each result dict carries a ``fact_text`` field pre-rendered for the
-    bullet list.
+    Date-group selection stage: when ``config.inference.temporal_selection_enabled``
+    is True, ``memory_store`` is resolved, and ``plan.steps`` is non-empty,
+    asks the local model (adapter off, temperature 0, via
+    :func:`~paramem.server.temporal_selection.select_date_groups`) which of
+    the plan's keys — read from bookkeeping and parsed to a calendar date
+    once via :func:`~paramem.server.temporal.build_date_by_key` — the
+    current turn needs, and probes only the surviving keys. This is the
+    ENTIRE stage: the clock read, the bookkeeping reads, the selection
+    call, the key filtering, and the dated context rendering are all
+    gated on the same condition, so a disabled (or inapplicable) stage
+    leaves this function's behavior — including the exact context string
+    — byte-identical to the stage never having existed. When every key is
+    filtered out, the probe call and the ``not layers`` escalation branch
+    below are both structurally unreachable — the reasoning turn runs
+    directly off a deterministic nothing-in-period note instead.
+
+    Each result dict carries a ``fact_text`` field; per-tier rendering
+    (the bullet-list "- " prefix, plus date headers when the selection
+    stage ran) happens once, at context assembly
+    (:func:`_render_tier_facts`), reading the same ``date_by_key`` map
+    the selection stage built — no fact's date is parsed more than once.
     """
     from paramem.memory.source import build_memory_source
     from paramem.models.loader import switch_adapter
@@ -912,12 +1029,118 @@ def _probe_and_reason(
         "episodic": "Recent knowledge",
     }
 
+    # Date-group selection stage.  ``active_steps`` defaults to
+    # ``plan.steps`` itself (same list, same objects) so every downstream
+    # read is unaffected when the stage does not run — the no-op
+    # contract for temporal_selection_enabled=False.  ``date_by_key``
+    # stays None on that no-op path too, and every renderer downstream
+    # treats None as "the stage didn't run" rather than taking a second
+    # explicit flag.
+    active_steps = plan.steps
+    today: date | None = None
+    date_by_key: dict[str, date | None] | None = None
+    period_note: str | None = None
+    temporal_stage_active = (
+        config.inference.temporal_selection_enabled
+        and memory_store is not None
+        and bool(plan.steps)
+    )
+
+    if temporal_stage_active:
+        today = date.today()
+        last_seen_by_key: dict[str, object] = {}
+        for step in plan.steps:
+            for key in step.keys_to_probe:
+                bookkeeping = memory_store.bookkeeping_for_key(key) or {}
+                last_seen_by_key[key] = bookkeeping.get("last_seen")
+
+        # Single parse of every key's raw bookkeeping value for this
+        # request — the selection inventory, the survivor filter, the
+        # nothing-in-period note, and the per-fact rendering below all
+        # read from this one map instead of re-parsing.
+        date_by_key = build_date_by_key(last_seen_by_key)
+        selection = select_date_groups(
+            text,
+            date_by_key,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            today=today,
+        )
+
+        active_steps = []
+        total_before = 0
+        total_after = 0
+        for step in plan.steps:
+            total_before += len(step.keys_to_probe)
+            kept = [key for key in step.keys_to_probe if selection.selects(date_by_key[key])]
+            total_after += len(kept)
+            if kept:
+                active_steps.append(RoutingStep(adapter_name=step.adapter_name, keys_to_probe=kept))
+
+        # Deterministic nothing-in-period note: the selection chose
+        # specific ranges (not `all`) and zero surviving keys carry a
+        # parseable date — regardless of whether undated keys survived
+        # via ``include_undated`` (they still probe and render alongside
+        # the note).
+        if not selection.all:
+            dated_kept = any(
+                date_by_key[key] is not None for step in active_steps for key in step.keys_to_probe
+            )
+            if not dated_kept:
+                existing_dates = sorted({day for day in date_by_key.values() if day is not None})
+                available_dates = ", ".join(day.isoformat() for day in existing_dates)
+                period_note = "Nothing was recorded for the requested period."
+                if available_dates:
+                    period_note += f" Recorded dates: {available_dates}."
+
+        logger.info(
+            "Date-group selection: %s, kept %d/%d key(s)",
+            "all"
+            if selection.all
+            else f"{len(selection.ranges)} range(s)"
+            + (" +undated" if selection.include_undated else ""),
+            total_after,
+            total_before,
+        )
+
+        if total_after == 0:
+            # No keys survived selection at all: the probe call and the
+            # `not layers` escalation branch below are never reached on
+            # this path — the reasoning turn runs directly off the note.
+            augmented_text = _render_augmented_text("", text, today=today, note=period_note)
+            response, is_truncated = _generate_local_reply(
+                augmented_text,
+                history,
+                model,
+                tokenizer,
+                config,
+                speaker_id=speaker_id,
+                language=language,
+            )
+            return _maybe_escalate(
+                response,
+                config,
+                intent=plan.intent,
+                probed_keys=[],
+                cloud_agent=cloud_agent,
+                ha_client=ha_client,
+                speaker=speaker,
+                speaker_id=speaker_id,
+                history=history,
+                language=language,
+                is_personal=is_personal,
+                model=model,
+                tokenizer=tokenizer,
+                is_truncated=is_truncated,
+            )
+
     # Build ordered keys_by_adapter dict from routing steps.
     # Insertion order matches router output (procedural → episodic → semantic
     # → session adapters newest-first).  Use a plain dict — Python 3.7+
     # guarantees insertion-order preservation.
     keys_by_adapter: dict[str, list[str]] = {}
-    for step in plan.steps:
+    for step in active_steps:
         keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
 
     # Mode-aware on-miss source from the one factory.  The MemoryStore cache is
@@ -953,11 +1176,15 @@ def _probe_and_reason(
         switch_adapter(model, "episodic")
 
     # Reassemble per-step facts so each adapter's results go to its layer.
-    layers: dict[str, list[str]] = {}
+    # Each fact retains its originating key (rather than a pre-rendered
+    # "- {fact}" string) so the date-grouped rendering at context assembly
+    # (_render_tier_facts) can look each fact's date up in date_by_key
+    # without a second bookkeeping read or a re-parse.
+    layers: dict[str, list[tuple[str, str]]] = {}
     successful_keys = []
 
-    for step in plan.steps:
-        layer_facts = []
+    for step in active_steps:
+        layer_facts: list[tuple[str, str]] = []
         for key in step.keys_to_probe:
             result = probe_results.get(key)
             if result and "failure_reason" not in result:
@@ -965,7 +1192,7 @@ def _probe_and_reason(
                 # probe_keys_grouped_by_adapter / probe_keys_from_graph.
                 # The get() fallback covers mocked/legacy callers that return
                 # a bare {answer: ...} dict without the field.
-                layer_facts.append(f"- {result.get('fact_text', result.get('answer', ''))}")
+                layer_facts.append((key, result.get("fact_text", result.get("answer", ""))))
                 successful_keys.append(key)
 
         if layer_facts:
@@ -981,7 +1208,7 @@ def _probe_and_reason(
     if not layers:
         logger.info(
             "All %d probed key(s) failed, escalating via HA%s (intent=%s)",
-            sum(len(s.keys_to_probe) for s in plan.steps),
+            sum(len(s.keys_to_probe) for s in active_steps),
             "" if is_personal else " → cloud",
             plan.intent.value,
         )
@@ -1021,7 +1248,7 @@ def _probe_and_reason(
             logger.info(
                 "Abstention: PA-empty personal interrogative in _probe_and_reason "
                 "(probes=%d failed, HA returned None)",
-                sum(len(s.keys_to_probe) for s in plan.steps),
+                sum(len(s.keys_to_probe) for s in active_steps),
             )
             return result
 
@@ -1057,25 +1284,34 @@ def _probe_and_reason(
     context_sections = []
     procedural_facts = layers.get("procedural")
     if procedural_facts:
-        context_sections.append(f"[{LAYER_LABELS['procedural']}]\n" + "\n".join(procedural_facts))
+        context_sections.append(
+            f"[{LAYER_LABELS['procedural']}]\n"
+            + _render_tier_facts(procedural_facts, date_by_key=date_by_key)
+        )
 
     episodic_adapter_names = sorted(
         (n for n in layers if n == "episodic" or n.startswith(INTERIM_NAME_PREFIX)),
         key=lambda n: (n != "episodic", n),
         reverse=True,
     )
-    episodic_facts: list[str] = []
+    episodic_facts: list[tuple[str, str]] = []
     for adapter_name in episodic_adapter_names:
         episodic_facts.extend(layers[adapter_name])
     if episodic_facts:
-        context_sections.append(f"[{LAYER_LABELS['episodic']}]\n" + "\n".join(episodic_facts))
+        context_sections.append(
+            f"[{LAYER_LABELS['episodic']}]\n"
+            + _render_tier_facts(episodic_facts, date_by_key=date_by_key)
+        )
 
     semantic_facts = layers.get("semantic")
     if semantic_facts:
-        context_sections.append(f"[{LAYER_LABELS['semantic']}]\n" + "\n".join(semantic_facts))
+        context_sections.append(
+            f"[{LAYER_LABELS['semantic']}]\n"
+            + _render_tier_facts(semantic_facts, date_by_key=date_by_key)
+        )
 
     layered_context = "\n\n".join(context_sections)
-    augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
+    augmented_text = _render_augmented_text(layered_context, text, today=today, note=period_note)
 
     response, is_truncated = _generate_local_reply(
         augmented_text,

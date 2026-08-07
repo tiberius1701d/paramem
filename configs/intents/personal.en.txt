@@ -20,3 +20,8 @@ When did I last call my doctor?
 Who is my closest friend?
 What did I have for dinner last night?
 What do you know about me?
+Summarize what we discussed yesterday.
+What did I tell you last week?
+What did we talk about on Monday?
+Recap our last conversation.
+Did I mention anything about my plans?
