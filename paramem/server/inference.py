@@ -45,7 +45,7 @@ callers own the cloud fallback.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 
 from paramem.cloud.providers.base import CloudAgent
@@ -169,7 +169,6 @@ def _build_system_prompt(
 class ChatResult:
     text: str
     escalated: bool = False
-    probed_keys: list[str] = field(default_factory=list)
 
 
 def _is_personal_interrogative(text: str, config: ServerConfig, *, is_personal: bool) -> bool:
@@ -1122,7 +1121,6 @@ def _probe_and_reason(
                 response,
                 config,
                 intent=plan.intent,
-                probed_keys=[],
                 cloud_agent=cloud_agent,
                 ha_client=ha_client,
                 speaker=speaker,
@@ -1181,7 +1179,6 @@ def _probe_and_reason(
     # (_render_tier_facts) can look each fact's date up in date_by_key
     # without a second bookkeeping read or a re-parse.
     layers: dict[str, list[tuple[str, str]]] = {}
-    successful_keys = []
 
     for step in active_steps:
         layer_facts: list[tuple[str, str]] = []
@@ -1193,7 +1190,6 @@ def _probe_and_reason(
                 # The get() fallback covers mocked/legacy callers that return
                 # a bare {answer: ...} dict without the field.
                 layer_facts.append((key, result.get("fact_text", result.get("answer", ""))))
-                successful_keys.append(key)
 
         if layer_facts:
             layers[step.adapter_name] = layer_facts
@@ -1327,7 +1323,6 @@ def _probe_and_reason(
         response,
         config,
         intent=plan.intent,
-        probed_keys=successful_keys,
         cloud_agent=cloud_agent,
         ha_client=ha_client,
         speaker=speaker,
@@ -1473,7 +1468,6 @@ def _maybe_escalate(
     response: str,
     config: ServerConfig,
     intent: Intent | None = None,
-    probed_keys: list[str] | None = None,
     cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
@@ -1535,7 +1529,7 @@ def _maybe_escalate(
 
     if not should_escalate:
         text = _trim_incomplete_sentence(response) if is_truncated else response
-        return ChatResult(text=text, probed_keys=probed_keys or [])
+        return ChatResult(text=text)
 
     forwarded_is_personal = is_self_referential(
         forwarded_query,
@@ -1572,7 +1566,7 @@ def _maybe_escalate(
 
     # All escalation paths exhausted — return pre-escalation text from local model
     local_text = response.split("[ESCALATE]")[0].strip()
-    return ChatResult(text=local_text or "I'm not sure about that.", probed_keys=probed_keys or [])
+    return ChatResult(text=local_text or "I'm not sure about that.")
 
 
 def _build_messages(

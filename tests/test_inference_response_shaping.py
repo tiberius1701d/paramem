@@ -20,11 +20,13 @@ Covers:
 - Structural guard: ``_generate_local_reply`` calls ``generate_answer``
   INSIDE ``with base_model_inference(...):`` — the primitive that disables
   the active PEFT adapter and gradient checkpointing for the duration.
+- ``ChatResult`` carries only the fields the serving path reads.
 """
 
 from __future__ import annotations
 
 import ast
+import dataclasses
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -136,6 +138,15 @@ class TestTrimIncompleteSentence:
     def test_german_closing_quote_retained_when_trimming(self):
         text = "Sie sagte „Ja.“ Dann brach der Satz ab und"
         assert _trim_incomplete_sentence(text) == "Sie sagte „Ja.“"
+
+
+class TestChatResultFields:
+    """``ChatResult`` carries only the fields the serving path actually
+    reads — a field with zero readers anywhere in the codebase must not
+    silently reappear."""
+
+    def test_only_text_and_escalated_fields(self):
+        assert {f.name for f in dataclasses.fields(ChatResult)} == {"text", "escalated"}
 
 
 class TestMaybeEscalateTrimApplication:
