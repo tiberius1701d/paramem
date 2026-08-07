@@ -22,7 +22,7 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 from paramem.models.loader import generate_adapter_off
-from paramem.server.temporal import DateWindow
+from paramem.server.temporal import DateWindow, weekday_name
 
 if TYPE_CHECKING:
     from paramem.server.config import ServerConfig
@@ -40,13 +40,16 @@ class DateSelection:
 
     ``all=True`` is both the model's own verdict for an unconstrained query
     and the fail-open shape :func:`select_date_groups` returns on any
-    failure — the two are indistinguishable to a caller by design: either
-    way, probe everything.
+    failure — :meth:`selects` treats the two identically, so recall scope
+    is unaffected either way: probe everything. :attr:`fail_open`
+    distinguishes them for a caller that wants provenance (e.g. a log line)
+    without changing that behaviour.
     """
 
     all: bool
     ranges: tuple[DateWindow, ...]
     include_undated: bool
+    fail_open: bool = False
 
     def selects(self, day: date | None) -> bool:
         """True iff *day* is covered by this selection.
@@ -71,7 +74,7 @@ def _render_inventory(date_by_key: Mapping[str, date | None]) -> str:
     stage. Counts are tallied from *date_by_key* in one pass (a key maps
     to ``None`` when it has no usable date); date lines are sorted
     ascending, and the undated line is always last. Each date line is
-    labeled with its English weekday name (``date.strftime('%A')``,
+    labeled with its English weekday name (:func:`paramem.server.temporal.weekday_name`,
     matching the "Today is {weekday}, {ISO}." header line) so the model
     can resolve weekday references ("am Montag") by lookup instead of by
     calendar arithmetic.
@@ -84,7 +87,7 @@ def _render_inventory(date_by_key: Mapping[str, date | None]) -> str:
         else:
             counts[day] += 1
     lines = [
-        f"{day.strftime('%A')}, {day.isoformat()}: {n} facts" for day, n in sorted(counts.items())
+        f"{weekday_name(day)}, {day.isoformat()}: {n} facts" for day, n in sorted(counts.items())
     ]
     lines.append(f"undated: {undated_count} facts")
     return "\n".join(lines)
@@ -168,12 +171,12 @@ def select_date_groups(
     :data:`_generate` seam so tests can stub it without a model). The
     response is parsed by :func:`_parse_response`.
 
-    Fails open to ``DateSelection(all=True, ...)`` — today's unfiltered
-    full probe — on ANY failure: the recall-selection section absent
-    (file missing or marker missing), generate raising, no parseable
-    JSON, a non-ISO date, ``start > end``, or a wrong type anywhere in
-    the shape. Exactly one WARNING is logged on that path. This function
-    never raises.
+    Fails open to ``DateSelection(all=True, ..., fail_open=True)`` —
+    today's unfiltered full probe — on ANY failure: the recall-selection
+    section absent (file missing or marker missing), generate raising, no
+    parseable JSON, a non-ISO date, ``start > end``, or a wrong type
+    anywhere in the shape. Exactly one WARNING is logged on that path.
+    This function never raises.
 
     Args:
         text: The user's current turn.
@@ -195,8 +198,8 @@ def select_date_groups(
             and the context header agree on the same value (keyword-only).
 
     Returns:
-        The parsed :class:`DateSelection`, or the fail-open ``all=True``
-        shape on any error.
+        The parsed :class:`DateSelection` (``fail_open=False``), or the
+        fail-open ``all=True`` shape (``fail_open=True``) on any error.
     """
     try:
         template = config.voice.load_recall_selection_prompt()
@@ -204,7 +207,7 @@ def select_date_groups(
             raise ValueError(
                 "recall-selection prompt section missing from configs/prompts/pa_voice.txt"
             )
-        today_line = f"Today is {today.strftime('%A')}, {today.isoformat()}."
+        today_line = f"Today is {weekday_name(today)}, {today.isoformat()}."
         inventory = _render_inventory(date_by_key)
         messages = [
             {"role": "system", "content": template},
@@ -220,4 +223,4 @@ def select_date_groups(
         return _parse_response(raw)
     except Exception:
         logger.warning("Date-group selection failed; falling open to a full probe", exc_info=True)
-        return DateSelection(all=True, ranges=(), include_undated=True)
+        return DateSelection(all=True, ranges=(), include_undated=True, fail_open=True)

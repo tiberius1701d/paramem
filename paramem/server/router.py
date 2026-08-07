@@ -32,6 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from paramem.memory.store import invalidate_simhash_registry_cache
 from paramem.utils.identity import prose_fold
 
 if TYPE_CHECKING:
@@ -219,8 +220,50 @@ class QueryRouter:
 
         Call after every consolidation cycle so the index reflects the
         current in-memory state.
+
+        Also invalidates the process-wide simhash-registry cache
+        (:func:`paramem.memory.store.invalidate_simhash_registry_cache`).
+        Fold finalize, erase-keys, speaker-forget, and interim-discard all
+        end in a router reload, so this hook is what keeps the per-turn
+        inference probe's opt-in cache
+        (``build_memory_source(..., cached_registry=True)``) fresh after
+        those paths.
+
+        The active-store-migration finalizer
+        (``paramem.server.app._finalize_migration``) is the one
+        registry-mutating path that does NOT call this reload, and that is
+        deliberate rather than an oversight: while a migration is pending,
+        ``_state["effective_mode"]`` stays pinned to the migration's
+        ``source_mode`` (``paramem.server.app``, set where
+        ``pending_rehydration`` is raised), so every inference turn during
+        a ``simulate_to_train`` migration is served through
+        ``DiskMemorySource`` — which never touches this cache — while the
+        per-tier registry write
+        (``paramem.server.active_store_migration._migrate_tier_simulate_to_train``,
+        the ``loop.store.replace_simhashes_in_tier`` / on-disk write) lands
+        on the worker thread; the pinned window only closes afterward, when
+        ``_finalize_migration`` restores ``effective_mode``. The safety
+        argument is content identity, not ordering: that write's
+        fingerprints come from
+        :func:`~paramem.memory.entry.build_registry`, which hashes each
+        entry's own ``key``/``subject``/``predicate``/``object``
+        (:func:`~paramem.memory.entry.entry_simhash`) — a pure function of
+        graph.json content, nothing else. Every path that can change that
+        content for a live tier — a fold finalize (train or simulate),
+        erase-keys, speaker-forget — already ends in this reload, so a
+        cache entry surviving a migration untouched can only be serving
+        fingerprints that still match the current on-disk content; the
+        migration's own write (train↔simulate is a representation change,
+        not a content change: ``_migrate_tier_train_to_simulate`` leaves
+        the registry file untouched, and ``_migrate_tier_simulate_to_train``
+        recomputes from the same graph.json a reload-covered path last
+        wrote) cannot introduce a value that reload wouldn't already have
+        exposed. The generation guard on
+        :meth:`paramem.memory.store.MemoryStore.read_simhash_registry_from_disk`
+        covers the remaining race: an invalidation landing mid disk-walk.
         """
         self._speaker_key_index.clear()
+        invalidate_simhash_registry_cache()
 
         store = self._memory_store
         if store is not None:

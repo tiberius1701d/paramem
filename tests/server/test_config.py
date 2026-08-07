@@ -394,6 +394,43 @@ class TestInferenceConfigMaxResponseTokens:
         assert cfg.inference.max_response_tokens == 512
 
 
+class TestInferenceConfigTemporalSelectionEnabledType:
+    """``inference.temporal_selection_enabled`` must be a real bool — a YAML
+    string like ``"false"`` is truthy under Python's ``bool()`` and would
+    silently leave the date-group selection stage on."""
+
+    def test_default_is_true(self):
+        from paramem.server.config import InferenceConfig
+
+        assert InferenceConfig().temporal_selection_enabled is True
+
+    @pytest.mark.parametrize("bad_value", ["false", "true", 0, 1, None])
+    def test_non_bool_rejected_at_construction(self, bad_value):
+        from paramem.server.config import InferenceConfig
+
+        with pytest.raises(ValueError, match="temporal_selection_enabled"):
+            InferenceConfig(temporal_selection_enabled=bad_value)
+
+    @pytest.mark.parametrize("good_value", [True, False])
+    def test_real_bool_accepted(self, good_value):
+        from paramem.server.config import InferenceConfig
+
+        cfg = InferenceConfig(temporal_selection_enabled=good_value)
+        assert cfg.temporal_selection_enabled is good_value
+
+    def test_string_false_rejected_at_load(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            inference:
+              temporal_selection_enabled: "false"
+            """,
+        )
+        with pytest.raises(ValueError, match="temporal_selection_enabled"):
+            load_server_config(yaml_file)
+
+
 class TestRatioIsACheckedMirrorOfTheCodeConstant:
     """``extraction_token_estimate_ratio`` governs
     nothing at runtime — every ``estimate_tokens()`` call site uses the

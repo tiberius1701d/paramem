@@ -13,6 +13,38 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 
+# English weekday names indexed by ``date.weekday()`` (0=Monday .. 6=Sunday).
+# ``date.strftime('%A')`` is LC_TIME-locale dependent, and every prompt this
+# module's callers build asserts English weekday names regardless of the
+# server process's locale — so weekday rendering goes through this fixed
+# table instead of strftime.
+_WEEKDAY_NAMES: tuple[str, ...] = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+
+def weekday_name(day: date) -> str:
+    """Return *day*'s English weekday name, independent of process locale.
+
+    Indexes :data:`_WEEKDAY_NAMES` by ``day.weekday()`` rather than calling
+    ``day.strftime('%A')``, which renders in the process's ``LC_TIME``
+    locale and would silently break every prompt that asserts an English
+    weekday name.
+
+    Args:
+        day: The calendar date to name.
+
+    Returns:
+        The English weekday name, e.g. ``"Monday"``.
+    """
+    return _WEEKDAY_NAMES[day.weekday()]
+
 
 @dataclass(frozen=True)
 class DateWindow:

@@ -231,6 +231,7 @@ def build_memory_source(
     batch_size: int,
     model=None,
     tokenizer=None,
+    cached_registry: bool = False,
 ) -> "MemorySource | None":
     """Construct the :class:`MemorySource` for *mode* — the ONE construction site.
 
@@ -263,6 +264,15 @@ def build_memory_source(
         model: Loaded ``PeftModel``.  Train mode only; ``None`` means no local
             model (cloud-only boot, or a failed load).
         tokenizer: Tokenizer matching *model*.  Train mode only.
+        cached_registry: Forwarded to
+            :meth:`~paramem.memory.store.MemoryStore.read_simhash_registry_from_disk`
+            as its ``cached`` keyword (train mode only; no effect in simulate
+            mode, which never reads the simhash registry).  Default ``False``
+            re-reads every tier registry from disk on every call — the
+            correct choice for hydration callers, which run before
+            :meth:`~paramem.server.router.QueryRouter.reload` and must see
+            disk truth.  Only the per-turn inference probe
+            (``inference._probe_and_reason``) opts in.
 
     Returns:
         A :class:`DiskMemorySource` in simulate mode; a
@@ -283,6 +293,6 @@ def build_memory_source(
     return WeightMemorySource(
         model,
         tokenizer,
-        registry=MemoryStore.read_simhash_registry_from_disk(adapter_dir),
+        registry=MemoryStore.read_simhash_registry_from_disk(adapter_dir, cached=cached_registry),
         batch_size=batch_size,
     )

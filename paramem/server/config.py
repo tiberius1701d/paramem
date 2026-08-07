@@ -1106,7 +1106,9 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     refresh_cadence: str = (
         "12h"  # default: one new interim every 12h → 84h full consolidation at count=7
     )
-    mode: str = "train"  # "train" = full pipeline, "simulate" = extract only
+    # "train" = full pipeline including LoRA training; "simulate" = full
+    # pipeline minus LoRA training, publishing a queryable disk-backed store.
+    mode: str = "train"
     retain_sessions: bool = True
     # Maximum number of interim cycles a session can be held pending because
     # of a recall-gate failure (recall_failed outcome).  When the counter
@@ -1873,11 +1875,15 @@ class InferenceConfig:
     temporal_selection_max_new_tokens: int = 160
 
     def __post_init__(self) -> None:
-        """Reject a non-positive response-length ceiling.
+        """Validate the three fields that ``@dataclass`` cannot type- or range-check itself.
 
-        No upper bound: see the class docstring's ``max_response_tokens``
-        paragraph for why the ceiling is owned by the HA client, not this
-        config.
+        Rejects a non-positive ``max_response_tokens`` (no upper bound: see
+        the class docstring's ``max_response_tokens`` paragraph for why the
+        ceiling is owned by the HA client, not this config), a
+        non-positive ``temporal_selection_max_new_tokens``, and a
+        ``temporal_selection_enabled`` that isn't a real ``bool`` — a YAML
+        string like ``"false"`` is truthy under plain ``bool()`` and would
+        silently leave the date-group selection stage on.
         """
         if self.max_response_tokens <= 0:
             raise ValueError(
@@ -1887,6 +1893,11 @@ class InferenceConfig:
             raise ValueError(
                 "inference.temporal_selection_max_new_tokens must be > 0; got "
                 f"{self.temporal_selection_max_new_tokens!r}"
+            )
+        if not isinstance(self.temporal_selection_enabled, bool):
+            raise ValueError(
+                "inference.temporal_selection_enabled must be a bool; got "
+                f"{self.temporal_selection_enabled!r}"
             )
 
 

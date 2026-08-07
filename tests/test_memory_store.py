@@ -1759,3 +1759,232 @@ class TestProbeRendersTokensVerbatim:
         s = MemoryStore()
         with pytest.raises(TypeError):
             s.probe({"episodic": []}, speaker_resolver=lambda t: t)
+
+
+# ---------------------------------------------------------------------------
+# read_simhash_registry_from_disk — opt-in cache
+# ---------------------------------------------------------------------------
+
+
+def _write_episodic_registry(adapter_dir, fingerprints: dict[str, int]) -> None:
+    """Write a minimal ``episodic/indexed_key_registry.json`` under *adapter_dir*."""
+    reg = KeyRegistry()
+    for key, fp in fingerprints.items():
+        reg.add(key)
+        reg.set_simhash(key, fp)
+    tier_dir = adapter_dir / "episodic"
+    tier_dir.mkdir(parents=True, exist_ok=True)
+    (tier_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
+
+
+@pytest.fixture(autouse=True)
+def _clear_simhash_registry_cache():
+    """Every test in this module gets a clean process-wide cache — a hit
+    left behind by one test must never leak into the next."""
+    from paramem.memory.store import invalidate_simhash_registry_cache
+
+    invalidate_simhash_registry_cache()
+    yield
+    invalidate_simhash_registry_cache()
+
+
+class TestReadSimhashRegistryFromDiskCache:
+    """``cached=True`` is opt-in: default behaviour is unchanged (always
+    disk-truth), and the cache is fresh until explicitly invalidated."""
+
+    def test_default_uncached_reflects_disk_every_call(self, tmp_path) -> None:
+        _write_episodic_registry(tmp_path, {"graph1": 111})
+        first = MemoryStore.read_simhash_registry_from_disk(tmp_path)
+        assert first == {"graph1": 111}
+
+        _write_episodic_registry(tmp_path, {"graph1": 222})
+        second = MemoryStore.read_simhash_registry_from_disk(tmp_path)
+        assert second == {"graph1": 222}
+
+    def test_cached_read_matches_fresh_read(self, tmp_path) -> None:
+        _write_episodic_registry(tmp_path, {"graph1": 111, "graph2": 222})
+        fresh = MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=False)
+        cached = MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+        assert cached == fresh == {"graph1": 111, "graph2": 222}
+
+    def test_cached_read_survives_disk_change_until_invalidated(self, tmp_path) -> None:
+        from paramem.memory.store import invalidate_simhash_registry_cache
+
+        _write_episodic_registry(tmp_path, {"graph1": 111})
+        first = MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+        assert first == {"graph1": 111}
+
+        # Mutate the registry file on disk without invalidating the cache.
+        _write_episodic_registry(tmp_path, {"graph1": 999})
+        stale = MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+        assert stale == {"graph1": 111}, "cache must serve the old mapping until invalidated"
+
+        invalidate_simhash_registry_cache()
+        fresh = MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+        assert fresh == {"graph1": 999}
+
+    def test_invalidate_clears_whole_cache(self, tmp_path) -> None:
+        from paramem.memory.store import invalidate_simhash_registry_cache
+
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        _write_episodic_registry(dir_a, {"graph1": 1})
+        _write_episodic_registry(dir_b, {"graph2": 2})
+        MemoryStore.read_simhash_registry_from_disk(dir_a, cached=True)
+        MemoryStore.read_simhash_registry_from_disk(dir_b, cached=True)
+
+        _write_episodic_registry(dir_a, {"graph1": 999})
+        _write_episodic_registry(dir_b, {"graph2": 999})
+        invalidate_simhash_registry_cache()
+
+        # invalidate_simhash_registry_cache() takes no argument — it always
+        # clears the whole process-wide cache, every adapter_dir at once.
+        assert MemoryStore.read_simhash_registry_from_disk(dir_a, cached=True) == {"graph1": 999}
+        assert MemoryStore.read_simhash_registry_from_disk(dir_b, cached=True) == {"graph2": 999}
+
+    def test_invalidate_takes_no_argument(self) -> None:
+        """Signature guard: passing an argument is a TypeError, not a
+        per-adapter_dir invalidation — there is no such arm any more."""
+        from paramem.memory.store import invalidate_simhash_registry_cache
+
+        with pytest.raises(TypeError):
+            invalidate_simhash_registry_cache("/some/adapter/dir")
+
+    def test_invalidation_mid_walk_is_returned_but_not_published(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """An invalidation landing while a disk walk is in flight must not
+        corrupt the cache: the walked result still reaches this call's own
+        caller (a walk in progress owes its result to whoever started it),
+        but the generation guard discards the publish — the next cached
+        read re-walks instead of ever serving that now-possibly-stale
+        value from the cache."""
+        from paramem.memory.store import invalidate_simhash_registry_cache
+
+        _write_episodic_registry(tmp_path, {"graph1": 111})
+
+        # Captured before monkeypatching — stays bound to the real
+        # implementation regardless of the patch below.
+        original_load_simhashes = KeyRegistry.load_simhashes
+        calls = {"n": 0}
+
+        def _racing_load_simhashes(cls, path):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # A concurrent registry mutation + invalidation landing
+                # while this walk is still in flight.
+                invalidate_simhash_registry_cache()
+            return original_load_simhashes(path)
+
+        monkeypatch.setattr(KeyRegistry, "load_simhashes", classmethod(_racing_load_simhashes))
+
+        result = MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+        assert result == {"graph1": 111}, "the walked result is still returned to the caller"
+
+        # The race must have discarded the publish: a second cached read
+        # re-walks (observable via the call counter) rather than serving a
+        # cache hit from the raced walk.
+        calls["n"] = 0
+        MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+        assert calls["n"] > 0, "cache entry was not published after the race — must re-walk"
+
+
+class TestBuildMemorySourceCachedRegistry:
+    """``build_memory_source(..., cached_registry=...)`` threads through to
+    :meth:`MemoryStore.read_simhash_registry_from_disk`."""
+
+    def test_default_cached_registry_is_disk_truth(self, tmp_path) -> None:
+        from paramem.memory.source import build_memory_source
+
+        _write_episodic_registry(tmp_path, {"graph1": 111})
+        source = build_memory_source(
+            mode="train",
+            adapter_dir=tmp_path,
+            batch_size=4,
+            model=object(),
+            tokenizer=object(),
+        )
+        assert source.registry == {"graph1": 111}
+
+        _write_episodic_registry(tmp_path, {"graph1": 222})
+        source2 = build_memory_source(
+            mode="train",
+            adapter_dir=tmp_path,
+            batch_size=4,
+            model=object(),
+            tokenizer=object(),
+        )
+        assert source2.registry == {"graph1": 222}
+
+    def test_cached_registry_true_serves_stale_until_router_reload(self, tmp_path) -> None:
+        from paramem.memory.source import build_memory_source
+
+        _write_episodic_registry(tmp_path, {"graph1": 111})
+        source = build_memory_source(
+            mode="train",
+            adapter_dir=tmp_path,
+            batch_size=4,
+            model=object(),
+            tokenizer=object(),
+            cached_registry=True,
+        )
+        assert source.registry == {"graph1": 111}
+
+        _write_episodic_registry(tmp_path, {"graph1": 999})
+        source2 = build_memory_source(
+            mode="train",
+            adapter_dir=tmp_path,
+            batch_size=4,
+            model=object(),
+            tokenizer=object(),
+            cached_registry=True,
+        )
+        assert source2.registry == {"graph1": 111}, "stale cache entry survives the disk write"
+
+        from paramem.memory.store import invalidate_simhash_registry_cache
+
+        invalidate_simhash_registry_cache()
+        source3 = build_memory_source(
+            mode="train",
+            adapter_dir=tmp_path,
+            batch_size=4,
+            model=object(),
+            tokenizer=object(),
+            cached_registry=True,
+        )
+        assert source3.registry == {"graph1": 999}
+
+
+class TestRouterReloadInvalidatesSimhashRegistryCache:
+    """``QueryRouter.reload()`` invalidates the process-wide simhash-registry
+    cache so a stale opt-in read can never survive past the reload every
+    registry-mutating server path ends in."""
+
+    def test_reload_calls_invalidate_simhash_registry_cache(self, tmp_path, monkeypatch) -> None:
+        import paramem.server.router as router_module
+
+        calls: list[object] = []
+        monkeypatch.setattr(
+            router_module,
+            "invalidate_simhash_registry_cache",
+            lambda *a, **k: calls.append((a, k)),
+        )
+
+        router = router_module.QueryRouter(adapter_dir=tmp_path, memory_store=None)
+        assert len(calls) == 1, "__init__ calls reload() once"
+
+        calls.clear()
+        router.reload()
+        assert len(calls) == 1
+
+    def test_reload_actually_clears_a_populated_cache(self, tmp_path) -> None:
+        import paramem.server.router as router_module
+
+        _write_episodic_registry(tmp_path, {"graph1": 111})
+        MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True)
+
+        _write_episodic_registry(tmp_path, {"graph1": 999})
+        router = router_module.QueryRouter(adapter_dir=tmp_path, memory_store=None)
+        router.reload()
+
+        assert MemoryStore.read_simhash_registry_from_disk(tmp_path, cached=True) == {"graph1": 999}

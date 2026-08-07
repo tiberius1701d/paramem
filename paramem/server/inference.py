@@ -56,7 +56,7 @@ from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
 from paramem.server.router import Intent, RoutingPlan, RoutingStep
 from paramem.server.sanitizer import is_self_referential
-from paramem.server.temporal import build_date_by_key
+from paramem.server.temporal import build_date_by_key, weekday_name
 from paramem.server.temporal_selection import select_date_groups
 from paramem.server.tools.ha_client import HAClient
 from paramem.utils.tokens import estimate_tokens
@@ -872,9 +872,10 @@ def _render_tier_facts(
     ``temporal_selection_enabled=False`` no-op contract; "dated" is not a
     separate flag, it is *date_by_key* being present. When a map is
     supplied, facts are grouped under ``"On {Weekday}, YYYY-MM-DD:"``
-    headers (dates descending; weekday via ``date.strftime('%A')``,
-    matching the shape of the ``"Today is {Weekday}, {YYYY-MM-DD}."``
-    header line built in :func:`_render_augmented_text`); facts whose key
+    headers (dates descending; weekday via
+    :func:`paramem.server.temporal.weekday_name`, matching the shape of
+    the ``"Today is {Weekday}, {YYYY-MM-DD}."`` header line built in
+    :func:`_render_augmented_text`); facts whose key
     has no parseable date render first, ungrouped. *date_by_key* is the
     request's single :func:`~paramem.server.temporal.build_date_by_key`
     parse — no second bookkeeping read, no second clock read, no re-parse
@@ -907,7 +908,7 @@ def _render_tier_facts(
     if undated_lines:
         sections.append("\n".join(undated_lines))
     for day in sorted(by_date, reverse=True):
-        sections.append(f"On {day.strftime('%A')}, {day.isoformat()}:\n" + "\n".join(by_date[day]))
+        sections.append(f"On {weekday_name(day)}, {day.isoformat()}:\n" + "\n".join(by_date[day]))
 
     return "\n".join(sections)
 
@@ -948,7 +949,7 @@ def _render_augmented_text(
         return f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
     header = (
-        f"Today is {today.strftime('%A')}, {today.isoformat()}. What you know about the speaker:"
+        f"Today is {weekday_name(today)}, {today.isoformat()}. What you know about the speaker:"
     )
     body = "\n\n".join(part for part in (note, layered_context) if part)
     return f"{header}\n\n{body}\n\nQuestion: {text}"
@@ -1095,10 +1096,13 @@ def _probe_and_reason(
 
         logger.info(
             "Date-group selection: %s, kept %d/%d key(s)",
-            "all"
-            if selection.all
-            else f"{len(selection.ranges)} range(s)"
-            + (" +undated" if selection.include_undated else ""),
+            (
+                "all"
+                if selection.all
+                else f"{len(selection.ranges)} range(s)"
+                + (" +undated" if selection.include_undated else "")
+            )
+            + (" (fail-open)" if selection.fail_open else ""),
             total_after,
             total_before,
         )
@@ -1152,6 +1156,12 @@ def _probe_and_reason(
         batch_size=config.consolidation.recall_probe_batch_size,
         model=model,
         tokenizer=tokenizer,
+        # Per-turn probe only: reuse the process-wide simhash-registry cache
+        # instead of re-reading and re-parsing every tier's
+        # indexed_key_registry.json from disk on every personal turn.
+        # QueryRouter.reload() invalidates the cache after every
+        # registry-mutating cycle, so this never serves stale fingerprints.
+        cached_registry=True,
     )
 
     probe_results = memory_store.probe(
@@ -1186,9 +1196,10 @@ def _probe_and_reason(
             result = probe_results.get(key)
             if result and "failure_reason" not in result:
                 # fact_text is guaranteed on every success result from
-                # probe_keys_grouped_by_adapter / probe_keys_from_graph.
-                # The get() fallback covers mocked/legacy callers that return
-                # a bare {answer: ...} dict without the field.
+                # probe_keys_grouped_by_adapter (train mode) / DiskMemorySource
+                # (simulate mode). The get() fallback covers mocked/legacy
+                # callers that return a bare {answer: ...} dict without the
+                # field.
                 layer_facts.append((key, result.get("fact_text", result.get("answer", ""))))
 
         if layer_facts:

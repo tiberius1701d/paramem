@@ -44,6 +44,7 @@ from paramem.server.inference import (
     _probe_and_reason,
     _trim_incomplete_sentence,
 )
+from paramem.server.temporal import weekday_name
 from tests._guard_utils import call_inside_context_manager, find_function
 
 
@@ -252,7 +253,7 @@ class _PlanBuilder:
         monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
         monkeypatch.setattr(
             "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path: {}),
+            staticmethod(lambda path, cached=False: {}),
         )
         monkeypatch.setattr(
             "paramem.server.inference.is_self_referential", lambda text, **kwargs: False
@@ -517,7 +518,7 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         monkeypatch.setattr("paramem.models.loader.switch_adapter", lambda model, name: None)
         monkeypatch.setattr(
             "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path: {}),
+            staticmethod(lambda path, cached=False: {}),
         )
         return captured
 
@@ -661,13 +662,12 @@ class TestTemporalSelectionWiring(_PlanBuilder):
 
         today = date.today()
         expected_header = (
-            f"Today is {today.strftime('%A')}, {today.isoformat()}. "
-            "What you know about the speaker:"
+            f"Today is {weekday_name(today)}, {today.isoformat()}. What you know about the speaker:"
         )
         text = generated["augmented_text"]
         assert text.startswith(expected_header)
         e1_day = date(2026, 8, 1)
-        assert f"On {e1_day.strftime('%A')}, 2026-08-01:\n- fact about e1" in text
+        assert f"On {weekday_name(e1_day)}, 2026-08-01:\n- fact about e1" in text
 
     def test_single_day_range_excludes_non_matching_and_undated_keys(self, monkeypatch, tmp_path):
         """Selection stub returns a single-day range: only the keys last
@@ -1123,9 +1123,110 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         assert text.count("fact about s1") == 1
         aug_02 = date(2026, 8, 2)
         aug_01 = date(2026, 8, 1)
-        assert f"On {aug_02.strftime('%A')}, 2026-08-02:\n- fact about p1" in text
-        assert f"On {aug_02.strftime('%A')}, 2026-08-02:\n- fact about e1" in text
-        assert f"On {aug_01.strftime('%A')}, 2026-08-01:\n- fact about s1" in text
+        assert f"On {weekday_name(aug_02)}, 2026-08-02:\n- fact about p1" in text
+        assert f"On {weekday_name(aug_02)}, 2026-08-02:\n- fact about e1" in text
+        assert f"On {weekday_name(aug_01)}, 2026-08-01:\n- fact about s1" in text
+
+    def test_fail_open_selection_marks_the_info_log(self, monkeypatch, tmp_path, caplog):
+        """The date-group-selection INFO log appends ``" (fail-open)"``
+        when the selection came back with ``fail_open=True``, and carries
+        no such marker for a genuine model ``all`` verdict — the log line
+        is what lets an operator distinguish "the model chose everything"
+        from "selection broke and we fell back to everything"."""
+        import logging
+
+        from paramem.server.temporal_selection import DateSelection
+
+        self.stub_probe_capturing(monkeypatch)
+        self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(all=True, ranges=(), include_undated=True, fail_open=True)
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        with caplog.at_level(logging.INFO, logger="paramem.server.inference"):
+            _probe_and_reason(
+                text="What do you know about me?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=memory_store,
+            )
+
+        selection_records = [
+            r.getMessage() for r in caplog.records if "Date-group selection" in r.getMessage()
+        ]
+        assert len(selection_records) == 1
+        assert "(fail-open)" in selection_records[0]
+
+    def test_genuine_all_selection_does_not_mark_the_info_log(self, monkeypatch, tmp_path, caplog):
+        """The mirror case: a genuine model ``all`` verdict
+        (``fail_open=False``) leaves the INFO log without the marker."""
+        import logging
+
+        from paramem.server.temporal_selection import DateSelection
+
+        self.stub_probe_capturing(monkeypatch)
+        self.stub_generate_local_reply(monkeypatch)
+
+        def fake_select(text, date_by_key, *, model, tokenizer, config, today):
+            return DateSelection(all=True, ranges=(), include_undated=True, fail_open=False)
+
+        monkeypatch.setattr("paramem.server.inference.select_date_groups", fake_select)
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+        model = self.make_model(["episodic"])
+
+        config = ServerConfig()
+        config.voice = _voice_config(tmp_path)
+
+        memory_store = _MS(replay_enabled=False)
+        memory_store.set_bookkeeping(
+            "e1",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-08-01T09:00:00",
+            last_seen="2026-08-01T09:00:00",
+        )
+        plan = self.make_plan([("episodic", ["e1"])])
+
+        with caplog.at_level(logging.INFO, logger="paramem.server.inference"):
+            _probe_and_reason(
+                text="What do you know about me?",
+                plan=plan,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                memory_store=memory_store,
+            )
+
+        selection_records = [
+            r.getMessage() for r in caplog.records if "Date-group selection" in r.getMessage()
+        ]
+        assert len(selection_records) == 1
+        assert "(fail-open)" not in selection_records[0]
 
 
 class TestRenderTierFactsDateGrouping:
@@ -1149,7 +1250,7 @@ class TestRenderTierFactsDateGrouping:
         day = date(2026, 8, 5)
         date_by_key = {"k1": day, "k2": None}
         rendered = _render_tier_facts(facts, date_by_key=date_by_key)
-        assert rendered == f"- undated fact\nOn {day.strftime('%A')}, 2026-08-05:\n- dated fact"
+        assert rendered == f"- undated fact\nOn {weekday_name(day)}, 2026-08-05:\n- dated fact"
 
     def test_two_distinct_dates_in_one_tier_rendered_descending(self):
         """Two facts in one tier on different dates: the more recent date
@@ -1162,6 +1263,6 @@ class TestRenderTierFactsDateGrouping:
         date_by_key = {"k1": older, "k2": newer}
         rendered = _render_tier_facts(facts, date_by_key=date_by_key)
         assert rendered == (
-            f"On {newer.strftime('%A')}, 2026-08-05:\n- newer fact\n"
-            f"On {older.strftime('%A')}, 2026-08-01:\n- older fact"
+            f"On {weekday_name(newer)}, 2026-08-05:\n- newer fact\n"
+            f"On {weekday_name(older)}, 2026-08-01:\n- older fact"
         )

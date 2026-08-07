@@ -565,7 +565,7 @@ class TestProbeAndReasonDispatch:
         )
         monkeypatch.setattr(
             "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path: {}),
+            staticmethod(lambda path, cached=False: {}),
         )
         monkeypatch.setattr(
             "paramem.server.inference.is_self_referential",
@@ -619,6 +619,76 @@ class TestProbeAndReasonDispatch:
         assert kba["procedural"] == ["p1", "p2"]
         assert kba["episodic"] == ["e1"]
 
+    def test_per_turn_probe_requests_cached_registry(self, monkeypatch, tmp_path):
+        """_probe_and_reason's on-miss source build must opt into the
+        process-wide simhash-registry cache (``cached_registry=True``) —
+        the per-turn probe is the one caller allowed to skip the disk
+        re-walk; hydration callers (``app._build_store_contents``,
+        ``ConsolidationLoop._hydrate_store_for_fold``) stay on the
+        disk-truth default and are not this call site."""
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        captured = {}
+
+        class _FakeSource:
+            def probe(self, keys_by_adapter, should_abort=None):
+                results = {}
+                for keys in keys_by_adapter.values():
+                    for k in keys:
+                        results[k] = {"key": k, "fact_text": f"fact about {k}", "confidence": 1.0}
+                return results
+
+        def fake_build_memory_source(**kwargs):
+            captured.update(kwargs)
+            return _FakeSource()
+
+        monkeypatch.setattr(
+            "paramem.memory.source.build_memory_source",
+            fake_build_memory_source,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            lambda model, name: None,
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.is_self_referential",
+            lambda text, **kwargs: False,
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer",
+            lambda model, tokenizer, prompt, **kwargs: "final answer",
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference._build_messages",
+            lambda text, history, system_prompt, tokenizer: [{"role": "user", "content": text}],
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+
+        model = self._make_model(["episodic"])
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("You are an assistant.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        plan = self._make_plan([("episodic", ["e1"])])
+
+        from paramem.server.inference import _probe_and_reason
+
+        _probe_and_reason(
+            text="What do I like?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=_MS(replay_enabled=False),
+        )
+
+        assert captured.get("cached_registry") is True
+
     def test_interim_episodic_facts_reach_prompt(self, monkeypatch, tmp_path):
         """Regression: facts probed under ``episodic_interim_<stamp>`` must
         appear in the augmented_text under the ``[Recent knowledge]`` layer.
@@ -655,7 +725,7 @@ class TestProbeAndReasonDispatch:
         )
         monkeypatch.setattr(
             "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path: {}),
+            staticmethod(lambda path, cached=False: {}),
         )
         monkeypatch.setattr(
             "paramem.server.inference.is_self_referential",
@@ -758,7 +828,7 @@ class TestProbeAndReasonDispatch:
         )
         monkeypatch.setattr(
             "paramem.memory.store.MemoryStore.read_simhash_registry_from_disk",
-            staticmethod(lambda path: {}),
+            staticmethod(lambda path, cached=False: {}),
         )
         monkeypatch.setattr(
             "paramem.server.inference.is_self_referential",

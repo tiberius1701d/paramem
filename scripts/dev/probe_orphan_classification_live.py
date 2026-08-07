@@ -108,7 +108,7 @@ CONV_TEXT = "conv-text"
 # Health-poll and consolidation-wait timeouts.
 # Model load in simulate mode: ~60-120 s (4-bit Mistral 7B on RTX 5070).
 HEALTH_POLL_TIMEOUT_S = 300
-# Consolidation in simulate mode: extraction only, no LoRA training.
+# Consolidation in simulate mode: full pipeline minus LoRA training.
 # Each session runs the extraction LLM forward pass.  Give 5 min.
 CONSOLIDATE_WAIT_TIMEOUT_S = 300
 
@@ -248,7 +248,7 @@ def _build_test_config() -> Path:
       paths.prompts            -> configs/prompts (prod prompts)
       debug                    -> true   (enables discard-sink writes)
       headless_boot            -> false
-      consolidation.mode       -> simulate (extract only; no LoRA training)
+      consolidation.mode       -> simulate (full pipeline minus LoRA training)
       consolidation.orphan_retirement -> "every 1m"  (60 s TTL for HOLDABLE sessions)
       consolidation.training_idle_debounce_s -> 0 (tick fires immediately after chat)
       speaker.enabled          -> true   (store loads the pre-seeded profile)

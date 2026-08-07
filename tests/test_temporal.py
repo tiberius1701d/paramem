@@ -9,7 +9,28 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from paramem.server.temporal import DateWindow, build_date_by_key, last_seen_date
+from paramem.server.temporal import DateWindow, build_date_by_key, last_seen_date, weekday_name
+
+
+class TestWeekdayName:
+    """``weekday_name`` renders the English weekday name for a
+    ``datetime.date`` without going through ``strftime('%A')``, which is
+    ``LC_TIME``-locale dependent."""
+
+    @pytest.mark.parametrize(
+        ("day", "expected"),
+        [
+            (date(2026, 8, 3), "Monday"),
+            (date(2026, 8, 4), "Tuesday"),
+            (date(2026, 8, 5), "Wednesday"),
+            (date(2026, 8, 6), "Thursday"),
+            (date(2026, 8, 7), "Friday"),
+            (date(2026, 8, 8), "Saturday"),
+            (date(2026, 8, 9), "Sunday"),
+        ],
+    )
+    def test_known_dates_all_seven_weekdays(self, day, expected):
+        assert weekday_name(day) == expected
 
 
 class TestLastSeenDate:
@@ -43,11 +64,15 @@ class TestLastSeenDate:
             last_seen_date(garbage)
 
     def test_aware_year_9999_overflow_returns_none(self):
-        """An aware year-9999 timestamp can shift past ``datetime.MAXYEAR``
-        once ``.astimezone()`` applies the process's local offset —
-        ``OverflowError``, not ``ValueError``/``TypeError``. Reproduced on
-        this host (TZ CET)."""
-        assert last_seen_date("9999-12-31T23:59:59+00:00") is None
+        """An aware year-9999 timestamp with a NEGATIVE UTC offset overflows
+        past ``datetime.MAXYEAR`` in the first step of ``.astimezone()``
+        (``self - self.utcoffset()``, which is an addition for a negative
+        offset) — before the host's own local offset is ever applied, so
+        this raises ``OverflowError`` deterministically on every host
+        regardless of its timezone. A ``+00:00`` input would only overflow
+        on a host whose local offset is positive, which made an earlier
+        version of this test host-dependent."""
+        assert last_seen_date("9999-12-31T23:59:59-01:00") is None
 
     def test_aware_year_1_overflow_returns_none(self):
         """Symmetric case at the other end of the representable range: an

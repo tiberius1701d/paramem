@@ -142,7 +142,7 @@ class TestSelectDateGroupsFailOpen:
             config=config,
             today=date(2026, 8, 6),
         )
-        assert result == DateSelection(all=True, ranges=(), include_undated=True)
+        assert result == DateSelection(all=True, ranges=(), include_undated=True, fail_open=True)
 
     def test_bad_dates_fall_open(self, config, monkeypatch):
         response = '{"ranges": [{"start": "not-a-date", "end": "2026-08-02"}], "undated": false}'
@@ -211,7 +211,7 @@ class TestSelectDateGroupsFailOpen:
             config=config,
             today=date(2026, 8, 6),
         )
-        assert result == DateSelection(all=True, ranges=(), include_undated=True)
+        assert result == DateSelection(all=True, ranges=(), include_undated=True, fail_open=True)
 
     def test_empty_response_falls_open(self, config, monkeypatch):
         monkeypatch.setattr("paramem.server.temporal_selection._generate", _stub_generate(""))
@@ -262,7 +262,45 @@ class TestSelectDateGroupsFailOpen:
             config=config,
             today=date(2026, 8, 6),
         )
-        assert result == DateSelection(all=True, ranges=(), include_undated=True)
+        assert result == DateSelection(all=True, ranges=(), include_undated=True, fail_open=True)
+
+    def test_fail_open_verdict_distinguishable_from_genuine_all_verdict(self, config, monkeypatch):
+        """Both paths produce the same recall scope (``all=True``, probe
+        everything) but must differ in provenance: a swallowed exception
+        sets :attr:`DateSelection.fail_open`, a genuine model ``{"all":
+        true}`` response does not."""
+        monkeypatch.setattr(
+            "paramem.server.temporal_selection._generate",
+            _stub_generate('{"all": true}'),
+        )
+        genuine = select_date_groups(
+            "anything",
+            {},
+            model=object(),
+            tokenizer=object(),
+            config=config,
+            today=date(2026, 8, 6),
+        )
+
+        monkeypatch.setattr(
+            "paramem.server.temporal_selection._generate",
+            _raising_generate(RuntimeError("simulated failure")),
+        )
+        fail_open = select_date_groups(
+            "anything",
+            {},
+            model=object(),
+            tokenizer=object(),
+            config=config,
+            today=date(2026, 8, 6),
+        )
+
+        assert genuine.fail_open is False
+        assert fail_open.fail_open is True
+        # Same recall scope either way — only provenance differs.
+        assert genuine.all is True
+        assert fail_open.all is True
+        assert genuine.selects(date(2026, 1, 1)) == fail_open.selects(date(2026, 1, 1))
 
 
 class TestDateSelectionSelects:

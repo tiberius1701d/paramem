@@ -87,6 +87,13 @@ handler threads (ThreadPoolExecutor), and the BG-trainer worker thread.  A
 single :class:`threading.RLock` (``self._lock``) guards all accesses to the
 three mutable structures: ``_entries``, ``_registry``, and ``_bookkeeping``.
 
+A second, separate lock (``_SIMHASH_REGISTRY_CACHE_LOCK``, module-level, a
+plain :class:`threading.Lock`) guards the module-level opt-in registry
+cache described just above the class (``_SIMHASH_REGISTRY_CACHE`` and its
+generation counter ``_SIMHASH_REGISTRY_CACHE_GENERATION``). This is process
+state, not instance state — it is not covered by ``self._lock`` and does
+not participate in any :class:`MemoryStore` instance's locking. See rule 7.
+
 Rules for callers and maintainers:
 
 1. Every method that reads or writes any of the three structures holds
@@ -122,6 +129,18 @@ Rules for callers and maintainers:
 6. :meth:`swap` is the atomic-publish primitive for phase-2 consolidation.
    Callers build new structures off-store, then publish in one locked rebind so
    no reader ever sees a torn/half-rebuilt store.
+
+7. :meth:`read_simhash_registry_from_disk` (a ``@staticmethod``, no
+   ``self._lock`` involved) reads ``_SIMHASH_REGISTRY_CACHE`` under
+   ``_SIMHASH_REGISTRY_CACHE_LOCK`` for its cache-hit check, then performs
+   its disk walk lock-free (the walk is not an in-RAM structure access).
+   Publishing the walked result back into the cache re-acquires the lock
+   and re-checks ``_SIMHASH_REGISTRY_CACHE_GENERATION`` against the value
+   snapshotted before the walk: an :func:`invalidate_simhash_registry_cache`
+   call that lands mid-walk bumps the generation, so the walking caller's
+   publish is a no-op and the walked (now-known-stale) result is still
+   returned to that one caller but never enters the cache. This is
+   structural, not a serialization convention callers must uphold.
 """
 
 from __future__ import annotations
@@ -136,6 +155,48 @@ from paramem.training.key_registry import KeyRegistry
 from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
+
+# Process-wide cache for the merged simhash registry produced by
+# ``MemoryStore.read_simhash_registry_from_disk(..., cached=True)``.  Keyed
+# by the adapter_dir's resolved path.  Guarded by
+# ``_SIMHASH_REGISTRY_CACHE_LOCK`` so concurrent request-handler threads
+# never observe a half-written entry.  Opt-in only: every existing caller
+# keeps reading disk-truth on every call (``cached`` defaults to False);
+# only the per-turn inference probe (``paramem.server.inference``) opts in.
+#
+# ``_SIMHASH_REGISTRY_CACHE_GENERATION`` is bumped by every
+# ``invalidate_simhash_registry_cache`` call.  ``read_simhash_registry_from_disk``
+# snapshots the generation before its disk walk and only publishes the
+# walked result if the generation is still unchanged at publish time — an
+# invalidation landing mid-walk is then structurally discarded rather than
+# depending on the caller to serialize against a concurrent invalidator.
+#
+# ``QueryRouter.reload`` (``paramem.server.router``) is the caller that
+# keeps this cache fresh for fold finalize, erase-keys, speaker-forget, and
+# interim-discard — every one of those ends in a router reload. The
+# active-store-migration finalizer is the one registry-mutating path that
+# does NOT reload the router; see its own comment
+# (``paramem.server.router.QueryRouter.reload``) for why that is safe.
+_SIMHASH_REGISTRY_CACHE_LOCK = threading.Lock()
+_SIMHASH_REGISTRY_CACHE: dict[str, dict[str, int]] = {}
+_SIMHASH_REGISTRY_CACHE_GENERATION = 0
+
+
+def invalidate_simhash_registry_cache() -> None:
+    """Drop every cached merged simhash registry populated by ``cached=True`` reads.
+
+    Clears the whole process-wide cache and bumps
+    ``_SIMHASH_REGISTRY_CACHE_GENERATION`` — the sole caller,
+    :meth:`paramem.server.router.QueryRouter.reload`, has no single
+    ``adapter_dir`` of its own to target, so there is no per-adapter_dir
+    invalidation arm to expose.  The generation bump is what lets
+    :meth:`MemoryStore.read_simhash_registry_from_disk` detect and discard
+    a walk that raced this call (see its docstring).
+    """
+    global _SIMHASH_REGISTRY_CACHE_GENERATION
+    with _SIMHASH_REGISTRY_CACHE_LOCK:
+        _SIMHASH_REGISTRY_CACHE.clear()
+        _SIMHASH_REGISTRY_CACHE_GENERATION += 1
 
 
 class MemoryStore:
@@ -1298,7 +1359,7 @@ class MemoryStore:
         }
 
     @staticmethod
-    def read_simhash_registry_from_disk(adapter_dir) -> "dict[str, int]":
+    def read_simhash_registry_from_disk(adapter_dir, *, cached: bool = False) -> "dict[str, int]":
         """Merge every tier registry under *adapter_dir* into one ``{key: fp}`` map.
 
         The flat projection of :meth:`read_registries_from_disk` — same disk
@@ -1319,10 +1380,24 @@ class MemoryStore:
 
         Args:
             adapter_dir: Path to the adapter root directory.
+            cached: When ``True``, serve from and populate the process-wide
+                cache keyed by *adapter_dir*'s resolved path
+                (``_SIMHASH_REGISTRY_CACHE``), skipping the disk walk
+                entirely on a hit. Default ``False`` preserves disk-truth
+                reads for every existing caller. A caller opting in relies
+                on :func:`invalidate_simhash_registry_cache` (called by
+                :meth:`paramem.server.router.QueryRouter.reload`) to keep
+                the cache fresh; an invalidation racing a concurrent walk
+                is handled structurally by the generation guard described
+                below, not by caller-side serialization.
 
         Returns:
             ``{key: fingerprint}`` across every tier.  Empty when the directory
-            holds no registry files.
+            holds no registry files.  On any ``cached=True`` call — a cache
+            hit, or a miss whose freshly-walked result gets published — this
+            is the *same dict object* held in ``_SIMHASH_REGISTRY_CACHE``
+            — callers must not write to it (matches the
+            :meth:`entries_in_tier` rule).
 
         Raises:
             Whatever :meth:`KeyRegistry.load_simhashes` raises on an
@@ -1334,9 +1409,31 @@ class MemoryStore:
         """
         from paramem.training.key_registry import KeyRegistry
 
+        cache_key = None
+        generation = None
+        if cached:
+            from pathlib import Path
+
+            cache_key = str(Path(adapter_dir).resolve())
+            with _SIMHASH_REGISTRY_CACHE_LOCK:
+                hit = _SIMHASH_REGISTRY_CACHE.get(cache_key)
+                generation = _SIMHASH_REGISTRY_CACHE_GENERATION
+            if hit is not None:
+                return hit
+
         merged: dict[str, int] = {}
         for _tier, reg_path in MemoryStore._iter_tier_registry_paths(adapter_dir):
             merged.update(KeyRegistry.load_simhashes(reg_path))
+
+        if cache_key is not None:
+            with _SIMHASH_REGISTRY_CACHE_LOCK:
+                # Publish only if no invalidation landed while this walk was
+                # in flight — otherwise the walked (now-possibly-stale)
+                # result is still returned to this caller but never cached,
+                # so the next cached read re-walks instead of serving it.
+                if _SIMHASH_REGISTRY_CACHE_GENERATION == generation:
+                    _SIMHASH_REGISTRY_CACHE[cache_key] = merged
+
         return merged
 
     def load_registries_from_disk(self, adapter_dir) -> None:
