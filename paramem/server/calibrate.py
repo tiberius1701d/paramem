@@ -806,7 +806,9 @@ def _run_calibration(
         n_in = estimate_tokens(input_prompt_text, tokenizer) if tokenizer else -1
         count_str = raw_output if isinstance(raw_output, str) else ""
         n_out = estimate_tokens(count_str, tokenizer) if (tokenizer and count_str) else -1
-        model_id = getattr(state.get("model_id"), "name", state.get("model_id", "unknown"))
+        # _preflight refused above when config was absent or no local model is
+        # loaded — this reads the config the server booted its model from.
+        model_id = state["config"].model_config.model_id
 
         response = {
             "stage": stage,

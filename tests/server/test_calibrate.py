@@ -94,6 +94,7 @@ def _state_enabled() -> dict:
         sanitization=SanitizationConfig(),
         cloud=CloudConfig(),
         paths=PathsConfig(),
+        model_config=SimpleNamespace(model_id="mistralai/Mistral-7B-Instruct-v0.3"),
     )
     return {
         "config": config,
@@ -101,7 +102,6 @@ def _state_enabled() -> dict:
         "model": MagicMock(),
         "tokenizer": MagicMock(),
         "consolidation_loop": MagicMock(),
-        "model_id": "test-model",
     }
 
 
@@ -1230,6 +1230,23 @@ class TestRunCalibrationResponseEnvelope:
     def test_stage_field_matches_argument(self):
         result = self._run(stage="plausibility")
         assert result["stage"] == "plausibility"
+
+    def test_model_field_matches_config_model_id(self):
+        """``model`` is read from ``state["config"].model_config.model_id``
+        — the model the server actually booted — not any other state key."""
+        state = _state_enabled()
+        result = self._run(state=state)
+        assert result["model"] == state["config"].model_config.model_id
+
+    def test_model_field_ignores_decoy_state_model_id(self):
+        """A stray ``state["model_id"]`` key must not leak into the
+        envelope: this kills any revert to reading it directly instead of
+        ``state["config"].model_config.model_id``."""
+        state = _state_enabled()
+        state["model_id"] = "decoy-model"
+        result = self._run(state=state)
+        assert result["model"] == state["config"].model_config.model_id
+        assert result["model"] != "decoy-model"
 
     def test_wall_clock_seconds_present_and_nonnegative(self):
         result = self._run()
