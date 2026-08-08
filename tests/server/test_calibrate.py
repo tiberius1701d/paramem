@@ -1263,12 +1263,12 @@ class TestRunCalibrationResponseEnvelope:
         assert result["n_output_tokens"] == -1
 
     def test_n_tokens_minus1_when_no_tokenizer(self):
-        """No tokenizer in state → both fields stay -1 (U1's explicit
-        decision: the ``if tokenizer`` / ``if tokenizer and count_str``
-        sentinel guards at calibrate.py:668-670 are unchanged).  The real
-        endpoint path 503s on a missing tokenizer before reaching this
-        guard (``_preflight`` requires one) — patched to a no-op here to
-        isolate the guard's own behavior rather than re-test ``_preflight``."""
+        """No tokenizer in state → both fields stay -1: the ``if tokenizer``
+        / ``if tokenizer and count_str`` sentinel guards short-circuit to
+        -1 rather than calling ``estimate_tokens``.  The real endpoint path
+        503s on a missing tokenizer before reaching this guard
+        (``_preflight`` requires one) — patched to a no-op here to isolate
+        the guard's own behavior rather than re-test ``_preflight``."""
         state = _state_enabled()
         state["tokenizer"] = None
         with patch("paramem.server.calibrate._preflight"):
@@ -1277,10 +1277,9 @@ class TestRunCalibrationResponseEnvelope:
         assert result["n_output_tokens"] == -1
 
     def test_n_input_tokens_uses_fallback_estimate_when_tokenizer_raises(self):
-        """A tokenizer that raises on call no longer collapses to -1 (U1):
+        """A tokenizer that raises on call no longer collapses to -1:
         ``estimate_tokens`` falls back to a conservative words-based
-        estimate instead — the raising-tokenizer case item 47 names as the
-        one thing this migration actually changes."""
+        estimate instead."""
         from paramem.graph.phase_trace import record_prompt
 
         state = _state_enabled()
