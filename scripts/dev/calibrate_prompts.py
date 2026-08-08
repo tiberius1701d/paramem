@@ -8,12 +8,14 @@ later steps.  Iterate on prompt files and inference params; measure
 compliance variance across seeds; compare candidate vs production
 baseline side-by-side.
 
-Stages:
-
-* ``extract``       — local Mistral.  POST /calibrate/extract
-* ``anonymize``     — local Mistral.  POST /calibrate/anonymize
-* ``enrich``        — cloud provider.  POST /calibrate/enrich
-* ``plausibility``  — local Mistral.  POST /calibrate/plausibility
+Stages: the live, authoritative list of stage names is the ``_STAGE_PROMPTS``
+mapping below — each key is a stage and maps 1:1 onto ``POST
+/calibrate/<stage>``.  Most stages (``extract``, ``anonymize``, ``enrich``,
+``plausibility``) run a chunk through the extraction pipeline; ``normalize``
+and ``anonymize_facts`` run against a stored graph snapshot (``--snapshot``);
+``name`` runs against a turn transcript (``--turns-jsonl``); ``respond`` runs
+one live serving turn against a bare utterance (``--utterance``).  See each
+stage's guard code in ``main()`` for its required input flag.
 
 Usage::
 
@@ -35,9 +37,10 @@ Usage::
         --input ingest/resume.pdf --chunk 0 --stages enrich \\
         --seed-from data/ha/calibration/artifacts/<prior-ts>/
 
-Out of scope: merger, keyed-entry assembly, adapter training, recall/chat.  The
-tool stops at "what did the LLM emit for this stage given this prompt
-and these params."
+Out of scope: merger, keyed-entry assembly, adapter training.  ``respond`` is
+the one stage that runs a live serving turn end-to-end; every other stage
+stops at "what did the LLM emit for this stage given this prompt and these
+params."
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -134,6 +138,13 @@ _STAGE_PROMPTS: dict[str, tuple[str, ...]] = {
     "normalize": ("normalize_filter",),
     "anonymize_facts": ("anonymize_facts",),
     "name": ("name_user", "name_system"),
+    "respond": (
+        "serving_system",
+        "serving_directives",
+        "cloud_serving_system",
+        "intent_classifier",
+        "recall_selection",
+    ),
 }
 
 
@@ -406,6 +417,103 @@ def _jaccard_pairwise(sets: list[set]) -> dict:
     }
 
 
+_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "and",
+        "or",
+        "but",
+        "it",
+        "that",
+        "this",
+        "i",
+        "you",
+        "he",
+        "she",
+        "they",
+        "we",
+        "with",
+        "as",
+        "at",
+        "by",
+        "be",
+        "been",
+        "has",
+        "have",
+        "had",
+        "not",
+        "no",
+        "do",
+        "does",
+        "did",
+        "so",
+        "if",
+        "than",
+        "then",
+        "from",
+        "its",
+        "your",
+        "my",
+        "our",
+        "their",
+        "what",
+        "which",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+    }
+)
+
+
+def _salient_tokens(text: str) -> set[str]:
+    """Lowercased word tokens with stopwords and very short tokens dropped.
+
+    Deterministic, no embeddings — a coarse content signal for comparing two
+    replies, not a semantic similarity measure.
+    """
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    return {w for w in words if w not in _STOPWORDS and len(w) > 2}
+
+
+def _reply_overlap(baseline: dict, candidate: dict) -> dict:
+    """Compare two ``respond`` stage responses' ``raw_output`` replies.
+
+    Reports the Jaccard similarity of each reply's salient-token set (same
+    empty-input handling as :func:`_jaccard_pairwise`: both empty -> 1.0,
+    exactly one empty -> 0.0) plus a plain length delta. Minimal by intent —
+    no embeddings, no semantic scoring.
+    """
+    b_raw = str(baseline.get("raw_output") or "")
+    c_raw = str(candidate.get("raw_output") or "")
+    b_tokens = _salient_tokens(b_raw)
+    c_tokens = _salient_tokens(c_raw)
+    if not b_tokens and not c_tokens:
+        jaccard = 1.0
+    elif not b_tokens or not c_tokens:
+        jaccard = 0.0
+    else:
+        jaccard = len(b_tokens & c_tokens) / len(b_tokens | c_tokens)
+    return {
+        "salient_token_jaccard": round(jaccard, 4),
+        "baseline_length": len(b_raw),
+        "candidate_length": len(c_raw),
+        "length_delta": len(c_raw) - len(b_raw),
+    }
+
+
 def _variance_report(stage: str, runs: list[dict]) -> dict:
     """Per-stage variance summary across N seed runs.
 
@@ -492,6 +600,17 @@ _STAGE_FILENAME = {
     "anonymize_facts": "anonymization_facts.txt",
     "name_user": "name_extraction.txt",
     "name_system": "name_extraction_system.txt",
+    # Serving prompts — the branch-dependent subset of these five templates
+    # a live /chat turn actually loads (an HA-answered turn loads none;
+    # cloud_serving_system.txt only on cloud escalation; recall_selection.txt
+    # only on the temporal personal leg; intent_classifier.txt only under
+    # intent.mode: llm). Distinct from every stage above: these are read by
+    # the serving dispatch, not the extraction pipeline.
+    "serving_system": "serving_system.txt",
+    "serving_directives": "serving_directives.txt",
+    "cloud_serving_system": "cloud_serving_system.txt",
+    "intent_classifier": "intent_classifier.txt",
+    "recall_selection": "recall_selection.txt",
 }
 
 
@@ -591,10 +710,11 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Forwarded to /calibrate/extract — pipeline returns immediately "
             "after the named phase completes (saves compute when only early "
-            "phases need inspection). Valid names: local_extract, "
-            "second_order_extract, anonymize, entity_correction, cloud_enrich, "
-            "anon_plausibility, deanon, deanon_plausibility. Default: run "
-            "full pipeline."
+            "phases need inspection). Valid names are the full phase "
+            "vocabulary defined by paramem.graph.phase_trace.PHASE_NAMES — "
+            "consult that module for the current list rather than this help "
+            "text, which has drifted out of sync with it before. Default: "
+            "run full pipeline."
         ),
     )
     parser.add_argument(
@@ -604,6 +724,17 @@ def main(argv: list[str] | None = None) -> int:
             'JSONL file of conversation turns ({"role": str, "text": str} per line). '
             "Required when --stages includes 'name'. Cannot be combined with "
             "chunk stages (extract, anonymize, enrich, plausibility)."
+        ),
+    )
+    parser.add_argument(
+        "--utterance",
+        default=None,
+        help=(
+            "A single bare utterance — not a turn-marked transcript — to run "
+            "through one live serving turn. Required when --stages includes "
+            "'respond'. Cannot be combined with any other stage, and takes no "
+            "sampling parameters (the serving reply is always greedy/"
+            "deterministic), so --seeds must name at most one seed."
         ),
     )
     args = parser.parse_args(argv)
@@ -638,7 +769,12 @@ def main(argv: list[str] | None = None) -> int:
                     f"--chunk {args.chunk} out of range (input has {len(chunks)} chunks)"
                 )
             chunks = [chunks[args.chunk]]
-    elif "normalize" not in stages and "anonymize_facts" not in stages and "name" not in stages:
+    elif (
+        "normalize" not in stages
+        and "anonymize_facts" not in stages
+        and "name" not in stages
+        and "respond" not in stages
+    ):
         raise SystemExit(
             "Error: --input is required for chunk stages "
             "(extract, anonymize, enrich, plausibility)."
@@ -694,6 +830,36 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "Error: --stages name requires --turns-jsonl <file.jsonl> "
             '(a JSONL file of {"role": str, "text": str} dicts).'
+        )
+    # Guard: respond cannot be combined with any other stage — it runs one
+    # live serving turn (--utterance), not a chunk/graph/turns artifact.
+    # Mirror the normalize/anonymize_facts/name mutual-exclusion pattern.
+    if "respond" in stages and stages != ["respond"]:
+        raise SystemExit(
+            "Error: 'respond' cannot be combined with other stages "
+            "(extract, anonymize, enrich, plausibility, normalize, "
+            "anonymize_facts, name). Run it in a separate invocation: "
+            "--stages respond --utterance '<text>'"
+        )
+    # Guard: respond requires --utterance; --utterance is meaningless for
+    # every other stage.
+    if "respond" in stages and not getattr(args, "utterance", None):
+        raise SystemExit(
+            "Error: --stages respond requires --utterance '<text>' "
+            "(a single bare utterance, not a turn-marked transcript)."
+        )
+    if "respond" not in stages and getattr(args, "utterance", None):
+        raise SystemExit("Error: --utterance is only valid with --stages respond.")
+    # Guard: respond takes no sampling parameters — the serving reply is
+    # always greedy/deterministic — so repeated identical calls under
+    # multiple seeds would only burn GPU time for no signal.
+    if "respond" in stages and len(seeds) > 1:
+        raise SystemExit(
+            "Error: --stages respond takes no sampling parameters (the "
+            "serving reply is always greedy/deterministic), so running it "
+            "under multiple --seeds would only repeat an identical call and "
+            "burn GPU time. Drop --seeds (or pass a single seed) for this "
+            "stage."
         )
 
     invocation = {
@@ -922,6 +1088,68 @@ def main(argv: list[str] | None = None) -> int:
                     "variance": _variance_report("name", name_runs),
                 },
             )
+
+    # ----- respond stage (standalone — one live serving turn) --------------
+    # Unlike every stage above, this is not part of the extraction pipeline:
+    # it POSTs a bare utterance straight to the serving dispatch and gets
+    # back a reply plus the routing diagnostics as ``parsed`` — so
+    # ``_phase_diff`` / ``_print_phase_diff`` give structured comparison for
+    # free.  No sampling params (guarded above), so exactly one candidate
+    # call is made.
+    if "respond" in stages:
+        # SAME conversation_id for the candidate and (if run) the baseline
+        # call: neither call appends to stored history (handle_chat itself
+        # performs no session-buffer write), so sharing the id is
+        # side-effect-free, and a distinct id per leg would otherwise
+        # guarantee a spurious ``parsed_changed.conversation_id`` diff on
+        # every comparison below.
+        respond_conversation_id = "calib-respond"
+        candidate = _post_stage(
+            args.server,
+            "respond",
+            {
+                "text": args.utterance,
+                "speaker_id": args.speaker_id,
+                "conversation_id": respond_conversation_id,
+                "prompt_variants": _variants(prompts_dir, args.prompt_prefix, "respond"),
+            },
+        )
+        _record_run("respond", "0", candidate)
+        candidate_unexercised = candidate.get("variants_unexercised") or []
+        if candidate_unexercised:
+            print(
+                f"WARNING: /calibrate/respond did not exercise these prompt "
+                f"variant(s) on this utterance — the corresponding production "
+                f"prompt never loaded on the branch this turn took (see "
+                f"paramem.server.calibrate.calibrate_respond): "
+                f"{candidate_unexercised}"
+            )
+        respond_blob: dict[str, Any] = {
+            "stage": "respond",
+            "utterance": args.utterance,
+            "artifact_dir": candidate.get("artifact_dir", ""),
+        }
+        if _run_baseline_for("respond"):
+            baseline = _post_stage(
+                args.server,
+                "respond",
+                {
+                    "text": args.utterance,
+                    "speaker_id": args.speaker_id,
+                    "conversation_id": respond_conversation_id,
+                    "prompt_variants": {},
+                },
+            )
+            respond_blob["baseline_artifact_dir"] = baseline.get("artifact_dir", "")
+            phase_diff = _phase_diff(baseline, candidate)
+            respond_blob["phase_diff"] = phase_diff
+            _print_phase_diff(phase_diff)
+            respond_blob["reply_overlap"] = _reply_overlap(baseline, candidate)
+        # Written unconditionally — even on --baseline none, where there is
+        # no comparison to report — so a no-baseline respond run leaves the
+        # same artifact trail every other stage does, rather than building
+        # respond_blob and discarding it.
+        write_artifact(dump_dir / "07_respond.json", respond_blob)
 
     write_artifact(dump_dir / _INDEX_FILENAME, run_index)
     print(f"Calibration complete.  Index: {dump_dir / _INDEX_FILENAME}")

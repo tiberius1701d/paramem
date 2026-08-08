@@ -45,11 +45,13 @@ callers own the cloud fallback.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 
 from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
+from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
 from paramem.models.loader import adapt_messages, base_model_inference, grad_checkpointing_disabled
 from paramem.server.config import ServerConfig
@@ -73,6 +75,10 @@ from paramem.utils.tokens import estimate_tokens
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10
+
+# The one phase name the serving dispatch (handle_chat) opens — see
+# paramem.graph.phase_trace.PHASE_NAMES and its doc table.
+_SERVING_PHASE = "serve_turn"
 
 
 def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:
@@ -176,8 +182,38 @@ def _build_system_prompt(
 
 @dataclass
 class ChatResult:
+    """Result of one chat dispatch.
+
+    Attributes:
+        text: The reply text.
+        escalated: Whether an escalation hop (HA or cloud) produced this
+            result.
+        diagnostics: The turn's routing/probe diagnostics, stamped by
+            :func:`handle_chat` (which also merges in the diagnostics
+            :func:`_probe_and_reason` builds on the personal-probe leg).
+            Key-presence contract:
+
+            * Guaranteed on every result ``handle_chat`` returns:
+              ``conversation_id``, ``intent``, ``paths_attempted``,
+              ``fallthrough_reason``, ``exit_via``, ``is_residual``,
+              ``is_self_referential``.
+            * Conditional, set only by :func:`_probe_and_reason` on the
+              personal-probe leg: ``temporal`` (always present on that leg
+              — ``None`` when the date-group selection stage did not run,
+              a dict when it did), ``probes`` (present once probing
+              actually happens; the zero-survivor date-selection early
+              return never reaches it), ``facts_recalled`` (present only
+              when the full probe-assembly path completes; the
+              no-recalled-facts fallback sets ``probes`` but never reaches
+              this key).
+            * Results produced by ``paramem.server.app._relay_route``
+              (the speakerless/cloud-only path, which never calls
+              :func:`handle_chat`) carry ``{}``.
+    """
+
     text: str
     escalated: bool = False
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 def _is_personal_interrogative(text: str, config: ServerConfig, *, is_personal: bool) -> bool:
@@ -309,10 +345,17 @@ def handle_chat(
 
     The ``is_residual`` diagnostic tracks "did any graph signal fire?"
     for the routing-quality metric independent of the intent decision —
-    ``True`` when neither PA steps nor HA domains were produced.
+    ``True`` when neither PA steps nor HA domains were produced.  It is
+    computed unconditionally (not gated on ``config.debug``) since it is
+    part of the returned ``ChatResult.diagnostics``, not just a log field.
 
-    When ``config.debug`` is True a per-request routing-decision
-    diagnostic is emitted via ``logging.info(extra={"routing": …})`` at
+    The whole dispatch runs inside its own ``paramem.graph.phase_trace``
+    scope (``extraction_trace()`` + ``phase_trace("serve_turn")``), so a
+    production turn always has a trace to record onto even with no
+    calibration caller — this is also what makes the returned
+    diagnostics dict the same object recorded as the phase's ``parsed``
+    field. When ``config.debug`` is True the routing decision is
+    additionally emitted via ``logging.info(extra={"routing": …})`` at
     function exit.
 
     Raises:
@@ -335,7 +378,8 @@ def handle_chat(
         "exit_via": None,
         "is_residual": False,
     }
-    try:
+
+    def _dispatch() -> ChatResult:
         with grad_checkpointing_disabled(model):
             plan = None
 
@@ -346,6 +390,19 @@ def handle_chat(
                 routing_diags["intent"] = plan.intent.value
 
             intent = plan.intent if plan is not None else Intent.UNKNOWN
+
+            # is_residual: the routing plan landed with no probe steps and
+            # no HA domains — i.e. no deterministic signal fired and the
+            # classifier residual (encoder cosine or LLM generate) drove
+            # the intent verdict.  Tracks whether the routing-quality
+            # metric should count this query toward the residual
+            # classifier's evaluation.  Computed here, unconditionally —
+            # not gated on config.debug — because it is part of the
+            # returned diagnostics artifact now, not just a log field.
+            routing_diags["is_residual"] = bool(
+                plan is not None and not plan.steps and not plan.ha_domains
+            )
+
             # First arm of the personal verdict.  Only a positive PERSONAL
             # verdict grants memory access and blocks cloud escalation.
             # Every other intent — including UNKNOWN (no IntentConfig,
@@ -470,17 +527,16 @@ def handle_chat(
                 language=language,
                 is_personal=is_personal,
             )
+
+    try:
+        with extraction_trace(), phase_trace(_SERVING_PHASE) as phase:
+            result = _dispatch()
+            result.diagnostics.update(routing_diags)
+            phase.set_raw(result.text)
+            phase.set_parsed(result.diagnostics)
+            return result
     finally:
         if getattr(config, "debug", False):
-            # is_residual: the routing plan landed with no probe steps and
-            # no HA domains — i.e. no deterministic signal fired and the
-            # classifier residual (encoder cosine or LLM generate) drove the
-            # intent verdict.  Tracks whether the routing-quality metric
-            # should count this query toward the residual classifier's
-            # evaluation.
-            routing_diags["is_residual"] = bool(
-                plan is not None and not plan.steps and not plan.ha_domains
-            )
             logger.info("routing decision", extra={"routing": routing_diags})
 
 
@@ -1025,6 +1081,12 @@ def _probe_and_reason(
     stage ran) happens once, at context assembly
     (:func:`_render_tier_facts`), reading the same ``date_by_key`` map
     the selection stage built — no fact's date is parsed more than once.
+
+    The returned ``ChatResult.diagnostics`` carries this leg's own keys
+    (``temporal``, and — once probing actually happens — ``probes`` and,
+    on the full probe-assembly path, ``facts_recalled``); see the
+    key-presence contract in :class:`ChatResult`'s docstring for exactly
+    which branches set which keys.
     """
     from paramem.memory.source import build_memory_source
     from paramem.models.loader import switch_adapter
@@ -1035,322 +1097,360 @@ def _probe_and_reason(
         "episodic": "Recent knowledge",
     }
 
-    # Date-group selection stage.  ``active_steps`` defaults to
-    # ``plan.steps`` itself (same list, same objects) so every downstream
-    # read is unaffected when the stage does not run — the no-op
-    # contract for temporal_selection_enabled=False.  ``date_by_key``
-    # stays None on that no-op path too, and every renderer downstream
-    # treats None as "the stage didn't run" rather than taking a second
-    # explicit flag.
-    active_steps = plan.steps
-    today: date | None = None
-    date_by_key: dict[str, date | None] | None = None
-    period_note: str | None = None
-    temporal_stage_active = (
-        config.inference.temporal_selection_enabled
-        and memory_store is not None
-        and bool(plan.steps)
-    )
+    # Diagnostics for this leg, stamped onto the returned ChatResult once —
+    # after _run() below returns, regardless of which internal branch
+    # produced the result (mirrors handle_chat's single-stamp pattern).
+    # "temporal" is always present once this function runs: None when the
+    # date-group selection stage did not run, a dict when it did.
+    # "probes"/"facts_recalled" are conditional — see ChatResult's
+    # docstring for the exact per-branch presence contract.
+    diags: dict[str, Any] = {"temporal": None}
 
-    if temporal_stage_active:
-        today = date.today()
-        last_seen_by_key: dict[str, object] = {}
-        for step in plan.steps:
-            for key in step.keys_to_probe:
-                bookkeeping = memory_store.bookkeeping_for_key(key) or {}
-                last_seen_by_key[key] = bookkeeping.get("last_seen")
+    def _run() -> ChatResult:
+        # Date-group selection stage.  ``active_steps`` defaults to
+        # ``plan.steps`` itself (same list, same objects) so every downstream
+        # read is unaffected when the stage does not run — the no-op
+        # contract for temporal_selection_enabled=False.  ``date_by_key``
+        # stays None on that no-op path too, and every renderer downstream
+        # treats None as "the stage didn't run" rather than taking a second
+        # explicit flag.
+        active_steps = plan.steps
+        today: date | None = None
+        date_by_key: dict[str, date | None] | None = None
+        period_note: str | None = None
+        temporal_stage_active = (
+            config.inference.temporal_selection_enabled
+            and memory_store is not None
+            and bool(plan.steps)
+        )
 
-        # Single parse of every key's raw bookkeeping value for this
-        # request — the selection inventory, the survivor filter, the
-        # nothing-in-period note, and the per-fact rendering below all
-        # read from this one map instead of re-parsing.
-        date_by_key = build_date_by_key(last_seen_by_key)
-        selection = select_date_groups(
-            text,
-            date_by_key,
+        if temporal_stage_active:
+            today = date.today()
+            last_seen_by_key: dict[str, object] = {}
+            for step in plan.steps:
+                for key in step.keys_to_probe:
+                    bookkeeping = memory_store.bookkeeping_for_key(key) or {}
+                    last_seen_by_key[key] = bookkeeping.get("last_seen")
+
+            # Single parse of every key's raw bookkeeping value for this
+            # request — the selection inventory, the survivor filter, the
+            # nothing-in-period note, and the per-fact rendering below all
+            # read from this one map instead of re-parsing.
+            date_by_key = build_date_by_key(last_seen_by_key)
+            selection = select_date_groups(
+                text,
+                date_by_key,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                today=today,
+            )
+
+            active_steps = []
+            total_before = 0
+            total_after = 0
+            for step in plan.steps:
+                total_before += len(step.keys_to_probe)
+                kept = [key for key in step.keys_to_probe if selection.selects(date_by_key[key])]
+                total_after += len(kept)
+                if kept:
+                    active_steps.append(
+                        RoutingStep(adapter_name=step.adapter_name, keys_to_probe=kept)
+                    )
+
+            # Deterministic nothing-in-period note: the selection chose
+            # specific ranges (not `all`) and zero surviving keys carry a
+            # parseable date — regardless of whether undated keys survived
+            # via ``include_undated`` (they still probe and render alongside
+            # the note).
+            if not selection.all:
+                dated_kept = any(
+                    date_by_key[key] is not None
+                    for step in active_steps
+                    for key in step.keys_to_probe
+                )
+                if not dated_kept:
+                    existing_dates = sorted(
+                        {day for day in date_by_key.values() if day is not None}
+                    )
+                    available_dates = ", ".join(day.isoformat() for day in existing_dates)
+                    period_note = empty_period_note()
+                    if available_dates:
+                        period_note += recorded_dates_suffix(available_dates)
+
+            diags["temporal"] = {
+                "all": selection.all,
+                "ranges": len(selection.ranges),
+                "include_undated": selection.include_undated,
+                "fail_open": selection.fail_open,
+                "keys_before": total_before,
+                "keys_after": total_after,
+                "period_note": period_note is not None,
+            }
+
+            logger.info(
+                "Date-group selection: %s, kept %d/%d key(s)",
+                (
+                    "all"
+                    if selection.all
+                    else f"{len(selection.ranges)} range(s)"
+                    + (" +undated" if selection.include_undated else "")
+                )
+                + (" (fail-open)" if selection.fail_open else ""),
+                diags["temporal"]["keys_after"],
+                diags["temporal"]["keys_before"],
+            )
+
+            if total_after == 0:
+                # No keys survived selection at all: the probe call and the
+                # `not layers` escalation branch below are never reached on
+                # this path — the reasoning turn runs directly off the note.
+                augmented_text = _render_augmented_text("", text, today=today, note=period_note)
+                response, is_truncated = _generate_local_reply(
+                    augmented_text,
+                    history,
+                    model,
+                    tokenizer,
+                    config,
+                    speaker_id=speaker_id,
+                    language=language,
+                )
+                return _maybe_escalate(
+                    response,
+                    config,
+                    intent=plan.intent,
+                    cloud_agent=cloud_agent,
+                    ha_client=ha_client,
+                    speaker=speaker,
+                    speaker_id=speaker_id,
+                    history=history,
+                    language=language,
+                    is_personal=is_personal,
+                    model=model,
+                    tokenizer=tokenizer,
+                    is_truncated=is_truncated,
+                )
+
+        # Build ordered keys_by_adapter dict from routing steps.
+        # Insertion order matches router output (procedural → episodic → semantic
+        # → session adapters newest-first).  Use a plain dict — Python 3.7+
+        # guarantees insertion-order preservation.
+        keys_by_adapter: dict[str, list[str]] = {}
+        for step in active_steps:
+            keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
+
+        # Mode-aware on-miss source from the one factory.  The MemoryStore cache is
+        # RAM-only and is the fast path; the source is the slow-path fallback when a
+        # key isn't already cached.  ``None`` (train mode, no model) leaves the probe
+        # cache-only.
+        _active_mode = effective_mode if effective_mode else config.consolidation.mode
+        source = build_memory_source(
+            mode=_active_mode,
+            adapter_dir=config.adapter_dir,
+            batch_size=config.consolidation.recall_probe_batch_size,
             model=model,
             tokenizer=tokenizer,
-            config=config,
-            today=today,
+            # Per-turn probe only: reuse the process-wide simhash-registry cache
+            # instead of re-reading and re-parsing every tier's
+            # indexed_key_registry.json from disk on every personal turn.
+            # QueryRouter.reload() invalidates the cache after every
+            # registry-mutating cycle, so this never serves stale fingerprints.
+            cached_registry=True,
         )
 
-        active_steps = []
-        total_before = 0
-        total_after = 0
-        for step in plan.steps:
-            total_before += len(step.keys_to_probe)
-            kept = [key for key in step.keys_to_probe if selection.selects(date_by_key[key])]
-            total_after += len(kept)
-            if kept:
-                active_steps.append(RoutingStep(adapter_name=step.adapter_name, keys_to_probe=kept))
-
-        # Deterministic nothing-in-period note: the selection chose
-        # specific ranges (not `all`) and zero surviving keys carry a
-        # parseable date — regardless of whether undated keys survived
-        # via ``include_undated`` (they still probe and render alongside
-        # the note).
-        if not selection.all:
-            dated_kept = any(
-                date_by_key[key] is not None for step in active_steps for key in step.keys_to_probe
-            )
-            if not dated_kept:
-                existing_dates = sorted({day for day in date_by_key.values() if day is not None})
-                available_dates = ", ".join(day.isoformat() for day in existing_dates)
-                period_note = empty_period_note()
-                if available_dates:
-                    period_note += recorded_dates_suffix(available_dates)
-
-        logger.info(
-            "Date-group selection: %s, kept %d/%d key(s)",
-            (
-                "all"
-                if selection.all
-                else f"{len(selection.ranges)} range(s)"
-                + (" +undated" if selection.include_undated else "")
-            )
-            + (" (fail-open)" if selection.fail_open else ""),
-            total_after,
-            total_before,
+        probe_results = memory_store.probe(
+            keys_by_adapter,
+            source=source,
+            memoize=config.inference.preload_cache,
         )
 
-        if total_after == 0:
-            # No keys survived selection at all: the probe call and the
-            # `not layers` escalation branch below are never reached on
-            # this path — the reasoning turn runs directly off the note.
-            augmented_text = _render_augmented_text("", text, today=today, note=period_note)
-            response, is_truncated = _generate_local_reply(
-                augmented_text,
-                history,
-                model,
-                tokenizer,
-                config,
-                speaker_id=speaker_id,
-                language=language,
+        # Restore predictable adapter state after weight probing: episodic is
+        # the main adapter for PM inference.  The reasoning phase uses
+        # disable_adapter() so the active adapter during generation does not
+        # matter — only the post-return state (restored here) does.  No-op in
+        # simulate mode where probing didn't touch the model.
+        if (
+            _active_mode != "simulate"
+            and model is not None
+            and hasattr(model, "peft_config")
+            and "episodic" in model.peft_config
+        ):
+            switch_adapter(model, "episodic")
+
+        # Reassemble per-step facts so each adapter's results go to its layer.
+        # Each fact retains its originating key (rather than a pre-rendered
+        # "- {fact}" string) so the date-grouped rendering at context assembly
+        # (_render_tier_facts) can look each fact's date up in date_by_key
+        # without a second bookkeeping read or a re-parse.
+        layers: dict[str, list[tuple[str, str]]] = {}
+        diags["probes"] = {}
+
+        for step in active_steps:
+            layer_facts: list[tuple[str, str]] = []
+            for key in step.keys_to_probe:
+                result = probe_results.get(key)
+                if result and "failure_reason" not in result:
+                    # fact_text is guaranteed on every success result from
+                    # probe_keys_grouped_by_adapter (train mode) / DiskMemorySource
+                    # (simulate mode). The get() fallback covers mocked/legacy
+                    # callers that return a bare {answer: ...} dict without the
+                    # field.
+                    layer_facts.append((key, result.get("fact_text", result.get("answer", ""))))
+
+            if layer_facts:
+                layers[step.adapter_name] = layer_facts
+
+            diags["probes"][step.adapter_name] = {
+                "probed": len(step.keys_to_probe),
+                "recalled": len(layer_facts),
+            }
+            logger.info(
+                "Adapter %s: probed %d keys, recalled %d facts",
+                step.adapter_name,
+                diags["probes"][step.adapter_name]["probed"],
+                diags["probes"][step.adapter_name]["recalled"],
             )
-            return _maybe_escalate(
-                response,
+
+        if not layers:
+            logger.info(
+                "All %d probed key(s) failed, escalating via HA%s (intent=%s)",
+                sum(len(s.keys_to_probe) for s in active_steps),
+                "" if is_personal else " → cloud",
+                plan.intent.value,
+            )
+            result = _escalate_to_ha_agent(text, ha_client, config, language=language)
+            if result is not None:
+                return result
+            cloud_result = answer_via_cloud(
+                text,
+                cloud_agent,
                 config,
-                intent=plan.intent,
-                cloud_agent=cloud_agent,
-                ha_client=ha_client,
+                is_personal=is_personal,
+                model=model,
+                tokenizer=tokenizer,
                 speaker=speaker,
                 speaker_id=speaker_id,
                 history=history,
                 language=language,
+            )
+            if cloud_result is not None:
+                return cloud_result
+            # Abstention: ``_probe_and_reason`` is reached only for PERSONAL with
+            # non-empty plan.steps (handle_chat dispatch).  Probes failed and HA
+            # had no tool answer either; the base model has no context here
+            # (``not layers`` means no facts were recalled), so generating an
+            # answer would be unconditional confabulation.
+            #
+            # ``router`` and ``speaker_id`` are deliberately NOT passed to this
+            # ``_abstain_if_applicable`` call (both default to ``None`` here) —
+            # cold-start can't apply: reaching here means the router already
+            # built probes from the speaker's existing keys, so the speaker has
+            # facts and the coverage-gap (canned) response fits.  ``speaker_id``
+            # itself IS a parameter of ``_probe_and_reason`` and is threaded to
+            # the escalation call above and to ``_base_model_answer`` below.
+            abstention = _abstain_if_applicable(text, config, is_personal=is_personal)
+            if abstention is not None:
+                result, _label = abstention
+                logger.info(
+                    "Abstention: PA-empty personal interrogative in _probe_and_reason "
+                    "(probes=%d failed, HA returned None)",
+                    sum(len(s.keys_to_probe) for s in active_steps),
+                )
+                return result
+
+            return _base_model_answer(
+                text,
+                history,
+                model,
+                tokenizer,
+                config,
+                cloud_agent=cloud_agent,
+                ha_client=ha_client,
+                speaker=speaker,
+                speaker_id=speaker_id,
+                language=language,
                 is_personal=is_personal,
-                model=model,
-                tokenizer=tokenizer,
-                is_truncated=is_truncated,
             )
 
-    # Build ordered keys_by_adapter dict from routing steps.
-    # Insertion order matches router output (procedural → episodic → semantic
-    # → session adapters newest-first).  Use a plain dict — Python 3.7+
-    # guarantees insertion-order preservation.
-    keys_by_adapter: dict[str, list[str]] = {}
-    for step in active_steps:
-        keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
+        total_facts = sum(len(f) for f in layers.values())
+        diags["facts_recalled"] = total_facts
+        logger.info("Total recalled: %d facts from %d layers", diags["facts_recalled"], len(layers))
 
-    # Mode-aware on-miss source from the one factory.  The MemoryStore cache is
-    # RAM-only and is the fast path; the source is the slow-path fallback when a
-    # key isn't already cached.  ``None`` (train mode, no model) leaves the probe
-    # cache-only.
-    _active_mode = effective_mode if effective_mode else config.consolidation.mode
-    source = build_memory_source(
-        mode=_active_mode,
-        adapter_dir=config.adapter_dir,
-        batch_size=config.consolidation.recall_probe_batch_size,
-        model=model,
-        tokenizer=tokenizer,
-        # Per-turn probe only: reuse the process-wide simhash-registry cache
-        # instead of re-reading and re-parsing every tier's
-        # indexed_key_registry.json from disk on every personal turn.
-        # QueryRouter.reload() invalidates the cache after every
-        # registry-mutating cycle, so this never serves stale fingerprints.
-        cached_registry=True,
-    )
-
-    probe_results = memory_store.probe(
-        keys_by_adapter,
-        source=source,
-        memoize=config.inference.preload_cache,
-    )
-
-    # Restore predictable adapter state after weight probing: episodic is
-    # the main adapter for PM inference.  The reasoning phase uses
-    # disable_adapter() so the active adapter during generation does not
-    # matter — only the post-return state (restored here) does.  No-op in
-    # simulate mode where probing didn't touch the model.
-    if (
-        _active_mode != "simulate"
-        and model is not None
-        and hasattr(model, "peft_config")
-        and "episodic" in model.peft_config
-    ):
-        switch_adapter(model, "episodic")
-
-    # Reassemble per-step facts so each adapter's results go to its layer.
-    # Each fact retains its originating key (rather than a pre-rendered
-    # "- {fact}" string) so the date-grouped rendering at context assembly
-    # (_render_tier_facts) can look each fact's date up in date_by_key
-    # without a second bookkeeping read or a re-parse.
-    layers: dict[str, list[tuple[str, str]]] = {}
-
-    for step in active_steps:
-        layer_facts: list[tuple[str, str]] = []
-        for key in step.keys_to_probe:
-            result = probe_results.get(key)
-            if result and "failure_reason" not in result:
-                # fact_text is guaranteed on every success result from
-                # probe_keys_grouped_by_adapter (train mode) / DiskMemorySource
-                # (simulate mode). The get() fallback covers mocked/legacy
-                # callers that return a bare {answer: ...} dict without the
-                # field.
-                layer_facts.append((key, result.get("fact_text", result.get("answer", ""))))
-
-        if layer_facts:
-            layers[step.adapter_name] = layer_facts
-
-        logger.info(
-            "Adapter %s: probed %d keys, recalled %d facts",
-            step.adapter_name,
-            len(step.keys_to_probe),
-            len(layer_facts),
-        )
-
-    if not layers:
-        logger.info(
-            "All %d probed key(s) failed, escalating via HA%s (intent=%s)",
-            sum(len(s.keys_to_probe) for s in active_steps),
-            "" if is_personal else " → cloud",
-            plan.intent.value,
-        )
-        result = _escalate_to_ha_agent(text, ha_client, config, language=language)
-        if result is not None:
-            return result
-        cloud_result = answer_via_cloud(
-            text,
-            cloud_agent,
-            config,
-            is_personal=is_personal,
-            model=model,
-            tokenizer=tokenizer,
-            speaker=speaker,
-            speaker_id=speaker_id,
-            history=history,
-            language=language,
-        )
-        if cloud_result is not None:
-            return cloud_result
-        # Abstention: ``_probe_and_reason`` is reached only for PERSONAL with
-        # non-empty plan.steps (handle_chat dispatch).  Probes failed and HA
-        # had no tool answer either; the base model has no context here
-        # (``not layers`` means no facts were recalled), so generating an
-        # answer would be unconditional confabulation.
+        # Assemble layered context: procedural → episodic (incl. interim slots) → semantic.
+        # Later sections sit closer to the query, giving them higher recency bias.
         #
-        # ``router`` and ``speaker_id`` are deliberately NOT passed to this
-        # ``_abstain_if_applicable`` call (both default to ``None`` here) —
-        # cold-start can't apply: reaching here means the router already
-        # built probes from the speaker's existing keys, so the speaker has
-        # facts and the coverage-gap (canned) response fits.  ``speaker_id``
-        # itself IS a parameter of ``_probe_and_reason`` and is threaded to
-        # the escalation call above and to ``_base_model_answer`` below.
-        abstention = _abstain_if_applicable(text, config, is_personal=is_personal)
-        if abstention is not None:
-            result, _label = abstention
-            logger.info(
-                "Abstention: PA-empty personal interrogative in _probe_and_reason "
-                "(probes=%d failed, HA returned None)",
-                sum(len(s.keys_to_probe) for s in active_steps),
+        # Adapter-name mapping: probe results land in ``layers`` under the
+        # ``step.adapter_name`` used during routing.  For interim windows that name
+        # is ``"episodic_interim_<stamp>"`` (per router.reload's
+        # do-not-strip-stamps policy at router.py:274-283 — required so
+        # ``switch_adapter`` lands on the trained slot).  The context-assembly
+        # layer is conceptually still "episodic", so we collect every
+        # ``episodic*`` adapter's facts under the single ``Recent knowledge``
+        # bucket.  Multiple interim slots are emitted newest-stamp-first,
+        # mirroring the router's probe-order policy.
+        context_sections = []
+        procedural_facts = layers.get("procedural")
+        if procedural_facts:
+            context_sections.append(
+                f"[{LAYER_LABELS['procedural']}]\n"
+                + _render_tier_facts(procedural_facts, date_by_key=date_by_key)
             )
-            return result
 
-        return _base_model_answer(
-            text,
+        episodic_adapter_names = sorted(
+            (n for n in layers if n == "episodic" or n.startswith(INTERIM_NAME_PREFIX)),
+            key=lambda n: (n != "episodic", n),
+            reverse=True,
+        )
+        episodic_facts: list[tuple[str, str]] = []
+        for adapter_name in episodic_adapter_names:
+            episodic_facts.extend(layers[adapter_name])
+        if episodic_facts:
+            context_sections.append(
+                f"[{LAYER_LABELS['episodic']}]\n"
+                + _render_tier_facts(episodic_facts, date_by_key=date_by_key)
+            )
+
+        semantic_facts = layers.get("semantic")
+        if semantic_facts:
+            context_sections.append(
+                f"[{LAYER_LABELS['semantic']}]\n"
+                + _render_tier_facts(semantic_facts, date_by_key=date_by_key)
+            )
+
+        layered_context = "\n\n".join(context_sections)
+        augmented_text = _render_augmented_text(
+            layered_context, text, today=today, note=period_note
+        )
+
+        response, is_truncated = _generate_local_reply(
+            augmented_text,
             history,
             model,
             tokenizer,
             config,
+            speaker_id=speaker_id,
+            language=language,
+        )
+
+        return _maybe_escalate(
+            response,
+            config,
+            intent=plan.intent,
             cloud_agent=cloud_agent,
             ha_client=ha_client,
             speaker=speaker,
             speaker_id=speaker_id,
+            history=history,
             language=language,
             is_personal=is_personal,
+            model=model,
+            tokenizer=tokenizer,
+            is_truncated=is_truncated,
         )
 
-    total_facts = sum(len(f) for f in layers.values())
-    logger.info("Total recalled: %d facts from %d layers", total_facts, len(layers))
-
-    # Assemble layered context: procedural → episodic (incl. interim slots) → semantic.
-    # Later sections sit closer to the query, giving them higher recency bias.
-    #
-    # Adapter-name mapping: probe results land in ``layers`` under the
-    # ``step.adapter_name`` used during routing.  For interim windows that name
-    # is ``"episodic_interim_<stamp>"`` (per router.reload's
-    # do-not-strip-stamps policy at router.py:274-283 — required so
-    # ``switch_adapter`` lands on the trained slot).  The context-assembly
-    # layer is conceptually still "episodic", so we collect every
-    # ``episodic*`` adapter's facts under the single ``Recent knowledge``
-    # bucket.  Multiple interim slots are emitted newest-stamp-first,
-    # mirroring the router's probe-order policy.
-    context_sections = []
-    procedural_facts = layers.get("procedural")
-    if procedural_facts:
-        context_sections.append(
-            f"[{LAYER_LABELS['procedural']}]\n"
-            + _render_tier_facts(procedural_facts, date_by_key=date_by_key)
-        )
-
-    episodic_adapter_names = sorted(
-        (n for n in layers if n == "episodic" or n.startswith(INTERIM_NAME_PREFIX)),
-        key=lambda n: (n != "episodic", n),
-        reverse=True,
-    )
-    episodic_facts: list[tuple[str, str]] = []
-    for adapter_name in episodic_adapter_names:
-        episodic_facts.extend(layers[adapter_name])
-    if episodic_facts:
-        context_sections.append(
-            f"[{LAYER_LABELS['episodic']}]\n"
-            + _render_tier_facts(episodic_facts, date_by_key=date_by_key)
-        )
-
-    semantic_facts = layers.get("semantic")
-    if semantic_facts:
-        context_sections.append(
-            f"[{LAYER_LABELS['semantic']}]\n"
-            + _render_tier_facts(semantic_facts, date_by_key=date_by_key)
-        )
-
-    layered_context = "\n\n".join(context_sections)
-    augmented_text = _render_augmented_text(layered_context, text, today=today, note=period_note)
-
-    response, is_truncated = _generate_local_reply(
-        augmented_text,
-        history,
-        model,
-        tokenizer,
-        config,
-        speaker_id=speaker_id,
-        language=language,
-    )
-
-    return _maybe_escalate(
-        response,
-        config,
-        intent=plan.intent,
-        cloud_agent=cloud_agent,
-        ha_client=ha_client,
-        speaker=speaker,
-        speaker_id=speaker_id,
-        history=history,
-        language=language,
-        is_personal=is_personal,
-        model=model,
-        tokenizer=tokenizer,
-        is_truncated=is_truncated,
-    )
+    result = _run()
+    result.diagnostics.update(diags)
+    return result
 
 
 def _base_model_answer(

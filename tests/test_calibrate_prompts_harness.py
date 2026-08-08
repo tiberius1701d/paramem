@@ -440,3 +440,313 @@ class TestSeedFromEnrichLoading:
         rc, fake_post_stage = self._run(tmp_path, write_extract=False)
         assert rc == 0
         fake_post_stage.assert_not_called()
+
+
+class TestRespondStage:
+    """``respond`` runs one live serving turn — a bare utterance posted to
+    ``/calibrate/respond``, not a chunk/graph/turns artifact."""
+
+    _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
+
+    @staticmethod
+    def _canned_response(raw_output: str = "Sure, here you go.") -> dict:
+        return {
+            "stage": "respond",
+            "raw_output": raw_output,
+            "parsed": {"escalated": False, "exit_via": "personal_probe"},
+            "parse_error": None,
+            "artifact_dir": "/tmp/paramem-calibration/respond_1",
+            "phases": [],
+        }
+
+    def test_respond_posts_expected_payload_and_records_run(self, tmp_path: Path):
+        """The candidate call posts exactly {text, speaker_id,
+        conversation_id, prompt_variants} — no sampling params, since the
+        endpoint takes none — and the run is recorded in the index."""
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        fake_post_stage = MagicMock(return_value=self._canned_response())
+
+        argv = [
+            "--stages",
+            "respond",
+            "--utterance",
+            "What time is my dentist appointment?",
+            "--speaker-id",
+            "speaker0",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        fake_post_stage.assert_called_once()
+        args, _kwargs = fake_post_stage.call_args
+        assert args[1] == "respond"
+        payload = args[2]
+        assert set(payload) == {"text", "speaker_id", "conversation_id", "prompt_variants"}
+        assert payload["text"] == "What time is my dentist appointment?"
+        assert payload["speaker_id"] == "speaker0"
+        assert isinstance(payload["conversation_id"], str) and payload["conversation_id"]
+        assert isinstance(payload["prompt_variants"], dict)
+
+        index = json.loads((dump_dir / "runs.json").read_text())
+        assert index["respond"] == {"0": self._canned_response()["artifact_dir"]}
+
+        # 07_respond.json is written unconditionally now, even with
+        # --baseline none where there is no comparison to report — the blob
+        # is no longer built and then discarded.
+        out_blob = json.loads((dump_dir / "07_respond.json").read_text())
+        assert out_blob["stage"] == "respond"
+        assert out_blob["artifact_dir"] == self._canned_response()["artifact_dir"]
+        assert "baseline_artifact_dir" not in out_blob
+        assert "reply_overlap" not in out_blob
+
+    def test_missing_utterance_exits_with_actionable_message(self, tmp_path: Path):
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        argv = [
+            "--stages",
+            "respond",
+            "--speaker-id",
+            "speaker0",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            calibrate_prompts.main(argv)
+        message = str(exc_info.value)
+        assert "--utterance" in message
+        assert "respond" in message
+
+    def test_utterance_without_respond_stage_is_rejected(self, tmp_path: Path):
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        snapshot = tmp_path / "graph_merged_snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {"directed": False, "multigraph": False, "graph": {}, "nodes": [], "links": []}
+            )
+        )
+        argv = [
+            "--stages",
+            "normalize",
+            "--utterance",
+            "irrelevant here",
+            "--snapshot",
+            str(snapshot),
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            calibrate_prompts.main(argv)
+        assert "--utterance" in str(exc_info.value)
+
+    def test_respond_combined_with_another_stage_is_rejected(self, tmp_path: Path):
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        input_path = tmp_path / "input.txt"
+        input_path.write_text("Some document content.")
+        argv = [
+            "--stages",
+            "respond,extract",
+            "--utterance",
+            "What's on my calendar?",
+            "--input",
+            str(input_path),
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            calibrate_prompts.main(argv)
+        message = str(exc_info.value)
+        assert "respond" in message
+        assert "combined" in message
+
+    def test_multiple_seeds_with_respond_is_refused(self, tmp_path: Path):
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        argv = [
+            "--stages",
+            "respond",
+            "--utterance",
+            "What's the weather?",
+            "--speaker-id",
+            "speaker0",
+            "--seeds",
+            "1,2,3",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            calibrate_prompts.main(argv)
+        message = str(exc_info.value)
+        assert "sampling parameters" in message or "seeds" in message.lower()
+
+    def test_baseline_posted_when_serving_system_variant_exists(self, tmp_path: Path):
+        """``--baseline auto`` (the default) runs a baseline call exactly
+        when a ``calib_serving_system.txt`` variant exists in
+        --prompts-dir. The baseline call shares the candidate's
+        ``conversation_id`` — neither call appends to stored history
+        (``handle_chat`` performs no session-buffer write), so sharing the
+        id is side-effect-free, and a distinct id per leg would otherwise
+        guarantee a spurious ``parsed_changed.conversation_id`` diff in
+        every ``_phase_diff`` comparison."""
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "calib_serving_system.txt").write_text("A candidate system prompt.")
+
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        calls: list[dict] = []
+
+        def _fake_post_stage(server, stage, payload):
+            calls.append(payload)
+            reply = "Candidate reply." if len(calls) == 1 else "Baseline reply."
+            return self._canned_response(raw_output=reply)
+
+        argv = [
+            "--stages",
+            "respond",
+            "--utterance",
+            "What's on my schedule today?",
+            "--speaker-id",
+            "speaker0",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(prompts_dir),
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", side_effect=_fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        assert len(calls) == 2, "expected a candidate call AND a baseline call"
+        candidate_payload, baseline_payload = calls
+        assert candidate_payload["prompt_variants"] == {
+            "serving_system.txt": "calib_serving_system.txt"
+        }
+        assert baseline_payload["prompt_variants"] == {}
+        assert candidate_payload["conversation_id"] == baseline_payload["conversation_id"]
+
+        out_blob = json.loads((dump_dir / "07_respond.json").read_text())
+        assert out_blob["reply_overlap"]["salient_token_jaccard"] < 1.0
+
+    def test_unexercised_variant_warning_printed(self, tmp_path: Path, capsys):
+        """When the server reports a non-empty ``variants_unexercised``,
+        the driver prints a loud warning naming the gap rather than
+        silently accepting a variant that never got a chance to load."""
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        response = self._canned_response()
+        response["variants_unexercised"] = ["recall_selection.txt"]
+        fake_post_stage = MagicMock(return_value=response)
+
+        argv = [
+            "--stages",
+            "respond",
+            "--utterance",
+            "What's my next appointment?",
+            "--speaker-id",
+            "speaker0",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.out
+        assert "recall_selection.txt" in captured.out
+
+    def test_no_warning_when_all_variants_exercised(self, tmp_path: Path, capsys):
+        """An empty (or absent) ``variants_unexercised`` prints no warning."""
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        fake_post_stage = MagicMock(return_value=self._canned_response())
+
+        argv = [
+            "--stages",
+            "respond",
+            "--utterance",
+            "What's my next appointment?",
+            "--speaker-id",
+            "speaker0",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "WARNING" not in captured.out
+
+
+class TestReplyOverlap:
+    """``_reply_overlap`` — a minimal, deterministic content-drift signal
+    between a baseline and a candidate serving reply."""
+
+    def test_identical_replies_score_one(self):
+        baseline = {"raw_output": "Your dentist appointment is at 3pm on Friday."}
+        candidate = {"raw_output": "Your dentist appointment is at 3pm on Friday."}
+        result = calibrate_prompts._reply_overlap(baseline, candidate)
+        assert result["salient_token_jaccard"] == 1.0
+        assert result["length_delta"] == 0
+
+    def test_divergent_replies_score_below_one(self):
+        baseline = {"raw_output": "Your dentist appointment is at 3pm on Friday."}
+        candidate = {"raw_output": "I don't have any information about that."}
+        result = calibrate_prompts._reply_overlap(baseline, candidate)
+        assert result["salient_token_jaccard"] < 1.0
+        assert result["salient_token_jaccard"] >= 0.0
+
+    def test_both_empty_scores_one(self):
+        result = calibrate_prompts._reply_overlap({"raw_output": ""}, {"raw_output": ""})
+        assert result["salient_token_jaccard"] == 1.0
+        assert result["length_delta"] == 0
+
+    def test_one_empty_scores_zero(self):
+        result = calibrate_prompts._reply_overlap(
+            {"raw_output": ""}, {"raw_output": "Something concrete happened."}
+        )
+        assert result["salient_token_jaccard"] == 0.0
+        assert result["length_delta"] > 0
+
+    def test_length_delta_reflects_raw_output_byte_counts(self):
+        baseline = {"raw_output": "short"}
+        candidate = {"raw_output": "a somewhat longer reply here"}
+        result = calibrate_prompts._reply_overlap(baseline, candidate)
+        assert result["baseline_length"] == len("short")
+        assert result["candidate_length"] == len("a somewhat longer reply here")
+        assert result["length_delta"] == len("a somewhat longer reply here") - len("short")

@@ -43,8 +43,16 @@ _CHAT_SCOPE_PATHS = {
     "/push/subscribe",
     "/status",
 }
-# These paths are exempt from auth entirely (PWA shell, manifest, liveness).
-_EXEMPT_PATHS = {"/", "/app", "/manifest.json", "/health"}
+# These paths are exempt from auth entirely (PWA shell, liveness). The PWA
+# manifest is served at /app/manifest.json under the "/app" StaticFiles
+# mount, not as a top-level path, so it is covered by the "/app" /
+# exempt_prefixes=("/app/",) entries below rather than listed separately.
+# "/app/sw.js" is a distinct APIRoute (registered ahead of the "/app"
+# StaticFiles mount so Starlette resolves it first, app.py:3357) that falls
+# under the BearerTokenMiddleware exempt_prefixes=("/app/",) wiring
+# (app.py:3301-3311) — the service-worker script must be fetchable before
+# onboarding, same as the rest of the PWA shell.
+_EXEMPT_PATHS = {"/", "/app", "/app/sw.js", "/health"}
 
 
 def _setup_daily(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: str = "pw"):
@@ -226,6 +234,7 @@ class TestChatScopeReachesChat:
 _ADMIN_PATHS = {
     "/gpu/acquire",
     "/gpu/release",
+    "/incidents/{incident_id}/ack",
     "/refresh-ha",
     "/admin/assign-orphans",
     "/scheduled-tick",
@@ -250,8 +259,14 @@ _ADMIN_PATHS = {
     "/debug/dump",
     "/debug/erase-keys",
     "/calibrate/extract",
+    "/calibrate/procedural",
     "/calibrate/anonymize",
     "/calibrate/plausibility",
+    "/calibrate/enrich",
+    "/calibrate/normalize",
+    "/calibrate/anonymize_facts",
+    "/calibrate/name",
+    "/calibrate/respond",
     "/integrity",
     "/speaker/forget",
     "/interim/discard",
@@ -313,6 +328,107 @@ class TestRouteTableIntrospection:
 
         assert not wrongly_gated, (
             f"Chat-scope paths should NOT have require_admin: {wrongly_gated!r}"
+        )
+
+    def test_route_classification_is_complete(self):
+        """Every live route must be classified into exactly one of
+        _ADMIN_PATHS / _CHAT_SCOPE_PATHS / _EXEMPT_PATHS.
+
+        Prevents a future route from silently escaping classification: the
+        other tests in this class only check the LISTED paths, so a route
+        added to ``app.py`` without being added to one of the three sets
+        would never be exercised by ``test_all_admin_paths_carry_require_admin``.
+
+        Uses the same ``hasattr(route, "path") and hasattr(route, "dependant")``
+        filter as the other introspection tests here. That filter is relied
+        on to exclude Starlette ``Mount`` routes (e.g. the PWA ``StaticFiles``
+        mount registered at ``/app`` — which is attached during the app
+        lifespan, so it is not even present in ``app.routes`` at import time)
+        and FastAPI's auto-generated docs/openapi routes (``/docs``,
+        ``/redoc``, ``/openapi.json``, ``/docs/oauth2-redirect``, which are
+        plain Starlette ``Route`` objects with no ``.dependant``). Both
+        claims are verified at runtime below rather than trusted.
+        """
+        from paramem.server.app import app
+
+        route_paths = {
+            route.path
+            for route in app.routes
+            if hasattr(route, "path") and hasattr(route, "dependant")
+        }
+
+        # Runtime proof the filter excludes FastAPI's generated docs/openapi
+        # routes (rather than trusting that as an assumption).
+        docs_routes = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+        leaked_docs = route_paths & docs_routes
+        assert not leaked_docs, (
+            f"Docs/openapi routes leaked past the dependant filter and would "
+            f"need explicit classification: {sorted(leaked_docs)!r}"
+        )
+
+        all_sets = (_ADMIN_PATHS, _CHAT_SCOPE_PATHS, _EXEMPT_PATHS)
+        unclassified = sorted(path for path in route_paths if sum(path in s for s in all_sets) == 0)
+        assert not unclassified, (
+            f"Route(s) not classified into any of _ADMIN_PATHS / "
+            f"_CHAT_SCOPE_PATHS / _EXEMPT_PATHS: {unclassified!r}\n"
+            "Read the route's registration in paramem/server/app.py and add it "
+            "to exactly one set: _ADMIN_PATHS if it carries "
+            "dependencies=[Depends(require_admin)], _CHAT_SCOPE_PATHS if it is a "
+            "user-token chat-scope endpoint, or _EXEMPT_PATHS if "
+            "BearerTokenMiddleware exempts it via exempt_paths/exempt_prefixes."
+        )
+
+        doubly_classified = sorted(
+            path for path in route_paths if sum(path in s for s in all_sets) > 1
+        )
+        assert not doubly_classified, (
+            f"Route(s) classified into more than one set: {doubly_classified!r}\n"
+            "Each route must appear in exactly one of _ADMIN_PATHS / "
+            "_CHAT_SCOPE_PATHS / _EXEMPT_PATHS — remove it from the sets where "
+            "it does not belong."
+        )
+
+    def test_exempt_paths_are_actually_exempted_by_the_middleware(self):
+        """Every ``_EXEMPT_PATHS`` entry must be exempted by the real app's
+        ``BearerTokenMiddleware`` wiring (``exempt_paths``/``exempt_prefixes``,
+        ``paramem/server/app.py``'s ``app.add_middleware(BearerTokenMiddleware,
+        ...)`` call).
+
+        ``test_route_classification_is_complete`` only proves every route is
+        classified into ONE of the three sets — it never checks that an
+        ``_EXEMPT_PATHS`` entry is backed by anything executable, so a route
+        could be dropped into that bucket by mistake (e.g. a future admin
+        route missing its ``require_admin`` dependency) and this suite would
+        never notice. This closes that gap the same way
+        ``test_real_app_health_exempt_in_middleware`` does for ``/health``
+        alone, generalized to the whole set.
+        """
+        from paramem.server.app import app as real_app
+
+        mw_entries = getattr(real_app, "user_middleware", [])
+        btm_kwargs = None
+        for entry in mw_entries:
+            if getattr(entry, "cls", None) is BearerTokenMiddleware:
+                btm_kwargs = getattr(entry, "kwargs", {})
+                break
+        assert btm_kwargs is not None, "BearerTokenMiddleware not found in app.user_middleware"
+
+        exempt_paths = set(btm_kwargs.get("exempt_paths", ()))
+        exempt_prefixes = tuple(btm_kwargs.get("exempt_prefixes", ()))
+
+        not_exempted = [
+            path
+            for path in _EXEMPT_PATHS
+            if path not in exempt_paths and not path.startswith(exempt_prefixes)
+        ]
+        assert not not_exempted, (
+            f"_EXEMPT_PATHS entries not covered by BearerTokenMiddleware's "
+            f"exempt_paths={exempt_paths!r} / exempt_prefixes={exempt_prefixes!r}: "
+            f"{not_exempted!r}\n"
+            "A path in _EXEMPT_PATHS with no matching middleware exemption is "
+            "unclassified in practice (it would 401 without a token) — either "
+            "add it to the middleware's exempt_paths/exempt_prefixes, or move "
+            "it to _ADMIN_PATHS / _CHAT_SCOPE_PATHS instead."
         )
 
 

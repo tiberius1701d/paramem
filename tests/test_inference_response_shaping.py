@@ -148,11 +148,16 @@ class TestTrimIncompleteSentence:
 
 class TestChatResultFields:
     """``ChatResult`` carries only the fields the serving path actually
-    reads — a field with zero readers anywhere in the codebase must not
+    reads plus the diagnostics artifact ``handle_chat``/``_probe_and_reason``
+    populate — a field with zero readers anywhere in the codebase must not
     silently reappear."""
 
-    def test_only_text_and_escalated_fields(self):
-        assert {f.name for f in dataclasses.fields(ChatResult)} == {"text", "escalated"}
+    def test_only_text_escalated_and_diagnostics_fields(self):
+        assert {f.name for f in dataclasses.fields(ChatResult)} == {
+            "text",
+            "escalated",
+            "diagnostics",
+        }
 
 
 class TestMaybeEscalateTrimApplication:

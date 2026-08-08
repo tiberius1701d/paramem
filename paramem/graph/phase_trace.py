@@ -113,19 +113,31 @@ it.  Each entry is ``{"path", "sha", "template"}``:
 :func:`phase_trace` scope — unlike :func:`phase_trace` itself, which
 raises.  This is deliberate, not an inconsistency: ``_load_prompt`` is a
 shared loader that cannot know whether it is being called from inside a
-phase; two real production call paths run it with no phase scope open
-(``anonymize_transcript`` from ``anonymize_turn``,
-reached from the live chat egress, and from
-``paramem.training.consolidation``), so a raise there would break
-legitimate production behaviour. ``phase_trace``'s caller, by contrast,
-has explicitly declared a phase boundary — a lost record there is a
-contract breach the raise is meant to catch.
+phase; one real production call path still runs it with no phase scope
+open — the full-fold graph-tier enrichment pass
+(``GraphTierRefiner.run_enrichment`` → ``enrich_graph`` → ``anonymize`` →
+``anonymize_transcript``, none of which open
+``extraction_trace``/``phase_trace``) — so a raise there would break
+legitimate production behaviour. The live chat egress's own
+``anonymize_transcript`` call (``answer_via_cloud`` → ``anonymize_turn``)
+no longer belongs on that list: it runs inside the ``serve_turn`` phase
+scope :func:`paramem.server.inference.handle_chat` opens around its
+whole dispatch, so those prompt loads ARE recorded onto the trace.
+``phase_trace``'s caller, by contrast, has explicitly declared a phase
+boundary — a lost record there is a contract breach the raise is meant
+to catch.
 
 Pipeline contract
 -----------------
 
-:func:`extract_graph` emits exactly these phases when the corresponding
-step runs (in firing order for the default configuration):
+The table below documents every name in :data:`PHASE_NAMES`. All rows
+except ``serve_turn`` are emitted by :func:`extract_graph`, in firing
+order for the default configuration, when the corresponding step runs.
+``serve_turn`` is emitted by the production serving dispatch
+(:func:`paramem.server.inference.handle_chat`) around its own routing +
+reply generation — a separate call tree from :func:`extract_graph`,
+listed in the same table because :func:`phase_trace` validates every
+phase name against the one shared whitelist.
 
 ==========================  ===============================================
 Phase                       Notes
@@ -179,6 +191,14 @@ Phase                       Notes
                             on an explicit turn list (calibration/
                             enrollment). Loads ``name_extraction.txt`` +
                             ``name_extraction_system.txt``.
+``serve_turn``              NOT an ``extract_graph`` phase. One production
+                            chat-dispatch turn
+                            (``paramem.server.inference.handle_chat``):
+                            opens directly around the routing decision and,
+                            on the personal-probe leg, the recall +
+                            reasoning generate. ``raw_output`` is the
+                            reply text; ``parsed`` is the turn's routing/
+                            probe diagnostics dict.
 ==========================  ===============================================
 
 Adding a new phase: extend :data:`PHASE_NAMES`, document it in the
@@ -200,9 +220,14 @@ if TYPE_CHECKING:
 
 
 # Canonical phase-name whitelist.  Order matches the firing order in
-# extract_graph for the default configuration; phases not configured for
-# a given run (e.g. anon_plausibility when plausibility_stage='deanon')
-# simply do not fire — order in the trace reflects what actually ran.
+# extract_graph for the default configuration, for every member except
+# ``serve_turn`` — a separate call tree
+# (paramem.server.inference.handle_chat) that shares this whitelist but is
+# not part of extract_graph's own sequence (see the module docstring's
+# "Pipeline contract" table).  Phases not configured for a given
+# extract_graph run (e.g. anon_plausibility when
+# plausibility_stage='deanon') simply do not fire — order in the trace
+# reflects what actually ran.
 PHASE_NAMES: tuple[str, ...] = (
     "local_extract",
     "second_order_extract",
@@ -218,6 +243,7 @@ PHASE_NAMES: tuple[str, ...] = (
     "dedup_procedural",
     "normalize",
     "name_extract",
+    "serve_turn",
 )
 
 
@@ -694,12 +720,18 @@ def record_prompt(*, path: str | None, content: str) -> None:
       raise here would break ``import paramem.server.speaker`` outright;
       this is the decisive reason a raise is not an option, independent of
       any call-time scoping question.
-    * Two real production call paths also run it with no phase scope
-      open at CALL time — ``anonymize_transcript`` from
-      ``anonymize_turn`` (reached from the live chat
-      egress, ``paramem/server/inference.py``'s ``answer_via_cloud``,
-      ``extractor.py:1108``) and from
-      ``paramem.training.consolidation`` (``consolidation.py:2739``).
+    * One real production call path also runs it with no phase scope
+      open at CALL time — the full-fold graph-tier enrichment pass
+      (``GraphTierRefiner.run_enrichment`` in
+      ``paramem/training/graph_tier.py`` → ``enrich_graph`` in
+      ``paramem/training/graph_enrich.py`` → ``anonymize`` →
+      ``anonymize_transcript``), none of which open
+      ``extraction_trace``/``phase_trace``.  The live chat egress's own
+      ``anonymize_transcript`` call (``answer_via_cloud`` →
+      ``anonymize_turn``, ``paramem/server/inference.py``) no longer
+      belongs on this list: it runs inside the ``serve_turn`` phase scope
+      ``handle_chat`` opens around its whole dispatch, so those prompt
+      loads ARE recorded.
 
     ``phase_trace``'s raise exists because ITS caller has explicitly
     declared a phase boundary, so a lost record there is a contract

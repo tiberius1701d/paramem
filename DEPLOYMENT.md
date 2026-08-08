@@ -923,24 +923,30 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/calibrate/extract` | admin + `calibrate_endpoint_enabled` | Run the extraction chain from a transcript. `stop_phase` selects which step's output comes back (default: run to the end); every other calibration route fixes its own. |
 | POST | `/calibrate/procedural` | admin + `calibrate_endpoint_enabled` | Run the procedural extractor on a transcript. |
 | POST | `/calibrate/anonymize` | admin + `calibrate_endpoint_enabled` | Enter the chain at `anonymize` with a supplied `graph` and return the anonymizer's output. |
+| POST | `/calibrate/anonymize_facts` | admin + `calibrate_endpoint_enabled` | Run the graph-tier anonymize step — the per-chunk fact-list shape graph enrichment sends, rather than a transcript — over supplied `facts` or a `snapshot_path`. Distinct from `/calibrate/anonymize` (session tier, takes a transcript-derived `graph`); this call takes no transcript at all. Uses the operator's configured scrub vocabulary and token envelope. |
 | POST | `/calibrate/normalize` | admin + `calibrate_endpoint_enabled` | Run the graph tier's predicate-normalization pass over supplied `relations` or a `snapshot_path`. Uses the production engine selection (cloud when egress is permitted, local otherwise) and the production survivor rule. |
 | POST | `/calibrate/plausibility` | admin + `calibrate_endpoint_enabled` + cloud egress | Enter the chain at `anonymize` with a supplied `graph` and return the de-anonymized plausibility judge's output. Reaching that judge runs the cloud enrichment it sits downstream of, so this route places a cloud call. |
 | POST | `/calibrate/enrich` | admin + `calibrate_endpoint_enabled` + cloud egress | Enter the chain at `anonymize` with a supplied `graph` and return the `cloud_enrich` step's output. Places a cloud call. Does **not** reach the separate graph-level enrichment, which has no calibration route. |
 | POST | `/calibrate/name` | admin + `calibrate_endpoint_enabled` | Run the enrollment name extractor over supplied `turns`. |
+| POST | `/calibrate/respond` | admin + `calibrate_endpoint_enabled` | Run one serving turn through the full production chat dispatch for an enrolled `speaker_id`. Body: `{text, speaker_id, conversation_id?, prompt_variants}` — `text` is a bare utterance, not a turn-marked transcript. Takes no sampling parameters (the serving reply cap is `inference.max_response_tokens`). **May reach Home Assistant and the cloud agent exactly as a real turn does — it can actuate devices and place a billed call.** Writes no conversation state; the reply and the routing diagnostics land in the run's artifact directory — and on a turn that escalates to the cloud, so does the nested local extraction/anonymization output of the utterance the escalation performed along the way. The driver script (`scripts/dev/calibrate_prompts.py`) separately records the `--utterance` text verbatim in its own invocation artifact. Both locations are gitignored data directories; this is disclosure of what was calibrated, not a new risk. |
 
-Every route above runs the **real production chain** — none re-invokes a
-step's primitive on its own, so what a probe reports is what the
-consolidation cycle would do on that input with that prompt. Each route
-declares where the chain is entered, which artifact it accepts, and which
-step's output it returns; routes entering past `local_extract` require the
-`graph` that step would have produced (typically a prior
-`/calibrate/extract` response, posted back verbatim). When the configured
-chain cannot reach the step a route reports on — cloud egress refused, an
-injected graph with no relations, a pass short-circuiting on its own floor
-— the call returns HTTP 400 naming the steps that did run and the cloud
-verdict, rather than a response whose provenance is silently empty. All
-routes are gated by `consolidation.calibrate_endpoint_enabled=true`
-(default off); none writes weights or production data.
+Every route above runs a **real production code path** — none re-invokes a
+step's primitive on its own, so what a probe reports is what production
+would do on that input with that prompt. Most routes report on the
+consolidation/extraction chain; one (`/calibrate/respond`) instead reports
+on the live serving turn — see its row above for what that means for side
+effects. Each chain route declares where the chain is entered, which
+artifact it accepts, and which step's output it returns; routes entering
+past `local_extract` require the `graph` that step would have produced
+(typically a prior `/calibrate/extract` response, posted back verbatim).
+When the configured chain cannot reach the step a route reports on — cloud
+egress refused, an injected graph with no relations, a pass
+short-circuiting on its own floor — the call returns HTTP 400 naming the
+steps that did run and the cloud verdict, rather than a response whose
+provenance is silently empty. All routes are gated by
+`consolidation.calibrate_endpoint_enabled=true` (default off); none writes
+weights or production data. `/calibrate/respond` is the one route whose
+downstream effects reach beyond the server process — see its row above.
 
 **Chat request:**
 
@@ -1105,6 +1111,23 @@ baseline-vs-candidate diff per phase. Workflow:
 4. Promote the variant to production only when the per-phase diff confirms
    the targeted improvement without regressions on other phases.
 
+The serving-path prompts (`serving_system.txt`, `serving_directives.txt`,
+`cloud_serving_system.txt`, `intent_classifier.txt`, `recall_selection.txt`)
+are calibrated through this same `calib_`-prefixed variant mechanism, via
+`--stages respond --utterance "..."` — one live serving turn rather than an
+extraction-chain phase. Which of these five actually load on a given turn
+is branch-dependent, not fixed: an HA-answered turn loads none of them;
+`cloud_serving_system.txt` loads only on cloud escalation; `recall_selection.txt`
+only on the temporal personal leg; `intent_classifier.txt` only under
+`intent.mode: llm`. A variant whose production prompt never got a chance to
+load on that turn is reported back in the response's `variants_unexercised`
+field rather than failing the call — `calibrate_prompts.py` prints a warning
+when it is non-empty. `calib_serving_directives.txt` must be a COMPLETE
+sectioned file — every section `serving_directives.txt` defines (see
+`configs/prompts/serving_directives.txt` for the authoritative list) — a
+partial variant fails the turn rather than falling back per-section to the
+shipped copy.
+
 The calibration endpoint is gated by
 `consolidation.calibrate_endpoint_enabled` in `configs/server.yaml`
 (default OFF — it loads the live model and would race against scheduled
@@ -1116,6 +1139,8 @@ production surface (`[user] <text>` / `[assistant] <text>`, rendered by
 on it, and a bare, unmarked transcript puts the model off-distribution
 (the endpoints reject unmarked input with HTTP 400). `calibrate_prompts.py`
 renders this automatically; a manual `curl` call must supply it explicitly.
+The one exception is `/calibrate/respond`, whose `text` field is a bare
+utterance rather than a transcript — do not turn-mark it.
 
 ### Editing checklist
 

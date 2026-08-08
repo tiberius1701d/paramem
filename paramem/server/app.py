@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from paramem.server.user_tokens import UserTokenStore
@@ -8699,13 +8699,7 @@ async def debug_probe(request: DebugProbeRequest):
         return ChatResponse(text=resolved_text, escalated=True, speaker=speaker_name)
 
     # Local mode — abort BG trainer + acquire gpu_lock, mirroring /chat.
-    bg_trainer = _state.get("background_trainer")
-    if bg_trainer is not None and bg_trainer.is_training:
-        _abort_timeout = config.consolidation.abort_quiesce_timeout_s
-        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
-        if not aborted:
-            bg_trainer._shutdown_requested = True
-            bg_trainer._is_training = False
+    _abort_background_training_for_inference()
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -8823,13 +8817,7 @@ async def debug_recall(request: DebugRecallRequest):
             status_code=400,
         )
 
-    bg_trainer = _state.get("background_trainer")
-    if bg_trainer is not None and bg_trainer.is_training:
-        _abort_timeout = config.consolidation.abort_quiesce_timeout_s
-        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
-        if not aborted:
-            bg_trainer._shutdown_requested = True
-            bg_trainer._is_training = False
+    _abort_background_training_for_inference()
 
     from paramem.evaluation.recall import generate_answer
     from paramem.memory.entry import parse_recalled_entry
@@ -9245,48 +9233,109 @@ async def debug_erase_keys(request: DebugEraseKeysRequest):
 # --------------------------------------------------------------------------
 
 
+async def _run_calibrate_off_loop(fn, /, *args) -> Any:
+    """Dispatch one synchronous ``calibrate_module`` handler off the event loop.
+
+    Every ``/calibrate/*`` handler reaches ``gpu_lock_sync()`` (blocking,
+    unbounded timeout) via :func:`paramem.server.calibrate._measured_local_call`.
+    Calling it inline on the event loop — as ``/chat`` does not — would block
+    the loop itself while waiting for the lock; since ``/chat``'s async
+    ``gpu_lock()`` releases its lock in an async-generator ``finally`` that
+    also runs on the loop, a blocked loop can never resume that generator to
+    release the lock it holds. The result is a permanent deadlock, not a
+    slow response. Running the whole handler in the default thread-pool
+    executor keeps the wait off the loop so ``/chat``'s release always gets
+    a turn to run.
+
+    Runs the ENTIRE handler in one executor thread (not just the GPU-locked
+    section) so any ``ContextVar`` the handler sets — prompt overrides,
+    extraction/phase trace — is set and read within that same thread's
+    single synchronous call, staying coherent; no cross-thread contextvar
+    visibility is needed because nothing outside this call reads them.
+
+    Args:
+        fn: The synchronous ``calibrate_module`` handler to run.
+        *args: Positional arguments forwarded to ``fn``.
+
+    Returns:
+        Whatever ``fn`` returns.
+
+    Raises:
+        HTTPException: Re-raised with its original status code — executor
+            futures propagate exceptions from the worker thread to the
+            awaiting coroutine unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: fn(*args))
+
+
 # Every endpoint below runs the SAME production extraction chain through
 # the SAME handler; the route name selects which calibration use case's
 # declaration (start step, injected artifact, stop step) applies — see
 # paramem.server.calibrate._CHAIN.
 @app.post("/calibrate/extract", dependencies=[Depends(require_admin)])
 async def calibrate_extract_route(req: calibrate_module.CalibrateChainRequest):
-    return calibrate_module.calibrate_chain(_state, "extract", req)
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_chain, _state, "extract", req)
 
 
 @app.post("/calibrate/procedural", dependencies=[Depends(require_admin)])
 async def calibrate_procedural_route(req: calibrate_module.CalibrateChainRequest):
-    return calibrate_module.calibrate_chain(_state, "procedural", req)
+    return await _run_calibrate_off_loop(
+        calibrate_module.calibrate_chain, _state, "procedural", req
+    )
 
 
 @app.post("/calibrate/anonymize", dependencies=[Depends(require_admin)])
 async def calibrate_anonymize_route(req: calibrate_module.CalibrateChainRequest):
-    return calibrate_module.calibrate_chain(_state, "anonymize", req)
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_chain, _state, "anonymize", req)
 
 
 @app.post("/calibrate/plausibility", dependencies=[Depends(require_admin)])
 async def calibrate_plausibility_route(req: calibrate_module.CalibrateChainRequest):
-    return calibrate_module.calibrate_chain(_state, "plausibility", req)
+    return await _run_calibrate_off_loop(
+        calibrate_module.calibrate_chain, _state, "plausibility", req
+    )
 
 
 @app.post("/calibrate/enrich", dependencies=[Depends(require_admin)])
 async def calibrate_enrich_route(req: calibrate_module.CalibrateChainRequest):
-    return calibrate_module.calibrate_chain(_state, "enrich", req)
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_chain, _state, "enrich", req)
 
 
 @app.post("/calibrate/normalize", dependencies=[Depends(require_admin)])
 async def calibrate_normalize_route(req: calibrate_module.CalibrateNormalizeRequest):
-    return calibrate_module.calibrate_normalize(_state, req)
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_normalize, _state, req)
 
 
 @app.post("/calibrate/anonymize_facts", dependencies=[Depends(require_admin)])
 async def calibrate_anonymize_facts_route(req: calibrate_module.CalibrateAnonymizeFactsRequest):
-    return calibrate_module.calibrate_anonymize_facts(_state, req)
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_anonymize_facts, _state, req)
 
 
 @app.post("/calibrate/name", dependencies=[Depends(require_admin)])
 async def calibrate_name_route(req: calibrate_module.CalibrateNameRequest):
-    return calibrate_module.calibrate_name(_state, req)
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_name, _state, req)
+
+
+@app.post("/calibrate/respond", dependencies=[Depends(require_admin)])
+async def calibrate_respond_route(req: calibrate_module.CalibrateRespondRequest):
+    """Run one production serving turn through ``handle_chat`` for calibration.
+
+    Stamps the idle-debounce marker and runs the training-abort sequence on
+    the event loop, before dispatch — matching every other inference entry
+    point in this module. The ``calibrate_respond`` handler itself then runs
+    in the default thread-pool executor via :func:`_run_calibrate_off_loop`:
+    it blocks on the GPU lock for the length of a real serving turn, and
+    running it inline on the event loop would deadlock ``/chat`` the same
+    way every other ``/calibrate/*`` route would (see
+    ``_run_calibrate_off_loop``'s docstring). The prompt-override and
+    phase-trace ``ContextVar``s the dispatch opens are opened and read
+    inside that same executor call, so running the whole handler in one
+    thread keeps them coherent.
+    """
+    _state["last_chat_monotonic"] = time.monotonic()
+    _abort_background_training_for_inference()
+    return await _run_calibrate_off_loop(calibrate_module.calibrate_respond, _state, req)
 
 
 def _trial_active() -> bool:

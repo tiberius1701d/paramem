@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from paramem.graph.extraction_pipeline import ExtractionPipeline
 from paramem.graph.phase_trace import (
@@ -42,6 +43,7 @@ from paramem.server.calibrate import (
     CalibrateNameRequest,
     CalibrateNormalizeRequest,
     CalibrateParams,
+    CalibrateRespondRequest,
     _effective_params,
     _preflight,
     _production_turn_markers,
@@ -51,8 +53,10 @@ from paramem.server.calibrate import (
     calibrate_chain,
     calibrate_name,
     calibrate_normalize,
+    calibrate_respond,
 )
 from paramem.server.config import CloudConfig, PathsConfig, SanitizationConfig
+from paramem.server.inference import ChatResult, handle_chat
 
 
 def _empty_graph() -> SessionGraph:
@@ -99,6 +103,30 @@ def _state_enabled() -> dict:
         "consolidation_loop": MagicMock(),
         "model_id": "test-model",
     }
+
+
+def _state_respond() -> dict:
+    """``_state_enabled()`` plus the collaborators ``calibrate_respond``
+    needs: a speaker store, session buffer, router, and memory store (each
+    a permissive ``MagicMock``), and a ``text_lang_detection`` config
+    namespace with detection disabled — ``resolve_text_language`` short-
+    circuits on ``cfg.enabled`` before touching a fastText model, so no
+    model file is required for these tests.
+    """
+    state = _state_enabled()
+    store = MagicMock()
+    store.get_name.return_value = "Alex"
+    store.resolve_speaker_name.return_value = "Alex"
+    state["speaker_store"] = store
+    buffer = MagicMock()
+    buffer.get_conversation_turns.return_value = []
+    state["session_buffer"] = buffer
+    state["router"] = MagicMock()
+    state["memory_store"] = MagicMock()
+    state["config"].text_lang_detection = SimpleNamespace(
+        enabled=False, model_path="", confidence_threshold=0.5
+    )
+    return state
 
 
 def _chain_side_effect(phase: str, extra=None):
@@ -475,6 +503,40 @@ class TestChainDispatch:
         )
         calibrate_chain(state, "plausibility", req)
         assert captured["stop"] == "deanon_plausibility"
+
+    def test_invalid_stop_phase_400s_before_any_pipeline_call(self):
+        """An unknown ``stop_phase`` posted to the one open-stop use case
+        (``extract``) is rejected at guard time — before the extraction
+        pipeline is ever invoked, not as a downstream ValueError surfaced
+        as a 500."""
+        state = self._capturing_state({})
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            stop_phase="not_a_real_phase",
+        )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_chain(state, "extract", req)
+        assert exc.value.status_code == 400
+        assert "not_a_real_phase" in exc.value.detail
+        assert not state["consolidation_loop"].extraction.run.called
+
+    def test_valid_but_non_firing_stop_phase_passes_guard(self):
+        """A real member of PHASE_NAMES that this chain run never opens
+        clears guard-time validation (it is a valid name, just not
+        applicable) — the eventual 400 comes from the declared-step-
+        unreached path, proven here only by the pipeline having been
+        called at all."""
+        state = self._capturing_state({})
+        state["consolidation_loop"].extraction.run.side_effect = _chain_side_effect("local_extract")
+        req = CalibrateChainRequest(
+            transcript="[user] hi there",
+            speaker_id="speaker0",
+            stop_phase="name_extract",
+        )
+        with pytest.raises(HTTPException):
+            calibrate_chain(state, "extract", req)
+        assert state["consolidation_loop"].extraction.run.called
 
     def test_run_opens_a_calibration_scope_under_the_calibration_root(self, tmp_path):
         """The run's artifacts are directed at a per-run directory under
@@ -1160,7 +1222,8 @@ class TestRunCalibrationResponseEnvelope:
         )
 
     def test_all_required_keys_present(self):
-        """All 11 uniform keys appear in the output."""
+        """All 12 uniform keys (plus ``phases``, not required here) appear
+        in the output."""
         result = self._run(raw_output="some output", parsed={"mapping": {}})
         assert self._REQUIRED_KEYS.issubset(result.keys())
 
@@ -1296,6 +1359,43 @@ class TestCalibrateName:
             calibrate_name(state, req)
         assert exc.value.status_code == 503
 
+    def test_uses_model_bound_after_loop_ensure(self):
+        """calibrate_name reads state['model']/state['tokenizer'] AFTER
+        _ensure_calibration_loop has run, not before — a fresh server's
+        first calibration call rebinds state['model'] = loop.model inside
+        that function (calibrate.py defect fix: the pre-rebind read)."""
+        state = _state_enabled()
+        sentinel_model = object()
+
+        def _swap_and_return(passed_state):
+            passed_state["model"] = sentinel_model
+            return passed_state["consolidation_loop"]
+
+        captured: dict = {}
+
+        def _fake_extract(turns, model, tokenizer, **kwargs):
+            captured["model"] = model
+            return "Alex", "raw output"
+
+        with (
+            patch(
+                "paramem.server.calibrate._ensure_calibration_loop",
+                side_effect=_swap_and_return,
+            ),
+            patch(
+                "paramem.graph.name_extraction.extract_name_via_llm",
+                side_effect=_fake_extract,
+            ),
+        ):
+            req = CalibrateNameRequest(turns=[{"role": "user", "text": "I'm Alex."}])
+            # The stubbed extractor opens no phase record, so
+            # _run_calibration's declared-step-unreached check 400s after
+            # dispatch runs — irrelevant to what this test pins.
+            with pytest.raises(HTTPException):
+                calibrate_name(state, req)
+
+        assert captured["model"] is sentinel_model
+
     def test_missing_prompt_variant_raises_400(self, tmp_path):
         """A named variant absent from the calibration prompt directory is
         refused before any model call — never a silent fall-back to the
@@ -1422,6 +1522,296 @@ class TestCalibrateName:
         assert "custom user" in user_content, (
             f"Model received default user prompt instead of override: {user_content!r}"
         )
+
+
+def _respond_dispatch_double(*, text: str = "a reply", escalated: bool = False, diagnostics=None):
+    """A ``handle_chat`` stand-in for ``/calibrate/respond`` tests.
+
+    Opens the real ``"serve_turn"`` phase around a stamp of *text*/
+    *diagnostics* rather than skipping it — see ``_chain_side_effect``'s
+    docstring above for why a dispatch double must fire the real phase: a
+    double that skips it would only exercise the calibration substrate's
+    "declared step never ran" refusal, not the wiring this test aims at.
+    """
+    diagnostics = diagnostics if diagnostics is not None else {"exit_via": "personal_probe"}
+
+    def _call(**_kwargs):
+        with phase_trace("serve_turn") as phase:
+            phase.set_raw(text)
+            phase.set_parsed(dict(diagnostics))
+        return ChatResult(text=text, escalated=escalated, diagnostics=dict(diagnostics))
+
+    return _call
+
+
+class TestCalibrateRespond:
+    """Tests for the ``/calibrate/respond`` use case."""
+
+    def test_disabled_404(self):
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_respond(_state_disabled(), req)
+        assert exc.value.status_code == 404
+
+    def test_consolidating_503(self):
+        state = _state_respond()
+        state["consolidating"] = True
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_respond(state, req)
+        assert exc.value.status_code == 503
+
+    def test_model_missing_503(self):
+        state = _state_respond()
+        state["model"] = None
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_respond(state, req)
+        assert exc.value.status_code == 503
+
+    def test_unknown_speaker_400_names_the_id(self):
+        """An unenrolled speaker is a 400, never a 404 — the driver script
+        (``scripts/dev/calibrate_prompts.py``) turns any 404 into an
+        actionable ``calibrate_endpoint_enabled`` operator hint, which would
+        mislead on an unenrolled speaker rather than an unenabled endpoint."""
+        state = _state_respond()
+        state["speaker_store"].get_name.return_value = None
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker99")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_respond(state, req)
+        assert exc.value.status_code == 400
+        assert "speaker99" in exc.value.detail
+
+    def test_empty_text_400(self):
+        state = _state_respond()
+        req = CalibrateRespondRequest(text="", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_respond(state, req)
+        assert exc.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "component", ["speaker_store", "session_buffer", "router", "memory_store"]
+    )
+    def test_missing_component_503(self, component):
+        state = _state_respond()
+        state[component] = None
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_respond(state, req)
+        assert exc.value.status_code == 503
+
+    def test_missing_prompt_variant_400_before_dispatch(self, tmp_path):
+        state = _state_respond()
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+        req = CalibrateRespondRequest(
+            text="Hello",
+            speaker_id="speaker0",
+            prompt_variants={"serving_system.txt": "absent_variant.txt"},
+        )
+        with patch(
+            "paramem.server.inference.handle_chat",
+            side_effect=AssertionError("dispatch must not run when the guard rejects"),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                calibrate_respond(state, req)
+        assert exc.value.status_code == 400
+        assert "variant not found" in exc.value.detail.lower()
+
+    def test_parameter_coverage_matches_handle_chat_signature(self):
+        """Fails the moment ``handle_chat`` grows a parameter this dispatch
+        does not pass through. ``handle_chat`` currently takes 14
+        parameters; this test protects only THIS call site
+        (``calibrate_respond``'s own kwarg set) — the other two production
+        call sites (``POST /chat``, ``POST /debug/probe``) each need their
+        own equivalent coverage against the same signature drift."""
+        expected = set(inspect.signature(handle_chat).parameters)
+        captured: dict = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            with phase_trace("serve_turn"):
+                pass
+            return ChatResult(text="ok", escalated=False, diagnostics={})
+
+        state = _state_respond()
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
+        with patch("paramem.server.inference.handle_chat", side_effect=_capture):
+            calibrate_respond(state, req)
+
+        assert set(captured) == expected
+
+    def test_uniform_envelope(self):
+        state = _state_respond()
+        req = CalibrateRespondRequest(text="Hello", speaker_id="speaker0")
+        diagnostics = {"exit_via": "personal_probe", "intent": "PERSONAL"}
+        with patch(
+            "paramem.server.inference.handle_chat",
+            side_effect=_respond_dispatch_double(
+                text="a reply", escalated=True, diagnostics=diagnostics
+            ),
+        ):
+            result = calibrate_respond(state, req)
+
+        required_keys = {
+            "stage",
+            "prompts",
+            "raw_output",
+            "parsed",
+            "n_input_tokens",
+            "n_output_tokens",
+            "wall_clock_seconds",
+            "model",
+            "params_effective",
+            "vram_before",
+            "vram_after",
+            "phases",
+            "artifact_dir",
+            "variants_unexercised",
+        }
+        assert required_keys.issubset(result.keys())
+        assert result["stage"] == "respond"
+        assert result["raw_output"] == "a reply"
+        assert result["parsed"]["escalated"] is True
+        # No resolved_text companion: it would write a household member's
+        # real display name into an on-disk artifact and duplicate
+        # raw_output — see calibrate_respond's docstring.
+        assert "resolved_text" not in result["parsed"]
+        assert result["parsed"]["exit_via"] == "personal_probe"
+        assert result["parsed"]["intent"] == "PERSONAL"
+        # No prompt_variants were supplied on this request, so there is
+        # nothing to have failed to exercise.
+        assert result["variants_unexercised"] == []
+
+    def test_no_params_field_and_params_effective_all_null(self):
+        """Pins against a later re-introduction of an echo-only ``params``
+        field: the request model exposes none, and ``params_effective`` is
+        all-``null`` because ``calibrate_respond`` always calls
+        ``_run_calibration`` with a bare ``CalibrateParams()`` and
+        ``supports_seed=False``."""
+        req = CalibrateRespondRequest(
+            text="Hello", speaker_id="speaker0", **{"params": {"temperature": 0.9}}
+        )
+        assert not hasattr(req, "params")
+
+        state = _state_respond()
+        with patch(
+            "paramem.server.inference.handle_chat",
+            side_effect=_respond_dispatch_double(),
+        ):
+            result = calibrate_respond(state, req)
+
+        assert all(v is None for v in result["params_effective"].values())
+
+    def test_prompt_variant_provenance_and_content_reach_dispatch(self, tmp_path):
+        """The overridden ``serving_system.txt`` is reported in provenance
+        AND is the exact content the dispatch double's own prompt load
+        returns — one derivation (``_load_prompt`` under the active
+        override), two readers, per ``TestCalibrateName.
+        test_filename_override_used_at_execution``."""
+        state = _state_respond()
+        variants = tmp_path / "prompts"
+        variants.mkdir()
+        variant_content = "custom serving system prompt"
+        (variants / "my_serving_system.txt").write_text(variant_content)
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+
+        req = CalibrateRespondRequest(
+            text="Hello",
+            speaker_id="speaker0",
+            prompt_variants={"serving_system.txt": "my_serving_system.txt"},
+        )
+
+        def _loads_serving_system(**_kwargs):
+            from paramem.server.prompts import serving_system_prompt
+
+            with phase_trace("serve_turn") as phase:
+                content = serving_system_prompt()
+                phase.set_raw(content)
+                phase.set_parsed({"exit_via": "test"})
+            return ChatResult(text=content, escalated=False, diagnostics={"exit_via": "test"})
+
+        with patch(
+            "paramem.server.inference.handle_chat",
+            side_effect=_loads_serving_system,
+        ):
+            result = calibrate_respond(state, req)
+
+        paths_reported = {p["path"] for p in result["prompts"]}
+        assert "<override:serving_system.txt>" in paths_reported
+        assert result["raw_output"] == variant_content
+        # The override's production basename shows up as <override:...> in
+        # provenance above, so nothing is unexercised.
+        assert result["variants_unexercised"] == []
+
+    def test_variants_unexercised_lists_basename_never_loaded(self, tmp_path):
+        """A branch that never touches a given production prompt (e.g. an
+        HA-answered or non-cloud, non-temporal turn skipping
+        ``recall_selection.txt``) reports the gap in
+        ``variants_unexercised`` rather than 400ing — a multi-variant sweep
+        must not fail because one leg didn't fire on this utterance."""
+        state = _state_respond()
+        variants = tmp_path / "prompts"
+        variants.mkdir()
+        (variants / "my_recall_selection.txt").write_text("unused variant")
+        state["config"].paths = PathsConfig(calibration=tmp_path)
+
+        req = CalibrateRespondRequest(
+            text="Hello",
+            speaker_id="speaker0",
+            prompt_variants={"recall_selection.txt": "my_recall_selection.txt"},
+        )
+
+        with patch(
+            "paramem.server.inference.handle_chat",
+            side_effect=_respond_dispatch_double(),
+        ):
+            result = calibrate_respond(state, req)
+
+        assert result["variants_unexercised"] == ["recall_selection.txt"]
+
+    def test_serve_turn_phase_lands_in_envelope_through_real_handle_chat(self):
+        """No dispatch double: exercises the trace no-op nesting the doubles
+        in the tests above bypass.  ``handle_chat`` opens its OWN
+        ``extraction_trace()``/``phase_trace("serve_turn")`` scope around
+        its whole dispatch (see ``paramem.server.inference.handle_chat``);
+        ``_run_calibration`` also opens ``extraction_trace()`` around
+        ``dispatch()``.  Re-entry into an already-active
+        ``extraction_trace()`` is documented as a no-op (the inner scope
+        lands on the SAME trace) — this proves that nesting actually works
+        end to end, not just in the phase_trace unit tests, by calling the
+        real ``handle_chat`` and reading the ``serve_turn`` record back out
+        of the calibration envelope.
+
+        Only ``_base_model_answer`` — the actual model-touching leaf — is
+        patched, mirroring ``tests/server/test_chat_diagnostics.py``.  The
+        router is a permissive stand-in returning a GENERAL, no-steps
+        ``RoutingPlan`` so the turn falls through HA (no ``ha_client``) and
+        cloud (no ``cloud_agent``) to the base model; ``abstention.enabled``
+        is set False so the abstention gate short-circuits without needing
+        a real ``sentence_type`` config namespace — the minimal config
+        additions this dispatch path actually touches, not a full
+        ``ServerConfig()``.
+        """
+        from paramem.server.router import Intent, RoutingPlan
+
+        state = _state_respond()
+        state["config"].personal_referent = None
+        state["config"].abstention = SimpleNamespace(enabled=False)
+        state["router"] = MagicMock()
+        state["router"].route.return_value = RoutingPlan(strategy="direct", intent=Intent.GENERAL)
+        req = CalibrateRespondRequest(text="hello there", speaker_id="speaker0")
+
+        with patch(
+            "paramem.server.inference._base_model_answer",
+            return_value=ChatResult(text="base reply", escalated=False, diagnostics={}),
+        ):
+            result = calibrate_respond(state, req)
+
+        serve_records = [p for p in result["phases"] if p.get("name") == "serve_turn"]
+        assert len(serve_records) == 1
+        assert serve_records[0]["raw_output"] == "base reply"
+        assert result["raw_output"] == "base reply"
+        assert result["parsed"]["exit_via"] == "base_model"
 
 
 class TestExtractNameViaLlmUserTurnFilter:
@@ -1574,3 +1964,93 @@ class TestExtractNameViaLlmUserTurnFilter:
             _load_prompt("no_such_prompt_xyz.txt", prompts_dir=tmp_path)
         assert "no_such_prompt_xyz.txt" in str(exc_info.value)
         assert "Searched" in str(exc_info.value)
+
+
+class TestCalibrateRoutesRunOffEventLoop:
+    """Route-level proof that the nine ``/calibrate/*`` routes dispatch their
+    sync handler off the event loop (``_run_calibrate_off_loop`` in
+    ``paramem/server/app.py``).
+
+    Every calibrate handler reaches ``gpu_lock_sync()`` (blocking, unbounded
+    timeout) through ``_measured_local_call``. Calling it inline on the
+    event loop — as these routes used to — would block the loop while
+    waiting for that lock; ``/chat``'s async ``gpu_lock()`` releases its
+    lock inside an async-generator ``finally`` that itself needs the loop
+    to run, so a blocked loop can never let that release happen and the
+    server deadlocks permanently. These tests exercise the real ASGI app
+    through ``TestClient`` used WITHOUT the ``with`` context-manager form
+    (which would run the app's lifespan and attempt a real model load) to
+    prove the executor round trip preserves both the raised
+    ``HTTPException``'s status code and the calling-side ordering the
+    respond route depends on.
+    """
+
+    def setup_method(self):
+        from paramem.server.app import app as real_app
+        from paramem.server.app import require_admin
+
+        self._real_app = real_app
+        self._require_admin = require_admin
+        real_app.dependency_overrides[require_admin] = lambda: None
+
+    def teardown_method(self):
+        self._real_app.dependency_overrides.pop(self._require_admin, None)
+
+    def test_http_exception_from_executor_surfaces_with_its_status(self):
+        """A calibrate handler's ``HTTPException``, raised inside the
+        thread-pool executor, reaches the client as that same HTTP status —
+        proving ``run_in_executor`` futures propagate exceptions to the
+        awaiting coroutine (and thence into FastAPI's exception handling)
+        unchanged. Uses the real disabled-gate 404 every ``/calibrate/*``
+        route raises when ``calibrate_endpoint_enabled`` is off — no mock
+        of ``calibrate_chain`` itself, so this exercises the actual
+        ``_preflight`` guard running inside the executor thread."""
+        from paramem.server.app import _state
+
+        original_config = _state.get("config")
+        _state["config"] = SimpleNamespace(
+            consolidation=SimpleNamespace(calibrate_endpoint_enabled=False)
+        )
+        try:
+            client = TestClient(self._real_app)
+            resp = client.post(
+                "/calibrate/extract",
+                json={"transcript": "[user] hi there", "speaker_id": "speaker0"},
+            )
+        finally:
+            _state["config"] = original_config
+
+        assert resp.status_code == 404
+        assert "disabled" in str(resp.json()).lower()
+
+    def test_respond_route_stamps_debounce_and_aborts_training_before_dispatch(self):
+        """The idle-debounce stamp and the training-abort call happen on
+        the event-loop side, before the executor dispatch — proven by
+        patching ``calibrate_respond`` itself (no real preflight/model
+        access needed) and asserting the abort mock ran and the debounce
+        marker moved."""
+        from paramem.server.app import _state
+
+        original_last_chat = _state.get("last_chat_monotonic")
+        try:
+            with (
+                patch("paramem.server.app.calibrate_module.calibrate_respond") as mocked_respond,
+                patch(
+                    "paramem.server.app._abort_background_training_for_inference"
+                ) as mocked_abort,
+            ):
+                mocked_respond.return_value = {"stage": "respond", "raw_output": "ok"}
+                client = TestClient(self._real_app)
+                resp = client.post(
+                    "/calibrate/respond",
+                    json={"text": "Hello", "speaker_id": "speaker0"},
+                )
+
+            assert resp.status_code == 200
+            assert resp.json() == {"stage": "respond", "raw_output": "ok"}
+            assert mocked_abort.call_count == 1
+            assert mocked_respond.call_count == 1
+            assert _state.get("last_chat_monotonic") is not None
+            assert _state.get("last_chat_monotonic") != original_last_chat
+        finally:
+            _state["last_chat_monotonic"] = original_last_chat

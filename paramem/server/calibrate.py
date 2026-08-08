@@ -35,6 +35,13 @@ endpoints whose own step sits inside a composite stage (``cloud_enrich``,
 the chain produce the intermediate artifacts by running — which is why
 the enrichment and plausibility use cases place a BILLED cloud call.
 
+The module also hosts four standalone handlers outside the chain —
+:func:`calibrate_normalize` (``POST /calibrate/normalize``),
+:func:`calibrate_anonymize_facts` (``POST /calibrate/anonymize_facts``),
+:func:`calibrate_name` (``POST /calibrate/name``), and
+:func:`calibrate_respond` (``POST /calibrate/respond``) — each with its
+own request shape; see each function's docstring.
+
 No call modifies weights or writes production data on disk.  Prompt
 variants are resolved by name from ``paths.calibration/prompts/`` and
 injected via :func:`~paramem.graph.prompts.prompt_overrides`; artifacts
@@ -42,9 +49,9 @@ land under ``paths.calibration/artifacts/``.
 
 Returns a uniform shape:
 
-  prompt_path, prompt_sha, prompt_template, raw_output, parsed,
-  n_input_tokens, n_output_tokens, wall_clock_seconds, model,
-  params_effective, vram_before, vram_after, artifact_dir.
+  stage, prompts, raw_output, parsed, n_input_tokens, n_output_tokens,
+  wall_clock_seconds, model, params_effective, vram_before, vram_after,
+  phases, artifact_dir.
 
 Concurrency: every endpoint short-circuits with 503 when
 ``_state["consolidating"]`` is True so calibration calls cannot race
@@ -68,6 +75,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from paramem.graph.phase_trace import (
+    PHASE_NAMES,
     PhaseRecord,
     extraction_trace,
     phase_trace,
@@ -76,6 +84,7 @@ from paramem.graph.phase_trace import (
 )
 from paramem.graph.prompts import _load_prompt, prompt_overrides
 from paramem.graph.schema import SessionGraph
+from paramem.server import lang_id
 from paramem.server.gpu_lock import gpu_lock_sync
 from paramem.server.session_buffer import SessionBuffer
 from paramem.utils.artifacts import calibration_run, on_calibration_result, on_session_extracted
@@ -244,6 +253,37 @@ class CalibrateNameRequest(BaseModel):
     user_turns_only: bool = True
     prompt_variants: dict[str, str] = Field(default_factory=dict)
     params: CalibrateParams = Field(default_factory=CalibrateParams)
+
+
+class CalibrateRespondRequest(BaseModel):
+    """Run one serving turn through the production chat dispatch
+    (:func:`~paramem.server.inference.handle_chat`) for an enrolled speaker.
+
+    ``text`` is a bare utterance — not a turn-marked transcript; the
+    serving path never expects the ``[user]``/``[assistant]`` markers
+    :func:`_require_turn_marked_transcript` requires from the extraction
+    chain endpoints. ``conversation_id`` selects which stored history
+    :meth:`~paramem.server.session_buffer.SessionBuffer.get_conversation_turns`
+    reads back; the default reads back empty (a fresh conversation), same as
+    every other calibration use case's default id.
+
+    Deliberately carries **no sampling-parameter field**. The serving
+    generate hardcodes ``temperature=0.0`` and takes its token cap from
+    ``config.inference.max_response_tokens`` (there is no production caller
+    of either as a per-request override) — offering a ``params`` field here
+    that the call silently ignored would be exactly the ``top_p``/``top_k``
+    echo-without-effect pattern this module already documents as a defect
+    for the chain endpoints, reproduced on purpose.
+
+    ``prompt_variants`` carries the operator's prompt variants, resolved
+    the same way every other calibration use case resolves them (see
+    :func:`_resolve_prompt_variants`).
+    """
+
+    text: str
+    speaker_id: str
+    conversation_id: str = "calib-respond"
+    prompt_variants: dict[str, str] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +474,8 @@ def _measured_local_call():
 
     Captures ``vram_before``, acquires ``gpu_lock_sync()`` and
     ``_cudnn_deterministic()``, then records ``elapsed`` and ``vram_after``
-    on exit.  All five calibration handlers must use this wrapper so the
+    on exit.  All five calibration handler functions (behind nine routes —
+    :func:`calibrate_chain` alone serves five) must use this wrapper so the
     "every local stage takes the GPU lock" invariant is enforced in a single
     place.
 
@@ -700,7 +741,7 @@ def _run_calibration(
        input that never reaches it must be reported, not papered over with
        an envelope carrying empty provenance. See
        :func:`_declared_step_unreached`.
-    7. Assembles the uniform 11-key response (+ ``phases``) directly from
+    7. Assembles the uniform 12-key response (+ ``phases``) directly from
        ``records``, ``prompts``, ``input_prompt_text``, ``raw_output``,
        ``parsed``, and ``m`` — the per-stage parts (``prompts``,
        ``raw_output``, ``parsed``) come from steps 1-5 above; the shared
@@ -721,8 +762,15 @@ def _run_calibration(
             :func:`_provenance_from_records`).
         state: The live server state dict.
         params: The request's :class:`CalibrateParams`.
-        supports_seed: ``True`` for local stages, ``False`` for cloud
-            stages (mirrors the existing ``_effective_params`` convention).
+        supports_seed: Whether ``params_effective["seed"]`` echoes
+            ``params.seed`` (``True``) or is forced to ``null`` (``False``).
+            Every extraction-chain and graph-tier stage passes ``True`` — a
+            seeded ``torch.Generator`` scopes the local generate. The one
+            ``False`` caller (:func:`calibrate_respond`) is not a cloud
+            stage: it passes ``False`` because ``CalibrateRespondRequest``
+            carries no sampling-parameter field at all, so no seed exists to
+            thread into the serving path — the flag is about whether a seed
+            was ever supplied, not about which transport the stage uses.
 
     Returns:
         The uniform calibration response dict.
@@ -909,6 +957,17 @@ def calibrate_chain(state: dict, use_case: str, req: CalibrateChainRequest) -> d
     resolved: dict[str, Any] = {}
 
     def guard() -> None:
+        # Validated here, at the HTTP boundary — after _preflight's config/
+        # state gates but before the GPU lock _measured_local_call takes —
+        # the SAME source (PHASE_NAMES) stop_at validates again downstream
+        # as a library precondition. Duplicating the membership test is
+        # deliberate: one is a request-input check, the other guards the
+        # pipeline call regardless of caller.
+        if stop is not None and stop not in PHASE_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"stop_phase {stop!r} is not a valid phase name. Valid: {list(PHASE_NAMES)}",
+            )
         _require_turn_marked_transcript(req.transcript)
         if not req.speaker_id:
             raise HTTPException(
@@ -1242,8 +1301,6 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
     from paramem.graph.name_extraction import extract_name_via_llm
     from paramem.models.loader import base_model_inference
 
-    model = state.get("model")
-    tokenizer = state.get("tokenizer")
     inference_params = {
         "temperature": req.params.temperature,
         "seed": req.params.seed,
@@ -1255,6 +1312,12 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
         resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
 
     def dispatch() -> tuple[Any, dict]:
+        # Read AFTER _ensure_calibration_loop (called by _run_calibration
+        # before dispatch) so a first-ever calibration call on a fresh
+        # server sees the loop's rebound state["model"]/["tokenizer"]
+        # rather than the pre-rebind values.
+        model = state.get("model")
+        tokenizer = state.get("tokenizer")
         with prompt_overrides(resolved["overrides"]), base_model_inference(model):
             extracted, raw_output = extract_name_via_llm(
                 req.turns,
@@ -1276,20 +1339,180 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
     )
 
 
+def calibrate_respond(state: dict, req: CalibrateRespondRequest) -> dict[str, Any]:
+    """Run one production serving turn for an enrolled speaker.
+
+    A standalone use case, like :func:`calibrate_normalize`,
+    :func:`calibrate_anonymize_facts`, and :func:`calibrate_name`: it never
+    goes through :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline`
+    — ``dispatch`` calls :func:`~paramem.server.inference.handle_chat`
+    verbatim, the same function ``POST /chat`` and ``POST /voice`` dispatch
+    to, with the SAME production kwarg set. Everything the call reaches from
+    there (dual-graph routing, the personal probe, HA escalation, cloud
+    escalation, abstention, the base-model fallback) runs exactly as it
+    would on a real turn: **this call may actuate a Home Assistant device
+    and place a billed cloud call**, with no opt-out.
+
+    ``guard`` rejects empty ``text``, empty or unknown ``speaker_id``
+    (``store.get_name(...) is None`` — **400, not 404**: the driver script
+    at ``scripts/dev/calibrate_prompts.py`` turns any 404 into an
+    ``calibrate_endpoint_enabled`` operator hint, which would mislead on an
+    unenrolled speaker), a missing ``speaker_store``/``session_buffer``/
+    ``router``/``memory_store`` (503 — server-not-ready, matching
+    :func:`_preflight`'s vocabulary), and an unresolvable prompt variant —
+    all before any model call. ``dispatch`` resolves the turn's language
+    (:func:`~paramem.server.lang_id.resolve_text_language`), the speaker's
+    display name, and the stored conversation history, then calls
+    :func:`~paramem.server.inference.handle_chat` under the operator's
+    prompt overrides; ``model``/``tokenizer`` are read from ``state`` INSIDE
+    ``dispatch`` (after :func:`_ensure_calibration_loop` has had a chance to
+    rebind them on a fresh server, same defect fix as :func:`calibrate_name`).
+
+    Envelope semantics specific to this use case:
+
+    * ``raw_output`` is the token-space reply (``speaker{N}`` tokens intact)
+      — the exact string :meth:`~paramem.server.session_buffer.SessionBuffer.append`
+      would persist for a real turn.  There is deliberately no
+      ``resolved_text`` companion: resolving ``speaker{N}`` tokens to real
+      household display names would write them into this on-disk artifact,
+      contradicting the token-space storage discipline
+      (:func:`~paramem.server.speaker.resolve_speaker_tokens` is scoped to
+      human-display output only), and it would only duplicate
+      ``raw_output`` in substance.
+    * ``parsed`` carries ``escalated`` (bool) and every key of
+      :attr:`~paramem.server.inference.ChatResult.diagnostics` (routing
+      decision, and — on the personal-probe leg — per-adapter probe
+      counts and the temporal selection outcome) flattened in.
+    * ``params_effective`` is all-``null`` by construction: this request
+      shape has no sampling-parameter field (see
+      :class:`CalibrateRespondRequest`), so :func:`_run_calibration` is
+      called with a bare :class:`CalibrateParams` and ``supports_seed=False``
+      — no seed threads into the serving path at all.
+    * ``n_input_tokens`` measures the template of the FIRST non-``*_system.txt``
+      prompt the ``serve_turn`` phase record captured (see
+      :func:`_provenance_from_records`) — which basename that actually is
+      depends on which branch the turn took: ``intent_classifier.txt``
+      under the shipped ``intent.mode: llm``, ``recall_selection.txt`` on
+      the temporal personal leg under encoder mode, or
+      ``serving_directives.txt`` otherwise.  Always the unsubstituted
+      template, per the project-wide provenance contract, never the
+      rendered prompt actually sent.
+    * ``phases`` includes any nested cloud-egress phases (``local_extract``,
+      ``cloud_enrich``, …) that a turn escalating through
+      :func:`~paramem.server.inference.answer_via_cloud` opened on this same
+      trace.
+    * ``variants_unexercised`` (sorted list, top-level envelope key, empty
+      when every override loaded): which prompt was resolved is
+      branch-dependent (an HA-answered turn loads none of the serving
+      prompts at all; ``cloud_serving_system.txt`` loads only on cloud
+      escalation; ``recall_selection.txt`` only on the temporal personal
+      leg; ``intent_classifier.txt`` only under ``intent.mode: llm``), so a
+      variant that never got a chance to load is NOT a 400 — a
+      multi-variant sweep must not fail because one leg didn't fire on
+      this particular utterance, the turn still ran production-faithfully.
+      Computed after :func:`_run_calibration` returns, by diffing
+      ``req.prompt_variants``'s keys against every ``<override:{name}>``
+      basename actually found in the response's ``prompts`` list.
+
+    This call writes no session-buffer entry, no speaker-store write, and no
+    registry write (:func:`~paramem.server.inference.handle_chat` itself
+    performs none); the reply and routing diagnostics are written to this
+    run's own artifact directory by the shared
+    :func:`~paramem.utils.artifacts.on_calibration_result` hook, same as
+    every other calibration stage.
+    """
+    resolved: dict[str, Any] = {}
+
+    def guard() -> None:
+        if not req.text:
+            raise HTTPException(status_code=400, detail="text must not be empty.")
+        if not req.speaker_id:
+            raise HTTPException(
+                status_code=400,
+                detail="speaker_id is required (no empty-string default).",
+            )
+        store = state.get("speaker_store")
+        if store is None:
+            raise HTTPException(status_code=503, detail="Speaker store not ready.")
+        if state.get("session_buffer") is None:
+            raise HTTPException(status_code=503, detail="Session buffer not ready.")
+        if state.get("router") is None:
+            raise HTTPException(status_code=503, detail="Router not ready.")
+        if state.get("memory_store") is None:
+            raise HTTPException(status_code=503, detail="Memory store not ready.")
+        if store.get_name(req.speaker_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown speaker_id: {req.speaker_id!r} is not enrolled.",
+            )
+        resolved["overrides"] = _resolve_prompt_variants(state, req.prompt_variants)
+
+    def dispatch() -> tuple[str, dict]:
+        from paramem.server.inference import handle_chat
+
+        model, tokenizer = state["model"], state["tokenizer"]
+        language, _ = lang_id.resolve_text_language(req.text, state["config"].text_lang_detection)
+        store = state["speaker_store"]
+        speaker_name = store.resolve_speaker_name(req.speaker_id)
+        history = state["session_buffer"].get_conversation_turns(req.conversation_id)
+        with prompt_overrides(resolved["overrides"]):
+            result = handle_chat(
+                text=req.text,
+                conversation_id=req.conversation_id,
+                speaker=speaker_name,
+                speaker_id=req.speaker_id,
+                history=history,
+                model=model,
+                tokenizer=tokenizer,
+                config=state["config"],
+                router=state["router"],
+                cloud_agent=state.get("cloud_agent"),
+                ha_client=state.get("ha_client"),
+                language=language,
+                effective_mode=state.get("effective_mode"),
+                memory_store=state["memory_store"],
+            )
+        parsed = {
+            "escalated": result.escalated,
+            **result.diagnostics,
+        }
+        return result.text, parsed
+
+    response = _run_calibration(
+        stage="respond",
+        guard=guard,
+        dispatch=dispatch,
+        input_prompt_phase="serve_turn",
+        state=state,
+        params=CalibrateParams(),
+        supports_seed=False,
+    )
+    exercised = {
+        path[len("<override:") : -1]
+        for p in response.get("prompts", [])
+        if isinstance((path := p.get("path")), str) and path.startswith("<override:")
+    }
+    response["variants_unexercised"] = sorted(set(req.prompt_variants) - exercised)
+    return response
+
+
 def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
     """Return the params dict the call effectively applied.
 
     ``supports_seed`` distinguishes local stages (where seed is honoured
-    via a scoped torch.Generator) from cloud stages (where Anthropic's API
-    accepts no seed parameter and the field is silently dropped).  The
+    via a scoped torch.Generator) from a stage fronting an API that accepts
+    no seed parameter (where the field would be silently dropped).  The
     response uses this to inform the operator which fields actually
     landed.
 
-    seed threads through all three local stages (extract, anonymize,
-    plausibility) via the helpers' ``seed`` parameter forwarded to
-    ``generate_answer``.  top_p / top_k are not yet threaded for these
-    stages (documented gap; cloud stages follow the Anthropic API which
-    omits them).  The field is reported as-requested for transparency.
+    Every local stage (:func:`calibrate_chain`, :func:`calibrate_normalize`,
+    :func:`calibrate_anonymize_facts`, :func:`calibrate_name`) calls this
+    with ``supports_seed=True``. :func:`calibrate_respond` is the one
+    ``supports_seed=False`` caller — its request shape carries no sampling
+    parameters at all, so ``seed`` is forced to ``null`` rather than echoing
+    a value that was never collected.  top_p / top_k are not yet threaded to
+    any stage's generation call (documented gap).  The field is reported
+    as-requested for transparency.
     """
     out: dict = {}
     for f in ("temperature", "top_p", "top_k", "max_tokens"):
