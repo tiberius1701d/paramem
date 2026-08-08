@@ -1645,6 +1645,83 @@ class TestSaveAdaptersManifest:
         # Manifest version must be v4 (no keyed_pairs_sha256 field).
         assert manifest.schema_version == 4
 
+    def test_save_adapters_stamps_each_tier_with_its_own_count(self, tmp_path):
+        """Each tier's manifest carries that tier's own active-key count.
+
+        Regression guard: a prior implementation stamped every tier's
+        manifest with the sum of active keys across ALL tiers, so a tier
+        with one key would read the same ``key_count`` as a tier with two.
+        Seed episodic and semantic with different-sized registries and
+        assert each manifest reports only its own tier's count.
+        """
+        from paramem.adapters.manifest import read_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_save_loop(tmp_path)
+
+        # Second tier's LoRA config, shaped like the episodic one so
+        # build_manifest_for can read rank/alpha/targets for it too.
+        lora_cfg = MagicMock()
+        lora_cfg.r = 4
+        lora_cfg.lora_alpha = 8
+        lora_cfg.lora_dropout = 0.0
+        lora_cfg.target_modules = ["q_proj"]
+        lora_cfg.bias = "none"
+        loop.model.peft_config["semantic"] = lora_cfg
+
+        ep_reg = KeyRegistry()
+        ep_reg.add("graph1")
+        loop.store.load_registry("episodic", ep_reg)
+
+        sem_reg = KeyRegistry()
+        sem_reg.add("graph2")
+        sem_reg.add("graph3")
+        loop.store.load_registry("semantic", sem_reg)
+
+        loop._save_adapters()
+
+        episodic_slots = [
+            d
+            for d in (tmp_path / "episodic").iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        semantic_slots = [
+            d
+            for d in (tmp_path / "semantic").iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        assert episodic_slots, "No episodic slot dir created"
+        assert semantic_slots, "No semantic slot dir created"
+
+        episodic_manifest = read_manifest(episodic_slots[0])
+        semantic_manifest = read_manifest(semantic_slots[0])
+
+        assert episodic_manifest.key_count == 1
+        assert semantic_manifest.key_count == 2
+
+        # Coupling invariant: key_count and registry_sha256 must derive from
+        # the SAME registry snapshot — not just happen to carry the right
+        # number. Load the on-disk registry file each manifest's
+        # registry_sha256 actually names (hash the literal bytes, don't
+        # re-serialise in memory) and assert key_count equals that file's
+        # own active-key count.
+        import hashlib
+
+        for manifest, tier_name, expected_count in (
+            (episodic_manifest, "episodic", 1),
+            (semantic_manifest, "semantic", 2),
+        ):
+            registry_path = tmp_path / tier_name / "indexed_key_registry.json"
+            registry_bytes = registry_path.read_bytes()
+            assert hashlib.sha256(registry_bytes).hexdigest() == manifest.registry_sha256, (
+                f"{tier_name} manifest.registry_sha256 does not name the on-disk registry file"
+            )
+            on_disk_registry = KeyRegistry.load(registry_path)
+            assert manifest.key_count == len(on_disk_registry) == expected_count, (
+                f"{tier_name} manifest.key_count must equal the active-key count "
+                "of the exact registry snapshot its registry_sha256 names"
+            )
+
 
 class TestAtomicJsonWriteHonoursSecurityPosture:
     """write_infra_json always routes through the infrastructure envelope.
@@ -3387,9 +3464,10 @@ class TestAbortSkipsCommit:
 
         import networkx as _nx
 
-        # Pre-populate the store so _all_active_keys() returns at least one key
-        # and jobs_by_tier["episodic"] ends up non-empty (otherwise the tier is
-        # skipped, the abort branch is never reached, and no rollback fires).
+        # Pre-populate the store so store.all_active_keys() returns at least
+        # one key and jobs_by_tier["episodic"] ends up non-empty (otherwise
+        # the tier is skipped, the abort branch is never reached, and no
+        # rollback fires).
         loop.store.put(
             "episodic",
             "graph1",

@@ -1264,6 +1264,61 @@ class TestCommitTierSlotVerifyCallback:
 
         assert not verify_called, "verify must NOT be called in simulate mode"
 
+    def test_manifest_key_count_is_the_slot_own_tier_not_the_global_store(
+        self, tmp_path: Path
+    ) -> None:
+        """commit_tier_slot stamps key_count from the committed tier's own
+        registry, not the sum of active keys across every tier in the store.
+
+        The fixture loop's ``episodic_interim_20260101T0000`` registry holds
+        one key.  A second, unrelated tier with two keys is added to the same
+        store so a store-global count would read 3 — the manifest must still
+        read 1.
+        """
+        from paramem.memory.persistence import commit_tier_slot
+
+        loop = self._make_loop(tmp_path)
+
+        other_reg = KeyRegistry()
+        other_reg.add("graph2")
+        other_reg.add("graph3")
+        loop.store.load_registry("semantic", other_reg)
+
+        captured_kwargs: dict[str, object] = {}
+
+        def _fake_build_manifest_for(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        from paramem.training.key_registry import KeyRegistry as _KR
+
+        with (
+            patch(
+                "paramem.models.loader.save_adapter",
+                return_value=tmp_path / "fake_slot",
+            ),
+            patch(
+                "paramem.adapters.manifest.build_manifest_for",
+                side_effect=_fake_build_manifest_for,
+            ),
+            patch.object(_KR, "save_from_bytes"),
+        ):
+            commit_tier_slot(
+                loop=loop,
+                tier="episodic",
+                adapter_name="episodic_interim_20260101T0000",
+                stamp="20260101T0000",
+                mode="train",
+                all_keyed=[],
+                output_dir=tmp_path,
+                verify=None,
+            )
+
+        assert captured_kwargs.get("key_count") == 1, (
+            "key_count must reflect the interim tier's own registry (1 key), "
+            f"not the store-global count; got {captured_kwargs.get('key_count')}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _persist_fold verify wiring

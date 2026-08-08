@@ -142,8 +142,8 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
 
     ``registry`` must be a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
     (when absent, a fresh three-tier dict is used).  Each entry is installed
-    via ``store.load_registry`` so ``_all_active_keys()`` works without a real
-    ``__init__`` call.
+    via ``store.load_registry`` so ``store.all_active_keys()`` works without a
+    real ``__init__`` call.
     ``indexed_key_cache`` entries are seeded via ``store.put("episodic", ...)``
     with ``register=False`` (matching the legacy flat-view write semantics).
     """

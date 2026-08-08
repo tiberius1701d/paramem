@@ -644,7 +644,8 @@ class TestLiveSlotManifestReStamp:
     (a) Re-stamp meta.json with the POST-erase registry hash.
     (b) find_live_slot(kind_dir, H_new) returns the slot.
     (c) find_live_slot(kind_dir, H_old) returns None (old hash obsolete).
-    (d) manifest.key_count is unchanged (counts WEIGHT keys, not registry keys).
+    (d) manifest.key_count is refreshed to the post-erase survivor count of
+        the slot's own registry.
     """
 
     def test_live_slot_rebound_to_new_hash_after_forget(self, tmp_path, monkeypatch):
@@ -704,7 +705,8 @@ class TestLiveSlotManifestReStamp:
         ep_reg.save(registry_path)
 
         # Write a real slot directory with a manifest stamped with H_old.
-        # key_count reflects both keys (counts weight keys, not registry keys).
+        # key_count reflects both keys — the pre-erase registry's own
+        # active-key count (the value /forget must refresh below).
         slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
         slot_dir.mkdir(parents=True)
         original_manifest = _minimal_manifest_for_tier(tier_name, h_old, key_count=2)
@@ -746,11 +748,13 @@ class TestLiveSlotManifestReStamp:
             "find_live_slot must return None for the pre-erase hash after re-stamp"
         )
 
-        # (iii) key_count in the manifest is unchanged (counts weight keys, not registry keys).
+        # (iii) key_count in the manifest is refreshed to the post-erase survivor
+        # count (one key forgotten, one key remains), not carried over from the
+        # pre-erase manifest.
         manifest_after = read_manifest(slot_dir)
-        assert manifest_after.key_count == original_manifest.key_count, (
-            "key_count must remain unchanged — it counts keys in the adapter weights, "
-            "which /forget does not modify"
+        assert manifest_after.key_count == 1, (
+            "key_count must be refreshed to the post-erase registry's active-key "
+            f"count (1); got {manifest_after.key_count}"
         )
 
     def test_rebind_survives_registry_payload_shape_change(self, tmp_path, monkeypatch):
@@ -841,7 +845,10 @@ class TestLiveSlotManifestReStamp:
         )
         manifest_after = read_manifest(slot_dir)
         assert manifest_after.registry_sha256 == h_new
-        assert manifest_after.key_count == original_manifest.key_count
+        # key_count is refreshed to the post-erase survivor count (one key
+        # forgotten, one key remains), not carried over from the pre-erase
+        # manifest.
+        assert manifest_after.key_count == 1
 
     def test_no_slot_logs_error_without_failing(self, tmp_path, monkeypatch, caplog):
         """When no slot matches the pre-erase hash, an ERROR is logged but the request succeeds.

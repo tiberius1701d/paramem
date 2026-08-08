@@ -1125,10 +1125,6 @@ class ConsolidationLoop:
 
             self.store = MemoryStore(replay_enabled=True)
 
-    def _all_active_keys(self) -> list[str]:
-        """Every active key across every registered tier — order is tier-then-insertion."""
-        return self.store.all_active_keys()
-
     def _fold_active_keys(self, scope: "FoldScope") -> list[str]:
         """The active keys a ``main_tiers`` fold owns, per ``scope.keys_from``.
 
@@ -2055,12 +2051,13 @@ class ConsolidationLoop:
         # Serialise each tier's registry to bytes and hash them — no disk I/O at this point.
         # Per-tier: tier_name → (payload_bytes, sha256_hex)
         tier_payloads: dict[str, tuple[bytes, str]] = {}
+        tier_key_counts: dict[str, int] = {}
         if self.store.replay_enabled:
             for _tier_name in self.store.tiers_with_registry():
                 _tier_reg = self.store.registry(_tier_name)
                 _payload = _tier_reg.save_bytes()
                 tier_payloads[_tier_name] = (_payload, _hashlib.sha256(_payload).hexdigest())
-        total_key_count = len(self._all_active_keys()) if self.store.replay_enabled else None
+                tier_key_counts[_tier_name] = len(_tier_reg)
 
         def _build(name: str) -> "object":
             # Use the tier's own registry hash when available.
@@ -2074,7 +2071,7 @@ class ConsolidationLoop:
                 self.model,
                 self.tokenizer,
                 name,
-                key_count=total_key_count,
+                key_count=tier_key_counts.get(name),
                 base_model_hash_cache=fingerprint_cache,
                 registry_sha256_override=_sha,
                 window_stamp=full_window_stamp,

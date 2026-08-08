@@ -1356,6 +1356,142 @@ class TestEraseKeysAndRestampManifest:
         assert find_live_slot(tier_root, h_new) == slot_dir
         assert find_live_slot(tier_root, h_old) is None
 
+    def test_survivor_restamp_refreshes_key_count(self, tmp_path):
+        """The re-stamped manifest's key_count reflects the post-erase
+        survivor count, not the pre-erase value carried over from the old
+        manifest."""
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            find_live_slot,
+            read_manifest,
+            write_manifest,
+        )
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+        reg.add("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+        tier_root.mkdir(parents=True)
+
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        slot_dir.mkdir()
+        manifest = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=tier_name,
+            trained_at="2026-06-12T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
+            registry_sha256=h_old,
+            key_count=2,
+        )
+        write_manifest(slot_dir, manifest)
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {}
+        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
+        live_slot = find_live_slot(tier_root, h_new)
+        assert live_slot == slot_dir
+
+        restamped = read_manifest(live_slot)
+        assert restamped.key_count == 1, (
+            "key_count must be refreshed to the post-erase survivor count "
+            f"(1), not carried over from the pre-erase manifest; got "
+            f"{restamped.key_count}"
+        )
+
+    def test_restamp_with_zero_active_but_stale_survivors_carries_int_zero(self, tmp_path):
+        """A tier reduced to zero ACTIVE keys but still holding a stale key
+        is a surviving tier (``list_known()`` is active ∪ stale, non-empty)
+        — it IS re-stamped, and the re-stamped key_count is int 0, not
+        UNKNOWN.
+
+        ``graph1`` is active and gets erased; ``graph2`` is already stale
+        before the erase and is untouched by it (erase only removes the
+        keys named in the call). After the erase the tier has zero active
+        keys and one stale key, so the emptied-tier branch (gated on
+        ``list_known()``) is not taken.
+        """
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            find_live_slot,
+            read_manifest,
+            write_manifest,
+        )
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+        tier_root.mkdir(parents=True)
+
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        slot_dir.mkdir()
+        manifest = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=tier_name,
+            trained_at="2026-06-12T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
+            registry_sha256=h_old,
+            key_count=1,
+        )
+        write_manifest(slot_dir, manifest)
+        assert find_live_slot(tier_root, h_old) == slot_dir
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        # Not returned as emptied — the stale survivor keeps the tier "known".
+        assert result == {}
+        assert not reg.knows("graph1")
+        assert reg.knows("graph2")
+        assert reg.list_active() == []
+
+        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
+        live_slot = find_live_slot(tier_root, h_new)
+        assert live_slot == slot_dir
+
+        restamped = read_manifest(live_slot)
+        assert restamped.key_count == 0, (
+            f"key_count must be the int 0 active-key count, not UNKNOWN or "
+            f"carried over; got {restamped.key_count!r}"
+        )
+
     def test_malformed_interim_tier_name_raises_before_mutation(self, tmp_path):
         """A malformed interim tier name raises ValueError BEFORE
         store.discard_keys runs — the store is left untouched."""

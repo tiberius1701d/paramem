@@ -139,7 +139,10 @@ class AdapterManifest:
         lora: LoRA shape.
         registry_sha256: SHA-256 hex of ``indexed_key_registry.json`` at
             training time; empty string when none; ``UNKNOWN`` for migrated.
-        key_count: Number of indexed keys in this adapter, or ``UNKNOWN``.
+        key_count: The active-key count of the registry whose bytes hash to
+            ``registry_sha256``, at the time this manifest was (re-)stamped —
+            not a count of keys encoded in the adapter weights. ``UNKNOWN``
+            when no such registry snapshot was available to count.
         synthesized: ``True`` **only** for migration-script output.  Drives
             UNKNOWN severity: synthesized + UNKNOWN → yellow; fresh +
             UNKNOWN → red.  Defaults to ``False`` when absent from on-disk
@@ -800,7 +803,10 @@ def build_manifest_for(
         tokenizer: A HuggingFace tokenizer with ``name_or_path`` and
             ``tokenizer.json``/``backend_tokenizer``.
         adapter_name: Name of the adapter being saved.
-        key_count: Number of indexed keys.
+        key_count: The active-key count of the exact registry snapshot whose
+            bytes hash to ``registry_sha256_override`` — caller must derive
+            both from the same registry read so the two fields never
+            diverge. ``None``/absent yields ``UNKNOWN``.
         base_model_hash_cache: Optional mutable dict used to cache the
             base-model weight hash.  Caller owns it; pass ``_state`` on the
             server path and a local dict in experiments.

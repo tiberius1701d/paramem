@@ -735,7 +735,12 @@ def erase_keys_and_restamp_manifest(
                     pre_sha[:12],
                 )
             else:
-                write_manifest(slot, _replace(read_manifest(slot), registry_sha256=new_hash))
+                write_manifest(
+                    slot,
+                    _replace(
+                        read_manifest(slot), registry_sha256=new_hash, key_count=len(registry)
+                    ),
+                )
 
         logger.info(
             "erase_keys_and_restamp_manifest: removed key(s) from KeyRegistry tier %s",
@@ -942,7 +947,7 @@ def commit_tier_slot(
                 loop.model,
                 loop.tokenizer,
                 adapter_name,
-                key_count=len(loop.store.all_active_keys()),
+                key_count=len(tier_reg),
                 base_model_hash_cache=fingerprint_cache,
                 registry_sha256_override=registry_sha256,
                 window_stamp=stamp,

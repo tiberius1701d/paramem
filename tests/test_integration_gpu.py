@@ -1010,6 +1010,98 @@ class TestBatchConsolidationE2E:
             assert isinstance(result, dict)
 
 
+class TestCommitTierSlotManifestKeyCountGPU:
+    """commit_tier_slot must stamp key_count from the real PEFT model's own
+    tier registry, not a store-global count.
+
+    Unit tests mock ``model.save_pretrained`` and ``build_manifest_for``
+    away entirely; this test drives a real ``PeftModel`` save and a real
+    manifest build (real LoRA config read, real base-model fingerprinting)
+    so the per-tier key_count fix is proven against the actual GPU
+    integration surface, not just its mocked shape.
+    """
+
+    def test_two_tiers_get_their_own_counts_on_real_save(self, model_and_tokenizer, tmp_path):
+        """Two real LoRA tiers with different registry sizes each get their
+        own key_count stamped, not the sum across tiers.
+
+        Adapters this test adds to the session-scoped model are deleted in
+        a ``finally`` so later tests in this module (in particular
+        ``TestVRAMBudget.test_fitting_config_math_and_reality``, which
+        asserts a tight VRAM margin) see the model in the state they found
+        it.
+        """
+        from paramem.adapters.manifest import read_manifest
+        from paramem.memory.persistence import commit_tier_slot
+        from paramem.memory.store import MemoryStore
+        from paramem.models.loader import create_adapter, switch_adapter
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig
+
+        model, tokenizer = model_and_tokenizer
+
+        created_names: list[str] = []
+        for name in ("episodic", "semantic"):
+            if name not in getattr(model, "peft_config", {}):
+                model = create_adapter(model, AdapterConfig(), name)
+                switch_adapter(model, name)
+                created_names.append(name)
+
+        try:
+            loop = ConsolidationLoop.__new__(ConsolidationLoop)
+            loop.model = model
+            loop.tokenizer = tokenizer
+            loop.output_dir = tmp_path
+            loop.fingerprint_cache = None
+
+            store = MemoryStore(replay_enabled=True)
+            ep_reg = KeyRegistry()
+            ep_reg.add("graph1")
+            store.load_registry("episodic", ep_reg)
+
+            sem_reg = KeyRegistry()
+            sem_reg.add("graph2")
+            sem_reg.add("graph3")
+            store.load_registry("semantic", sem_reg)
+            loop.store = store
+
+            for tier in ("episodic", "semantic"):
+                commit_tier_slot(
+                    loop=loop,
+                    tier=tier,
+                    adapter_name=tier,
+                    stamp="20260101T0000",
+                    mode="train",
+                    all_keyed=[],
+                    output_dir=tmp_path,
+                    verify=None,
+                )
+
+            episodic_slots = [
+                d
+                for d in (tmp_path / "episodic").iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            ]
+            semantic_slots = [
+                d
+                for d in (tmp_path / "semantic").iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            ]
+            assert episodic_slots, "No episodic slot dir created"
+            assert semantic_slots, "No semantic slot dir created"
+
+            episodic_manifest = read_manifest(episodic_slots[0])
+            semantic_manifest = read_manifest(semantic_slots[0])
+
+            assert episodic_manifest.key_count == 1
+            assert semantic_manifest.key_count == 2
+        finally:
+            for name in created_names:
+                if name in model.peft_config:
+                    model.delete_adapter(name)
+
+
 # --- 9. VRAM budget: math prediction vs real GPU occupation ---
 
 
@@ -1421,7 +1513,7 @@ class TestSimulateModePromptIteration:
         loop = result["loop"]
         assert loop is not None
         assert loop.store.replay_enabled
-        assert len(loop._all_active_keys()) >= 1, (
+        assert len(loop.store.all_active_keys()) >= 1, (
             "Indexed-key registry empty — run_consolidation_cycle (simulate mode) "
             "did not assign keys."
         )
