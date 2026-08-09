@@ -446,10 +446,10 @@ def count_slot_candidates(adapter_kind_dir: Path) -> int:
     Delegates to :func:`_iter_slot_candidates` — see its docstring for what
     counts as a candidate. This is the single implementation of the "does
     this tier dir have any trained slot at all" check that used to be
-    duplicated at four call sites: the boot mount loop's main-tier
-    validation (``_validate_main_adapter_slot``) and its interim-tier
-    fallback, ``/speaker/forget``'s manifest re-stamp gate, and
-    :func:`~paramem.server.migration.compute_shape_changes`'s
+    duplicated at multiple call sites; it is now shared by the boot mount
+    loop's one per-tier validator (``_validate_adapter_slot``, used
+    identically for main and interim tiers), ``/speaker/forget``'s manifest
+    re-stamp gate, and :func:`~paramem.server.migration.compute_shape_changes`'s
     never-trained-vs-all-corrupt distinction. It lets each caller tell "not
     yet trained" (zero candidates — silent skip is correct) apart from "every
     candidate slot is unreadable or doesn't match" (one or more candidates,

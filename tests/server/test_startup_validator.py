@@ -14,13 +14,25 @@ Covers:
 - Registry hash mismatch → no_matching_slot.
 - Multiple rows render independently.
 - Migration-script slot (synthesized=True, UNKNOWN fields) → yellow even for episodic.
-- Fresh-built manifest with UNKNOWN fields (synthesized=False) → red.
-- episodic_interim_* uses same schema.
+- Fresh-built manifest with UNKNOWN fields (synthesized=False) → red for the
+  primary tier (episodic), yellow for a non-primary tier (semantic) — a red
+  row renders as a failed-level "PA routing DISABLED" attention item, which
+  is only true for the primary tier.
+- episodic_interim_* routes through the same _validate_adapter_slot decision
+  tree as main tiers (fingerprints compared against config.adapters.episodic):
+  no-weight-slot-candidate → INFO fresh install, no row; a real weight-slot
+  candidate with a hash mismatch → WARNING, yellow no_matching_slot row;
+  healthy slot → mounted, no row (and clears a stale pre-existing row);
+  fingerprint mismatch → not mounted, yellow mismatch row with field set.
 - A keyless tier (main or interim) is reaped before any slot is resolved:
   interim-child survival, stale-only preservation with the reworded ERROR,
   an unreadable registry preserved and logged, an absent registry left
   untouched, a reaped tier's fresh-install classification, and the
   keyless-tier sweep running before any slot is resolved (mock order).
+- _revalidate_adapter_manifests: revalidates BOTH main tiers and every live
+  interim dir (healthy clears a stale row, torn gets an accurate row), plus
+  pruning stale adapter_manifest_status rows for interim tiers whose dir is
+  gone entirely.
 """
 
 from __future__ import annotations
@@ -383,20 +395,25 @@ class TestNoMatchingSlot:
 
 
 class TestInterimNoMatchingSlotLogLevel:
-    """Interim-mount log level for an unmatched interim dir is structurally
-    gated: WARNING for the benign no-weight-slot-candidate shape (simulate
-    mode never creates a timestamped weight slot), ERROR only when a real
+    """Interim tiers now route through the same _validate_adapter_slot
+    decision tree as main tiers, so their log level / row shape follows the
+    shared classifier exactly: INFO + no row for the benign "no weight-slot
+    candidate at all" shape (simulate mode never creates a timestamped
+    weight slot); WARNING + a yellow no_matching_slot row when a real
     weight-slot candidate (a subdir with meta.json) exists but its hash
     doesn't match — the genuinely torn case.
     """
 
-    def test_no_weight_slot_candidate_is_warning_not_error(self, tmp_path: Path, caplog) -> None:
-        """Simulate-mode shape (graph.json only, no meta.json anywhere) → WARNING.
+    def test_no_weight_slot_candidate_is_info_fresh_install_no_row(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Simulate-mode shape (graph.json + registry, no meta.json anywhere)
+        → nothing mounted, INFO-level fresh-install log, no manifest row.
 
         The registry carries a known key so the boot-time keyless-tier sweep
         preserves this slot instead of reaping it before mounting — an empty
-        registry here would be reaped pre-mount and the mount-loop log-level
-        gate under test would never run.
+        registry here would be reaped pre-mount and the mount-loop
+        classifier under test would never run.
         """
         import logging
 
@@ -406,27 +423,33 @@ class TestInterimNoMatchingSlotLogLevel:
         (interim_dir / "graph.json").write_text("{}")
         (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
 
-        caplog.set_level(logging.WARNING, logger="paramem.server.app")
-        _run(config)
+        caplog.set_level(logging.INFO, logger="paramem.server.app")
+        model, state = _run(config)
 
-        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert not any("episodic_interim_20260619T1200" in msg for msg in error_messages), (
-            f"Benign simulate-mode shape must not log ERROR, got: {error_messages}"
-        )
-        assert any("episodic_interim_20260619T1200" in msg for msg in warning_messages), (
-            f"Expected a WARNING naming the interim adapter, got: {warning_messages}"
-        )
+        assert "episodic_interim_20260619T1200" not in getattr(model, "peft_config", {})
+        assert "episodic_interim_20260619T1200" not in state["adapter_manifest_status"]
 
-    def test_weight_slot_candidate_with_hash_mismatch_is_error(
+        warning_or_error = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        info_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert not any("episodic_interim_20260619T1200" in msg for msg in warning_or_error), (
+            f"Benign simulate-mode shape must not log WARNING/ERROR, got: {warning_or_error}"
+        )
+        assert any(
+            "episodic_interim_20260619T1200" in msg and "fresh install" in msg
+            for msg in info_messages
+        ), f"Expected an INFO fresh-install log naming the interim adapter, got: {info_messages}"
+
+    def test_weight_slot_candidate_with_hash_mismatch_is_warning_yellow_row(
         self, tmp_path: Path, caplog
     ) -> None:
-        """A real weight-slot candidate (meta.json) whose hash doesn't match → ERROR.
+        """A real weight-slot candidate (meta.json) whose hash doesn't match
+        → nothing mounted, WARNING log, yellow no_matching_slot row keyed by
+        the interim adapter name.
 
         The registry carries a known key so the boot-time keyless-tier sweep
         preserves this slot instead of reaping it before mounting — an empty
-        registry here would be reaped pre-mount and the mount-loop log-level
-        gate under test would never run.
+        registry here would be reaped pre-mount and the mount-loop
+        classifier under test would never run.
         """
         import logging
 
@@ -439,13 +462,136 @@ class TestInterimNoMatchingSlotLogLevel:
         _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
 
         caplog.set_level(logging.WARNING, logger="paramem.server.app")
-        _run(config)
+        model, state = _run(config)
 
+        assert "episodic_interim_20260619T1200" not in getattr(model, "peft_config", {})
+        row = state["adapter_manifest_status"].get("episodic_interim_20260619T1200")
+        assert row is not None
+        assert row["status"] == "no_matching_slot"
+        assert row["severity"] == "yellow"
+
+        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any(
-            "episodic_interim_20260619T1200" in msg and "no matching slot" in msg
-            for msg in error_messages
-        ), f"Expected an ERROR naming the interim adapter, got: {error_messages}"
+        assert not any("episodic_interim_20260619T1200" in msg for msg in error_messages), (
+            f"Torn interim shape must not log ERROR, got: {error_messages}"
+        )
+        assert any("episodic_interim_20260619T1200" in msg for msg in warning_messages), (
+            f"Expected a WARNING naming the interim adapter, got: {warning_messages}"
+        )
+
+
+class TestInterimHealthyMountAndFingerprintMismatch:
+    """Interim tiers get the full :func:`_validate_adapter_slot` treatment:
+    a healthy slot mounts with no row (and clears any stale pre-existing
+    row for that name); a fingerprint mismatch against
+    ``config.adapters.episodic`` (interim slots are episodic-shaped) skips
+    the mount and writes a yellow ``mismatch`` row naming the field.
+    """
+
+    def test_healthy_interim_slot_mounts_and_clears_stale_row(self, tmp_path: Path) -> None:
+        """Binds the PeftModel.from_pretrained patch and asserts the actual
+        mount call fired — a pin on only the popped stale row would stay
+        green even if the mount itself silently regressed, since the
+        fresh-install branch also pops a stale row without mounting."""
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
+        interim_dir.mkdir(parents=True)
+        _write_slot(interim_dir, registry_sha256="")
+
+        state = {
+            "adapter_manifest_status": {
+                "episodic_interim_20260619T1200": {
+                    "status": "no_matching_slot",
+                    "reason": "no_matching_slot",
+                    "field": None,
+                    "severity": "yellow",
+                    "slot_path": None,
+                    "checked_at": "2026-06-19T12:00:00Z",
+                }
+            },
+            "base_model_hash_cache": {},
+        }
+
+        from peft import PeftModel
+
+        with patch.object(
+            PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)
+        ) as mock_from_pretrained:
+            _, state = _run(config, state=state)
+
+        mock_from_pretrained.assert_called_once()
+        assert (
+            mock_from_pretrained.call_args.kwargs.get("adapter_name")
+            == "episodic_interim_20260619T1200"
+        ), "Expected the interim slot to actually be mounted, not just the row cleared"
+        assert "episodic_interim_20260619T1200" not in state["adapter_manifest_status"], (
+            "Healthy interim mount must clear a pre-existing stale row"
+        )
+
+    def test_interim_fingerprint_mismatch_not_mounted_yellow_row(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
+        interim_dir.mkdir(parents=True)
+        # config.adapters.episodic.rank is 8 (see _make_config); slot rank=4 mismatches.
+        _write_slot(interim_dir, registry_sha256="", rank=4)
+
+        model, state = _run(config)
+
+        assert "episodic_interim_20260619T1200" not in getattr(model, "peft_config", {})
+        row = state["adapter_manifest_status"].get("episodic_interim_20260619T1200")
+        assert row is not None
+        assert row["status"] == "mismatch"
+        assert row["severity"] == "yellow"
+        assert row["field"] == "lora.rank"
+
+    def test_interim_mounts_even_when_all_main_tiers_disabled(self, tmp_path: Path) -> None:
+        """No ``.enabled`` gate on the interim loop: interims stay
+        episodic-shaped and mountable even when episodic/semantic/procedural
+        are all disabled in config."""
+        config = _make_config(tmp_path, enabled_names=())
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
+        interim_dir.mkdir(parents=True)
+        _write_slot(interim_dir, registry_sha256="")
+
+        from peft import PeftModel
+
+        with patch.object(
+            PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)
+        ) as mock_from_pretrained:
+            _run(config)
+
+        mock_from_pretrained.assert_called_once()
+        assert (
+            mock_from_pretrained.call_args.kwargs.get("adapter_name")
+            == "episodic_interim_20260619T1200"
+        ), "Interim slot must mount even with every main tier disabled"
+
+
+class TestMalformedInterimStampSurvivesMount:
+    """A stray ``episodic/interim_<malformed-stamp>/`` directory (e.g.
+    ``interim_garbage/``) is a shape :func:`iter_interim_dirs` yields
+    without validating the stamp (pinned separately at
+    ``tests/test_interim_adapter_lifecycle.py::test_whole_ring_reap_removes_stray_malformed_stamp_dir``).
+    ``_validate_adapter_slot`` must not crash boot on it: it receives
+    ``kind_dir`` already resolved from its caller and never re-derives it
+    from ``name`` via ``adapter_slot_root_for_name``/``interim_dir_for_name``
+    (which would raise ``ValueError`` on the malformed stamp).
+    """
+
+    def test_stray_malformed_stamp_dir_mounts_nothing_no_row_no_raise(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        malformed_dir = config.adapter_dir / "episodic" / "interim_garbage"
+        malformed_dir.mkdir(parents=True)
+        # Flat adapter files directly under the malformed dir — NOT inside a
+        # meta.json-bearing slot subdirectory — so this has no weight-slot
+        # candidate and lands in the fresh-install branch (INFO, no row).
+        (malformed_dir / "adapter_config.json").write_text("{}")
+        (malformed_dir / "adapter_model.safetensors").write_bytes(b"w")
+
+        model, state = _run(config)  # must not raise ValueError
+
+        assert "episodic_interim_garbage" not in getattr(model, "peft_config", {})
+        assert "episodic_interim_garbage" not in state["adapter_manifest_status"]
 
 
 class TestEmptiedInterimSlotReapedAtBoot:
@@ -564,16 +710,60 @@ class TestSynthesizedUnknown:
         assert row["severity"] == "red"
         assert row["status"] == "migrated_unverified"
 
+    def test_synthesized_false_unknown_semantic_is_yellow(self, tmp_path: Path) -> None:
+        """synthesized=False + UNKNOWN fields on a NON-primary tier (semantic)
+        → yellow, not red. Severity red is reserved for the primary tier —
+        it is what makes _collect_adapter_fingerprint_items render a
+        failed-level "PA routing DISABLED" item (attention.py:550-560), and
+        PA routing is only disabled by a primary-tier problem."""
+        config = _make_config(
+            tmp_path, adapter_names=("episodic", "semantic"), enabled_names=("semantic",)
+        )
+        kind_dir = config.adapter_dir / "semantic"
+        kind_dir.mkdir()
+        slot = kind_dir / "20260421-000000"
+        slot.mkdir()
+        (slot / "adapter_config.json").write_text("{}")
+        (slot / "adapter_model.safetensors").write_bytes(b"w")
+        m = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name="semantic",
+            trained_at="2026-04-21T00:00:00Z",
+            base_model=BaseModelFingerprint(repo=UNKNOWN, sha=UNKNOWN, hash=UNKNOWN),
+            tokenizer=TokenizerFingerprint(
+                name_or_path=UNKNOWN, vocab_size=UNKNOWN, merges_hash=UNKNOWN
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
+            registry_sha256="",
+            key_count=UNKNOWN,
+            synthesized=False,
+        )
+        write_manifest(slot, m)
 
-class TestRevalidateMainAdapterManifests:
+        _, state = _run(config)
+
+        row = state["adapter_manifest_status"].get("semantic")
+        assert row is not None
+        assert row["severity"] == "yellow"
+        assert row["status"] == "migrated_unverified"
+
+
+class TestRevalidateAdapterManifests:
     """Post-cycle revalidation shares the same per-tier decision tree as the
-    boot validator (_validate_main_adapter_slot). These tests exercise
-    _revalidate_main_adapter_manifests directly to verify two key behaviours:
+    boot validator (_validate_adapter_slot) — for BOTH main and interim
+    tiers, the single row-freshness owner for the whole
+    ``adapter_manifest_status`` dict. These tests exercise
+    _revalidate_adapter_manifests directly to verify:
 
     1. Stale RED rows from the boot snapshot are CLEARED when on-disk slots
        are now healthy (the bug this function exists to fix).
     2. Slots that genuinely became unhealthy after boot get a fresh row
        written, with current ``checked_at``.
+    3. Stale ``adapter_manifest_status`` rows keyed by an interim adapter
+       name whose on-disk directory is gone entirely are pruned.
+    4. A live, on-disk interim dir is actively revalidated (not merely left
+       alone): a healthy interim clears a stale problematic row; a torn
+       interim gets an accurate row reflecting its current on-disk state.
     """
 
     def _state_from_config(self, config, model=None, tokenizer=None):
@@ -589,7 +779,7 @@ class TestRevalidateMainAdapterManifests:
         """A boot-time row exists for episodic; on-disk state is healthy.
         Revalidation removes the row.
         """
-        from paramem.server.app import _revalidate_main_adapter_manifests
+        from paramem.server.app import _revalidate_adapter_manifests
 
         config = _make_config(tmp_path)
         # Healthy slot on disk with empty registry hash (matches "no registry").
@@ -607,7 +797,7 @@ class TestRevalidateMainAdapterManifests:
             "checked_at": "2026-04-27T11:43:44Z",
         }
 
-        _revalidate_main_adapter_manifests(state)
+        _revalidate_adapter_manifests(state)
 
         assert "episodic" not in state["adapter_manifest_status"], (
             "Stale RED row must be cleared once slot is healthy"
@@ -615,7 +805,7 @@ class TestRevalidateMainAdapterManifests:
 
     def test_writes_red_row_when_no_matching_slot(self, tmp_path: Path) -> None:
         """No matching slot on disk → revalidation writes a no_matching_slot row."""
-        from paramem.server.app import _revalidate_main_adapter_manifests
+        from paramem.server.app import _revalidate_adapter_manifests
 
         config = _make_config(tmp_path)
         # Slot with a non-empty registry hash that won't match the live "" hash.
@@ -624,7 +814,7 @@ class TestRevalidateMainAdapterManifests:
 
         state = self._state_from_config(config)
         # Start with no row (post-boot default for a healthy slot).
-        _revalidate_main_adapter_manifests(state)
+        _revalidate_adapter_manifests(state)
 
         row = state["adapter_manifest_status"].get("episodic")
         assert row is not None, "Mismatch must produce a row"
@@ -633,7 +823,7 @@ class TestRevalidateMainAdapterManifests:
 
     def test_disabled_adapter_pops_any_existing_row(self, tmp_path: Path) -> None:
         """If a tier is disabled in config, its row is removed regardless of state."""
-        from paramem.server.app import _revalidate_main_adapter_manifests
+        from paramem.server.app import _revalidate_adapter_manifests
 
         config = _make_config(tmp_path, enabled_names=())  # all tiers disabled
         state = self._state_from_config(config)
@@ -646,18 +836,122 @@ class TestRevalidateMainAdapterManifests:
             "checked_at": "2026-04-27T11:00:00Z",
         }
 
-        _revalidate_main_adapter_manifests(state)
+        _revalidate_adapter_manifests(state)
 
         assert "episodic" not in state["adapter_manifest_status"]
 
     def test_noop_when_state_missing_model(self, tmp_path: Path) -> None:
         """Defensive: missing model in state → silently no-op (no exception)."""
-        from paramem.server.app import _revalidate_main_adapter_manifests
+        from paramem.server.app import _revalidate_adapter_manifests
 
         config = _make_config(tmp_path)
         state = {"config": config, "tokenizer": _make_tokenizer()}  # no "model" key
-        _revalidate_main_adapter_manifests(state)  # must not raise
+        _revalidate_adapter_manifests(state)  # must not raise
         assert state.get("adapter_manifest_status", {}) == {}
+
+    def test_prunes_gone_interim_row_and_clears_stale_main_row(self, tmp_path: Path) -> None:
+        """A full cycle can retire an interim slot entirely (dir removed from
+        disk) — the stale row for that now-gone interim must be popped, same
+        as before this dir ever gets a chance to be revalidated. Main-tier
+        rows behave exactly as the pins above (stale RED cleared once
+        healthy)."""
+        from paramem.server.app import _revalidate_adapter_manifests
+
+        config = _make_config(tmp_path)
+        # Healthy main episodic slot — stale RED row must be cleared.
+        episodic_dir = config.adapter_dir / "episodic"
+        _write_slot(episodic_dir, ts="20260427-105338", registry_sha256="")
+
+        state = self._state_from_config(config)
+        state["adapter_manifest_status"]["episodic"] = {
+            "status": "no_matching_slot",
+            "reason": "no_matching_slot",
+            "field": None,
+            "severity": "red",
+            "slot_path": None,
+            "checked_at": "2026-04-27T11:43:44Z",
+        }
+        # Row for an interim dir that no longer exists on disk at all — must
+        # be popped by the gone-dir prune (it never reaches _validate_adapter_slot).
+        state["adapter_manifest_status"]["episodic_interim_20260601T0000"] = {
+            "status": "no_matching_slot",
+            "reason": "no_matching_slot",
+            "field": None,
+            "severity": "yellow",
+            "slot_path": None,
+            "checked_at": "2026-04-27T11:43:44Z",
+        }
+
+        _revalidate_adapter_manifests(state)
+
+        assert "episodic" not in state["adapter_manifest_status"], (
+            "Stale RED main-tier row must be cleared once slot is healthy"
+        )
+        assert "episodic_interim_20260601T0000" not in state["adapter_manifest_status"], (
+            "Row for a gone interim dir must be pruned"
+        )
+
+    def test_live_healthy_interim_clears_stale_row(self, tmp_path: Path) -> None:
+        """A live, on-disk interim dir is now actively revalidated (not just
+        left alone) — a stale problematic row for a healthy interim slot
+        must be cleared by _revalidate_adapter_manifests, the same way a
+        healthy main-tier slot clears its stale row."""
+        from paramem.server.app import _revalidate_adapter_manifests
+
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
+        interim_dir.mkdir(parents=True)
+        # Fingerprints match config.adapters.episodic (rank=8) and the
+        # default _make_model() (sha="abc123") — a genuinely healthy slot.
+        _write_slot(interim_dir, registry_sha256="")
+
+        state = self._state_from_config(config)
+        state["adapter_manifest_status"]["episodic_interim_20260803T1200"] = {
+            "status": "no_matching_slot",
+            "reason": "no_matching_slot",
+            "field": None,
+            "severity": "yellow",
+            "slot_path": None,
+            "checked_at": "2026-04-27T11:43:44Z",
+        }
+
+        _revalidate_adapter_manifests(state)
+
+        assert "episodic_interim_20260803T1200" not in state["adapter_manifest_status"], (
+            "Stale row for a now-healthy live interim slot must be cleared"
+        )
+
+    def test_live_torn_interim_gets_accurate_no_matching_slot_row(self, tmp_path: Path) -> None:
+        """A live, on-disk interim dir whose slot hash doesn't match the
+        live registry gets (or keeps, refreshed to accurate content) a
+        yellow no_matching_slot row — proving revalidation actually re-runs
+        the decision tree against the interim's current on-disk state
+        rather than trusting a pre-existing row."""
+        from paramem.server.app import _revalidate_adapter_manifests
+
+        config = _make_config(tmp_path)
+        interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
+        interim_dir.mkdir(parents=True)
+        _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
+
+        state = self._state_from_config(config)
+        # Seed a stale row with the WRONG severity/reason to prove revalidation
+        # overwrites it with accurate content rather than leaving it as-is.
+        state["adapter_manifest_status"]["episodic_interim_20260803T1200"] = {
+            "status": "mismatch",
+            "reason": "fingerprint_mismatch",
+            "field": "lora.rank",
+            "severity": "red",
+            "slot_path": None,
+            "checked_at": "2026-04-27T11:43:44Z",
+        }
+
+        _revalidate_adapter_manifests(state)
+
+        row = state["adapter_manifest_status"].get("episodic_interim_20260803T1200")
+        assert row is not None
+        assert row["status"] == "no_matching_slot"
+        assert row["severity"] == "yellow"  # interim is never primary
 
 
 # ---------------------------------------------------------------------------
@@ -966,7 +1260,7 @@ class TestKeylessTierSweep:
     def test_sweep_runs_before_any_slot_is_resolved(self, tmp_path: Path) -> None:
         """The keyless-tier sweep runs before find_live_slot resolves any
         tier's slot — mirrors the sweep_orphan_pending-before-find_live_slot
-        ordering already load-bearing inside _validate_main_adapter_slot."""
+        ordering already load-bearing inside _validate_adapter_slot."""
         from paramem.adapters.manifest import find_live_slot as real_find_live_slot
         from paramem.server import app as app_module
 

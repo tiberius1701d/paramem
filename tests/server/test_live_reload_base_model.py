@@ -2401,7 +2401,7 @@ def test_finalize_full_swaps_store_when_replay_enabled_and_not_degraded():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_main_adapter_manifests"),
+        patch.object(app_module, "_revalidate_adapter_manifests"),
     ):
         app_module._finalize_full(
             fake_loop,
@@ -2452,7 +2452,7 @@ def test_finalize_full_skips_swap_when_staged_build_degraded():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_main_adapter_manifests"),
+        patch.object(app_module, "_revalidate_adapter_manifests"),
     ):
         app_module._finalize_full(
             fake_loop, fake_result, {}, {}, {}, staged_stats, absorbed_interims=True
@@ -2491,7 +2491,7 @@ def test_finalize_full_skips_swap_when_replay_disabled():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_revalidate_main_adapter_manifests"),
+        patch.object(app_module, "_revalidate_adapter_manifests"),
     ):
         app_module._finalize_full(
             fake_loop, fake_result, {}, {}, {}, staged_stats, absorbed_interims=True

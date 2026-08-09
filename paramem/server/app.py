@@ -1092,10 +1092,14 @@ class RollbackResponse(BaseModel):
 # --- Adapter manifest validation + mount helpers ---
 #
 # The boot-time validator (_mount_adapters_from_slots) and the post-full-cycle
-# revalidator (_revalidate_main_adapter_manifests) share the same per-tier
-# decision logic — extracted into _validate_main_adapter_slot below so there
+# revalidator (_revalidate_adapter_manifests) share the same per-tier
+# decision logic — extracted into _validate_adapter_slot below so there
 # is a single source of truth for "what does this slot's manifest say about
-# its health, and should it be mounted?"
+# its health, and should it be mounted?" Main tiers (episodic/semantic/
+# procedural) and interim tiers (episodic_interim_*) both route through it —
+# interim slots are episodic-shaped, so their fingerprint reference is
+# config.adapters.episodic, but each interim's own per-tier registry hash
+# (never the main-episodic hash) drives its live-slot match.
 
 
 def _tier_registry_sha256_boot_degraded(tier_root: Path, tier_label: str) -> str:
@@ -1155,21 +1159,38 @@ def _record_manifest_row(
     }
 
 
-def _validate_main_adapter_slot(
+def _validate_adapter_slot(
     name: str,
     adapter_cfg,
     model,
     tokenizer,
-    config,
+    kind_dir: Path,
     live_registry_sha256: str,
     manifest_status: dict,
 ) -> "tuple[Path | None, object | None, bool]":
-    """Validate one main adapter's live slot.
+    """Validate one adapter's live slot — main tier or interim tier alike.
 
     Single source of truth for the per-tier validation decision.  Updates
     ``manifest_status[name]`` with a row for unhealthy outcomes; pops any
     prior row for healthy outcomes (so post-cycle revalidation clears the
     stale boot-time snapshot).
+
+    ``kind_dir`` is the already-resolved tier root — the caller passes it in
+    rather than this function re-deriving it from ``name``. This matters for
+    interim tiers specifically: re-deriving via
+    :func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name` (which
+    dispatches interim names to ``interim_dir_for_name``) raises
+    ``ValueError`` on a stray ``episodic/interim_<malformed-stamp>/``
+    directory, because ``interim_dir_for_name`` demands a well-formed stamp
+    while :func:`~paramem.memory.interim_adapter.iter_interim_dirs` yields
+    such directories unvalidated (see its docstring, and
+    :func:`~paramem.memory.interim_adapter.unload_interim_adapters`'s
+    "never re-derived via interim_dir_for_name" comment, which pins the same
+    hazard on the reap path). Callers must always pass the exact path
+    ``iter_interim_dirs`` yielded (interim case) or
+    ``adapter_slot_root_for_name(config.adapter_dir, name)`` (main-tier
+    case, where the name is a known-good literal) — never re-derive the
+    root from an interim name inside this function.
 
     Returns ``(slot, manifest, should_mount)``:
       * ``slot``: resolved live slot Path, or ``None`` when no matching slot.
@@ -1178,9 +1199,10 @@ def _validate_main_adapter_slot(
         False for "no slot," "unreadable manifest," or "fingerprint mismatch."
 
     Used by:
-      * :func:`_mount_adapters_from_slots` (boot path) — uses the return
-        triple to decide what to mount.
-      * :func:`_revalidate_main_adapter_manifests` (post-full-cycle) — only
+      * :func:`_mount_adapters_from_slots` (boot path) — for both the main
+        tiers and the interim tiers; uses the return triple to decide what
+        to mount.
+      * :func:`_revalidate_adapter_manifests` (post-full-cycle) — only
         the side-effect on ``manifest_status`` matters; return value is
         discarded.
     """
@@ -1192,15 +1214,9 @@ def _validate_main_adapter_slot(
         read_manifest,
     )
     from paramem.backup.backup import sweep_orphan_pending
-    from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
     severity = "red" if _is_primary_adapter(name) else "yellow"
 
-    # name is always a main-tier name here (episodic/semantic/procedural) —
-    # adapter_slot_root_for_name returns config.adapter_dir / name unchanged
-    # for those; routed through the one resolver for consistency with every
-    # other slot-root computation in this module.
-    kind_dir = adapter_slot_root_for_name(config.adapter_dir, name)
     if kind_dir.exists():
         sweep_orphan_pending(kind_dir)
 
@@ -1258,7 +1274,18 @@ def _validate_main_adapter_slot(
 
     unknown_field = _first_unknown_field(manifest)
     if unknown_field is not None:
-        unknown_severity = "yellow" if manifest.synthesized else "red"
+        # Red is only correct for the primary tier: a red row renders as a
+        # failed-level "... — PA routing DISABLED" attention item
+        # (paramem/server/attention.py:550-560,
+        # _collect_adapter_fingerprint_items), and PA routing is only
+        # disabled by a primary-tier problem. A non-synthesized manifest on
+        # a non-primary tier (semantic/procedural/interim) that still has
+        # UNKNOWN fields is unexpected but must stay yellow/info, matching
+        # every other severity decision in this function
+        # (severity = "red" if _is_primary_adapter(name) else "yellow").
+        unknown_severity = (
+            "red" if _is_primary_adapter(name) and not manifest.synthesized else "yellow"
+        )
         _record_manifest_row(
             manifest_status,
             name,
@@ -1282,20 +1309,60 @@ def _validate_main_adapter_slot(
     return slot, manifest, True
 
 
-def _revalidate_main_adapter_manifests(state: dict) -> None:
-    """Re-run the main-adapter manifest validator and refresh
-    ``state['adapter_manifest_status']``.
+def _revalidate_adapter_manifests(state: dict) -> None:
+    """Re-run :func:`_validate_adapter_slot` for every tier — main AND
+    interim — and refresh ``state['adapter_manifest_status']``.  The single
+    row-freshness owner for the whole ``adapter_manifest_status`` dict,
+    called from the two TRAINING-path fold finalizers (``_finalize_full``
+    and ``_finalize_interim``) so rows refresh at every training fold, not
+    only once a dir vanishes.  ``_finalize_simulate`` does NOT call this —
+    a simulate-mode interim cycle writes only ``graph.json`` (no
+    ``adapter_model.safetensors``), so it has no weight-slot candidate and
+    :func:`_validate_adapter_slot` can never mint a row for it either way;
+    any row that predates a switch to simulate mode still gets refreshed at
+    the next boot or the next training fold, so skipping the call here
+    costs nothing.
 
     Boot's :func:`_mount_adapters_from_slots` snapshots adapter health from
-    the on-disk state at startup.  After a full cycle re-saves main slots
-    with a fresh registry hash, that snapshot is stale — operators see
+    the on-disk state at startup.  After a fold re-saves a tier's slot with
+    a fresh registry hash, that boot-time snapshot is stale — operators see
     ``FINGERPRINT MISMATCH … PA routing DISABLED`` on /status / pstatus
-    even though main is healthy.  Calling this from ``_finalize_full``
-    clears those stale rows.
+    even though the tier is healthy.  Calling this from both training
+    finalizers clears those stale rows on every training fold, main or
+    interim.
 
-    Pure validation: model + tokenizer come from state but are never
-    mutated.  Healthy main adapters have their row removed; unhealthy
-    ones get a fresh row stamped with the current ``checked_at``.
+    NOT pure validation: :func:`_validate_adapter_slot` calls
+    ``sweep_orphan_pending(kind_dir)`` (backup/atomic.py), which
+    unconditionally deletes everything under ``<kind_dir>/.pending/`` — the
+    same staging directory ``atomic_save_adapter`` writes into before its
+    rename-into-place. That is safe here only positionally: both callers
+    dispatch this function AFTER the fold's own saves have completed, and
+    ``_state["consolidating"]`` is still ``True`` for the whole window,
+    blocking every other consolidation door from starting a competing save
+    into the same ``.pending/`` dir. Do not move this call earlier in
+    either finalizer, and do not call it from anywhere that runs
+    concurrently with an in-flight save, on the strength of a "pure
+    validation" reading of this function — model + tokenizer are read but
+    never mutated, and nothing is ever mounted, but the pending-dir sweep is
+    a real, unconditional delete. Healthy adapters have their row removed;
+    unhealthy ones get a fresh row stamped with the current ``checked_at``.
+
+    Main tiers first (episodic/semantic/procedural, gated on
+    ``adapter_cfg.enabled``), then every interim dir :func:`iter_interim_dirs`
+    currently yields (no ``enabled`` gate — interims stay episodic-shaped
+    and validated regardless of the main episodic tier's enabled state;
+    ``kind_dir`` is the exact path ``iter_interim_dirs`` yielded, never
+    re-derived — see :func:`_validate_adapter_slot`'s docstring for why).
+    Finally, any ``manifest_status`` row keyed by an interim adapter name
+    (:data:`~paramem.memory.interim_adapter.INTERIM_NAME_PREFIX`) whose
+    on-disk directory no longer exists (folded away or discarded since the
+    row was written) is popped — a full cycle can retire an interim slot
+    without that interim ever being revalidated again, so without this
+    prune a stale row would linger and permanently suppress the
+    ``local_recall_inactive`` attention item (any row with a problematic
+    status defers to the more specific fingerprint item instead — see the
+    guard in
+    :func:`~paramem.server.attention._collect_local_recall_inactive_items`).
     """
     config = state.get("config")
     model = state.get("model")
@@ -1303,7 +1370,11 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
     if config is None or model is None or tokenizer is None:
         return
 
-    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+    from paramem.memory.interim_adapter import (
+        INTERIM_NAME_PREFIX,
+        adapter_slot_root_for_name,
+        iter_interim_dirs,
+    )
 
     manifest_status = state.setdefault("adapter_manifest_status", {})
 
@@ -1315,17 +1386,36 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
         if not adapter_cfg.enabled:
             manifest_status.pop(name, None)
             continue
-        _validate_main_adapter_slot(
+        _kind_dir = adapter_slot_root_for_name(config.adapter_dir, name)
+        _validate_adapter_slot(
             name,
             adapter_cfg,
             model,
             tokenizer,
-            config,
-            _tier_registry_sha256_boot_degraded(
-                adapter_slot_root_for_name(config.adapter_dir, name), name
-            ),
+            _kind_dir,
+            _tier_registry_sha256_boot_degraded(_kind_dir, name),
             manifest_status,
         )
+
+    live_interims = list(iter_interim_dirs(config.adapter_dir))
+    for _interim_name, _interim_path in live_interims:
+        _validate_adapter_slot(
+            _interim_name,
+            config.adapters.episodic,
+            model,
+            tokenizer,
+            _interim_path,
+            _tier_registry_sha256_boot_degraded(_interim_path, _interim_name),
+            manifest_status,
+        )
+
+    live_interim_names = {n for n, _ in live_interims}
+    for stale_name in [
+        n
+        for n in manifest_status
+        if n.startswith(INTERIM_NAME_PREFIX) and n not in live_interim_names
+    ]:
+        manifest_status.pop(stale_name, None)
 
 
 def _dispatch_finalize(finalize: Callable[[], None]) -> None:
@@ -1522,16 +1612,23 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     Sweeps every tier down to its never-trained shape when its on-disk
     registry legitimately tracks zero keys
     (:func:`_sweep_keyless_tier_artifacts`, run first, before any slot is
-    resolved for any tier). For each enabled adapter kind:
+    resolved for any tier). Every adapter kind — the three enabled main
+    tiers (episodic/semantic/procedural) AND every interim tier on disk
+    (``episodic_interim_*``, no ``enabled`` gate — interims stay
+    episodic-shaped even when the episodic main tier is disabled) — is
+    validated through the single :func:`_validate_adapter_slot` decision
+    tree:
 
-    1. Sweep orphan ``.pending`` dirs.
-    2. Resolve the live registry SHA-256.
+    1. Sweep orphan ``.pending`` dirs (inside the validator, scoped to that
+       tier's own slot root).
+    2. Resolve the live registry SHA-256 (per-tier: main tiers hash their own
+       registry; interim tiers hash their own, never the main-episodic one).
     3. Call ``find_live_slot`` to locate the matching slot.
-    4. Read the manifest; compare base model / tokenizer / LoRA fingerprints.
+    4. Read the manifest; compare base model / tokenizer / LoRA fingerprints
+       (interim tiers compare against ``config.adapters.episodic`` — interim
+       slots are episodic-shaped).
     5. Mount matching slots; record mismatch / missing rows in
        ``state["adapter_manifest_status"]``.
-
-    Interim adapters (``episodic_interim_*``) are handled with the same logic.
 
     Args:
         model: Base model (or existing PeftModel) to load adapters onto.
@@ -1545,8 +1642,6 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     """
     from peft import PeftModel
 
-    from paramem.adapters.manifest import count_slot_candidates, find_live_slot
-    from paramem.backup.backup import sweep_orphan_pending
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
@@ -1595,7 +1690,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
                 )
 
     # ---- Main adapter kinds ----
-    # Per-tier validation is delegated to _validate_main_adapter_slot so the
+    # Per-tier validation is delegated to _validate_adapter_slot so the
     # boot path and post-full-cycle revalidation share one decision tree.
     for name, adapter_cfg in (
         ("episodic", config.adapters.episodic),
@@ -1604,74 +1699,45 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     ):
         if not adapter_cfg.enabled:
             continue
-        slot, _manifest, should_mount = _validate_main_adapter_slot(
+        _kind_dir = adapter_slot_root_for_name(config.adapter_dir, name)
+        slot, _manifest, should_mount = _validate_adapter_slot(
             name,
             adapter_cfg,
             model,
             tokenizer,
-            config,
-            _tier_registry_sha256_boot_degraded(
-                adapter_slot_root_for_name(config.adapter_dir, name), name
-            ),
+            _kind_dir,
+            _tier_registry_sha256_boot_degraded(_kind_dir, name),
             manifest_status,
         )
         if should_mount and slot is not None:
             _load_one(name, slot)
 
     # ---- Interim adapters ----
+    # Same _validate_adapter_slot decision tree as the main tiers, using
+    # config.adapters.episodic as the fingerprint reference (interim slots
+    # are episodic-shaped) and each interim's own per-tier registry hash
+    # (never the main-episodic hash — comparing to the main hash always
+    # misses when a full cycle hasn't run yet). No .enabled gate here:
+    # interims stay episodic-shaped and mountable even when the episodic
+    # main tier is disabled. ``_interim_path`` (the exact path
+    # iter_interim_dirs yielded) is passed as kind_dir directly — never
+    # re-derived from ``_interim_name`` via adapter_slot_root_for_name,
+    # which raises on a stray dir whose stamp is malformed (see
+    # _validate_adapter_slot's docstring).
     from paramem.memory.interim_adapter import iter_interim_dirs
 
     for _interim_name, _interim_path in iter_interim_dirs(config.adapter_dir):
-        sweep_orphan_pending(_interim_path)
-
-        # Interim slots are matched against their OWN per-interim registry,
-        # not the main-episodic ``live_registry_sha256``.  Each interim's
-        # ``indexed_key_registry.json`` is the authoritative ledger for that
-        # interim's slot; comparing to the main hash always misses when a
-        # full cycle hasn't run yet (the main registry is empty).  ``_interim_path``
-        # IS the interim tier root (yielded by ``iter_interim_dirs``).
-        _interim_hash = _tier_registry_sha256_boot_degraded(_interim_path, _interim_name)
-
-        slot = find_live_slot(_interim_path, _interim_hash)
-        if slot is None:
-            # Fallback: old flat layout (no slot-dir yet) — look for adapter files directly
-            if (_interim_path / "adapter_config.json").exists() and (
-                _interim_path / "adapter_model.safetensors"
-            ).exists():
-                logger.info("Loading interim adapter (flat layout): %s", _interim_name)
-                try:
-                    from paramem.models.loader import _adapter_slot_for_load
-
-                    with _adapter_slot_for_load(_interim_path) as _load_path:
-                        if isinstance(model, PeftModel):
-                            model.load_adapter(str(_load_path), adapter_name=_interim_name)
-                        else:
-                            model = PeftModel.from_pretrained(
-                                model, str(_load_path), adapter_name=_interim_name
-                            )
-                except Exception as exc:
-                    logger.error("Failed to load interim adapter %s: %s", _interim_name, exc)
-                # Flat layout has no meta.json → default "qa"
-            else:
-                # Simulate mode never creates a timestamped weight slot (only
-                # graph.json) — an interim dir with no meta.json-bearing
-                # subdirectory at all is the expected/benign simulate-mode
-                # shape, not a torn state, so it only warrants a WARNING.
-                # A weight-slot candidate that exists but didn't match the
-                # registry hash (find_live_slot returned None despite one
-                # being present) is the genuinely torn case and stays ERROR.
-                _has_weight_slot_candidate = count_slot_candidates(_interim_path) > 0
-                if _has_weight_slot_candidate:
-                    logger.error("Interim adapter %s: no matching slot — skipping", _interim_name)
-                else:
-                    logger.warning(
-                        "Interim adapter %s: no weight-slot candidates found "
-                        "(simulate mode or not yet trained) — skipping",
-                        _interim_name,
-                    )
-            continue
-
-        _load_one(_interim_name, slot)
+        slot, _manifest, should_mount = _validate_adapter_slot(
+            _interim_name,
+            config.adapters.episodic,
+            model,
+            tokenizer,
+            _interim_path,
+            _tier_registry_sha256_boot_degraded(_interim_path, _interim_name),
+            manifest_status,
+        )
+        if should_mount and slot is not None:
+            _load_one(_interim_name, slot)
 
     if hasattr(model, "peft_config") and model.peft_config:
         logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
@@ -2398,7 +2464,7 @@ async def lifespan(app: FastAPI):
             getattr(logger, level.lower(), logger.info)(msg)
 
         # Sweep .pending/ residue from the snapshot bundle backup directory.
-        # This mirrors the per-kind sweep in _validate_main_adapter_slot for
+        # This mirrors the per-kind sweep in _validate_adapter_slot for
         # adapter dirs; the snapshot/ dir is the new home for bundle slots and
         # must be swept at startup so a crash mid-write doesn't leave residue.
         from paramem.backup.backup import sweep_orphan_pending as _sweep_backup
@@ -16146,12 +16212,16 @@ def _finalize_interim(
 ) -> None:
     """Success/terminal finalizer for the interim-training Stage-B cycle.
 
-    Runs on the asyncio event loop via ``_dispatch_finalize``.  Reloads the
-    router, records the durable run-status row, auto-resolves the incidents
-    a clean interim success clears, and clears ``_state["consolidating"]``.
-    Covers every non-crash interim terminal (``trained`` / ``simulated`` /
-    ``recall_failed`` / ``aborted`` / ``cap_pending``) — the outcome label
-    and clean-success gating come from *result* and *released_sids*.
+    Runs on the asyncio event loop via ``_dispatch_finalize``.  Revalidates
+    every tier's ``adapter_manifest_status`` row against the freshly-saved
+    interim slot (:func:`_revalidate_adapter_manifests` — pure reads +
+    hashing of small registry files, the same cost profile as the full-fold
+    call this mirrors), reloads the router, records the durable run-status
+    row, auto-resolves the incidents a clean interim success clears, and
+    clears ``_state["consolidating"]``. Covers every non-crash interim
+    terminal (``trained`` / ``simulated`` / ``recall_failed`` / ``aborted``
+    / ``cap_pending``) — the outcome label and clean-success gating come
+    from *result* and *released_sids*.
 
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-training PEFT rebind).
@@ -16172,6 +16242,11 @@ def _finalize_interim(
     """
     loop.model.eval()
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    # Re-validate manifests now that this interim slot has been freshly
+    # saved with a new registry hash — mirrors _finalize_full's step c, so
+    # a stale FINGERPRINT MISMATCH row for this interim doesn't linger on
+    # /status until the next full cycle happens to prune it.
+    _revalidate_adapter_manifests(_state)
     _state["router"].reload()
     # inference path sees the just-written interim slot (and any tier whose
     # format drifted from the loop's current setting).  Count via the
@@ -17043,7 +17118,8 @@ def _finalize_full(
        registry (``store_load_degraded=False``, no active keys) still swaps.
     b. ``_state`` ``boot_degraded`` / ``store_load_degraded`` — from
        *staged_stats*, always propagated regardless of whether swap ran.
-    c. ``_revalidate_main_adapter_manifests`` — reads fresh on-disk slots.
+    c. ``_revalidate_adapter_manifests`` — reads fresh on-disk slots and
+       prunes stale interim ``adapter_manifest_status`` rows.
     d. ``_state["router"].reload()`` — AFTER the swap so the speaker index
        is built from the freshly-published bookkeeping.
     e. ``_state`` flags / result bookkeeping — ``last_consolidation`` etc.
@@ -17079,7 +17155,7 @@ def _finalize_full(
     # c. Re-validate manifests now that main slots have been re-saved
     #    with a fresh registry hash + window_stamp.  Without this,
     #    /status keeps showing "FINGERPRINT MISMATCH" until restart.
-    _revalidate_main_adapter_manifests(_state)
+    _revalidate_adapter_manifests(_state)
     # d. Reload router AFTER swap so the speaker index is built from
     #    the freshly-published bookkeeping (phase-2 ordering fix).
     _state["router"].reload()

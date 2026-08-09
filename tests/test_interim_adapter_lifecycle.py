@@ -1,7 +1,6 @@
 """Unit tests for interim-adapter lifecycle helpers.
 
 Covers:
-  - Startup glob picks up valid episodic_interim_* dirs and skips half-present ones.
   - create_interim_adapter is idempotent for the same stamp.
   - unload_interim_adapters removes interim adapters from PEFT and on-disk,
     leaving main adapters intact.
@@ -62,14 +61,6 @@ def _make_stub_peft_model(*adapter_names: str) -> MagicMock:
 
     model.delete_adapter.side_effect = _delete_adapter
     return model
-
-
-def _write_adapter_files(directory: Path, *, safetensors: bool = True) -> None:
-    """Write the PEFT files that a valid interim adapter directory must contain."""
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "adapter_config.json").write_text("{}")
-    if safetensors:
-        (directory / "adapter_model.safetensors").write_bytes(b"")
 
 
 # ---------------------------------------------------------------------------
@@ -170,88 +161,6 @@ class TestInterimTiersNewestFirst:
         rather than sorted as ``""``."""
         store = _FakeStore(["episodic_interim_today", "episodic_interim_99999999T9999"])
         assert interim_tiers_newest_first(store) == []
-
-
-# ---------------------------------------------------------------------------
-# Test 2 — startup skips half-present interim adapter (warning logged)
-# ---------------------------------------------------------------------------
-
-
-class TestStartupSkipsHalfPresent:
-    def test_missing_safetensors_triggers_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """An interim dir with adapter_config.json but no adapter_model.safetensors
-        must be skipped and a WARNING must be logged.
-
-        This simulates the guard in app.py's startup loop.
-        """
-        interim_dir = tmp_path / "episodic_interim_20260417T0000"
-        _write_adapter_files(interim_dir, safetensors=False)  # only config, no weights
-
-        named_logger = logging.getLogger("paramem.server.app")
-        caplog.set_level(logging.WARNING, logger="paramem.server.app")
-        for path in sorted(tmp_path.glob("episodic_interim_*")):
-            if not path.is_dir():
-                continue
-            if (
-                not (path / "adapter_config.json").exists()
-                or not (path / "adapter_model.safetensors").exists()
-            ):
-                named_logger.warning("Skipping half-present interim adapter: %s", path.name)
-
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings, "Expected at least one WARNING for the half-present adapter"
-        assert "episodic_interim_20260417T0000" in warnings[0].getMessage()
-        assert "Skipping" in warnings[0].getMessage()
-
-    def test_missing_config_json_triggers_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """An interim dir with safetensors but no adapter_config.json is also skipped."""
-        interim_dir = tmp_path / "episodic_interim_20260418T0000"
-        interim_dir.mkdir(parents=True)
-        (interim_dir / "adapter_model.safetensors").write_bytes(b"")
-        # adapter_config.json intentionally absent
-
-        named_logger = logging.getLogger("paramem.server.app")
-        caplog.set_level(logging.WARNING, logger="paramem.server.app")
-        for path in sorted(tmp_path.glob("episodic_interim_*")):
-            if not path.is_dir():
-                continue
-            if (
-                not (path / "adapter_config.json").exists()
-                or not (path / "adapter_model.safetensors").exists()
-            ):
-                named_logger.warning("Skipping half-present interim adapter: %s", path.name)
-
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings
-        assert "episodic_interim_20260418T0000" in warnings[0].getMessage()
-
-    def test_complete_interim_dir_not_warned(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A fully-present interim adapter dir must not produce any warning."""
-        interim_dir = tmp_path / "episodic_interim_20260418T0000"
-        _write_adapter_files(interim_dir)  # both files present
-
-        named_logger = logging.getLogger("paramem.server.app")
-        caplog.set_level(logging.WARNING, logger="paramem.server.app")
-        for path in sorted(tmp_path.glob("episodic_interim_*")):
-            if not path.is_dir():
-                continue
-            if (
-                not (path / "adapter_config.json").exists()
-                or not (path / "adapter_model.safetensors").exists()
-            ):
-                named_logger.warning("Skipping half-present interim adapter: %s", path.name)
-
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert not warnings, (
-            "No warning expected for a complete interim adapter dir. "
-            f"Got: {[r.getMessage() for r in warnings]}"
-        )
 
 
 # ---------------------------------------------------------------------------
