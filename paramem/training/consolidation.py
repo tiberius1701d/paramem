@@ -398,6 +398,43 @@ class RegistryBookkeepingDivergence(RuntimeError):
         self.divergent_keys = divergent_keys
 
 
+class ActiveKeyHydrationFailure(RuntimeError):
+    """Raised by :meth:`ConsolidationLoop._hydrate_store_for_fold` when a
+    registered active key has no content in the store cache and none in the
+    fold's venue (adapter weights or ``graph.json``).
+
+    The registry is the durable record of a key's existence; a fold must
+    never retire a registered active key because a READ of its content
+    failed.  A failed source read is evidence about the read path, not
+    about the key, so it is never treated as proof the key's fact no
+    longer exists.  Deliberate retirement paths — dedup staling
+    (``store.discard_keys(mode="stale")`` on a registry-true duplicate),
+    the removal ledger (:meth:`_apply_subtractive_removals_to_store`), and
+    the explicit operator doors ``/debug/erase-keys`` and
+    ``/speaker/forget`` — are unaffected; this exception guards only the
+    unreadable case.
+
+    Fired BEFORE any registry mutation or durable write for this fold, so
+    the prior (pre-fold) weights, registries, and interim slots stay
+    intact and the next cycle simply retries the hydration.
+
+    Carries the dropped key list and the venue that failed to produce them
+    so the caller's incident record names exactly what could not be
+    hydrated.
+    """
+
+    def __init__(self, *, dropped_keys: "list[str]", venue: str):
+        dropped_keys = sorted(dropped_keys)
+        message = (
+            f"{len(dropped_keys)} active key(s) could not be hydrated from the "
+            f"{venue} source; aborting fold before any registry mutation or "
+            f"durable write: {dropped_keys[:10]}"
+        )
+        super().__init__(message)
+        self.dropped_keys = dropped_keys
+        self.venue = venue
+
+
 @dataclass(frozen=True)
 class FoldScope:
     """Immutable descriptor that parameterizes one invocation of
@@ -3034,19 +3071,21 @@ class ConsolidationLoop:
         and each of those places drops the key.  A dropped key does not reach
         ``tier_keyed``, and the finalize step rewrites every main-tier
         registry from ``tier_keyed`` — so a key the cache happened not to
-        hold is *deregistered and flushed to disk*, and the drift partition
-        buckets it as an orphan.  That is silent data loss, and the store can
-        legitimately be partially hydrated: ``app._build_store_contents``
-        reports exactly this as ``boot_degraded={"reason": "preload_partial"}``
-        when the boot probe materialises only some of the active keys.
+        hold would be *deregistered and flushed to disk*, and the drift
+        partition would bucket it as an orphan.  That would be silent data
+        loss, and the store can legitimately be partially hydrated:
+        ``app._build_store_contents`` reports exactly this as
+        ``boot_degraded={"reason": "preload_partial"}`` when the boot probe
+        materialises only some of the active keys.
 
         So the fold hydrates first.  Every active key of every registered tier
         is resolved through :meth:`~paramem.memory.store.MemoryStore.probe`
         against the venue's :class:`~paramem.memory.source.MemorySource`: cache
         hits cost nothing, misses are materialised from the source of truth
-        (adapter weights or ``graph.json``) in one batched pass, and only a key
-        that no venue can produce is left for the three sites to drop — which
-        is then a true orphan rather than a cache artifact.
+        (adapter weights or ``graph.json``) in one batched pass.  A key that
+        no venue can produce aborts the fold via
+        :class:`ActiveKeyHydrationFailure` — see that class's docstring for
+        which retirement paths this does and does not affect.
 
         ``memoize=True`` is not conditional on ``inference.preload_cache``.
         That toggle governs the *read* path (boot preload + per-query on-miss
@@ -3096,13 +3135,7 @@ class ConsolidationLoop:
 
         dropped = [k for keys in keys_by_tier.values() for k in keys if self.store.get(k) is None]
         if dropped:
-            logger.warning(
-                "_hydrate_store_for_fold: %d live key(s) have no content in the store "
-                "and none in the %s source — this fold will drop them: %s",
-                len(dropped),
-                venue,
-                sorted(dropped)[:10],
-            )
+            raise ActiveKeyHydrationFailure(dropped_keys=dropped, venue=venue)
 
     def _verify_committed_slot(
         self,
@@ -4459,19 +4492,12 @@ class ConsolidationLoop:
                             drift_intended_removal_by_reason.get(_r, 0) + 1
                         )
                     else:
-                        _dk_bk = self.store.bookkeeping_for_key(_dk)
                         _dk_entry = self.store.get(_dk)
                         _entry_subj = (_dk_entry or {}).get("subject", "")
                         _entry_pred = (_dk_entry or {}).get("predicate", "")
                         _entry_obj = (_dk_entry or {}).get("object", "")
-                        _bk_subj = (_dk_bk or {}).get("subject", "")
-                        _bk_pred = (_dk_bk or {}).get("predicate", "")
-                        _bk_obj = (_dk_bk or {}).get("object", "")
                         if not _entry_subj and not _entry_pred and not _entry_obj:
-                            if _bk_subj or _bk_pred or _bk_obj:
-                                drift_genuine_loss.append(_dk)
-                            else:
-                                drift_orphan.append(_dk)
+                            drift_orphan.append(_dk)
                         else:
                             drift_genuine_loss.append(_dk)
 

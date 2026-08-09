@@ -17,9 +17,10 @@ Covers:
   owns that conditional resolve)
 - resolve_incident idempotency fix: already-resolved returns False
 - Ack endpoint: acknowledged incident omitted from attention items
-- _run_stage_b_cycle's crash envelope: RegistryBookkeepingDivergence's
-  divergent_keys merged into the recorded incident detail; any other
-  exception keeps the plain detail
+- _run_stage_b_cycle's crash envelope: a raised exception's own structured
+  fields (RegistryBookkeepingDivergence's divergent_keys,
+  ActiveKeyHydrationFailure's dropped_keys/venue) merged into the recorded
+  incident detail; any other exception keeps the plain detail
 """
 
 from __future__ import annotations
@@ -1164,10 +1165,40 @@ class TestSameTypeDifferentKeysStaySeparate:
 
 
 # ---------------------------------------------------------------------------
-# _run_stage_b_cycle's crash envelope: RegistryBookkeepingDivergence's
-# divergent_keys must survive into the recorded incident's detail; any other
-# exception keeps the caller-supplied detail unchanged.
+# _run_stage_b_cycle's crash envelope: a raised exception's own structured
+# fields (RegistryBookkeepingDivergence's divergent_keys,
+# ActiveKeyHydrationFailure's dropped_keys/venue) must survive into the
+# recorded incident's detail; any other exception keeps the caller-supplied
+# detail unchanged.
 # ---------------------------------------------------------------------------
+
+
+def _drive_stage_b_cycle_crash(state, *, exc):
+    """Call ``_run_stage_b_cycle`` directly with a body that raises *exc*.
+
+    Mirrors ``TestInterimBookkeepingRegionCrash``'s synchronous-submit
+    idiom: ``consolidation_loop`` and ``background_trainer`` are
+    pre-seeded ``MagicMock``s so ``_get_or_create_consolidation_loop`` /
+    ``_active_bg_trainer`` short-circuit to them without touching a real
+    model, and ``bt.submit`` runs the worker inline rather than on a
+    background thread.
+    """
+    state["consolidation_loop"] = MagicMock()
+    mock_bt = MagicMock()
+    mock_bt.submit.side_effect = lambda fn, **kw: fn()
+    state["background_trainer"] = mock_bt
+
+    def _body(loop, bt):
+        raise exc
+
+    with patch("paramem.server.app._set_voice_pipeline_profile"):
+        app_module._run_stage_b_cycle(
+            kind="consolidation_crash",
+            incident_key="full",
+            failure_summary="full consolidation crashed",
+            failure_detail={"phase": "fold"},
+            body=_body,
+        )
 
 
 class TestStageBCycleDivergentKeysIncidentDetail:
@@ -1178,33 +1209,6 @@ class TestStageBCycleDivergentKeysIncidentDetail:
     of leaving that only in the log traceback.  Any other exception type
     records the caller-supplied ``failure_detail`` verbatim."""
 
-    def _drive(self, state, *, exc):
-        """Call ``_run_stage_b_cycle`` directly with a body that raises *exc*.
-
-        Mirrors ``TestInterimBookkeepingRegionCrash``'s synchronous-submit
-        idiom: ``consolidation_loop`` and ``background_trainer`` are
-        pre-seeded ``MagicMock``s so ``_get_or_create_consolidation_loop`` /
-        ``_active_bg_trainer`` short-circuit to them without touching a real
-        model, and ``bt.submit`` runs the worker inline rather than on a
-        background thread.
-        """
-        state["consolidation_loop"] = MagicMock()
-        mock_bt = MagicMock()
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-        state["background_trainer"] = mock_bt
-
-        def _body(loop, bt):
-            raise exc
-
-        with patch("paramem.server.app._set_voice_pipeline_profile"):
-            app_module._run_stage_b_cycle(
-                kind="consolidation_crash",
-                incident_key="full",
-                failure_summary="full consolidation crashed",
-                failure_detail={"phase": "fold"},
-                body=_body,
-            )
-
     def test_divergent_keys_merged_into_incident_detail(self, state):
         """A RegistryBookkeepingDivergence's divergent_keys is folded into
         the incident detail alongside the caller-supplied fields."""
@@ -1214,7 +1218,7 @@ class TestStageBCycleDivergentKeysIncidentDetail:
         exc = RegistryBookkeepingDivergence(
             "registry/bookkeeping divergence", divergent_keys=divergent
         )
-        self._drive(state, exc=exc)
+        _drive_stage_b_cycle_crash(state, exc=exc)
 
         incidents = read_incidents(_state_dir(state))
         crashes = [i for i in incidents if i.type == "consolidation_crash"]
@@ -1229,7 +1233,7 @@ class TestStageBCycleDivergentKeysIncidentDetail:
     def test_generic_exception_keeps_plain_detail(self, state):
         """A non-divergence exception records the failure_detail unchanged --
         no divergent_keys key is synthesized."""
-        self._drive(state, exc=RuntimeError("boom"))
+        _drive_stage_b_cycle_crash(state, exc=RuntimeError("boom"))
 
         incidents = read_incidents(_state_dir(state))
         crashes = [i for i in incidents if i.type == "consolidation_crash"]
@@ -1238,3 +1242,29 @@ class TestStageBCycleDivergentKeysIncidentDetail:
         )
         assert "divergent_keys" not in crashes[0].detail
         assert crashes[0].detail == {"phase": "fold"}
+
+
+class TestStageBCycleHydrationFailureIncidentDetail:
+    """``_run_stage_b_cycle``'s crash envelope merges an
+    ``ActiveKeyHydrationFailure``'s ``dropped_keys`` and ``venue`` into the
+    incident detail it records, so the incident names exactly which keys
+    could not be hydrated and from which venue."""
+
+    def test_dropped_keys_and_venue_merged_into_incident_detail(self, state):
+        """An ActiveKeyHydrationFailure's dropped_keys and venue are folded
+        into the incident detail alongside the caller-supplied fields."""
+        from paramem.training.consolidation import ActiveKeyHydrationFailure
+
+        exc = ActiveKeyHydrationFailure(dropped_keys=["g0", "g1"], venue="train")
+        _drive_stage_b_cycle_crash(state, exc=exc)
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert crashes[0].detail["dropped_keys"] == ["g0", "g1"]
+        assert crashes[0].detail["venue"] == "train"
+        assert crashes[0].detail["phase"] == "fold", (
+            "caller-supplied detail fields must survive the merge"
+        )

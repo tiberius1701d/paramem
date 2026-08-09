@@ -101,6 +101,7 @@ from paramem.server.vram_validator import (
 )
 from paramem.training.consolidation import (
     AbortedDuringConsolidation,
+    ActiveKeyHydrationFailure,
     RegistryBookkeepingDivergence,
 )
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
@@ -16061,11 +16062,15 @@ def _run_stage_b_cycle(
             # RegistryBookkeepingDivergence names the divergent keys on the
             # exception itself; fold them into the incident detail so the
             # incident record — not just the log traceback — identifies what
-            # diverged.  Every other exception keeps the generic detail
-            # unchanged.
+            # diverged.  ActiveKeyHydrationFailure names the keys it could
+            # not hydrate and the venue it tried.  Every other exception
+            # keeps the generic detail unchanged.
             incident_detail = dict(failure_detail)
             if isinstance(exc, RegistryBookkeepingDivergence):
                 incident_detail["divergent_keys"] = exc.divergent_keys
+            if isinstance(exc, ActiveKeyHydrationFailure):
+                incident_detail["dropped_keys"] = exc.dropped_keys
+                incident_detail["venue"] = exc.venue
             try:
                 record_incident(
                     config.paths.data / "state",

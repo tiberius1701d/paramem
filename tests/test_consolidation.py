@@ -5974,119 +5974,6 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # Content-free live key is NOT classified as orphan
-    # -------------------------------------------------------------------------
-
-    def test_content_free_live_key_not_classified_as_orphan(self, tmp_path):
-        """A live key with no content in the store AND none in the weights must
-        NOT be classified as drift_orphan when its bookkeeping carries SPO.
-
-        The fold hydrates the store from the venue's ``MemorySource`` before
-        reading it (``_hydrate_store_for_fold``), so an empty entry cache is no
-        longer enough to reach this state — the weight probe is stubbed to
-        return a miss as well, which is the only way a live key can end the fold
-        with no content anywhere.  Such a key:
-          - Is NOT classified as drift_orphan (bookkeeping has SPO).
-          - IS classified as drift_genuine_loss.
-          - Is NOT in tier_keyed (nothing to replay).
-
-        Setup: two keys — "graph_ok" has a normal content entry;
-        "graph_no_content" is active in the registry, absent from the entry
-        cache, and unrecoverable from the source, while its bookkeeping carries
-        valid SPO.
-        """
-        from unittest.mock import patch
-
-        import networkx as nx
-
-        from paramem.graph.reconstruct import ReconstructionResult
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        # Recon graph: only graph_ok has a recon edge.
-        recon_g = nx.MultiDiGraph()
-        eid = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
-        recon_g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "graph_ok"
-
-        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
-        self._install_provenance_merge_spy(loop)
-
-        # graph_ok: full content entry.
-        loop.store.put(
-            "episodic",
-            "graph_ok",
-            {
-                "key": "graph_ok",
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Berlin",
-                "speaker_id": "speaker0",
-            },
-            register=True,
-        )
-        loop.store.set_bookkeeping(
-            "graph_ok", speaker_id="speaker0", relation_type="factual", first_seen=""
-        )
-
-        # graph_no_content: registered in the store but NO content entry.
-        # Register it first (put with register=True), then delete the entry cache
-        # so only the registry keeps it alive.
-        loop.store.put(
-            "episodic",
-            "graph_no_content",
-            {
-                "key": "graph_no_content",
-                "subject": "Bob",
-                "predicate": "works_at",
-                "object": "Acme",
-                "speaker_id": "speaker0",
-            },
-            register=True,
-        )
-        # Drop the content entry.
-        loop.store._entries["episodic"].pop("graph_no_content", None)
-        # Bookkeeping carries the SPO (populated independently of _entries).
-        loop.store.set_bookkeeping(
-            "graph_no_content",
-            speaker_id="speaker0",
-            relation_type="factual",
-            reinforcement_count=1,
-            last_reinforced_cycle=1,
-            first_seen="",
-        )
-        # Manually add SPO fields to bookkeeping so the drift-partition
-        # classification finds them and routes to genuine_loss rather than orphan.
-        # Note: _build_registry_true_relations does not read SPO from bookkeeping
-        # (content-free keys are skipped there); only the drift partition uses these.
-        loop.store._bookkeeping["graph_no_content"]["subject"] = "Bob"
-        loop.store._bookkeeping["graph_no_content"]["predicate"] = "works_at"
-        loop.store._bookkeeping["graph_no_content"]["object"] = "Acme"
-
-        # The weights hold nothing for it either, so the fold's hydration pass
-        # cannot recover it — the only route to a content-free live key.
-        with patch(
-            "paramem.memory.probe.probe_keys_grouped_by_adapter",
-            side_effect=lambda model, tokenizer, keys_by_adapter, **kw: {
-                k: None for keys in keys_by_adapter.values() for k in keys
-            },
-        ):
-            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
-
-        # Must NOT be classified as orphan: the drift partition finds SPO in
-        # bookkeeping (injected above) and routes to genuine_loss.
-        assert result["drift_orphan"] == 0, (
-            f"Expected drift_orphan=0 (a content-free key with SPO bookkeeping is NOT "
-            f"an orphan); got drift_orphan={result['drift_orphan']}"
-        )
-        # Goes to the genuine_loss bucket (not orphan, not deduplicated).
-        assert result["drift_genuine_loss"] == 1, (
-            f"Expected drift_genuine_loss=1 (content-free key classified as retry); "
-            f"got drift_genuine_loss={result['drift_genuine_loss']}"
-        )
-        # graph_ok must survive into tier_keyed.
-        all_keys = {e["key"] for tier_list in result["tier_keyed"].values() for e in tier_list}
-        assert "graph_ok" in all_keys, "graph_ok must survive"
-
-    # -------------------------------------------------------------------------
     # Reconstruction collision does NOT manufacture a collapse
     # -------------------------------------------------------------------------
 
@@ -9303,6 +9190,173 @@ class TestRegistryBookkeepingDivergenceGate:
             f"expected a registry_bookkeeping_divergence WARNING naming ep_reinforced; "
             f"caplog had: {[r.message for r in caplog.records]}"
         )
+
+
+# =============================================================================
+# TestActiveKeyHydrationFailureGate — the main-tiers fold's hydration pass
+# (ConsolidationLoop._hydrate_store_for_fold), run before any registry read
+# or mutation, so a key no venue can produce fails the cycle before anything
+# durable changes.
+# =============================================================================
+
+
+class TestActiveKeyHydrationFailureGate:
+    def test_unhydratable_active_key_raises_before_registry_mutation_or_disk_write(self, tmp_path):
+        """A registered active key with no entry in the store cache and no
+        content in the venue (weights) raises ActiveKeyHydrationFailure before
+        _reset_main_tier_registries_and_simhashes mutates the in-RAM registry
+        and before any durable write for this fold."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import ActiveKeyHydrationFailure
+
+        loop = _make_fold_loop(tmp_path)
+        loop._key_metadata_path = tmp_path / "key_metadata.json"
+
+        # Pre-existing, fully-hydratable key -- establishes the FORMER durable state.
+        _seed_keys(loop, "episodic", ["ep_old"], relation_type="factual")
+        registry_path = loop.output_dir / "episodic" / "indexed_key_registry.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        loop.store.registry("episodic").save(registry_path)
+        former_registry_bytes = registry_path.read_bytes()
+
+        # A key registered in the store (entry + registry) but with its entry
+        # cache dropped -- only the registry keeps it alive, matching the only
+        # route to a content-free live key.
+        loop.store.put(
+            "episodic",
+            "ep_unhydratable",
+            {
+                "key": "ep_unhydratable",
+                "subject": "Bob",
+                "predicate": "p",
+                "object": "o",
+                "speaker_id": "S1",
+            },
+            register=True,
+        )
+        loop.store._entries["episodic"].pop("ep_unhydratable", None)
+
+        active_before_fold = set(loop.store.registry("episodic").list_active())
+
+        # The weights hold nothing for it either, so the fold's hydration
+        # pass cannot recover it.
+        with patch(
+            "paramem.memory.probe.probe_keys_grouped_by_adapter",
+            side_effect=lambda model, tokenizer, keys_by_adapter, **kw: {
+                k: None for keys in keys_by_adapter.values() for k in keys
+            },
+        ):
+            with pytest.raises(ActiveKeyHydrationFailure) as excinfo:
+                _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert "ep_unhydratable" in excinfo.value.dropped_keys
+        assert excinfo.value.venue == "train"
+
+        # The in-RAM registry is exactly as it was going in -- the gate fired
+        # before _reset_main_tier_registries_and_simhashes ran.
+        assert set(loop.store.registry("episodic").list_active()) == active_before_fold
+
+        # Nothing durable changed: the on-disk registry is byte-identical,
+        # and key_metadata.json (written by write_key_metadata, which never
+        # runs) does not exist.
+        assert registry_path.read_bytes() == former_registry_bytes
+        assert not loop._key_metadata_path.exists()
+
+    def test_interim_branch_hydration_failure_preserves_a_prior_committed_interim_tier(
+        self, tmp_path
+    ):
+        """The interim branch's hydration call sits in the fold's outer try,
+        whose only handler is a ``finally`` that resets the merger graph --
+        NOT inside the later commit-window try whose ``except`` drops the
+        cycle's own freshly-minted tier.  An abort raised there must never
+        reach that commit-window compensation, so a PRIOR interim cycle's
+        already-committed tier (unrelated to the key that failed to
+        hydrate) stays exactly as it was."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import ActiveKeyHydrationFailure
+
+        loop = TestInterimRecitalDedup._make_loop(tmp_path)
+
+        # A prior interim cycle's committed tier, holding a key with content.
+        prior_tier = "episodic_interim_20260101T0000"
+        loop.store.put(
+            prior_tier,
+            "graph_committed",
+            {
+                "key": "graph_committed",
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+                "speaker_id": "spk-a",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_committed",
+            speaker_id="spk-a",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
+            first_seen="",
+        )
+
+        # A registered active key with its entry cache dropped -- the fold's
+        # hydration pass cannot recover it (probe stubbed to a miss below).
+        loop.store.put(
+            "episodic",
+            "ep_unhydratable",
+            {
+                "key": "ep_unhydratable",
+                "subject": "Bob",
+                "predicate": "p",
+                "object": "o",
+                "speaker_id": "S1",
+            },
+            register=True,
+        )
+        loop.store._entries["episodic"].pop("ep_unhydratable", None)
+
+        prior_entries_before = dict(loop.store.entries_in_tier(prior_tier))
+        prior_bookkeeping_before = loop.store.bookkeeping_for_key("graph_committed")
+        active_keys_before = set(loop.store.all_active_keys())
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, stamp: m,
+            ),
+            patch(
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
+                side_effect=lambda model, tokenizer, keys_by_adapter, **kw: {
+                    k: None for keys in keys_by_adapter.values() for k in keys
+                },
+            ),
+        ):
+            with pytest.raises(ActiveKeyHydrationFailure) as excinfo:
+                loop.run_consolidation_cycle(
+                    [
+                        {
+                            "subject": "carol",
+                            "predicate": "likes",
+                            "object": "tea",
+                            "relation_type": "factual",
+                            "speaker_id": "spk-c",
+                        }
+                    ],
+                    [],
+                    speaker_id="spk-c",
+                    mode="train",
+                    run_label="hydration-failure-interim-test",
+                    stamp="20260201T0000",
+                )
+
+        assert "ep_unhydratable" in excinfo.value.dropped_keys
+
+        assert loop.store.entries_in_tier(prior_tier) == prior_entries_before
+        assert loop.store.bookkeeping_for_key("graph_committed") == prior_bookkeeping_before
+        assert set(loop.store.all_active_keys()) == active_keys_before
 
 
 # =============================================================================
