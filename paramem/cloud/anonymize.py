@@ -66,9 +66,9 @@ from paramem.cloud.placeholders import (
     placeholder_prefix,
 )
 from paramem.evaluation.recall import generate_answer
-from paramem.models.loader import adapt_messages
+from paramem.models.loader import render_chat_prompt
 from paramem.utils.identity import canonical, is_speaker_id
-from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS, estimate_tokens
+from paramem.utils.tokens import ANONYMIZE_ENVELOPE_TOKENS, RenderedPrompt, estimate_tokens
 from paramem.utils.vram_guard import effective_token_envelope, vram_scope
 
 logger = logging.getLogger(__name__)
@@ -114,9 +114,10 @@ def _render_anonymize_prompt(
     system_prompt: str,
     speaker_id: str | None = None,
     speaker_anchor_template: str = "",
-) -> str:
+) -> RenderedPrompt:
     """THE prompt renderer: ``template.format(...)`` +
-    ``tokenizer.apply_chat_template(...)``.
+    ``tokenizer.apply_chat_template(...)`` (via
+    :func:`~paramem.models.loader.render_chat_prompt`).
 
     One implementation, shared by :func:`anonymize_transcript`'s generate
     call and :func:`_slice_facts_to_envelope`'s overhead probe (the
@@ -166,11 +167,7 @@ def _render_anonymize_prompt(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    return tokenizer.apply_chat_template(
-        adapt_messages(messages, tokenizer),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    return render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
 
 
 def _mapping_reserve_tokens(surface: str, tokenizer) -> int:

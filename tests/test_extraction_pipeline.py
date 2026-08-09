@@ -1657,13 +1657,15 @@ class TestCloudEnrichmentProvider:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
-            # ``generate_answer`` and ``adapt_messages`` are imported at
-            # module top in ``paramem.cloud.anonymize`` (no longer lazy).
-            # Patches must target the bound name in that module, not the
-            # source module — the rebound name is what ``anonymize_transcript``
-            # actually calls.
+            # ``generate_answer`` is imported at module top in
+            # ``paramem.cloud.anonymize`` (no longer lazy) — the patch must
+            # target the bound name in that module, not the source module.
+            # ``adapt_messages`` is no longer imported by ``anonymize.py`` at
+            # all: rendering routes through ``render_chat_prompt``
+            # (paramem.models.loader), which calls ``adapt_messages`` as its
+            # own module-global — so the patch targets THAT module.
             patch("paramem.cloud.anonymize.generate_answer", return_value="not json"),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, _raw = anonymize_transcript(
                 facts_from_relations(graph.relations),
@@ -1881,10 +1883,13 @@ class TestCloudEnrichmentProvider:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
-            # See companion comment above: extractor binds these names
-            # at module top, so patches must target the bound name.
+            # See companion comment above (test_anonymize_graceful_on_bad_output):
+            # ``generate_answer`` is bound at module top in extractor.py, so
+            # its patch targets the bound name there; ``adapt_messages`` is
+            # only ever called from inside render_chat_prompt
+            # (paramem.models.loader), so its patch targets THAT module.
             patch("paramem.graph.extractor.generate_answer", return_value=drop_response),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             result, raw = judge_plausibility(facts, "transcript", MagicMock(), tokenizer)
         assert result is not None
@@ -2293,7 +2298,7 @@ class TestAnonymizerMappingOnlyContract:
         )
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             result = anonymize_transcript(
                 facts_from_relations(graph.relations),
@@ -2348,7 +2353,7 @@ class TestAnonymizerMappingOnlyContract:
         caplog.set_level(logging.INFO, logger="paramem.cloud.anonymize")
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             anonymize_transcript(
                 facts_from_relations(graph.relations),
@@ -2417,7 +2422,7 @@ class TestAnonymizerMappingOnlyContract:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
             patch("paramem.graph.stage_enrich.request_enrichment", side_effect=fake_cloud),
         ):
             run_cloud_stages(
@@ -2514,7 +2519,7 @@ class TestAnonymizerMappingOnlyContract:
 
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value="not json"),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             parse_failure_mapping, _parse_failure_transcript, _ = anonymize_transcript(
                 facts, model, tokenizer, scrub={"person name"}, **template_kwargs
@@ -2525,7 +2530,7 @@ class TestAnonymizerMappingOnlyContract:
                 "paramem.cloud.anonymize.generate_answer",
                 return_value='{"mapping": {}, "anonymized_transcript": "nothing to scrub here"}',
             ),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             empty_mapping, empty_mapping_transcript, _ = anonymize_transcript(
                 facts, model, tokenizer, scrub={"person name"}, **template_kwargs
@@ -2590,7 +2595,7 @@ class TestAnonymizerTranscriptArrayContract:
         )
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, _raw = anonymize_transcript(
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
@@ -2617,7 +2622,7 @@ class TestAnonymizerTranscriptArrayContract:
         )
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, _raw = anonymize_transcript(
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
@@ -2644,7 +2649,7 @@ class TestAnonymizerTranscriptArrayContract:
         raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_transcript(
                 self._facts(),
@@ -2672,7 +2677,7 @@ class TestAnonymizerTranscriptArrayContract:
         raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_transcript(
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
@@ -2696,7 +2701,7 @@ class TestAnonymizerTranscriptArrayContract:
         )
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_transcript(
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
@@ -2719,7 +2724,7 @@ class TestAnonymizerTranscriptArrayContract:
         raw = json.dumps({"mapping": {"Alex": "Person_1"}})
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_transcript(
                 self._facts(),
@@ -2745,7 +2750,7 @@ class TestAnonymizerTranscriptArrayContract:
         raw = json.dumps({"mapping": {"Alex": "Person_1"}})
         with (
             patch("paramem.cloud.anonymize.generate_answer", return_value=raw),
-            patch("paramem.cloud.anonymize.adapt_messages", return_value=[]),
+            patch("paramem.models.loader.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_transcript(
                 self._facts(), model, tokenizer, scrub={"person name"}, **self._TEMPLATE_KWARGS
@@ -2800,7 +2805,7 @@ class TestScrubCategoriesReachPrompt:
         with (
             patch("paramem.cloud.anonymize.generate_answer", side_effect=_fake_generate_answer),
             patch(
-                "paramem.cloud.anonymize.adapt_messages",
+                "paramem.models.loader.adapt_messages",
                 side_effect=lambda messages, tok: messages,
             ),
         ):
@@ -3703,7 +3708,7 @@ class TestCloudSystemPromptCallTimeOverride:
             # override) reaches apply_chat_template unchanged — see the
             # companion note on TestFilterWithCloudPromptsDir-style tests.
             patch(
-                "paramem.graph.extractor.adapt_messages",
+                "paramem.models.loader.adapt_messages",
                 side_effect=lambda messages, tok: messages,
             ),
         ):

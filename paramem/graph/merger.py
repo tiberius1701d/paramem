@@ -96,22 +96,15 @@ def check_predicate_coexistence(
             ``_load_prompt(...)`` and pass here.
     """
     from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
+    from paramem.models.loader import render_chat_prompt
 
     prompt = prompt.format(predicate=predicate)
 
-    messages = adapt_messages(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        tokenizer,
-    )
-    formatted = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    formatted = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
 
     output = generate_answer(
         model,

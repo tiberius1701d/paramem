@@ -560,7 +560,9 @@ class TestFormatQuadrupleTraining:
 
         import torch
 
-        def tokenize_fn(text, truncation=True, max_length=512, return_tensors="pt"):
+        def tokenize_fn(
+            text, truncation=True, max_length=512, return_tensors="pt", add_special_tokens=True
+        ):
             token_count = max(1, len(text.split()))
             return {
                 "input_ids": torch.ones(1, token_count, dtype=torch.long),
@@ -594,3 +596,123 @@ class TestFormatQuadrupleTraining:
             assert "input_ids" in ex
             assert "attention_mask" in ex
             assert "labels" in ex
+
+
+class _AddSpecialTokensAwareMaskBoundaryTokenizer:
+    """Chat-template + flag-sensitive-encode stub for
+    ``_tokenize_with_prompt_masking``'s own mask-boundary symmetry guard
+    (``paramem/training/dataset.py:103-108`` — the two ``encode_rendered``
+    calls that build ``full_enc``/``prompt_enc``).
+
+    ``apply_chat_template`` renders turn-by-turn with a per-role tag
+    (mirrors ``TestFormatQuadrupleTraining.mock_tokenizer`` above), so
+    ``prompt_text`` (``messages[:-1]``, ``add_generation_prompt=True``) is a
+    genuine STRING-level prefix of ``full_text`` (all messages,
+    ``add_generation_prompt=False``) up to and including the assistant-turn
+    tag.
+
+    ``__call__`` mirrors ``tests/test_tokens.py::_AddSpecialTokensAwareStubTokenizer``'s
+    flag-sensitivity (one extra id when ``add_special_tokens=True``), but ALSO
+    prepends that extra id (mirroring a real tokenizer's leading BOS) rather
+    than appending it — so a caller that let the two ``encode_rendered``
+    calls diverge on ``add_special_tokens`` would shift every id in the
+    longer encoding by one position, breaking the token-level prefix match
+    this test checks, not merely the reported prompt length.
+    """
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        parts = [f"<|{m['role']}|> {m['content']} " for m in messages]
+        if add_generation_prompt:
+            parts.append("<|assistant|> ")
+        return "".join(parts)
+
+    def __call__(
+        self,
+        text,
+        add_special_tokens=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    ):
+        import torch
+
+        ids = list(range(len(text.split())))
+        if add_special_tokens:
+            ids = [-1, *ids]
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+        }
+
+
+class TestTokenizeWithPromptMaskingBoundarySymmetry:
+    """``_tokenize_with_prompt_masking`` masks ``labels[:prompt_length]`` to
+    ``-100`` using ``prompt_length`` from the SEPARATE prompt-only encode —
+    correct only when both encodes (full and prompt-only) agree on
+    ``add_special_tokens``.  ``encode_rendered`` fixes that flag to
+    ``False`` for both calls; this guards the identity rather than assuming
+    it holds by construction.
+    """
+
+    def _messages(self):
+        return [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "USR"},
+            {"role": "assistant", "content": "REPLY WORDS HERE"},
+        ]
+
+    def test_mask_boundary_matches_prompt_only_token_count(self):
+        from paramem.training.dataset import _tokenize_with_prompt_masking
+
+        tok = _AddSpecialTokensAwareMaskBoundaryTokenizer()
+        result = _tokenize_with_prompt_masking(self._messages(), tok, max_length=512)
+
+        # Independently compute the prompt-only length the SAME way
+        # _tokenize_with_prompt_masking's own prompt_enc does (rendered
+        # through the same tokenizer, add_special_tokens=False via
+        # encode_rendered).
+        prompt_text = tok.apply_chat_template(
+            self._messages()[:-1], tokenize=False, add_generation_prompt=True
+        )
+        expected_prompt_length = len(tok(prompt_text, add_special_tokens=False)["input_ids"][0])
+
+        labels = result["labels"]
+        boundary = (labels != -100).nonzero(as_tuple=True)[0][0].item()
+        assert boundary == expected_prompt_length
+        assert (labels[:expected_prompt_length] == -100).all()
+
+    def test_full_encoding_prefix_matches_prompt_only_encoding(self):
+        """The symmetry the boundary depends on: the full encoding's leading
+        slice, up to the prompt length, is token-identical to the
+        prompt-only encoding — not merely the same length."""
+        from paramem.training.dataset import _tokenize_with_prompt_masking
+
+        tok = _AddSpecialTokensAwareMaskBoundaryTokenizer()
+        result = _tokenize_with_prompt_masking(self._messages(), tok, max_length=512)
+
+        prompt_text = tok.apply_chat_template(
+            self._messages()[:-1], tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"][0]
+        prompt_length = len(prompt_ids)
+
+        input_ids = result["input_ids"]
+        assert input_ids[:prompt_length].tolist() == prompt_ids.tolist()
+
+    def test_stub_is_sensitive_to_add_special_tokens_divergence(self):
+        """Negative control, proving the stub actually detects a divergence
+        (so the positive tests above are not vacuous): if the two encodes
+        disagreed on ``add_special_tokens``, the prefix match would break."""
+        tok = _AddSpecialTokensAwareMaskBoundaryTokenizer()
+        text = tok.apply_chat_template(
+            self._messages(), tokenize=False, add_generation_prompt=False
+        )
+        prompt_text = tok.apply_chat_template(
+            self._messages()[:-1], tokenize=False, add_generation_prompt=True
+        )
+        prompt_length_false = len(tok(prompt_text, add_special_tokens=False)["input_ids"][0])
+
+        full_ids_mismatched = tok(text, add_special_tokens=True)["input_ids"][0]
+        prompt_ids_consistent = tok(prompt_text, add_special_tokens=False)["input_ids"][0]
+
+        assert full_ids_mismatched[:prompt_length_false].tolist() != prompt_ids_consistent.tolist()

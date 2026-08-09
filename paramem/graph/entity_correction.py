@@ -37,7 +37,7 @@ from collections import namedtuple
 from paramem.config.taxonomy import placeholder_entity_type
 from paramem.evaluation.recall import generate_answer
 from paramem.graph.prompts import _load_prompt
-from paramem.models.loader import adapt_messages
+from paramem.models.loader import render_chat_prompt
 from paramem.utils.identity import canonical
 from paramem.utils.vram_guard import vram_scope
 
@@ -162,11 +162,7 @@ def _verdict(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    formatted = tokenizer.apply_chat_template(
-        adapt_messages(messages, tokenizer),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    formatted = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
     raw = generate_answer(
         model,
         tokenizer,

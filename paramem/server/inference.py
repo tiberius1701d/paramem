@@ -53,7 +53,11 @@ from paramem.cloud.providers.base import CloudAgent
 from paramem.evaluation.recall import generate_answer
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
-from paramem.models.loader import adapt_messages, base_model_inference, grad_checkpointing_disabled
+from paramem.models.loader import (
+    base_model_inference,
+    grad_checkpointing_disabled,
+    render_chat_prompt,
+)
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
 from paramem.server.prompts import (
@@ -903,8 +907,8 @@ def _generate_local_reply(
         :data:`_CAP_HIT_TOKEN_TOLERANCE` of ``max_new_tokens``.
     """
     system_prompt = _build_system_prompt(speaker_id, language, config)
-    messages = _build_messages(text, history, system_prompt, tokenizer)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    messages = _build_messages(text, history, system_prompt)
+    prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
     max_new_tokens = config.inference.max_response_tokens
     with base_model_inference(model):
         reply = generate_answer(
@@ -1690,7 +1694,6 @@ def _build_messages(
     text: str,
     history: list[dict] | None,
     system_prompt: str,
-    tokenizer,
 ) -> list[dict]:
     """Build chat messages enforcing strict user/assistant alternation.
 
@@ -1728,4 +1731,4 @@ def _build_messages(
     else:
         messages.append({"role": "user", "content": text})
 
-    return adapt_messages(messages, tokenizer)
+    return messages

@@ -3,13 +3,15 @@
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
+from paramem.utils.tokens import RenderedPrompt, encode_rendered
+
 _DEFAULT_REPETITION_PENALTY = 1.1
 
 
 def generate_answer(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
-    prompt: str,
+    prompt: RenderedPrompt,
     max_new_tokens: int = 128,
     temperature: float = 0.0,
     repetition_penalty: float | None = None,
@@ -18,6 +20,13 @@ def generate_answer(
     seed: int | None = None,
 ) -> str:
     """Generate an answer from the model given a prompt.
+
+    ``prompt`` must be a :class:`~paramem.utils.tokens.RenderedPrompt` — the
+    output of :func:`~paramem.models.loader.render_chat_prompt` — never a
+    plain ``str``. It is tensorized via
+    :func:`~paramem.utils.tokens.encode_rendered`, which always encodes with
+    ``add_special_tokens=False`` so the chat template's own literal BOS is
+    the only BOS reaching the model.
 
     When repetition_penalty is None, uses the module-level default (1.1).
     Call sites can override per-objective when needed.
@@ -33,7 +42,7 @@ def generate_answer(
     """
     if repetition_penalty is None:
         repetition_penalty = _DEFAULT_REPETITION_PENALTY
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    inputs = encode_rendered(tokenizer, prompt, return_tensors="pt").to(model.device)
 
     # Build stop token list: eos_token + chat template end tokens (e.g. <|im_end|>)
     stop_ids = [tokenizer.eos_token_id]

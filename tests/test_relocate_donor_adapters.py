@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from paramem.adapters.manifest import find_live_slot
 from paramem.training.donor import (
     DONOR_META_FILENAME,
     DONOR_MIN_ENTRIES,
@@ -201,14 +202,22 @@ class TestRelocate:
         assert not (tmp_path / "_donor").exists()
 
     def test_rerun_is_a_no_op(self, tmp_path):
+        """A second run relocates nothing and leaves the first run's slot
+        byte-for-byte as it was — weights, manifest and donor meta alike."""
         _write_tier_slot(tmp_path)
         _write_legacy_donor(tmp_path)
 
         relocate(tmp_path)
+        store = donor_store_dir(tmp_path, _BASE_REPO, _LORA_SHAPE)
+        slot = find_live_slot(store, "")
+        assert slot is not None
+        before = {p.name: p.read_bytes() for p in slot.iterdir()}
+
         moved, skipped = relocate(tmp_path)
 
         assert (moved, skipped) == (0, 0)
-        store = donor_store_dir(tmp_path, _BASE_REPO, _LORA_SHAPE)
+        assert find_live_slot(store, "") == slot
+        assert {p.name: p.read_bytes() for p in slot.iterdir()} == before
         assert donor_checkpoint_valid(store, _BASE_REPO, _LORA_SHAPE) is True
 
     def test_donor_without_a_matching_tier_manifest_is_left_in_place(self, tmp_path):

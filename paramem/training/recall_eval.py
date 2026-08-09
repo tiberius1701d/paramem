@@ -205,6 +205,7 @@ def probe_entries(
 
     from paramem.memory.entry import finalize_recalled
     from paramem.training.dataset import build_inference_prompts, trained_recall_template
+    from paramem.utils.tokens import encode_rendered
 
     device = next(model.parameters()).device
     stop_ids = derive_stop_ids(tokenizer)
@@ -231,7 +232,9 @@ def probe_entries(
         for start in range(0, len(entries), batch_size):
             chunk = entries[start : start + batch_size]
             prompts = all_prompts[start : start + batch_size]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+            inputs = encode_rendered(tokenizer, prompts, return_tensors="pt", padding=True).to(
+                device
+            )
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,

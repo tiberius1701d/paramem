@@ -14,13 +14,14 @@ from unittest.mock import MagicMock
 import torch
 
 from paramem.evaluation.recall import generate_answer
+from paramem.utils.tokens import RenderedPrompt
 
 
 class _FakeTokenizer:
     eos_token_id = 0
     pad_token_id = 0
 
-    def __call__(self, text, return_tensors="pt"):
+    def __call__(self, text, return_tensors="pt", add_special_tokens=False):
         out = MagicMock()
         out.to = lambda device: {
             "input_ids": torch.zeros((1, 4), dtype=torch.long),
@@ -45,7 +46,7 @@ def _fake_model() -> MagicMock:
 def test_top_p_top_k_forwarded_to_generate():
     model = _fake_model()
     tok = _FakeTokenizer()
-    generate_answer(model, tok, "p", max_new_tokens=4, top_p=0.95, top_k=40)
+    generate_answer(model, tok, RenderedPrompt("p"), max_new_tokens=4, top_p=0.95, top_k=40)
     kwargs = model.generate.call_args.kwargs
     assert kwargs["top_p"] == 0.95
     assert kwargs["top_k"] == 40
@@ -62,7 +63,7 @@ def test_seed_sets_global_rng_and_no_generator_kwarg():
 
     # Capture global RNG state; assert it IS changed after the call (seed was applied).
     before = torch.random.get_rng_state()
-    generate_answer(model, tok, "p", max_new_tokens=4, seed=12345)
+    generate_answer(model, tok, RenderedPrompt("p"), max_new_tokens=4, seed=12345)
     after = torch.random.get_rng_state()
     assert not torch.equal(before, after), (
         "generate_answer(seed=...) must set the global torch RNG via torch.manual_seed"
@@ -77,7 +78,7 @@ def test_seed_sets_global_rng_and_no_generator_kwarg():
 def test_no_overrides_no_extra_kwargs():
     model = _fake_model()
     tok = _FakeTokenizer()
-    generate_answer(model, tok, "p", max_new_tokens=4)
+    generate_answer(model, tok, RenderedPrompt("p"), max_new_tokens=4)
     kwargs = model.generate.call_args.kwargs
     for k in ("top_p", "top_k", "generator"):
         assert k not in kwargs, f"unexpected kwarg {k!r} forwarded when no override given"

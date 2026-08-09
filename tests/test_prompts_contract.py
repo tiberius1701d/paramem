@@ -1722,10 +1722,14 @@ class TestCheckPredicateCoexistenceParser:
     def _call_with_mock_output(self, output: str) -> str:
         """Drive check_predicate_coexistence with a mocked model output.
 
-        ``generate_answer`` and ``adapt_messages`` are imported locally inside
-        ``check_predicate_coexistence`` (lazy import), so we patch them at their
-        definition site (``paramem.evaluation.recall`` and
-        ``paramem.models.loader``), not via the merger module namespace.
+        ``generate_answer`` is imported locally inside
+        ``check_predicate_coexistence`` (lazy import), so it is patched at
+        its definition site (``paramem.evaluation.recall``), not via the
+        merger module namespace. ``check_predicate_coexistence`` no longer
+        imports ``adapt_messages`` directly — it renders through
+        ``render_chat_prompt`` (``paramem.models.loader``), which calls
+        ``adapt_messages`` as its own module-global, so that patch targets
+        ``paramem.models.loader`` too.
         """
         from unittest.mock import MagicMock, patch
 

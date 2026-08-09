@@ -37,7 +37,7 @@ from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.relation_build import build_relations
 from paramem.graph.schema import SessionGraph
-from paramem.models.loader import adapt_messages, base_model_inference
+from paramem.models.loader import base_model_inference, render_chat_prompt
 from paramem.utils.identity import as_speaker_id, canonical, is_speaker_id
 from paramem.utils.tokens import estimate_tokens
 from paramem.utils.vram_guard import vram_scope
@@ -701,9 +701,7 @@ def _generate_extraction(
             "content": prompt.format(**format_kwargs),
         },
     ]
-    formatted = tokenizer.apply_chat_template(
-        adapt_messages(messages, tokenizer), tokenize=False, add_generation_prompt=True
-    )
+    formatted = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
 
     # vram_scope: main extraction generate is the longest prefill of the
     # extraction chain. Without an empty_cache between this phase and the
@@ -2502,11 +2500,7 @@ def judge_plausibility(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    formatted = tokenizer.apply_chat_template(
-        adapt_messages(messages, tokenizer),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    formatted = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
     # Token count is the actual KV-cache driver, not character count.
     token_count = estimate_tokens(formatted, tokenizer)
     logger.info(
@@ -2703,11 +2697,7 @@ def normalize_predicates(
                         {"role": "system", "content": normalization_system_prompt},
                         {"role": "user", "content": rendered},
                     ]
-                    formatted = tokenizer.apply_chat_template(
-                        adapt_messages(messages, tokenizer),
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
+                    formatted = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
                     with vram_scope("dedup"):
                         raw = generate_answer(
                             model,

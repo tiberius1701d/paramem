@@ -60,11 +60,11 @@ from paramem.memory.persistence import load_registry, save_registry
 
 # --- models ---------------------------------------------------------------
 from paramem.models.loader import (
-    adapt_messages,
     create_adapter,
     load_adapter,
     load_base_model,
     lora_shape_fields,
+    render_chat_prompt,
     save_adapter,
     switch_adapter,
     unload_model,
@@ -98,6 +98,9 @@ from paramem.utils.artifacts import write_artifact
 # --- config ---------------------------------------------------------------
 from paramem.utils.config import AdapterConfig, ModelConfig, TrainingConfig, budget_for
 
+# --- tokens -----------------------------------------------------------------
+from paramem.utils.tokens import encode_rendered
+
 __all__ = [
     # adapters
     "resolve_adapter_slot",
@@ -125,10 +128,10 @@ __all__ = [
     # artifacts
     "write_artifact",
     # models
-    "adapt_messages",
     "create_adapter",
     "load_adapter",
     "load_base_model",
+    "render_chat_prompt",
     "save_adapter",
     "switch_adapter",
     "unload_model",
@@ -157,4 +160,6 @@ __all__ = [
     "donor_slot_valid",
     "triples_hash",
     "lora_shape_fields",
+    # tokens
+    "encode_rendered",
 ]

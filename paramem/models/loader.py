@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from paramem.utils.config import AdapterConfig, ModelConfig
+from paramem.utils.tokens import RenderedPrompt, encode_rendered
 from paramem.utils.vram_guard import safe_empty_cache
 
 logger = logging.getLogger(__name__)
@@ -141,8 +142,8 @@ def generate_adapter_off(
             own; each caller owns its own try/except and its own
             fail-shape (``Intent.UNKNOWN``, ``DateSelection(all=True, ...)``).
     """
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
+    inputs = encode_rendered(tokenizer, prompt, return_tensors="pt").to(model.device)
 
     with base_model_inference(model):
         with torch.no_grad():
@@ -383,6 +384,47 @@ def adapt_messages(messages: list[dict], tokenizer: PreTrainedTokenizer) -> list
         adapted.insert(0, {"role": "user", "content": system_prefix})
 
     return adapted
+
+
+def render_chat_prompt(
+    messages: list[dict],
+    tokenizer: PreTrainedTokenizer,
+    *,
+    add_generation_prompt: bool = True,
+) -> RenderedPrompt:
+    """THE one production chat-template renderer.
+
+    Applies :func:`adapt_messages` internally (folding system content for a
+    tokenizer whose template doesn't render a system role, e.g. Mistral
+    v0.3), then ``tokenizer.apply_chat_template(adapted, tokenize=False,
+    add_generation_prompt=...)``, and wraps the result in
+    :class:`~paramem.utils.tokens.RenderedPrompt` — the marker type
+    :func:`~paramem.utils.tokens.encode_rendered` requires before it will
+    tensorize the text.
+
+    This is the ONLY production call site of ``apply_chat_template`` for
+    text that will later be generated on. The one deliberate exception is
+    :func:`supports_system_role`, which renders a probe string that is
+    never encoded — it stays a direct ``apply_chat_template`` call.
+
+    Args:
+        messages: Chat message dicts (``[{"role", "content"}, ...]``),
+            UN-adapted — this function applies :func:`adapt_messages` so
+            callers must not adapt a second time.
+        tokenizer: The tokenizer whose chat template renders the text.
+        add_generation_prompt: Forwarded to ``apply_chat_template``. ``True``
+            (default) appends the assistant-turn generation prefix; callers
+            rendering a full (already-completed) conversation for training
+            pass ``False``.
+
+    Returns:
+        The rendered prompt string as a :class:`RenderedPrompt`.
+    """
+    adapted = adapt_messages(messages, tokenizer)
+    rendered = tokenizer.apply_chat_template(
+        adapted, tokenize=False, add_generation_prompt=add_generation_prompt
+    )
+    return RenderedPrompt(rendered)
 
 
 def _get_quantization_config(model_config: ModelConfig) -> Optional[BitsAndBytesConfig]:

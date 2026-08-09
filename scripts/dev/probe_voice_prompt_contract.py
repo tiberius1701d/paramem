@@ -55,7 +55,7 @@ from experiments.utils.test_harness import (  # noqa: E402
 )
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.memory.probe import probe_keys_grouped_by_adapter  # noqa: E402
-from paramem.models.loader import load_adapter, load_base_model  # noqa: E402
+from paramem.models.loader import load_adapter, load_base_model, render_chat_prompt  # noqa: E402
 from paramem.server.config import load_server_config  # noqa: E402
 from paramem.server.escalation import detect_escalation  # noqa: E402
 from paramem.server.inference import _build_system_prompt  # noqa: E402
@@ -141,7 +141,7 @@ def main() -> int:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": augmented},
         ]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
         if isinstance(model, PeftModel):
             with model.disable_adapter():
                 response = generate_answer(

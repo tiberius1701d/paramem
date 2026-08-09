@@ -201,8 +201,6 @@ def format_entry_training(
         List of pre-tokenized training example dicts with ``input_ids``,
         ``attention_mask``, and ``labels`` (prompt tokens masked to -100).
     """
-    from paramem.models.loader import adapt_messages
-
     system = trained_recall_system_prompt()
     template = trained_recall_template()
 
@@ -210,14 +208,11 @@ def format_entry_training(
     for entry in entries:
         recall_prompt = template.format(key=entry["key"])
         recall_response = _build_response(entry)
-        messages = adapt_messages(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": recall_prompt},
-                {"role": "assistant", "content": recall_response},
-            ],
-            tokenizer,
-        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": recall_prompt},
+            {"role": "assistant", "content": recall_response},
+        ]
         examples.append(_tokenize_with_prompt_masking(messages, tokenizer, max_length))
     return examples
 

@@ -220,9 +220,11 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
 
     On teardown: if the cache was empty/invalid at setup and the test's run
     produced a valid donor under ``tmp_path``, copy it into the cache so the
-    next invocation is warm. The cache shipped with this repo is already
-    populated for Mistral 7B / rank 8 / alpha 16 / 4 target modules, so this
-    branch does not fire in that configuration.
+    next invocation is warm -- replacing a stale-but-present cache directory
+    first, since the cache always holds the most recent valid build. The
+    cache shipped with this repo is already populated for Mistral 7B /
+    rank 8 / alpha 16 / 4 target modules, so this branch does not fire in
+    that configuration.
     """
     import shutil
 
@@ -256,6 +258,8 @@ def donor_checkpoint_cache(model_and_tokenizer, tmp_path):
         lora_shape = seeded["lora_shape"]
         if donor_checkpoint_valid(dest_dir, base_model_id, lora_shape):
             cache_dir.parent.mkdir(parents=True, exist_ok=True)
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
             shutil.copytree(dest_dir, cache_dir)
 
 

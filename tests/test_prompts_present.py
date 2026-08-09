@@ -342,6 +342,105 @@ class TestTrainedRecallInterfacePin:
         assert rendered == "Recall the fact stored under key 'graph1'.", self._PIN_FAILURE_MESSAGE
 
 
+@pytest.mark.gpu
+class TestEncodeBoundaryWeightCoupledPin:
+    """Pin the single-BOS / mask-boundary invariant between the training
+    encoding (:func:`~paramem.memory.entry.format_entry_training`) and the
+    serving encoding (:func:`~paramem.training.dataset.build_inference_prompts`)
+    against the real pinned Mistral tokenizer.
+
+    Both paths render through the one production renderer
+    (:func:`~paramem.models.loader.render_chat_prompt`) and tensorize through
+    the one production tensorizer (:func:`~paramem.utils.tokens.encode_rendered`,
+    always ``add_special_tokens=False``). This test proves that pairing holds
+    end to end against the real tokenizer's chat template and added-token
+    trie, not just at the unit level with a stub.
+
+    _PIN_FAILURE_MESSAGE below is asserted on every failure: the chat
+    template, the tokenizer's special-token policy, and
+    ``add_special_tokens`` handling are ONE weight-coupled interface with the
+    trained-recall text — every adapter in production was trained against
+    this exact encode/render pairing.
+    """
+
+    _PIN_FAILURE_MESSAGE = (
+        "The chat template, the tokenizer's special-token policy, and "
+        "add_special_tokens handling are ONE weight-coupled interface with "
+        "the trained-recall text: every adapter in production was trained "
+        "against this exact encode/render pairing. Changing the chat "
+        "template, the special-token policy, or add_special_tokens handling "
+        "invalidates all trained adapters until they are retrained."
+    )
+
+    @pytest.fixture(scope="class")
+    def tokenizer(self):
+        from transformers import AutoTokenizer
+
+        from paramem.server.config import load_server_config
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        return AutoTokenizer.from_pretrained(
+            cfg.model_config.model_id,
+            trust_remote_code=cfg.model_config.trust_remote_code,
+        )
+
+    @pytest.fixture(scope="class")
+    def encodings(self, tokenizer):
+        from paramem.memory.entry import format_entry_training
+        from paramem.training.dataset import build_inference_prompts, trained_recall_template
+        from paramem.utils.tokens import encode_rendered
+
+        entry = {
+            "key": "graph1",
+            "subject": "alex",
+            "predicate": "works at",
+            "object": "acme corp",
+        }
+        training_example = format_entry_training([entry], tokenizer)[0]
+        serving_prompt = build_inference_prompts(
+            [trained_recall_template().format(key=entry["key"])], tokenizer
+        )[0]
+        serving_encoded = encode_rendered(tokenizer, serving_prompt, return_tensors="pt")
+
+        return {
+            "training_ids": training_example["input_ids"].tolist(),
+            "training_labels": training_example["labels"].tolist(),
+            "serving_ids": serving_encoded["input_ids"][0].tolist(),
+            "bos_id": tokenizer.bos_token_id,
+            "eos_id": tokenizer.eos_token_id,
+        }
+
+    def test_training_encoding_has_single_leading_bos(self, encodings):
+        ids = encodings["training_ids"]
+        bos_id = encodings["bos_id"]
+        assert ids.count(bos_id) == 1, self._PIN_FAILURE_MESSAGE
+        assert ids[0] == bos_id, self._PIN_FAILURE_MESSAGE
+
+    def test_training_encoding_ends_with_eos(self, encodings):
+        """The template's trailing ``</s>`` must survive add_special_tokens=False
+        via the tokenizer's added-token trie — if this ever breaks, training
+        targets silently lose their stop token."""
+        assert encodings["training_ids"][-1] == encodings["eos_id"], self._PIN_FAILURE_MESSAGE
+
+    def test_serving_encoding_is_an_exact_prefix_of_training_encoding(self, encodings):
+        serving_ids = encodings["serving_ids"]
+        training_ids = encodings["training_ids"]
+        assert training_ids[: len(serving_ids)] == serving_ids, self._PIN_FAILURE_MESSAGE
+
+    def test_label_mask_boundary_equals_serving_encoding_length(self, encodings):
+        """The -100 label mask must end EXACTLY where generation starts —
+        i.e. exactly at the serving encoding's length."""
+        labels = encodings["training_labels"]
+        boundary = next(i for i, v in enumerate(labels) if v != -100)
+        assert boundary == len(encodings["serving_ids"]), self._PIN_FAILURE_MESSAGE
+
+    def test_serving_encoding_has_single_leading_bos(self, encodings):
+        ids = encodings["serving_ids"]
+        bos_id = encodings["bos_id"]
+        assert ids.count(bos_id) == 1, self._PIN_FAILURE_MESSAGE
+        assert ids[0] == bos_id, self._PIN_FAILURE_MESSAGE
+
+
 class TestRetiredServingPromptFilesAbsent:
     """``pa_voice.txt`` and its marker convention are retired — six new
     files replace it (``serving_system.txt``, ``serving_directives.txt``,

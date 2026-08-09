@@ -19,6 +19,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from experiments.utils.production import encode_rendered, render_chat_prompt  # noqa: E402
 from paramem.models.loader import unload_model  # noqa: E402
 
 
@@ -68,8 +69,8 @@ def load_model_and_adapter(adapter_path):
 def generate(model, tokenizer, prompt, max_new_tokens=300, temperature=0.0):
     """Generate a response from the model."""
     messages = [{"role": "user", "content": prompt}]
-    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+    input_text = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
+    inputs = encode_rendered(tokenizer, input_text, return_tensors="pt").to(model.device)
 
     outputs = model.generate(
         **inputs,

@@ -1588,7 +1588,7 @@ class TestSaveAdaptersManifest:
         """
         import hashlib
 
-        from paramem.adapters.manifest import find_live_slot, read_manifest
+        from paramem.adapters.manifest import MANIFEST_SCHEMA_VERSION, find_live_slot, read_manifest
         from paramem.training.key_registry import KeyRegistry
 
         loop = self._make_save_loop(tmp_path)
@@ -1642,8 +1642,8 @@ class TestSaveAdaptersManifest:
         # stale pre-existing registry (stale_key).
         assert manifest.key_count == 1
 
-        # Manifest version must be v4 (no keyed_pairs_sha256 field).
-        assert manifest.schema_version == 4
+        # Manifest version must be current (no keyed_pairs_sha256 field).
+        assert manifest.schema_version == MANIFEST_SCHEMA_VERSION
 
     def test_save_adapters_stamps_each_tier_with_its_own_count(self, tmp_path):
         """Each tier's manifest carries that tier's own active-key count.
@@ -1932,7 +1932,9 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             trained_at="2026-04-21T00:00:00Z",
             base_model=BaseModelFingerprint(repo="hf/base", sha="abc123", hash=expected_hash),
             tokenizer=TokenizerFingerprint(
-                name_or_path="hf/base", vocab_size=32000, merges_hash="m"
+                name_or_path="hf/base",
+                vocab_size=32000,
+                merges_hash="m",
             ),
             lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=()),
             registry_sha256="",

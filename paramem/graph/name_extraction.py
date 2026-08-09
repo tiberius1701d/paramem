@@ -1,7 +1,13 @@
 """LLM-based speaker name extraction for enrollment.
 
-Graph-layer module: no imports from paramem.server.  Only uses
-paramem.evaluation.recall, paramem.graph.prompts, and stdlib.
+Graph-layer module: no imports from paramem.server.  Uses
+paramem.evaluation.recall, paramem.graph.phase_trace, paramem.graph.prompts,
+paramem.models.loader (render_chat_prompt — the one production
+chat-template renderer; itself free of any paramem.server dependency),
+and stdlib.  All four are imported locally inside
+:func:`extract_name_via_llm`, matching this module's existing pattern of
+deferring heavy (torch/transformers/peft) imports until the function that
+actually needs them runs.
 """
 
 from __future__ import annotations
@@ -65,6 +71,7 @@ def extract_name_via_llm(
     from paramem.evaluation.recall import generate_answer
     from paramem.graph.phase_trace import phase_trace
     from paramem.graph.prompts import _load_prompt
+    from paramem.models.loader import render_chat_prompt
 
     # Build transcript — filter to user turns only when requested.
     lines = []
@@ -99,7 +106,7 @@ def extract_name_via_llm(
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
 
         # Resolve inference params.
         p = params or {}

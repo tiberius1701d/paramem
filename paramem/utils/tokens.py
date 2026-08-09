@@ -23,6 +23,25 @@ CLI must not import the cloud package), nor in ``paramem.graph``
 ``paramem.utils`` is the existing leaf home for exactly this kind of
 dependency-light shared primitive (``identity.py``, ``paths.py``).
 
+Boundary, part two — the encode chokepoint (added when this module gained
+:class:`RenderedPrompt` and :func:`encode_rendered`): this module owns not
+only token *counting* but also the *encode* boundary for chat-template
+rendered text. :func:`~paramem.models.loader.render_chat_prompt` is the one
+production renderer (``tokenizer.apply_chat_template(..., tokenize=False)``);
+:func:`encode_rendered` is the one production tensorizer for its output
+(``tokenizer(text, add_special_tokens=False, ...)``). Both exist so a
+rendered chat template's own literal BOS token is never joined by a second,
+tokenizer-default BOS from a naive re-encode. The two functions in this
+module that touch a tokenizer have deliberately DIVERGENT failure contracts
+— read the one that applies before assuming either behaviour:
+:func:`estimate_tokens` (below) swallows any tokenizer exception and falls
+back to the words-based estimate (see its own docstring and its ``except
+Exception`` fallback branch); :func:`encode_rendered` never swallows — a
+raising tokenizer call propagates unchanged, because a sizing estimate may
+safely degrade to a bound, but a tensorization that will actually be fed to
+``model.generate()``/a training step must fail loudly rather than silently
+produce wrong tensors.
+
 The fallback ratio (:data:`MEASURED_TOKENS_PER_WORD`) is MEASURED ONCE
 with the production tokenizer (Mistral 7B,
 ``mistralai/Mistral-7B-Instruct-v0.3``, pinned by
@@ -53,6 +72,68 @@ import logging
 import math
 
 logger = logging.getLogger(__name__)
+
+
+class RenderedPrompt(str):
+    """Marker subclass for chat-template-rendered text.
+
+    A plain ``str`` subclass with no behavior of its own — its only job is
+    to let :func:`encode_rendered` distinguish "text that already went
+    through :func:`~paramem.models.loader.render_chat_prompt`" from an
+    arbitrary ``str`` that has not been through a chat template at all (and
+    so may be missing the template's own literal BOS, or may need one added
+    by the tokenizer). Every production renderer wraps its output in this
+    type; every production tensorizer of rendered text requires it.
+    """
+
+
+def encode_rendered(tokenizer, text: "RenderedPrompt | list[RenderedPrompt]", **tokenizer_kwargs):
+    """THE tensorizer for chat-template-rendered text — ``add_special_tokens=False`` always.
+
+    A rendered chat template already carries its own literal BOS token (and
+    any other template-inserted special tokens). Encoding it with a
+    tokenizer's default ``add_special_tokens=True`` re-adds a second BOS on
+    top of the template's own — the double-BOS bug this function exists to
+    make structurally impossible at every call site that routes through it.
+
+    Args:
+        tokenizer: A HuggingFace-style tokenizer, callable as
+            ``tokenizer(text_or_list, add_special_tokens=False,
+            **tokenizer_kwargs)``.
+        text: A single :class:`RenderedPrompt`, or a list of them (for a
+            batched encode). A plain ``str`` (or a list containing one) is
+            rejected — see ``Raises`` below.
+        **tokenizer_kwargs: Forwarded verbatim to the tokenizer call (e.g.
+            ``return_tensors``, ``padding``, ``truncation``, ``max_length``).
+            ``add_special_tokens`` may not be passed here — it is always
+            ``False``, fixed by this function.
+
+    Returns:
+        Whatever the tokenizer call returns (typically a ``BatchEncoding``).
+
+    Raises:
+        TypeError: When *text* (or any element of a list *text*) is a plain
+            ``str``, not a :class:`RenderedPrompt` — the caller skipped
+            :func:`~paramem.models.loader.render_chat_prompt` and is about
+            to double-BOS (or under-BOS) the encode. The message names
+            ``render_chat_prompt`` as the fix.
+        Exception: Any exception the tokenizer itself raises propagates
+            unchanged — this function never catches a tokenizer failure.
+    """
+    if isinstance(text, list):
+        for item in text:
+            if not isinstance(item, RenderedPrompt):
+                raise TypeError(
+                    "encode_rendered: list element is a plain str, not a RenderedPrompt — "
+                    "render it first via paramem.models.loader.render_chat_prompt"
+                )
+    elif not isinstance(text, RenderedPrompt):
+        raise TypeError(
+            "encode_rendered: text is a plain str, not a RenderedPrompt — "
+            "render it first via paramem.models.loader.render_chat_prompt"
+        )
+    return tokenizer(text, add_special_tokens=False, **tokenizer_kwargs)
+
 
 # Fallback words->tokens ratio. MEASURED ONCE with the production tokenizer
 # (Mistral 7B, mistralai/Mistral-7B-Instruct-v0.3, pinned by

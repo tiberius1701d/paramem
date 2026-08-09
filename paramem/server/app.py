@@ -1683,8 +1683,9 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
 def _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg) -> "str | None":
     """Compare manifest fingerprints against live runtime state.
 
-    Skips UNKNOWN values (cannot verify).  Returns the name of the first
-    mismatching field, or ``None`` when all non-UNKNOWN fields match.
+    Skips UNKNOWN values (cannot verify) on the ``base_model``/``lora``
+    fields. Returns the name of the first mismatching field, or ``None``
+    when all checked fields match.
 
     Args:
         manifest: :class:`~paramem.adapters.manifest.AdapterManifest` to check.
@@ -8821,7 +8822,11 @@ async def debug_recall(request: DebugRecallRequest):
 
     from paramem.evaluation.recall import generate_answer
     from paramem.memory.entry import parse_recalled_entry
-    from paramem.models.loader import adapt_messages, grad_checkpointing_disabled, switch_adapter
+    from paramem.models.loader import (
+        grad_checkpointing_disabled,
+        render_chat_prompt,
+        switch_adapter,
+    )
     from paramem.server.gpu_lock import gpu_lock
     from paramem.training.dataset import trained_recall_system_prompt
 
@@ -8830,14 +8835,11 @@ async def debug_recall(request: DebugRecallRequest):
         if request.system_prompt is not None
         else trained_recall_system_prompt()
     )
-    messages = adapt_messages(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": request.text},
-        ],
-        tokenizer,
-    )
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": request.text},
+    ]
+    prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
 
     def _run() -> tuple[str, str, int]:
         # Capture prior active adapter so we can restore.  PEFT exposes both

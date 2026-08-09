@@ -179,13 +179,11 @@ def load_model_4bit(model_id):
 
 def generate(model, tokenizer, prompt, max_new_tokens=1024, temperature=0.3):
     """Generate text from a prompt using chat template."""
+    from experiments.utils.production import encode_rendered, render_chat_prompt
+
     messages = [{"role": "user", "content": prompt}]
-    formatted = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
+    formatted = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
+    inputs = encode_rendered(tokenizer, formatted, return_tensors="pt").to(model.device)
 
     stop_ids = [tokenizer.eos_token_id]
     # Add model-specific stop tokens

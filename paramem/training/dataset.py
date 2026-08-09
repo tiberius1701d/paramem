@@ -1,6 +1,7 @@
 """Dataset utilities for personal memory training."""
 
 from paramem.graph.prompts import _load_prompt_section
+from paramem.utils.tokens import RenderedPrompt
 
 _TRAINED_RECALL_FILE = "trained_recall.txt"
 
@@ -33,7 +34,7 @@ def trained_recall_template() -> str:
     return _load_prompt_section(_TRAINED_RECALL_FILE, "RECALL")
 
 
-def build_inference_prompts(questions: list[str], tokenizer) -> list[str]:
+def build_inference_prompts(questions: list[str], tokenizer) -> list[RenderedPrompt]:
     """Render inference prompts for N questions, sharing one system-prompt load.
 
     No fact context is provided — the model must recall from its adapted
@@ -49,21 +50,19 @@ def build_inference_prompts(questions: list[str], tokenizer) -> list[str]:
         tokenizer: HuggingFace tokenizer supporting ``apply_chat_template``.
 
     Returns:
-        Rendered prompt strings, same order and length as *questions*.
+        Rendered :class:`~paramem.utils.tokens.RenderedPrompt` strings, same
+        order and length as *questions*.
     """
-    from paramem.models.loader import adapt_messages
+    from paramem.models.loader import render_chat_prompt
 
     system_prompt = trained_recall_system_prompt()
     return [
-        tokenizer.apply_chat_template(
-            adapt_messages(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": question},
-                ],
-                tokenizer,
-            ),
-            tokenize=False,
+        render_chat_prompt(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ],
+            tokenizer,
             add_generation_prompt=True,
         )
         for question in questions
@@ -77,13 +76,15 @@ def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: i
     masked to ``-100`` in labels so the model learns to predict only the
     assistant turn.
 
-    Used by both the entry-format training path
-    (:func:`paramem.memory.entry.format_entry_training`) and the legacy
-    QA-format archive (:func:`archive.legacy_qa.format_indexed_training`).
+    Used by the entry-format training path
+    (:func:`paramem.memory.entry.format_entry_training`).
 
     Args:
         messages: List of chat message dicts (role/content pairs), with the
-            last message being the assistant response.
+            last message being the assistant response. UN-adapted — this
+            function renders through :func:`~paramem.models.loader.render_chat_prompt`,
+            which applies :func:`~paramem.models.loader.adapt_messages`
+            internally; callers must not adapt a second time.
         tokenizer: HuggingFace tokenizer supporting ``apply_chat_template``.
         max_length: Maximum token length; truncation applied to both full and
             prompt encodings.
@@ -92,13 +93,18 @@ def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: i
         Dict with ``input_ids``, ``attention_mask``, and ``labels`` tensors
         (prompt tokens masked to ``-100``).
     """
-    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    prompt_text = tokenizer.apply_chat_template(
-        messages[:-1], tokenize=False, add_generation_prompt=True
-    )
+    from paramem.models.loader import render_chat_prompt
+    from paramem.utils.tokens import encode_rendered
 
-    full_enc = tokenizer(full_text, truncation=True, max_length=max_length, return_tensors="pt")
-    prompt_enc = tokenizer(prompt_text, truncation=True, max_length=max_length, return_tensors="pt")
+    full_text = render_chat_prompt(messages, tokenizer, add_generation_prompt=False)
+    prompt_text = render_chat_prompt(messages[:-1], tokenizer, add_generation_prompt=True)
+
+    full_enc = encode_rendered(
+        tokenizer, full_text, truncation=True, max_length=max_length, return_tensors="pt"
+    )
+    prompt_enc = encode_rendered(
+        tokenizer, prompt_text, truncation=True, max_length=max_length, return_tensors="pt"
+    )
 
     input_ids = full_enc["input_ids"].squeeze()
     attention_mask = full_enc["attention_mask"].squeeze()

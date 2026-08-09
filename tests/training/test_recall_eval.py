@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from paramem.utils.tokens import RenderedPrompt
+
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
 # ---------------------------------------------------------------------------
@@ -187,7 +189,7 @@ class TestBatchedFinalizeHandlesFailures:
 
         with patch(
             "paramem.training.dataset.build_inference_prompts",
-            side_effect=lambda qs, t: list(qs),
+            side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
         ):
             pairs = list(_generate_recall_batch(model, tokenizer, entries, registry, batch_size=4))
 
@@ -281,7 +283,7 @@ class TestLeftPaddingCorrectness:
 
         with patch(
             "paramem.training.dataset.build_inference_prompts",
-            side_effect=lambda qs, t: list(qs),
+            side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
         ):
             results = list(
                 _generate_recall_batch(model, tokenizer, entries, registry, batch_size=2)
@@ -332,7 +334,7 @@ class TestPaddingSideRestored:
 
         with patch(
             "paramem.training.dataset.build_inference_prompts",
-            side_effect=lambda qs, t: list(qs),
+            side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
         ):
             list(_generate_recall_batch(model, tokenizer, entries, None, batch_size=4))
 
@@ -410,7 +412,7 @@ class TestRegistryLowConfidenceBatched:
 
         with patch(
             "paramem.training.dataset.build_inference_prompts",
-            side_effect=lambda qs, t: list(qs),
+            side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
         ):
             pairs = list(_generate_recall_batch(model, tokenizer, entries, registry, batch_size=2))
 
@@ -521,7 +523,7 @@ class TestBatchSizeExceedsEntries:
             patch("paramem.models.loader.switch_adapter"),
             patch(
                 "paramem.training.dataset.build_inference_prompts",
-                side_effect=lambda qs, t: list(qs),
+                side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
             ),
         ):
             result = evaluate_indexed_recall(
@@ -602,7 +604,7 @@ class TestPerKeyRawOutputInBothBranches:
             patch("paramem.models.loader.switch_adapter"),
             patch(
                 "paramem.training.dataset.build_inference_prompts",
-                side_effect=lambda qs, t: list(qs),
+                side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
             ),
         ):
             result = evaluate_indexed_recall(
@@ -663,7 +665,7 @@ class TestPerKeyRawOutputInBothBranches:
             patch("paramem.models.loader.switch_adapter"),
             patch(
                 "paramem.training.dataset.build_inference_prompts",
-                side_effect=lambda qs, t: list(qs),
+                side_effect=lambda qs, t: [RenderedPrompt(q) for q in qs],
             ),
         ):
             result = evaluate_indexed_recall(model, tokenizer, entries, registry, batch_size=1)

@@ -37,7 +37,10 @@ sys.path.insert(0, str(project_root))
 
 from peft import PeftModel  # noqa: E402
 
-from experiments.utils.production import wait_for_cooldown  # noqa: E402
+from experiments.utils.production import (  # noqa: E402
+    render_chat_prompt,
+    wait_for_cooldown,
+)
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     model_output_dir,
@@ -221,9 +224,7 @@ def generate_diverse_questions(
                 {"role": "assistant", "content": style_config["example_out"]},
                 {"role": "user", "content": original_q},
             ]
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
 
             if isinstance(model, PeftModel):
                 with model.disable_adapter():
@@ -293,9 +294,7 @@ def judge_answer(
             ),
         },
     ]
-    prompt = tokenizer.apply_chat_template(
-        judge_prompt_messages, tokenize=False, add_generation_prompt=True
-    )
+    prompt = render_chat_prompt(judge_prompt_messages, tokenizer, add_generation_prompt=True)
 
     if isinstance(model, PeftModel):
         with model.disable_adapter():
@@ -325,7 +324,7 @@ def probe_diverse_rephrase(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": dq["rephrased_question"]},
         ]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = render_chat_prompt(messages, tokenizer, add_generation_prompt=True)
         generated = generate_answer(model, tokenizer, prompt, max_new_tokens=150, temperature=0.0)
 
         # Strict: entity match

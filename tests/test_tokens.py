@@ -31,7 +31,9 @@ from paramem.utils.tokens import (
     MEASURED_TOKENS_PER_WORD,
     SESSION_ANON_SKELETON_TOKENS,
     TRANSCRIPT_TOKENS_PER_WORD,
+    RenderedPrompt,
     check_ratio_drift,
+    encode_rendered,
     envelope_derived_cap_tokens,
     estimate_tokens,
     words_to_estimator_tokens,
@@ -344,3 +346,134 @@ class TestAnonymizeEnvelopeMirrors:
         assert ANONYMIZE_OUTPUT_RESERVE_TOKENS == (
             _OUTPUT_JSON_ENVELOPE_TOKENS + _MAPPING_ENTRY_OVERHEAD_TOKENS
         )
+
+
+class _RecordingTokenizer:
+    """Records the exact args/kwargs of its last call and returns a fixed dict."""
+
+    def __init__(self, *, raises: bool = False):
+        self.last_args: tuple | None = None
+        self.last_kwargs: dict | None = None
+        self._raises = raises
+
+    def __call__(self, text_or_list, **kwargs):
+        self.last_args = (text_or_list,)
+        self.last_kwargs = kwargs
+        if self._raises:
+            raise RuntimeError("tokenizer exploded")
+        return {"input_ids": [1, 2, 3]}
+
+
+class TestRenderedPrompt:
+    """RenderedPrompt is a plain str subclass — no behavior of its own."""
+
+    def test_is_a_str_subclass(self):
+        rp = RenderedPrompt("hello")
+        assert isinstance(rp, str)
+        assert isinstance(rp, RenderedPrompt)
+
+    def test_behaves_like_the_underlying_string(self):
+        rp = RenderedPrompt("hello world")
+        assert rp == "hello world"
+        assert rp.upper() == "HELLO WORLD"
+        assert len(rp) == len("hello world")
+
+    def test_plain_str_is_not_a_rendered_prompt(self):
+        assert not isinstance("hello", RenderedPrompt)
+
+
+class TestEncodeRendered:
+    """encode_rendered: add_special_tokens=False always; type-gated on
+    RenderedPrompt; never swallows a tokenizer exception."""
+
+    def test_encodes_single_rendered_prompt_with_add_special_tokens_false(self):
+        tok = _RecordingTokenizer()
+        rp = RenderedPrompt("<s>[INST] hi [/INST]")
+        result = encode_rendered(tok, rp, return_tensors="pt")
+        assert result == {"input_ids": [1, 2, 3]}
+        assert tok.last_args == (rp,)
+        assert tok.last_kwargs == {"add_special_tokens": False, "return_tensors": "pt"}
+
+    def test_encodes_list_of_rendered_prompts(self):
+        tok = _RecordingTokenizer()
+        prompts = [RenderedPrompt("a"), RenderedPrompt("b")]
+        encode_rendered(tok, prompts, padding=True)
+        assert tok.last_args == (prompts,)
+        assert tok.last_kwargs == {"add_special_tokens": False, "padding": True}
+
+    def test_plain_str_raises_type_error_naming_render_chat_prompt(self):
+        tok = _RecordingTokenizer()
+        with pytest.raises(TypeError, match="render_chat_prompt"):
+            encode_rendered(tok, "plain string, not rendered")
+
+    def test_list_containing_a_plain_str_raises_type_error(self):
+        tok = _RecordingTokenizer()
+        with pytest.raises(TypeError, match="render_chat_prompt"):
+            encode_rendered(tok, [RenderedPrompt("ok"), "not rendered"])
+
+    def test_empty_list_of_rendered_prompts_is_accepted(self):
+        """No element fails the per-item check on an empty list — the
+        tokenizer call itself decides what to do with an empty batch."""
+        tok = _RecordingTokenizer()
+        encode_rendered(tok, [])
+        assert tok.last_args == ([],)
+
+    def test_add_special_tokens_cannot_be_overridden_via_kwargs(self):
+        """add_special_tokens is fixed by encode_rendered itself — a caller
+        passing it explicitly collides as a duplicate keyword argument
+        rather than silently overriding the False."""
+        tok = _RecordingTokenizer()
+        with pytest.raises(TypeError):
+            encode_rendered(tok, RenderedPrompt("x"), add_special_tokens=True)
+
+    def test_tokenizer_exception_propagates_unchanged(self):
+        """Never swallowed — unlike estimate_tokens's fallback contract."""
+        tok = _RecordingTokenizer(raises=True)
+        with pytest.raises(RuntimeError, match="tokenizer exploded"):
+            encode_rendered(tok, RenderedPrompt("x"))
+
+
+class _AddSpecialTokensAwareStubTokenizer:
+    """Stub tokenizer whose id COUNT depends on ``add_special_tokens`` —
+    unlike :class:`_StubTokenizer` above (fixed count regardless of the
+    flag), this one adds one synthetic id when ``add_special_tokens=True``.
+    That makes it possible to prove a count/encode identity actually depends
+    on both call sites passing the SAME value for the flag, rather than
+    holding by coincidence of a fixture that ignores the flag entirely.
+    """
+
+    def __call__(self, text: str, add_special_tokens: bool = True, **kwargs):
+        words = text.split()
+        return {"input_ids": list(range(len(words) + (1 if add_special_tokens else 0)))}
+
+
+class TestEncodeCountIdentity:
+    """``len(encode_rendered(tok, p)["input_ids"]) == estimate_tokens(p, tok)``
+    for a rendered prompt.
+
+    This identity became EXACT once both :func:`encode_rendered` and
+    :func:`estimate_tokens`'s exact path settled on ``add_special_tokens=False``
+    — see ``paramem/utils/tokens.py``'s module docstring, "the encode
+    chokepoint". :func:`paramem.cloud.anonymize.anonymize_transcript`'s
+    ``max_new_tokens = envelope - estimate_tokens(...)`` arithmetic
+    (``paramem/cloud/anonymize.py:448-453``) depends on this identity: if the
+    two calls ever diverged on ``add_special_tokens``, the envelope budget
+    would be computed against a different token count than the one actually
+    consumed when the rendered prompt is later tensorized for ``generate()``.
+    """
+
+    def test_count_matches_encode_for_rendered_prompt(self):
+        tok = _AddSpecialTokensAwareStubTokenizer()
+        prompt = RenderedPrompt("<s>[INST] hello there [/INST]")
+        encoded_len = len(encode_rendered(tok, prompt)["input_ids"])
+        estimated = estimate_tokens(prompt, tok)
+        assert encoded_len == estimated
+
+    def test_identity_would_break_if_either_side_used_add_special_tokens_true(self):
+        """Negative control: proves the stub is actually sensitive to the
+        flag (so the positive test above is not vacuous)."""
+        tok = _AddSpecialTokensAwareStubTokenizer()
+        prompt = RenderedPrompt("<s>[INST] hello there [/INST]")
+        encoded_len = len(encode_rendered(tok, prompt)["input_ids"])
+        with_special = len(tok(prompt, add_special_tokens=True)["input_ids"])
+        assert with_special != encoded_len

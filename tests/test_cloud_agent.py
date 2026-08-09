@@ -503,7 +503,7 @@ class TestPrivacyRouting:
                 return_value=(False, ""),
             ),
             patch(
-                "paramem.server.inference.adapt_messages",
+                "paramem.models.loader.adapt_messages",
                 side_effect=lambda msgs, tok: msgs,
             ),
             patch.object(
@@ -737,7 +737,7 @@ class TestPrivacyRouting:
                 return_value=(False, ""),
             ),
             patch(
-                "paramem.server.inference.adapt_messages",
+                "paramem.models.loader.adapt_messages",
                 side_effect=lambda msgs, tok: msgs,
             ),
             patch.object(
@@ -873,7 +873,7 @@ class TestPrivacyRouting:
                 return_value="Noted: Alex prefers dim lights.",
             ),
             patch("paramem.server.inference.detect_escalation", return_value=(False, "")),
-            patch("paramem.server.inference.adapt_messages", side_effect=lambda msgs, tok: msgs),
+            patch("paramem.models.loader.adapt_messages", side_effect=lambda msgs, tok: msgs),
             patch.object(tokenizer, "apply_chat_template", return_value="prompt"),
         ):
             result = handle_chat(
@@ -941,7 +941,7 @@ class TestPrivacyRouting:
                 "paramem.server.inference.detect_escalation",
                 return_value=(True, "Where does Jordan live?"),
             ),
-            patch("paramem.server.inference.adapt_messages", side_effect=lambda msgs, tok: msgs),
+            patch("paramem.models.loader.adapt_messages", side_effect=lambda msgs, tok: msgs),
             patch.object(tokenizer, "apply_chat_template", return_value="prompt"),
         ):
             result = handle_chat(

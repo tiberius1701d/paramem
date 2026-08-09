@@ -121,11 +121,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         (
             "experiments/lme_qa_from_triples_probe.py",
             "paramem.models.loader",
-            "adapt_messages",
-        ),
-        (
-            "experiments/lme_qa_from_triples_probe.py",
-            "paramem.models.loader",
             "load_base_model",
         ),
         # probe_adapter.py

@@ -558,8 +558,8 @@ def run_probe(
     Returns:
         List of per-question result dicts.
     """
+    from experiments.utils.production import render_chat_prompt
     from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
 
     results_path = output_dir / "results.json"
     results: list[dict] = []
@@ -594,16 +594,11 @@ def run_probe(
         else:
             ctx = context_block
         user_msg = f"{ctx}\n\nQuestion: {question}"
-        answer_messages = adapt_messages(
-            [
-                {"role": "system", "content": ANSWER_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            tokenizer,
-        )
-        answer_prompt = tokenizer.apply_chat_template(
-            answer_messages, tokenize=False, add_generation_prompt=True
-        )
+        answer_messages = [
+            {"role": "system", "content": ANSWER_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ]
+        answer_prompt = render_chat_prompt(answer_messages, tokenizer, add_generation_prompt=True)
         response = generate_answer(
             model, tokenizer, answer_prompt, max_new_tokens=256, temperature=0.0
         )
@@ -618,16 +613,11 @@ def run_probe(
             "Does the candidate answer convey the same information as the "
             "reference answer? Reply with exactly 'YES' or 'NO'."
         )
-        judge_messages = adapt_messages(
-            [
-                {"role": "system", "content": JUDGE_SYSTEM},
-                {"role": "user", "content": judge_user},
-            ],
-            tokenizer,
-        )
-        judge_prompt = tokenizer.apply_chat_template(
-            judge_messages, tokenize=False, add_generation_prompt=True
-        )
+        judge_messages = [
+            {"role": "system", "content": JUDGE_SYSTEM},
+            {"role": "user", "content": judge_user},
+        ]
+        judge_prompt = render_chat_prompt(judge_messages, tokenizer, add_generation_prompt=True)
         judge_raw = generate_answer(
             model, tokenizer, judge_prompt, max_new_tokens=8, temperature=0.0
         )

@@ -561,7 +561,7 @@ class TestProbeAndReasonDispatch:
         )
         monkeypatch.setattr(
             "paramem.server.inference._build_messages",
-            lambda text, history, system_prompt, tokenizer: [{"role": "user", "content": text}],
+            lambda text, history, system_prompt: [{"role": "user", "content": text}],
         )
 
         tokenizer = MagicMock()
@@ -639,7 +639,7 @@ class TestProbeAndReasonDispatch:
         )
         monkeypatch.setattr(
             "paramem.server.inference._build_messages",
-            lambda text, history, system_prompt, tokenizer: [{"role": "user", "content": text}],
+            lambda text, history, system_prompt: [{"role": "user", "content": text}],
         )
 
         tokenizer = MagicMock()
@@ -713,7 +713,7 @@ class TestProbeAndReasonDispatch:
 
         # Capture the augmented text reaching _build_messages — that's the
         # exact string handed to the chat template before tokenization.
-        def capture_augmented(text, history, system_prompt, tokenizer):
+        def capture_augmented(text, history, system_prompt):
             captured["augmented_text"] = text
             return [{"role": "user", "content": text}]
 
@@ -820,7 +820,7 @@ class TestProbeAndReasonDispatch:
 
         captured = {}
 
-        def capture_messages(text, history, system_prompt, tokenizer):
+        def capture_messages(text, history, system_prompt):
             captured["system_prompt"] = system_prompt
             captured["augmented_text"] = text
             return [{"role": "user", "content": text}]
@@ -872,7 +872,7 @@ class TestProbeAndReasonDispatch:
 
         captured = {}
 
-        def capture_messages(text, history, system_prompt, tokenizer):
+        def capture_messages(text, history, system_prompt):
             captured["system_prompt"] = system_prompt
             return [{"role": "user", "content": text}]
 
@@ -915,7 +915,7 @@ class TestBaseModelAnswerSystemPrompt:
     def test_speaker_token_and_language_reach_system_prompt(self, monkeypatch):
         captured = {}
 
-        def capture_messages(text, history, system_prompt, tokenizer):
+        def capture_messages(text, history, system_prompt):
             captured["system_prompt"] = system_prompt
             return [{"role": "user", "content": text}]
 
@@ -959,7 +959,7 @@ class TestBaseModelAnswerSystemPrompt:
         the prefix is gated on ``speaker_id`` alone, anonymous included."""
         captured = {}
 
-        def capture_messages(text, history, system_prompt, tokenizer):
+        def capture_messages(text, history, system_prompt):
             captured["system_prompt"] = system_prompt
             return [{"role": "user", "content": text}]
 
@@ -1011,20 +1011,18 @@ class TestBuildMessagesAlternationDefense:
     def test_consecutive_same_role_turns_merged(self, monkeypatch):
         from paramem.server.inference import _build_messages
 
-        # Bypass adapt_messages/tokenizer template resolution entirely — it's
-        # a separate concern (system-role folding) from the merge/strip logic
-        # under test here.
-        monkeypatch.setattr(
-            "paramem.server.inference.adapt_messages",
-            lambda messages, tokenizer: messages,
-        )
-
+        # _build_messages no longer calls adapt_messages itself — that
+        # system-role-folding concern now lives in render_chat_prompt
+        # (paramem.models.loader), applied by the production call site
+        # AFTER _build_messages returns. Nothing to bypass here any more;
+        # the merge/strip logic under test is the whole of what
+        # _build_messages does.
         history = [
             {"role": "user", "text": "first"},
             {"role": "user", "text": "second"},
             {"role": "assistant", "text": "reply"},
         ]
-        messages = _build_messages("question", history, "system prompt", tokenizer=MagicMock())
+        messages = _build_messages("question", history, "system prompt")
 
         assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
         assert messages[1]["content"] == "first\nsecond"
@@ -1033,16 +1031,11 @@ class TestBuildMessagesAlternationDefense:
     def test_leading_assistant_turn_stripped(self, monkeypatch):
         from paramem.server.inference import _build_messages
 
-        monkeypatch.setattr(
-            "paramem.server.inference.adapt_messages",
-            lambda messages, tokenizer: messages,
-        )
-
         history = [
             {"role": "assistant", "text": "orphaned reply"},
             {"role": "user", "text": "hi"},
         ]
-        messages = _build_messages("question", history, "system prompt", tokenizer=MagicMock())
+        messages = _build_messages("question", history, "system prompt")
 
         # The leading assistant turn is dropped; the surviving user turn ends
         # up last, so the current-turn text is appended onto it (see

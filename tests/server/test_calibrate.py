@@ -1510,7 +1510,14 @@ class TestCalibrateName:
 
         def _capture_template(messages, **kw):
             captured_messages.append(messages)
-            return "formatted-prompt"
+            # Echo every message's content into the rendered text (like a
+            # real chat template would) — supports_system_role's own probe
+            # call (inside adapt_messages, invoked by render_chat_prompt)
+            # checks for its marker string in the rendered output, and a
+            # fixed return value would make that probe always report "no
+            # system-role support", folding system content into user and
+            # breaking this test's separate system/user assertions below.
+            return "".join(m["content"] for m in messages)
 
         state["tokenizer"].apply_chat_template.side_effect = _capture_template
 
@@ -1528,8 +1535,12 @@ class TestCalibrateName:
         assert "<override:name_extraction.txt>" in paths_reported
 
         # The model must have received the OVERRIDE content, not the default.
+        # captured_messages[0] is now supports_system_role's own probe call
+        # (render_chat_prompt applies adapt_messages, which checks system-role
+        # support via a throwaway apply_chat_template call before the real
+        # render) — the actual rendered messages are always the LAST call.
         assert captured_messages, "apply_chat_template was never called"
-        msgs = captured_messages[0]
+        msgs = captured_messages[-1]
         sys_content = next(m["content"] for m in msgs if m["role"] == "system")
         user_content = next(m["content"] for m in msgs if m["role"] == "user")
         assert sys_content == "custom system", (

@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from paramem.training.dataset import build_inference_prompts
+from paramem.utils.tokens import RenderedPrompt
 
 
 def _make_mock_tokenizer():
@@ -62,3 +63,15 @@ def test_build_inference_prompts_loads_system_prompt_exactly_once_per_call():
     assert len(prompts) == len(questions)
     for prompt in prompts:
         assert "You are a personal assistant." in prompt
+
+
+def test_build_inference_prompts_elements_are_rendered_prompt():
+    """Every rendered element is a :class:`~paramem.utils.tokens.RenderedPrompt`
+    — the marker type ``encode_rendered`` requires before it will tensorize
+    the text, not a plain ``str``."""
+    tokenizer = _make_mock_tokenizer()
+    questions = ["What is your name?", "Where do you live?"]
+    prompts = build_inference_prompts(questions, tokenizer)
+    assert len(prompts) == len(questions)
+    for prompt in prompts:
+        assert isinstance(prompt, RenderedPrompt)

@@ -12,7 +12,7 @@ Schema history:
   * v3: retired — the ``keyed_pairs_sha256`` field it added is dropped on load.
   * v4 (current): ``window_stamp`` is the only evolving field since v2.
 
-Forward-compat: ``_dict_to_manifest`` accepts v1–v2 manifests on read.
+Forward-compat: ``_dict_to_manifest`` accepts v1–v3 manifests on read.
 Absent ``window_stamp`` defaults to ``""``.
 ``synthesized`` retains the same forward-compat default of ``False`` when absent.
 
