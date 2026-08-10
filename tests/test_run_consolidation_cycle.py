@@ -1264,6 +1264,7 @@ class TestRecallGateRejectedVramCleanup:
         def _commit_side_effect(*args, **kwargs):
             raise RecallGateRejected(
                 "simulated post-save disk-integrity failure",
+                adapter_name=interim_name,
                 recall_rate=0.5,
                 threshold=1.0,
             )
@@ -1328,6 +1329,7 @@ class TestRecallGateRejectedVramCleanup:
             if _commit_calls["n"] == 1:
                 raise RecallGateRejected(
                     "simulated post-save disk-integrity failure",
+                    adapter_name=interim_name,
                     recall_rate=0.5,
                     threshold=1.0,
                 )
@@ -1474,6 +1476,7 @@ class TestRecallGateRejectedVramCleanup:
             if _commit_calls["n"] == 1:
                 raise RecallGateRejected(
                     "simulated post-save disk-integrity failure",
+                    adapter_name=interim_name,
                     recall_rate=0.5,
                     threshold=1.0,
                 )

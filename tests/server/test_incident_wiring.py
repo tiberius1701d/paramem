@@ -1268,3 +1268,38 @@ class TestStageBCycleHydrationFailureIncidentDetail:
         assert crashes[0].detail["phase"] == "fold", (
             "caller-supplied detail fields must survive the merge"
         )
+
+
+class TestStageBCycleRecallGateIncidentDetail:
+    """``_run_stage_b_cycle``'s crash envelope merges a
+    ``RecallGateRejected``'s ``adapter_name``/``recall_rate``/``threshold``
+    into the incident detail it records — a main-tiers fold refusal reaches
+    here uncaught (the interim fold catches this type itself and returns a
+    normal ``recall_failed`` outcome instead), so the incident names the
+    tier that fell short."""
+
+    def test_abort_reaches_the_incident_detail(self, state):
+        """A RecallGateRejected's adapter_name/recall_rate/threshold are
+        folded into the incident detail alongside the caller-supplied
+        fields."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        exc = RecallGateRejected(
+            "tier fell short of 100% recall",
+            adapter_name="episodic",
+            recall_rate=0.98,
+            threshold=1.0,
+        )
+        _drive_stage_b_cycle_crash(state, exc=exc)
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert crashes[0].detail["adapter_name"] == "episodic"
+        assert crashes[0].detail["recall_rate"] == 0.98
+        assert crashes[0].detail["threshold"] == 1.0
+        assert crashes[0].detail["phase"] == "fold", (
+            "caller-supplied detail fields must survive the merge"
+        )

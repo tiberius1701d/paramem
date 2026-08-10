@@ -3717,6 +3717,16 @@ class TestAbortSkipsCommit:
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
             ),
+            # _assert_tier_recall's no-verdict fallback probes recall for
+            # real via model.generate() before the tier joins tiers_rebuilt —
+            # stub it out (admit-all) so the fold reaches the mocked registry
+            # rewrite below, exercising the CM-restore-scope boundary this
+            # test is actually about.
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+            ),
             patch.object(
                 ConsolidationLoop,
                 "_reset_main_tier_registries_and_simhashes",
@@ -3805,9 +3815,9 @@ class TestAbortSkipsCommit:
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
             ),
-            # Registry rewrite (reached on this success-then-post-finalize-
-            # failure path) probes recall for real via model.generate() —
-            # stub it out like TestDriftIntendedRemoval does.
+            # _assert_tier_recall's no-verdict fallback probes recall for
+            # real via model.generate() before the tier joins tiers_rebuilt
+            # — stub it out like TestDriftIntendedRemoval does.
             patch.object(
                 ConsolidationLoop,
                 "_probe_passing_keys",
@@ -9037,6 +9047,615 @@ def _run_full_fold_mocked(
             )
     finally:
         _gpu_thread_lock.release()
+
+
+# =============================================================================
+# TestMainTiersRecallCompletenessGate — a rebuilt tier that does not reach
+# 100% recall over its own full key set refuses the fold, loudly and
+# reversibly, before any durable write.  ConsolidationLoop._assert_tier_recall
+# is the single verdict; ConsolidationLoop._discard_fold_work is the single
+# compensation.
+# =============================================================================
+
+
+def _seed_gate_loop(tmp_path, *, episodic_keys=(), semantic_keys=(), procedural_keys=()):
+    """Build a main-tiers-fold-ready loop with the given keys seeded across tiers.
+
+    Mirrors ``TestRegistryBookkeepingDivergenceGate``'s setup pattern: real
+    store entries + bookkeeping via ``_seed_keys``, and matching merger-graph
+    edges via ``_build_merger_graph`` so the edge-walk stage re-derives the
+    identical ``tier_keyed`` entries this fold trains on.
+    """
+    loop = _make_fold_loop(tmp_path)
+    loop._key_metadata_path = tmp_path / "key_metadata.json"
+    entries = []
+    # relation_type drives the edge walk's tier derivation for a keyed edge
+    # (paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into):
+    # "preference" routes to procedural, anything else stays episodic/semantic.
+    for tier, keys, rel_type in (
+        ("episodic", episodic_keys, "factual"),
+        ("semantic", semantic_keys, "factual"),
+        ("procedural", procedural_keys, "preference"),
+    ):
+        if not keys:
+            continue
+        _seed_keys(loop, tier, keys, relation_type=rel_type)
+        for k in keys:
+            entries.append(
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": rel_type,
+                }
+            )
+    _build_merger_graph(loop, entries)
+    loop.merger.removal_ledger = {}
+    return loop
+
+
+def _probe_fails_one_episodic_key(adapter_name, entries):
+    """Admit-all probe stub except episodic, which drops 'graph_bad'."""
+    keys = {e["key"] for e in entries}
+    if adapter_name == "episodic":
+        keys.discard("graph_bad")
+    return keys
+
+
+class TestMainTiersRecallCompletenessGate:
+    def test_tier_below_threshold_aborts_the_fold(self, tmp_path):
+        """A tier whose own trained weights fall short of 100% recall over
+        its full key set raises RecallGateRejected carrying adapter_name,
+        rate, and threshold; the message names the operator levers."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+
+        with pytest.raises(RecallGateRejected) as excinfo:
+            _run_full_fold_mocked(
+                loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+            )
+
+        exc = excinfo.value
+        assert exc.adapter_name == "episodic"
+        assert exc.recall_rate == pytest.approx(0.5)
+        assert exc.threshold == 1.0
+        message = str(exc)
+        assert "rank" in message and "server.yaml" in message, (
+            f"expected the message to name the LoRA rank/alpha remedy; got: {message}"
+        )
+        assert "paramem/utils/config.py" in message, (
+            f"expected the message to name the training-budget table; got: {message}"
+        )
+
+    def test_abort_restores_the_pre_fold_weights(self, tmp_path):
+        """copy_adapter_weights restores every snapshotted tier from its
+        <tier>_backup -- main_tier_backup_scope's own except BaseException
+        arm, triggered by the propagating RecallGateRejected."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph_good", "graph_bad"],
+            semantic_keys=["graph_sem"],
+            procedural_keys=["proc1"],
+        )
+        copy_calls: list = []
+
+        def _copy_spy(model, src, dst):
+            copy_calls.append((src, dst))
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop,
+                keys_from="main_tiers",
+                probe_side_effect=_probe_fails_one_episodic_key,
+                copy_adapter_weights_side_effect=_copy_spy,
+            )
+
+        restore_calls = {c for c in copy_calls if c[0].endswith("_backup")}
+        for tier in ("episodic", "semantic", "procedural"):
+            assert (f"{tier}_backup", tier) in restore_calls, (
+                f"expected a restore copy for tier {tier!r}; got {copy_calls}"
+            )
+
+    def test_abort_writes_nothing(self, tmp_path):
+        """Registries, key_metadata.json, and slot dirs stay exactly as they
+        were; _save_adapters and _persist_fold never run."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        save_spy = MagicMock(name="_save_adapters")
+        persist_spy = MagicMock(name="_persist_fold")
+        loop._save_adapters = save_spy
+        loop._persist_fold = persist_spy
+        registry_path = loop.output_dir / "episodic" / "indexed_key_registry.json"
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+            )
+
+        save_spy.assert_not_called()
+        persist_spy.assert_not_called()
+        assert not registry_path.exists(), "no registry file must be written on refusal"
+        assert not loop._key_metadata_path.exists(), "no key_metadata.json must be written"
+
+    def test_abort_stops_before_the_next_tier_trains(self, tmp_path):
+        """episodic failing means _train_tier_adapter is called exactly
+        once -- semantic and procedural never train."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph_good", "graph_bad"],
+            semantic_keys=["graph_sem"],
+            procedural_keys=["proc1"],
+        )
+        orig_train_tier_adapter = loop._train_tier_adapter
+        call_count = {"n": 0}
+
+        def _spy_train_tier_adapter(*args, **kwargs):
+            call_count["n"] += 1
+            return orig_train_tier_adapter(*args, **kwargs)
+
+        loop._train_tier_adapter = _spy_train_tier_adapter
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+            )
+
+        assert call_count["n"] == 1, (
+            f"expected exactly one _train_tier_adapter call (episodic only); got {call_count['n']}"
+        )
+
+    def test_abort_reactivates_this_folds_soft_stales(self, tmp_path):
+        """A pre-existing key this fold's subtractive-removal stage
+        soft-staled is reactivated by the refusal -- every tier's active-key
+        set matches its pre-fold state."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph_good", "graph_bad"],
+            semantic_keys=["graph_sem"],
+            procedural_keys=["proc1"],
+        )
+        loop.store.put(
+            "episodic",
+            "graph_preexisting",
+            {"key": "graph_preexisting", "subject": "X", "predicate": "knows", "object": "Y"},
+            register=True,
+            simhash=999,
+        )
+        loop.merger.removal_ledger = {"graph_preexisting": {"reason": "predicate_synonym_collapse"}}
+
+        pre_fold_active = {
+            tier: set(loop.store.active_keys_in_tier(tier))
+            for tier in ("episodic", "semantic", "procedural")
+        }
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+            )
+
+        for tier in ("episodic", "semantic", "procedural"):
+            assert set(loop.store.active_keys_in_tier(tier)) == pre_fold_active[tier], (
+                f"tier {tier!r}: active keys changed by an aborted fold"
+            )
+
+    def test_abort_reverses_promotions_and_mints(self, tmp_path):
+        """A refusal reverses BOTH a same-fold promotion (store.move back to
+        episodic, dropped from promoted_keys) and a same-fold mint
+        (store.delete, counters re-derived) -- the store must equal its
+        pre-fold state exactly: per-tier active key sets,
+        tier_for_active_key for the promoted key, the bookkeeping row set,
+        and the mint counter."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph_good", "graph_bad", "graph_promote"],
+        )
+        # graph_promote is mature -- _promote_mature_keys_inline moves it to
+        # semantic before the tier loop.  The promotion move is gated on
+        # has_simhash("episodic", key), so a simhash must be seeded too (
+        # _seed_keys does not set one).
+        loop.store.put_simhash("episodic", "graph_promote", 12345)
+        loop.store.set_bookkeeping(
+            "graph_promote",
+            speaker_id="S0",
+            relation_type="factual",
+            reinforcement_count=loop.config.promotion_threshold,
+            last_reinforced_cycle=1,
+            first_seen="",
+        )
+        # Sync the mint counter with the seeded store BEFORE this fold mints
+        # anything -- production always boots through _derive_key_counters,
+        # so this is the realistic pre-fold baseline (the raw test fixture's
+        # counter starts at 0, which no production store is ever at).
+        loop._derive_key_counters()
+
+        pre_active = {
+            t: set(loop.store.active_keys_in_tier(t))
+            for t in ("episodic", "semantic", "procedural")
+        }
+        pre_bookkeeping_keys = {k for k, _ in loop.store.iter_bookkeeping()}
+        pre_indexed_index = loop._indexed_next_index
+
+        # A keyless edge (cloud-enrichment / consume-pending shape) mints a
+        # new key inside the fold, before the tier loop -- defer=False for
+        # main_tiers.
+        loop.merger.graph.add_edge(
+            "Alice",
+            "Freshtown",
+            predicate="visited",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s",
+            last_seen="s",
+            reinforcement_count=1,
+            sessions=["s"],
+        )
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+            )
+
+        post_active = {
+            t: set(loop.store.active_keys_in_tier(t))
+            for t in ("episodic", "semantic", "procedural")
+        }
+        assert post_active == pre_active, (
+            f"active keys changed by a refused fold: {pre_active} -> {post_active}"
+        )
+        assert loop.store.tier_for_active_key("graph_promote") == "episodic", (
+            "a refused fold's promotion must be reversed"
+        )
+        assert "graph_promote" not in loop.promoted_keys, (
+            "a reversed promotion must be dropped from promoted_keys so a later fold reconsiders it"
+        )
+        post_bookkeeping_keys = {k for k, _ in loop.store.iter_bookkeeping()}
+        assert post_bookkeeping_keys == pre_bookkeeping_keys, (
+            f"bookkeeping rows changed by a refused fold:"
+            f" {pre_bookkeeping_keys} -> {post_bookkeeping_keys}"
+        )
+        assert loop._indexed_next_index == pre_indexed_index, (
+            f"mint counter not restored: {pre_indexed_index} -> {loop._indexed_next_index}"
+        )
+
+    def test_resumed_refusal_reverses_reconstituted_mint_and_relocation(self, tmp_path):
+        """The crash-resume fast path reconstitutes a pre-crash mint
+        (store.put + set_bookkeeping) and relocates a key whose on-disk
+        registry still reflects a pre-promotion tier (store.move) -- a
+        refusal on a LATER tier must reverse BOTH exactly like the
+        fresh-derivation path does: the reconstituted mint is deleted
+        entirely and the relocated key moves back to its pre-resume tier."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph_good", "graph_bad"],
+            semantic_keys=["graph_sem"],
+        )
+        # A key the on-disk registry still carries under "semantic" (a
+        # crashed prior attempt promoted it and wrote the marker under the
+        # new tier before the registry rewrite reached disk) -- the marker
+        # below claims it under "episodic", so resume must relocate it back.
+        loop.store.put(
+            "semantic",
+            "graph_drifted",
+            {
+                "key": "graph_drifted",
+                "subject": "Bob",
+                "predicate": "knows",
+                "object": "Carol",
+                "speaker_id": "S0",
+            },
+            register=True,
+            simhash=42,
+        )
+        loop.store.set_bookkeeping(
+            "graph_drifted", speaker_id="S0", relation_type="factual", first_seen=""
+        )
+        loop._derive_key_counters()
+        pre_indexed_index = loop._indexed_next_index
+
+        stamp = loop._compute_fold_stamp(tier=None)
+        marker = {
+            "version": loop._FOLD_RESUME_VERSION,
+            "scope": "main_tiers",
+            "fold_stamp": stamp,
+            "completed_tiers": ["episodic"],
+            "tier_checkpoints": {},
+            "in_flight_tier": None,
+            "train_assignment": {
+                "episodic": [
+                    {
+                        "key": "graph_good",
+                        "subject": "Alice",
+                        "predicate": "pgraph_good",
+                        "object": "ograph_good",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    {
+                        "key": "graph_bad",
+                        "subject": "Alice",
+                        "predicate": "pgraph_bad",
+                        "object": "ograph_bad",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    {
+                        "key": "graph_drifted",
+                        "subject": "Bob",
+                        "predicate": "knows",
+                        "object": "Carol",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    # Newly minted pre-crash: "relation_type" present marks
+                    # this as a reconstitution target, not a bare replay.
+                    {
+                        "key": "graph_crashmint",
+                        "subject": "Dana",
+                        "predicate": "visited",
+                        "object": "Elsewhere",
+                        "speaker_id": "S0",
+                        "relation_type": "factual",
+                        "session_ids": ["s1"],
+                        "last_seen": "2026-01-01T00:00:00Z",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "tier": "episodic",
+                    },
+                ],
+                "semantic": [],
+                "procedural": [],
+            },
+            "dataset_fingerprint": {},
+            "pending_session_ids": [],
+        }
+        loop._write_fold_resume(marker)
+
+        from unittest.mock import patch
+
+        with patch("paramem.models.loader.load_adapter"):
+            with pytest.raises(RecallGateRejected):
+                _run_full_fold_mocked(
+                    loop,
+                    keys_from="main_tiers",
+                    probe_side_effect=_probe_fails_one_episodic_key,
+                )
+
+        # Reconstituted mint fully reversed: gone from every structure.
+        assert not loop.store.has("graph_crashmint"), (
+            "a reconstituted pre-crash mint must be deleted entirely by a refusal"
+        )
+        assert loop.store.bookkeeping_for_key("graph_crashmint") is None
+        assert loop._indexed_next_index == pre_indexed_index, (
+            f"mint counter not restored after reversing a reconstituted mint:"
+            f" {pre_indexed_index} -> {loop._indexed_next_index}"
+        )
+
+        # Relocation reversed: back under its pre-resume tier.
+        assert loop.store.tier_for_active_key("graph_drifted") == "semantic", (
+            "a resume-path relocation must be reversed to its pre-resume tier"
+        )
+
+    def test_disk_verify_rejection_does_not_discard_fold_work(self, tmp_path):
+        """A RecallGateRejected raised by the disk-integrity probe inside
+        _save_adapters (downstream of _persist_fold, outside the
+        _assert_tier_recall gate) is NOT caught by the try/except wrapped
+        around main_tier_backup_scope -- it propagates with
+        fold_resume.json intact, the same retry-on-next-cycle contract
+        every other post-persist failure gets."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"])
+
+        def _raise_disk_verify_rejection(*args, **kwargs):
+            raise RecallGateRejected(
+                "simulated post-save disk-integrity failure",
+                adapter_name="episodic",
+                recall_rate=0.5,
+                threshold=1.0,
+            )
+
+        # Instance-level override: _run_full_fold_mocked's own
+        # patch.object(ConsolidationLoop, "_save_adapters") would shadow a
+        # class-level patch for the duration of its own `with` block --
+        # setting it directly on the instance wins over any class patch.
+        loop._save_adapters = _raise_disk_verify_rejection
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        fold_resume_path = loop._fold_state_dir / "fold_resume.json"
+        assert fold_resume_path.exists(), (
+            "a disk-integrity rejection from _save_adapters must leave"
+            " fold_resume.json in place for retry -- it is not caught by"
+            " the main_tier_backup_scope try/except"
+        )
+
+    def test_abort_clears_the_resume_marker_and_scratch(self, tmp_path):
+        """fold_resume.json and the retained consolidation_refresh scratch
+        tree are both removed by the refusal -- a surviving marker would
+        replay the pre-abort checkpoint at the OLD LoRA rank on the next
+        cycle, defeating the operator's remedy."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        refresh_dir = loop.output_dir / "consolidation_refresh"
+        refresh_dir.mkdir(parents=True, exist_ok=True)
+        (refresh_dir / "leftover.txt").write_text("scratch")
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+            )
+
+        fold_resume_path = loop._fold_state_dir / "fold_resume.json"
+        assert not fold_resume_path.exists(), "fold_resume.json must be cleared after a refusal"
+        assert not refresh_dir.exists(), "consolidation_refresh scratch must be removed"
+
+    @pytest.mark.parametrize(
+        "make_exc",
+        [
+            lambda: __import__(
+                "paramem.training.consolidation", fromlist=["AbortedDuringConsolidation"]
+            ).AbortedDuringConsolidation("aborted mid-tier"),
+            lambda: RuntimeError("unexpected crash"),
+        ],
+        ids=["aborted", "generic_crash"],
+    )
+    def test_crash_or_abort_keeps_the_resume_marker(self, tmp_path, make_exc):
+        """A crash or a training-thread abort raised at the same tier-loop
+        site LEAVES fold_resume.json -- only RecallGateRejected clears it."""
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"])
+        exc = make_exc()
+
+        def _raiser(*args, **kwargs):
+            raise exc
+
+        loop._train_tier_adapter = _raiser
+
+        with pytest.raises(type(exc)):
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        fold_resume_path = loop._fold_state_dir / "fold_resume.json"
+        assert fold_resume_path.exists(), (
+            f"{type(exc).__name__} must leave fold_resume.json in place for crash-resume"
+        )
+
+    def test_resumed_tier_is_probed_and_gated(self, tmp_path):
+        """A crash-resumed tier (marked completed pre-crash, no recorded
+        checkpoint) is probed exactly once via _assert_tier_recall's
+        no-verdict fallback, and refuses below 100% before joining
+        tiers_rebuilt."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        stamp = loop._compute_fold_stamp(tier=None)
+        marker = {
+            "version": loop._FOLD_RESUME_VERSION,
+            "scope": "main_tiers",
+            "fold_stamp": stamp,
+            "completed_tiers": ["episodic"],
+            "tier_checkpoints": {},
+            "in_flight_tier": None,
+            "train_assignment": {
+                "episodic": [
+                    {
+                        "key": "graph_good",
+                        "subject": "Alice",
+                        "predicate": "pgraph_good",
+                        "object": "ograph_good",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    {
+                        "key": "graph_bad",
+                        "subject": "Alice",
+                        "predicate": "pgraph_bad",
+                        "object": "ograph_bad",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                ],
+                "semantic": [],
+                "procedural": [],
+            },
+            "dataset_fingerprint": {},
+            "pending_session_ids": [],
+        }
+        loop._write_fold_resume(marker)
+
+        probe_calls: list = []
+
+        def _probe(adapter_name, entries):
+            probe_calls.append(adapter_name)
+            return {e["key"] for e in entries} - {"graph_bad"}
+
+        with patch("paramem.models.loader.load_adapter"):
+            with pytest.raises(RecallGateRejected) as excinfo:
+                _run_full_fold_mocked(loop, keys_from="main_tiers", probe_side_effect=_probe)
+
+        assert excinfo.value.adapter_name == "episodic"
+        assert probe_calls.count("episodic") == 1, (
+            f"expected exactly one probe of the resumed tier; got {probe_calls}"
+        )
+
+    def test_no_verdict_tier_is_probed_once_at_the_training_site(self, tmp_path):
+        """Early stopping off -- _probe_passing_keys runs once per trained
+        tier, at the training-completeness gate, never again afterward."""
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph1"],
+            semantic_keys=["graph2"],
+            procedural_keys=["proc1"],
+        )
+        probe_calls: list = []
+
+        def _probe(adapter_name, entries):
+            probe_calls.append(adapter_name)
+            return {e["key"] for e in entries}
+
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers", probe_side_effect=_probe)
+
+        assert probe_calls == ["episodic", "semantic", "procedural"], (
+            f"expected exactly one probe per tier, in training order; got {probe_calls}"
+        )
+        assert set(result["tiers_rebuilt"]) == {"episodic", "semantic", "procedural"}
+
+    def test_all_pass_fold_commits_unchanged(self, tmp_path):
+        """Every tier at 100%: registries hold exactly tier_keyed,
+        _save_adapters runs once, and the result dict is unchanged."""
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph1", "graph2"],
+            semantic_keys=["graph3"],
+            procedural_keys=["proc1"],
+        )
+        save_spy = MagicMock(name="_save_adapters")
+        loop._save_adapters = save_spy
+
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        save_spy.assert_called_once()
+        assert set(loop.store.registry("episodic").list_active()) == {"graph1", "graph2"}
+        assert set(loop.store.registry("semantic").list_active()) == {"graph3"}
+        assert set(loop.store.registry("procedural").list_active()) == {"proc1"}
+        assert result["tiers_rebuilt"] == ["episodic", "semantic", "procedural"]
+
+    def test_abort_leaves_sessions_pending(self, tmp_path):
+        """A refused fold must not reach interim reap -- app.py only calls
+        session_buffer.mark_consolidated and unload_interim_adapters after
+        loop.consolidate() returns normally, so a raised RecallGateRejected
+        (which never returns) guarantees neither retirement path runs.
+        unload_interim_adapters is the ConsolidationLoop-level gate for
+        both: mark_consolidated itself lives in app.py, outside
+        ConsolidationLoop's reach."""
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        unload_spy = MagicMock(return_value=[])
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop,
+                keys_from="all_tiers",
+                probe_side_effect=_probe_fails_one_episodic_key,
+                unload_spy=unload_spy,
+            )
+
+        unload_spy.assert_not_called()
 
 
 # =============================================================================

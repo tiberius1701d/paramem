@@ -701,22 +701,20 @@ class TestRecallPassingKeys:
 
 
 # ---------------------------------------------------------------------------
-# Class I — TestRegistrationFilter
-# Tests for the recall gate filtering registration in the consolidation paths.
+# Class I — TestResetRegistersEveryKey
+# _reset_main_tier_registries_and_simhashes admits every key it is given —
+# there is no per-key recall filtering left in this method.  The
+# training-completeness verdict now lives one level up, in
+# ConsolidationLoop._assert_tier_recall.
 # ---------------------------------------------------------------------------
 
 
-class TestRegistrationFilter:
-    """Verify that a failed key is excluded from store.put and simhash registration."""
+class TestResetRegistersEveryKey:
+    """Every key in tier_keyed lands in the rebuilt registry -- with its
+    simhash, and without a probe."""
 
-    def test_reset_main_tier_filters_failed_keys(self, tmp_path: Path) -> None:
-        """_reset_main_tier_registries_and_simhashes filters by passing_sets_by_tier.
-
-        A key with exact_match=False must NOT appear in the rebuilt registry.
-        """
-        from unittest.mock import MagicMock, patch
-
-        from paramem.training.consolidation import ConsolidationLoop
+    def _make_loop(self, tmp_path: Path) -> "ConsolidationLoop":
+        from paramem.memory.store import MemoryStore
         from paramem.utils.config import TrainingConfig
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
@@ -726,121 +724,72 @@ class TestRegistrationFilter:
             recall_early_stopping=False,
             recall_probe_batch_size=1,
         )
-        loop._thermal_policy = None
+        loop.store = MemoryStore()
+        return loop
 
-        # Build a real MemoryStore so registry/simhash calls work.
-        from paramem.memory.store import MemoryStore
-
-        store = MemoryStore()
-        loop.store = store
-
+    def test_reset_registers_every_keyed_entry(self, tmp_path: Path) -> None:
+        """Every key in tier_keyed is registered, across all three tiers --
+        there is no per-key filtering left in this method.  Simhash pairing
+        is pinned separately by
+        ``TestResetMainTierRegistriesAndSimhashes.test_registry_and_simhash_rebuilt_together``
+        (tests/test_consolidation.py) -- not duplicated here."""
+        loop = self._make_loop(tmp_path)
         tier_keyed = {
             "episodic": [
                 {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
                 {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
             ],
-            "semantic": [],
-            "procedural": [],
-        }
-        # graph2 failed recall; only graph1 should be registered
-        passing_sets = {
-            "episodic": {"graph1"},
-            "semantic": None,  # no keys, probe wouldn't fire
-            "procedural": None,  # no keys
+            "semantic": [
+                {"key": "graph3", "subject": "S3", "predicate": "p", "object": "O3"},
+            ],
+            "procedural": [
+                {"key": "proc1", "subject": "S4", "predicate": "p", "object": "O4"},
+            ],
         }
 
-        # For the None-verdict tiers (semantic/procedural with no entries),
-        # the helper would normally call _probe_passing_keys but keyed is [],
-        # so the loop continues early.  Patch _probe_passing_keys to ensure
-        # it is NOT called (tier with empty keyed skips the probe).
+        loop._reset_main_tier_registries_and_simhashes(tier_keyed)
+
+        assert set(loop.store.registry("episodic").list_active()) == {"graph1", "graph2"}
+        assert set(loop.store.registry("semantic").list_active()) == {"graph3"}
+        assert set(loop.store.registry("procedural").list_active()) == {"proc1"}
+
+    def test_reset_never_probes(self, tmp_path: Path) -> None:
+        """_probe_passing_keys is never called by the reset -- registration
+        is unconditional now that the training-completeness verdict is
+        enforced earlier, by _assert_tier_recall.  Also carries the
+        stale-seeding and simhash-pairing coverage the deleted
+        TestRegistrationFilter class exercised, so that coverage survives."""
+        loop = self._make_loop(tmp_path)
+        tier_keyed = {
+            "episodic": [
+                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
+            ],
+            "semantic": [
+                {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
+            ],
+            "procedural": [
+                {"key": "proc1", "subject": "S3", "predicate": "p", "object": "O3"},
+            ],
+        }
+        soft_stale_by_tier = {
+            "episodic": {"graph_stale": {"stale_cycles": 1, "simhash": 0xDEAD}},
+        }
+
+        from unittest.mock import patch
+
         with patch.object(ConsolidationLoop, "_probe_passing_keys") as mock_probe:
-            loop._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets)
-            # No probe needed for empty tiers
+            loop._reset_main_tier_registries_and_simhashes(
+                tier_keyed, soft_stale_by_tier=soft_stale_by_tier
+            )
             mock_probe.assert_not_called()
 
-        epi_reg = store.registry("episodic")
-        assert "graph1" in epi_reg
-        assert "graph2" not in epi_reg, "graph2 failed recall gate and must not be in the registry"
-
-    def test_reset_main_tier_probes_when_verdict_none(self, tmp_path: Path) -> None:
-        """When passing_sets_by_tier has None for a tier, _probe_passing_keys is called."""
-        from unittest.mock import patch
-
-        from paramem.memory.store import MemoryStore
-        from paramem.training.consolidation import ConsolidationLoop
-        from paramem.utils.config import TrainingConfig
-
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.model = MagicMock()
-        loop.tokenizer = MagicMock()
-        loop.training_config = TrainingConfig(
-            recall_early_stopping=False,
-            recall_probe_batch_size=1,
-        )
-        loop.store = MemoryStore()
-
-        tier_keyed = {
-            "episodic": [
-                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
-            ],
-            "semantic": [],
-            "procedural": [],
-        }
-        # None verdict for episodic → must invoke _probe_passing_keys
-        passing_sets = {"episodic": None, "semantic": None, "procedural": None}
-
-        # Fake probe returns the key as passing
-        with patch.object(
-            ConsolidationLoop,
-            "_probe_passing_keys",
-            return_value={"graph1"},
-        ) as mock_probe:
-            loop._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets)
-            # Probe must be called for episodic (non-empty tier with None verdict)
-            called_tiers = [call.args[0] for call in mock_probe.call_args_list]
-            assert "episodic" in called_tiers
-
+        # Active keys registered in every tier.
         assert "graph1" in loop.store.registry("episodic")
+        assert "graph2" in loop.store.registry("semantic")
+        assert "proc1" in loop.store.registry("procedural")
 
-    def test_none_verdict_never_wipes_tier(self, tmp_path: Path) -> None:
-        """Fail-safe: a None verdict must NOT result in an empty registry.
-
-        This is the drop-all guard: if _probe_passing_keys is not invoked for
-        a non-empty tier when the verdict is None, all keys would be dropped.
-        """
-        from unittest.mock import patch
-
-        from paramem.memory.store import MemoryStore
-        from paramem.training.consolidation import ConsolidationLoop
-        from paramem.utils.config import TrainingConfig
-
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.model = MagicMock()
-        loop.tokenizer = MagicMock()
-        loop.training_config = TrainingConfig(
-            recall_early_stopping=False,
-            recall_probe_batch_size=1,
-        )
-        loop.store = MemoryStore()
-
-        tier_keyed = {
-            "episodic": [
-                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
-                {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
-            ],
-            "semantic": [],
-            "procedural": [],
-        }
-        passing_sets = {"episodic": None, "semantic": None, "procedural": None}
-
-        # Probe returns both keys as passing — registry must be non-empty
-        with patch.object(
-            ConsolidationLoop,
-            "_probe_passing_keys",
-            return_value={"graph1", "graph2"},
-        ):
-            loop._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets)
-
-        reg = loop.store.registry("episodic")
-        assert "graph1" in reg
-        assert "graph2" in reg, "Fail-safe: None verdict must invoke the probe, not drop all keys"
+        # Stale partition seeded before the active keys -- survives the
+        # rebuild, and its simhash is carried onto the fresh registry too.
+        epi_reg = loop.store.registry("episodic")
+        assert "graph_stale" in epi_reg._stale
+        assert epi_reg._stale["graph_stale"]["simhash"] == 0xDEAD

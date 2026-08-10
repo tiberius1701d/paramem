@@ -336,8 +336,12 @@ class TrialActiveError(RuntimeError):
 
 
 class RecallGateRejected(RuntimeError):
-    """Raised by :meth:`ConsolidationLoop._verify_saved_adapter_from_disk` when the
-    post-save recall probe lands below ``recall_sanity_threshold``.
+    """Raised when a recall verdict falls short of the required bar.
+
+    Two raise sites: :meth:`ConsolidationLoop._verify_saved_adapter_from_disk`
+    (post-save disk-integrity probe below ``recall_sanity_threshold``) and
+    :meth:`ConsolidationLoop._assert_tier_recall` (a main-tier fold's own
+    training-completeness verdict below 100% over its full key set).
 
     A deterministic quality verdict, NOT a crash: the adapter trained and saved
     successfully, and the probe simply did not reach the threshold.  The interim
@@ -348,12 +352,24 @@ class RecallGateRejected(RuntimeError):
     propagate as a bare exception skips that bookkeeping entirely, which leaves
     the durable retry counter at zero and the release valve unreachable.
 
+    Main-tiers compensation is scoped to ONE of its two raise sites.  A
+    ``_assert_tier_recall`` rejection is raised inside
+    ``main_tier_backup_scope``, caught by the ``except RecallGateRejected``
+    wrapped around it, and discards the fold's in-flight work before
+    re-raising unchanged (see :meth:`ConsolidationLoop._discard_fold_work`).
+    A ``_verify_saved_adapter_from_disk`` rejection is raised later — from
+    ``_save_adapters`` inside ``_persist_fold``, downstream of that same
+    ``except`` block's ``try`` — so it is NOT caught there: it propagates
+    with ``fold_resume.json`` left intact, the same retry-on-next-cycle
+    contract every other post-persist failure gets.
+
     Subclasses ``RuntimeError`` so existing broad handlers on the main-tier
     path keep their current behaviour.
     """
 
-    def __init__(self, message: str, *, recall_rate: float, threshold: float):
+    def __init__(self, message: str, *, adapter_name: str, recall_rate: float, threshold: float):
         super().__init__(message)
+        self.adapter_name = adapter_name
         self.recall_rate = recall_rate
         self.threshold = threshold
 
@@ -1207,6 +1223,12 @@ class ConsolidationLoop:
         return is the explicit "no verdict" signal; callers MUST route it to
         ``_probe_passing_keys`` — never treat it as an empty passing-set.
 
+        Two surviving consumers: the interim fold's per-key registration gate
+        (a failing key stays unregistered and its session stays pending), and
+        :meth:`_assert_tier_recall` — the main fold's single training-
+        completeness verdict, which falls back to ``_probe_passing_keys`` on
+        a ``None`` return.
+
         Args:
             state: The ``_EarlyStopState`` returned alongside the callback by
                 ``_maybe_make_recall_callback``, or ``None`` when the callback
@@ -1233,9 +1255,13 @@ class ConsolidationLoop:
 
         Called when ``_recall_passing_keys`` returns ``None`` — i.e. when the
         early-stop callback was not active (``recall_early_stopping=False``) or
-        had not yet run a probe.  This ensures recall-gated registration always
-        has a verdict on the FINAL trained weights, regardless of whether the
-        callback fired.
+        had not yet run a probe.  This ensures a verdict on the FINAL trained
+        weights always exists, regardless of whether the callback fired.
+
+        Two surviving consumers: the interim fold's per-key registration gate
+        (``_run_fold``'s interim branch, ~:4082) and :meth:`_assert_tier_recall`
+        — the main fold's single training-completeness verdict, whose
+        no-verdict fallback runs this probe over a rebuilt tier's full key set.
 
         Uses the full entries list without any sampling cap (unlike
         ``_run_recall_sanity_probe`` which caps at max_probe=100).  Probe
@@ -1266,6 +1292,195 @@ class ConsolidationLoop:
         )
         return {r["key"] for r in result["per_key"] if r["exact_match"]}
 
+    def _assert_tier_recall(
+        self,
+        adapter_name: str,
+        entries: "list[dict]",
+        recall_state: "object | None",
+    ) -> float:
+        """The ONE main-tier training-completeness verdict.
+
+        Called at each rebuilt tier's training end, and — for a
+        crash-resumed tier — before it joins ``tiers_rebuilt``.  Both call
+        sites sit inside ``main_tier_backup_scope`` and before every durable
+        write, so a refusal restores the pre-fold weights (the backup
+        scope's own ``except BaseException`` restore arm) and leaves disk
+        untouched.
+
+        Verdict over the tier's FULL key set, never a sample: reads
+        ``state.last_per_key`` via :meth:`_recall_passing_keys` when the
+        early-stop callback produced one (its probe target is the same
+        ``entries`` list, and a probe is forced on the final epoch);
+        otherwise runs a dedicated probe over the full ``entries`` list
+        (:meth:`_probe_passing_keys`).  For a tier trained THIS run, this is
+        the identical fallback call the pre-refusal finalize step used to
+        run for a ``None`` verdict — only moved earlier in the call
+        sequence, so the happy-path GPU cost for that tier is unchanged, not
+        added.  A crash-resumed tier (``recall_state=None``, its weights
+        loaded from a checkpoint this process never probed) always takes
+        this branch too; the pre-refusal finalize step already ran an
+        equivalent probe against a resumed tier's weights, so this is not
+        new GPU spend per tier — but the RESULT is now load-bearing where
+        before it only filtered which keys registered: a resumed tier's
+        probe can now refuse the whole fold, which the pre-refusal finalize
+        step never did.
+
+        Duplicate-tolerant: the denominator is the DISTINCT key count
+        (``len({key set})``), not ``len(entries)`` — a caller that passed a
+        list with a repeated key must never refuse at genuine 100% recall.
+
+        Deliberately not threshold-fed: unlike the disk-integrity probe
+        (``recall_sanity_threshold``), this gate never admits a partial
+        pass — the comparison is ``passing == total``.
+
+        Args:
+            adapter_name: The tier's adapter name (``"episodic"`` /
+                ``"semantic"`` / ``"procedural"``) — also the active adapter
+                the fallback probe runs against.
+            entries: The tier's full keyed-entry list for this fold (the
+                same list the tier trained on).
+            recall_state: The ``_EarlyStopState`` returned by
+                ``_train_tier_adapter``, or ``None`` (early-stop disabled,
+                or a crash-resumed tier this process never trained).
+
+        Returns:
+            The tier's recall rate (``passing / total``) — always ``1.0``
+            on return, since a lower rate raises instead.
+
+        Raises:
+            RecallGateRejected: when any key in ``entries`` failed recall
+                on the final trained weights.  Names the tier, the
+                passing/total count, and the two operator levers: the
+                tier's LoRA ``rank``/``alpha`` under ``adapters:`` in
+                ``server.yaml``, and the training-budget table in
+                ``paramem/utils/config.py``.
+        """
+        passing = self._recall_passing_keys(recall_state, entries)
+        if passing is None:
+            passing = self._probe_passing_keys(adapter_name, entries)
+        # Distinct key count, not len(entries) — a caller that passed a
+        # list with a repeated key must never refuse at genuine 100% recall.
+        total = len({e["key"] for e in entries})
+        n_passing = len(passing)
+        rate = n_passing / total
+        if n_passing < total:
+            raise RecallGateRejected(
+                f"_assert_tier_recall: tier '{adapter_name}' reached {n_passing}/{total} "
+                f"keys ({rate:.3f}) on its own trained weights — short of the required "
+                "100%.  This is a capacity/epoch-budget limit, not a transient failure; "
+                "it will recur every cycle until the tier gets more capacity.  Raise "
+                "this tier's LoRA rank (and alpha) under adapters: in server.yaml, or "
+                "review the training-budget table in paramem/utils/config.py.  The "
+                "fold has been refused before any durable write — former "
+                "adapters/registries stay live, pending conversations stay pending.",
+                adapter_name=adapter_name,
+                recall_rate=rate,
+                threshold=1.0,
+            )
+        return rate
+
+    def _reactivate_fold_soft_stales(
+        self, soft_stale_by_tier: "dict[str, dict[str, dict]]"
+    ) -> None:
+        """Reverse every soft-stale flip a fold applied to the store.
+
+        The ONE spelling of "undo the in-RAM soft-stale flips
+        :meth:`_apply_subtractive_removals_to_store` applied this fold" —
+        delegates to :meth:`~paramem.memory.store.MemoryStore.reactivate`
+        per key (idempotent, replay-gated).  Called by every compensation
+        path that must return the store to its pre-fold state: the interim
+        fold's ``RecallGateRejected`` and generic-exception handlers, and
+        the main-tiers fold's :meth:`_discard_fold_work`.
+
+        Args:
+            soft_stale_by_tier: Per-tier dict of keys this fold soft-staled,
+                as returned by :meth:`_apply_subtractive_removals_to_store`.
+        """
+        for _stale_tier, _stale_keys in soft_stale_by_tier.items():
+            for _stale_key in _stale_keys:
+                self.store.reactivate(_stale_tier, _stale_key)
+
+    def _discard_fold_work(
+        self,
+        soft_stale_by_tier: "dict[str, dict[str, dict]]",
+        *,
+        relocated_keys: "list[tuple[str, str]] | None" = None,
+        minted_keys: "list[tuple[str, str]] | None" = None,
+    ) -> None:
+        """Return the store to its pre-fold state after a deterministic refusal.
+
+        Called by the main-tiers fold immediately before a
+        ``RecallGateRejected`` it cannot recover from propagates — resuming
+        a deterministic verdict would only reproduce it, and the
+        crash-resume marker's content fingerprint
+        (:meth:`_compute_fold_stamp`) does not move when the operator's
+        remedy (raising a tier's LoRA rank/alpha) changes, so a surviving
+        marker would send the next cycle down the crash-resume branch and
+        reload the pre-abort checkpoint at the OLD rank — defeating the
+        remedy.  A crash or ``AbortedDuringConsolidation`` must NOT reach
+        this: both keep the marker so a genuine crash can resume.
+
+        The fold mutates the LIVE store, with ``defer=False``, BEFORE the
+        tier loop that can trigger this refusal — inline promotion
+        (:meth:`_promote_mature_keys_inline`, ``store.move`` to
+        ``"semantic"``) and keyless-edge minting
+        (:meth:`_build_all_edge_entries_into`, ``store.put`` +
+        ``set_bookkeeping`` + a mint-counter advance).  The crash-resume
+        fast path replays the SAME two operations from the marker
+        (reconstituting a pre-crash mint the crashed process never
+        persisted; relocating a key whose on-disk registry still reflects
+        its pre-promotion tier).  Left in place, a refusal would leave a
+        promoted key enumerated under a tier whose restored adapter never
+        trained it (unrecallable until restart, and the gate recurs every
+        cycle), or a minted key active with no adapter holding it —
+        directly contradicting "former adapters/registries stay live."
+        *relocated_keys* and *minted_keys* are exactly what the calling
+        branch (fresh-derivation or crash-resume) captured before the tier
+        loop; both default to empty for callers with nothing to reverse.
+
+        Four steps, in order:
+
+        1. Reactivate every key this fold soft-staled
+           (:meth:`_reactivate_fold_soft_stales`) — by the time this runs,
+           ``main_tier_backup_scope``'s own ``except BaseException`` arm has
+           already restored the pre-fold adapter weights, so this only
+           needs to undo the OTHER in-flight mutations (RAM soft-stale
+           flips, promotions/relocations, mints).
+        2. Reverse every relocation — ``store.move(key, original_tier)`` —
+           and drop the key from ``self.promoted_keys`` so a future fold
+           reconsiders it for promotion rather than skipping it forever
+           (the fresh path's ``if key in self.promoted_keys: continue``
+           guard).  A no-op when the key was never added (the crash-resume
+           relocation branch never touches ``self.promoted_keys``).
+        3. Reverse every mint — ``store.delete(key)`` (entries, registry,
+           simhash, and bookkeeping across every tier in one call) — then
+           re-derive the mint-index counters (:meth:`_derive_key_counters`)
+           so the next fold does not skip the ids this refusal freed.
+        4. Clear ``fold_resume.json`` and the retained
+           ``consolidation_refresh/`` scratch tree
+           (:meth:`_clear_fold_resume_and_scratch`).
+
+        Args:
+            soft_stale_by_tier: Per-tier dict of keys this fold soft-staled.
+            relocated_keys: ``(key, original_tier)`` pairs for every key this
+                fold moved to a new tier before the tier loop (promotion or
+                its crash-resume relocation equivalent).
+            minted_keys: ``(tier, key)`` pairs for every key this fold
+                registered fresh before the tier loop (a keyless-edge mint
+                or its crash-resume reconstitution equivalent).
+        """
+        self._reactivate_fold_soft_stales(soft_stale_by_tier)
+        for _key, _original_tier in relocated_keys or ():
+            self.store.move(_key, _original_tier)
+            self.promoted_keys.discard(_key)
+        _minted = list(minted_keys or ())
+        for _tier, _key in _minted:
+            self.store.delete(_key)
+            logger.info("_discard_fold_work: reversed mint %s (tier %s) after refusal", _key, _tier)
+        if _minted:
+            self._derive_key_counters()
+        self._clear_fold_resume_and_scratch(reason="fold refused")
+
     def _assert_registry_bookkeeping_parity(
         self, candidate_keyed_by_tier: "dict[str, list[dict]]"
     ) -> None:
@@ -1273,14 +1488,18 @@ class ConsolidationLoop:
         bookkeeping record.
 
         Called from the main-tiers fold's atomic finalize, immediately BEFORE
-        :meth:`_reset_main_tier_registries_and_simhashes`, against the exact
-        per-tier key set that call is about to admit into the rebuilt
-        registries (post recall-gate filtering, pre-mutation).  Firing here
-        — ahead of any in-RAM registry mutation and any durable write to
-        serving state for this fold — means the former registries stay live
-        and servable when the gate trips.  Earlier fold-scratch writes
-        (``fold_resume.json``, per-tier training checkpoints) may already be
-        on disk; they are recoverable resume scratch, not serving state.
+        :meth:`_reset_main_tier_registries_and_simhashes`, against
+        ``tier_keyed`` itself — the exact per-tier key set that call is about
+        to admit into the rebuilt registries.  Every key reaching this point
+        already cleared its tier's :meth:`_assert_tier_recall` verdict (100%
+        recall over the tier's full key set), so there is no recall-gate
+        filtering left to apply first; this gate is pre-mutation only.
+        Firing here — ahead of any in-RAM registry mutation and any durable
+        write to serving state for this fold — means the former registries
+        stay live and servable when the gate trips.  Earlier fold-scratch
+        writes (``fold_resume.json``, per-tier training checkpoints) may
+        already be on disk; they are recoverable resume scratch, not serving
+        state.
 
         Predicate per key: a store entry exists (``store.get(key)``) AND a
         bookkeeping record exists (``store.bookkeeping_for_key(key)``).
@@ -1330,7 +1549,6 @@ class ConsolidationLoop:
     def _reset_main_tier_registries_and_simhashes(
         self,
         tier_keyed: dict[str, list[dict]],
-        passing_sets_by_tier: "dict[str, set[str] | None] | None" = None,
         *,
         soft_stale_by_tier: "dict[str, dict[str, dict]] | None" = None,
     ) -> None:
@@ -1347,33 +1565,24 @@ class ConsolidationLoop:
         simhash is written directly onto the fresh :class:`KeyRegistry` before
         it is loaded into the store.
 
-        Recall-gated registration (stage 9): only keys whose ``exact_match``
-        verdict is True on the FINAL trained weights are admitted.  The verdict
-        is supplied via ``passing_sets_by_tier``.  For any tier whose entry is
-        ``None`` (verdict absent — early-stop disabled or tier not trained),
-        a dedicated per-key probe is run on the trained weights as the fail-safe
-        (``_probe_passing_keys``).  A ``None`` verdict NEVER admits all keys
-        blindly — that would constitute silent total knowledge loss if the model
-        had not actually learned them.
+        Every key in ``tier_keyed`` is registered unconditionally — there is no
+        per-key filtering here.  The training-completeness verdict is enforced
+        earlier, once per tier, by :meth:`_assert_tier_recall` (called at each
+        rebuilt tier's training end, before the tier joins ``tiers_rebuilt``):
+        a tier that did not reach 100% recall over its own full key set aborts
+        the fold before this method ever runs, so every tier reaching here has
+        already cleared that bar.
 
         Soft-stale preservation: the fresh ``KeyRegistry()`` that replaces the
         live registry would wipe any stale flip applied during the drift-partition
         step.  Pass ``soft_stale_by_tier`` so the rebuilt registry seeds the stale
-        partition BEFORE adding passing (active) keys.  Stale simhashes are also
+        partition BEFORE adding the active keys.  Stale simhashes are also
         merged back into the rebuilt simhash dict so they survive on disk for the
         stale-echo seam.
 
         Args:
             tier_keyed: Per-tier keyed-entry lists (full post-consolidation set).
-            passing_sets_by_tier: Per-tier sets of keys that passed the recall
-                gate.  A ``None`` entry for a tier triggers the probe fallback.
-                Pass ``None`` for the entire dict to skip recall gating: every
-                key in ``tier_keyed`` is admitted without a verdict.  That is the
-                DISK VENUE's production contract — recall gating is a verdict on
-                adapter weights, and the disk venue has none to probe, so there
-                is nothing a probe could add and nothing a missing verdict could
-                hide.  Distinct from a per-tier ``None`` (weights venue, verdict
-                absent for that tier), which triggers ``_probe_passing_keys``.
+                Every key present is admitted into the rebuilt registry.
             soft_stale_by_tier: Per-tier dict of soft-staled keys captured at the
                 drift-partition step.  Keys map to
                 ``{"stale_cycles": int, "simhash": int | None}``.  When ``None``
@@ -1394,33 +1603,15 @@ class ConsolidationLoop:
                 self.store.load_registry(_main_tier, new_reg)
                 continue
 
-            # Determine the recall-passing set for this tier.
-            if passing_sets_by_tier is not None:
-                passing = passing_sets_by_tier.get(_main_tier)
-                if passing is None:
-                    # FAIL-SAFE: None verdict → dedicated per-key probe.
-                    # Never treat None as "admit all" or "drop all".
-                    passing = self._probe_passing_keys(_main_tier, keyed)
-                    logger.info(
-                        "_reset_main_tier_registries_and_simhashes: tier %s — "
-                        "no verdict from callback, ran dedicated probe (%d/%d passed)",
-                        _main_tier,
-                        len(passing),
-                        len(keyed),
-                    )
-                else:
-                    logger.info(
-                        "_reset_main_tier_registries_and_simhashes: tier %s — "
-                        "%d/%d keys passed recall gate",
-                        _main_tier,
-                        len(passing),
-                        len(keyed),
-                    )
-                keyed = [kp for kp in keyed if kp["key"] in passing]
+            logger.info(
+                "_reset_main_tier_registries_and_simhashes: tier %s — registering all %d key(s)",
+                _main_tier,
+                len(keyed),
+            )
 
             # Build the fresh registry:
             # (a) seed stale records FIRST — they must survive the rebuild;
-            # (b) then add passing active keys with their simhashes.
+            # (b) then add every key with its simhash.
             # Simhashes are set directly on the registry; stale simhashes live
             # in _stale[key]["simhash"] already (carried by the stale records).
             new_reg = KeyRegistry()
@@ -2513,6 +2704,38 @@ class ConsolidationLoop:
         path = self._fold_state_dir / self._FOLD_RESUME_FILENAME
         path.unlink(missing_ok=True)
         logger.debug("_clear_fold_resume: removed %s", path)
+
+    def _clear_fold_resume_and_scratch(self, *, reason: str) -> None:
+        """Clear ``fold_resume.json`` AND remove the retained
+        ``consolidation_refresh/`` scratch tree — the one spelling of this
+        compound cleanup.
+
+        Three main-tiers call sites converge here: a stale (mismatched)
+        marker detected at fold entry, a successful fold's post-persist
+        cleanup, and a refusal's discard (:meth:`_discard_fold_work`).  All
+        three clear the same marker and reap the same scratch tree; only WHY
+        differs, carried in *reason* for the one log line so each call site
+        keeps its own diagnostic wording without its own ``rmtree``.
+
+        Idempotent: a no-op (beyond the debug log inside
+        :meth:`_clear_fold_resume`) when both the marker and the scratch
+        tree are already absent.
+
+        Args:
+            reason: Short phrase naming why the cleanup ran (e.g. ``"stale
+                marker (fold_stamp or scope mismatch)"``, ``"after
+                _save_adapters"``, ``"fold refused"``).
+        """
+        self._clear_fold_resume()
+        import shutil as _sh_clear
+
+        _refresh_root = self.output_dir / "consolidation_refresh"
+        if _refresh_root.exists():
+            _sh_clear.rmtree(_refresh_root, ignore_errors=True)
+            logger.info(
+                "_clear_fold_resume_and_scratch: removed consolidation_refresh scratch (%s)",
+                reason,
+            )
 
     @staticmethod
     def _latest_checkpoint_in_dir(directory: Path) -> "str | None":
@@ -4042,9 +4265,7 @@ class ConsolidationLoop:
                     # cycle return and is skipped entirely when this
                     # propagates.  commit_tier_slot has already removed the
                     # un-flushed slot in its own finally.
-                    for _stale_tier, _stale_keys in _soft_stale_by_tier.items():
-                        for _stale_key in _stale_keys:
-                            self.store.reactivate(_stale_tier, _stale_key)
+                    self._reactivate_fold_soft_stales(_soft_stale_by_tier)
                     self.store.drop_tier(adapter_name)
                     # Drop the rejected slot from VRAM too — commit_tier_slot's
                     # finally only removes the disk artifact, and
@@ -4085,7 +4306,7 @@ class ConsolidationLoop:
                     logger.warning(
                         "_run_fold[interim]: recall gate rejected %s "
                         "(recall %.3f < threshold %.2f) — %d session(s) stay pending",
-                        adapter_name,
+                        _gate.adapter_name,
                         _gate.recall_rate,
                         _gate.threshold,
                         len(_pending_session_ids_b),
@@ -4096,9 +4317,7 @@ class ConsolidationLoop:
                     # (reversing _apply_subtractive_removals_to_store), then
                     # drop the freshly-minted interim tier wholesale — restoring
                     # the store to its pre-cycle state.
-                    for _stale_tier, _stale_keys in _soft_stale_by_tier.items():
-                        for _stale_key in _stale_keys:
-                            self.store.reactivate(_stale_tier, _stale_key)
+                    self._reactivate_fold_soft_stales(_soft_stale_by_tier)
                     self.store.drop_tier(adapter_name)
                     raise
 
@@ -4210,20 +4429,24 @@ class ConsolidationLoop:
         if _resume_marker is not None and not _resume_c:
             # Stale marker (different fold inputs or scope): clear it and
             # delete any retained checkpoint scratch from that stale fold.
-            import shutil as _shutil
-
-            _stale_refresh = self.output_dir / "consolidation_refresh"
-            if _stale_refresh.exists():
-                _shutil.rmtree(_stale_refresh, ignore_errors=True)
-                logger.info(
-                    "_run_fold[main_tiers]: removed stale consolidation_refresh tree"
-                    " from prior mismatched fold"
-                )
-            self._clear_fold_resume()
+            self._clear_fold_resume_and_scratch(
+                reason="stale marker (fold_stamp or scope mismatch)"
+            )
             logger.info(
                 "_run_fold[main_tiers]: cleared stale fold_resume.json"
                 " (fold_stamp or scope mismatch) — proceeding as fresh fold"
             )
+
+        # Pre-training store mutations this fold applies with defer=False —
+        # both the fresh path (_promote_mature_keys_inline / the keyless-edge
+        # mint branch of _build_all_edge_entries_into) and the crash-resume
+        # path's reconstitution (the same two operations, replayed from the
+        # marker) touch the live store BEFORE the tier loop.  A refusal must
+        # reverse exactly these, symmetrically, before _discard_fold_work
+        # clears the marker — see that method's docstring.  Populated by
+        # whichever branch below actually runs; the other leaves both empty.
+        _relocated_keys_this_fold: "list[tuple[str, str]]" = []
+        _minted_keys_this_fold: "list[tuple[str, str]]" = []
 
         try:
             # -----------------------------------------------------------------
@@ -4270,6 +4493,13 @@ class ConsolidationLoop:
                                 first_seen=_rec["first_seen"],
                                 allow_empty_speaker=(_rec["speaker_id"] == ""),
                             )
+                            # Reconstitution, not a fresh mint, but the same
+                            # reversal applies: THIS process had no record of
+                            # the key before this loop iteration (the crashed
+                            # process's writes never reached disk), so a
+                            # refusal must delete it entirely (see
+                            # _discard_fold_work).
+                            _minted_keys_this_fold.append((_t, _entry["key"]))
                         else:
                             # Pre-existing key (anti-forgetting replay): content
                             # and bookkeeping were already durable before this
@@ -4314,6 +4544,11 @@ class ConsolidationLoop:
                                     _t,
                                 )
                                 self.store.move(_entry["key"], _t)
+                                # A refusal must move this key back to
+                                # _existing_tier (see _discard_fold_work) —
+                                # this relocation is the resume path's
+                                # equivalent of a fresh-fold promotion move.
+                                _relocated_keys_this_fold.append((_entry["key"], _existing_tier))
                             self.store.put(
                                 _t,
                                 _entry["key"],
@@ -4396,6 +4631,11 @@ class ConsolidationLoop:
                             "before tier assignment",
                             len(_inline_promoted),
                         )
+                        # A refusal must move these back to episodic (see
+                        # _discard_fold_work) — _promote_mature_keys_inline's
+                        # newly_promoted list is exactly the keys it moved
+                        # (episodic -> semantic; the only move branch it has).
+                        _relocated_keys_this_fold.extend((k, "episodic") for k in _inline_promoted)
 
                 tier_keyed: dict[str, list[dict]] = {
                     "episodic": [],
@@ -4407,6 +4647,12 @@ class ConsolidationLoop:
                     tier_keyed,
                     defer=scope.defer,
                     tag_new=scope.tag_new,
+                )
+                # scope.defer is always False for main_tiers, so the mints
+                # above are already live in the store — a refusal must
+                # delete them entirely (see _discard_fold_work).
+                _minted_keys_this_fold.extend(
+                    (r["tier"], r["entry"]["key"]) for r in _minted_records
                 )
 
                 if recall_miss_keys:
@@ -4624,7 +4870,6 @@ class ConsolidationLoop:
                 on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
             tiers_rebuilt: list[str] = []
-            last_per_key_by_tier: dict[str, "list | None"] = {}
 
             if scope.source != "weights":
                 # Disk venue: no adapter weights exist, so there is nothing to
@@ -4692,441 +4937,483 @@ class ConsolidationLoop:
                 _telemetry_free_before = (
                     torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
                 )
-                with main_tier_backup_scope(self.model, tier_config_for_backup) as _bscope:
-                    self.model = _bscope.model
-                    if torch.cuda.is_available() and _telemetry_free_before is not None:
-                        _telemetry_free_after, _telemetry_total = torch.cuda.mem_get_info()
-                        _telemetry_adapter_count = len(self.model.peft_config)
-                        _telemetry_interim_count = len(
-                            [a for a in self.model.peft_config if a.startswith(INTERIM_NAME_PREFIX)]
-                        )
-                        logger.info(
-                            "_run_fold[main_tiers]: telemetry backup_creation — "
-                            "free_before=%d free_after=%d adapter_count=%d interim_count=%d",
-                            _telemetry_free_before,
-                            _telemetry_free_after,
-                            _telemetry_adapter_count,
-                            _telemetry_interim_count,
-                        )
-                        if self._telemetry_dir is not None:
-                            try:
-                                record_fold_telemetry(
-                                    self._telemetry_dir,
-                                    cycle_stamp=_telemetry_run_stamp_c,
-                                    kind="backup_creation",
-                                    record={
-                                        "fold_stamp": _fold_stamp_c,
-                                        "free_before": _telemetry_free_before,
-                                        "free_after": _telemetry_free_after,
-                                        "total": _telemetry_total,
-                                        "adapter_count": _telemetry_adapter_count,
-                                        "interim_count": _telemetry_interim_count,
-                                    },
-                                )
-                            except Exception:  # noqa: BLE001  # boundary: telemetry runs
-                                # inside the CM's entered body — a write failure must
-                                # never replace an in-flight exception (e.g. an
-                                # AbortedDuringConsolidation raised later in the tier
-                                # loop). Losing a telemetry record is strictly
-                                # preferable to a misrouted abort.
-                                logger.warning(
-                                    "_run_fold[main_tiers]: telemetry write failed"
-                                    " for backup_creation",
-                                    exc_info=True,
-                                )
-
-                    # Completed-tier set from resume marker (empty on fresh fold).
-                    _completed_in_marker: set[str] = (
-                        set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
-                        if _resume_c
-                        else set()
-                    )
-                    _marker_checkpoints: dict[str, str] = (
-                        _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
-                        if _resume_c
-                        else {}
-                    )
-
-                    for tier in ("episodic", "semantic", "procedural"):
-                        backup_name = f"{tier}_backup"
-                        job = jobs_by_tier[tier]
-
-                        if not job.entries:
-                            logger.info(
-                                "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild",
-                                tier,
+                try:
+                    # RecallGateRejected raised anywhere in the tier loop
+                    # below (either _assert_tier_recall call site) means
+                    # main_tier_backup_scope's own except BaseException arm
+                    # has already restored every snapshotted tier from its
+                    # <tier>_backup before this handler runs -- so
+                    # _discard_fold_work only needs to undo the fold's
+                    # OTHER in-flight work (soft-staled keys, the resume
+                    # marker, retained scratch), never the weights.
+                    with main_tier_backup_scope(self.model, tier_config_for_backup) as _bscope:
+                        self.model = _bscope.model
+                        if torch.cuda.is_available() and _telemetry_free_before is not None:
+                            _telemetry_free_after, _telemetry_total = torch.cuda.mem_get_info()
+                            _telemetry_adapter_count = len(self.model.peft_config)
+                            _telemetry_interim_count = len(
+                                [
+                                    a
+                                    for a in self.model.peft_config
+                                    if a.startswith(INTERIM_NAME_PREFIX)
+                                ]
                             )
-                            continue
-
-                        # --- Crash-resume: reload completed tiers from durable checkpoint ---
-                        if _resume_c and tier in _completed_in_marker:
-                            # The checkpoint path stored in the marker (may be absent
-                            # when _latest_checkpoint_in_dir found no checkpoint-N dir
-                            # for this tier).
-                            _ckpt_path = _marker_checkpoints.get(tier)
                             logger.info(
-                                "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
-                                " durable checkpoint (no retrain); checkpoint=%s",
-                                tier,
-                                _ckpt_path or "production-slot",
+                                "_run_fold[main_tiers]: telemetry backup_creation — "
+                                "free_before=%d free_after=%d adapter_count=%d interim_count=%d",
+                                _telemetry_free_before,
+                                _telemetry_free_after,
+                                _telemetry_adapter_count,
+                                _telemetry_interim_count,
                             )
-                            # Delete the stale production slot (pre-crash _save_adapters never
-                            # ran — weights are stale) and reload from the checkpoint dir or the
-                            # existing production slot when no checkpoint was recorded.
-                            # The per-tier backups created above mean the deleted
-                            # slot is never the last adapter on the PeftModel
-                            # (no base-unwrap needed).
-                            if tier in self.model.peft_config:
-                                if backup_name in self.model.peft_config:
-                                    from paramem.models.loader import switch_adapter as _sw_pre
-
-                                    _sw_pre(self.model, backup_name)
-                                self.model.delete_adapter(tier)
-                                logger.debug(
-                                    "_run_fold[main_tiers]: crash-resume deleted stale slot %s",
-                                    tier,
-                                )
-                            if _ckpt_path and Path(_ckpt_path).is_dir():
-                                # checkpoint-N dir present — load the staged adapter
-                                # from it.  HF Trainer saves all PEFT adapters under
-                                # checkpoint-N/<adapter_name>/ (one subdir per adapter).
-                                # The training adapter staging slot is "in_training"
-                                # (trainer._STAGING_ADAPTER), so the weights live at
-                                # checkpoint-N/in_training/adapter_model.safetensors.
-                                # Decrypt into /dev/shm when security is ON (mirrors
-                                # trainer.py:962-976).
-                                from paramem.backup import key_store as _ks
-                                from paramem.training.trainer import (
-                                    _STAGING_ADAPTER as _STAGING_SLOT,
-                                )
-
-                                # Resolve to the staging-adapter subdir within the checkpoint.
-                                _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
-                                _ckpt_effective = (
-                                    str(_ckpt_staging_path)
-                                    if _ckpt_staging_path.is_dir()
-                                    else _ckpt_path
-                                )
-                                _ckpt_shm_dir = None
-                                if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-                                    from paramem.backup.checkpoint_shard import (
-                                        materialize_checkpoint_to_shm,
-                                    )
-
-                                    _ckpt_shm_dir = materialize_checkpoint_to_shm(
-                                        Path(_ckpt_effective)
-                                    )
-                                    _ckpt_load_path = str(_ckpt_shm_dir)
-                                else:
-                                    _ckpt_load_path = _ckpt_effective
+                            if self._telemetry_dir is not None:
                                 try:
-                                    self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
-                                    logger.info(
-                                        "_run_fold[main_tiers]: crash-resume loaded %s from"
-                                        " checkpoint %s (staging slot=%s)",
-                                        tier,
-                                        _ckpt_path,
-                                        _STAGING_SLOT,
-                                    )
-                                finally:
-                                    if (
-                                        _ckpt_shm_dir is not None
-                                        and Path(str(_ckpt_shm_dir)).exists()
-                                    ):
-                                        import shutil as _s
-
-                                        _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
-                            else:
-                                # no checkpoint-N dir recorded for this tier (see
-                                # _latest_checkpoint_in_dir). Reload from the EXISTING
-                                # production slot on disk — it was not overwritten
-                                # (final _save_adapters never ran on crash).
-                                from paramem.memory.interim_adapter import (
-                                    adapter_slot_root_for_name as _asr_fn,
-                                )
-                                from paramem.models.loader import load_adapter as _la
-
-                                _prod_root = _asr_fn(self.output_dir, tier)
-                                _la(self.model, _prod_root.parent, tier)
-                                logger.info(
-                                    "_run_fold[main_tiers]: crash-resume (no recorded checkpoint)"
-                                    " loaded %s from production slot %s",
-                                    tier,
-                                    _prod_root.parent,
-                                )
-                            from paramem.models.loader import switch_adapter as _sw_resume
-
-                            _sw_resume(self.model, tier)
-                            last_per_key_by_tier[tier] = None
-                            tiers_rebuilt.append(tier)
-                            continue
-
-                        tier_cfg = (
-                            self.episodic_config
-                            if tier == "episodic"
-                            else (
-                                self.semantic_config
-                                if tier == "semantic"
-                                else (self.procedural_config or self.episodic_config)
-                            )
-                        )
-
-                        if backup_name in self.model.peft_config:
-                            from paramem.models.loader import switch_adapter as _sw_backup
-
-                            _sw_backup(self.model, backup_name)
-
-                        if scope.cold_init:
-                            # RECONCILE only (FoldScope.cold_init) — reproduce
-                            # today's unconditional cold rebuild exactly.
-                            if tier in self.model.peft_config:
-                                self.model.delete_adapter(tier)
-                                logger.debug(
-                                    "_run_fold[main_tiers]: deleted adapter %s"
-                                    " (cold_init: RECONCILE)",
-                                    tier,
-                                )
-                            self.model = create_adapter(self.model, tier_cfg, tier)
-                            logger.debug(
-                                "_run_fold[main_tiers]: created fresh adapter %s"
-                                " (cold_init: RECONCILE)",
-                                tier,
-                            )
-                        else:
-                            # Warm default: keep the resident tier's weights —
-                            # the funnel's staging copy (trainer.py:944-948)
-                            # warm-starts training from them. Recreates cold
-                            # only on first-boot absence or a genuine LoRA
-                            # config mismatch (never as blanket policy).
-                            self.model = ensure_adapter_matching(self.model, tier_cfg, tier)
-
-                        from paramem.models.loader import switch_adapter as _sw
-
-                        _sw(self.model, tier)
-
-                        prior_job = None
-                        recall_state = None
-                        _tier_metrics = None
-                        if trainer is not None:
-                            prior_job = trainer._current_job
-                            trainer._current_job = job
-                            trainer._set_is_training(True)
-                        # --- Per-tier device-saturation telemetry ---
-                        # max_memory_allocated() is a process-wide PyTorch-allocator
-                        # counter, polluted by the per-epoch recall probe's
-                        # model.generate() and by inference served during
-                        # BackgroundTrainer step-yields — NOT an adapter cost.
-                        # Bare snapshots only (never vram_measure: that captures
-                        # endpoint free-deltas, not the intra-training peak this
-                        # needs, and its OOM->VramExhausted transform is beside the
-                        # point here since abort/rollback is gated on
-                        # _tier_metrics.get("aborted"), a normal return value).
-                        _telemetry_tier_free_before: int | None = None
-                        _telemetry_tier_total: int | None = None
-                        _telemetry_tier_n_keys = len(job.entries)
-                        # Derived here (not read off refresh_training_config.num_epochs)
-                        # so the finally-path telemetry below records the TRUE
-                        # budget even when training raises. _train_tier_adapter
-                        # derives the identical value from the same n_keys input --
-                        # budget_for is pure.
-                        _telemetry_tier_epochs, _telemetry_tier_accum, _ = budget_for(
-                            _telemetry_tier_n_keys
-                        )
-                        # Measured BEFORE training starts -- same enclosing-scope
-                        # hoist as the budget derivation above, so the
-                        # finally-path record below carries the true
-                        # pre-training weight state even when training raises.
-                        _telemetry_tier_init = measured_adapter_init_state(self.model, tier)
-                        _telemetry_tier_stale = len(self.store.stale_keys_in_tier(tier))
-                        if torch.cuda.is_available():
-                            torch.cuda.reset_peak_memory_stats()
-                            _telemetry_tier_free_before, _telemetry_tier_total = (
-                                torch.cuda.mem_get_info()
-                            )
-                        try:
-                            _tier_metrics, recall_state = self._train_tier_adapter(
-                                job.entries,
-                                adapter_name=tier,
-                                adapter_config=tier_cfg,
-                                training_config=refresh_training_config,
-                                output_dir=self.output_dir / "consolidation_refresh" / tier,
-                                run_name=f"consolidate-{tier}",
-                                phase_name=f"consolidate-{tier}",
-                                retain_scratch_until_external_commit=True,
-                            )
-                            if _tier_metrics is not None:
-                                if _tier_metrics.get("aborted"):
-                                    logger.info(
-                                        "_run_fold[main_tiers]: training aborted on tier %s "
-                                        "— restoring all tiers from backups",
-                                        tier,
-                                    )
-                                    raise AbortedDuringConsolidation(
-                                        f"training aborted on tier {tier!r}"
-                                    )
-                                else:
-                                    logger.info(
-                                        "_run_fold[main_tiers]: trained %s on %d keys",
-                                        tier,
-                                        len(job.entries),
-                                    )
-                        finally:
-                            if trainer is not None:
-                                trainer._set_is_training(False)
-                                trainer._current_job = prior_job
-                            # The ENTIRE record build (not just the write below)
-                            # is inside this try/except: constructing the dict
-                            # reads self.model.peft_config and calls
-                            # _recall_bind_telemetry, either of which could raise
-                            # on a sufficiently broken state, and a raise here in
-                            # a bare finally (unguarded) would REPLACE an
-                            # in-flight exception from the try above (e.g.
-                            # AbortedDuringConsolidation) with whatever this
-                            # construction raised -- silently misrouting an abort
-                            # to the crash-incident path via main_tier_backup_scope's
-                            # except. Losing a telemetry record is strictly
-                            # preferable to that.
-                            try:
-                                # aborted is a NORMAL RETURN VALUE from
-                                # _train_tier_adapter (the trainer's own
-                                # thermal-throttle/operator-pause signal) that
-                                # this branch converts to a raised
-                                # AbortedDuringConsolidation AFTER the
-                                # assignment above succeeds -- so _tier_metrics
-                                # is bound (with aborted=True) on that path, and
-                                # stays at its pre-declared None only when
-                                # _train_tier_adapter itself raised before
-                                # returning.
-                                _tier_aborted = bool(
-                                    _tier_metrics.get("aborted")
-                                    if _tier_metrics is not None
-                                    else False
-                                )
-                                # Budget/bind/init/stale fields do not depend on
-                                # CUDA introspection -- the record is always
-                                # written; only the VRAM fields below are
-                                # conditional on it.
-                                _telemetry_tier_record: dict = {
-                                    "tier": tier,
-                                    "fold_stamp": _fold_stamp_c,
-                                    "adapter_count": len(self.model.peft_config),
-                                    "interim_count": len(
-                                        [
-                                            a
-                                            for a in self.model.peft_config
-                                            if a.startswith(INTERIM_NAME_PREFIX)
-                                        ]
-                                    ),
-                                    "epochs": _telemetry_tier_epochs,
-                                    "n_keys": _telemetry_tier_n_keys,
-                                    "accum": _telemetry_tier_accum,
-                                    "stale_keys": _telemetry_tier_stale,
-                                    "aborted": _tier_aborted,
-                                }
-                                if _telemetry_tier_init is not None:
-                                    _telemetry_tier_record["init"] = _telemetry_tier_init
-                                # See the interim call site's identical comment:
-                                # _train_tier_adapter tags its returned metrics
-                                # dict on an actual donor-seeded copy; the
-                                # exception path (where _tier_metrics stays None)
-                                # leaves the pre-training measured value alone.
-                                if _tier_metrics is not None and _tier_metrics.get("donor_seeded"):
-                                    _telemetry_tier_record["init"] = "donor"
-                                _tier_epochs_to_bind, _tier_steps_to_bind, _tier_hit_cap = (
-                                    _recall_bind_telemetry(
-                                        recall_state, _telemetry_tier_n_keys, _telemetry_tier_accum
-                                    )
-                                )
-                                if _tier_epochs_to_bind is not None:
-                                    _telemetry_tier_record["epochs_to_bind"] = _tier_epochs_to_bind
-                                    _telemetry_tier_record["steps_to_bind"] = _tier_steps_to_bind
-                                # hit_cap is suppressed on the abort path: stop_epoch
-                                # is None whenever the trainer never reached (or
-                                # never signalled) recall convergence, and an abort
-                                # is exactly such a case -- emitting hit_cap=True
-                                # there would be indistinguishable from a genuine
-                                # "budget too small" outcome in the bucket re-fit.
-                                if not _tier_aborted and _tier_hit_cap is not None:
-                                    _telemetry_tier_record["hit_cap"] = _tier_hit_cap
-                                if (
-                                    torch.cuda.is_available()
-                                    and _telemetry_tier_free_before is not None
-                                ):
-                                    _telemetry_tier_peak = torch.cuda.max_memory_allocated()
-                                    # peak_reserved is the OOM-relevant quantity: the
-                                    # caching allocator raises when it cannot reserve,
-                                    # not when driver-free (mem_get_info) drops —
-                                    # driver-free counts cached-but-unused allocator
-                                    # segments as used, which peak_reserved does not.
-                                    _telemetry_tier_peak_reserved = torch.cuda.max_memory_reserved()
-                                    _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
-                                    logger.info(
-                                        "_run_fold[main_tiers]: telemetry tier_train[%s] "
-                                        "(device-saturation indicator, not adapter cost) — "
-                                        "free_before=%d free_after=%d peak_alloc=%d "
-                                        "peak_reserved=%d",
-                                        tier,
-                                        _telemetry_tier_free_before,
-                                        _telemetry_tier_free_after,
-                                        _telemetry_tier_peak,
-                                        _telemetry_tier_peak_reserved,
-                                    )
-                                    _telemetry_tier_record.update(
-                                        {
-                                            "free_before": _telemetry_tier_free_before,
-                                            "free_after": _telemetry_tier_free_after,
-                                            "peak_alloc": _telemetry_tier_peak,
-                                            "peak_reserved": _telemetry_tier_peak_reserved,
-                                            "total": _telemetry_tier_total,
-                                        }
-                                    )
-                                if self._telemetry_dir is not None:
                                     record_fold_telemetry(
                                         self._telemetry_dir,
                                         cycle_stamp=_telemetry_run_stamp_c,
-                                        kind="tier_train",
-                                        record=_telemetry_tier_record,
+                                        kind="backup_creation",
+                                        record={
+                                            "fold_stamp": _fold_stamp_c,
+                                            "free_before": _telemetry_free_before,
+                                            "free_after": _telemetry_free_after,
+                                            "total": _telemetry_total,
+                                            "adapter_count": _telemetry_adapter_count,
+                                            "interim_count": _telemetry_interim_count,
+                                        },
                                     )
-                            except Exception:  # noqa: BLE001  # boundary: this
-                                # finally runs on the abort path too — e.g.
-                                # AbortedDuringConsolidation is raised in the try
-                                # above and would reach main_tier_backup_scope's
-                                # except only if this finally does not itself
-                                # raise. A failure anywhere in record
-                                # construction OR the write (disk full,
-                                # permissions, corrupt store, a broken
-                                # model/store attribute) must never replace the
-                                # in-flight exception and misroute an abort to
-                                # the crash-incident path. Losing a telemetry
-                                # record is strictly preferable.
-                                logger.warning(
-                                    "_run_fold[main_tiers]: telemetry write failed for tier %s",
+                                except Exception:  # noqa: BLE001  # boundary: telemetry runs
+                                    # inside the CM's entered body — a write failure must
+                                    # never replace an in-flight exception (e.g. an
+                                    # AbortedDuringConsolidation raised later in the tier
+                                    # loop). Losing a telemetry record is strictly
+                                    # preferable to a misrouted abort.
+                                    logger.warning(
+                                        "_run_fold[main_tiers]: telemetry write failed"
+                                        " for backup_creation",
+                                        exc_info=True,
+                                    )
+
+                        # Completed-tier set from resume marker (empty on fresh fold).
+                        _completed_in_marker: set[str] = (
+                            set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
+                            if _resume_c
+                            else set()
+                        )
+                        _marker_checkpoints: dict[str, str] = (
+                            _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
+                            if _resume_c
+                            else {}
+                        )
+
+                        for tier in ("episodic", "semantic", "procedural"):
+                            backup_name = f"{tier}_backup"
+                            job = jobs_by_tier[tier]
+
+                            if not job.entries:
+                                logger.info(
+                                    "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild",
                                     tier,
-                                    exc_info=True,
                                 )
+                                continue
 
-                        last_per_key_by_tier[tier] = (
-                            recall_state.last_per_key if recall_state is not None else None
-                        )
-                        if recall_state is not None and recall_state.last_per_key is not None:
-                            on_recall_probe(
-                                recall_state.last_per_key,
-                                phase="train_fill",
-                                adapter_name=tier,
+                            # --- Crash-resume: reload completed tiers from durable checkpoint ---
+                            if _resume_c and tier in _completed_in_marker:
+                                # The checkpoint path stored in the marker (may be absent
+                                # when _latest_checkpoint_in_dir found no checkpoint-N dir
+                                # for this tier).
+                                _ckpt_path = _marker_checkpoints.get(tier)
+                                logger.info(
+                                    "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
+                                    " durable checkpoint (no retrain); checkpoint=%s",
+                                    tier,
+                                    _ckpt_path or "production-slot",
+                                )
+                                # Delete the stale production slot (pre-crash _save_adapters never
+                                # ran — weights are stale) and reload from the checkpoint dir or the
+                                # existing production slot when no checkpoint was recorded.
+                                # The per-tier backups created above mean the deleted
+                                # slot is never the last adapter on the PeftModel
+                                # (no base-unwrap needed).
+                                if tier in self.model.peft_config:
+                                    if backup_name in self.model.peft_config:
+                                        from paramem.models.loader import switch_adapter as _sw_pre
+
+                                        _sw_pre(self.model, backup_name)
+                                    self.model.delete_adapter(tier)
+                                    logger.debug(
+                                        "_run_fold[main_tiers]: crash-resume deleted stale slot %s",
+                                        tier,
+                                    )
+                                if _ckpt_path and Path(_ckpt_path).is_dir():
+                                    # checkpoint-N dir present — load the staged adapter
+                                    # from it.  HF Trainer saves all PEFT adapters under
+                                    # checkpoint-N/<adapter_name>/ (one subdir per adapter).
+                                    # The training adapter staging slot is "in_training"
+                                    # (trainer._STAGING_ADAPTER), so the weights live at
+                                    # checkpoint-N/in_training/adapter_model.safetensors.
+                                    # Decrypt into /dev/shm when security is ON (mirrors
+                                    # trainer.py:962-976).
+                                    from paramem.backup import key_store as _ks
+                                    from paramem.training.trainer import (
+                                        _STAGING_ADAPTER as _STAGING_SLOT,
+                                    )
+
+                                    # Resolve to the staging-adapter subdir within the checkpoint.
+                                    _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
+                                    _ckpt_effective = (
+                                        str(_ckpt_staging_path)
+                                        if _ckpt_staging_path.is_dir()
+                                        else _ckpt_path
+                                    )
+                                    _ckpt_shm_dir = None
+                                    if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+                                        from paramem.backup.checkpoint_shard import (
+                                            materialize_checkpoint_to_shm,
+                                        )
+
+                                        _ckpt_shm_dir = materialize_checkpoint_to_shm(
+                                            Path(_ckpt_effective)
+                                        )
+                                        _ckpt_load_path = str(_ckpt_shm_dir)
+                                    else:
+                                        _ckpt_load_path = _ckpt_effective
+                                    try:
+                                        self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
+                                        logger.info(
+                                            "_run_fold[main_tiers]: crash-resume loaded %s from"
+                                            " checkpoint %s (staging slot=%s)",
+                                            tier,
+                                            _ckpt_path,
+                                            _STAGING_SLOT,
+                                        )
+                                    finally:
+                                        if (
+                                            _ckpt_shm_dir is not None
+                                            and Path(str(_ckpt_shm_dir)).exists()
+                                        ):
+                                            import shutil as _s
+
+                                            _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
+                                else:
+                                    # no checkpoint-N dir recorded for this tier (see
+                                    # _latest_checkpoint_in_dir). Reload from the EXISTING
+                                    # production slot on disk — it was not overwritten
+                                    # (final _save_adapters never ran on crash).
+                                    from paramem.memory.interim_adapter import (
+                                        adapter_slot_root_for_name as _asr_fn,
+                                    )
+                                    from paramem.models.loader import load_adapter as _la
+
+                                    _prod_root = _asr_fn(self.output_dir, tier)
+                                    _la(self.model, _prod_root.parent, tier)
+                                    logger.info(
+                                        "_run_fold[main_tiers]: crash-resume (no recorded"
+                                        " checkpoint) loaded %s from production slot %s",
+                                        tier,
+                                        _prod_root.parent,
+                                    )
+                                from paramem.models.loader import switch_adapter as _sw_resume
+
+                                _sw_resume(self.model, tier)
+                                # Crash-resumed weights come from a checkpoint
+                                # this process never probed -- gate before the
+                                # tier joins tiers_rebuilt (recall_state=None
+                                # forces the dedicated probe fallback).
+                                self._assert_tier_recall(tier, job.entries, None)
+                                tiers_rebuilt.append(tier)
+                                continue
+
+                            tier_cfg = (
+                                self.episodic_config
+                                if tier == "episodic"
+                                else (
+                                    self.semantic_config
+                                    if tier == "semantic"
+                                    else (self.procedural_config or self.episodic_config)
+                                )
                             )
-                        tiers_rebuilt.append(tier)
-                        # Mark this tier complete in the fold_resume.json marker so that a
-                        # crash AFTER training but BEFORE _save_adapters can reload it without
-                        # retraining on the next re-entry.  Locate the retained checkpoint-N dir
-                        # (retain_scratch_until_external_commit=True keeps it alive until
-                        # _save_adapters below).
-                        _tier_ckpt_path = self._latest_checkpoint_in_dir(
-                            self.output_dir / "consolidation_refresh" / tier
-                        )
-                        self._mark_tier_complete(tier, _tier_ckpt_path)
 
-                    if trainer is not None:
-                        trainer._set_is_training(False)
+                            if backup_name in self.model.peft_config:
+                                from paramem.models.loader import switch_adapter as _sw_backup
+
+                                _sw_backup(self.model, backup_name)
+
+                            if scope.cold_init:
+                                # RECONCILE only (FoldScope.cold_init) — reproduce
+                                # today's unconditional cold rebuild exactly.
+                                if tier in self.model.peft_config:
+                                    self.model.delete_adapter(tier)
+                                    logger.debug(
+                                        "_run_fold[main_tiers]: deleted adapter %s"
+                                        " (cold_init: RECONCILE)",
+                                        tier,
+                                    )
+                                self.model = create_adapter(self.model, tier_cfg, tier)
+                                logger.debug(
+                                    "_run_fold[main_tiers]: created fresh adapter %s"
+                                    " (cold_init: RECONCILE)",
+                                    tier,
+                                )
+                            else:
+                                # Warm default: keep the resident tier's weights —
+                                # the funnel's staging copy (trainer.py:944-948)
+                                # warm-starts training from them. Recreates cold
+                                # only on first-boot absence or a genuine LoRA
+                                # config mismatch (never as blanket policy).
+                                self.model = ensure_adapter_matching(self.model, tier_cfg, tier)
+
+                            from paramem.models.loader import switch_adapter as _sw
+
+                            _sw(self.model, tier)
+
+                            prior_job = None
+                            recall_state = None
+                            _tier_metrics = None
+                            if trainer is not None:
+                                prior_job = trainer._current_job
+                                trainer._current_job = job
+                                trainer._set_is_training(True)
+                            # --- Per-tier device-saturation telemetry ---
+                            # max_memory_allocated() is a process-wide PyTorch-allocator
+                            # counter, polluted by the per-epoch recall probe's
+                            # model.generate() and by inference served during
+                            # BackgroundTrainer step-yields — NOT an adapter cost.
+                            # Bare snapshots only (never vram_measure: that captures
+                            # endpoint free-deltas, not the intra-training peak this
+                            # needs, and its OOM->VramExhausted transform is beside the
+                            # point here since abort/rollback is gated on
+                            # _tier_metrics.get("aborted"), a normal return value).
+                            _telemetry_tier_free_before: int | None = None
+                            _telemetry_tier_total: int | None = None
+                            _telemetry_tier_n_keys = len(job.entries)
+                            # Derived here (not read off refresh_training_config.num_epochs)
+                            # so the finally-path telemetry below records the TRUE
+                            # budget even when training raises. _train_tier_adapter
+                            # derives the identical value from the same n_keys input --
+                            # budget_for is pure.
+                            _telemetry_tier_epochs, _telemetry_tier_accum, _ = budget_for(
+                                _telemetry_tier_n_keys
+                            )
+                            # Measured BEFORE training starts -- same enclosing-scope
+                            # hoist as the budget derivation above, so the
+                            # finally-path record below carries the true
+                            # pre-training weight state even when training raises.
+                            _telemetry_tier_init = measured_adapter_init_state(self.model, tier)
+                            _telemetry_tier_stale = len(self.store.stale_keys_in_tier(tier))
+                            if torch.cuda.is_available():
+                                torch.cuda.reset_peak_memory_stats()
+                                _telemetry_tier_free_before, _telemetry_tier_total = (
+                                    torch.cuda.mem_get_info()
+                                )
+                            try:
+                                _tier_metrics, recall_state = self._train_tier_adapter(
+                                    job.entries,
+                                    adapter_name=tier,
+                                    adapter_config=tier_cfg,
+                                    training_config=refresh_training_config,
+                                    output_dir=self.output_dir / "consolidation_refresh" / tier,
+                                    run_name=f"consolidate-{tier}",
+                                    phase_name=f"consolidate-{tier}",
+                                    retain_scratch_until_external_commit=True,
+                                )
+                                if _tier_metrics is not None:
+                                    if _tier_metrics.get("aborted"):
+                                        logger.info(
+                                            "_run_fold[main_tiers]: training aborted on tier %s "
+                                            "— restoring all tiers from backups",
+                                            tier,
+                                        )
+                                        raise AbortedDuringConsolidation(
+                                            f"training aborted on tier {tier!r}"
+                                        )
+                                    else:
+                                        logger.info(
+                                            "_run_fold[main_tiers]: trained %s on %d keys",
+                                            tier,
+                                            len(job.entries),
+                                        )
+                            finally:
+                                if trainer is not None:
+                                    trainer._set_is_training(False)
+                                    trainer._current_job = prior_job
+                                # The ENTIRE record build (not just the write below)
+                                # is inside this try/except: constructing the dict
+                                # reads self.model.peft_config and calls
+                                # _recall_bind_telemetry, either of which could raise
+                                # on a sufficiently broken state, and a raise here in
+                                # a bare finally (unguarded) would REPLACE an
+                                # in-flight exception from the try above (e.g.
+                                # AbortedDuringConsolidation) with whatever this
+                                # construction raised -- silently misrouting an abort
+                                # to the crash-incident path via main_tier_backup_scope's
+                                # except. Losing a telemetry record is strictly
+                                # preferable to that.
+                                try:
+                                    # aborted is a NORMAL RETURN VALUE from
+                                    # _train_tier_adapter (the trainer's own
+                                    # thermal-throttle/operator-pause signal) that
+                                    # this branch converts to a raised
+                                    # AbortedDuringConsolidation AFTER the
+                                    # assignment above succeeds -- so _tier_metrics
+                                    # is bound (with aborted=True) on that path, and
+                                    # stays at its pre-declared None only when
+                                    # _train_tier_adapter itself raised before
+                                    # returning.
+                                    _tier_aborted = bool(
+                                        _tier_metrics.get("aborted")
+                                        if _tier_metrics is not None
+                                        else False
+                                    )
+                                    # Budget/bind/init/stale fields do not depend on
+                                    # CUDA introspection -- the record is always
+                                    # written; only the VRAM fields below are
+                                    # conditional on it.
+                                    _telemetry_tier_record: dict = {
+                                        "tier": tier,
+                                        "fold_stamp": _fold_stamp_c,
+                                        "adapter_count": len(self.model.peft_config),
+                                        "interim_count": len(
+                                            [
+                                                a
+                                                for a in self.model.peft_config
+                                                if a.startswith(INTERIM_NAME_PREFIX)
+                                            ]
+                                        ),
+                                        "epochs": _telemetry_tier_epochs,
+                                        "n_keys": _telemetry_tier_n_keys,
+                                        "accum": _telemetry_tier_accum,
+                                        "stale_keys": _telemetry_tier_stale,
+                                        "aborted": _tier_aborted,
+                                    }
+                                    if _telemetry_tier_init is not None:
+                                        _telemetry_tier_record["init"] = _telemetry_tier_init
+                                    # See the interim call site's identical comment:
+                                    # _train_tier_adapter tags its returned metrics
+                                    # dict on an actual donor-seeded copy; the
+                                    # exception path (where _tier_metrics stays None)
+                                    # leaves the pre-training measured value alone.
+                                    if _tier_metrics is not None and _tier_metrics.get(
+                                        "donor_seeded"
+                                    ):
+                                        _telemetry_tier_record["init"] = "donor"
+                                    _tier_epochs_to_bind, _tier_steps_to_bind, _tier_hit_cap = (
+                                        _recall_bind_telemetry(
+                                            recall_state,
+                                            _telemetry_tier_n_keys,
+                                            _telemetry_tier_accum,
+                                        )
+                                    )
+                                    if _tier_epochs_to_bind is not None:
+                                        _telemetry_tier_record["epochs_to_bind"] = (
+                                            _tier_epochs_to_bind
+                                        )
+                                        _telemetry_tier_record["steps_to_bind"] = (
+                                            _tier_steps_to_bind
+                                        )
+                                    # hit_cap is suppressed on the abort path: stop_epoch
+                                    # is None whenever the trainer never reached (or
+                                    # never signalled) recall convergence, and an abort
+                                    # is exactly such a case -- emitting hit_cap=True
+                                    # there would be indistinguishable from a genuine
+                                    # "budget too small" outcome in the bucket re-fit.
+                                    if not _tier_aborted and _tier_hit_cap is not None:
+                                        _telemetry_tier_record["hit_cap"] = _tier_hit_cap
+                                    if (
+                                        torch.cuda.is_available()
+                                        and _telemetry_tier_free_before is not None
+                                    ):
+                                        _telemetry_tier_peak = torch.cuda.max_memory_allocated()
+                                        # peak_reserved is the OOM-relevant quantity: the
+                                        # caching allocator raises when it cannot reserve,
+                                        # not when driver-free (mem_get_info) drops —
+                                        # driver-free counts cached-but-unused allocator
+                                        # segments as used, which peak_reserved does not.
+                                        _telemetry_tier_peak_reserved = (
+                                            torch.cuda.max_memory_reserved()
+                                        )
+                                        _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
+                                        logger.info(
+                                            "_run_fold[main_tiers]: telemetry tier_train[%s] "
+                                            "(device-saturation indicator, not adapter cost) — "
+                                            "free_before=%d free_after=%d peak_alloc=%d "
+                                            "peak_reserved=%d",
+                                            tier,
+                                            _telemetry_tier_free_before,
+                                            _telemetry_tier_free_after,
+                                            _telemetry_tier_peak,
+                                            _telemetry_tier_peak_reserved,
+                                        )
+                                        _telemetry_tier_record.update(
+                                            {
+                                                "free_before": _telemetry_tier_free_before,
+                                                "free_after": _telemetry_tier_free_after,
+                                                "peak_alloc": _telemetry_tier_peak,
+                                                "peak_reserved": _telemetry_tier_peak_reserved,
+                                                "total": _telemetry_tier_total,
+                                            }
+                                        )
+                                    if self._telemetry_dir is not None:
+                                        record_fold_telemetry(
+                                            self._telemetry_dir,
+                                            cycle_stamp=_telemetry_run_stamp_c,
+                                            kind="tier_train",
+                                            record=_telemetry_tier_record,
+                                        )
+                                except Exception:  # noqa: BLE001  # boundary: this
+                                    # finally runs on the abort path too — e.g.
+                                    # AbortedDuringConsolidation is raised in the try
+                                    # above and would reach main_tier_backup_scope's
+                                    # except only if this finally does not itself
+                                    # raise. A failure anywhere in record
+                                    # construction OR the write (disk full,
+                                    # permissions, corrupt store, a broken
+                                    # model/store attribute) must never replace the
+                                    # in-flight exception and misroute an abort to
+                                    # the crash-incident path. Losing a telemetry
+                                    # record is strictly preferable.
+                                    logger.warning(
+                                        "_run_fold[main_tiers]: telemetry write failed for tier %s",
+                                        tier,
+                                        exc_info=True,
+                                    )
+
+                            if recall_state is not None and recall_state.last_per_key is not None:
+                                on_recall_probe(
+                                    recall_state.last_per_key,
+                                    phase="train_fill",
+                                    adapter_name=tier,
+                                )
+                            # ONE main-tier training-completeness verdict, run on
+                            # the FINAL trained weights before this tier is
+                            # allowed to join tiers_rebuilt.  Raises
+                            # RecallGateRejected when any key of this tier's own
+                            # full key set fell short -- caught by the
+                            # try/except wrapping the backup scope below, which
+                            # discards this fold's in-flight work before
+                            # re-raising (the scope's own except BaseException
+                            # arm has already restored every snapshotted tier's
+                            # pre-fold weights by the time that handler runs).
+                            self._assert_tier_recall(tier, job.entries, recall_state)
+                            tiers_rebuilt.append(tier)
+                            # Mark this tier complete in the fold_resume.json marker so that a
+                            # crash AFTER training but BEFORE _save_adapters can reload it without
+                            # retraining on the next re-entry.  Locate the retained checkpoint-N dir
+                            # (retain_scratch_until_external_commit=True keeps it alive until
+                            # _save_adapters below).
+                            _tier_ckpt_path = self._latest_checkpoint_in_dir(
+                                self.output_dir / "consolidation_refresh" / tier
+                            )
+                            self._mark_tier_complete(tier, _tier_ckpt_path)
+
+                        if trainer is not None:
+                            trainer._set_is_training(False)
+                except RecallGateRejected:
+                    self._discard_fold_work(
+                        soft_stale_by_tier,
+                        relocated_keys=_relocated_keys_this_fold,
+                        minted_keys=_minted_keys_this_fold,
+                    )
+                    raise
 
             # --- Atomic finalize ---
             # Interim disposal follows from the key source, not from a flag of
@@ -5136,55 +5423,16 @@ class ConsolidationLoop:
             _absorbed_interims = scope.keys_from == "all_tiers"
 
             if self.store.replay_enabled:
-                # Recall gating is a weight verdict.  The disk venue has no
-                # weights to verify against, so it passes None for the whole
-                # dict — the documented "skip recall gating" signal, distinct
-                # from a per-tier None (which triggers the weight probe).
-                passing_sets_by_tier: "dict[str, set[str] | None] | None" = None
-                if scope.source == "weights":
-                    passing_sets_by_tier = {}
-                    for _tier in ("episodic", "semantic", "procedural"):
-                        _lpk = last_per_key_by_tier.get(_tier)
-                        if _lpk is not None:
-                            _serve_keys = {e["key"] for e in tier_keyed[_tier]}
-                            passing_sets_by_tier[_tier] = {
-                                r["key"] for r in _lpk if r["exact_match"]
-                            } & _serve_keys
-                        else:
-                            passing_sets_by_tier[_tier] = None
-
-                # Resolve the exact per-tier candidate key set the reset call
-                # below is about to admit — the identical admission rule
-                # _reset_main_tier_registries_and_simhashes applies internally
-                # (pass every key through for a None whole-dict venue, filter
-                # by a concrete per-tier passing set, or probe-resolve a
-                # per-tier None verdict) — computed here so the integrity
-                # gate can run BEFORE that call mutates any in-RAM registry.
-                # A tier whose verdict resolves to a concrete set here is
-                # written back into passing_sets_by_tier so the reset call
-                # below does not re-run the probe.
-                candidate_keyed_by_tier: dict[str, list[dict]] = {}
-                for _tier in ("episodic", "semantic", "procedural"):
-                    _cand_keyed = tier_keyed.get(_tier, [])
-                    if not _cand_keyed:
-                        candidate_keyed_by_tier[_tier] = []
-                        continue
-                    if passing_sets_by_tier is None:
-                        candidate_keyed_by_tier[_tier] = _cand_keyed
-                        continue
-                    _cand_passing = passing_sets_by_tier.get(_tier)
-                    if _cand_passing is None:
-                        _cand_passing = self._probe_passing_keys(_tier, _cand_keyed)
-                        passing_sets_by_tier[_tier] = _cand_passing
-                    candidate_keyed_by_tier[_tier] = [
-                        kp for kp in _cand_keyed if kp["key"] in _cand_passing
-                    ]
-
-                self._assert_registry_bookkeeping_parity(candidate_keyed_by_tier)
+                # Every tier that reached here already passed its own
+                # _assert_tier_recall verdict (100% recall over its FULL key
+                # set) before joining tiers_rebuilt -- a tier that fell short
+                # aborted the fold before this point.  So every key the fold
+                # assembled is registered; there is no per-key filtering left
+                # to resolve here.
+                self._assert_registry_bookkeeping_parity(tier_keyed)
 
                 self._reset_main_tier_registries_and_simhashes(
                     tier_keyed,
-                    passing_sets_by_tier,
                     soft_stale_by_tier=soft_stale_by_tier,
                 )
                 # Bookkeeping durable BEFORE the registry rewrite below: the
@@ -5221,16 +5469,7 @@ class ConsolidationLoop:
                 # the persist succeeds.  On persist FAILURE (the except
                 # above re-raises) the marker is intentionally LEFT so a retry can
                 # resume completed tiers without retraining.
-                self._clear_fold_resume()
-                import shutil as _sh_fold
-
-                _refresh_root = self.output_dir / "consolidation_refresh"
-                if _refresh_root.exists():
-                    _sh_fold.rmtree(_refresh_root, ignore_errors=True)
-                    logger.debug(
-                        "_run_fold[main_tiers]: cleaned consolidation_refresh scratch"
-                        " after _save_adapters"
-                    )
+                self._clear_fold_resume_and_scratch(reason="after _save_adapters")
 
             if self.store.replay_enabled and soft_stale_by_tier:
                 for _st_tier in ("episodic", "semantic", "procedural"):
@@ -7220,6 +7459,7 @@ class ConsolidationLoop:
                 f"(slot: {slot_path}). "
                 "The on-disk artifact may be corrupt. "
                 "Sessions will remain pending for retry on the next cycle.",
+                adapter_name=adapter_name,
                 recall_rate=recall_rate,
                 threshold=threshold,
             )

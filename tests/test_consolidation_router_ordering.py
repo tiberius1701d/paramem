@@ -247,8 +247,8 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     # consolidate calls GraphTierRefiner.run_enrichment() via _refine_consolidation_graph
     # when scope.enrich is True.  The config default (refinement_enrichment="off",
     # cloud master switch off) yields enrich=False — no enrichment runs in these ordering tests.
-    # Admit-all probe stub for the registration fail-safe: when no recall verdict is
-    # available, _reset_main_tier_registries_and_simhashes runs _probe_passing_keys,
+    # Admit-all probe stub for the training-completeness gate: when no recall
+    # verdict is available, _assert_tier_recall runs _probe_passing_keys,
     # whose real evaluate_indexed_recall feeds the MagicMock model into re.sub and
     # TypeErrors.  Admitting every key matches the prior no-gate behavior, so it is
     # inert for these ordering/registry tests.
