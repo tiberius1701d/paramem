@@ -1075,7 +1075,7 @@ class TestKeylessTierSweep:
             '{"active_keys": ["k1"], "fidelity_history": {}, "stale": {}, "simhash": {}}'
         )
 
-        reaped = _sweep_keyless_tier_artifacts(config)
+        reaped = _sweep_keyless_tier_artifacts(config, {})
 
         assert reaped == ["episodic"]
         assert not (episodic_dir / "indexed_key_registry.json").exists()
@@ -1111,7 +1111,7 @@ class TestKeylessTierSweep:
         )
 
         caplog.set_level(logging.ERROR, logger="paramem.server.app")
-        reaped = _sweep_keyless_tier_artifacts(config)
+        reaped = _sweep_keyless_tier_artifacts(config, {})
 
         assert reaped == []
         assert semantic_dir.exists()
@@ -1149,7 +1149,7 @@ class TestKeylessTierSweep:
         )
 
         caplog.set_level(logging.ERROR, logger="paramem.server.app")
-        reaped = _sweep_keyless_tier_artifacts(config)
+        reaped = _sweep_keyless_tier_artifacts(config, {})
 
         assert reaped == []
         assert interim_dir.exists(), "unfolded facts must not be deleted"
@@ -1161,7 +1161,13 @@ class TestKeylessTierSweep:
 
     def test_unreadable_registry_is_preserved_and_logged(self, tmp_path: Path, caplog) -> None:
         """A registry that raises on load (corrupt file, failed decrypt) is
-        never inferred to hold zero keys — it is preserved and logged."""
+        never inferred to hold zero keys — it is preserved and logged.
+
+        The read now happens inside ``verify_tier_binding``
+        (``paramem/adapters/registry_binding.py``), not directly in the
+        sweep — but that function reads via the same ``KeyRegistry.load``
+        class method, so patching it here still exercises the sweep's
+        ``binding.registry is None`` branch."""
         import logging
 
         from paramem.server.app import _sweep_keyless_tier_artifacts
@@ -1177,7 +1183,7 @@ class TestKeylessTierSweep:
             "paramem.training.key_registry.KeyRegistry.load",
             side_effect=RuntimeError("decrypt failed"),
         ):
-            reaped = _sweep_keyless_tier_artifacts(config)
+            reaped = _sweep_keyless_tier_artifacts(config, {})
 
         assert reaped == []
         assert reg_path.exists(), "an unreadable registry must never be swept"
@@ -1189,36 +1195,84 @@ class TestKeylessTierSweep:
     def test_foreign_shaped_registry_with_real_weights_is_preserved_and_errors(
         self, tmp_path: Path, caplog
     ) -> None:
-        """A parseable-but-foreign registry payload (e.g. ``{}``) must never
-        be inferred to hold zero keys just because ``KeyRegistry.load`` is
-        tolerant by contract and shrugs it into an empty registry.
-        ``KeyRegistry.load_simhashes`` refuses anything that is not
-        affirmatively KeyRegistry-shaped, so a foreign shape is preserved
-        and logged rather than reaped — even with real trained weights
-        sitting right next to it, which the sweep must never delete."""
+        """A genuinely undecryptable registry (age-encrypted to a key never
+        loaded as the daily identity) must never be inferred to hold zero
+        keys — ``verify_tier_binding`` resolves this to
+        ``REGISTRY_UNREADABLE`` (``binding.registry is None``), so it is
+        preserved and logged rather than reaped, even with real trained
+        weights sitting right next to it (a COMPLETE slot, so boot
+        housekeeping's ``cleanup_partial_slots`` pass does not remove it
+        either), which the sweep must never delete."""
         import logging
 
+        from paramem.backup.encryption import age_encrypt_bytes
+        from paramem.backup.key_store import mint_daily_identity
         from paramem.server.app import _sweep_keyless_tier_artifacts
 
         config = _make_config(tmp_path)
         episodic_dir = config.adapter_dir / "episodic"
         episodic_dir.mkdir(parents=True)
-        slot = episodic_dir / "20260421-000000"
-        slot.mkdir()
-        (slot / "adapter_config.json").write_text("{}")
-        (slot / "adapter_model.safetensors").write_bytes(b"weights")
+        slot = _write_slot(episodic_dir, registry_sha256="", key_count=0)
+
+        # Undecryptable: encrypted to a public key whose private half was
+        # never loaded as the process's daily identity.
+        encrypter = mint_daily_identity()
+        corrupt_bytes = age_encrypt_bytes(b'{"active_keys": []}', [encrypter.to_public()])
         reg_path = episodic_dir / "indexed_key_registry.json"
-        reg_path.write_text("{}")
+        reg_path.write_bytes(corrupt_bytes)
 
         caplog.set_level(logging.ERROR, logger="paramem.server.app")
-        reaped = _sweep_keyless_tier_artifacts(config)
+        reaped = _sweep_keyless_tier_artifacts(config, {})
 
         assert reaped == []
-        assert reg_path.exists(), "a foreign-shaped registry must never be swept"
+        assert reg_path.read_bytes() == corrupt_bytes, "an unreadable registry must never be swept"
         assert (slot / "adapter_model.safetensors").exists(), "trained weights must survive"
         error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("episodic" in msg and "KeyRegistry-shaped" in msg for msg in error_messages), (
-            f"Expected a not-affirmatively-KeyRegistry-shaped ERROR, got: {error_messages}"
+        assert any("episodic" in msg and "unreadable" in msg for msg in error_messages), (
+            f"Expected an unreadable-registry ERROR, got: {error_messages}"
+        )
+
+    def test_unreadable_registry_marker_does_not_authorise_reap(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Same undecryptable-registry shape as above, but the erase-in-flight
+        marker names the tier — an unreadable registry is NEVER
+        marker-authorised (``binding.registry is None`` short-circuits before
+        the marker is ever consulted). Still preserved and logged; the marker
+        is still cleared unconditionally after the sweep."""
+        import logging
+
+        from paramem.backup.encryption import age_encrypt_bytes
+        from paramem.backup.key_store import mint_daily_identity
+        from paramem.memory.persistence import read_erase_marker, write_erase_marker
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        slot = _write_slot(episodic_dir, registry_sha256="", key_count=0)
+
+        encrypter = mint_daily_identity()
+        corrupt_bytes = age_encrypt_bytes(b'{"active_keys": []}', [encrypter.to_public()])
+        reg_path = episodic_dir / "indexed_key_registry.json"
+        reg_path.write_bytes(corrupt_bytes)
+
+        write_erase_marker(config.adapter_dir, ["episodic"])
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert reg_path.read_bytes() == corrupt_bytes, (
+            "an unreadable registry must never be swept, marker or not"
+        )
+        assert (slot / "adapter_model.safetensors").exists(), "trained weights must survive"
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("episodic" in msg and "unreadable" in msg for msg in error_messages), (
+            f"Expected an unreadable-registry ERROR, got: {error_messages}"
+        )
+        assert read_erase_marker(config.adapter_dir) == [], (
+            "the marker must be cleared even though it authorised nothing"
         )
 
     def test_absent_registry_tier_is_untouched(self, tmp_path: Path) -> None:
@@ -1231,19 +1285,113 @@ class TestKeylessTierSweep:
         procedural_dir.mkdir(parents=True)
         (procedural_dir / "some_other_file.txt").write_text("noop")
 
-        reaped = _sweep_keyless_tier_artifacts(config)
+        reaped = _sweep_keyless_tier_artifacts(config, {})
 
         assert reaped == []
         assert procedural_dir.exists()
         assert (procedural_dir / "some_other_file.txt").exists()
 
+    def test_absent_registry_with_nonmatching_candidate_is_preserved_and_errors(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """No registry file at all, but a real candidate slot whose stamped
+        hash does not match the (empty-hash) fresh-install convention —
+        REGISTRY_ABSENT_WITH_SLOTS, the torn commit_tier_slot shape.
+        Preserved and logged as an ERROR unconditionally; no marker is
+        involved."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        slot = _write_slot(episodic_dir, registry_sha256="some_real_looking_hash", key_count=3)
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert slot.exists(), "a torn commit_tier_slot shape must never be swept"
+        assert not (episodic_dir / "indexed_key_registry.json").exists()
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "episodic" in msg and "torn commit_tier_slot" in msg for msg in error_messages
+        ), f"Expected a torn commit_tier_slot ERROR, got: {error_messages}"
+
+    def test_absent_registry_with_nonmatching_candidate_marker_does_not_authorise_reap(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Same REGISTRY_ABSENT_WITH_SLOTS (torn commit_tier_slot) shape as
+        above, but the erase-in-flight marker names the tier — this shape is
+        NEVER marker-authorised (a torn commit is not an interrupted erase;
+        see the sweep's docstring). Still preserved and logged; the marker
+        is still cleared unconditionally after the sweep."""
+        import logging
+
+        from paramem.memory.persistence import read_erase_marker, write_erase_marker
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        slot = _write_slot(episodic_dir, registry_sha256="some_real_looking_hash", key_count=3)
+
+        write_erase_marker(config.adapter_dir, ["episodic"])
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert slot.exists(), "a torn commit_tier_slot shape must never be swept, marker or not"
+        assert not (episodic_dir / "indexed_key_registry.json").exists()
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            "episodic" in msg and "torn commit_tier_slot" in msg for msg in error_messages
+        ), f"Expected a torn commit_tier_slot ERROR, got: {error_messages}"
+        assert read_erase_marker(config.adapter_dir) == [], (
+            "the marker must be cleared even though it authorised nothing"
+        )
+
+    def test_absent_registry_with_zero_stamped_candidate_is_silent_skip(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """No registry file at all, and a ``""``-stamped candidate slot
+        whose manifest stamps ``key_count=0`` — VERIFIED (the fresh-install
+        convention matches, and the manifest independently agrees the tier
+        is empty). Skipped silently: no reap, no log."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        slot = _write_slot(episodic_dir, registry_sha256="", key_count=0)
+
+        caplog.set_level(logging.DEBUG, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert slot.exists()
+        assert not any("episodic" in r.getMessage() for r in caplog.records), (
+            "a verified-empty absent-registry shape must produce no sweep log at all"
+        )
+
     def test_reaped_payload_bearing_tier_produces_no_manifest_row(self, tmp_path: Path) -> None:
-        """Behavioural reclassification: a tier that carries real adapter
-        weights but whose registry has already dropped to zero known keys
-        is reaped, not surfaced — the old post-mount check never even read
-        the registry for a payload-bearing dir, so this shape used to be
-        left mounted-but-orphaned. After the sweep reaps it pre-mount, the
-        boot validator sees a fresh install and emits no row."""
+        """Behavioural reclassification (binding-aware, 2026-08): a tier
+        that carries real adapter weights under a STALE (non-matching)
+        hash, whose registry has already dropped to zero known keys, is no
+        longer reaped purely on the registry's own empty read — the
+        NO_MATCHING_SLOT verdict cannot tell a genuinely stale slot from a
+        transiently corrupt one (see
+        ``TestCorruptManifest.test_corrupt_meta_json_without_patch_gives_no_matching_slot``,
+        which pins the corrupt-manifest sibling of this exact shape staying
+        VISIBLE), so it requires the erase-in-flight marker like every
+        other unverified empty-registry shape. Without a marker it is
+        preserved and surfaces via the mount validator's own
+        ``no_matching_slot`` row; with one it is reaped pre-mount and the
+        boot validator sees a fresh install (no row)."""
         config = _make_config(tmp_path)
         episodic_dir = config.adapter_dir / "episodic"
         episodic_dir.mkdir(parents=True)
@@ -1254,8 +1402,19 @@ class TestKeylessTierSweep:
 
         _, state = _run(config)
 
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None and row["status"] == "no_matching_slot"
+        assert episodic_dir.exists(), "no marker — the stale slot must be preserved, not reaped"
+
+        # With the erase-in-flight marker naming episodic, the same shape
+        # reaps pre-mount and the boot validator sees a fresh install.
+        from paramem.memory.persistence import write_erase_marker
+
+        write_erase_marker(config.adapter_dir, ["episodic"])
+        _, state = _run(config)
+
         assert "episodic" not in state["adapter_manifest_status"]
-        assert not episodic_dir.exists(), "the emptied tier is fully reaped, not just unmounted"
+        assert not episodic_dir.exists(), "marker-authorised — the emptied tier is fully reaped"
 
     def test_sweep_runs_before_any_slot_is_resolved(self, tmp_path: Path) -> None:
         """The keyless-tier sweep runs before find_live_slot resolves any
@@ -1272,9 +1431,9 @@ class TestKeylessTierSweep:
         call_order: list[str] = []
         real_sweep = app_module._sweep_keyless_tier_artifacts
 
-        def _tracked_sweep(cfg):
+        def _tracked_sweep(cfg, state):
             call_order.append("sweep")
-            return real_sweep(cfg)
+            return real_sweep(cfg, state)
 
         def _tracked_find_live_slot(*args, **kwargs):
             call_order.append("find_live_slot")
@@ -1300,7 +1459,15 @@ class TestKeylessTierSweep:
         call to after the scan loop (but still inside the sweep, still
         before find_live_slot) would pass an order check pinned only against
         find_live_slot, so this test tracks the scan's own KeyRegistry.load
-        call directly."""
+        call directly.
+
+        The scan now calls ``KeyRegistry.load`` once per main tier root via
+        ``verify_tier_binding`` (unconditionally — including tiers whose
+        registry file does not exist, unlike the old sweep's own
+        ``reg_path.exists()`` short-circuit) rather than once only for a
+        tier that actually has a registry file, so more than one "scan"
+        entry is expected; the load-bearing invariant under test is that
+        every one of them follows "resume", never precedes it."""
         from paramem.memory import persistence as persistence_module
         from paramem.server.app import _sweep_keyless_tier_artifacts
         from paramem.training.key_registry import KeyRegistry
@@ -1331,11 +1498,16 @@ class TestKeylessTierSweep:
                 side_effect=_tracked_load,
             ),
         ):
-            _sweep_keyless_tier_artifacts(config)
+            _sweep_keyless_tier_artifacts(config, {})
 
-        assert call_order == ["resume", "scan"], (
+        assert call_order[0] == "resume", (
             f"resume_pending_reaps must run before the keyless registry scan, got {call_order}"
         )
+        assert call_order.count("resume") == 1
+        assert all(entry == "scan" for entry in call_order[1:]), (
+            f"every scan must follow resume, got {call_order}"
+        )
+        assert len(call_order) > 1, "expected at least one registry scan"
 
     def test_pending_delete_leftover_is_resumed_at_boot(self, tmp_path: Path) -> None:
         """A ``.pending-delete/`` leftover from a prior crash (a
@@ -1352,6 +1524,304 @@ class TestKeylessTierSweep:
         _run(config)
 
         assert not (config.adapter_dir / _PENDING_DELETE_DIR_NAME).exists()
+
+
+class TestKeylessTierSweepBindingAwareGuard:
+    """The rewrite's cross-artifact guard: a registry that reads zero known
+    keys is no longer reaped purely on its own say-so when a matched slot's
+    manifest independently disagrees — only the erase-in-flight marker can
+    authorise treating that disagreement as an interrupted hard erase rather
+    than corruption."""
+
+    def test_matching_slot_key_count_mismatch_preserved_without_marker(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A slot whose registry_sha256 MATCHES the (empty) registry but
+        whose manifest stamps key_count=5 is the cross-artifact guard this
+        rewrite adds — the pre-rewrite sweep reaped this shape purely from
+        the registry's own empty read, never looking at the slot's
+        manifest. No marker → preserved, logged as an ERROR naming the
+        restore door."""
+        import logging
+
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+        from paramem.training.key_registry import KeyRegistry
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        KeyRegistry().save(episodic_dir / "indexed_key_registry.json")
+        live_hash = tier_registry_sha256(episodic_dir)
+        _write_slot(episodic_dir, registry_sha256=live_hash, key_count=5)
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert (episodic_dir / "indexed_key_registry.json").exists()
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        matching = [m for m in error_messages if "episodic" in m]
+        assert matching, f"Expected a preserve ERROR for episodic, got: {error_messages}"
+        assert any("/backup/restore" in m for m in matching), (
+            f"Expected the restore door named, got: {matching}"
+        )
+        assert not any("/reconsolidate" in m for m in matching), (
+            f"/reconsolidate must never be offered — it cannot rebuild an "
+            f"unverified registry binding, got: {matching}"
+        )
+
+    def test_matching_slot_key_count_mismatch_reaped_with_marker(self, tmp_path: Path) -> None:
+        """Same shape as above, but an erase-in-flight marker names
+        episodic — the interrupted-hard-erase self-heal reaps it, and the
+        marker is cleared afterward (one boot's authorisation, spent)."""
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.memory.persistence import read_erase_marker, write_erase_marker
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+        from paramem.training.key_registry import KeyRegistry
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        KeyRegistry().save(episodic_dir / "indexed_key_registry.json")
+        live_hash = tier_registry_sha256(episodic_dir)
+        _write_slot(episodic_dir, registry_sha256=live_hash, key_count=5)
+
+        write_erase_marker(config.adapter_dir, ["episodic"])
+
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == ["episodic"]
+        assert not episodic_dir.exists()
+        assert read_erase_marker(config.adapter_dir) == [], (
+            "the marker must be cleared after the sweep completes"
+        )
+
+    def test_marker_naming_tier_with_active_keys_authorises_nothing(self, tmp_path: Path) -> None:
+        """A marker naming a tier that still reads a nonzero known-key
+        count authorises nothing — every reap row requires
+        ``list_known()`` empty regardless of the marker. The marker is
+        still cleared unconditionally (one boot, spent either way)."""
+        from paramem.memory.persistence import read_erase_marker, write_erase_marker
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        (episodic_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        _write_slot(episodic_dir, registry_sha256="stale_hash_does_not_match", key_count=1)
+
+        write_erase_marker(config.adapter_dir, ["episodic"])
+
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert (episodic_dir / "indexed_key_registry.json").exists()
+        assert read_erase_marker(config.adapter_dir) == [], (
+            "the marker must be cleared even though it authorised nothing"
+        )
+
+    def test_matching_slot_key_count_zero_reaped_without_marker(self, tmp_path: Path) -> None:
+        """A MATCHING slot whose manifest independently stamps
+        key_count=0 agrees with the registry's own empty read — reaped
+        unconditionally, no marker needed."""
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+        from paramem.training.key_registry import KeyRegistry
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        KeyRegistry().save(episodic_dir / "indexed_key_registry.json")
+        live_hash = tier_registry_sha256(episodic_dir)
+        _write_slot(episodic_dir, registry_sha256=live_hash, key_count=0)
+
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == ["episodic"]
+        assert not episodic_dir.exists()
+
+    def test_absent_registry_zero_hash_key_count_mismatch_preserved_without_marker(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """No registry file, a ``""``-stamped (fresh-install-hash-matching)
+        slot whose manifest carries key_count=5 — KEY_COUNT_MISMATCH.
+        Preserved and logged without a marker."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        _write_slot(episodic_dir, registry_sha256="", key_count=5)
+
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert (episodic_dir / "20260421-000000").exists()
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("episodic" in m for m in error_messages), (
+            f"Expected a preserve ERROR for episodic, got: {error_messages}"
+        )
+
+    def test_absent_registry_zero_hash_key_count_mismatch_reaped_with_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """Same shape as above, with the marker naming episodic — reaped,
+        marker cleared."""
+        from paramem.memory.persistence import read_erase_marker, write_erase_marker
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        _write_slot(episodic_dir, registry_sha256="", key_count=5)
+
+        write_erase_marker(config.adapter_dir, ["episodic"])
+
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == ["episodic"]
+        assert not episodic_dir.exists()
+        assert read_erase_marker(config.adapter_dir) == []
+
+    def test_keyed_tier_no_matching_slot_sweep_is_quiet(self, tmp_path: Path, caplog) -> None:
+        """A tier with real known keys whose live weight-bearing slot's
+        hash does not match the current registry is preserved — and the
+        SWEEP ITSELF logs nothing about it at any level. Whether/why it
+        mounts is the mount stage's report to make; one reporter per
+        condition."""
+        import logging
+
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        (episodic_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        _write_slot(episodic_dir, registry_sha256="stale_hash_does_not_match", key_count=1)
+
+        caplog.set_level(logging.DEBUG, logger="paramem.server.app")
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == []
+        assert (episodic_dir / "indexed_key_registry.json").exists()
+        assert not any("episodic" in r.getMessage() for r in caplog.records), (
+            "the sweep must log nothing for a keyed tier awaiting a matching slot"
+        )
+
+    def test_unreadable_marker_errors_and_self_heals(self, tmp_path: Path, caplog) -> None:
+        """A malformed erase-in-flight marker file logs an ERROR (from
+        ``read_erase_marker``) and authorises nothing — a same-shape tier
+        without a valid marker stays preserved — and the marker file itself
+        is GONE after the sweep (the unconditional post-loop clear
+        self-heals a marker that can never be read again)."""
+        import logging
+
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.server.app import _sweep_keyless_tier_artifacts
+        from paramem.training.key_registry import KeyRegistry
+
+        config = _make_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        KeyRegistry().save(episodic_dir / "indexed_key_registry.json")
+        live_hash = tier_registry_sha256(episodic_dir)
+        _write_slot(episodic_dir, registry_sha256=live_hash, key_count=5)
+
+        marker_path = config.adapter_dir / "erase_in_flight.json"
+        marker_path.write_text("{not valid json")
+
+        caplog.set_level(logging.ERROR)
+        reaped = _sweep_keyless_tier_artifacts(config, {})
+
+        assert reaped == [], "an unreadable marker must authorise nothing"
+        assert (episodic_dir / "indexed_key_registry.json").exists()
+        assert not marker_path.exists(), (
+            "the marker must be cleared unconditionally, even when unreadable"
+        )
+        error_messages = [r.getMessage() for r in caplog.records]
+        assert any("read_erase_marker" in msg for msg in error_messages), (
+            f"Expected an ERROR from read_erase_marker, got: {error_messages}"
+        )
+
+    def test_cleanup_partial_slots_runs_before_any_binding_is_computed(
+        self, tmp_path: Path
+    ) -> None:
+        """A slot missing ``adapter_model.safetensors`` (boot housekeeping's
+        ``cleanup_partial_slots``, moved pre-mount) is deleted before any
+        tier's ``verify_tier_binding`` is computed — the mount stage and a
+        later binding computation cannot then disagree about the same
+        on-disk tree. Mirrors ``test_sweep_runs_before_any_slot_is_resolved``'s
+        call-order style."""
+        from paramem.adapters.registry_binding import verify_tier_binding as real_verify
+        from paramem.backup import integrity as integrity_module
+
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir(parents=True)
+        # An incomplete slot: meta.json + adapter_config.json but no weights.
+        partial_slot = kind_dir / "20260421-000000"
+        partial_slot.mkdir()
+        (partial_slot / "adapter_config.json").write_text("{}")
+        (partial_slot / "meta.json").write_text("{}")
+
+        call_order: list[str] = []
+        real_cleanup = integrity_module.cleanup_partial_slots
+
+        def _tracked_cleanup(adapter_dir):
+            call_order.append("cleanup")
+            return real_cleanup(adapter_dir)
+
+        def _tracked_verify(*args, **kwargs):
+            call_order.append("verify")
+            return real_verify(*args, **kwargs)
+
+        with (
+            patch.object(integrity_module, "cleanup_partial_slots", side_effect=_tracked_cleanup),
+            patch(
+                "paramem.adapters.registry_binding.verify_tier_binding",
+                side_effect=_tracked_verify,
+            ),
+        ):
+            _run(config)
+
+        assert call_order, "expected both cleanup_partial_slots and verify_tier_binding to run"
+        assert call_order[0] == "cleanup", (
+            "cleanup_partial_slots must run before any tier's binding is computed"
+        )
+        assert "verify" in call_order
+        assert not partial_slot.exists(), (
+            "the incomplete slot must be deleted by cleanup_partial_slots"
+        )
+
+    def test_cleanup_partial_slots_removal_recorded_on_state_integrity_cleanup(
+        self, tmp_path: Path
+    ) -> None:
+        """The real production path (``_mount_adapters_from_slots``, driven
+        through ``_run``) feeds ``cleanup_partial_slots``'s removal onto
+        ``state["integrity_cleanup"]`` — the field the attention populator
+        (``_collect_integrity_cleanup_items``) reads. ``state`` is now a
+        required parameter specifically so this bookkeeping is never
+        silently dropped."""
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir(parents=True)
+        # An incomplete slot: meta.json + adapter_config.json but no weights.
+        partial_slot = kind_dir / "20260421-000000"
+        partial_slot.mkdir()
+        (partial_slot / "adapter_config.json").write_text("{}")
+        (partial_slot / "meta.json").write_text("{}")
+
+        _, state = _run(config)
+
+        assert not partial_slot.exists()
+        removed = state.get("integrity_cleanup")
+        assert removed, f"expected integrity_cleanup to record the removal, got: {removed}"
+        assert removed[0]["tier"] == "episodic"
+        assert removed[0]["slot_name"] == "20260421-000000"
 
 
 # ---------------------------------------------------------------------------

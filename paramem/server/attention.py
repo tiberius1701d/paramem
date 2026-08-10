@@ -455,8 +455,9 @@ def _collect_boot_degraded_items(state: dict) -> list[AttentionItem]:
 def _collect_integrity_cleanup_items(state: dict) -> list[AttentionItem]:
     """Emit one item when boot-time cleanup removed partial training slots.
 
-    Populated by the boot integrity pass in ``_initialize_memory_store``
-    (``app.py``) via :func:`paramem.backup.integrity.cleanup_partial_slots`.
+    Populated pre-mount by ``_sweep_keyless_tier_artifacts``, called from
+    ``_mount_adapters_from_slots`` (``app.py``), via
+    :func:`paramem.backup.integrity.cleanup_partial_slots`.
     Each removed slot directory was missing one of the canonical three slot
     files (``meta.json``, ``adapter_config.json``,
     ``adapter_model.safetensors``) — scratch from an interrupted training

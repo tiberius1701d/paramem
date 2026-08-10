@@ -1439,115 +1439,218 @@ def _dispatch_finalize(finalize: Callable[[], None]) -> None:
         finalize()
 
 
-def _sweep_keyless_tier_artifacts(config) -> list[str]:
-    """Reap every tier whose on-disk registry legitimately tracks zero keys.
+def _sweep_keyless_tier_artifacts(config, state: dict) -> list[str]:
+    """Reap every tier whose registry↔slot binding legitimately reads as empty.
 
-    First action: :func:`~paramem.memory.persistence.resume_pending_reaps`
-    finishes any tier-artifact deletion a prior :func:`reap_tier_artifacts`
-    call left stranded under ``.pending-delete/`` (crash between the
-    rename-condemn and the actual delete). This must run before the keyless
-    scan below — a stranded tombstone is already out of the live namespace,
-    so the scan below cannot see or reap it; only the tombstone-specific
-    resume can finish it.
+    Pre-mount housekeeping, in order:
+
+    1. :func:`~paramem.memory.persistence.resume_pending_reaps` finishes any
+       tier-artifact deletion a prior :func:`reap_tier_artifacts` call left
+       stranded under ``.pending-delete/`` (crash between the rename-condemn
+       and the actual delete). A stranded tombstone is already out of the
+       live namespace, so nothing below can see or reap it; only the
+       tombstone-specific resume can finish it.
+    2. :func:`~paramem.backup.integrity.cleanup_partial_slots` deletes any
+       ``<adapter_dir>/<tier>/<slot>/`` scratch directory missing one of the
+       three canonical slot files (interrupted training write). This runs
+       BEFORE any tier's binding is verified below, and before mount
+       validation / store publish / the integrity report run later in the
+       same boot (all reached only after this function returns) — a torn
+       scratch dir left in place could otherwise be counted as a candidate
+       slot (:func:`~paramem.adapters.manifest.count_slot_candidates` only
+       requires a readable ``meta.json``, not a complete slot) and produce a
+       verdict that disagrees with what a later, post-cleanup pass would
+       compute for the same tier. Any removal is recorded on
+       ``state["integrity_cleanup"]`` for the attention populator — *state*
+       is required (not optional) precisely so this bookkeeping is never
+       silently skipped; direct-call tests pass an explicit ``{}`` when the
+       recorded value is not under test.
+    3. The keyless-tier scan below: every main + interim tier root
+       (:func:`~paramem.memory.interim_adapter.iter_tier_roots`) is
+       evaluated via :func:`~paramem.adapters.registry_binding.verify_tier_binding`
+       — the single shape/read oracle for this stage (no separate
+       ``KeyRegistry.load``/``load_simhashes`` call here; a raise inside
+       ``verify_tier_binding`` itself already resolves to
+       :data:`~paramem.adapters.registry_binding.REGISTRY_UNREADABLE`).
 
     Runs pre-mount, at the top of :func:`_mount_adapters_from_slots` — before
     any slot is resolved for any tier, before ``find_live_slot`` is called,
     and before :func:`~paramem.adapters.registry_binding.verify_tier_binding`
-    reads any tier's registry. Nothing this sweep removes is ever mounted,
-    and it never unmounts a live adapter — at this point in boot nothing has
-    been mounted yet. The memory
-    store is hydrated later still (the lifespan calls
-    ``_build_config_derived_state`` only after ``_load_model_into_state``
-    returns), so no RAM-resident tier can ever outlive the files this sweep
-    removed. The same call also runs on every live reload —
-    :func:`_live_reload_base_model` reaches this function through its own
-    call to :func:`_load_model_into_state` — but never on a cloud-only boot,
-    because ``_load_model_into_state`` is only invoked when a local model is
-    about to be loaded; a cloud-only server serves nothing from any tier and
-    never reaches this code.
+    reads any tier's registry a second time for mounting. Nothing this sweep
+    removes is ever mounted, and it never unmounts a live adapter — at this
+    point in boot nothing has been mounted yet. The memory store is hydrated
+    later still (the lifespan calls ``_build_config_derived_state`` only
+    after ``_load_model_into_state`` returns), so no RAM-resident tier can
+    ever outlive the files this sweep removed. The same call also runs on
+    every live reload — :func:`_live_reload_base_model` reaches this
+    function through its own call to :func:`_load_model_into_state` — but
+    never on a cloud-only boot, because ``_load_model_into_state`` is only
+    invoked when a local model is about to be loaded; a cloud-only server
+    serves nothing from any tier and never reaches this code. (A cloud-only
+    boot still runs ``_build_store_contents``'s own ``verify_adapter_tree``
+    call for the memory store — unconditionally, regardless of mode — so
+    that pass sees whatever partial-slot state is already on disk; the next
+    boot or reload that acquires a local model runs this sweep, including
+    :func:`~paramem.backup.integrity.cleanup_partial_slots`, before any
+    binding is computed and self-heals it then.)
 
-    This is the self-heal for a crash between a hard key erase and the
-    on-disk reap that follows it (``POST /speaker/forget`` persists the
-    emptied registry to disk before it unmounts and deletes the tier's
-    artifacts — see that handler's docstring for the ordering rationale). A
-    kill in that window leaves an empty registry sitting next to a stale
-    slot directory whose manifest still carries the pre-erase hash, which
-    would otherwise permanently fail to match at ``find_live_slot`` and pin
-    a red ``no_matching_slot`` incident forever, since nothing else revisits
-    it. Sweeping first means the doomed slot is gone before mounting is ever
-    attempted, so no later step has to notice or recover from it.
+    Erase-in-flight marker (self-heal for an interrupted hard erase). The
+    marker (:func:`~paramem.memory.persistence.read_erase_marker`,
+    :func:`~paramem.memory.persistence.write_erase_marker`,
+    :func:`~paramem.memory.persistence.clear_erase_marker`) distinguishes an
+    interrupted hard erase from ordinary corruption — the two otherwise
+    leave a byte-identical disk shape (a registry that reads zero known keys
+    beside a slot manifest whose stamped hash or ``key_count`` still
+    disagrees). It is read ONCE, before the scan loop below, naming the
+    tier set an in-flight erase was mutating at write time; a tier's
+    membership in that set is the ONLY thing that turns a "registry says
+    empty, slot binding does not independently corroborate it" shape from a
+    preserved ERROR into a reap. The marker is cleared UNCONDITIONALLY after
+    the loop completes — even when the read itself failed (already logged
+    an ERROR by :func:`read_erase_marker`) — so a marker that outlives its
+    own boot (a stale marker surviving a restore, since it is one of
+    :func:`~paramem.backup.encryption.infra_paths`; or one a prior crash
+    left behind with nothing left to authorise) can never linger to
+    authorise an unrelated tier at a later boot. A marker naming a tier that
+    still reads a nonzero known-key count authorises nothing — every reap
+    row below requires ``list_known()`` empty regardless of the marker.
 
-    Walks the three main tier roots UNCONDITIONALLY — this does not consult
-    ``adapters.<tier>.enabled``, unlike the mount loop below. A disabled
-    tier that still knows keys is left untouched regardless (nothing here
-    ever removes a tier with content); a disabled tier whose registry knows
-    zero keys holds only artifacts of zero value, so the disabled flag
-    changes nothing about whether it should be swept.
+    Per tier root, after ``binding = verify_tier_binding(name, root)``:
 
-    Per tier root:
-
-    1. No ``indexed_key_registry.json`` at all — skipped. A payload-bearing
-       directory with no registry is a fresh install, not this sweep's
-       business.
-    2. Registry present but unreadable (corrupt file, failed decrypt) —
-       preserved and logged as an ERROR. An unreadable registry is never
-       inferred to hold zero keys; only a registry that actually answers
-       and says so is swept.
-    3. ``list_known()`` (active ∪ stale) non-empty — preserved. When the
-       tier carries neither adapter weights nor a ``graph.json`` (no
-       payload at all) this is logged as an ERROR naming the known-key
-       count — the same shape a crash-interrupted erase or a torn training
-       write can both produce, and deleting facts that were never folded
-       anywhere else would be a silent data loss.
-    4. ``list_known()`` empty but the registry is NOT affirmatively
-       KeyRegistry-shaped (``KeyRegistry.load_simhashes`` rejects it — no
-       dict-valued ``"simhash"`` section, e.g. a parseable-but-foreign
-       payload like ``"{}"`` or a renamed schema) — preserved and logged as
-       an ERROR. ``KeyRegistry.load`` is tolerant by contract and would
-       otherwise read this shape as "zero known keys"; this check exists so
-       that inference is never trusted for the destructive branch, only for
-       the preserve branch above.
-    5. ``list_known()`` empty AND the registry affirmatively answers
-       KeyRegistry-shaped — the tier's on-disk artifacts are removed via
-       :func:`~paramem.memory.persistence.reap_tier_artifacts` (idempotent;
-       logged as a WARNING naming the tier and the trigger).
+    1. ``binding.registry is None`` (:data:`~paramem.adapters.registry_binding.REGISTRY_UNREADABLE`
+       — corrupt file, failed decrypt, or any other read failure) — preserved
+       and logged as an ERROR, regardless of the marker. An unreadable
+       registry is never inferred to hold zero keys; only a registry that
+       actually answers and says so is swept.
+    2. ``binding.registry.list_known()`` (active ∪ stale) non-empty —
+       preserved. When the tier carries neither adapter weights nor a
+       ``graph.json`` (no payload at all,
+       :func:`~paramem.memory.interim_adapter.slot_payload_kind` returns
+       ``None``) this is logged as an ERROR naming the known-key count — the
+       same shape a crash-interrupted erase or a torn training write can
+       both produce, and deleting facts that were never folded anywhere
+       else would be a silent data loss. Every other non-empty shape
+       (simulate-venue slot, real weight-bearing slot, keyed main tier
+       still awaiting a matching slot) is preserved SILENTLY — a tier that
+       still knows keys is not this sweep's to report; the mount stage
+       mints its own row and log line for whatever binding status a keyed
+       tier resolves to, and this keeps that to one reporter per condition.
+    3. ``list_known()`` empty and the registry file does not exist
+       (``binding.registry_present is False``):
+       :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — skipped
+       silently (fresh install, nothing on disk to reap);
+       :data:`~paramem.adapters.registry_binding.VERIFIED` (a
+       ``""``-stamped slot whose manifest agrees the tier is empty, stamping
+       ``key_count`` as ``0`` or leaving it
+       :data:`~paramem.adapters.manifest.UNKNOWN`) — skipped silently (the
+       replay-disabled/experiment-install shape);
+       :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`
+       — preserved and logged as an ERROR, UNCONDITIONALLY (never
+       marker-authorised): this is the torn :func:`commit_tier_slot` shape
+       (a crash after the weight write but before the registry flush — see
+       that function's crash-semantics note), and a reap here would discard
+       a slot whose registry commit never landed rather than one an erase
+       genuinely emptied; a ``""``-stamped slot whose manifest disagrees on
+       ``key_count`` (:data:`~paramem.adapters.registry_binding.KEY_COUNT_MISMATCH`)
+       or the rare manifest-read-race
+       :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT` falls
+       through to the marker-gated case below.
+    4. ``list_known()`` empty and the registry file exists
+       (``binding.registry_present is True``):
+       :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — reaped
+       unconditionally (a registry file and nothing else — no manifest to
+       read at all, so there is no visible cross-artifact claim to weigh
+       against the registry's own empty read; the ordinary self-heal this
+       sweep has always performed);
+       :data:`~paramem.adapters.registry_binding.VERIFIED` with an
+       ``int`` ``manifest.key_count == 0`` — reaped unconditionally
+       (registry and matched manifest independently agree the tier is
+       empty). Everything else —
+       :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT`
+       (deliberately NOT reaped unconditionally here, unlike
+       :data:`NO_CANDIDATES`: ``find_live_slot`` returns the same verdict
+       whether every candidate's hash genuinely mismatched or a candidate's
+       ``meta.json`` was merely unreadable — this status cannot tell a
+       stale slot from a transiently corrupt one, so it never gets the
+       benefit of the doubt),
+       :data:`~paramem.adapters.registry_binding.KEY_COUNT_MISMATCH`
+       (a matching-hash slot whose ``key_count`` disagrees), or a
+       ``VERIFIED`` match whose ``key_count`` is
+       :data:`~paramem.adapters.manifest.UNKNOWN` — falls through to the
+       marker-gated case below.
+    5. Marker-gated fallback (every ``list_known()``-empty shape not
+       resolved by 3 or 4 above): reaped when the erase-in-flight marker
+       names this tier (the interrupted-hard-erase self-heal — the registry
+       write from :func:`~paramem.memory.persistence.erase_keys_and_restamp_manifest`
+       landed, but the reap that should have followed it did not); preserved
+       and logged as an ERROR otherwise, naming ``POST /backup/restore``
+       as the recovery door (never ``/reconsolidate``, which cannot rebuild
+       a tier whose registry binding is itself unverified).
 
     Args:
         config: Loaded ``ServerConfig``; only ``adapter_dir`` is read.
+        state: The global ``_state`` dict (or an explicit ``{}`` from a
+            direct-call test), for recording
+            :func:`~paramem.backup.integrity.cleanup_partial_slots` removals
+            on ``state["integrity_cleanup"]``. Required, not optional —
+            that bookkeeping must never be silently skipped.
 
     Returns:
-        Sorted tier names whose artifacts were actually removed.
+        Sorted tier names whose artifacts were actually removed by the
+        keyless-tier scan (step 3 above) — NOT tiers whose scratch was
+        removed by :func:`~paramem.backup.integrity.cleanup_partial_slots`.
     """
+    from paramem.adapters.registry_binding import (
+        NO_CANDIDATES,
+        REGISTRY_ABSENT_WITH_SLOTS,
+        VERIFIED,
+        verify_tier_binding,
+    )
+    from paramem.backup.integrity import cleanup_partial_slots
     from paramem.memory.interim_adapter import (
         INTERIM_NAME_PREFIX,
         iter_tier_roots,
         slot_payload_kind,
     )
-    from paramem.memory.persistence import reap_tier_artifacts, resume_pending_reaps
-    from paramem.training.key_registry import KeyRegistry
+    from paramem.memory.persistence import (
+        clear_erase_marker,
+        read_erase_marker,
+        reap_tier_artifacts,
+        resume_pending_reaps,
+    )
 
     resume_pending_reaps(config.adapter_dir)
 
+    _partial_removed = cleanup_partial_slots(config.adapter_dir)
+    if _partial_removed:
+        logger.warning(
+            "Boot sweep: cleanup_partial_slots removed %d partial slot(s) "
+            "before any tier's registry binding is verified",
+            len(_partial_removed),
+        )
+        state["integrity_cleanup"] = _partial_removed
+
     roots: list[tuple[str, Path]] = list(iter_tier_roots(config.adapter_dir))
+
+    # Read the erase-in-flight marker ONCE, before any tier below is
+    # evaluated — a marker authorises at most one boot's worth of reaps (see
+    # the docstring paragraph above). Cleared unconditionally after the loop,
+    # regardless of whether it named anything reap-eligible.
+    marker_tiers = set(read_erase_marker(config.adapter_dir))
 
     reaped: list[str] = []
     for name, root in roots:
-        reg_path = root / "indexed_key_registry.json"
-        if not reg_path.exists():
-            continue
+        binding = verify_tier_binding(name, root)
 
-        try:
-            registry = KeyRegistry.load(reg_path)
-        except Exception as exc:  # noqa: BLE001
+        if binding.registry is None:
             logger.error(
-                "Boot sweep: tier %s registry at %s is unreadable (%s) — preserving",
+                "Boot sweep: tier %s registry binding is unreadable (%s) — preserving",
                 name,
-                reg_path,
-                exc,
+                binding.detail,
             )
             continue
 
-        known = registry.list_known()
+        known = binding.registry.list_known()
         if known:
             payload_kind = slot_payload_kind(root)
             if payload_kind is None:
@@ -1564,46 +1667,110 @@ def _sweep_keyless_tier_artifacts(config) -> list[str]:
                     "(has graph.json, no safetensors) — preserving",
                     name,
                 )
-            # payload_kind == "train": carries content — nothing to log here.
+            # payload_kind == "train", or a keyed tier whose binding is not
+            # VERIFIED (no_matching_slot, key_count_mismatch, ...): the tier
+            # carries content — whether/why it mounts is the mount stage's
+            # report to make, not this sweep's. One reporter per condition.
             continue
 
-        # known reads empty — before treating that as "legitimately zero
-        # keys" and reaping, confirm the payload is affirmatively
-        # KeyRegistry-shaped. KeyRegistry.load is tolerant by contract (a
-        # parseable-but-foreign payload, e.g. "{}" or a renamed schema,
-        # loads as an empty registry rather than raising), so an unverified
-        # "known is empty" here could be a foreign file that merely looks
-        # empty. load_simhashes refuses anything without a dict-valued
-        # "simhash" section, so a foreign shape lands in the preserve+ERROR
-        # branch instead of a silent delete — deletion only ever happens
-        # when the registry affirmatively answers "zero known keys". This
-        # check is scoped to the empty-known case only: a registry that
-        # already has known keys is preserved above regardless of its
-        # shape, so gating it here as well would only change how that
-        # (already-preserved) case is logged.
-        try:
-            KeyRegistry.load_simhashes(reg_path)
-        except Exception as exc:  # noqa: BLE001
+        # known is empty from here on. One reap primitive for every arm below
+        # that decides to reap — a shared closure so a future arm cannot add
+        # a reap that forgets `reaped.append`.
+        def _reap(reason: str) -> None:
+            removed = reap_tier_artifacts(root)
+            if removed:
+                reaped.append(name)
+                logger.warning(
+                    "Boot sweep: tier %s reaped — %s — removed %d stale "
+                    "artifact path(s) (self-heals a crash between a hard "
+                    "key erase and its reap, or a torn training write)",
+                    name,
+                    reason,
+                    len(removed),
+                )
+
+        # The decision table's two halves, structurally: registry-absent
+        # shapes on one side, registry-present shapes on the other. Neither
+        # branch falls all the way through on its own — every arm either
+        # `continue`s (resolved without the marker) or drops out of the
+        # if/else to the shared marker-gated fallback below.
+        if not binding.registry_present:
+            if binding.status == NO_CANDIDATES:
+                continue  # fresh install — nothing on disk to reap
+            if binding.status == VERIFIED:
+                # A ""-stamped slot whose manifest independently agrees the
+                # tier is empty (key_count 0 or UNKNOWN) — the
+                # replay-disabled / experiment-install shape. Nothing to
+                # reap, nothing to log.
+                continue
+            if binding.status == REGISTRY_ABSENT_WITH_SLOTS:
+                logger.error(
+                    "Boot sweep: tier %s has %d candidate slot(s) but no "
+                    "indexed_key_registry.json at all (%s) — preserving; "
+                    "this is the torn commit_tier_slot shape (registry "
+                    "flush interrupted after the weight write) and is "
+                    "never eligible for a marker-authorised reap — recover "
+                    "via POST /backup/restore then restart",
+                    name,
+                    binding.candidate_count,
+                    binding.detail,
+                )
+                continue
+            # KEY_COUNT_MISMATCH (a ""-stamped slot whose manifest disagrees
+            # on key_count) or the rare manifest-read-race NO_MATCHING_SLOT
+            # falls through to the marker-gated fallback below.
+        else:
+            if binding.status == NO_CANDIDATES:
+                # A registry file and nothing else — no manifest to read at
+                # all, so there is no visible cross-artifact claim to weigh
+                # against the registry's own empty read; the ordinary
+                # self-heal this sweep has always performed.
+                _reap("registry lists zero known keys with no weight-slot candidate")
+                continue
+            if (
+                binding.status == VERIFIED
+                and isinstance(binding.manifest.key_count, int)
+                and binding.manifest.key_count == 0
+            ):
+                # Registry and the matched slot's manifest independently
+                # agree the tier is empty — reap unconditionally.
+                _reap("registry and matched slot manifest both read zero known keys")
+                continue
+            # NO_MATCHING_SLOT (deliberately NOT reaped unconditionally,
+            # unlike NO_CANDIDATES: find_live_slot returns the same verdict
+            # whether every candidate's hash genuinely mismatched or a
+            # candidate's meta.json was merely unreadable — this status
+            # cannot tell a stale slot from a transiently corrupt one, so it
+            # never gets the benefit of the doubt), KEY_COUNT_MISMATCH (a
+            # matching-hash slot whose key_count disagrees), or a VERIFIED
+            # match whose key_count is UNKNOWN falls through to the
+            # marker-gated fallback below.
+
+        # Marker-gated fallback: the registry reads zero known keys, but the
+        # binding does not independently, unambiguously corroborate that.
+        # Every other empty-known shape was already resolved above without
+        # needing the marker. Only a same-boot erase-in-flight marker naming
+        # this tier authorises treating this as the interrupted-hard-erase
+        # self-heal rather than corruption.
+        if name in marker_tiers:
+            _reap(
+                "erase-in-flight marker authorised recovery from an "
+                f"interrupted hard erase (binding was {binding.status}: {binding.detail})"
+            )
+        else:
             logger.error(
-                "Boot sweep: tier %s registry at %s reads zero known keys but is "
-                "not affirmatively KeyRegistry-shaped (%s) — preserving rather "
-                "than coercing a foreign schema into a delete",
+                "Boot sweep: tier %s registry reads zero known keys but its "
+                "slot binding (%s: %s) does not independently corroborate "
+                "that, and no erase-in-flight marker authorises treating "
+                "this as an interrupted hard erase — preserving; restore "
+                "this tier from a snapshot bundle via POST /backup/restore "
+                "and restart; see GET /integrity",
                 name,
-                reg_path,
-                exc,
+                binding.status,
+                binding.detail,
             )
-            continue
 
-        removed = reap_tier_artifacts(root)
-        if removed:
-            reaped.append(name)
-            logger.warning(
-                "Boot sweep: tier %s registry lists zero known keys — removed %d "
-                "stale artifact path(s) (self-heals a crash between a hard key "
-                "erase and its reap, or a torn training write)",
-                name,
-                len(removed),
-            )
+    clear_erase_marker(config.adapter_dir)
 
     return sorted(reaped)
 
@@ -1611,12 +1778,21 @@ def _sweep_keyless_tier_artifacts(config) -> list[str]:
 def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     """Load enabled adapters from slot-dir layout with manifest verification.
 
-    Sweeps every tier down to its never-trained shape when its on-disk
-    registry legitimately tracks zero keys
-    (:func:`_sweep_keyless_tier_artifacts`, run first, before any slot is
-    resolved for any tier). Every adapter kind — the three enabled main
-    tiers (episodic/semantic/procedural) AND every interim tier on disk
-    (``episodic_interim_*``, no ``enabled`` gate — interims stay
+    Pre-mount housekeeping runs first, before any slot is resolved for any
+    tier (:func:`_sweep_keyless_tier_artifacts`, which itself runs
+    ``resume_pending_reaps`` then
+    :func:`~paramem.backup.integrity.cleanup_partial_slots` then the
+    keyless-tier scan proper — see that function's docstring for the full
+    ordering rationale and why it must precede every consumer of
+    :func:`~paramem.adapters.registry_binding.verify_tier_binding` /
+    :func:`~paramem.adapters.registry_binding.verify_adapter_tree` reached
+    later in the same boot: this mount loop, the memory-store publish
+    (``_build_store_contents``, called from ``_preload_memory_store`` further
+    down the same boot/reload event), and the integrity report all then see
+    the identical, already-cleaned tree instead of three independently timed
+    snapshots that could disagree). Then every adapter kind — the three
+    enabled main tiers (episodic/semantic/procedural) AND every interim tier
+    on disk (``episodic_interim_*``, no ``enabled`` gate — interims stay
     episodic-shaped even when the episodic main tier is disabled) — is
     validated through the single :func:`_validate_adapter_slot` decision
     tree:
@@ -1638,7 +1814,10 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         model: Base model (or existing PeftModel) to load adapters onto.
         tokenizer: Loaded tokenizer (for fingerprint comparison).
         config: Loaded ``ServerConfig``.
-        state: The global ``_state`` dict (mutated in-place for manifest status).
+        state: The global ``_state`` dict (mutated in-place for manifest
+            status and, when :func:`_sweep_keyless_tier_artifacts`'s
+            ``cleanup_partial_slots`` pass removes anything,
+            ``state["integrity_cleanup"]``).
 
     Returns:
         The updated model (PeftModel when any adapter was loaded, otherwise
@@ -1659,7 +1838,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     # window between a hard key erase and its reap, or a torn training
     # write). Must run BEFORE any slot below is resolved or mounted — see
     # _sweep_keyless_tier_artifacts's docstring.
-    _swept_tiers = _sweep_keyless_tier_artifacts(config)
+    _swept_tiers = _sweep_keyless_tier_artifacts(config, state)
     if _swept_tiers:
         logger.info("Boot sweep: reaped keyless tier(s): %s", ", ".join(_swept_tiers))
 
@@ -6131,27 +6310,22 @@ def _preload_memory_store(config, *, model, tokenizer):
     # blocks migrations and flags integrity_check_failed (a corrupt registry
     # is a different, more severe condition than boot_degraded's cold cache).
     #
-    # Boot housekeeping runs FIRST: cleanup_partial_slots deletes any
-    # subdirectory under <adapter_dir>/<tier>/ that is missing one of the
-    # canonical three slot files.  These are scratch left by interrupted
-    # training (a class that the staging+promote contract should have
-    # eliminated going forward, but historical state may still carry
-    # them).  Removals are recorded on _state["integrity_cleanup"] so the
-    # attention populator can surface them to the operator.
+    # cleanup_partial_slots (scratch left by interrupted training) no longer
+    # runs here — it moved pre-mount, into _sweep_keyless_tier_artifacts
+    # (paramem/server/app.py), called from _mount_adapters_from_slots, which
+    # runs strictly before this function on every boot/reload that loads a
+    # local model.  Removing an incomplete slot AFTER _hydrate_memory_store_in_place
+    # (a few lines above) had already computed this tier's binding for
+    # publish would let the mount stage, the store-publish builder, and this
+    # integrity check disagree about the same on-disk tree within one boot;
+    # running it pre-mount instead means all three read the same
+    # already-cleaned tree.  A cloud-only boot never reaches
+    # _mount_adapters_from_slots (no local model to mount), so this pass
+    # does not run for it — the next boot/reload that acquires a local model
+    # runs it, pre-mount, before that boot's own bindings are computed.
     try:
         from paramem.backup import key_store as _key_store_mod
-        from paramem.backup.integrity import (
-            cleanup_partial_slots,
-            verify_infrastructure_integrity,
-        )
-
-        _removed = cleanup_partial_slots(config.adapter_dir)
-        if _removed:
-            _state["integrity_cleanup"] = _removed
-            logger.warning(
-                "integrity-cleanup removed %d partial slot(s) before integrity check",
-                len(_removed),
-            )
+        from paramem.backup.integrity import verify_infrastructure_integrity
 
         _daily_ok_local = _key_store_mod.daily_identity_loadable(
             _key_store_mod.DAILY_KEY_PATH_DEFAULT
@@ -16372,10 +16546,12 @@ def _finalize_interim(
 
     Runs on the asyncio event loop via ``_dispatch_finalize``.  Revalidates
     every tier's ``adapter_manifest_status`` row against the freshly-saved
-    interim slot (:func:`_revalidate_adapter_manifests` — pure reads +
-    hashing of small registry files, the same cost profile as the full-fold
-    call this mirrors), records (or clears) any ``tier_registry_unverified``
-    incident for the FULL tier tree (:func:`_record_unverified_tier_incidents`
+    interim slot (:func:`_revalidate_adapter_manifests` — NOT pure: it also
+    performs its documented ``.pending/`` sweep via ``sweep_orphan_pending``,
+    see that function's own docstring; the read+hash cost profile otherwise
+    matches the full-fold call this mirrors), records (or clears) any
+    ``tier_registry_unverified`` incident for the FULL tier tree
+    (:func:`_record_unverified_tier_incidents`
     over :func:`~paramem.adapters.registry_binding.verify_adapter_tree` —
     not the revalidate loop's enabled-tiers subset, so a disabled-but-broken
     tier is never mistaken for a vanished one and wrongly auto-resolved),

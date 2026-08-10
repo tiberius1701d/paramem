@@ -402,19 +402,35 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
     them marks it as scratch from an interrupted training run and the
     directory is removed via ``shutil.rmtree``.
 
+    Called from :func:`paramem.server.app._sweep_keyless_tier_artifacts`
+    (itself called from ``_mount_adapters_from_slots``), pre-mount: before
+    any tier's :func:`~paramem.adapters.registry_binding.verify_tier_binding`
+    is computed, on every boot/reload that loads a local model. A torn
+    scratch slot left in place could otherwise be counted as a weight-slot
+    candidate (``count_slot_candidates`` only requires a readable
+    ``meta.json``, not a complete slot) and produce a binding verdict that
+    disagrees with what a later pass — the mount loop itself, the
+    memory-store publish, or the integrity report, all reached later in the
+    same boot — would compute for the identical tier once the scratch is
+    gone. Running this before all three means they see one already-cleaned
+    tree instead of independently timed snapshots.
+
     Skipped (never touched):
     - Dotted entries (``.quarantine``, ``.tmp``).
     - Interim container directories (``interim_*`` under episodic/).  These
       are nested containers whose integrity is fully owned by
       ``find_live_slot`` (manifest.py), the boot-time keyless-tier sweep
       (``_sweep_keyless_tier_artifacts``, app.py — reaps a tier's on-disk
-      artifacts pre-mount only when its registry file exists and
-      affirmatively reads zero known keys; an unreadable or foreign-shaped
-      registry, or one that still lists a key, is preserved untouched), and
-      the post-consolidation teardown (``unload_interim_adapters``).  Applying
-      the flat 3-file completeness check to an interim container is wrong
-      because weights live in the inner ``<ts>/`` slot, not at the container
-      root.  Passing judgment here would be a parallel-topology drift bug.
+      artifacts, pre-mount, based on
+      :func:`~paramem.adapters.registry_binding.verify_tier_binding`'s
+      registry↔slot binding verdict for the tier, gated by the
+      erase-in-flight marker for any shape the binding does not
+      independently corroborate as empty; see that function's docstring for
+      the full decision table), and the post-consolidation teardown
+      (``unload_interim_adapters``).  Applying the flat 3-file completeness
+      check to an interim container is wrong because weights live in the
+      inner ``<ts>/`` slot, not at the container root.  Passing judgment
+      here would be a parallel-topology drift bug.
     - The staging slot conventions are in-memory PEFT keys, not on disk —
       this function cannot affect them.
     - The ``bg_checkpoint_epoch`` and ``checkpoint-*`` scratch dirs written

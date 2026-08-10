@@ -343,9 +343,13 @@ class TestBootDegradedPath:
             "key_count": 1,
         }
         (slot_dir / "meta.json").write_text(_json.dumps(manifest), encoding="utf-8")
-        # A COMPLETE slot — _preload_memory_store's cleanup_partial_slots
-        # step (unlike _arm_active_store_migration) removes any slot
-        # missing one of the three required files before the check runs.
+        # A COMPLETE slot — required regardless: cleanup_partial_slots now
+        # runs pre-mount (inside _sweep_keyless_tier_artifacts, called from
+        # _mount_adapters_from_slots), not inside _preload_memory_store
+        # (this test calls _preload_memory_store directly, so that pass
+        # never runs here), but an incomplete slot would still fail the
+        # manifest check this test exercises regardless of which pass
+        # would have removed it.
         (slot_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
         (slot_dir / "adapter_model.safetensors").write_bytes(b"weights")
 

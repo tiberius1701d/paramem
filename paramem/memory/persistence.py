@@ -350,10 +350,19 @@ def reap_tier_artifacts(tier_root: Path) -> list[Path]:
         become empty enough to ``rmdir``.
 
     In the main-tier branch, ``indexed_key_registry.json`` is condemned LAST
-    by construction — it is the commit signal a boot sweep reads to decide
-    whether a tier holds any keys, so a crash mid-reap must never leave the
-    registry gone while a weight slot survives (see the ordering comment at
-    the child-iteration site for the full rationale).
+    by construction — it is the commit signal a boot sweep
+    (``_sweep_keyless_tier_artifacts``, ``paramem/server/app.py``) reads to
+    decide whether a tier holds any keys, so a crash mid-reap must never
+    leave the registry gone while a weight slot survives (see the ordering
+    comment at the child-iteration site for the full rationale). That same
+    boot sweep is also the erase-crash discriminator for the *other*
+    direction — a registry that already reads zero known keys beside a slot
+    whose binding does not independently corroborate that emptiness (a
+    stale hash, a disagreeing ``key_count``) is corruption unless the
+    erase-in-flight marker (:func:`write_erase_marker` /
+    :func:`read_erase_marker` / :func:`clear_erase_marker`, this module)
+    names the tier, in which case the sweep treats it as an interrupted hard
+    erase and calls this function to finish the reap the crash left undone.
 
     Crash-safe deletion (rename-then-delete): every condemned root — the
     whole slot in the interim branch, each surviving child in the main-tier
@@ -1119,17 +1128,20 @@ def commit_tier_slot(
        files are complete.
 
     Crash semantics: a kill after step 5 but before step 7 leaves the slot
-    present without the registry file.  Nothing at boot deletes this shape:
-    the keyless-tier sweep
-    (:func:`paramem.server.app._sweep_keyless_tier_artifacts`) only acts on
-    a tier whose ``indexed_key_registry.json`` exists and affirmatively
-    reads zero known keys, so a registry-absent tier is skipped outright —
-    not this sweep's business, per its own docstring.  The mount loop in
-    :func:`paramem.server.app._mount_adapters_from_slots` then finds no
-    matching slot for the interim tier's (degraded) hash and logs the
-    payload-bearing-but-unmatched slot as an ERROR, leaving it on disk. The
-    partial slot survives across restarts until an operator or a later fold
-    reuses or clears it.
+    present without the registry file.  The boot-time keyless-tier sweep
+    (:func:`paramem.server.app._sweep_keyless_tier_artifacts`) reads this
+    shape via :func:`~paramem.adapters.registry_binding.verify_tier_binding`
+    as :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`
+    — candidate slot(s) present, no ``indexed_key_registry.json`` at all —
+    and, since 2026-08, that verdict is flagged LOUD: preserved and logged
+    as an ERROR naming ``POST /backup/restore`` as the recovery door, never
+    silently skipped, and never eligible for erase-in-flight-marker
+    authorisation (a torn commit is not an interrupted erase). The mount
+    loop in :func:`paramem.server.app._mount_adapters_from_slots` separately
+    finds no matching slot for the interim tier's (degraded) hash and
+    records its own ``registry_unverified`` row. The partial slot survives
+    across restarts until an operator restores the registry or a later fold
+    reuses or clears the slot.
 
     Args:
         loop: The live :class:`paramem.training.consolidation.ConsolidationLoop`
