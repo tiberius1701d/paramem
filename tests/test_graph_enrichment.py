@@ -3995,6 +3995,14 @@ class TestEnrichmentRemovalLedger:
         assert entry["keep_node"] == "alice", (
             f"Expected keep_node='alice' (canonical keep node); got {entry['keep_node']!r}"
         )
+        # A same_as contraction merges NODES, not facts — there is no
+        # surviving indexed key to inherit maturity, so record_removal's
+        # survivor_key must be omitted.  Driven through the REAL production
+        # writer (GraphTierRefiner.run_enrichment -> enrich_graph ->
+        # merger.record_removal), not a hand-constructed ledger entry.
+        assert "survivor_key" not in entry, (
+            f"enrichment_same_as must never carry survivor_key; got {entry}"
+        )
 
     def test_failed_contraction_does_not_write_to_ledger(self, tmp_path, monkeypatch):
         """A contraction that raises does NOT write phantom entries to ledger."""

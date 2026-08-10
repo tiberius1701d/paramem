@@ -167,6 +167,68 @@ class TestAttributeKeysBookkeeping:
         assert reloaded.nodes["speaker0"]["attribute_keys"]["email"] == "graph7"
 
 
+class TestAttributeKeySupersession:
+    """A second attribute relation for the same (subject, attribute) pair
+    displaces the incumbent indexed key.  The displaced key must be
+    ledgered as a removal (reason='attribute_key_superseded', survivor_key=
+    the new key) so it is not silently dropped from the fold's accounting.
+    """
+
+    def test_superseded_attribute_key_is_ledgered_with_a_survivor(self):
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(indexed_key="graph_old"), session_id="s0"))
+        merger.merge(_session(_attr_relation(indexed_key="graph_new"), session_id="s1"))
+
+        node = merger.graph.nodes["speaker0"]
+        assert node["attribute_keys"]["email"] == "graph_new", (
+            "the new key must win the attribute_keys slot"
+        )
+        assert "graph_old" in merger.removal_ledger, (
+            f"the displaced key must be ledgered; got {list(merger.removal_ledger)}"
+        )
+        entry = merger.removal_ledger["graph_old"]
+        assert entry["reason"] == "attribute_key_superseded", (
+            f"expected reason='attribute_key_superseded'; got {entry['reason']!r}"
+        )
+        assert entry["survivor_key"] == "graph_new", (
+            f"expected survivor_key='graph_new'; got {entry.get('survivor_key')!r}"
+        )
+        assert "graph_new" not in merger.removal_ledger, "the surviving key must not be ledgered"
+
+    def test_repeated_merge_of_the_same_key_does_not_ledger(self):
+        """Re-merging the SAME indexed key onto the same attribute is a no-op
+        overwrite, not a supersession — nothing to ledger."""
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(indexed_key="graph7"), session_id="s0"))
+        merger.merge(_session(_attr_relation(indexed_key="graph7"), session_id="s1"))
+        assert merger.removal_ledger == {}
+
+    def test_superseded_attribute_key_with_a_different_value_omits_the_survivor(self):
+        """A DIFFERENT value winning the same (subject, attribute) slot is the
+        contradiction shape, not a carry-forward: the displaced key is still
+        ledgered (so it still counts as an intended removal, never a genuine
+        loss) but the entry must NOT carry survivor_key, and must instead
+        record old_object/new_object — mirroring an edge-level contradiction.
+        """
+        merger = GraphMerger()
+        old_rel = _attr_relation(indexed_key="graph_old", obj="old@example.com")
+        new_rel = _attr_relation(indexed_key="graph_new", obj="new@example.com")
+        merger.merge(_session(old_rel, session_id="s0"))
+        merger.merge(_session(new_rel, session_id="s1"))
+
+        node = merger.graph.nodes["speaker0"]
+        assert node["attribute_keys"]["email"] == "graph_new"
+        entry = merger.removal_ledger["graph_old"]
+        assert entry["reason"] == "attribute_key_superseded", (
+            f"expected reason='attribute_key_superseded'; got {entry['reason']!r}"
+        )
+        assert "survivor_key" not in entry, (
+            f"a different-value overwrite must NOT carry survivor_key; got {entry}"
+        )
+        assert entry["old_object"] == "old@example.com", f"got {entry}"
+        assert entry["new_object"] == "new@example.com", f"got {entry}"
+
+
 class TestAttributeGateDoesNotReachUpsertRelation:
     def test_no_upsert_relation_side_effects(self):
         """An attribute relation must never touch the Case-1/2/3 machinery

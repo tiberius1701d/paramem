@@ -246,10 +246,10 @@ class GraphTierRefiner:
               ``last_seen``, then key string) so the fact keeps its identity
               and its earned bookkeeping instead of being re-minted; that key
               is NOT recorded as a removal.
-           c. Write ``removal_ledger[ik_key] = {"reason":
-              "predicate_synonym_collapse", "survivor_predicate":
-              <survivor_pred>, "survivor_key": <survivor ik_key>}`` for each
-              remaining retired keyed edge.  ``survivor_key`` is the fold's
+           c. Call ``merger.record_removal(ik_key, reason=
+              "predicate_synonym_collapse", survivor_predicate=<survivor_pred>,
+              survivor_key=<survivor ik_key>)`` for each remaining retired
+              keyed edge.  ``survivor_key`` is the fold's
               reinforcement-credit input — the survivor inherits the retired
               keys' maturity, which their staling would otherwise discard.  It
               is omitted only when no edge in the group carried a key at all.
@@ -490,13 +490,12 @@ class GraphTierRefiner:
                         # The adopted key moved to the survivor edge — it is not
                         # a removal and must not be staled.
                         if _ret_ik and _ret_ik != _adopted_ik:
-                            _entry: dict = {
-                                "reason": "predicate_synonym_collapse",
-                                "survivor_predicate": _survivor_pred,
-                            }
-                            if _survivor_ik:
-                                _entry["survivor_key"] = _survivor_ik
-                            self._merger.removal_ledger[_ret_ik] = _entry
+                            self._merger.record_removal(
+                                _ret_ik,
+                                reason="predicate_synonym_collapse",
+                                survivor_key=_survivor_ik or None,
+                                survivor_predicate=_survivor_pred,
+                            )
                         # Fail-loud: the (u, v, eid) triple was built from
                         # graph.edges(keys=True) and each predicate is retired at most
                         # once (guaranteed by _retired_in_so_group tracking above),

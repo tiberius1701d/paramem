@@ -7159,6 +7159,367 @@ class TestDriftIntendedRemoval:
             "key_dup2 must not survive (collapsed)"
         )
 
+    def test_predicateless_key_is_ledgered_and_not_a_genuine_loss(self, tmp_path):
+        """A key whose stored entry carries subject/object but an empty
+        predicate is ledgered by ``_build_registry_true_relations`` (reason=
+        'unkeyable_no_predicate'), so the drift partition routes it to
+        drift_intended_removal instead of drift_genuine_loss.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        recon_g = nx.MultiDiGraph()  # no recon edge for the predicate-less key
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        loop.store.put(
+            "episodic",
+            "key_nopred",
+            {
+                "key": "key_nopred",
+                "subject": "Carol",
+                "predicate": "",
+                "object": "Berlin",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_nopred", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert result["drift_intended_removal"] == 1, (
+            f"Expected drift_intended_removal=1; got {result['drift_intended_removal']}"
+        )
+        assert result["drift_intended_removal_by_reason"] == {"unkeyable_no_predicate": 1}, (
+            f"Expected by_reason={{'unkeyable_no_predicate': 1}}; "
+            f"got {result['drift_intended_removal_by_reason']}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (must not misclassify the missing-predicate "
+            f"key as genuine loss); got {result['drift_genuine_loss']}"
+        )
+
+    def test_fully_empty_entry_still_classifies_drift_orphan(self, tmp_path):
+        """The negative of the narrowed unkeyable_no_predicate guard: a key
+        whose stored entry has subject, predicate, AND object all empty is
+        the sibling no-content case the drift partition already classifies
+        orphan on its own — it must stay unledgered and continue landing in
+        drift_orphan, not drift_intended_removal.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        recon_g = nx.MultiDiGraph()
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        loop.store.put(
+            "episodic",
+            "key_orphan",
+            {
+                "key": "key_orphan",
+                "subject": "",
+                "predicate": "",
+                "object": "",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_orphan", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert result["drift_orphan"] == 1, (
+            f"Expected drift_orphan=1 (fully-empty entry, no content to ledger); got {result}"
+        )
+        assert result["drift_intended_removal"] == 0, (
+            f"Expected drift_intended_removal=0 (unkeyable_no_predicate must not fire "
+            f"when there is no subject/object content); got {result}"
+        )
+        assert result["drift_genuine_loss"] == 0, f"got {result}"
+
+    def test_superseded_attribute_key_drifts_as_intended_removal(self, tmp_path):
+        """A displaced attribute key (a second attribute relation supersedes
+        the first on the same (subject, attribute) pair, SAME value — a true
+        carry-forward) is ledgered by the merger's attribute-key-overwrite
+        guard WITH a survivor_key and lands in drift_intended_removal, not
+        drift_genuine_loss — the survivor (key_attr_new) trains normally.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        recon_g = nx.MultiDiGraph()  # attribute facts never produce edges to reconstruct
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        # The fold's own `finally` clears removal_ledger via reset_graph() before
+        # control returns to the caller, so capture the ledger's content at the
+        # reset that empties it (the fold-exit call — the fold-entry call finds
+        # nothing to capture, since this merger has no prior-fold state).
+        captured_ledgers: list[dict] = []
+        _orig_reset_graph = loop.merger.reset_graph
+
+        def _capturing_reset_graph():
+            if loop.merger.removal_ledger:
+                captured_ledgers.append(dict(loop.merger.removal_ledger))
+            _orig_reset_graph()
+
+        loop.merger.reset_graph = _capturing_reset_graph
+
+        for key in ("key_attr_old", "key_attr_new"):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "has phone",
+                    "object": "+1 555 0001",  # SAME value on both keys
+                    "speaker_id": "speaker0",
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="attribute", first_seen=""
+            )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert result["drift_intended_removal"] == 1, (
+            f"Expected drift_intended_removal=1 (key_attr_old superseded); got {result}"
+        )
+        assert result["drift_intended_removal_by_reason"] == {"attribute_key_superseded": 1}, (
+            f"Expected by_reason={{'attribute_key_superseded': 1}}; got {result}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (fact carries forward under key_attr_new); got {result}"
+        )
+        assert result["keys_per_tier"]["episodic"] == 1, (
+            f"only the survivor key_attr_new must train; got {result['keys_per_tier']}"
+        )
+        assert len(captured_ledgers) == 1, (
+            f"expected exactly one populated ledger; got {captured_ledgers}"
+        )
+        assert captured_ledgers[0]["key_attr_old"].get("survivor_key") == "key_attr_new", (
+            f"a same-value supersession must carry survivor_key; got {captured_ledgers[0]}"
+        )
+
+    def test_superseded_attribute_key_different_value_still_drifts_as_intended_removal(
+        self, tmp_path
+    ):
+        """A displaced attribute key whose value DIFFERS from the survivor's
+        (a real contradiction, not a carry-forward) is still ledgered and
+        still routed to drift_intended_removal rather than drift_genuine_loss
+        — but WITHOUT a survivor_key, carrying old_object/new_object instead
+        (the contradiction shape, mirroring an edge-level contradiction).
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        recon_g = nx.MultiDiGraph()
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        # See the same-value sibling test above: the fold's own `finally`
+        # clears removal_ledger before control returns, so capture it at the
+        # reset that empties it.
+        captured_ledgers: list[dict] = []
+        _orig_reset_graph = loop.merger.reset_graph
+
+        def _capturing_reset_graph():
+            if loop.merger.removal_ledger:
+                captured_ledgers.append(dict(loop.merger.removal_ledger))
+            _orig_reset_graph()
+
+        loop.merger.reset_graph = _capturing_reset_graph
+
+        for key, phone in (("key_attr_old", "+1 555 0001"), ("key_attr_new", "+1 555 0002")):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "has phone",
+                    "object": phone,
+                    "speaker_id": "speaker0",
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="attribute", first_seen=""
+            )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert result["drift_intended_removal"] == 1, (
+            f"Expected drift_intended_removal=1 (key_attr_old superseded); got {result}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (still ledgered, not genuine loss); got {result}"
+        )
+        assert len(captured_ledgers) == 1, (
+            f"expected exactly one populated ledger; got {captured_ledgers}"
+        )
+        entry = captured_ledgers[0]["key_attr_old"]
+        assert "survivor_key" not in entry, (
+            f"a different-value overwrite is a contradiction, not a carry-forward — "
+            f"must NOT carry survivor_key; got {entry}"
+        )
+        assert entry["old_object"] == "+1 555 0001", f"got {entry}"
+        assert entry["new_object"] == "+1 555 0002", f"got {entry}"
+
+    def test_superseded_attribute_key_credits_the_survivor(self, tmp_path):
+        """Same-value attribute-key supersession: the survivor inherits the
+        displaced key's reinforcement_count through ``_credit_reinforcement``
+        and is eligible for promotion in the same fold — the behaviour
+        silently lost before ``attribute_key_superseded`` carried a
+        ``survivor_key``.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        recon_g = nx.MultiDiGraph()
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        loop.store.put(
+            "episodic",
+            "key_attr_old",
+            {
+                "key": "key_attr_old",
+                "subject": "Alice",
+                "predicate": "has phone",
+                "object": "+1 555 0001",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_attr_old",
+            speaker_id="speaker0",
+            relation_type="attribute",
+            first_seen="",
+            reinforcement_count=5,
+        )
+        loop.store.put(
+            "episodic",
+            "key_attr_new",
+            {
+                "key": "key_attr_new",
+                "subject": "Alice",
+                "predicate": "has phone",
+                "object": "+1 555 0001",  # SAME value -> true carry-forward
+                "speaker_id": "speaker0",
+            },
+            simhash=0xABCD1234,
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_attr_new", speaker_id="speaker0", relation_type="attribute", first_seen=""
+        )
+
+        self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        survivor_bk = loop.store.bookkeeping_for_key("key_attr_new")
+        assert survivor_bk["reinforcement_count"] == 5, (
+            "the survivor must inherit key_attr_old's reinforcement_count (5); "
+            f"got {survivor_bk['reinforcement_count']}"
+        )
+        assert loop.store.tier_for_active_key("key_attr_new") == "semantic", (
+            "the inherited count (5) meets the default promotion_threshold (3) — "
+            "the survivor must be promoted in the same fold"
+        )
+
+    def test_superseded_attribute_key_different_value_does_not_credit_or_promote(self, tmp_path):
+        """Different-value attribute-key supersession (a contradiction, not a
+        carry-forward): the survivor must NOT inherit the displaced key's
+        reinforcement_count and must NOT be promoted — this is the defect the
+        value-gated survivor-credit fix closes (previously a brand-new fact
+        silently inherited the retired fact's maturity and was promoted to
+        semantic in the same fold).
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        recon_g = nx.MultiDiGraph()
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        loop.store.put(
+            "episodic",
+            "key_attr_old",
+            {
+                "key": "key_attr_old",
+                "subject": "Alice",
+                "predicate": "has phone",
+                "object": "+1 555 0001",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_attr_old",
+            speaker_id="speaker0",
+            relation_type="attribute",
+            first_seen="",
+            reinforcement_count=5,
+        )
+        loop.store.put(
+            "episodic",
+            "key_attr_new",
+            {
+                "key": "key_attr_new",
+                "subject": "Alice",
+                "predicate": "has phone",
+                "object": "+1 555 0002",  # DIFFERENT value -> contradiction, not carry-forward
+                "speaker_id": "speaker0",
+            },
+            simhash=0xEF567890,
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_attr_new", speaker_id="speaker0", relation_type="attribute", first_seen=""
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        survivor_bk = loop.store.bookkeeping_for_key("key_attr_new")
+        assert survivor_bk["reinforcement_count"] == 1, (
+            "a different-value overwrite must NOT credit the survivor with the "
+            f"retired fact's maturity; got {survivor_bk['reinforcement_count']}"
+        )
+        assert loop.store.tier_for_active_key("key_attr_new") == "episodic", (
+            "the survivor's own count (1) is below promotion_threshold (3) — it must "
+            "NOT be promoted"
+        )
+        assert result["drift_intended_removal"] == 1, (
+            f"Expected drift_intended_removal=1 (still ledgered); got {result}"
+        )
+
 
 class TestFoldGraphDebug:
     """Tests for on_fold_graph, on_removal_ledger, on_fold_assignments.
@@ -11275,6 +11636,71 @@ class TestInterimRecitalDedup:
         )
 
     # ------------------------------------------------------------------
+    # 1a-bis. A predicate-less key reached through the dedup_target_keys
+    #     caller is ledgered but otherwise inert (no drift partition here).
+    # ------------------------------------------------------------------
+
+    def test_predicateless_key_on_the_interim_path_is_inert(self, tmp_path):
+        """A predicate-less key reached through the interim
+        ``dedup_target_keys`` caller of ``_build_registry_true_relations`` is
+        ledgered (``record_removal`` fires) but changes nothing else — the
+        interim path computes no drift partition, so nothing consumes the
+        entry, and the key stays active until the next reset_graph() clears
+        the ledger.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+        _adapter = "episodic_interim_20260101T0000"
+
+        loop.store.put(
+            "episodic",
+            "graph_nopred",
+            {"key": "graph_nopred", "subject": "alice", "predicate": "", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph_nopred", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],
+                extra_relations=None,
+                dedup_target_keys=["graph_nopred"],
+            )
+
+        assert "graph_nopred" in loop.merger.removal_ledger, (
+            "the interim dedup_target_keys caller must still ledger a predicate-less key"
+        )
+        assert loop.merger.removal_ledger["graph_nopred"]["reason"] == "unkeyable_no_predicate"
+        assert loop.merger.graph.number_of_edges() == 0, (
+            "a predicate-less key must produce no edge or node-attribute mutation"
+        )
+        assert loop.store.registry("episodic").list_active() == ["graph_nopred"], (
+            "the interim path computes no drift partition, so the key must remain active"
+        )
+
+        # Drive the ledger entry through the interim fold's actual subtractive
+        # stage (the stage that DOES consume removal_ledger at interim scope)
+        # rather than merely asserting on a stage that never touches the
+        # registry — unkeyable_no_predicate must not be in _always_stale_reasons,
+        # so this must be a true no-op on the registry.
+        loop._apply_subtractive_removals_to_store(fold_name="interim")
+
+        assert not loop.store.is_stale("graph_nopred"), (
+            "unkeyable_no_predicate must NOT be soft-staled by the interim "
+            "subtractive-removals stage"
+        )
+        assert loop.store.registry("episodic").list_active() == ["graph_nopred"], (
+            "the key must still be active after the subtractive-removals stage runs"
+        )
+
+    # ------------------------------------------------------------------
     # 1b. Recital-only end-to-end bump: main key reinforced exactly once
     #     (pins the relaxed bump-loop guard -- recon_relations is empty here)
     # ------------------------------------------------------------------
@@ -13989,6 +14415,69 @@ class TestSubtractiveRemovalsHelperInterim:
         assert not loop.store.is_stale("graph_enrich_k1"), (
             "enrichment_same_as key must NOT be soft-staled at interim scope "
             "(retain-only bucket; handled by fold drift_intended_removal)"
+        )
+
+    def test_attribute_key_superseded_not_soft_staled_at_interim(self, tmp_path):
+        """attribute_key_superseded stays in the retain-only bucket at
+        interim scope, like enrichment_same_as — the helper must NOT
+        soft-stale it (it is hard-dropped by the full-fold drift partition
+        instead; the interim path never reaches that partition at all)."""
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_attr_k1": {
+                    "reason": "attribute_key_superseded",
+                    "survivor_key": "graph_attr_k2",
+                },
+            },
+        )
+        loop.store.put(
+            "episodic",
+            "graph_attr_k1",
+            {
+                "key": "graph_attr_k1",
+                "subject": "Riley",
+                "predicate": "has phone",
+                "object": "+1 555 0001",
+                "speaker_id": "Riley",
+            },
+            register=True,
+        )
+
+        loop._apply_subtractive_removals_to_store(fold_name="interim")
+
+        assert not loop.store.is_stale("graph_attr_k1"), (
+            "attribute_key_superseded key must NOT be soft-staled at interim scope"
+        )
+
+    def test_unkeyable_no_predicate_not_soft_staled_at_interim(self, tmp_path):
+        """unkeyable_no_predicate stays in the retain-only bucket at interim
+        scope — the helper must NOT soft-stale it, so a key ledgered through
+        the interim dedup_target_keys caller stays active until the next
+        reset_graph() clears the ledger."""
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_nopred_k1": {"reason": "unkeyable_no_predicate"},
+            },
+        )
+        loop.store.put(
+            "episodic",
+            "graph_nopred_k1",
+            {
+                "key": "graph_nopred_k1",
+                "subject": "Riley",
+                "predicate": "",
+                "object": "Somewhere",
+                "speaker_id": "Riley",
+            },
+            register=True,
+        )
+
+        loop._apply_subtractive_removals_to_store(fold_name="interim")
+
+        assert not loop.store.is_stale("graph_nopred_k1"), (
+            "unkeyable_no_predicate key must NOT be soft-staled at interim scope"
         )
 
     def test_key_absent_from_active_tier_is_noop(self, tmp_path):

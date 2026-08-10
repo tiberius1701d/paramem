@@ -2901,6 +2901,25 @@ class ConsolidationLoop:
         # contradiction_same_pred: recency-backed contradiction (freshest last_seen wins).
         #   The merger only writes this entry when timestamps pick a unique winner;
         #   empty/tied → coexist (no entry) → safe to stale at the full fold too.
+        # attribute_key_superseded and unkeyable_no_predicate are deliberately
+        # NOT listed here.  "dedup" is not a counter-example: a dedup key is
+        # soft-staled through the SEPARATE _collapsed_set branch in the drift
+        # partition (tested FIRST, before this helper's output is even
+        # consulted, and simhash-retained) -- it never reaches this
+        # always-stale set at all.  The honest analogy for both new reasons is
+        # "enrichment_same_as": ledgered so the full-fold drift partition
+        # routes the key to drift_intended_removal instead of
+        # drift_genuine_loss, but hard-dropped with NO soft-stale record.
+        # attribute_key_superseded additionally carries a survivor_key only
+        # when the SAME value carries forward under the new key (so
+        # _credit_reinforcement transfers its maturity and it can be
+        # promoted); a DIFFERENT value winning is the contradiction shape and
+        # omits survivor_key (no credit, no promotion).  unkeyable_no_predicate
+        # never carries a survivor: the key never re-enters the merge surface
+        # under any key.  On the interim dedup_target_keys path (which
+        # computes no drift partition) both reasons are inert -- the ledger
+        # entry is written but nothing consumes it before the next
+        # reset_graph() clears it.
         _always_stale_reasons = {
             "predicate_synonym_collapse",
             "contradiction_same_pred",
@@ -6235,7 +6254,24 @@ class ConsolidationLoop:
                 continue
 
             if not pred:
-                # No predicate: not keyable — skip.
+                # No predicate: not keyable — skip.  When the entry still
+                # carries subject or object content, the drift partition's
+                # empty-content test (the ``not _entry_subj and not _entry_pred
+                # and not _entry_obj`` check that separates drift_orphan from
+                # drift_genuine_loss) would otherwise classify this key
+                # genuine_loss; ledger it so it lands in drift_intended_removal
+                # instead.  No survivor: the key never re-enters the merge
+                # surface under any key.  Also reached by the interim
+                # dedup_target_keys caller
+                # (:meth:`_materialize_consolidation_graph`), where it is
+                # inert — see the ``unkeyable_no_predicate`` note at
+                # ``_always_stale_reasons``.  An entry with NO content at all
+                # (subject, predicate, AND object empty) is the sibling
+                # no-content case the drift partition already classifies
+                # orphan on its own — leave it unledgered so that
+                # classification is undisturbed.
+                if subj or obj:
+                    self.merger.record_removal(key, reason="unkeyable_no_predicate")
                 logger.debug(
                     "_build_registry_true_relations: key=%s has no predicate — skipping",
                     key,
@@ -6834,11 +6870,14 @@ class ConsolidationLoop:
         Two channels, one rule:
 
         - ``merger.removal_ledger`` — every entry carrying a ``survivor_key``
-          (a ``dedup`` or ``predicate_synonym_collapse`` collapse).  The
-          survivor inherits the retired keys' counts.  Entries without one are
-          skipped: a contradiction superseded the fact with a DIFFERENT one and
-          an enrichment same_as contracted nodes, so neither has a survivor to
-          credit.
+          (a ``dedup`` collapse, a ``predicate_synonym_collapse``, or a
+          same-value ``attribute_key_superseded`` overwrite).  The survivor
+          inherits the retired keys' counts.  Entries without one are
+          skipped: a contradiction superseded the fact with a DIFFERENT one,
+          an enrichment same_as contracted nodes, a different-value
+          ``attribute_key_superseded`` overwrite is the same contradiction
+          shape, and an ``unkeyable_no_predicate`` removal has no surviving
+          fact at all — none of those four has a survivor to credit.
         - ``adopt_reinforcements`` — every merge run with
           ``credit_adopt_reinforcement=True`` re-sighting an already-keyed
           fact: the interim recital-dedup Case-1-adopt (a recited pending

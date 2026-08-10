@@ -39,6 +39,22 @@ from paramem.utils.identity import is_speaker_id
 
 logger = logging.getLogger(__name__)
 
+#: The complete, executable vocabulary of ``GraphMerger.removal_ledger``
+#: reason codes.  :meth:`GraphMerger.record_removal` — the ledger's ONE
+#: writer — rejects any other reason.  Consumers that enumerate reason codes
+#: (e.g. :func:`paramem.utils.artifacts.on_removal_ledger`) reference this
+#: constant rather than restating the list, so the two can never drift apart.
+REMOVAL_REASONS: frozenset[str] = frozenset(
+    {
+        "dedup",
+        "contradiction_same_pred",
+        "enrichment_same_as",
+        "predicate_synonym_collapse",
+        "attribute_key_superseded",
+        "unkeyable_no_predicate",
+    }
+)
+
 
 def min_nonempty(a: str, b: str) -> str:
     """Return the lexicographically smallest of *a* and *b*, treating "" as absent.
@@ -266,20 +282,36 @@ class GraphMerger:
         # drift-accounting site in consolidation to distinguish intended dedup
         # from genuine reconstruction loss.
         self.collapsed: list[str] = []
-        # removal_ledger: records every edge REMOVAL keyed by the removed edge's
-        # ik_key, with a stable reason code.  Reset in reset_graph(), NOT in
-        # merge() — must survive the fold's reset_graph→re-merge→enrich→classify
-        # span.
-        # reason ∈ {"dedup", "contradiction_same_pred",
-        #            "enrichment_same_as", "predicate_synonym_collapse"}
+        # removal_ledger: records, keyed by ik_key with a stable reason code,
+        # every reason a previously-registered key is absent from the merged
+        # graph this fold — an edge/attribute removal (dedup, contradiction,
+        # synonym collapse, enrichment contraction, attribute-key
+        # supersession) OR a key that was never merged at all
+        # (unkeyable_no_predicate — its store entry has no predicate, so it
+        # never reaches the merge surface under any key).  Reset in
+        # reset_graph(), NOT in merge() — must survive the fold's
+        # reset_graph→re-merge→enrich→classify span.  The ONLY writer is
+        # :meth:`record_removal`; every in-module removal site calls it, and
+        # the two out-of-module writers
+        # (:meth:`~paramem.training.graph_tier.GraphTierRefiner.run_normalization`
+        # and :func:`~paramem.training.graph_enrich.enrich_graph`, both of
+        # which already hold the merger they mutate) call it through the
+        # merger they were constructed/passed with.
+        # reason ∈ :data:`REMOVAL_REASONS` (``record_removal`` rejects any
+        # other value).
         # ``survivor_key`` is present exactly when the removed fact carries
-        # forward under another indexed key — "dedup" and
-        # "predicate_synonym_collapse".  It is the fold's reinforcement-credit
-        # input: the survivor inherits the removed keys' maturity, which would
-        # otherwise be discarded when they are staled.  A contradiction is a
-        # supersession (a DIFFERENT fact won, see old_object/new_object) and an
-        # enrichment same_as is a node contraction (see keep_node), so neither
-        # designates a surviving key and neither carries a ``survivor_key``.
+        # forward under another indexed key — always true for "dedup" and
+        # "predicate_synonym_collapse", and true for "attribute_key_superseded"
+        # ONLY when the same value carries forward under the new key (a
+        # different value winning is the contradiction shape — see
+        # old_object/new_object — and omits it).  It is the fold's
+        # reinforcement-credit input: the survivor inherits the removed keys'
+        # maturity, which would otherwise be discarded when they are staled.
+        # A contradiction (either the edge kind or the different-value
+        # attribute-key kind) is a supersession (a DIFFERENT fact won, see
+        # old_object/new_object), an enrichment same_as is a node contraction
+        # (see keep_node), and an unkeyable-no-predicate removal has no
+        # surviving fact at all, so none of those carries a ``survivor_key``.
         self.removal_ledger: dict[str, dict] = {}
         # adopt_reinforcements: main-tier ik_key -> (last_seen, first_seen) recorded
         # by any merge called with credit_adopt_reinforcement=True, from either
@@ -434,7 +466,12 @@ class GraphMerger:
                 node = self.graph.nodes[subject]
                 node_attrs = node.get("attributes", {})
                 attr_key = canonical_id(_strip_has_prefix(relation.predicate), mode="full")
-                node_attrs[attr_key] = canonical_id(relation.object, mode="spaces")
+                # Read the incumbent value BEFORE the write below overwrites it —
+                # the supersession guard needs to compare old vs new value, and
+                # once overwritten the old value is gone.
+                incumbent_value = node_attrs.get(attr_key)
+                new_value = canonical_id(relation.object, mode="spaces")
+                node_attrs[attr_key] = new_value
                 node["attributes"] = node_attrs
                 if relation.indexed_key:
                     # Node analog of the edge ``_IK_KEY_ATTR`` — lets the
@@ -442,7 +479,34 @@ class GraphMerger:
                     # (``ConsolidationLoop._build_all_edge_entries_into``)
                     # replay this key's registry-true content instead of
                     # re-minting it every cycle.
-                    node.setdefault("attribute_keys", {})[attr_key] = relation.indexed_key
+                    attr_keys = node.setdefault("attribute_keys", {})
+                    incumbent_key = attr_keys.get(attr_key)
+                    if incumbent_key is not None and incumbent_key != relation.indexed_key:
+                        # A prior key already registered for this
+                        # (subject, attribute) pair is about to be overwritten.
+                        # Same value under two keys is a true carry-forward (the
+                        # documented condition for survivor_key): the displaced
+                        # key's reinforcement maturity flows to the survivor via
+                        # _credit_reinforcement instead of being silently
+                        # discarded.  A DIFFERENT value winning is the
+                        # contradiction shape — a different fact won, not a
+                        # carry-forward — so it is ledgered (still routed to
+                        # drift_intended_removal, never genuine_loss) WITHOUT a
+                        # survivor_key: no credit inheritance, no promotion.
+                        if incumbent_value == new_value:
+                            self.record_removal(
+                                incumbent_key,
+                                reason="attribute_key_superseded",
+                                survivor_key=relation.indexed_key,
+                            )
+                        else:
+                            self.record_removal(
+                                incumbent_key,
+                                reason="attribute_key_superseded",
+                                old_object=incumbent_value,
+                                new_object=new_value,
+                            )
+                    attr_keys[attr_key] = relation.indexed_key
                 continue
 
             # Build a display-name map for endpoints not resolved through entities.
@@ -490,6 +554,60 @@ class GraphMerger:
             self.graph.number_of_edges(),
         )
         return self.graph
+
+    def record_removal(
+        self,
+        indexed_key: str,
+        *,
+        reason: str,
+        survivor_key: "str | None" = None,
+        **detail,
+    ) -> None:
+        """Record one reason *indexed_key* is absent from the merged graph.
+
+        The ONE writer of ``removal_ledger`` across the three modules that
+        record removals (this module, :mod:`paramem.training.graph_tier`, and
+        :mod:`paramem.training.graph_enrich`) — no other line anywhere writes
+        ``removal_ledger`` directly.  Covers both an edge/attribute removal
+        (dedup, contradiction, synonym collapse, enrichment contraction,
+        attribute-key supersession) and a key that was never merged at all
+        (``unkeyable_no_predicate``).
+
+        Args:
+            indexed_key: The removed key's ``ik_key`` string — the ledger's
+                dict key.
+            reason: A stable reason code from the documented vocabulary (see
+                the ``removal_ledger`` field comment in ``__init__``), e.g.
+                ``"dedup"``, ``"contradiction_same_pred"``,
+                ``"predicate_synonym_collapse"``, ``"enrichment_same_as"``,
+                ``"attribute_key_superseded"``, or ``"unkeyable_no_predicate"``.
+            survivor_key: Set exactly when the removed fact carries forward
+                under another indexed key — that is what the fold's
+                reinforcement-credit pass
+                (:meth:`~paramem.training.consolidation.ConsolidationLoop._credit_reinforcement`)
+                consumes.  Omitted from the stored entry when ``None`` (the
+                default), so removal shapes that carry no survivor (a
+                contradiction, an enrichment same_as contraction, an
+                unkeyable-no-predicate skip) are unchanged on disk.
+            **detail: Reason-specific fields stored verbatim on the entry,
+                e.g. ``pre_surfaces`` for a dedup, ``old_object``/
+                ``new_object`` for a contradiction, ``survivor_predicate`` for
+                a synonym collapse, or ``keep_node`` for an enrichment
+                contraction.
+
+        Raises:
+            ValueError: when *reason* is not one of :data:`REMOVAL_REASONS`.
+        """
+        if reason not in REMOVAL_REASONS:
+            raise ValueError(
+                f"record_removal: reason={reason!r} is not in REMOVAL_REASONS "
+                f"({sorted(REMOVAL_REASONS)})"
+            )
+        entry: dict = {"reason": reason}
+        if survivor_key is not None:
+            entry["survivor_key"] = survivor_key
+        entry.update(detail)
+        self.removal_ledger[indexed_key] = entry
 
     def merge_relations(
         self,
@@ -892,10 +1010,11 @@ class GraphMerger:
                 _surviving_obj_surface = (
                     self.graph.nodes.get(obj, {}).get("attributes", {}).get("name", obj)
                 )
-                self.removal_ledger[relation.indexed_key] = {
-                    "reason": "dedup",
-                    "survivor_key": surviving_ik,
-                    "pre_surfaces": {
+                self.record_removal(
+                    relation.indexed_key,
+                    reason="dedup",
+                    survivor_key=surviving_ik,
+                    pre_surfaces={
                         "incoming": {
                             "subject": relation.subject,
                             "predicate": relation.predicate,
@@ -907,7 +1026,7 @@ class GraphMerger:
                             "object": _surviving_obj_surface,
                         },
                     },
-                }
+                )
             # Keyless-onto-keyed re-sighting: the incoming relation carries no
             # ik_key (a pending re-observation, never stamped at capture) but
             # the existing edge already carries one — the fact was already
@@ -1027,11 +1146,12 @@ class GraphMerger:
                                 continue  # at max_ls — coexist (tied rivals kept)
                             _removed_ik = rival_data.get(_IK_KEY_ATTR)
                             if _removed_ik:
-                                self.removal_ledger[_removed_ik] = {
-                                    "reason": "contradiction_same_pred",
-                                    "old_object": rival_obj,
-                                    "new_object": winner_obj,
-                                }
+                                self.record_removal(
+                                    _removed_ik,
+                                    reason="contradiction_same_pred",
+                                    old_object=rival_obj,
+                                    new_object=winner_obj,
+                                )
                             self.graph.remove_edge(subject, rival_obj, key=rival_key)
                             self.contradictions_resolved.append(
                                 {
@@ -1056,11 +1176,12 @@ class GraphMerger:
                         if incoming_ls < max_ls:
                             # Incoming loses to a rival at max_ls; skip Case-3 insertion.
                             if relation.indexed_key:
-                                self.removal_ledger[relation.indexed_key] = {
-                                    "reason": "contradiction_same_pred",
-                                    "old_object": obj,
-                                    "new_object": winner_obj,
-                                }
+                                self.record_removal(
+                                    relation.indexed_key,
+                                    reason="contradiction_same_pred",
+                                    old_object=obj,
+                                    new_object=winner_obj,
+                                )
                             self.contradictions_resolved.append(
                                 {
                                     "method": "model_cardinality",
@@ -1130,7 +1251,7 @@ class GraphMerger:
         - ``_predicate_cardinality`` — per-predicate COEXIST/REPLACE cache
         - ``contradictions_resolved`` — log of prior resolves
         - ``collapsed`` — prior fold's Case-1 deduplicated (incoming) keys
-        - ``removal_ledger`` — prior fold's reason-coded edge removal records
+        - ``removal_ledger`` — prior fold's reason-coded key-absence records
         - ``adopt_reinforcements`` — prior fold's dedup-adopt credited main keys
 
         Does NOT touch ``model``, ``tokenizer``, or the prompt strings — those

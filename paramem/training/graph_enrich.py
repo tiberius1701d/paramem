@@ -987,10 +987,7 @@ def enrich_graph(
     # the fact does not carry forward under another indexed key, so there is
     # no maturity to inherit.  ``keep_node`` is the surviving NODE.
     for _ik, _keep in _collapsed_ik.items():
-        merger.removal_ledger[_ik] = {
-            "reason": "enrichment_same_as",
-            "keep_node": _keep,
-        }
+        merger.record_removal(_ik, reason="enrichment_same_as", keep_node=_keep)
     return {
         "chunks": calls_made,
         "new_edges": total_new,

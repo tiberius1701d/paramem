@@ -1976,6 +1976,120 @@ class TestRemovalLedger:
             f"{pre.get('surviving', {}).get('predicate')!r}"
         )
 
+    def test_record_removal_omits_a_none_survivor_key(self):
+        """record_removal with survivor_key=None (the default) omits the key
+        entirely from the stored entry, so removal shapes that never carry a
+        survivor (a contradiction, an enrichment same_as contraction, an
+        unkeyable-no-predicate skip) stay byte-identical to before
+        record_removal existed.
+
+        Direct unit coverage of ``record_removal``'s own contract. The real
+        production writer that structurally never carries a survivor_key is
+        ``enrichment_same_as`` (a node contraction has no surviving indexed
+        key), driven through its actual call site in
+        ``tests/test_graph_enrichment.py::TestEnrichmentRemovalLedger
+        ::test_same_as_contraction_writes_keyed_edge_to_ledger``.
+        ``predicate_synonym_collapse``'s real writer
+        (``GraphTierRefiner.run_normalization``) cannot reach a no-survivor
+        entry at all: whenever it records anything, the survivor edge either
+        already carried its own key or adopted the best-ranked retired one
+        first, so ``survivor_key`` is always set on any entry that writer
+        produces (verified empirically — a keyless-survivor group with two
+        keyed retired predicates ledgers the non-adopted one WITH the
+        adopted key as its survivor, never without).
+        """
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        m.record_removal("key_x", reason="enrichment_same_as", keep_node="alice")
+
+        entry = m.removal_ledger["key_x"]
+        assert "survivor_key" not in entry, (
+            f"survivor_key must be absent from the entry when None; got {entry}"
+        )
+        assert entry == {"reason": "enrichment_same_as", "keep_node": "alice"}, (
+            f"unexpected entry shape: {entry}"
+        )
+
+    def test_record_removal_is_the_only_ledger_writer(self):
+        """AST scan: no mutation of ``removal_ledger`` exists outside
+        :meth:`GraphMerger.record_removal` (and the whole-object reset in
+        :meth:`GraphMerger.reset_graph`) anywhere under ``paramem/``.
+        Guards against a new inline writer drifting the entry shape or the
+        survivor rule apart from the shared method.  Pattern mirrors
+        ``tests/test_persist_fold_guard.py``.
+
+        Catches three shapes of mutation on any attribute chain ending in
+        ``removal_ledger`` (``self.removal_ledger``, ``self._merger
+        .removal_ledger``, ``merger.removal_ledger``, ...):
+
+        - subscript assignment (``removal_ledger[key] = ...``)
+        - augmented assignment (``removal_ledger[key] += ...`` or
+          ``removal_ledger += ...``)
+        - a mutating method call (``.update``/``.setdefault``/``.pop``/
+          ``.clear``) invoked directly on ``removal_ledger``
+
+        Reads (``.get``, ``.items``, iteration, membership, plain rebinding
+        of the whole attribute as in ``__init__``/``reset_graph``) are not
+        matched — only genuine ledger-content mutation is a violation.
+        """
+        import ast
+        from pathlib import Path
+
+        _MUTATING_METHODS = frozenset({"update", "setdefault", "pop", "clear"})
+        _EXEMPT_FUNC_NAMES = frozenset({"record_removal", "reset_graph"})
+
+        repo_root = Path(__file__).parent.parent
+        paramem_root = repo_root / "paramem"
+
+        def _is_removal_ledger_attr(node: ast.AST) -> bool:
+            return isinstance(node, ast.Attribute) and node.attr == "removal_ledger"
+
+        def _exempt_lines(tree: ast.Module) -> set[int]:
+            lines: set[int] = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in _EXEMPT_FUNC_NAMES
+                ):
+                    lines |= {n.lineno for n in ast.walk(node) if hasattr(n, "lineno")}
+            return lines
+
+        violations: list[str] = []
+        for path in sorted(paramem_root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            exempt_lines = _exempt_lines(tree)
+            rel = path.relative_to(repo_root)
+
+            for node in ast.walk(tree):
+                lineno = getattr(node, "lineno", None)
+                if lineno is not None and lineno in exempt_lines:
+                    continue
+
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Subscript) and _is_removal_ledger_attr(
+                            target.value
+                        ):
+                            violations.append(f"{rel}:{node.lineno} (subscript assign)")
+
+                elif isinstance(node, ast.AugAssign):
+                    target = node.target
+                    if (
+                        isinstance(target, ast.Subscript) and _is_removal_ledger_attr(target.value)
+                    ) or _is_removal_ledger_attr(target):
+                        violations.append(f"{rel}:{node.lineno} (aug-assign)")
+
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _MUTATING_METHODS
+                    and _is_removal_ledger_attr(node.func.value)
+                ):
+                    violations.append(f"{rel}:{node.lineno} (.{node.func.attr}() call)")
+
+        assert not violations, f"removal_ledger mutated outside record_removal: {violations}"
+
 
 class TestRecencyAnyEmpty:
     """Recency rule: an empty last_seen sorts as the oldest possible timestamp.

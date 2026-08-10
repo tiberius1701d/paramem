@@ -287,9 +287,10 @@ def on_removal_ledger(ledger: dict) -> None:
     """Persist the merger's removal ledger.
 
     Writes ``<base>/fold/removal_ledger.json``.  The ledger maps each removed
-    edge's ``ik_key`` to a dict carrying ``"reason"`` (one of ``"dedup"``,
-    ``"contradiction_same_pred"``, ``"enrichment_same_as"``) and per-reason
-    detail fields.
+    key's ``ik_key`` to a dict carrying ``"reason"`` (one of
+    :data:`paramem.graph.merger.REMOVAL_REASONS` — the executable vocabulary;
+    :meth:`~paramem.graph.merger.GraphMerger.record_removal` rejects any
+    other value) and per-reason detail fields.
 
     Called once per fold AFTER the drift classifier has consumed the ledger
     (the ledger is final — ``reset_graph`` cleared it before the fold's
