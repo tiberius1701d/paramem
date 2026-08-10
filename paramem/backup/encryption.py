@@ -39,6 +39,7 @@ from paramem.backup.age_envelope import (
     is_age_envelope,
 )
 from paramem.backup.types import FatalConfigError
+from paramem.memory.persistence import ERASE_MARKER_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,10 @@ def infra_paths(data_dir: Path) -> list[Path]:
       in-place by :func:`~paramem.models.loader._encrypt_adapter_safetensors`
       at save time; decrypted into anonymous RAM at load time via
       :func:`~paramem.models.loader._adapter_slot_for_load`.
+    - ``adapters/erase_in_flight.json`` — the durable hard-erase-in-flight
+      marker (:func:`~paramem.memory.persistence.write_erase_marker`),
+      transient by design (normally absent) but a genuine age
+      infrastructure file whenever it exists.
 
     Parameters
     ----------
@@ -361,6 +366,13 @@ def infra_paths(data_dir: Path) -> list[Path]:
     # simhash_registry.json has been eliminated; simhashes now live inside
     # indexed_key_registry.json under the "simhash" key.
     adapters_root = data_dir / "adapters"
+    # Erase-in-flight marker: written by erase_keys_and_restamp_manifest
+    # before it mutates any tier's registry, cleared once the erase (and any
+    # downstream reap) has fully completed. One marker per adapter store, at
+    # the adapters root regardless of which tier(s) it names — always
+    # returned here, like every other fixed-location infra path, so rotation
+    # and encrypt-infra cover it whenever it exists.
+    paths.append(adapters_root / ERASE_MARKER_FILENAME)
     for _tier in ("episodic", "semantic", "procedural"):
         _tier_root = adapters_root / _tier
         # Main-slot files at the tier root.

@@ -34,6 +34,15 @@ Coverage
   failure, which propagates as a 500).
 - Auth: ``/speaker/forget`` carries the ``require_admin`` dependency in the
   real app route table.
+- ``TestEraseMarker``: the durable hard-erase-in-flight marker
+  (``persistence.write_erase_marker``/``read_erase_marker``/``clear_erase_marker``)
+  — written before any tier mutation, naming only tiers actually affected;
+  skipped when the erase resolves to zero affected tiers; survives any
+  caller-side failure after the write (reap failure, ``write_key_metadata``
+  failure); cleared on every successful completion through both erase doors
+  (``/speaker/forget`` and ``/debug/erase-keys``) even when nothing was
+  reaped; fail-safe shape/version validation on read; encrypted round-trip
+  and ``infra_paths`` enumeration under Security ON.
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import networkx as nx
+import pytest
 from fastapi.testclient import TestClient
 from peft import PeftModel
 
@@ -62,9 +72,14 @@ from paramem.adapters.manifest import (
 from paramem.memory.entry import compute_simhash
 from paramem.memory.persistence import (
     _IK_KEY_ATTR,
+    ERASE_MARKER_FILENAME,
+    ERASE_MARKER_SCHEMA_VERSION,
+    clear_erase_marker,
     iter_entries,
     load_memory_from_disk,
+    read_erase_marker,
     save_memory_to_disk,
+    write_erase_marker,
 )
 from paramem.memory.store import MemoryStore
 from paramem.server.incidents import read_incidents, record_incident
@@ -2370,3 +2385,460 @@ class TestReapFailure:
 
         assert resp.status_code == 500
         assert state["consolidating"] is False
+
+
+# ---------------------------------------------------------------------------
+# Durable erase-in-flight marker: written before any tier mutation, cleared
+# once the erase and its downstream reap (if any) have both completed.
+# ---------------------------------------------------------------------------
+
+
+class TestEraseMarker:
+    """``erase_keys_and_restamp_manifest`` writes ``erase_in_flight.json``
+    before ``store.discard_keys`` runs; ``_erase_keys_with_reap`` (the
+    single sequence shared by ``/speaker/forget`` and ``/debug/erase-keys``)
+    clears it once the erase and any downstream reap have both completed —
+    whether or not a tier was actually emptied."""
+
+    def test_marker_is_written_before_any_mutation(self, tmp_path, monkeypatch):
+        """A raise from ``store.discard_keys`` still leaves the marker on
+        disk, naming every tier that knew an erased key: the marker is
+        written before ``discard_keys`` runs, and nothing clears it on this
+        failure path (the clear site is reached only after a completed
+        call)."""
+        speaker_id = "speaker0"
+        key = "graph1"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry("episodic")
+        ep_reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("discard_keys failed")
+
+        monkeypatch.setattr(real_store, "discard_keys", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500, resp.text
+        marker_path = cfg.adapter_dir / ERASE_MARKER_FILENAME
+        assert marker_path.exists()
+        assert read_erase_marker(cfg.adapter_dir) == ["episodic"]
+
+    def test_marker_names_only_tiers_that_knew_an_erased_key(self, tmp_path, monkeypatch):
+        """A tier that never held any of the erased keys is absent from the
+        marker's ``tiers`` list, even though it has its own registry."""
+        speaker_id = "speaker0"
+        key_to_forget = "graph1"
+        unrelated_key = "graph9"
+
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry("episodic")
+        ep_reg.add(key_to_forget)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+        sem_reg = real_store.registry("semantic")
+        sem_reg.add(unrelated_key)
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("discard_keys failed")
+
+        monkeypatch.setattr(real_store, "discard_keys", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500, resp.text
+        assert read_erase_marker(cfg.adapter_dir) == ["episodic"]
+
+    def test_malformed_tier_name_pre_mutation_raise_leaves_no_marker(self, tmp_path, monkeypatch):
+        """A malformed interim tier name aborts before ANY mutation — the
+        marker write happens only after the resolution loop completes
+        cleanly, so a refused erase leaves no marker behind."""
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+        tier_name = f"{INTERIM_NAME_PREFIX}foo"
+        key_to_forget = "graph1"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        malformed_reg = real_store.registry(tier_name)
+        malformed_reg.add(key_to_forget)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="episodic", first_seen=""
+        )
+
+        cfg = _make_config(tmp_path)
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500, resp.text
+        assert not (cfg.adapter_dir / ERASE_MARKER_FILENAME).exists()
+
+    def test_marker_survives_a_reap_failure(self, tmp_path, monkeypatch):
+        """A failure downstream of the marker write — in the reap, not in
+        ``erase_keys_and_restamp_manifest`` itself — must NOT clear the
+        marker: the clear call is unreached on a failed request, and that
+        is the point — a failed request leaves the marker as the record of
+        what it was in the middle of doing. Mirrors
+        ``TestReapFailure.test_reap_failure_returns_500_and_clears_flag``."""
+        tier_name = "episodic"
+        key = "graph1"
+        speaker_id = "speaker0"
+
+        cfg = _make_config(tmp_path)
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+        reg.save(cfg.adapter_dir / tier_name / "indexed_key_registry.json")
+
+        loop = _make_loop_with_store(real_store)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("reap failed")
+
+        monkeypatch.setattr("paramem.memory.persistence.reap_tier_artifacts", _boom)
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500, resp.text
+        assert (cfg.adapter_dir / ERASE_MARKER_FILENAME).exists()
+
+    def test_marker_survives_a_write_key_metadata_failure(self, tmp_path, monkeypatch):
+        """Same guarantee for a failure in the post-reap bookkeeping step
+        (``loop.write_key_metadata``) — the clear call sits after it, so a
+        raise there must also leave the marker in place."""
+        speaker_id = "speaker0"
+        key = "graph1"
+
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry("episodic")
+        reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        loop.write_key_metadata.side_effect = RuntimeError("write_key_metadata failed")
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 500, resp.text
+        assert (cfg.adapter_dir / ERASE_MARKER_FILENAME).exists()
+
+    def test_marker_is_cleared_after_the_reap(self, tmp_path, monkeypatch):
+        """A forget that empties the only tier holding the key: the tier is
+        reaped instead of re-stamped, and the marker is gone once the
+        request completes."""
+        tier_name = "episodic"
+        key = "graph1"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        cfg = _make_config(tmp_path)
+        model = _make_peft_model(tier_name, "semantic", "procedural")
+        loop = _make_loop_with_store(real_store)
+        loop.model = model
+        loop.ensure_adapters = MagicMock(side_effect=lambda: loop.model)
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["reaped_tiers"] == [tier_name]
+        assert not (cfg.adapter_dir / ERASE_MARKER_FILENAME).exists()
+
+    def test_marker_is_cleared_when_the_erase_empties_nothing_via_speaker_forget(
+        self, tmp_path, monkeypatch
+    ):
+        """A forget that erases a key but leaves a survivor in the same
+        tier — re-stamped, not reaped — still clears the marker: the one
+        clear site in ``_erase_keys_with_reap`` must fire on every
+        successful completion, not only on the branch that emptied a tier,
+        or a marker could linger past the erase it describes."""
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "speaker0"
+
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key_to_forget)
+        reg.add(key_to_keep)
+        real_store.set_bookkeeping(
+            key_to_forget, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["reaped_tiers"] == []
+        assert not (cfg.adapter_dir / ERASE_MARKER_FILENAME).exists()
+
+    def test_marker_is_cleared_when_the_erase_empties_nothing_via_debug_erase_keys(
+        self, tmp_path, monkeypatch
+    ):
+        """Same guarantee through the second door onto the shared helper:
+        ``POST /debug/erase-keys`` also clears the marker even when nothing
+        is reaped — one clear site, ``_erase_keys_with_reap``, serves both
+        doors."""
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+
+        real_store = MemoryStore(replay_enabled=True)
+        reg = real_store.registry(tier_name)
+        reg.add(key_to_forget)
+        reg.add(key_to_keep)
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=None,
+            buffer=MagicMock(),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/debug/erase-keys", json={"keys": [key_to_forget], "confirm": True})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["erased"] == [key_to_forget]
+        assert not (cfg.adapter_dir / ERASE_MARKER_FILENAME).exists()
+
+    def test_zero_affected_tiers_writes_no_marker(self, tmp_path, monkeypatch):
+        """A key with a bookkeeping row but no matching registry entry in
+        any tier (reachable via ``/speaker/forget``, which resolves its key
+        set from ``store.iter_bookkeeping()`` alone) makes the step-1
+        resolution loop find no affected tier — no marker is written, and
+        ``write_infra_json``'s ``mkdir`` side effect never creates
+        ``adapter_dir`` for a mutation that never happens."""
+        speaker_id = "speaker0"
+        key = "graph1"
+
+        real_store = MemoryStore(replay_enabled=True)
+        real_store.set_bookkeeping(
+            key, speaker_id=speaker_id, relation_type="factual", first_seen=""
+        )
+        # Deliberately NOT added to any tier's KeyRegistry — iter_bookkeeping
+        # still resolves it for the speaker, but no registry "knows" it.
+
+        loop = _make_loop_with_store(real_store)
+        cfg = _make_config(tmp_path)
+        # _make_config already creates adapter_dir for fixture convenience;
+        # remove it so the assertion below actually proves no mkdir happened
+        # on this request's path, not just that a pre-existing dir persisted.
+        cfg.adapter_dir.rmdir()
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["erased_keys"] == [key]
+        assert not cfg.adapter_dir.exists(), (
+            "no tier was affected, so write_erase_marker (and its mkdir side effect) must never run"
+        )
+
+    def test_unreadable_marker_reads_as_empty_and_errors(self, tmp_path, caplog):
+        """Garbage bytes at the marker path: ``read_erase_marker`` returns
+        ``[]`` (authorise nothing) and logs an ERROR rather than raising or
+        silently propagating a parse failure."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+        (adapter_dir / ERASE_MARKER_FILENAME).write_bytes(b"not json{{{")
+
+        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
+        result = read_erase_marker(adapter_dir)
+
+        assert result == []
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("unreadable marker" in msg for msg in error_messages), (
+            f"Expected an unreadable-marker ERROR, got: {error_messages}"
+        )
+
+    def test_absent_marker_reads_as_empty_silently(self, tmp_path, caplog):
+        """No marker file at all: ``read_erase_marker`` returns ``[]``
+        without logging — there is no erase in flight to explain."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+
+        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
+        assert read_erase_marker(adapter_dir) == []
+        assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+
+    def test_clear_erase_marker_on_absent_file_does_not_raise(self, tmp_path):
+        """Clearing an already-absent marker is a no-op, not an error."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+        clear_erase_marker(adapter_dir)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(
+                {"schema_version": ERASE_MARKER_SCHEMA_VERSION},
+                id="missing_tiers",
+            ),
+            pytest.param(
+                {"schema_version": ERASE_MARKER_SCHEMA_VERSION, "tiers": "episodic"},
+                id="tiers_not_a_list",
+            ),
+            pytest.param(["episodic"], id="payload_not_a_dict"),
+            pytest.param(
+                {"schema_version": ERASE_MARKER_SCHEMA_VERSION, "tiers": ["episodic", 42]},
+                id="tiers_has_non_string_member",
+            ),
+            pytest.param(
+                {"schema_version": 99, "tiers": ["episodic"]},
+                id="unknown_schema_version",
+            ),
+        ],
+    )
+    def test_shape_validation_rejects_malformed_marker(self, tmp_path, caplog, payload):
+        """Well-formed JSON that fails the marker's shape/version contract:
+        ``read_erase_marker`` returns ``[]`` and logs an ERROR for each of a
+        missing ``"tiers"`` key, a non-list ``"tiers"``, a non-dict payload,
+        a non-string ``"tiers"`` member, and an unrecognised
+        ``schema_version`` — an unfamiliar shape must authorise nothing
+        rather than being guessed at."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+        (adapter_dir / ERASE_MARKER_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
+        result = read_erase_marker(adapter_dir)
+
+        assert result == []
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("unreadable marker" in msg for msg in error_messages), (
+            f"Expected an unreadable-marker ERROR for payload {payload!r}, got: {error_messages}"
+        )
+
+    def test_schema_version_round_trips(self, tmp_path):
+        """A marker written by ``write_erase_marker`` carries the current
+        ``schema_version`` and reads back its tiers — pins the write/read
+        contract against ``ERASE_MARKER_SCHEMA_VERSION`` drifting silently
+        out of sync between the writer and the reader's version check."""
+        adapter_dir = tmp_path / "adapters"
+        adapter_dir.mkdir(parents=True)
+        write_erase_marker(adapter_dir, ["episodic", "semantic"])
+
+        raw = json.loads((adapter_dir / ERASE_MARKER_FILENAME).read_bytes().decode("utf-8"))
+        assert raw["schema_version"] == ERASE_MARKER_SCHEMA_VERSION
+        assert read_erase_marker(adapter_dir) == ["episodic", "semantic"]
+
+    def test_encrypted_round_trip(self, tmp_path, monkeypatch):
+        """Under Security ON (daily identity loaded), the marker is written
+        as a genuine age envelope, decrypts back through
+        ``read_erase_marker``, and is enumerated by ``infra_paths`` so
+        rotation and ``encrypt-infra`` cover it like every other infra
+        file."""
+        from paramem.backup.age_envelope import AGE_MAGIC
+        from paramem.backup.encryption import infra_paths
+        from paramem.backup.key_store import _clear_daily_identity_cache
+        from tests.cli.test_encrypt_infra_cli import _setup_daily
+
+        _clear_daily_identity_cache()
+        try:
+            _setup_daily(tmp_path, monkeypatch)
+
+            data_dir = tmp_path / "data"
+            adapter_dir = data_dir / "adapters"
+            adapter_dir.mkdir(parents=True)
+
+            write_erase_marker(adapter_dir, ["episodic"])
+
+            marker_path = adapter_dir / ERASE_MARKER_FILENAME
+            assert marker_path.read_bytes().startswith(AGE_MAGIC)
+            assert read_erase_marker(adapter_dir) == ["episodic"]
+            assert marker_path in infra_paths(data_dir)
+        finally:
+            _clear_daily_identity_cache()

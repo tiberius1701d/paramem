@@ -38,6 +38,12 @@ Public API
   half-deleted in place.
 - :func:`resume_pending_reaps` — boot-time sweep that finishes any deletion
   :func:`reap_tier_artifacts` left stranded under ``.pending-delete/``.
+- :func:`write_erase_marker` / :func:`read_erase_marker` / :func:`clear_erase_marker` —
+  the durable "hard erase in flight" marker: names the tier set a hard
+  erase is about to mutate, so a later boot can tell an interrupted erase
+  apart from registry corruption. Written by
+  :func:`erase_keys_and_restamp_manifest` before any mutation; cleared by
+  the erase door once its downstream reap has also completed.
 
 Internal edge attribute naming
 -------------------------------
@@ -65,6 +71,7 @@ import json
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -568,6 +575,114 @@ def resume_pending_reaps(adapter_dir: Path) -> None:
         )
 
 
+# Filename for the durable "hard erase in flight" marker: written by
+# :func:`erase_keys_and_restamp_manifest` before it mutates any tier, and
+# cleared by the erase door (``_erase_keys_with_reap``,
+# ``paramem/server/app.py``) once the erase and its downstream reap have
+# both completed. Lives at the adapter-dir root, beside ``.pending-delete/``
+# — a property of the adapter store as a whole, not of any one tier.
+ERASE_MARKER_FILENAME: Final[str] = "erase_in_flight.json"
+ERASE_MARKER_SCHEMA_VERSION: Final[int] = 1
+
+
+def write_erase_marker(adapter_dir: Path, tiers: list[str]) -> None:
+    """Record that a hard erase is about to mutate *tiers*.
+
+    Names the tier set a hard erase is about to mutate, so a later boot can
+    distinguish an interrupted erase from registry corruption — the two
+    otherwise leave a byte-identical disk shape (empty/absent registry
+    beside a slot manifest still stamping the pre-erase key set).
+
+    Goes through the same envelope-aware writer the rest of this module
+    uses (:func:`~paramem.backup.encryption.write_infra_json`), so the
+    marker is age-encrypted when a daily identity is loaded and plaintext
+    otherwise — no separate encryption branch here. It is a genuine age
+    infrastructure file when it exists, and is enumerated by
+    :func:`~paramem.backup.encryption.infra_paths` so key rotation and
+    ``paramem encrypt-infra`` cover it like every other infra file.
+
+    Args:
+        adapter_dir: Adapter store root (``config.adapter_dir``).
+        tiers: Tier names the erase is about to mutate.
+
+    Returns:
+        ``None``.
+    """
+    from paramem.backup.encryption import write_infra_json
+
+    payload = {
+        "schema_version": ERASE_MARKER_SCHEMA_VERSION,
+        "tiers": list(tiers),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_infra_json(Path(adapter_dir) / ERASE_MARKER_FILENAME, payload)
+
+
+def read_erase_marker(adapter_dir: Path) -> list[str]:
+    """Read the tier set a hard erase marked as in flight — fail-safe.
+
+    Returns ``[]`` silently when the marker file is absent: there is no
+    erase in flight to authorise anything against. On any other failure —
+    undecryptable, malformed JSON, a shape other than a dict with a
+    list-valued ``"tiers"`` key whose members are all strings, or a
+    ``schema_version`` other than :data:`ERASE_MARKER_SCHEMA_VERSION`
+    (this file may be read by a differently-versioned binary at a later
+    boot; refusing an unknown version rather than guessing its shape
+    mirrors :func:`~paramem.adapters.manifest.read_manifest`'s refusal on a
+    newer manifest schema) — this also returns ``[]``, but logs an ERROR. A
+    caller reading this marker uses it to authorise a boot-time action, so
+    an unreadable or unrecognised marker must resolve to "authorise
+    nothing" rather than silently propagate a parse failure or guess at an
+    unfamiliar shape.
+
+    Args:
+        adapter_dir: Adapter store root (``config.adapter_dir``).
+
+    Returns:
+        The tier names the marker records, or ``[]`` when the marker is
+        absent, unreadable, or of an unrecognised shape/version.
+    """
+    from paramem.backup.encryption import read_maybe_encrypted
+
+    path = Path(adapter_dir) / ERASE_MARKER_FILENAME
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"erase marker at {path} is not a JSON object")
+        tiers = data.get("tiers")
+        if not isinstance(tiers, list) or not all(isinstance(t, str) for t in tiers):
+            raise ValueError(f"erase marker at {path} has a malformed 'tiers' field")
+        if data.get("schema_version") != ERASE_MARKER_SCHEMA_VERSION:
+            raise ValueError(
+                f"erase marker at {path} has schema_version "
+                f"{data.get('schema_version')!r}, expected {ERASE_MARKER_SCHEMA_VERSION!r}"
+            )
+        return list(tiers)
+    except Exception:
+        logger.error("read_erase_marker: unreadable marker at %s", path, exc_info=True)
+        return []
+
+
+def clear_erase_marker(adapter_dir: Path) -> None:
+    """Remove the erase-in-flight marker; a no-op when it is absent.
+
+    Called by the erase door (``_erase_keys_with_reap``,
+    ``paramem/server/app.py``) once a hard erase and its downstream reap
+    have both fully completed, so the marker on disk never outlives the
+    erase it describes.
+
+    Args:
+        adapter_dir: Adapter store root (``config.adapter_dir``).
+
+    Returns:
+        ``None``.
+    """
+    (Path(adapter_dir) / ERASE_MARKER_FILENAME).unlink(missing_ok=True)
+
+
 def erase_keys_from_graph_file(path: Path, keys: set[str]) -> int:
     """Remove every edge whose ``ik_key`` is in *keys* from the graph at *path*.
 
@@ -789,23 +904,44 @@ def erase_keys_and_restamp_manifest(
        undecryptable on-disk registry (rotated key, corrupt age header)
        aborts before any mutation, for every affected tier at once — not
        mid-loop after an earlier tier has already committed.
-    2. ``store.discard_keys(keys, mode="erase")`` — hard erase from every
+    2. :func:`write_erase_marker`, naming every tier the step-1 loop found
+       affected — skipped entirely when that set is empty (every key in
+       *keys* is unknown to every tier's registry — e.g. a bookkeeping row
+       with no matching registry entry — so there is nothing to mutate and
+       nothing for a marker to name). Otherwise the last thing this function
+       does before any mutation, so a step-1 abort (malformed tier name,
+       undecryptable registry) leaves no marker behind: a refused erase
+       mutated nothing and has nothing to mark. A raise from any point after
+       this write is, by construction, an interrupted erase — exactly what
+       the marker exists to name. The marker itself is cleared by the
+       caller, once the reap fed by this function's return value has also
+       completed (see :func:`~paramem.memory.persistence.clear_erase_marker`)
+       — never here, since a caller-side reap failure after this function
+       returns is still an interrupted erase from the marker's point of
+       view.
+    3. ``store.discard_keys(keys, mode="erase")`` — hard erase from every
        tier's ``KeyRegistry`` (active + stale + simhash) and bookkeeping in
        one call, across every tier at once.
-    3. :func:`restamp_tier_manifest`, passing the step-1 pre-erase hash as
+    4. :func:`restamp_tier_manifest`, passing the step-1 pre-erase hash as
        *pre_sha* — the no-retrain commit primitive: persists the erased
        registry to disk, then re-stamps the tier's live weight slot (guards
        documented there) so :func:`~paramem.adapters.manifest.find_live_slot`
        rebinds it on restart.
-    4. :func:`erase_keys_from_graph_file` (fact content) — registry first,
-       content second (step 3 before step 4), so a crash between the two
+    5. :func:`erase_keys_from_graph_file` (fact content) — registry first,
+       content second (step 4 before step 5), so a crash between the two
        never leaves an orphaned graph edge no reader can resolve.
-    5. A tier reduced to zero known keys (``registry.list_known()`` empty)
+    6. A tier reduced to zero known keys (``registry.list_known()`` empty)
        is collected in the result for the caller to reap — its weight slot
-       was already re-stamped to ``key_count=0`` by step 3, one call
+       was already re-stamped to ``key_count=0`` by step 4, one call
        earlier; the reap that follows deletes the directory outright.
 
     A no-op — returns ``{}``, calls nothing — when *keys* is empty.
+
+    A marker is written exactly when at least one tier is about to be
+    mutated: whenever the step-1 loop's affected-tier set is non-empty. That
+    set can be empty even with a non-empty *keys* — every key already
+    unknown to every tier's registry — in which case step 2 also writes
+    nothing.
 
     Args:
         store: A :class:`~paramem.memory.store.MemoryStore` (duck-typed:
@@ -853,6 +989,9 @@ def erase_keys_and_restamp_manifest(
             root = adapter_slot_root_for_name(adapter_dir, tier_name)
             tier_root[tier_name] = root
             tier_pre_sha[tier_name] = tier_registry_sha256(root)
+
+    if tier_root:
+        write_erase_marker(adapter_dir, sorted(tier_root))
 
     store.discard_keys(keys, mode="erase")
 

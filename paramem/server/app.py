@@ -7997,6 +7997,16 @@ def _erase_keys_with_reap(*, loop, config, erased_keys: list[str], label: str) -
     ``promoted_keys`` against ``is_known()`` on load, not on save).  A no-op
     (no store mutation, no metadata write) when *erased_keys* is empty.
 
+    The hard-erase-in-flight marker
+    (:func:`~paramem.memory.persistence.write_erase_marker`, written by
+    ``erase_keys_and_restamp_manifest`` before any tier mutation) is cleared
+    here on every SUCCESSFUL completion of this call, whether or not the
+    erase actually emptied a tier. This call site must never move into a
+    ``finally`` block: a failure anywhere before this point (the reap,
+    ``write_key_metadata``) must LEAVE the marker in place — that survival
+    is the record of an interrupted erase, which is exactly what a later
+    boot needs to read.
+
     Args:
         loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`,
             re-resolved by the caller against the current ``_state["config"]``
@@ -8028,7 +8038,7 @@ def _erase_keys_with_reap(*, loop, config, erased_keys: list[str], label: str) -
 
     if erased_keys:
         from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_interim_dirs
-        from paramem.memory.persistence import erase_keys_and_restamp_manifest
+        from paramem.memory.persistence import clear_erase_marker, erase_keys_and_restamp_manifest
 
         try:
             emptied_tiers = erase_keys_and_restamp_manifest(
@@ -8072,6 +8082,8 @@ def _erase_keys_with_reap(*, loop, config, erased_keys: list[str], label: str) -
 
         loop.promoted_keys.difference_update(erased_keys)
         loop.write_key_metadata()
+
+        clear_erase_marker(config.adapter_dir)
 
     return {
         "erased_keys": erased_keys,
