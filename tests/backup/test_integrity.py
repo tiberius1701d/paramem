@@ -10,7 +10,7 @@ Covers:
 - Cross-consistency: R-without-S, S-without-R, key_metadata orphan.
 - registry-key-absent-from-metadata → NOT a failure.
 - Required-vs-optional: empty registry → skipped; partial interim slot → skipped.
-- Boot degraded: corrupt registry → store_load_degraded True.
+- Boot degraded: corrupt registry → integrity_check_failed True.
 
 Tests use a config mock and tmp_path; encryption tests mock out
 read_maybe_encrypted to inject age-like behaviour without a real key.

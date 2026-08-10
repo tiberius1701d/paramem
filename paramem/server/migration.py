@@ -46,12 +46,12 @@ from typing import Any, Literal, TypedDict
 
 import yaml
 
-from paramem.adapters.manifest import (
-    ManifestError,
-    count_slot_candidates,
-    find_live_slot,
-    read_manifest,
-    tier_registry_sha256,
+from paramem.adapters.registry_binding import (
+    NO_CANDIDATES,
+    NO_MATCHING_SLOT,
+    REGISTRY_ABSENT_WITH_SLOTS,
+    REGISTRY_UNREADABLE,
+    verify_tier_binding,
 )
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
@@ -515,37 +515,37 @@ def compute_shape_changes(
     For each adapter name whose ``adapters.<name>.enabled`` is ``True`` in
     *candidate_yaml*:
 
-    1. Resolve that adapter's OWN tier registry hash via
-       ``tier_registry_sha256(adapter_dir / name)`` — the same hash every
-       manifest writer stamps (``commit_tier_slot``,
-       ``_save_adapters._build``, ``active_store_migration``, ``backup.py``'s
-       bundle writer).  A single hash computed once for all tiers can never
-       match a per-tier stamp, which is why this used to be a caller-supplied
-       parameter — dropped in favour of resolving it here, per adapter.
-    2. Call ``find_live_slot(adapter_dir / name, that hash)`` to locate the
-       current on-disk slot.
-    3. If no slot is found: when the kind directory has zero weight-slot
-       candidates (``count_slot_candidates``), skip silently — the adapter
-       has never been trained. When it has one or more candidates but none
-       matched (every manifest unreadable, or none stamped with the live
-       hash), log WARN and append a warning naming the adapter kind and
-       candidate count — this is the genuinely torn case ``find_live_slot``
-       would otherwise conflate with never-trained.
-    4. If a slot exists but ``read_manifest`` raises (``ManifestError`` or
-       ``OSError`` — ``read_manifest`` calls ``Path.read_text()``, which can
-       raise a bare ``OSError`` independent of the JSON/schema errors it
-       wraps as ``ManifestError``), log WARN and skip (no row emitted).
-    5. Compare ``manifest.lora.{rank, alpha, target_modules}`` against the
+    1. Resolve that adapter's
+       :class:`~paramem.adapters.registry_binding.TierBinding` via
+       :func:`~paramem.adapters.registry_binding.verify_tier_binding` — the
+       one place that resolves a tier's own registry hash, finds its live
+       slot, and compares key counts.  A LoRA shape comparison does not care
+       about key counts, so both :data:`~paramem.adapters.registry_binding.VERIFIED`
+       and :data:`~paramem.adapters.registry_binding.KEY_COUNT_MISMATCH`
+       proceed to step 2.
+    2. :data:`~paramem.adapters.registry_binding.REGISTRY_UNREADABLE` — log
+       WARN and append a warning naming the adapter and the read/decrypt
+       failure; no row emitted.
+    3. :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` — the adapter
+       has never been trained; skip silently, no warning.
+    4. :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT` or
+       :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`
+       — one or more candidate slots exist but none matched (every manifest
+       unreadable, none stamped with the live hash, or the registry itself
+       is absent); log WARN and append a warning naming the adapter kind and
+       candidate count.
+    5. Read ``binding.manifest`` — already parsed inside
+       :func:`~paramem.adapters.registry_binding.verify_tier_binding` step 1;
+       never re-read here (a second read of the same slot could observe a
+       DIFFERENT file than the one the verdict was computed from). A manifest
+       read failure can only happen INSIDE ``verify_tier_binding`` at this
+       point, and resolves to :data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT`
+       there (step 4 above already handles that case).
+    6. Compare ``manifest.lora.{rank, alpha, target_modules}`` against the
        candidate config.  Emit one ``ShapeChange`` per differing field.
        ``dropout`` is NOT compared here — it is not a shape field (see
        ``_SHAPE_CONSEQUENCE``'s module comment); an operator dropout edit
        never carries the weight-discard consequence a real shape change does.
-
-    A tier whose registry file exists but cannot be read/decrypted is
-    skipped with a WARNING (no row) rather than degraded to an empty hash:
-    ``""`` is ``find_live_slot``'s fresh-install match convention
-    (``manifest.py:373``), and degrading to it would bind the row to an
-    unrelated ``""``-stamped slot instead of surfacing the read failure.
 
     Parameters
     ----------
@@ -562,9 +562,9 @@ def compute_shape_changes(
         ordered by adapter name then field name. ``warnings`` holds one
         human-readable string per adapter skipped because its tier registry
         or manifest could not be read, or because every on-disk candidate
-        slot failed to match ``find_live_slot`` — the same substance as the
-        WARNING logged at each skip site. A tier with zero weight-slot
-        candidates (never trained) contributes no warning.
+        slot failed to match — the same substance as the WARNING logged at
+        each skip site. A tier with zero weight-slot candidates (never
+        trained) contributes no warning.
     """
     adapters_cfg = candidate_yaml.get("adapters", {})
     if not isinstance(adapters_cfg, dict):
@@ -580,60 +580,44 @@ def compute_shape_changes(
             continue
 
         kind_dir = adapter_dir / adapter_name
-        try:
-            tier_hash = tier_registry_sha256(kind_dir)
-        except Exception as exc:  # noqa: BLE001
+        binding = verify_tier_binding(adapter_name, kind_dir)
+
+        if binding.status == REGISTRY_UNREADABLE:
             logger.warning(
                 "compute_shape_changes: skipping adapter %r — cannot read/decrypt "
                 "tier registry at %s: %s",
                 adapter_name,
                 kind_dir,
-                exc,
+                binding.detail,
             )
             warnings.append(
                 f"adapter {adapter_name!r}: skipped shape-change check — cannot "
-                f"read/decrypt tier registry at {kind_dir}: {exc}"
+                f"read/decrypt tier registry at {kind_dir}: {binding.detail}"
             )
             continue
 
-        slot = find_live_slot(kind_dir, tier_hash)
-        if slot is None:
-            # find_live_slot skips unreadable manifests internally, so a
-            # tier whose every candidate slot is corrupt or hash-mismatched
-            # lands here too — the same signal as never-trained. Tell them
-            # apart by whether any candidate slot exists at all.
-            candidate_count = count_slot_candidates(kind_dir)
-            if candidate_count == 0:
-                # Not yet trained — skip silently.
-                continue
+        if binding.status == NO_CANDIDATES:
+            # Not yet trained — skip silently.
+            continue
+
+        if binding.status in (NO_MATCHING_SLOT, REGISTRY_ABSENT_WITH_SLOTS):
             logger.warning(
                 "compute_shape_changes: skipping adapter %r — %d candidate "
                 "slot(s) in %s, none readable/matching the live registry hash",
                 adapter_name,
-                candidate_count,
+                binding.candidate_count,
                 kind_dir,
             )
             warnings.append(
-                f"adapter {adapter_name!r}: {candidate_count} candidate slot(s) in "
+                f"adapter {adapter_name!r}: {binding.candidate_count} candidate slot(s) in "
                 f"{kind_dir}, none readable/matching — skipped shape-change check"
             )
             continue
 
-        try:
-            manifest = read_manifest(slot)
-        except (ManifestError, OSError) as exc:
-            logger.warning(
-                "compute_shape_changes: skipping adapter %r — cannot read manifest "
-                "from slot %s: %s",
-                adapter_name,
-                slot,
-                exc,
-            )
-            warnings.append(
-                f"adapter {adapter_name!r}: skipped shape-change check — cannot "
-                f"read manifest from slot {slot}: {exc}"
-            )
-            continue
+        # binding.status in (VERIFIED, KEY_COUNT_MISMATCH) — key count is
+        # irrelevant to a LoRA shape comparison; both proceed. Both statuses
+        # guarantee binding.manifest is set (see verify_tier_binding step 5).
+        manifest = binding.manifest
 
         # Compare each shape field. `dropout` is intentionally excluded — see
         # the module comment above `_SHAPE_CONSEQUENCE`.

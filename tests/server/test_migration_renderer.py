@@ -233,7 +233,7 @@ class TestComputeShapeChangesNoManifest:
         slot.mkdir(parents=True)
         (slot / "meta.json").write_text("{}")  # candidate exists on disk
 
-        with patch("paramem.server.migration.find_live_slot", return_value=None):
+        with patch("paramem.adapters.registry_binding.find_live_slot", return_value=None):
             result, warnings = compute_shape_changes(yaml, tmp_path)
 
         assert result == []
@@ -249,7 +249,7 @@ class TestComputeShapeChangesNoManifest:
             slot.mkdir(parents=True)
             (slot / "meta.json").write_text("{}")
 
-        with patch("paramem.server.migration.find_live_slot", return_value=None):
+        with patch("paramem.adapters.registry_binding.find_live_slot", return_value=None):
             result, warnings = compute_shape_changes(yaml, tmp_path)
 
         assert result == []
@@ -274,6 +274,15 @@ def _make_manifest_mock(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",
 
 
 class TestComputeShapeChangesWithManifest:
+    """``compute_shape_changes`` reads ``binding.manifest`` — the manifest
+    ``verify_tier_binding`` already parsed while resolving the verdict — and
+    never re-reads the slot itself. Mocking ``find_live_slot`` +
+    ``read_manifest`` at their OWN import site
+    (``paramem.adapters.registry_binding``) is therefore the only mock
+    needed; the ``key_count`` stamp on the mock manifest is itself a
+    MagicMock, which is not ``int``, so it never trips the
+    key-count-mismatch branch."""
+
     def test_rank_change_detected(self, tmp_path):
         """rank change → ShapeChange with adapter='episodic', field='rank'."""
         yaml = {"adapters": {"episodic": {"enabled": True, "rank": 16, "alpha": 16}}}
@@ -283,8 +292,8 @@ class TestComputeShapeChangesWithManifest:
         manifest = _make_manifest_mock(rank=8, alpha=16)
 
         with (
-            patch("paramem.server.migration.find_live_slot", return_value=slot),
-            patch("paramem.server.migration.read_manifest", return_value=manifest),
+            patch("paramem.adapters.registry_binding.find_live_slot", return_value=slot),
+            patch("paramem.adapters.registry_binding.read_manifest", return_value=manifest),
         ):
             result, _warnings = compute_shape_changes(yaml, tmp_path)
 
@@ -299,8 +308,8 @@ class TestComputeShapeChangesWithManifest:
         manifest = _make_manifest_mock(rank=8, alpha=16)
 
         with (
-            patch("paramem.server.migration.find_live_slot", return_value=slot),
-            patch("paramem.server.migration.read_manifest", return_value=manifest),
+            patch("paramem.adapters.registry_binding.find_live_slot", return_value=slot),
+            patch("paramem.adapters.registry_binding.read_manifest", return_value=manifest),
         ):
             result, _warnings = compute_shape_changes(yaml, tmp_path)
 
@@ -315,21 +324,20 @@ class TestComputeShapeChangesWithManifest:
         manifest = _make_manifest_mock(rank=8, alpha=16)
 
         with (
-            patch("paramem.server.migration.find_live_slot", return_value=slot),
-            patch("paramem.server.migration.read_manifest", return_value=manifest),
+            patch("paramem.adapters.registry_binding.find_live_slot", return_value=slot),
+            patch("paramem.adapters.registry_binding.read_manifest", return_value=manifest),
         ):
             result, warnings = compute_shape_changes(yaml, tmp_path)
 
         assert result == []
         assert warnings == []
 
-    def test_unreadable_manifest_skips_with_warn(self, tmp_path):
-        """ManifestError on read → skip (no row emitted), and a warning row
-        naming the adapter and slot is appended to the returned warnings list.
-
-        The same failure is also emitted via logger.warning; we verify both
-        the row is absent and the returned warnings list carries the failure.
-        """
+    def test_manifest_schema_error_inside_binding_skips_with_warn(self, tmp_path):
+        """A manifest that fails to parse is now caught INSIDE
+        verify_tier_binding (step 5's race arm), which resolves to
+        NO_MATCHING_SLOT — compute_shape_changes skips it with the same
+        "candidate slot(s) ... none readable/matching" warning as an actual
+        hash mismatch, since both are the same binding verdict."""
         from paramem.adapters.manifest import ManifestSchemaError
 
         yaml_data = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
@@ -337,9 +345,9 @@ class TestComputeShapeChangesWithManifest:
         slot.mkdir(parents=True)
 
         with (
-            patch("paramem.server.migration.find_live_slot", return_value=slot),
+            patch("paramem.adapters.registry_binding.find_live_slot", return_value=slot),
             patch(
-                "paramem.server.migration.read_manifest",
+                "paramem.adapters.registry_binding.read_manifest",
                 side_effect=ManifestSchemaError("bad json"),
             ),
         ):
@@ -349,23 +357,21 @@ class TestComputeShapeChangesWithManifest:
         assert result == []
         assert len(warnings) == 1
         assert "episodic" in warnings[0]
-        assert "cannot read manifest" in warnings[0]
-        assert str(slot) in warnings[0]
+        assert "none readable/matching" in warnings[0]
 
-    def test_oserror_from_read_manifest_skips_with_warn_not_500(self, tmp_path):
-        """A bare OSError from read_manifest (e.g. Path.read_text() failing
-        for a permission or I/O reason, not a JSON/schema error) is caught
-        alongside ManifestError — skip with a warning, never an uncaught
-        exception. This test fails if the catch is narrowed back to
-        ManifestError only."""
+    def test_oserror_inside_binding_skips_with_warn_not_500(self, tmp_path):
+        """A bare OSError reading the matched slot's meta.json (e.g. a
+        permission or I/O failure, not a JSON/schema error) is caught inside
+        verify_tier_binding alongside the manifest errors — never an
+        uncaught exception propagating out of compute_shape_changes."""
         yaml_data = {"adapters": {"episodic": {"enabled": True, "rank": 16}}}
         slot = tmp_path / "episodic" / "ts"
         slot.mkdir(parents=True)
 
         with (
-            patch("paramem.server.migration.find_live_slot", return_value=slot),
+            patch("paramem.adapters.registry_binding.find_live_slot", return_value=slot),
             patch(
-                "paramem.server.migration.read_manifest",
+                "paramem.adapters.registry_binding.read_manifest",
                 side_effect=OSError("simulated I/O failure"),
             ),
         ):
@@ -374,7 +380,7 @@ class TestComputeShapeChangesWithManifest:
         assert result == []
         assert len(warnings) == 1
         assert "episodic" in warnings[0]
-        assert "cannot read manifest" in warnings[0]
+        assert "none readable/matching" in warnings[0]
 
     def test_target_modules_change_detected(self, tmp_path):
         """target_modules change → ShapeChange for target_modules field."""
@@ -396,8 +402,8 @@ class TestComputeShapeChangesWithManifest:
         )
 
         with (
-            patch("paramem.server.migration.find_live_slot", return_value=slot),
-            patch("paramem.server.migration.read_manifest", return_value=manifest),
+            patch("paramem.adapters.registry_binding.find_live_slot", return_value=slot),
+            patch("paramem.adapters.registry_binding.read_manifest", return_value=manifest),
         ):
             result, _warnings = compute_shape_changes(yaml, tmp_path)
 
@@ -541,7 +547,9 @@ class TestComputeShapeChangesLiveSlotIntegration:
         }
 
         with (
-            patch("paramem.server.migration.tier_registry_sha256", side_effect=side_effect),
+            patch(
+                "paramem.adapters.registry_binding.tier_registry_sha256", side_effect=side_effect
+            ),
             caplog.at_level(logging.WARNING, logger="paramem.server.migration"),
         ):
             result, warnings = compute_shape_changes(yaml, tmp_path)

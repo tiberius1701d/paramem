@@ -689,8 +689,9 @@ class TestTierRegistrySha256:
     Contract: absent registry file → ``""``.  A read/decrypt failure on an
     EXISTING file is NOT swallowed — it propagates (delegated to
     :func:`~paramem.backup.hashing.plaintext_sha256`).  Boot-boundary callers
-    that want to degrade instead of crashing catch locally
-    (``app.py::_tier_registry_sha256_boot_degraded``); ``/speaker/forget``
+    that want to degrade instead of crashing route through
+    :func:`~paramem.adapters.registry_binding.verify_tier_binding`, which
+    catches locally and returns ``REGISTRY_UNREADABLE``; ``/speaker/forget``
     deliberately does not catch.
     """
 

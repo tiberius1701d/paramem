@@ -315,7 +315,7 @@ def _make_arbitrator_state(
         "cloud_only_reason": None,
         "last_chat_monotonic": None,
         "pending_rehydration": False,
-        "store_load_degraded": False,
+        "integrity_check_failed": False,
     }
 
 

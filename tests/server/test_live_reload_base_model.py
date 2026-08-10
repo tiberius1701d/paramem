@@ -40,11 +40,34 @@ Additional tests cover the config-refresh path:
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from paramem.adapters.registry_binding import VERIFIED, TierBinding
 from paramem.server.config import load_server_config
+
+
+def _verified_bindings(registry_map: dict) -> dict:
+    """Wrap a ``{tier: registry}`` map into the ``{tier: TierBinding}`` shape
+    ``verify_adapter_tree`` returns, with every tier VERIFIED and publishable
+    — the boot/hydrate-path equivalent of the pre-refactor
+    ``read_registries_from_disk`` return value these tests used to patch."""
+    return {
+        tier: TierBinding(
+            tier=tier,
+            tier_root=Path(f"/fake/{tier}"),
+            status=VERIFIED,
+            registry=reg,
+            registry_present=True,
+            slot=None,
+            manifest=None,
+            candidate_count=0,
+            detail="",
+        )
+        for tier, reg in registry_map.items()
+    }
 
 
 def _server_config(consolidation_mode="train", preload_cache=True):
@@ -645,6 +668,7 @@ def test_preload_source_selection_simulate_mode():
         def probe(self, keys_by_tier, should_abort=None):
             return {}
 
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
     import paramem.memory.store as store_mod
 
@@ -657,11 +681,13 @@ def test_preload_source_selection_simulate_mode():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        # Constructor returns fake_store; read_registries_from_disk returns fake registry map.
+        # Constructor returns fake_store; verify_adapter_tree returns fake bindings.
         patch.object(store_mod, "MemoryStore", return_value=fake_store),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
-        ),
+            registry_binding_mod,
+            "verify_adapter_tree",
+            return_value=_verified_bindings(fake_registry_map),
+        ) as mock_verify_tree,
         patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
     ):
@@ -671,6 +697,7 @@ def test_preload_source_selection_simulate_mode():
             tokenizer=app_module._state.get("tokenizer"),
         )
 
+    mock_verify_tree.assert_called_once()
     assert disk_source_calls, "DiskMemorySource should be used when consolidation.mode='simulate'"
     assert not weight_source_calls, "WeightMemorySource must not be used in simulate mode"
     # Full probe succeeded → boot_degraded should be cleared.
@@ -715,6 +742,7 @@ def test_preload_source_selection_train_mode_uses_weight_source():
         def probe(self, keys_by_tier, should_abort=None):
             return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
 
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
     import paramem.memory.store as store_mod
 
@@ -727,11 +755,13 @@ def test_preload_source_selection_train_mode_uses_weight_source():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        # Constructor returns fake_store; read_registries_from_disk returns fake registry map.
+        # Constructor returns fake_store; verify_adapter_tree returns fake bindings.
         patch.object(store_mod, "MemoryStore", return_value=fake_store),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
-        ),
+            registry_binding_mod,
+            "verify_adapter_tree",
+            return_value=_verified_bindings(fake_registry_map),
+        ) as mock_verify_tree,
         patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
     ):
@@ -741,6 +771,7 @@ def test_preload_source_selection_train_mode_uses_weight_source():
             tokenizer=app_module._state.get("tokenizer"),
         )
 
+    mock_verify_tree.assert_called_once()
     assert weight_source_calls, "WeightMemorySource should be used when consolidation.mode='train'"
     assert not disk_source_calls, "DiskMemorySource must not be used in train mode"
     assert app_module._state.get("boot_degraded") is None
@@ -793,8 +824,8 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
     base-swap marker, so the invalidity gate does not fire.
 
     Source enumeration now comes from the fresh registry returned by
-    _build_store_contents (via MemoryStore.read_registries_from_disk), not from
-    the live store instance methods.
+    _build_store_contents (via verify_adapter_tree), not from the live store
+    instance methods.
     """
     from paramem.server import app as app_module
 
@@ -818,6 +849,7 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
             # Only graph1 found, graph2 missing.
             return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
 
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
     import paramem.memory.store as store_mod
 
@@ -832,8 +864,10 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(store_mod, "MemoryStore", return_value=fake_store),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
-        ),
+            registry_binding_mod,
+            "verify_adapter_tree",
+            return_value=_verified_bindings(fake_registry_map),
+        ) as mock_verify_tree,
         patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
     ):
         app_module._preload_memory_store(
@@ -842,6 +876,7 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
             tokenizer=app_module._state.get("tokenizer"),
         )
 
+        mock_verify_tree.assert_called_once()
         degraded = app_module._state.get("boot_degraded")
         assert degraded is not None, "boot_degraded must be set on partial hydration"
         assert degraded["hits"] == 1
@@ -2050,13 +2085,13 @@ def test_hydrate_clears_stale_entries_and_reloads():
     by the active post-fold set (e.g. 186).  The test verifies that stale entries
     from before the call are not present in the store after the call completes.
 
-    The rebuild is done by _build_store_contents, which reads registries via the
-    store-free MemoryStore.read_registries_from_disk static method and then publishes
-    via store.swap().  Stale entries are cleared because swap() replaces _entries
-    atomically — the new entries dict starts empty (no active keys to probe here).
+    The rebuild is done by _build_store_contents, which verifies registries via
+    verify_adapter_tree and then publishes via store.swap().  Stale entries are
+    cleared because swap() replaces _entries atomically — the new entries dict
+    starts empty (no active keys to probe here).
     """
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     store = _make_real_store()
@@ -2068,15 +2103,14 @@ def test_hydrate_clears_stale_entries_and_reloads():
 
     state_patch = {
         "boot_degraded": None,
-        "store_load_degraded": False,
     }
 
-    # Empty registry map → no active keys → new_entries stays {} → swap clears the store.
+    # Empty bindings map → no active keys → new_entries stays {} → swap clears the store.
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value={}
-        ) as mock_read_reg,
+            registry_binding_mod, "verify_adapter_tree", return_value={}
+        ) as mock_verify_tree,
         patch.object(src_mod, "WeightMemorySource", FakeWeightSourceHydrate),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2091,9 +2125,8 @@ def test_hydrate_clears_stale_entries_and_reloads():
         assert len(store) == 0, (
             f"stale entries must be cleared; store has {len(store)} entries after hydration"
         )
-        # Disk read happened (the new builder path).
-        mock_read_reg.assert_called_once()
-        assert app_module._state["store_load_degraded"] is False
+        # Verification happened (the new builder path).
+        mock_verify_tree.assert_called_once()
 
 
 def test_hydrate_registers_active_keys_when_source_hits():
@@ -2101,11 +2134,11 @@ def test_hydrate_registers_active_keys_when_source_hits():
     into the store (via store.swap()).  The stale pre-call entries are replaced by
     the source results.
 
-    _build_store_contents enumerates active keys from the fresh registry returned
-    by MemoryStore.read_registries_from_disk, probes them, then publishes via swap().
+    _build_store_contents enumerates active keys from the fresh bindings returned
+    by verify_adapter_tree, probes them, then publishes via swap().
     """
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     store = _make_real_store()
@@ -2114,7 +2147,7 @@ def test_hydrate_registers_active_keys_when_source_hits():
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
 
-    state_patch = {"boot_degraded": None, "store_load_degraded": False}
+    state_patch = {"boot_degraded": None}
 
     # Registry reports two active keys; the weight source will return both.
     fake_reg = MagicMock()
@@ -2124,8 +2157,10 @@ def test_hydrate_registers_active_keys_when_source_hits():
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
-        ),
+            registry_binding_mod,
+            "verify_adapter_tree",
+            return_value=_verified_bindings(fake_registry_map),
+        ) as mock_verify_tree,
         patch.object(src_mod, "WeightMemorySource", FakeWeightSourceHydrate),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2135,6 +2170,7 @@ def test_hydrate_registers_active_keys_when_source_hits():
             tokenizer=MagicMock(),
         )
 
+    mock_verify_tree.assert_called_once()
     # After hydration the store holds the two newly-probed keys, not the two stale ones.
     assert len(store) == 2
     assert store.get("new_key1") is not None
@@ -2148,13 +2184,13 @@ def test_hydrate_sets_boot_degraded_on_partial_probe():
     """When some active keys cannot be materialised, boot_degraded is set
     (same lifecycle as the boot-path partial preload).
 
-    _build_store_contents enumerates keys from the fresh registry returned by
-    MemoryStore.read_registries_from_disk; when the probe returns fewer entries
-    than the total active key count, stats["boot_degraded"] is set and propagated
-    to _state by _hydrate_memory_store_in_place.
+    _build_store_contents enumerates keys from the fresh bindings returned by
+    verify_adapter_tree; when the probe returns fewer entries than the total
+    active key count, stats["boot_degraded"] is set and propagated to
+    _state by _hydrate_memory_store_in_place.
     """
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     class _PartialSource:
@@ -2170,7 +2206,7 @@ def test_hydrate_sets_boot_degraded_on_partial_probe():
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
 
-    state_patch = {"boot_degraded": None, "store_load_degraded": False}
+    state_patch = {"boot_degraded": None}
 
     # Registry reports two active keys; the probe will only return one.
     fake_reg = MagicMock()
@@ -2180,8 +2216,10 @@ def test_hydrate_sets_boot_degraded_on_partial_probe():
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
-        ),
+            registry_binding_mod,
+            "verify_adapter_tree",
+            return_value=_verified_bindings(fake_registry_map),
+        ) as mock_verify_tree,
         patch.object(src_mod, "WeightMemorySource", _PartialSource),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2191,6 +2229,7 @@ def test_hydrate_sets_boot_degraded_on_partial_probe():
             tokenizer=MagicMock(),
         )
 
+        mock_verify_tree.assert_called_once()
         # Read inside the with block so patch.dict hasn't restored _state yet.
         degraded = app_module._state.get("boot_degraded")
         assert degraded is not None, "boot_degraded must be set on partial hydration"
@@ -2210,7 +2249,6 @@ def test_hydrate_clears_boot_degraded_on_preload_cache_false():
 
     state_patch = {
         "boot_degraded": {"reason": "preload_partial", "hits": 0, "total": 5},
-        "store_load_degraded": False,
     }
 
     with (
@@ -2234,15 +2272,18 @@ def test_hydrate_clears_boot_degraded_on_preload_cache_false():
     assert len(store) == 0
 
 
-def test_hydrate_sets_store_load_degraded_on_registry_failure():
-    """When MemoryStore.read_registries_from_disk raises, store_load_degraded is set to True.
+def test_hydrate_publishes_nothing_for_an_unverified_tier(tmp_path):
+    """A tier whose registry binding fails verification is excluded from the
+    published registry; the swap itself still runs UNCONDITIONALLY — there is
+    no global degrade flag any more, only a per-tier one.
 
-    NEW CONTRACT (data-integrity guard): when the registry read fails,
-    _hydrate_memory_store_in_place must NOT call store.swap() — the live store
-    is preserved intact so no existing entries are lost.  Callers depend on this
-    no-wipe guarantee to safely retry without losing their authoritative state.
+    NEW CONTRACT (per-tier data-integrity guard): _hydrate_memory_store_in_place
+    always calls store.swap(); an unverified tier simply contributes nothing
+    to the published registry/entries, so a reader asking for that tier
+    afterward gets a fresh, empty one — every other tier still publishes.
     """
-    import paramem.memory.store as store_mod
+    import paramem.adapters.registry_binding as registry_binding_mod
+    from paramem.adapters.registry_binding import REGISTRY_UNREADABLE, TierBinding
     from paramem.server import app as app_module
 
     store = _make_real_store()
@@ -2251,8 +2292,11 @@ def test_hydrate_sets_store_load_degraded_on_registry_failure():
 
     config = _server_config(preload_cache=False)
     config.consolidation.indexed_key_replay = False
+    # Redirect incident writes away from the shared tests/fixtures/sandbox
+    # tree — this test's unverified tier writes a real incident.
+    config.paths.data = tmp_path
 
-    state_patch = {"store_load_degraded": False, "boot_degraded": None}
+    state_patch = {"boot_degraded": None}
 
     swap_calls = []
     original_swap = store.swap
@@ -2261,13 +2305,23 @@ def test_hydrate_sets_store_load_degraded_on_registry_failure():
         swap_calls.append(True)
         return original_swap(*args, **kwargs)
 
+    fake_bindings = {
+        "episodic": TierBinding(
+            tier="episodic",
+            tier_root=Path("/fake/episodic"),
+            status=REGISTRY_UNREADABLE,
+            registry=None,
+            registry_present=True,
+            slot=None,
+            manifest=None,
+            candidate_count=0,
+            detail="simulated decrypt failure",
+        ),
+    }
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(
-            store_mod.MemoryStore,
-            "read_registries_from_disk",
-            side_effect=OSError("disk error"),
-        ),
+        patch.object(registry_binding_mod, "verify_adapter_tree", return_value=fake_bindings),
         patch.object(store, "swap", side_effect=spy_swap),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2277,19 +2331,22 @@ def test_hydrate_sets_store_load_degraded_on_registry_failure():
             tokenizer=MagicMock(),
         )
 
-        # Read inside the with block so patch.dict hasn't restored _state yet.
-        assert app_module._state["store_load_degraded"] is True
-        # Critical: swap must NOT be called — live store is preserved on registry failure.
-        assert not swap_calls, (
-            "store.swap() must not be called when registry read fails; "
-            "the live store must be preserved intact to avoid losing valid entries"
-        )
+        # Critical: swap DOES run — the unverified tier is simply absent
+        # from the payload it publishes.
+        assert swap_calls, "store.swap() must run even when one tier is unverified"
 
-    # Verify store still has original entries (no-wipe guarantee).
-    assert len(store) == pre_call_size, (
-        f"live store must not be wiped on registry failure; "
-        f"expected {pre_call_size} entries, got {len(store)}"
+    # ABSENT from the published registry map — checked BEFORE any
+    # .registry(tier) call, which allocates a fresh empty registry via
+    # setdefault and would mask the very thing under test (an empty
+    # PUBLISHED registry would also satisfy list_active() == []).
+    assert not store.has_registry("episodic"), (
+        "an unverified tier must be ABSENT from the published registry map"
     )
+
+    from paramem.server.incidents import read_incidents
+
+    incidents = read_incidents(tmp_path / "state")
+    assert any(i.id == "tier_registry_unverified:episodic" for i in incidents)
 
 
 def test_hydrate_weight_source_is_frame_local():
@@ -2306,8 +2363,8 @@ def test_hydrate_weight_source_is_frame_local():
     its probe was called (entry is in the store), and no persistent _state or
     module-global reference was established.
     """
+    import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
-    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     sources_created = []
@@ -2326,7 +2383,7 @@ def test_hydrate_weight_source_is_frame_local():
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
 
-    state_patch = {"boot_degraded": None, "store_load_degraded": False}
+    state_patch = {"boot_degraded": None}
 
     # Registry reports one active key so the source-creation branch is entered.
     fake_reg = MagicMock()
@@ -2336,7 +2393,9 @@ def test_hydrate_weight_source_is_frame_local():
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(
-            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
+            registry_binding_mod,
+            "verify_adapter_tree",
+            return_value=_verified_bindings(fake_registry_map),
         ),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSourceCapture),
     ):
@@ -2362,17 +2421,17 @@ def test_hydrate_weight_source_is_frame_local():
 # ---------------------------------------------------------------------------
 
 
-def test_finalize_full_swaps_store_when_replay_enabled_and_not_degraded():
+def test_finalize_full_swaps_store_when_replay_enabled_and_staged_present():
     """_finalize_full publishes the staged store contents on a clean success.
 
     Exercises the REAL ``app_module._finalize_full`` directly — it is a
-    module-level function taking ``(loop, result, staged_e, staged_r,
-    staged_b, staged_stats, absorbed_interims)`` as explicit parameters (no
-    closure captures),
-    so the test calls production code rather than a hand-copied mirror.
-    ``store.swap`` is the atomic-publish primitive; it must fire exactly
-    once with the staged payload when replay is enabled and the staged
-    build did not degrade.
+    module-level function taking ``(loop, result, staged, *, absorbed_interims)``
+    as explicit parameters (no closure captures), so the test calls
+    production code rather than a hand-copied mirror. ``store.swap`` is the
+    atomic-publish primitive; it must fire exactly once with the staged
+    payload when replay is enabled and a staged build is present — publish
+    now runs unconditionally (per-tier verification already excluded any
+    unverified tier from the staged dicts).
     """
     from paramem.server import app as app_module
 
@@ -2389,7 +2448,8 @@ def test_finalize_full_swaps_store_when_replay_enabled_and_not_degraded():
     staged_e = {"episodic": {}}
     staged_r = {"episodic": MagicMock()}
     staged_b = {}
-    staged_stats = {"boot_degraded": False, "store_load_degraded": False}
+    staged_stats = {"boot_degraded": False, "tier_bindings": {}}
+    staged = (staged_e, staged_r, staged_b, staged_stats)
 
     state_patch = {
         "router": MagicMock(),
@@ -2406,10 +2466,7 @@ def test_finalize_full_swaps_store_when_replay_enabled_and_not_degraded():
         app_module._finalize_full(
             fake_loop,
             fake_result,
-            staged_e,
-            staged_r,
-            staged_b,
-            staged_stats,
+            staged,
             absorbed_interims=True,
         )
 
@@ -2419,17 +2476,74 @@ def test_finalize_full_swaps_store_when_replay_enabled_and_not_degraded():
         assert swap_calls == [(staged_e, staged_r, staged_b)], (
             f"store.swap must be called once with the staged payload; got {swap_calls}"
         )
-        assert app_module._state["store_load_degraded"] is False
+        assert app_module._state["boot_degraded"] is False
         assert app_module._state["consolidating"] is False
 
 
-def test_finalize_full_skips_swap_when_staged_build_degraded():
-    """store.swap must NOT be called when the staged build degraded.
+def test_finalize_full_raising_incident_store_does_not_prevent_consolidating_clear(caplog):
+    """A raising incident store (record/resolve/read) inside
+    _record_unverified_tier_incidents must not wedge _finalize_full —
+    _state["consolidating"] must still clear, _revalidate_adapter_manifests
+    and router.reload() must still run, and the fault must be logged as an
+    ERROR, never silently swallowed."""
+    import logging
 
-    A degraded build (store_load_degraded=True) must preserve the live
-    in-RAM store rather than publishing a possibly-incomplete registry —
-    queries self-heal on-miss instead.
-    """
+    from paramem.server import app as app_module
+
+    fake_store = MagicMock()
+    fake_store.replay_enabled = True
+    fake_store.all_active_keys.return_value = ["k1"]
+    swap_calls = []
+    fake_store.swap.side_effect = lambda e, r, b: swap_calls.append((e, r, b))
+
+    fake_loop = MagicMock()
+    fake_loop.store = fake_store
+
+    fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
+    staged_stats = {"boot_degraded": None, "tier_bindings": {}}
+    staged = ({"episodic": {}}, {"episodic": MagicMock()}, {}, staged_stats)
+
+    fake_router = MagicMock()
+    state_patch = {
+        "router": fake_router,
+        "last_consolidation": None,
+        "consolidating": True,
+        "event_loop": None,
+        "config": _server_config(),
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_revalidate_adapter_manifests") as mock_revalidate,
+        patch.object(
+            app_module,
+            "_record_unverified_tier_incidents",
+            side_effect=RuntimeError("simulated incident store fault"),
+        ),
+        caplog.at_level(logging.ERROR, logger="paramem.server.app"),
+    ):
+        app_module._finalize_full(fake_loop, fake_result, staged, absorbed_interims=True)
+
+        # The fault must not prevent the swap that already happened, nor
+        # any step after the protected region.
+        assert swap_calls, "store.swap must still have run before the fault"
+        mock_revalidate.assert_called_once()
+        fake_router.reload.assert_called_once()
+        assert app_module._state["consolidating"] is False, (
+            "a raising incident store must not wedge the finalizer before consolidating clears"
+        )
+
+    error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("tier-incident" in msg for msg in error_messages), (
+        f"expected the fault logged as an ERROR, got: {error_messages}"
+    )
+
+
+def test_finalize_full_with_staged_none_preserves_boot_degraded():
+    """staged=None (the worker-thread rebuild itself raised) preserves the
+    live store: no swap runs, and _state["boot_degraded"] keeps its PRIOR
+    value — a failed rebuild proves nothing about cache warmth, so it must
+    not be silently cleared."""
     from paramem.server import app as app_module
 
     fake_store = MagicMock()
@@ -2440,34 +2554,32 @@ def test_finalize_full_skips_swap_when_staged_build_degraded():
     fake_loop.store = fake_store
 
     fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-    staged_stats = {"boot_degraded": None, "store_load_degraded": True}
 
+    _prior_boot_degraded = {"reason": "preload_partial", "hits": 1, "total": 2}
     state_patch = {
         "router": MagicMock(),
         "last_consolidation": None,
         "consolidating": True,
         "event_loop": None,
         "config": _server_config(),
+        "boot_degraded": _prior_boot_degraded,
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_revalidate_adapter_manifests"),
     ):
-        app_module._finalize_full(
-            fake_loop, fake_result, {}, {}, {}, staged_stats, absorbed_interims=True
-        )
+        app_module._finalize_full(fake_loop, fake_result, None, absorbed_interims=True)
 
         fake_store.swap.assert_not_called()
-        assert app_module._state["store_load_degraded"] is True
+        assert app_module._state["boot_degraded"] is _prior_boot_degraded
         assert app_module._state["consolidating"] is False
 
 
 def test_finalize_full_skips_swap_when_replay_disabled():
     """store.swap must NOT be called when replay is disabled.
 
-    There are no registries to publish when replay is off — the swap and
-    the degraded-flag propagation are both gated on ``replay_enabled``.
+    There are no registries to publish when replay is off.
     """
     from paramem.server import app as app_module
 
@@ -2479,7 +2591,6 @@ def test_finalize_full_skips_swap_when_replay_disabled():
     fake_loop.store = fake_store
 
     fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-    staged_stats = {"boot_degraded": False, "store_load_degraded": False}
 
     state_patch = {
         "router": MagicMock(),
@@ -2493,9 +2604,7 @@ def test_finalize_full_skips_swap_when_replay_disabled():
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_revalidate_adapter_manifests"),
     ):
-        app_module._finalize_full(
-            fake_loop, fake_result, {}, {}, {}, staged_stats, absorbed_interims=True
-        )
+        app_module._finalize_full(fake_loop, fake_result, None, absorbed_interims=True)
 
         fake_store.swap.assert_not_called()
         assert app_module._state["consolidating"] is False

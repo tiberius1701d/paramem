@@ -1320,12 +1320,16 @@ class MemoryStore:
         """Read per-tier ``indexed_key_registry.json`` files from disk into a
         fresh ``dict[str, KeyRegistry]`` without touching any live store.
 
-        This is the store-free counterpart to
-        :meth:`load_registries_from_disk`.  It is used by
-        :func:`paramem.server.app._build_store_contents` to build new
-        registry structures off-store before atomically publishing them via
-        :meth:`swap`.  The boot / in-process-reload path still uses the
-        instance method (which delegates here and then installs).
+        This is the store-free counterpart to :meth:`load_registries_from_disk`,
+        which delegates here and then installs. Batch, all-or-nothing: any one
+        tier's read raising propagates and aborts the whole call — it does
+        NOT verify a tier's registry against its slot manifests. Boot uses
+        :func:`~paramem.adapters.registry_binding.verify_adapter_tree` instead
+        (per-tier verified, unverified tiers simply excluded rather than
+        aborting the whole read); this method remains the reader for callers
+        that do not need that verification — the trial store, base-swap
+        Phase-B, and cold-store paths in ``app.py``, all reached through the
+        instance method :meth:`load_registries_from_disk`.
 
         Reads every path :meth:`_iter_tier_registry_paths` yields:
 
@@ -1454,9 +1458,9 @@ class MemoryStore:
         No-op when the store has ``replay_enabled=False`` (registries are not
         tracked).
 
-        Delegates disk reads to :meth:`read_registries_from_disk` so the
-        on-disk parsing logic is shared with the store-free builder path
-        (:func:`paramem.server.app._build_store_contents`).
+        Delegates disk reads to :meth:`read_registries_from_disk` — batch,
+        all-or-nothing, no per-tier verification (see that method's
+        docstring for the callers this is and is not for).
         """
         if not self._replay_enabled:
             return

@@ -1854,13 +1854,13 @@ class TestTerminologyGuard:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch-guard: store_load_degraded blocks migration dispatch
+# Dispatch-guard: integrity_check_failed blocks migration dispatch
 # ---------------------------------------------------------------------------
 
 
-class TestStoreLoadDegradedDispatchGuard:
+class TestIntegrityCheckFailedDispatchGuard:
     """_dispatch_consolidation must not dispatch migration when
-    store_load_degraded is True.
+    integrity_check_failed is True.
 
     This is the second half of the fix for the silent data-loss bug: even if
     pending_rehydration is set, a degraded store (failed boot registry load)
@@ -1871,7 +1871,7 @@ class TestStoreLoadDegradedDispatchGuard:
     """
 
     def test_degraded_store_skips_migration_dispatch(self):
-        """With store_load_degraded=True and pending_rehydration=True,
+        """With integrity_check_failed=True and pending_rehydration=True,
         _dispatch_consolidation returns 'migration_skipped_degraded'
         and does NOT call _run_active_store_migration_sync.
         """
@@ -1892,7 +1892,7 @@ class TestStoreLoadDegradedDispatchGuard:
                     ),
                     "session_buffer": MagicMock(),
                     "pending_rehydration": True,
-                    "store_load_degraded": True,
+                    "integrity_check_failed": True,
                 },
                 clear=False,
             ),
@@ -1914,11 +1914,11 @@ class TestStoreLoadDegradedDispatchGuard:
             "migration must be blocked when the store failed to load at boot"
         )
         assert run_migration_calls == [], (
-            "_run_active_store_migration_sync must NOT be called when store_load_degraded=True"
+            "_run_active_store_migration_sync must NOT be called when integrity_check_failed=True"
         )
 
     def test_healthy_store_dispatches_migration(self):
-        """With store_load_degraded=False and pending_rehydration=True,
+        """With integrity_check_failed=False and pending_rehydration=True,
         _dispatch_consolidation proceeds to dispatch the migration.
 
         Verifies that the degraded guard does not block healthy stores.
@@ -1943,7 +1943,7 @@ class TestStoreLoadDegradedDispatchGuard:
                     ),
                     "session_buffer": MagicMock(),
                     "pending_rehydration": True,
-                    "store_load_degraded": False,
+                    "integrity_check_failed": False,
                     "event_loop": mock_loop,
                 },
                 clear=False,
@@ -1959,7 +1959,7 @@ class TestStoreLoadDegradedDispatchGuard:
 
         assert result == "started_migration", (
             f"Expected 'started_migration' but got {result!r}; "
-            "migration must proceed when store_load_degraded=False"
+            "migration must proceed when integrity_check_failed=False"
         )
         mock_loop.run_in_executor.assert_called_once()
 

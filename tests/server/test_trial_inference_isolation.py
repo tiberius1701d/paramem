@@ -229,8 +229,9 @@ class TestReadSimhashRegistryPerTierPaths:
         The fingerprint map and the store's own registries come from the same
         files through the same reader, so they cannot disagree about whether a
         corrupt file exists: an unparseable registry raises here exactly as it
-        does on the boot path (``app._build_store_contents`` catches it and
-        marks ``store_load_degraded``).  Skipping it would hand back a partial
+        does on the boot path (``app._build_store_contents``'s per-tier
+        ``verify_tier_binding`` marks the tier ``registry_unreadable`` and
+        excludes it from publish).  Skipping it would hand back a partial
         fingerprint map that silently un-gates every key of the failed tier.
         """
         adapter_dir = tmp_path / "adapters"

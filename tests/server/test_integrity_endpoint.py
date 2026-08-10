@@ -4,7 +4,7 @@ Covers:
 - GET /integrity with a valid plaintext store → ok=True, HTTP 200.
 - GET /integrity with a corrupt registry → ok=False, HTTP 200 (report, not 5xx).
 - Boot degraded: real corrupt registry on disk → _preload_memory_store sets
-  store_load_degraded=True via the production infrastructure integrity check.
+  integrity_check_failed=True via the production infrastructure integrity check.
 - Base-swap 409: corrupt store + base-swap candidate → 409 with integrity_failure.
 - Pure mode-switch 409: corrupt store + mode-only candidate → 409,
   AND live config file is NOT renamed on failure.
@@ -57,7 +57,7 @@ def _make_minimal_state(tmp_path: Path) -> dict:
         "migration": initial_migration_state(),
         "migration_lock": asyncio.Lock(),
         "server_started_at": "2026-05-01T00:00:00+00:00",
-        "store_load_degraded": False,
+        "integrity_check_failed": False,
         "daily_loadable": False,
         "memory_store": None,
         "consolidation_loop": None,
@@ -268,14 +268,14 @@ class TestIntegrityEndpointFailure:
 
 
 # ---------------------------------------------------------------------------
-# Boot degraded path: real corrupt registry → store_load_degraded=True
+# Boot degraded path: real corrupt registry → integrity_check_failed=True
 # ---------------------------------------------------------------------------
 
 
 class TestBootDegradedPath:
-    def test_corrupt_registry_sets_store_load_degraded(self, tmp_path, monkeypatch):
+    def test_corrupt_registry_sets_integrity_check_failed(self, tmp_path, monkeypatch):
         """Real corrupt registry on disk causes _preload_memory_store to set
-        store_load_degraded=True via the production integrity gate.
+        integrity_check_failed=True via the production integrity gate.
 
         Calls production code (_preload_memory_store) with real filesystem
         state; no logic reimplementation.
@@ -295,14 +295,65 @@ class TestBootDegradedPath:
         # inside the function, and the integrity check reads it again)
         result = app_module._preload_memory_store(cfg, model=None, tokenizer=None)
 
-        # The corrupt registry should cause store_load_degraded=True
-        assert state["store_load_degraded"] is True, (
-            "Expected store_load_degraded=True after boot integrity check with corrupt registry"
+        # The corrupt registry should cause integrity_check_failed=True
+        assert state["integrity_check_failed"] is True, (
+            "Expected integrity_check_failed=True after boot integrity check with corrupt registry"
         )
         # The function must still return a MemoryStore (degraded, but present)
         from paramem.memory.store import MemoryStore
 
         assert isinstance(result, MemoryStore)
+
+    def test_clean_recheck_after_restore_clears_integrity_check_failed(self, tmp_path, monkeypatch):
+        """A restart-only flag would strand the operator: restoring the
+        registry and re-applying config (which re-runs
+        _preload_memory_store) must clear integrity_check_failed on the
+        next CLEAN integrity check, not require a process restart."""
+        import json as _json
+
+        state = _make_minimal_state(tmp_path)
+        cfg = state["config"]
+        cfg.consolidation.mode = "train"
+        cfg.consolidation.indexed_key_replay = True
+        cfg.inference.preload_cache = False
+        ep_dir = Path(cfg.adapter_dir) / "episodic"
+        _write_corrupt_registry(ep_dir)
+
+        monkeypatch.setattr(app_module, "_state", state)
+
+        app_module._preload_memory_store(cfg, model=None, tokenizer=None)
+        assert state["integrity_check_failed"] is True, "precondition: flag must be set"
+
+        # Operator restores a healthy registry (plus the manifest slot the
+        # train-mode integrity check requires for a keyed tier) and
+        # re-applies config — the real production recovery path re-runs
+        # _preload_memory_store.
+        _write_valid_registry(ep_dir, ["key1"])
+        slot_dir = ep_dir / "20260501-000000"
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema_version": 4,
+            "name": "episodic",
+            "trained_at": "2026-05-01T00:00:00Z",
+            "window_stamp": "",
+            "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
+            "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
+            "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
+            "registry_sha256": "",
+            "key_count": 1,
+        }
+        (slot_dir / "meta.json").write_text(_json.dumps(manifest), encoding="utf-8")
+        # A COMPLETE slot — _preload_memory_store's cleanup_partial_slots
+        # step (unlike _arm_active_store_migration) removes any slot
+        # missing one of the three required files before the check runs.
+        (slot_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+        (slot_dir / "adapter_model.safetensors").write_bytes(b"weights")
+
+        app_module._preload_memory_store(cfg, model=None, tokenizer=None)
+
+        assert state["integrity_check_failed"] is False, (
+            "a clean integrity check must clear integrity_check_failed without a restart"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -392,21 +443,21 @@ class TestArmActiveMigrationIntegrityGate:
 
 
 # ---------------------------------------------------------------------------
-# Migration scheduler: store_load_degraded → migration skipped
+# Migration scheduler: integrity_check_failed → migration skipped
 # ---------------------------------------------------------------------------
 
 
 class TestMigrationSchedulerDegraded:
     def test_scheduler_returns_migration_skipped_degraded(self, tmp_path, monkeypatch):
-        """Scheduler tick with store_load_degraded=True returns 'migration_skipped_degraded'.
+        """Scheduler tick with integrity_check_failed=True returns 'migration_skipped_degraded'.
 
         Calls the real _dispatch_consolidation production code
-        with store_load_degraded=True and pending_rehydration=True.
+        with integrity_check_failed=True and pending_rehydration=True.
         """
         from paramem.server.session_buffer import SessionBuffer
 
         state = _make_minimal_state(tmp_path)
-        state["store_load_degraded"] = True
+        state["integrity_check_failed"] = True
         state["pending_rehydration"] = True
         state["consolidating"] = False
         state["background_trainer"] = None

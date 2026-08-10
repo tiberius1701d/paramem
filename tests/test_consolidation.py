@@ -1378,7 +1378,7 @@ class TestTickGateNoNamed:
             "mode": "local",
             "last_chat_monotonic": None,
             "pending_rehydration": False,
-            "store_load_degraded": False,
+            "integrity_check_failed": False,
         }
 
     def _make_stub_store(self, anonymous_ids=None):
@@ -18127,7 +18127,7 @@ class TestFullCycleDispatcherOverdueIncident:
             "background_trainer": None,
             "last_chat_monotonic": None,
             "pending_rehydration": False,
-            "store_load_degraded": False,
+            "integrity_check_failed": False,
             "cloud_only_reason": None,
         }
 
@@ -20744,7 +20744,7 @@ class TestDispatchCountZeroRoutesToFull:
             "mode": "local",
             "last_chat_monotonic": None,
             "pending_rehydration": False,
-            "store_load_degraded": False,
+            "integrity_check_failed": False,
         }
 
     def _call_tick_count_zero(self, state_overrides: dict):
@@ -20891,7 +20891,7 @@ class TestSchedulerCatchUpGate:
             "background_trainer": None,
             "last_chat_monotonic": None,
             "pending_rehydration": False,
-            "store_load_degraded": False,
+            "integrity_check_failed": False,
             "cloud_only_reason": None,
         }
 

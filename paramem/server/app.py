@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
+    from paramem.adapters.registry_binding import TierBinding
     from paramem.server.user_tokens import UserTokenStore
 
 import torch
@@ -221,11 +222,15 @@ _state = {
     "unknown_speakers": {},
     "migration": None,  # MigrationStashState — populated in lifespan
     "server_started_at": "",  # ISO-8601 UTC timestamp set in lifespan
-    # Set to True when boot-time load_registries_from_disk raises.  The store
-    # may hold zero or partial tiers; downstream migration must not run against
-    # a degraded store (it would vacuously complete with no-op relocations).
-    # Cleared to False on successful load.
-    "store_load_degraded": False,
+    # Set to True when the infrastructure integrity check
+    # (verify_infrastructure_integrity, inside _preload_memory_store) finds
+    # a failure.  Downstream migration must not run against a degraded
+    # store (it would vacuously complete with no-op relocations).
+    # _preload_memory_store runs on every boot AND every in-process config
+    # apply/reload — its integrity-check success branch clears this back to
+    # False, so a corrupt registry the operator restores and then re-applies
+    # config for is re-checked and un-stuck without a process restart.
+    "integrity_check_failed": False,
     # Whether the daily age identity was loadable at boot.  Set in lifespan
     # alongside ``encryption``; used by ``GET /integrity`` and the boot
     # integrity gate to distinguish no-key from corruption failures.
@@ -1104,37 +1109,6 @@ class RollbackResponse(BaseModel):
 # (never the main-episodic hash) drives its live-slot match.
 
 
-def _tier_registry_sha256_boot_degraded(tier_root: Path, tier_label: str) -> str:
-    """``tier_registry_sha256`` with boot-boundary degrade-on-failure.
-
-    ``tier_registry_sha256`` propagates a read/decrypt failure on an
-    EXISTING registry file (it only swallows "file absent" to ``""``).  The
-    three boot-path callers here (startup mount, post-full-cycle revalidate,
-    interim mount) must not crash the server over a single tier's
-    undecryptable/unreadable registry — this wrapper is the one place that
-    degrades such a failure to an empty hash (which resolves downstream to
-    "no live slot matched", an unhealthy-but-surfaced ``manifest_status`` row,
-    not a boot crash) and logs it as an ERROR so the operator sees it.
-
-    Deliberately NOT used by ``POST /speaker/forget``: its pre-erase hash
-    read happens before any store mutation, so a decrypt failure there is
-    safe — and more honest — to surface as a request error than to silently
-    misdiagnose as "no live slot found".
-    """
-    from paramem.adapters.manifest import tier_registry_sha256
-
-    try:
-        return tier_registry_sha256(tier_root)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "boot: could not hash registry for tier %s at %s: %s — degrading to unmatched",
-            tier_label,
-            tier_root,
-            exc,
-        )
-        return ""
-
-
 def _is_primary_adapter(name: str) -> bool:
     """Episodic is primary (red on mismatch); semantic / procedural are
     secondary (yellow).  Drives severity in adapter_manifest_status rows."""
@@ -1167,7 +1141,7 @@ def _validate_adapter_slot(
     model,
     tokenizer,
     kind_dir: Path,
-    live_registry_sha256: str,
+    binding: "TierBinding",
     manifest_status: dict,
 ) -> "tuple[Path | None, object | None, bool]":
     """Validate one adapter's live slot — main tier or interim tier alike.
@@ -1194,11 +1168,22 @@ def _validate_adapter_slot(
     case, where the name is a known-good literal) — never re-derive the
     root from an interim name inside this function.
 
+    ``binding`` is the caller's already-resolved
+    :class:`~paramem.adapters.registry_binding.TierBinding` for this exact
+    ``kind_dir`` (:func:`~paramem.adapters.registry_binding.verify_tier_binding`).
+    It carries the hash-match decision, the resolved slot, and the candidate
+    count — this function no longer re-derives any of those.
+
     Returns ``(slot, manifest, should_mount)``:
       * ``slot``: resolved live slot Path, or ``None`` when no matching slot.
-      * ``manifest``: parsed AdapterManifest when read succeeded, else ``None``.
+      * ``manifest``: ``binding.manifest`` — already parsed inside
+        :func:`~paramem.adapters.registry_binding.verify_tier_binding`, never
+        re-read here (a second read could observe a different file than the
+        one the verdict was computed from). ``None`` unless ``binding.status``
+        is :data:`~paramem.adapters.registry_binding.VERIFIED`.
       * ``should_mount``: True when the boot caller should mount this slot.
-        False for "no slot," "unreadable manifest," or "fingerprint mismatch."
+        False for "no slot," "registry unverified," "key-count mismatch,"
+        or "fingerprint mismatch."
 
     Used by:
       * :func:`_mount_adapters_from_slots` (boot path) — for both the main
@@ -1208,12 +1193,12 @@ def _validate_adapter_slot(
         the side-effect on ``manifest_status`` matters; return value is
         discarded.
     """
-    from paramem.adapters.manifest import (
-        ManifestNotFoundError,
-        ManifestSchemaError,
-        count_slot_candidates,
-        find_live_slot,
-        read_manifest,
+    from paramem.adapters.registry_binding import (
+        KEY_COUNT_MISMATCH,
+        NO_CANDIDATES,
+        NO_MATCHING_SLOT,
+        REGISTRY_ABSENT_WITH_SLOTS,
+        REGISTRY_UNREADABLE,
     )
     from paramem.backup.backup import sweep_orphan_pending
 
@@ -1222,39 +1207,55 @@ def _validate_adapter_slot(
     if kind_dir.exists():
         sweep_orphan_pending(kind_dir)
 
-    slot = find_live_slot(kind_dir, live_registry_sha256) if kind_dir.exists() else None
-
-    if slot is None:
-        # Count only directories that contain meta.json — the authoritative marker
-        # of a committed adapter slot (see find_live_slot in manifest.py which also
-        # gates on meta.json).  A subdir containing only progress.json (aborted
-        # training run) is NOT a real slot and must not trigger the no_matching_slot
-        # red incident; it should fall through to the fresh-install branch instead.
-        has_slots = count_slot_candidates(kind_dir) > 0
-        if has_slots:
-            _record_manifest_row(
-                manifest_status, name, "no_matching_slot", "no_matching_slot", severity
-            )
-            logger.warning("Adapter %s: no slot matching registry hash — skipping mount", name)
-        else:
-            manifest_status.pop(name, None)
-            logger.info("Adapter %s: no slots found — fresh install", name)
+    if binding.status == NO_CANDIDATES:
+        manifest_status.pop(name, None)
+        logger.info("Adapter %s: no slots found — fresh install", name)
         return None, None, False
 
-    try:
-        manifest = read_manifest(slot)
-    except ManifestNotFoundError:
+    if binding.status == NO_MATCHING_SLOT:
         _record_manifest_row(
-            manifest_status, name, "manifest_missing", "manifest_missing", severity, slot
+            manifest_status, name, "no_matching_slot", "no_matching_slot", severity
         )
-        # Still mount — weights are present even without manifest.
-        return slot, None, True
-    except ManifestSchemaError as exc:
+        logger.warning("Adapter %s: no slot matching registry hash — skipping mount", name)
+        return None, None, False
+
+    if binding.status in (REGISTRY_UNREADABLE, REGISTRY_ABSENT_WITH_SLOTS):
+        reason = (
+            "registry_unreadable"
+            if binding.status == REGISTRY_UNREADABLE
+            else "registry_absent_with_slots"
+        )
+        _record_manifest_row(manifest_status, name, "registry_unverified", reason, severity)
+        logger.error(
+            "Adapter %s: registry binding unverified (%s: %s) — skipping mount",
+            name,
+            reason,
+            binding.detail,
+        )
+        return None, None, False
+
+    if binding.status == KEY_COUNT_MISMATCH:
         _record_manifest_row(
-            manifest_status, name, "mismatch", "manifest_unreadable", severity, slot
+            manifest_status,
+            name,
+            "key_count_mismatch",
+            "key_count_mismatch",
+            severity,
+            binding.slot,
         )
-        logger.warning("Adapter %s: corrupt meta.json (%s) — skipping mount", name, exc)
-        return slot, None, False
+        logger.warning(
+            "Adapter %s: manifest key_count disagrees with registry active count "
+            "(%s) — skipping mount",
+            name,
+            binding.detail,
+        )
+        return None, None, False
+
+    # binding.status == VERIFIED — the manifest is already parsed on the
+    # binding; verify_tier_binding only returns VERIFIED after a successful
+    # read, so this is never None here.
+    slot = binding.slot
+    manifest = binding.manifest
 
     mismatch_field = _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg)
     if mismatch_field is not None:
@@ -1372,6 +1373,7 @@ def _revalidate_adapter_manifests(state: dict) -> None:
     if config is None or model is None or tokenizer is None:
         return
 
+    from paramem.adapters.registry_binding import verify_tier_binding
     from paramem.memory.interim_adapter import (
         INTERIM_NAME_PREFIX,
         adapter_slot_root_for_name,
@@ -1395,7 +1397,7 @@ def _revalidate_adapter_manifests(state: dict) -> None:
             model,
             tokenizer,
             _kind_dir,
-            _tier_registry_sha256_boot_degraded(_kind_dir, name),
+            verify_tier_binding(name, _kind_dir),
             manifest_status,
         )
 
@@ -1407,7 +1409,7 @@ def _revalidate_adapter_manifests(state: dict) -> None:
             model,
             tokenizer,
             _interim_path,
-            _tier_registry_sha256_boot_degraded(_interim_path, _interim_name),
+            verify_tier_binding(_interim_name, _interim_path),
             manifest_status,
         )
 
@@ -1450,10 +1452,10 @@ def _sweep_keyless_tier_artifacts(config) -> list[str]:
 
     Runs pre-mount, at the top of :func:`_mount_adapters_from_slots` — before
     any slot is resolved for any tier, before ``find_live_slot`` is called,
-    and before the boot-degraded hash helper
-    (:func:`_tier_registry_sha256_boot_degraded`) reads any tier's registry.
-    Nothing this sweep removes is ever mounted, and it never unmounts a live
-    adapter — at this point in boot nothing has been mounted yet. The memory
+    and before :func:`~paramem.adapters.registry_binding.verify_tier_binding`
+    reads any tier's registry. Nothing this sweep removes is ever mounted,
+    and it never unmounts a live adapter — at this point in boot nothing has
+    been mounted yet. The memory
     store is hydrated later still (the lifespan calls
     ``_build_config_derived_state`` only after ``_load_model_into_state``
     returns), so no RAM-resident tier can ever outlive the files this sweep
@@ -1621,13 +1623,15 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
 
     1. Sweep orphan ``.pending`` dirs (inside the validator, scoped to that
        tier's own slot root).
-    2. Resolve the live registry SHA-256 (per-tier: main tiers hash their own
-       registry; interim tiers hash their own, never the main-episodic one).
-    3. Call ``find_live_slot`` to locate the matching slot.
+    2. Resolve the tier's :class:`~paramem.adapters.registry_binding.TierBinding`
+       (per-tier: main tiers verify their own registry; interim tiers verify
+       their own, never the main-episodic one) via
+       :func:`~paramem.adapters.registry_binding.verify_tier_binding`.
+    3. The binding carries the matched slot, when one was found.
     4. Read the manifest; compare base model / tokenizer / LoRA fingerprints
        (interim tiers compare against ``config.adapters.episodic`` — interim
        slots are episodic-shaped).
-    5. Mount matching slots; record mismatch / missing rows in
+    5. Mount matching slots; record mismatch / missing / unverified rows in
        ``state["adapter_manifest_status"]``.
 
     Args:
@@ -1642,13 +1646,13 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     """
     from peft import PeftModel
 
+    from paramem.adapters.registry_binding import verify_tier_binding
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
     # Per-tier paths live at <adapter_dir>/<tier>/indexed_key_registry.json; each
     # tier's slot manifest is stamped with that tier's own registry hash, so
-    # slot matching is per-tier (see tier_registry_sha256 /
-    # _tier_registry_sha256_boot_degraded).
+    # slot matching is per-tier (see verify_tier_binding).
 
     # Self-heal any tier whose on-disk registry has already dropped to zero
     # known keys but whose slot directory/manifest still lingers (crash
@@ -1706,7 +1710,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             model,
             tokenizer,
             _kind_dir,
-            _tier_registry_sha256_boot_degraded(_kind_dir, name),
+            verify_tier_binding(name, _kind_dir),
             manifest_status,
         )
         if should_mount and slot is not None:
@@ -1733,7 +1737,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             model,
             tokenizer,
             _interim_path,
-            _tier_registry_sha256_boot_degraded(_interim_path, _interim_name),
+            verify_tier_binding(_interim_name, _interim_path),
             manifest_status,
         )
         if should_mount and slot is not None:
@@ -5665,47 +5669,59 @@ def _build_store_contents(
     should_abort:
         Optional zero-argument callable forwarded to the weight probe.  When
         it returns ``True`` the probe exits early with partial entry results;
-        registry and bookkeeping are still complete in that case.
-        ``store_load_degraded=True`` (registry read raised) leaves registry
-        AND bookkeeping empty — the caller must NOT publish via ``swap`` and
-        must instead preserve the live store.  ``None`` (default) means no
-        abort check — used on the boot path.
+        registry and bookkeeping are still complete in that case.  A tier
+        whose registry binding fails verification (see
+        :func:`~paramem.adapters.registry_binding.verify_adapter_tree`) is
+        simply ABSENT from ``new_registry``/``new_entries`` — every other
+        tier still publishes normally.  ``None`` (default) means no abort
+        check — used on the boot path.
 
     Returns
     -------
     tuple of (new_entries, new_registry, new_bookkeeping, stats)
         ``new_entries``: ``dict[tier, dict[key, entry]]``
-        ``new_registry``: ``dict[tier, KeyRegistry]``
+        ``new_registry``: ``dict[tier, KeyRegistry]`` — only tiers whose
+            binding is publishable.
         ``new_bookkeeping``: ``dict[key, bookkeeping_record]``
-        ``stats``: ``{"boot_degraded": dict | None, "store_load_degraded": bool,
+        ``stats``: ``{"boot_degraded": dict | None,
+                      "tier_bindings": dict[str, TierBinding],
                       "meta_loaded": int, "meta_orphaned": int,
-                      "meta_unbookkept": int}``
+                      "meta_unbookkept": int}``. ``tier_bindings`` carries the
+        actual :class:`~paramem.adapters.registry_binding.TierBinding`
+        objects (not a lossy status-string projection) — a consumer that
+        needs to report *why* an unverified tier lost verification (e.g.
+        the incident store) reads ``binding.detail`` directly rather than
+        re-deriving it.
     """
+    from paramem.adapters.registry_binding import verify_adapter_tree
     from paramem.memory.source import build_memory_source as _build_memory_source
-    from paramem.memory.store import MemoryStore as _MemoryStore
 
     stats: dict = {
         "boot_degraded": None,
-        "store_load_degraded": False,
+        "tier_bindings": {},
         "meta_loaded": 0,
         "meta_orphaned": 0,
         "meta_unbookkept": 0,
     }
 
     # ------------------------------------------------------------------ #
-    # Registry — read fresh from disk; no live store interaction.         #
+    # Registry — verify fresh from disk, per tier; no live store          #
+    # interaction.  A tier whose binding is not publishable contributes   #
+    # nothing to new_registry — it stays absent (MemoryStore.registry()   #
+    # setdefaults a fresh empty registry for any tier a reader asks for). #
     # ------------------------------------------------------------------ #
     new_registry: dict = {}
-    try:
-        new_registry = _MemoryStore.read_registries_from_disk(config.adapter_dir)
-        stats["store_load_degraded"] = False
-    except Exception:
-        logger.error(
-            "Registry load failed during store content build; memory store will be "
-            "empty — active-store migration will be refused until this is resolved",
-            exc_info=True,
-        )
-        stats["store_load_degraded"] = True
+    stats["tier_bindings"] = verify_adapter_tree(config.adapter_dir)
+    for _tier, _binding in stats["tier_bindings"].items():
+        if _binding.publishable:
+            new_registry[_tier] = _binding.registry
+        else:
+            logger.error(
+                "Tier %s registry binding unverified (%s: %s) — publishing nothing for this tier",
+                _tier,
+                _binding.status,
+                _binding.detail,
+            )
 
     # ------------------------------------------------------------------ #
     # Entry content — probed from weights or disk depending on mode.      #
@@ -5720,12 +5736,10 @@ def _build_store_contents(
         logger.info(
             "preload_cache: disabled — store stays entry-empty; inference pays source latency"
         )
-    elif stats["store_load_degraded"]:
-        # Registry failed — cannot enumerate active keys; entries stay empty.
-        pass
     else:
-        # Build a temporary in-memory view of the registry to enumerate active keys.
-        # We cannot use the live store here; build from the fresh registry dict.
+        # Build a temporary in-memory view of the (published) registry to
+        # enumerate active keys.  We cannot use the live store here; build
+        # from the fresh registry dict.
         _preload_keys_by_tier: dict[str, list[str]] = {}
         for _tier, _reg in new_registry.items():
             _active = _reg.list_active()
@@ -5880,11 +5894,17 @@ def _build_store_contents(
         # prevents new divergence from being written.
         _active_keys = {key for _reg in new_registry.values() for key in _reg.list_active()}
         stats["meta_unbookkept"] = len(_active_keys - set(new_bookkeeping))
+        _unbookkept_by_tier = {
+            _t: len(set(_r.list_active()) - set(new_bookkeeping))
+            for _t, _r in new_registry.items()
+            if set(_r.list_active()) - set(new_bookkeeping)
+        }
         logger.info(
-            "load_bookkeeping_from_disk: loaded=%d orphaned=%d unbookkept=%d",
+            "load_bookkeeping_from_disk: loaded=%d orphaned=%d unbookkept=%d by_tier=%s",
             _meta_stats["loaded"],
             _meta_stats["orphaned"],
             stats["meta_unbookkept"],
+            _unbookkept_by_tier,
         )
     except Exception:
         logger.exception(
@@ -5893,6 +5913,92 @@ def _build_store_contents(
         )
 
     return new_entries, new_registry, new_bookkeeping, stats
+
+
+_TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE = "tier_registry_unverified"
+
+
+def _record_unverified_tier_incidents(config, tier_bindings: dict) -> None:
+    """Record (or clear) a ``tier_registry_unverified`` incident per tier.
+
+    Shared by both hydrate venues — :func:`_hydrate_memory_store_in_place`
+    (boot / in-process reload) and :func:`_finalize_full` (post-fold) — so an
+    operator sees exactly one incident type regardless of which venue
+    observed the loss.  This is the single record-or-clear site for the
+    type: a tier whose binding is publishable (``binding.publishable``)
+    resolves any prior incident for it (idempotent no-op when there was
+    none); an unpublishable tier records one, with ``binding.detail`` (the
+    actual failure reason) in the incident payload — the incident store is
+    the plaintext control-plane that survives a keyless restart, exactly
+    when the ERROR log line this same failure also produced is gone.
+
+    Severity follows the same primary/secondary tiering every manifest row
+    this unit mints uses (:func:`_is_primary_adapter`): ``"failed"`` for the
+    primary (episodic) tier, ``"info"`` otherwise — a transient interim
+    slot or a secondary-tier (semantic/procedural) failure must not raise a
+    failed-level row.
+
+    A tier that no longer appears in *tier_bindings* at all (an interim
+    slot folded away, a tier removed from config) can never be re-verified
+    again under its old name — any incident still open for it is resolved
+    here too, so it does not ride ``GET /status`` forever.
+
+    The recorded detail/message deliberately names ``POST /backup/restore``
+    (restore the affected tier from a snapshot bundle, then restart) and
+    ``GET /integrity`` as the operator's exit — never ``/reconsolidate``,
+    which cannot rebuild a tier whose registry itself is unverified.
+
+    Args:
+        config: Live server config object; only ``paths.data`` is read.
+        tier_bindings: ``{tier: TierBinding}`` from ``_build_store_contents``'s
+            ``stats["tier_bindings"]``.
+    """
+    from paramem.adapters.registry_binding import KEY_COUNT_MISMATCH
+
+    state_dir = config.paths.data / "state"
+    _action_hint = (
+        "restore this tier from a snapshot bundle via POST /backup/restore "
+        "and restart; see GET /integrity"
+    )
+    for tier, binding in tier_bindings.items():
+        if binding.publishable:
+            resolve_incident(state_dir, _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE, tier)
+            continue
+        severity = "failed" if _is_primary_adapter(tier) else "info"
+        if binding.status == KEY_COUNT_MISMATCH:
+            summary = (
+                f"Tier '{tier}' manifest key_count disagrees with its registry's "
+                f"active-key count — publishing nothing for this tier"
+            )
+        else:
+            summary = (
+                f"Tier '{tier}' registry could not be verified against its slot "
+                f"manifests ({binding.status}) — publishing nothing for this tier"
+            )
+        record_incident(
+            state_dir,
+            type=_TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE,
+            key=tier,
+            severity=severity,
+            summary=summary,
+            detail={
+                "tier": tier,
+                "status": binding.status,
+                "detail": binding.detail,
+                "candidate_count": binding.candidate_count,
+                "action_hint": _action_hint,
+            },
+        )
+
+    _id_prefix = f"{_TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE}:"
+    for _incident in read_incidents(state_dir):
+        if _incident.type != _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE:
+            continue
+        if _incident.status not in ("active", "acknowledged"):
+            continue
+        _incident_tier = _incident.id[len(_id_prefix) :]
+        if _incident_tier not in tier_bindings:
+            resolve_incident(state_dir, _TIER_REGISTRY_UNVERIFIED_INCIDENT_TYPE, _incident_tier)
 
 
 def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
@@ -5936,17 +6042,13 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
         model=model,
         tokenizer=tokenizer,
     )
-    # Atomically publish only when the registry build SUCCEEDED.  A degraded
-    # build (store_load_degraded=True, registry read raised internally) leaves
-    # the live store intact so callers preserve their authoritative
-    # registry/bookkeeping.  A legitimately empty registry
-    # (store_load_degraded=False, read succeeded with no keys) DOES swap.
-    if not stats["store_load_degraded"]:
-        store.swap(new_entries, new_registry, new_bookkeeping)
+    # Publish unconditionally — per-tier verification already excluded any
+    # unverified tier's registry/entries from the built dicts, so swapping
+    # always reflects the healthy subset of tiers.
+    store.swap(new_entries, new_registry, new_bookkeeping)
 
-    # Propagate stats to shared _state flags regardless of whether we swapped.
-    _state["store_load_degraded"] = stats["store_load_degraded"]
     _state["boot_degraded"] = stats["boot_degraded"]
+    _record_unverified_tier_incidents(config, stats["tier_bindings"])
 
 
 def _preload_memory_store(config, *, model, tokenizer):
@@ -6010,7 +6112,7 @@ def _preload_memory_store(config, *, model, tokenizer):
 
     _swap_marker = _read_trial_marker((config.paths.data / "state").resolve())
     if _swap_marker is not None and _swap_marker.migration_kind == "base_swap":
-        _state["store_load_degraded"] = False
+        _state["integrity_check_failed"] = False
         _state["boot_degraded"] = None
         logger.info(
             "preload_cache: base-swap in flight (phase=%s) — on-disk registry "
@@ -6026,8 +6128,8 @@ def _preload_memory_store(config, *, model, tokenizer):
 
     # Infrastructure integrity check — runs after all loaders so the store
     # is fully populated for cross-consistency checks.  A corrupt registry
-    # blocks migrations and flags store_load_degraded (a corrupt registry is a
-    # different, more severe condition than boot_degraded's cold cache).
+    # blocks migrations and flags integrity_check_failed (a corrupt registry
+    # is a different, more severe condition than boot_degraded's cold cache).
     #
     # Boot housekeeping runs FIRST: cleanup_partial_slots deletes any
     # subdirectory under <adapter_dir>/<tier>/ that is missing one of the
@@ -6068,20 +6170,21 @@ def _preload_memory_store(config, *, model, tokenizer):
                     _fc.path,
                     _fc.detail,
                 )
-            _state["store_load_degraded"] = True
+            _state["integrity_check_failed"] = True
             logger.error(
                 "Boot-time integrity check found %d failure(s); "
                 "active-store migration will be refused until this is resolved",
                 len(_integrity_report.failures),
             )
         else:
+            _state["integrity_check_failed"] = False
             logger.info(
                 "Boot-time integrity check passed (%d checks)",
                 len(_integrity_report.checks),
             )
     except Exception:
         logger.exception(
-            "Boot-time integrity check raised unexpectedly; store_load_degraded left unchanged"
+            "Boot-time integrity check raised unexpectedly; integrity_check_failed left unchanged"
         )
 
     return memory_store
@@ -15165,11 +15268,12 @@ def _dispatch_consolidation(
     # 1.0 recall gate. This pre-empts the action's own gates because the active
     # store is not yet coherent with the operator's yaml mode.
     if _state.get("pending_rehydration", False):
-        if _state.get("store_load_degraded", False):
+        if _state.get("integrity_check_failed", False):
             logger.warning(
                 "Consolidation dispatch: active-store migration pending but "
-                "store_load_degraded=True — refusing to dispatch (boot-time registry load "
-                "failed; resolve the corrupt registry file and restart the server to retry)"
+                "integrity_check_failed=True — refusing to dispatch (boot-time integrity "
+                "check failed; resolve the corrupt registry file and restart the server "
+                "to retry)"
             )
             return "migration_skipped_degraded", action
         logger.info("Consolidation dispatch: active-store migration pending — running migration")
@@ -16239,12 +16343,23 @@ def _finalize_interim(
     every tier's ``adapter_manifest_status`` row against the freshly-saved
     interim slot (:func:`_revalidate_adapter_manifests` — pure reads +
     hashing of small registry files, the same cost profile as the full-fold
-    call this mirrors), reloads the router, records the durable run-status
-    row, auto-resolves the incidents a clean interim success clears, and
-    clears ``_state["consolidating"]``. Covers every non-crash interim
-    terminal (``trained`` / ``simulated`` / ``recall_failed`` / ``aborted``
-    / ``cap_pending``) — the outcome label and clean-success gating come
-    from *result* and *released_sids*.
+    call this mirrors), records (or clears) any ``tier_registry_unverified``
+    incident for the FULL tier tree (:func:`_record_unverified_tier_incidents`
+    over :func:`~paramem.adapters.registry_binding.verify_adapter_tree` —
+    not the revalidate loop's enabled-tiers subset, so a disabled-but-broken
+    tier is never mistaken for a vanished one and wrongly auto-resolved),
+    reloads the router, records the durable run-status row, auto-resolves
+    the incidents a clean interim success clears, and clears
+    ``_state["consolidating"]``. Covers every non-crash interim terminal
+    (``trained`` / ``simulated`` / ``recall_failed`` / ``aborted`` /
+    ``cap_pending``) — the outcome label and clean-success gating come from
+    *result* and *released_sids*.
+
+    The incident bookkeeping is wrapped in its own protected region: this
+    is the SOLE operator-visible reporter for an unverified tier (the
+    row-driven attention populator deliberately stays silent for it — see
+    ``attention.py``), so a fault recording it must be logged, never allowed
+    to wedge the finalizer before ``_state["consolidating"]`` clears.
 
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-training PEFT rebind).
@@ -16263,6 +16378,8 @@ def _finalize_interim(
             is populated regardless of which finalizer wrote the record.
         procedural_rels: Count of procedural relations, same rationale.
     """
+    from paramem.adapters.registry_binding import verify_adapter_tree
+
     loop.model.eval()
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
     # Re-validate manifests now that this interim slot has been freshly
@@ -16270,6 +16387,17 @@ def _finalize_interim(
     # a stale FINGERPRINT MISMATCH row for this interim doesn't linger on
     # /status until the next full cycle happens to prune it.
     _revalidate_adapter_manifests(_state)
+    # Interim folds are the first observer of a tier whose binding breaks
+    # after boot — without this, nothing renders and no incident exists for
+    # it until the next full cycle (up to the full-consolidation period).
+    # Protected: a fault here must not wedge the finalizer.
+    _config = _state["config"]
+    try:
+        _record_unverified_tier_incidents(_config, verify_adapter_tree(_config.adapter_dir))
+    except Exception:
+        logger.exception(
+            "Post-interim tier-incident bookkeeping failed (non-fatal); finalization continues"
+        )
     _state["router"].reload()
     # inference path sees the just-written interim slot (and any tier whose
     # format drifted from the loop's current setting).  Count via the
@@ -17120,10 +17248,7 @@ def _finalize_full_status_only(
 def _finalize_full(
     loop,
     result: dict,
-    staged_e: dict,
-    staged_r: dict,
-    staged_b: dict,
-    staged_stats: dict,
+    staged: "tuple[dict, dict, dict, dict] | None",
     *,
     absorbed_interims: bool,
 ) -> None:
@@ -17136,11 +17261,20 @@ def _finalize_full(
     Step order is load-bearing:
 
     a. ``store.swap`` — atomically publish new entries/registry/bookkeeping,
-       ONLY when ``staged_stats["store_load_degraded"]`` is ``False``.  A
-       degraded build preserves the live store; a legitimately empty
-       registry (``store_load_degraded=False``, no active keys) still swaps.
-    b. ``_state`` ``boot_degraded`` / ``store_load_degraded`` — from
-       *staged_stats*, always propagated regardless of whether swap ran.
+       ONLY when *staged* is not ``None``.  ``staged is None`` means the
+       worker-thread rebuild itself raised — the live store is preserved
+       and ``_state["boot_degraded"]`` keeps its PRIOR value (a failed
+       rebuild proves nothing about cache warmth).  When *staged* IS
+       present, the swap runs unconditionally: per-tier verification
+       already excluded any unverified tier's registry/entries from the
+       staged dicts, so publishing the staged payload always reflects the
+       healthy subset of tiers — an incident is recorded for the rest.
+    b. ``_state["boot_degraded"]`` — from the staged stats, only when
+       *staged* is present. ``_record_unverified_tier_incidents`` (the SOLE
+       operator-visible reporter for an unverified tier — the row-driven
+       attention populator deliberately stays silent for it) runs in its
+       own protected region here: a fault is logged, never allowed to wedge
+       the finalizer before ``_state["consolidating"]`` clears at step e.
     c. ``_revalidate_adapter_manifests`` — reads fresh on-disk slots and
        prunes stale interim ``adapter_manifest_status`` rows.
     d. ``_state["router"].reload()`` — AFTER the swap so the speaker index
@@ -17150,31 +17284,33 @@ def _finalize_full(
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-fold PEFT rebind).
         result: The ``loop.consolidate(...)`` return dict.
-        staged_e: Staged ``tier -> key -> entry`` map built off-store on the
-            worker thread by ``_build_store_contents``.
-        staged_r: Staged ``tier -> KeyRegistry`` map.
-        staged_b: Staged ``key -> bookkeeping-record`` map.
-        staged_stats: ``{"boot_degraded", "store_load_degraded"}`` from the
-            staged build.
+        staged: ``(staged_e, staged_r, staged_b, staged_stats)`` built
+            off-store on the worker thread by ``_build_store_contents``, or
+            ``None`` when that rebuild raised.
         absorbed_interims: Whether this fold's key source included the interim
             slots (and therefore drained the ring).  Only such a fold may
             auto-resolve the ring incidents — a reconcile leaves the backlog
             exactly where it was, so clearing them would report a drain that
             did not happen.
     """
-    if loop.store.replay_enabled:
-        # a. Atomically publish only when the registry build SUCCEEDED.
-        # A degraded build (store_load_degraded=True, raised internally
-        # or caught by the caller) must not wipe the live registry/
-        # bookkeeping — preserve the authoritative in-RAM state and let
-        # queries self-heal on-miss.  A legitimately empty registry
-        # (store_load_degraded=False, read succeeded with no active keys)
-        # DOES swap.
-        if not staged_stats["store_load_degraded"]:
-            loop.store.swap(staged_e, staged_r, staged_b)
-        # b. Propagate degraded flags regardless of whether we swapped.
-        _state["store_load_degraded"] = staged_stats["store_load_degraded"]
+    if loop.store.replay_enabled and staged is not None:
+        staged_e, staged_r, staged_b, staged_stats = staged
+        # a. Publish unconditionally — see docstring.
+        loop.store.swap(staged_e, staged_r, staged_b)
+        # b. Propagate boot_degraded from the staged build.
         _state["boot_degraded"] = staged_stats["boot_degraded"]
+        # Protected: this is the SOLE operator-visible reporter for an
+        # unverified tier (attention.py's row-driven populator deliberately
+        # stays silent for it) — a fault here must be logged, never allowed
+        # to wedge the finalizer before _state["consolidating"] clears below.
+        try:
+            _record_unverified_tier_incidents(_state["config"], staged_stats["tier_bindings"])
+        except Exception:
+            logger.exception(
+                "Post-fold tier-incident bookkeeping failed (non-fatal); finalization continues"
+            )
+    # staged is None: the worker-thread rebuild raised — preserve the live
+    # store, no swap, and _state["boot_degraded"] keeps its prior value.
     # c. Re-validate manifests now that main slots have been re-saved
     #    with a fresh registry hash + window_stamp.  Without this,
     #    /status keeps showing "FINGERPRINT MISMATCH" until restart.
@@ -17463,20 +17599,15 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         # concurrent CUDA call can race it.                                    #
         #                                                                      #
         # The should_abort=bt.abort_requested check makes the probe yield the  #
-        # GPU between adapter groups when a /chat arrives.  Partial ENTRY      #
-        # results are published when the registry build SUCCEEDED              #
-        # (store_load_degraded=False); a failed registry build is NOT          #
-        # published and the live store is preserved.  Missing entry slots      #
-        # self-heal via on-miss probing.                                        #
+        # GPU between adapter groups when a /chat arrives.  A failed rebuild    #
+        # (staged=None) is NOT published and the live store is preserved.      #
+        # Missing entry slots self-heal via on-miss probing.                    #
         # ------------------------------------------------------------------ #
-        staged_e: dict = {}
-        staged_r: dict = {}
-        staged_b: dict = {}
-        staged_stats: dict = {"boot_degraded": None, "store_load_degraded": False}
+        staged: "tuple[dict, dict, dict, dict] | None" = None
         if loop.store.replay_enabled:
             loop.model.eval()
             try:
-                staged_e, staged_r, staged_b, staged_stats = _build_store_contents(
+                staged = _build_store_contents(
                     config,
                     model=loop.model,
                     tokenizer=loop.tokenizer,
@@ -17487,16 +17618,13 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
                     "Post-fold store rebuild failed (non-fatal); "
                     "live store not updated — queries self-heal on-miss"
                 )
-                staged_stats = {"boot_degraded": None, "store_load_degraded": True}
+                staged = None
 
         return "full_trained", functools.partial(
             _finalize_full,
             loop,
             result,
-            staged_e,
-            staged_r,
-            staged_b,
-            staged_stats,
+            staged,
             absorbed_interims=keys_from == "all_tiers",
         )
 

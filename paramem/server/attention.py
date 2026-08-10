@@ -510,11 +510,22 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
       "manifest_missing", "migrated_unverified"}``.  Slot exists but its
       manifest doesn't match the loaded model.
     * No matching slot — ``status == "no_matching_slot"``.  Slot dirs exist on
-      disk but none have a ``meta.registry_sha256`` matching the live
-      registry, e.g. because the registry file is corrupt/unreadable (the
-      observable downstream of ``store_load_degraded`` being set when
-      ``load_registries_from_disk`` raised) or the slots are stale relative
-      to a rebuilt registry.
+      disk but none have a ``meta.registry_sha256`` matching the live,
+      readable registry — the slots are stale relative to a rebuilt
+      registry.
+
+    ``status in {"registry_unverified", "key_count_mismatch"}`` rows are
+    DELIBERATELY not rendered here — the tier's registry↔slot-manifest
+    binding itself failed verification (see
+    :func:`~paramem.adapters.registry_binding.verify_tier_binding`), and
+    that condition is reported exactly once, via the
+    ``tier_registry_unverified`` incident
+    (``_record_unverified_tier_incidents``, app.py) surfaced by
+    ``_collect_incident_items`` — the durable, keyless-visible reporter,
+    unlike this populator which reads in-memory ``_state``. Both statuses
+    stay in ``_PROBLEMATIC_STATUSES`` below so
+    ``_collect_local_recall_inactive_items`` still defers to the
+    incident-driven item instead of double-reporting.
 
     Primary adapter (``"episodic"``) with severity ``"red"`` → level
     ``"failed"``.  Secondary adapters (``"semantic"``,
@@ -598,6 +609,9 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
                         age_seconds=age,
                     )
                 )
+        # registry_unverified / key_count_mismatch rows are intentionally
+        # NOT rendered here — see the docstring's "DELIBERATELY not
+        # rendered" note. The incident-driven item is the sole reporter.
 
     # Primary items first (already sorted by name via sorted()), then secondary.
     return primary_items + secondary_items
@@ -629,7 +643,8 @@ def _collect_local_recall_inactive_items(state: dict) -> list[AttentionItem]:
        ``/status pending_sessions`` field exactly.
     3. No existing problematic adapter-manifest entry (status in
        ``{"no_matching_slot", "mismatch", "manifest_missing",
-       "migrated_unverified"}``) — those rows carry their own, more specific
+       "migrated_unverified", "registry_unverified",
+       "key_count_mismatch"}``) — those rows carry their own, more specific
        action hints.  If any such entry is present, this item stays silent to
        avoid double-reporting.
 
@@ -657,6 +672,8 @@ def _collect_local_recall_inactive_items(state: dict) -> list[AttentionItem]:
         "mismatch",
         "manifest_missing",
         "migrated_unverified",
+        "registry_unverified",
+        "key_count_mismatch",
     }
     manifest_status: dict = state.get("adapter_manifest_status") or {}
     for row in manifest_status.values():

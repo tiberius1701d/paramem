@@ -1080,7 +1080,7 @@ class TestBuildStoreContents:
         assert isinstance(stats, dict)
 
     def test_stats_has_expected_keys(self, tmp_path) -> None:
-        """stats dict carries boot_degraded and store_load_degraded."""
+        """stats dict carries boot_degraded and tier_bindings."""
         from paramem.server.app import _build_store_contents
 
         for tier in ("episodic", "semantic", "procedural"):
@@ -1089,7 +1089,8 @@ class TestBuildStoreContents:
         cfg = self._make_config(tmp_path)
         _, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
         assert "boot_degraded" in stats
-        assert "store_load_degraded" in stats
+        assert "tier_bindings" in stats
+        assert "store_load_degraded" not in stats
 
     def test_preload_cache_off_entries_empty(self, tmp_path) -> None:
         """When preload_cache=False, new_entries is empty (intentional opt-out)."""
@@ -1137,11 +1138,15 @@ class TestBuildStoreContents:
         result = _build_store_contents(cfg, model=None, tokenizer=None, should_abort=lambda: True)
         assert len(result) == 4
 
-    def test_meta_unbookkept_counts_active_keys_without_bookkeeping(self, tmp_path) -> None:
+    def test_meta_unbookkept_counts_active_keys_without_bookkeeping(self, tmp_path, caplog) -> None:
         """meta_unbookkept counts active registry keys with no bookkeeping row —
         the inverse of meta_orphaned (a bookkeeping row with no registry key).
         Detect-and-surface only: the build must still succeed (no raise, no
-        degrade)."""
+        degrade). The per-tier breakdown is folded into the existing log
+        line (no separate stats key) — checked via caplog."""
+        import logging
+
+        from paramem.adapters.registry_binding import NO_CANDIDATES
         from paramem.server.app import _build_store_contents
         from paramem.training.key_registry import KeyRegistry
 
@@ -1157,10 +1162,18 @@ class TestBuildStoreContents:
         (tmp_path / "key_metadata.json").write_text(json.dumps({"keys": {}}))
 
         cfg = self._make_config(tmp_path)
-        _, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
+        with caplog.at_level(logging.INFO, logger="paramem.server.app"):
+            _, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
 
         assert stats["meta_unbookkept"] == 1
-        assert stats["store_load_degraded"] is False
+        assert stats["tier_bindings"]["episodic"].status == NO_CANDIDATES
+
+        by_tier_messages = [
+            r.getMessage() for r in caplog.records if "load_bookkeeping_from_disk" in r.getMessage()
+        ]
+        assert any("episodic" in msg and "'episodic': 1" in msg for msg in by_tier_messages), (
+            f"expected the per-tier unbookkept breakdown in the log line, got: {by_tier_messages}"
+        )
 
     def test_meta_unbookkept_zero_when_every_active_key_has_bookkeeping(self, tmp_path) -> None:
         """A registry/bookkeeping pair that agrees reports meta_unbookkept=0."""
@@ -1203,7 +1216,7 @@ class TestBuildStoreContents:
 
 
 class TestHydrateMemoryStoreSwapGuard:
-    """Degraded builder must not wipe a populated live store."""
+    """Per-tier publish: an unverified tier is excluded, healthy tiers still swap."""
 
     def _make_config(self, tmp_path):
         """Minimal config stub sufficient for _build_store_contents."""
@@ -1213,44 +1226,49 @@ class TestHydrateMemoryStoreSwapGuard:
         cfg.consolidation.mode = "simulate"
         cfg.consolidation.recall_probe_batch_size = 1
         cfg.inference.preload_cache = False
+        cfg.paths.data = tmp_path
         return cfg
 
-    def test_degraded_build_does_not_swap(self, tmp_path) -> None:
-        """When the builder returns store_load_degraded=True, swap is skipped.
-
-        The live store's registry/bookkeeping must survive intact; only
-        _state degraded flags are updated.
-        """
-        from unittest.mock import patch
-
+    def test_unverified_tier_is_absent_from_swap_others_publish(self, tmp_path) -> None:
+        """A tier whose registry binding fails verification is ABSENT from
+        the published registry map — not merely empty, which an actually-
+        published-but-empty registry would also satisfy (non-discriminating).
+        Every other healthy tier still publishes normally, and the swap
+        runs unconditionally (no global degrade flag)."""
         from paramem.memory.store import MemoryStore
         from paramem.server.app import _hydrate_memory_store_in_place
+        from paramem.training.key_registry import KeyRegistry
 
         for tier in ("episodic", "semantic", "procedural"):
             (tmp_path / tier).mkdir()
 
-        # Pre-populate the live store with a sentinel entry.
-        live = MemoryStore()
-        live.put("episodic", "pre_existing_key", {"key": "pre_existing_key", "tier": "episodic"})
+        # episodic: unparseable registry -> REGISTRY_UNREADABLE.
+        (tmp_path / "episodic" / "indexed_key_registry.json").write_bytes(b"not json at all")
 
+        # semantic: a real, healthy registry with one active key.
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.save(tmp_path / "semantic" / "indexed_key_registry.json")
+
+        live = MemoryStore()
         cfg = self._make_config(tmp_path)
 
-        # Simulate read_registries_from_disk raising to trigger store_load_degraded.
-        with patch(
-            "paramem.memory.store.MemoryStore.read_registries_from_disk",
-            side_effect=OSError("simulated disk failure"),
-        ):
-            _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
 
-        # The pre-existing entry must still be present — swap must not have run.
-        assert live.get("pre_existing_key") is not None, (
-            "degraded build wiped the live store: pre-existing entry lost"
+        # has_registry checked BEFORE any .registry(tier) call — that
+        # accessor allocates a fresh empty registry via setdefault, which
+        # would flip has_registry to True and mask the very thing under test.
+        assert not live.has_registry("episodic"), (
+            "an unverified tier must be ABSENT from the published registry map"
         )
+        assert live.has_registry("semantic")
+        assert live.registry("semantic").list_active() == ["graph1"]
 
     def test_legitimate_empty_registry_does_swap(self, tmp_path) -> None:
-        """A successful build with an empty registry (store_load_degraded=False) swaps.
+        """A successful build with an empty (but verified) registry swaps.
 
-        This verifies the guard is on the failure flag, not on len(registry)==0.
+        This verifies the guard is per-tier verification, not on
+        len(registry)==0.
         """
         from paramem.memory.store import MemoryStore
         from paramem.server.app import _hydrate_memory_store_in_place
@@ -1273,31 +1291,93 @@ class TestHydrateMemoryStoreSwapGuard:
             "legitimate empty build did not swap: old entry still present"
         )
 
-    def test_degraded_build_sets_state_flag(self, tmp_path) -> None:
-        """_state['store_load_degraded'] is set True when builder degrades."""
-        from unittest.mock import patch
-
-        import paramem.server.app as app_module
+    def test_unverified_tier_records_an_incident(self, tmp_path) -> None:
+        """A tier whose registry binding fails verification records a
+        tier_registry_unverified incident naming the tier and severity."""
         from paramem.memory.store import MemoryStore
         from paramem.server.app import _hydrate_memory_store_in_place
+        from paramem.server.incidents import read_incidents
 
         for tier in ("episodic", "semantic", "procedural"):
             (tmp_path / tier).mkdir()
+        (tmp_path / "episodic" / "indexed_key_registry.json").write_bytes(b"not json at all")
 
         live = MemoryStore()
         cfg = self._make_config(tmp_path)
 
-        original_state = app_module._state.copy()
-        try:
-            with patch(
-                "paramem.memory.store.MemoryStore.read_registries_from_disk",
-                side_effect=OSError("simulated disk failure"),
-            ):
-                _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
 
-            assert app_module._state["store_load_degraded"] is True, (
-                "_state['store_load_degraded'] not set True after degraded build"
-            )
-        finally:
-            # Restore _state so we do not leak into other tests.
-            app_module._state.update(original_state)
+        incidents = read_incidents(tmp_path / "state")
+        matching = [i for i in incidents if i.id == "tier_registry_unverified:episodic"]
+        assert len(matching) == 1
+        assert matching[0].severity == "failed"
+
+    def test_recovered_tier_clears_its_incident(self, tmp_path) -> None:
+        """A tier that was unverified and later becomes publishable again
+        (e.g. the operator restored a healthy registry) has its incident
+        resolved on the next hydrate — the record-or-clear site is the
+        same call, not a separate resolver a caller could forget."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _hydrate_memory_store_in_place
+        from paramem.server.incidents import read_incidents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+        reg_path = tmp_path / "episodic" / "indexed_key_registry.json"
+        reg_path.write_bytes(b"not json at all")
+
+        live = MemoryStore()
+        cfg = self._make_config(tmp_path)
+
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+        active = [
+            i
+            for i in read_incidents(tmp_path / "state")
+            if i.id == "tier_registry_unverified:episodic" and i.status == "active"
+        ]
+        assert len(active) == 1, "precondition: episodic incident must be active"
+
+        # Restore a healthy (parseable, empty) registry and hydrate again.
+        reg_path.write_text('{"active_keys": [], "stale": {}, "simhash": {}}')
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+
+        all_incidents = read_incidents(tmp_path / "state")
+        resolved = [i for i in all_incidents if i.id == "tier_registry_unverified:episodic"]
+        assert len(resolved) == 1
+        assert resolved[0].status == "resolved"
+
+    def test_vanished_interim_tier_resolves_its_incident(self, tmp_path) -> None:
+        """An interim tier's incident, once minted, must not ride /status
+        forever once the tier itself is gone (folded away by a full cycle):
+        it can never be re-verified again under its old name, so the next
+        hydrate must resolve it — not just leave it stranded."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _hydrate_memory_store_in_place
+        from paramem.server.incidents import read_incidents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+        interim_dir = tmp_path / "episodic" / "interim_20260421T0400"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "indexed_key_registry.json").write_bytes(b"not json at all")
+
+        live = MemoryStore()
+        cfg = self._make_config(tmp_path)
+
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+        incident_id = "tier_registry_unverified:episodic_interim_20260421T0400"
+        all_before = read_incidents(tmp_path / "state")
+        active = [i for i in all_before if i.id == incident_id and i.status == "active"]
+        assert len(active) == 1, "precondition: interim incident must be active"
+
+        # The interim slot folds away entirely — a full cycle absorbed and
+        # reaped it. It is never enumerated by verify_adapter_tree again.
+        import shutil
+
+        shutil.rmtree(interim_dir)
+
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+
+        resolved = [i for i in read_incidents(tmp_path / "state") if i.id == incident_id]
+        assert len(resolved) == 1
+        assert resolved[0].status == "resolved"

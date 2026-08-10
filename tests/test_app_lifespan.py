@@ -121,7 +121,7 @@ def _make_scheduler_state(last_chat_monotonic=None, debounce_s: int = 30) -> tup
         "session_buffer": buf,
         "speaker_store": None,
         "pending_rehydration": False,
-        "store_load_degraded": False,
+        "integrity_check_failed": False,
         "last_chat_monotonic": last_chat_monotonic,
     }
     return state_patch, cfg

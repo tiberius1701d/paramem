@@ -20,16 +20,37 @@ All tests run CPU-only — no model loading or GPU required.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import paramem.server.app as app_module
+from paramem.adapters.registry_binding import VERIFIED, TierBinding
 from paramem.server.app import _build_store_contents
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _verified_bindings(registry_map: dict) -> dict:
+    """Wrap a ``{tier: registry}`` map into the ``{tier: TierBinding}`` shape
+    ``verify_adapter_tree`` returns, with every tier VERIFIED."""
+    return {
+        tier: TierBinding(
+            tier=tier,
+            tier_root=Path(f"/fake/{tier}"),
+            status=VERIFIED,
+            registry=reg,
+            registry_present=True,
+            slot=None,
+            manifest=None,
+            candidate_count=0,
+            detail="",
+        )
+        for tier, reg in registry_map.items()
+    }
 
 
 def _make_config(tmp_path):
@@ -190,8 +211,8 @@ class TestPreloadCooldownOrder:
 
         with (
             patch(
-                "paramem.memory.store.MemoryStore.read_registries_from_disk",
-                return_value={"episodic": fake_reg},
+                "paramem.adapters.registry_binding.verify_adapter_tree",
+                return_value=_verified_bindings({"episodic": fake_reg}),
             ),
             patch("paramem.memory.source.DiskMemorySource", return_value=source_mock),
         ):

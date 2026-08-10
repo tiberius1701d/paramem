@@ -253,7 +253,7 @@ class TestPopulatorRegistration:
             "consolidating": False,
             "last_consolidation": None,
             "boot_degraded": None,
-            "store_load_degraded": None,
+            "integrity_check_failed": None,
             "integrity_cleanup": None,
             "adapter_fingerprints_ok": True,
             "voice_degraded": None,
@@ -892,8 +892,93 @@ class TestFinalizeInterimDetailShape:
 
 
 # ---------------------------------------------------------------------------
-# consolidation_retry_exhausted NOT resolved by the incident-wiring success paths
+# _finalize_interim records tier_registry_unverified incidents too — the
+# interim-fold blind-window fix: an interim fold is often the FIRST observer
+# of a tier whose binding breaks after boot, and the incident is the SOLE
+# operator-visible reporter for that condition.
 # ---------------------------------------------------------------------------
+
+
+class TestFinalizeInterimTierIncident:
+    def _make_loop(self, state):
+        state["router"] = MagicMock()
+        loop = MagicMock()
+        loop.model = MagicMock()
+        loop.store.replay_enabled = True
+        loop.store.all_active_keys.return_value = set()
+        return loop
+
+    def test_broken_tier_records_incident_and_stays_sole_reporter(self, state):
+        """A tier whose registry binding breaks and is FIRST observed by an
+        interim fold (not boot, not a full cycle) still gets its incident
+        recorded — closing the blind window. The row-driven attention
+        populator stays silent for the same condition (the sole-reporter
+        property holds on the interim path too, mirroring the full-cycle
+        path)."""
+        from paramem.server.attention import _collect_adapter_fingerprint_items
+        from paramem.server.incidents import read_incidents
+
+        episodic_dir = state["config"].adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True, exist_ok=True)
+        (episodic_dir / "indexed_key_registry.json").write_bytes(b"not json at all")
+
+        loop = self._make_loop(state)
+        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
+
+        app_module._finalize_interim(
+            loop,
+            result,
+            session_ids=["sess-1"],
+            released_sids=[],
+        )
+
+        incidents = read_incidents(_state_dir(state))
+        matching = [i for i in incidents if i.id == "tier_registry_unverified:episodic"]
+        assert len(matching) == 1
+        assert matching[0].status == "active"
+        assert matching[0].severity == "failed"
+
+        # Sole reporter: the row-driven populator stays silent for the same
+        # condition (_revalidate_adapter_manifests, called earlier in the
+        # same finalizer, already minted the adapter_manifest_status row).
+        assert _collect_adapter_fingerprint_items(state) == []
+
+    def test_raising_incident_store_does_not_prevent_consolidating_clear(self, state, caplog):
+        """A raising incident store (record/resolve/read) must not wedge
+        the finalizer — _state['consolidating'] must still clear, and the
+        fault must be logged as an ERROR, never silently swallowed."""
+        import logging
+
+        episodic_dir = state["config"].adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True, exist_ok=True)
+        (episodic_dir / "indexed_key_registry.json").write_bytes(b"not json at all")
+
+        state["consolidating"] = True
+        loop = self._make_loop(state)
+        result = {"mode": "trained", "adapter_name": "episodic_interim_x"}
+
+        with (
+            patch.object(
+                app_module,
+                "_record_unverified_tier_incidents",
+                side_effect=RuntimeError("simulated incident store fault"),
+            ),
+            caplog.at_level(logging.ERROR, logger="paramem.server.app"),
+        ):
+            app_module._finalize_interim(
+                loop,
+                result,
+                session_ids=["sess-1"],
+                released_sids=[],
+            )
+
+        assert state["consolidating"] is False, (
+            "a raising incident store must not wedge the finalizer before consolidating clears"
+        )
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("tier-incident" in msg for msg in error_messages), (
+            f"expected the fault logged as an ERROR, got: {error_messages}"
+        )
 
 
 class TestS4Ordering:

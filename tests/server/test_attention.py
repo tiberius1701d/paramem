@@ -21,6 +21,7 @@ from paramem.server.attention import (
     _collect_config_drift_items,
     _collect_consolidation_items,
     _collect_encryption_items,
+    _collect_incident_items,
     _collect_integrity_cleanup_items,
     _collect_key_rotation_items,
     _collect_local_recall_inactive_items,
@@ -705,7 +706,9 @@ def test_adapter_fingerprint_manifest_missing():
 def test_adapter_no_matching_slot_primary_emits_failed():
     """no_matching_slot on episodic (red) → failed, kind=adapter_no_matching_slot_primary.
 
-    Surfaces the corrupt-registry / stale-slot downstream of store_load_degraded.
+    Surfaces a stale slot on a registry that read cleanly but found no
+    hash-matching slot — a corrupt/unreadable/absent registry now routes to
+    the distinct ``registry_unverified`` status instead.
     """
     state = _live_state(
         adapter_manifest_status={
@@ -749,6 +752,97 @@ def test_adapter_no_matching_slot_secondary_emits_info():
     assert "NO MATCHING SLOT" in items[0].summary
     assert "adapter unmounted" in items[0].summary
     assert items[0].action_hint is None
+
+
+def test_adapter_registry_unverified_row_emits_no_fingerprint_item():
+    """registry_unverified rows are DELIBERATELY not rendered by
+    _collect_adapter_fingerprint_items — the tier_registry_unverified
+    incident (via _collect_incident_items) is the sole reporter, so this
+    populator must not ALSO emit an item for the same condition."""
+    state = _live_state(
+        adapter_manifest_status={
+            "episodic": {
+                "status": "registry_unverified",
+                "reason": "registry_unreadable",
+                "field": None,
+                "severity": "red",
+                "slot_path": None,
+                "checked_at": "",
+            }
+        }
+    )
+    items = _collect_adapter_fingerprint_items(state)
+    assert items == []
+
+
+def test_adapter_key_count_mismatch_row_emits_no_fingerprint_item():
+    """key_count_mismatch rows are likewise not rendered here — same
+    incident-driven reporter as registry_unverified."""
+    state = _live_state(
+        adapter_manifest_status={
+            "semantic": {
+                "status": "key_count_mismatch",
+                "reason": "key_count_mismatch",
+                "field": None,
+                "severity": "yellow",
+                "slot_path": "/adapters/semantic",
+                "checked_at": "",
+            }
+        }
+    )
+    items = _collect_adapter_fingerprint_items(state)
+    assert items == []
+
+
+def test_registry_unverified_incident_is_the_sole_reporter(tmp_path):
+    """The tier_registry_unverified incident renders via
+    _collect_incident_items (the durable, keyless-visible reporter) — and
+    an adapter_manifest_status row for the same tier/condition produces no
+    SECOND item from _collect_adapter_fingerprint_items, so /status shows
+    exactly one row for this condition, not two."""
+    from paramem.server.incidents import record_incident
+
+    state_dir = tmp_path / "state"
+    record_incident(
+        state_dir,
+        type="tier_registry_unverified",
+        key="episodic",
+        severity="failed",
+        summary="Tier 'episodic' registry could not be verified against its "
+        "slot manifests (registry_unreadable) — publishing nothing for this tier",
+        detail={
+            "tier": "episodic",
+            "status": "registry_unreadable",
+            "detail": "registry load failed: Expecting value: line 1 column 1 (char 0)",
+            "candidate_count": 0,
+            "action_hint": (
+                "restore this tier from a snapshot bundle via POST "
+                "/backup/restore and restart; see GET /integrity"
+            ),
+        },
+    )
+
+    cfg = SimpleNamespace(paths=SimpleNamespace(data=tmp_path))
+    incident_items = _collect_incident_items({}, cfg)
+    assert len(incident_items) == 1
+    assert incident_items[0].level == "failed"
+    assert "episodic" in incident_items[0].summary
+    assert "registry_unreadable" in incident_items[0].summary
+
+    # The row-driven populator stays silent for the same condition.
+    fingerprint_state = _live_state(
+        adapter_manifest_status={
+            "episodic": {
+                "status": "registry_unverified",
+                "reason": "registry_unreadable",
+                "field": None,
+                "severity": "red",
+                "slot_path": None,
+                "checked_at": "",
+            }
+        }
+    )
+    assert _collect_adapter_fingerprint_items(fingerprint_state) == []
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1093,28 @@ def test_local_recall_inactive_silent_when_no_matching_slot_present():
                 "field": None,
                 "severity": "red",
                 "slot_path": "/adapters/episodic",
+                "checked_at": "",
+            }
+        },
+    )
+    items = _collect_local_recall_inactive_items(state)
+    assert items == []
+
+
+def test_local_recall_inactive_silent_when_registry_unverified_present():
+    """keys_count==0 + pending>0 BUT adapter_manifest_status has
+    registry_unverified → no item; the fingerprint collector already covers
+    that case with a more specific hint."""
+    state = _live_state(
+        memory_store=_mock_store(0),
+        session_buffer=_mock_buffer(2),
+        adapter_manifest_status={
+            "episodic": {
+                "status": "registry_unverified",
+                "reason": "registry_unreadable",
+                "field": None,
+                "severity": "red",
+                "slot_path": None,
                 "checked_at": "",
             }
         },

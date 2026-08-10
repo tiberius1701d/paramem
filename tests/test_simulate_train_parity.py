@@ -1187,8 +1187,9 @@ def _write_interim_graph(
               keys are live and serving; only their content is missing, and the
               slot's ``graph.json`` still holds it.
             - ``"absent"`` — the store knows nothing of the slot at all: a
-              registry read that failed outright (``store_load_degraded``).  The
-              payload is on disk and only on disk.
+              registry that fails per-tier binding verification (unpublished
+              by ``verify_tier_binding``).  The payload is on disk and only
+              on disk.
 
     Returns:
         The interim directory path.

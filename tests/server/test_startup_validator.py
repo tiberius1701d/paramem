@@ -8,8 +8,11 @@ Covers:
 - Healthy mount → no rows.
 - Episodic wrong base_model.sha → red fingerprint_mismatch, not loaded.
 - Semantic wrong lora.rank → yellow mismatch.
-- Corrupt meta.json → manifest_unreadable.
-- Weights + no meta.json → manifest_missing.
+- Corrupt meta.json (registry present) → no_matching_slot (find_live_slot
+  skips it internally); registry absent → registry_unverified instead (see
+  TestNoMatchingSlot).
+- Weights + no meta.json → fresh (no row); manifest_missing is now only
+  minted by _load_one's load-failure fallback, not by this decision tree.
 - enabled=False → no row.
 - Registry hash mismatch → no_matching_slot.
 - Multiple rows render independently.
@@ -102,8 +105,18 @@ def _write_slot(
     sha: str = "abc123",
     rank: int = 8,
     synthesized: bool = False,
-    key_count: "int | str" = 5,
+    key_count: "int | str" = 0,
 ) -> Path:
+    """Write a slot manifest.  ``key_count`` defaults to 0 — matching the
+    active-key count of a genuinely absent registry (the common shape most
+    fingerprint/manifest tests in this file use), so an int default stays
+    a non-mismatch against verify_tier_binding's key-count check without
+    tripping app.py's separate ``_first_unknown_field`` UNKNOWN-sentinel
+    check (which an UNKNOWN default WOULD trip). Tests writing a real
+    registry with active keys, or specifically exercising
+    KEY_COUNT_MISMATCH, pass an explicit key_count that matches (or
+    deliberately disagrees with) their own registry.
+    """
     slot = adapter_kind_dir / ts
     slot.mkdir(parents=True)
     # Write minimal adapter files so load won't fail on file-not-found
@@ -205,35 +218,17 @@ class TestFingerprintMismatch:
 
 
 class TestCorruptManifest:
-    def test_corrupt_meta_json_gives_manifest_unreadable_via_patch(self, tmp_path: Path) -> None:
-        """Manifest unreadable row is produced when find_live_slot returns a slot
-        but reading the manifest raises ManifestSchemaError.
+    def test_corrupt_meta_json_without_patch_gives_no_matching_slot(self, tmp_path: Path) -> None:
+        """Corrupt meta.json causes find_live_slot to skip the slot → no_matching_slot.
 
-        find_live_slot already skips unreadable meta.json internally (logs WARN
-        and returns None), producing a no_matching_slot row.  The manifest_unreadable
-        path is exercised by patching find_live_slot to return the corrupt slot.
+        A real registry is present (registry_present=True) so the binding
+        distinguishes this from the absent-registry shape — the point under
+        test is the corrupt manifest, not the registry's presence.
         """
         config = _make_config(tmp_path)
         kind_dir = config.adapter_dir / "episodic"
         kind_dir.mkdir()
-        slot = kind_dir / "20260421-000000"
-        slot.mkdir()
-        (slot / "adapter_config.json").write_text("{}")
-        (slot / "adapter_model.safetensors").write_bytes(b"w")
-        (slot / "meta.json").write_text("{bad json")
-
-        with patch("paramem.adapters.manifest.find_live_slot", return_value=slot):
-            _, state = _run(config)
-
-        row = state["adapter_manifest_status"].get("episodic")
-        assert row is not None
-        assert row["reason"] == "manifest_unreadable"
-
-    def test_corrupt_meta_json_without_patch_gives_no_matching_slot(self, tmp_path: Path) -> None:
-        """Corrupt meta.json causes find_live_slot to skip the slot → no_matching_slot."""
-        config = _make_config(tmp_path)
-        kind_dir = config.adapter_dir / "episodic"
-        kind_dir.mkdir()
+        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
         slot = kind_dir / "20260421-000000"
         slot.mkdir()
         (slot / "adapter_config.json").write_text("{}")
@@ -258,11 +253,17 @@ class TestManifestMissing:
         progress.json, or any other content — is treated as a non-slot and the
         tier is classified as fresh (no manifest row emitted).
 
-        The manifest_missing path (find_live_slot returns a slot but the manifest
-        read then raises ManifestNotFoundError) is exercised separately via patching
-        in TestManifestMissingWithPatch, which is the only real-world path to that
-        state: the caller holds a slot reference it obtained before the manifest
-        disappeared.
+        The ``manifest_missing`` status now only ever comes from
+        ``_load_one``'s load-failure fallback (an actual PEFT mount
+        failure, app.py) — not from ``_validate_adapter_slot``, which no
+        longer re-reads a matched slot's manifest (it reads
+        ``binding.manifest``, already parsed inside
+        ``verify_tier_binding``). A slot whose manifest disappears between
+        ``verify_tier_binding``'s own match-and-parse and a caller using
+        the result is therefore a race ``verify_tier_binding`` itself
+        resolves to ``NO_MATCHING_SLOT`` (see
+        ``tests/adapters/test_registry_binding.py``'s race-arm test) — it
+        never reaches this function as ``manifest_missing``.
         """
         config = _make_config(tmp_path)
         kind_dir = config.adapter_dir / "episodic"
@@ -277,35 +278,6 @@ class TestManifestMissing:
         # No real slot found; classifier treats the tier as fresh — no row.
         row = state["adapter_manifest_status"].get("episodic")
         assert row is None
-
-
-class TestManifestMissingWithPatch:
-    """Directly exercise the manifest_missing code path by patching find_live_slot."""
-
-    def test_manifest_missing_when_find_returns_slot_without_meta(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        kind_dir = config.adapter_dir / "episodic"
-        kind_dir.mkdir()
-        # Slot exists but has no meta.json
-        slot = kind_dir / "20260421-000000"
-        slot.mkdir()
-        (slot / "adapter_config.json").write_text("{}")
-        (slot / "adapter_model.safetensors").write_bytes(b"w")
-
-        from peft import PeftModel
-
-        # Patch find_live_slot to return the slot despite no meta.json
-        # Also patch PeftModel.from_pretrained so the load succeeds (no real weights)
-        with (
-            patch("paramem.adapters.manifest.find_live_slot", return_value=slot),
-            patch.object(PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)),
-        ):
-            _, state = _run(config)
-
-        row = state["adapter_manifest_status"].get("episodic")
-        assert row is not None
-        assert row["status"] == "manifest_missing"
-        assert row["reason"] == "manifest_missing"
 
 
 class TestEnabledFalse:
@@ -324,7 +296,9 @@ class TestNoMatchingSlot:
         config = _make_config(tmp_path)
         kind_dir = config.adapter_dir / "episodic"
         kind_dir.mkdir()
-        # Slot has registry_sha256="old_hash", no live registry file → live_hash=""
+        # A real, readable registry so the binding is REGISTRY-present — the
+        # slot's stamped hash simply does not match it.
+        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
         _write_slot(kind_dir, registry_sha256="old_hash")
 
         _, state = _run(config)
@@ -332,6 +306,25 @@ class TestNoMatchingSlot:
         row = state["adapter_manifest_status"].get("episodic")
         assert row is not None
         assert row["status"] == "no_matching_slot"
+        assert row["severity"] == "red"  # episodic is primary
+
+    def test_absent_registry_with_slot_gives_registry_unverified(self, tmp_path: Path) -> None:
+        """A real weight-slot candidate but NO indexed_key_registry.json at all
+        (distinct from "registry present, hash mismatch") is a different,
+        more severe verdict — the registry itself cannot be corroborated,
+        not just unmatched."""
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        # No indexed_key_registry.json — registry_present=False.
+        _write_slot(kind_dir, registry_sha256="old_hash")
+
+        _, state = _run(config)
+
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "registry_unverified"
+        assert row["reason"] == "registry_absent_with_slots"
         assert row["severity"] == "red"  # episodic is primary
 
     def test_progress_only_stub_dir_classified_as_fresh(self, tmp_path: Path) -> None:
@@ -379,6 +372,8 @@ class TestNoMatchingSlot:
         config = _make_config(tmp_path)
         kind_dir = config.adapter_dir / "episodic"
         kind_dir.mkdir()
+        # A real, readable registry so the binding is REGISTRY-present.
+        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
         # Real slot: meta.json written with a non-matching registry_sha256.
         _write_slot(kind_dir, registry_sha256="stale_hash_from_old_training_run")
         # Also place a progress.json stub alongside it — must not affect outcome.
@@ -808,8 +803,11 @@ class TestRevalidateAdapterManifests:
         from paramem.server.app import _revalidate_adapter_manifests
 
         config = _make_config(tmp_path)
-        # Slot with a non-empty registry hash that won't match the live "" hash.
         episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True, exist_ok=True)
+        # A real, readable registry so the binding is REGISTRY-present — the
+        # slot's stamped hash simply does not match it.
+        (episodic_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
         _write_slot(episodic_dir, ts="20260427-105338", registry_sha256="stale_hash_123")
 
         state = self._state_from_config(config)
@@ -932,6 +930,8 @@ class TestRevalidateAdapterManifests:
         config = _make_config(tmp_path)
         interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
         interim_dir.mkdir(parents=True)
+        # A real, readable registry so the binding is REGISTRY-present.
+        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
         _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
 
         state = self._state_from_config(config)
@@ -1261,7 +1261,7 @@ class TestKeylessTierSweep:
         """The keyless-tier sweep runs before find_live_slot resolves any
         tier's slot — mirrors the sweep_orphan_pending-before-find_live_slot
         ordering already load-bearing inside _validate_adapter_slot."""
-        from paramem.adapters.manifest import find_live_slot as real_find_live_slot
+        from paramem.adapters.registry_binding import find_live_slot as real_find_live_slot
         from paramem.server import app as app_module
 
         config = _make_config(tmp_path)
@@ -1282,7 +1282,10 @@ class TestKeylessTierSweep:
 
         with (
             patch.object(app_module, "_sweep_keyless_tier_artifacts", side_effect=_tracked_sweep),
-            patch("paramem.adapters.manifest.find_live_slot", side_effect=_tracked_find_live_slot),
+            patch(
+                "paramem.adapters.registry_binding.find_live_slot",
+                side_effect=_tracked_find_live_slot,
+            ),
         ):
             _run(config)
 
@@ -1349,3 +1352,167 @@ class TestKeylessTierSweep:
         _run(config)
 
         assert not (config.adapter_dir / _PENDING_DELETE_DIR_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# Registry-loss integration pins: both surfaces that verify a tier's
+# registry↔slot binding — the boot mount validator (adapter_manifest_status)
+# and the store-publish builder (_build_store_contents) — must agree on the
+# same real, on-disk tree.
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryLossChain:
+    """Real temp-dir trees exercised through BOTH `_mount_adapters_from_slots`
+    (the `adapter_manifest_status` row) and `_build_store_contents` (the
+    published-registry map / incident), pinning that a single on-disk loss
+    is observed consistently by every consumer of
+    `verify_tier_binding`/`verify_adapter_tree`."""
+
+    def _make_full_config(self, tmp_path: Path):
+        """A config exposing both the mount-validator surface (`adapters.*`)
+        and the store-builder surface (`key_metadata_path`, `paths.data`,
+        `consolidation`, `inference`) against the SAME adapter_dir tree."""
+        config = _make_config(tmp_path)
+        config.key_metadata_path = tmp_path / "key_metadata.json"
+        config.consolidation.mode = "simulate"
+        config.consolidation.recall_probe_batch_size = 1
+        config.inference.preload_cache = False
+        config.paths.data = tmp_path
+        return config
+
+    def test_undecryptable_episodic_leaves_others_published(self, tmp_path: Path) -> None:
+        """Episodic's registry is undecryptable; semantic and procedural are
+        healthy. Episodic is absent from the published registry map AND
+        carries a registry_unverified row; the other two tiers publish
+        their real keys; the corrupt file itself is untouched afterward."""
+        from paramem.backup.encryption import age_encrypt_bytes
+        from paramem.backup.key_store import mint_daily_identity
+        from paramem.server.app import _build_store_contents
+        from paramem.training.key_registry import KeyRegistry
+
+        config = self._make_full_config(tmp_path)
+
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        encrypter = mint_daily_identity()
+        corrupt_bytes = age_encrypt_bytes(b'{"active_keys":["ghost"]}', [encrypter.to_public()])
+        episodic_reg_path = episodic_dir / "indexed_key_registry.json"
+        episodic_reg_path.write_bytes(corrupt_bytes)
+
+        semantic_dir = config.adapter_dir / "semantic"
+        semantic_dir.mkdir(parents=True)
+        sem_reg = KeyRegistry()
+        sem_reg.add("sem_key1")
+        sem_reg.save(semantic_dir / "indexed_key_registry.json")
+
+        procedural_dir = config.adapter_dir / "procedural"
+        procedural_dir.mkdir(parents=True)
+        proc_reg = KeyRegistry()
+        proc_reg.add("proc_key1")
+        proc_reg.save(procedural_dir / "indexed_key_registry.json")
+
+        # Surface 1: the store-publish builder.
+        _, new_registry, _, stats = _build_store_contents(config, model=None, tokenizer=None)
+        assert "episodic" not in new_registry
+        assert new_registry["semantic"].list_active() == ["sem_key1"]
+        assert new_registry["procedural"].list_active() == ["proc_key1"]
+        assert stats["tier_bindings"]["episodic"].status == "registry_unreadable"
+
+        # Surface 2: the boot mount validator.
+        _, state = _run(config)
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "registry_unverified"
+        assert row["reason"] == "registry_unreadable"
+
+        # The corrupt file itself is untouched by either pass.
+        assert episodic_reg_path.read_bytes() == corrupt_bytes
+
+    def test_key_count_mismatch_row_and_publish_suppressed(self, tmp_path: Path) -> None:
+        """A slot stamped key_count=3 under a matching hash, while the
+        registry actually holds 2 active keys, mints a key_count_mismatch
+        row and is excluded from the published registry map."""
+        from paramem.adapters.manifest import tier_registry_sha256
+        from paramem.server.app import _build_store_contents
+        from paramem.training.key_registry import KeyRegistry
+
+        config = self._make_full_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("k1")
+        reg.add("k2")
+        reg.save(episodic_dir / "indexed_key_registry.json")
+        live_hash = tier_registry_sha256(episodic_dir)
+        _write_slot(episodic_dir, registry_sha256=live_hash, key_count=3)
+
+        _, new_registry, _, stats = _build_store_contents(config, model=None, tokenizer=None)
+        assert "episodic" not in new_registry
+        assert stats["tier_bindings"]["episodic"].status == "key_count_mismatch"
+
+        _, state = _run(config)
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "key_count_mismatch"
+
+    def test_no_matching_slot_row_and_tier_absent_from_publish(self, tmp_path: Path) -> None:
+        """A healthy, readable registry with no matching slot mints a
+        no_matching_slot row at the mount stage AND is excluded from the
+        published registry map — NO_MATCHING_SLOT is not a publishable
+        verdict, unlike NO_CANDIDATES."""
+        from paramem.server.app import _build_store_contents
+        from paramem.training.key_registry import KeyRegistry
+
+        config = self._make_full_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("k1")
+        reg.save(episodic_dir / "indexed_key_registry.json")
+        # Slot stamped with a hash that will never match the real registry hash.
+        _write_slot(episodic_dir, registry_sha256="stale_hash_does_not_match")
+
+        _, new_registry, _, stats = _build_store_contents(config, model=None, tokenizer=None)
+        assert "episodic" not in new_registry
+        assert stats["tier_bindings"]["episodic"].status == "no_matching_slot"
+
+        _, state = _run(config)
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "no_matching_slot"
+
+    def test_unverified_tier_error_names_the_restore_door(self, tmp_path: Path) -> None:
+        """The incident detail for an unverified tier names POST
+        /backup/restore + GET /integrity as the operator's exit — never
+        /reconsolidate, which cannot rebuild a tier whose registry itself
+        is unverified. The incident is the SOLE reporter for this
+        condition (see attention.py's docstring) — the row-driven
+        fingerprint populator stays silent for it, so there is exactly one
+        surfaced item, not two."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _hydrate_memory_store_in_place
+        from paramem.server.attention import _collect_adapter_fingerprint_items
+        from paramem.server.incidents import read_incidents
+
+        config = self._make_full_config(tmp_path)
+        episodic_dir = config.adapter_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        (episodic_dir / "indexed_key_registry.json").write_bytes(b"not json at all")
+
+        live = MemoryStore()
+        _hydrate_memory_store_in_place(live, config, model=None, tokenizer=None)
+
+        incidents = read_incidents(tmp_path / "state")
+        matching = [i for i in incidents if i.id == "tier_registry_unverified:episodic"]
+        assert len(matching) == 1
+        detail_text = str(matching[0].detail)
+        assert "/backup/restore" in detail_text
+        assert "/integrity" in detail_text
+        assert "/reconsolidate" not in detail_text
+
+        # The row-driven populator must NOT also emit an item for the same
+        # condition — the incident above is the sole reporter.
+        _, state = _run(config)
+        items = _collect_adapter_fingerprint_items(state)
+        assert items == []
