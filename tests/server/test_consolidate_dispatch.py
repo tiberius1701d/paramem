@@ -1012,6 +1012,37 @@ class TestStampPredicate:
         assert resolved is ConsolidationAction.INTERIM
         assert stamp_calls == 1
 
+    def test_unverified_tier_defers_before_the_stamp_and_does_not_advance_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A ``deferred_tier_unverified`` AUTO tick must not consume the
+        cadence window — the tier problem persists across ticks (it is
+        resolved by an operator restore, not by time passing), so the next
+        scheduled tick must still see the cycle as due.
+        """
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=2, refresh_cadence="every 5h", period_seconds=1
+        )
+        for i in range(3):
+            _make_interim_slot(
+                state["config"].adapter_dir, f"2020010{i + 1}T0000", payload="weights"
+            )
+        seeded_stamp = time.time() - 6 * 3600
+        write_last_scheduled_run(state["config"].paths.data / "state", seeded_stamp)
+        state["adapter_manifest_status"] = {"procedural": {"status": "no_matching_slot"}}
+
+        status, resolved, stamp_calls = self._dispatch_and_track_stamp(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status == "deferred_tier_unverified"
+        assert resolved is ConsolidationAction.AUTO
+        assert stamp_calls == 0
+        assert read_last_scheduled_run(state["config"].paths.data / "state") == seeded_stamp
+
 
 # ---------------------------------------------------------------------------
 # TestUniversalCatchUpGate — the durable-stamp catch-up gate
@@ -1772,3 +1803,180 @@ class TestFullConsolidationFoldEntry:
         assert state["consolidating"] is False, (
             "_state['consolidating'] must be cleared after the fold completes"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTierUnverifiedDeferral — a MAIN tier's registry<->manifest binding
+# unverified (``no_matching_slot`` / ``registry_unverified`` /
+# ``key_count_mismatch``) makes the fold's cross-tier key identity space
+# unknowable and both persist branches would overwrite the very
+# manifest/registry pair preserved for recovery, so every action defers with
+# ``deferred_tier_unverified`` — including RECONCILE, which rebuilds all
+# three main registries.  A fingerprint ``mismatch`` and any interim-tier row
+# do not carry this hazard and must not defer.  The erase/discard doors
+# (``/speaker/forget``, ``/interim/discard``, ``/debug/erase-keys``) consult
+# only the shared guard predicate, never this arm, so they stay open.
+# ---------------------------------------------------------------------------
+
+
+class TestTierUnverifiedDeferral:
+    @pytest.mark.parametrize(
+        "unverified_status",
+        ["registry_unverified", "key_count_mismatch", "no_matching_slot"],
+    )
+    @pytest.mark.parametrize("action_name", ["FULL", "INTERIM", "RECONCILE"])
+    def test_fold_deferred_while_a_main_tier_is_unverified(
+        self, tmp_path, monkeypatch, unverified_status, action_name
+    ) -> None:
+        """Any of the three unverified statuses, on any of the three main
+        tiers, defers every action — FULL, INTERIM, and RECONCILE alike —
+        and nothing reaches the executor.
+        """
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+        _make_interim_slot(state["config"].adapter_dir, "20260701T0000", payload="weights")
+        state["adapter_manifest_status"] = {
+            "episodic": {"status": unverified_status, "reason": unverified_status}
+        }
+
+        status, resolved, spy, _ = _dispatch(
+            state, getattr(ConsolidationAction, action_name), monkeypatch=monkeypatch
+        )
+
+        assert status == "deferred_tier_unverified"
+        assert resolved is getattr(ConsolidationAction, action_name)
+        assert spy.call_count == 0
+
+    def test_a_fingerprint_mismatch_row_does_not_defer(self, tmp_path, monkeypatch) -> None:
+        """A ``mismatch`` (fingerprint) row is a provenance problem, not a
+        key-set-unknowable problem — it must not trigger the deferral.
+        """
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+        state["adapter_manifest_status"] = {
+            "episodic": {"status": "mismatch", "field": "base_model"}
+        }
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
+        )
+
+        assert status == "started"
+        assert resolved is ConsolidationAction.INTERIM
+        assert spy.call_count == 1
+
+    @pytest.mark.parametrize(
+        "unverified_status",
+        ["registry_unverified", "key_count_mismatch", "no_matching_slot"],
+    )
+    def test_an_interim_tier_row_does_not_defer(
+        self, tmp_path, monkeypatch, unverified_status
+    ) -> None:
+        """The same three unverified statuses on an INTERIM-shaped row
+        (``episodic_interim_<stamp>``) are out of scope — the deferral is
+        MAIN-tier only, matched by exact tier name.
+        """
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, named_sessions=1)
+        state["adapter_manifest_status"] = {
+            "episodic_interim_20260101T0000": {"status": unverified_status}
+        }
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.INTERIM, monkeypatch=monkeypatch
+        )
+
+        assert status == "started"
+        assert resolved is ConsolidationAction.INTERIM
+        assert spy.call_count == 1
+
+    def test_unverified_tier_defers_the_active_store_migration_branch(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The arm fires before the ``pending_rehydration`` pre-empt: that
+        branch re-saves tier adapters and restamps ``key_count``, exactly
+        the artifact pair under suspicion while a tier is unverified.
+        """
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["pending_rehydration"] = True
+        state["adapter_manifest_status"] = {"semantic": {"status": "key_count_mismatch"}}
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "deferred_tier_unverified"
+        assert resolved is ConsolidationAction.FULL
+        assert spy.call_count == 0, "the migration branch must never have been reached"
+
+    def test_unverified_tier_defers_before_the_idle_debounce(self, tmp_path, monkeypatch) -> None:
+        """A live chat turn inside the debounce window would defer with
+        ``deferred_idle`` on its own — but the tier-unverified deferral must
+        win first, since the arm sits above the debounce in dispatch order.
+        """
+        import time as _time
+
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        state["last_chat_monotonic"] = _time.monotonic() - 5  # debounce is 30s
+        state["adapter_manifest_status"] = {"episodic": {"status": "registry_unverified"}}
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.FULL, monkeypatch=monkeypatch
+        )
+
+        assert status == "deferred_tier_unverified"
+        assert resolved is ConsolidationAction.FULL
+        assert spy.call_count == 0
+
+    def test_shared_guard_predicate_is_unaffected(self, tmp_path, monkeypatch) -> None:
+        """``_consolidation_dispatch_guards()`` — the predicate the three
+        erase/discard doors consult directly — is untouched by this arm: it
+        still returns ``None`` while a main tier carries an unverified row.
+        """
+        import paramem.server.app as app_module
+
+        state = _make_dispatch_state(tmp_path=tmp_path)
+        state["adapter_manifest_status"] = {"episodic": {"status": "registry_unverified"}}
+        monkeypatch.setattr(app_module, "_state", state)
+
+        assert app_module._consolidation_dispatch_guards() is None
+
+    def test_speaker_forget_still_succeeds_while_a_tier_is_unverified(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """One erase door driven end-to-end: ``POST /speaker/forget`` answers
+        200 with the same unverified row present that defers every
+        consolidation action — the privacy door stays open.
+        """
+        from fastapi.testclient import TestClient
+
+        import paramem.server.app as app_module
+        from tests.server.test_speaker_forget import (
+            _make_buffer,
+            _make_loop,
+            _make_speaker_store,
+        )
+        from tests.server.test_speaker_forget import _make_state as _make_forget_state
+
+        speaker_id = "speaker0"
+        loop = _make_loop(speaker_id, [])
+        state = _make_forget_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            adapter_manifest_status={"episodic": {"status": "registry_unverified"}},
+        )
+
+        monkeypatch.setattr(app_module, "_state", state)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200

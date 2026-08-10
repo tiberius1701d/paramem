@@ -9724,8 +9724,9 @@ async def reconsolidate():
     nothing new; this one never does.  The run does not move the cadence
     window.  Being gate-exempt is not guard-exempt: it still passes through
     the shared safety guards ahead of the gate — busy/cloud-only/bg-training
-    (``_consolidation_dispatch_guards``), the idle debounce, and the
-    active-store migration pre-empt — so a busy server still defers it.
+    (``_consolidation_dispatch_guards``), a main tier's registry binding
+    being unverified, the idle debounce, and the active-store migration
+    pre-empt — so a busy server still defers it.
 
     Takes no request body.
 
@@ -15159,25 +15160,30 @@ def _dispatch_consolidation(
 
     1. ``_consolidation_dispatch_guards()`` — base-swap active / already-running /
        cloud-only / bg-training / migration TRIAL active.  All actions.
-    2. **Idle debounce** — all actions.  This protects a live chat turn from a
+    2. **Any MAIN tier's registry binding unverified** — every action, including
+       ``RECONCILE``.  A tier the boot/fold validator could not bind to a
+       registry has an unknowable key set, which the merger's cross-tier
+       identity space cannot tolerate, and both persist branches would
+       overwrite the very manifest/registry pair preserved for recovery.
+    3. **Idle debounce** — all actions.  This protects a live chat turn from a
        long GPU seizure; it is a safety property, not a schedule, so an explicit
        request defers on it too.
-    3. Retroactive orphan-session voice claim + :func:`_triage_pending_sessions`
+    4. Retroactive orphan-session voice claim + :func:`_triage_pending_sessions`
        — the two side-effect-only pre-stages, run on every dispatch.  Retiring
        what can never be attributed does not depend on which door was used.
-    4. ``pending_rehydration`` — an incoherent active store pre-empts every
+    5. ``pending_rehydration`` — an incoherent active store pre-empts every
        action until the migration completes.
-    5. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
+    6. **``AUTO`` only** — the suspend/power-off catch-up gate, and the
        resolution to ``FULL`` or ``INTERIM`` via :func:`_is_full_cycle_due`
        (its only call site).  Both belong to the schedule; a direct
        ``FULL``/``INTERIM``/``RECONCILE`` request skips straight past them.
-    6. **``FULL`` or ``INTERIM``, resolved or direct** — :func:`_consolidation_content_gate`.
+    7. **``FULL`` or ``INTERIM``, resolved or direct** — :func:`_consolidation_content_gate`.
        An empty input set is empty whether the schedule resolved into it or
        an operator named it directly.  A ``noop_*`` status is not a refusal —
        it is the answer.  ``RECONCILE`` is the one action exempt: it is the
        operator's explicit rebuild-the-store door, and its input (the main
        tiers' own stored keys) always exists, so it never reaches this gate.
-    7. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule stamp
+    8. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule stamp
        (:func:`_stamp_scheduled_run`) on an ``AUTO`` dispatch only — a direct
        ``FULL``/``INTERIM``/``RECONCILE`` request does not move the cadence
        window.
@@ -15227,6 +15233,31 @@ def _dispatch_consolidation(
                 action.value,
             )
         return _guard, action
+
+    # A MAIN tier (episodic/semantic/procedural) whose registry<->manifest
+    # binding could not be verified has an unknowable key set: the merger's
+    # identity space spans every main tier, so an invisible tier's keys get
+    # re-minted as duplicates, and both persist branches rewrite all three
+    # main registries -- overwriting the very file preserved for recovery.
+    # This defers every action, including RECONCILE (which rebuilds all
+    # three main registries from the store). It lives here rather than in
+    # _consolidation_dispatch_guards because three of that predicate's four
+    # callers are the erase/discard doors (POST /speaker/forget,
+    # POST /interim/discard, POST /debug/erase-keys) that must stay open
+    # while a tier is unverified -- adding an arm there would close them too.
+    from paramem.memory.interim_adapter import MAIN_TIERS
+
+    _manifest_status = _state.get("adapter_manifest_status", {})
+    _unverified_statuses = {"no_matching_slot", "registry_unverified", "key_count_mismatch"}
+    if any(
+        _manifest_status.get(_tier, {}).get("status") in _unverified_statuses
+        for _tier in MAIN_TIERS
+    ):
+        logger.warning(
+            "Consolidation dispatch (%s): a main tier's registry binding is unverified — deferred",
+            action.value,
+        )
+        return "deferred_tier_unverified", action
 
     config = _state["config"]
 
