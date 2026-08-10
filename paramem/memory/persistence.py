@@ -22,6 +22,11 @@ Public API
   affected tier's registry, graph, and (for a surviving tier) weight-slot
   manifest in one atomic-ordered sequence; shared by every out-of-fold
   registry-mutation caller (``POST /speaker/forget`` today).
+- :func:`restamp_tier_manifest` — the no-retrain commit primitive
+  ``erase_keys_and_restamp_manifest`` calls per tier: persists a registry to
+  disk, then rebinds the tier's live weight-slot manifest to the new hash.
+  The one place any out-of-fold caller that mutates a tier's registry
+  without retraining commits that mutation.
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
   as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
@@ -58,8 +63,9 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import networkx as nx
 
@@ -68,6 +74,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from paramem.training.consolidation import ConsolidationLoop
+    from paramem.training.key_registry import KeyRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -601,6 +608,164 @@ def erase_keys_from_graph_file(path: Path, keys: set[str]) -> int:
     return len(to_remove)
 
 
+# Status values returned by :func:`restamp_tier_manifest`.  Each corresponds
+# to one of the three guards documented on that function.
+RESTAMPED: Final[str] = "restamped"
+NO_WEIGHT_SLOT: Final[str] = "no_weight_slot"
+NO_PRE_WRITE_HASH: Final[str] = "no_pre_write_hash"
+SLOT_ORPHANED: Final[str] = "slot_orphaned"
+
+
+@dataclass(frozen=True)
+class RestampResult:
+    """Outcome of one :func:`restamp_tier_manifest` call.
+
+    Attributes:
+        status: One of :data:`RESTAMPED`, :data:`NO_WEIGHT_SLOT`,
+            :data:`NO_PRE_WRITE_HASH`, or :data:`SLOT_ORPHANED`.
+        slot: The re-stamped slot directory when ``status == RESTAMPED``;
+            ``None`` for every other status.
+    """
+
+    status: str
+    slot: Path | None
+
+
+def restamp_tier_manifest(
+    tier_root: Path, *, registry: "KeyRegistry", pre_sha: str | None = None
+) -> RestampResult:
+    """The ONE no-retrain commit for a tier whose weights did not change.
+
+    Persists *registry* to ``tier_root/indexed_key_registry.json``, then
+    rebinds the tier's live weight-slot manifest so
+    :func:`~paramem.adapters.manifest.find_live_slot` matches the rewritten
+    registry on the next boot/reload. Used by every out-of-fold caller that
+    mutates a tier's registry without retraining an adapter (today:
+    :func:`erase_keys_and_restamp_manifest`).
+
+    Two production derivations of the pre-write registry hash
+    (:func:`~paramem.adapters.manifest.tier_registry_sha256`) exist, both
+    correct:
+
+    * :func:`erase_keys_and_restamp_manifest` passes its own pre-mutation
+      snapshot as *pre_sha*, captured in its pre-loop BEFORE
+      ``store.discard_keys`` runs. By the time it calls this function the
+      in-memory registry has already been mutated, so reading the hash here
+      would observe the state AFTER a mutation the caller needs to be able
+      to abort before — a decrypt/read failure on that hash must surface
+      before any mutation, not from inside a call that runs after one.
+    * A caller that mutates nothing before calling this function omits
+      *pre_sha* (``None``, the default); this function reads it here
+      instead, at the top, before *registry* is written. Nothing else
+      writes *tier_root*'s registry file in between, so the read-inside
+      path observes the identical on-disk value a pre-mutation snapshot
+      would have captured.
+
+    Ordering is registry-first, manifest-second, deliberately: a crash
+    between the two leaves :func:`~paramem.adapters.manifest.find_live_slot`
+    with no match for the new hash (surfaced, recoverable via a consolidation
+    fold or registry restore) rather than a match bound to the wrong slot.
+
+    Three guards, each reported as a distinct status:
+
+    * No weight-slot candidate anywhere under *tier_root*
+      (:func:`~paramem.adapters.manifest.count_slot_candidates` == 0) — the
+      registry is still written; the re-stamp is skipped with a DEBUG log.
+      Simulate venue or a never-trained tier never has a slot to bind.
+      Returns :data:`NO_WEIGHT_SLOT`.
+    * The pre-write registry hash is ``""`` (no readable registry existed on
+      disk before this call) — the registry is still written; the re-stamp
+      is REFUSED with a WARNING rather than binding a stray ``""``-stamped
+      slot. Returns :data:`NO_PRE_WRITE_HASH`.
+    * No on-disk slot's manifest matches the pre-write hash — an ERROR is
+      logged and no manifest is written; the slot is already orphaned (e.g.
+      from a prior crash) and this call must not adopt it. Returns
+      :data:`SLOT_ORPHANED`.
+
+    On success the re-stamped manifest carries the new registry hash and
+    ``key_count=len(registry)`` — the ACTIVE key count
+    (:meth:`~paramem.training.key_registry.KeyRegistry.__len__`), matching
+    the documented meaning of
+    :attr:`~paramem.adapters.manifest.AdapterManifest.key_count`. Returns
+    :data:`RESTAMPED`.
+
+    There is deliberately NO emptied-tier rule here: whether *registry* has
+    been reduced to zero known keys is the caller's decision (e.g.
+    :func:`erase_keys_and_restamp_manifest` collects emptied tiers for reap
+    immediately after calling this). A tier restamped here with
+    ``key_count=0`` in the moments before a caller reaps its directory is
+    strictly safer than leaving it unstamped: a crash between the two calls
+    leaves a self-consistent empty tier rather than an ambiguous one.
+
+    Args:
+        tier_root: Resolved tier slot root (main tier or interim slot) —
+            the same shape :func:`~paramem.adapters.manifest.tier_registry_sha256`
+            and :func:`~paramem.adapters.manifest.find_live_slot` expect.
+        registry: The tier's :class:`~paramem.training.key_registry.KeyRegistry`,
+            already reflecting the caller's mutation. Written to disk by
+            this call.
+        pre_sha: The registry hash from BEFORE the caller's mutation, when
+            the caller captured one ahead of its own mutation (see above).
+            ``None`` (default) reads it here instead, for a caller that
+            mutates nothing before calling this function.
+
+    Returns:
+        A :class:`RestampResult` naming the outcome and (only for
+        :data:`RESTAMPED`) the rebound slot path.
+    """
+    import hashlib as _hashlib
+    from dataclasses import replace as _replace
+
+    from paramem.adapters.manifest import (
+        count_slot_candidates,
+        find_live_slot,
+        read_manifest,
+        tier_registry_sha256,
+        write_manifest,
+    )
+
+    if pre_sha is None:
+        pre_sha = tier_registry_sha256(tier_root)
+
+    registry.save(tier_root / "indexed_key_registry.json")
+
+    if count_slot_candidates(tier_root) == 0:
+        logger.debug(
+            "restamp_tier_manifest: tier %s has no on-disk weight slot — "
+            "skipping manifest re-stamp (simulate venue or never-trained tier)",
+            tier_root,
+        )
+        return RestampResult(status=NO_WEIGHT_SLOT, slot=None)
+
+    if pre_sha == "":
+        logger.warning(
+            "restamp_tier_manifest: tier %s had no readable pre-write "
+            "registry on disk (empty hash) — skipping manifest re-stamp to avoid "
+            'binding a stray ""-stamped slot; recover via consolidation fold or '
+            "registry restore",
+            tier_root,
+        )
+        return RestampResult(status=NO_PRE_WRITE_HASH, slot=None)
+
+    slot = find_live_slot(tier_root, pre_sha)
+    if slot is None:
+        logger.error(
+            "restamp_tier_manifest: tier %s has no on-disk slot whose manifest "
+            "matches pre-write hash %s… — slot already orphaned; manifest not "
+            "rewritten",
+            tier_root,
+            pre_sha[:12],
+        )
+        return RestampResult(status=SLOT_ORPHANED, slot=None)
+
+    new_hash = _hashlib.sha256(registry.save_bytes()).hexdigest()
+    write_manifest(
+        slot,
+        _replace(read_manifest(slot), registry_sha256=new_hash, key_count=len(registry)),
+    )
+    return RestampResult(status=RESTAMPED, slot=slot)
+
+
 def erase_keys_and_restamp_manifest(
     *,
     store,
@@ -617,28 +782,25 @@ def erase_keys_and_restamp_manifest(
        (:func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`)
        and read the pre-erase registry hash
        (:func:`~paramem.adapters.manifest.tier_registry_sha256`) — both
-       BEFORE ``store.discard_keys`` runs, so a malformed tier name aborts
-       before any mutation and the hash reflects exactly what the last save
-       wrote to disk (not a re-serialisation of the in-memory registry,
-       which could diverge from the stamped manifest hash across a future
-       payload-shape change).
+       BEFORE ``store.discard_keys`` runs, so a malformed tier name OR an
+       undecryptable on-disk registry (rotated key, corrupt age header)
+       aborts before any mutation, for every affected tier at once — not
+       mid-loop after an earlier tier has already committed.
     2. ``store.discard_keys(keys, mode="erase")`` — hard erase from every
        tier's ``KeyRegistry`` (active + stale + simhash) and bookkeeping in
        one call, across every tier at once.
-    3. ``registry.save(...)`` (durable erase) then
-       :func:`erase_keys_from_graph_file` (fact content) — registry first,
-       content second, so a crash between the two never leaves an orphaned
-       graph edge no reader can resolve.
-    4. A surviving tier (still knows a key after the erase) gets its live
-       weight slot's manifest re-stamped so
-       :func:`~paramem.adapters.manifest.find_live_slot` rebinds it on
-       restart. Gated by a venue check
-       (:func:`~paramem.adapters.manifest.count_slot_candidates` — a weight
-       slot can only exist in the train venue; zero candidates means there
-       is no slot to re-stamp, not that one is orphaned) and an empty-hash
-       guard (an unreadable/absent pre-erase registry must never bind a
-       stray ``""``-stamped slot). A tier emptied by the erase is not
-       re-stamped — it is returned in the result for the caller to reap.
+    3. :func:`restamp_tier_manifest`, passing the step-1 pre-erase hash as
+       *pre_sha* — the no-retrain commit primitive: persists the erased
+       registry to disk, then re-stamps the tier's live weight slot (guards
+       documented there) so :func:`~paramem.adapters.manifest.find_live_slot`
+       rebinds it on restart.
+    4. :func:`erase_keys_from_graph_file` (fact content) — registry first,
+       content second (step 3 before step 4), so a crash between the two
+       never leaves an orphaned graph edge no reader can resolve.
+    5. A tier reduced to zero known keys (``registry.list_known()`` empty)
+       is collected in the result for the caller to reap — its weight slot
+       was already re-stamped to ``key_count=0`` by step 3, one call
+       earlier; the reap that follows deletes the directory outright.
 
     A no-op — returns ``{}``, calls nothing — when *keys* is empty.
 
@@ -664,20 +826,18 @@ def erase_keys_and_restamp_manifest(
             :func:`~paramem.memory.interim_adapter.adapter_slot_root_for_name`),
             raised before ``discard_keys`` runs so no mutation has happened
             yet.
+        RuntimeError: An affected tier's on-disk registry exists but cannot
+            be decrypted (propagated from
+            :func:`~paramem.adapters.manifest.tier_registry_sha256`), raised
+            before ``discard_keys`` runs so no mutation has happened yet —
+            see the doc comment in
+            :func:`~paramem.adapters.manifest.tier_registry_sha256` on why
+            this caller deliberately does not catch it.
     """
     if not keys:
         return {}
 
-    import hashlib as _hashlib
-    from dataclasses import replace as _replace
-
-    from paramem.adapters.manifest import (
-        count_slot_candidates,
-        find_live_slot,
-        read_manifest,
-        tier_registry_sha256,
-        write_manifest,
-    )
+    from paramem.adapters.manifest import tier_registry_sha256
     from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
     keys_set = set(keys)
@@ -696,7 +856,7 @@ def erase_keys_and_restamp_manifest(
     emptied_tiers: dict[str, Path] = {}
     for tier_name, root in tier_root.items():
         registry = store.registry(tier_name)
-        registry.save(root / "indexed_key_registry.json")
+        restamp_tier_manifest(root, registry=registry, pre_sha=tier_pre_sha[tier_name])
         erase_keys_from_graph_file(root / "graph.json", keys_set)
 
         if not registry.list_known():
@@ -706,41 +866,6 @@ def erase_keys_and_restamp_manifest(
             )
             emptied_tiers[tier_name] = root
             continue
-
-        pre_sha = tier_pre_sha[tier_name]
-        has_weight_slot = count_slot_candidates(root) > 0
-        if not has_weight_slot:
-            logger.debug(
-                "erase_keys_and_restamp_manifest: tier %s has no on-disk weight slot — "
-                "skipping manifest re-stamp (simulate venue or never-trained tier)",
-                tier_name,
-            )
-        elif pre_sha == "":
-            logger.warning(
-                "erase_keys_and_restamp_manifest: tier %s had no readable pre-erase "
-                "registry on disk (empty hash) — skipping manifest re-stamp to avoid "
-                'binding a stray ""-stamped slot; recover via consolidation fold or '
-                "registry restore",
-                tier_name,
-            )
-        else:
-            new_hash = _hashlib.sha256(registry.save_bytes()).hexdigest()
-            slot = find_live_slot(root, pre_sha)
-            if slot is None:
-                logger.error(
-                    "erase_keys_and_restamp_manifest: tier %s live slot for pre-erase "
-                    "hash %s… not found — slot already orphaned; recover via "
-                    "consolidation fold or registry restore",
-                    tier_name,
-                    pre_sha[:12],
-                )
-            else:
-                write_manifest(
-                    slot,
-                    _replace(
-                        read_manifest(slot), registry_sha256=new_hash, key_count=len(registry)
-                    ),
-                )
 
         logger.info(
             "erase_keys_and_restamp_manifest: removed key(s) from KeyRegistry tier %s",

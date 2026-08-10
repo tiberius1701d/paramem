@@ -776,7 +776,15 @@ def _migrate_tier_simulate_to_train(
             loop.model,
             loop.tokenizer,
             name,
-            key_count=len(entries),
+            # The active-key count of _tier_reg -- the SAME registry object
+            # whose bytes were just hashed into _reg_sha above -- not
+            # len(entries) (the graph-entry count after known_keys
+            # filtering, which is active-union-stale domain). The true
+            # active count can EXCEED len(entries): a key already active in
+            # the registry but with no corresponding edge in this
+            # migration's source graph.json never appears in entries, yet
+            # still counts toward the registry's active total.
+            key_count=len(_tier_reg),
             base_model_hash_cache=fingerprint_cache,
             registry_sha256_override=_reg_sha,
             adapter_root=Path(config.adapter_dir),

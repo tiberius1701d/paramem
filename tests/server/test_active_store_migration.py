@@ -965,6 +965,65 @@ class TestMigrateTierSimulateToTrain:
             "tier registry must be written for slot binding"
         )
 
+    def test_key_count_is_registry_active_count_not_entry_count(self, tmp_path):
+        """Stamp-domain pin: key_count must be the ACTIVE count of the same
+        registry whose bytes were hashed into registry_sha256_override -- not
+        len(entries) (the graph-entry count after known_keys filtering,
+        which is active-union-stale domain and can diverge from the true
+        active count when the store carries a leftover active key untouched
+        by this migration's entries).
+
+        Fixture: the tier registry already knows an extra ACTIVE key
+        ("g_extra", no graph edge) plus a STALE key ("g_stale", no graph
+        edge) before the migration runs. Neither is touched by the hot-load
+        loop (their keys never appear in entries), so they survive the call
+        unchanged -- g_extra inflates the true active count past
+        len(entries) while g_stale must NOT.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0"), _full_quad("g1")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+
+        reg = loop.store.registry("episodic")
+        reg.add("g0")
+        reg.add("g1")
+        reg.add("g_extra")
+        reg.add("g_stale")
+        reg.stale("g_stale")
+
+        captured: dict = {}
+
+        def _capture_manifest(*args, **kwargs):
+            captured["key_count"] = kwargs.get("key_count")
+            return MagicMock()
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.build_registry",
+                return_value={"g0": 0, "g1": 0},
+            ),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch(
+                "paramem.adapters.manifest.build_manifest_for",
+                side_effect=_capture_manifest,
+            ),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        # len(entries) after known_keys filtering is 2 (g0, g1) -- the buggy
+        # domain. The true active count is 3 (g0, g1, g_extra); g_stale must
+        # not be counted.
+        assert captured["key_count"] == 3, (
+            "key_count must be the registry's active count (g0, g1, g_extra), "
+            f"not len(entries); got {captured['key_count']!r}"
+        )
+        assert captured["key_count"] == len(loop.store.registry("episodic"))
+
     def test_writes_fingerprints_in_unified_registry(self, tmp_path):
         """The persisted registry carries exactly the fingerprints from Step 2.
 

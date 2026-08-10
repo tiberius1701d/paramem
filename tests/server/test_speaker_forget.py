@@ -974,7 +974,7 @@ class TestLiveSlotManifestReStamp:
 
         warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
-            "had no readable pre-erase registry on disk" in msg for msg in warning_messages
+            "had no readable pre-write registry on disk" in msg for msg in warning_messages
         ), f"Expected empty-pre-hash WARNING in logs, got: {warning_messages}"
 
         # No manifest touched.

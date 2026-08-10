@@ -1282,9 +1282,14 @@ class TestEraseKeysAndRestampManifest:
         keys_on_disk = {e["key"] for e in iter_entries(g2)}
         assert keys_on_disk == {"graph2"}
 
-    def test_emptied_tier_is_returned_not_restamped(self, tmp_path):
-        """A tier reduced to zero known keys is returned in the result (for
-        the caller to reap), not re-stamped."""
+    def test_emptied_tier_is_returned_for_reap(self, tmp_path):
+        """A tier reduced to zero known keys is returned in the result for
+        the caller to reap. This fixture has no weight-slot candidate under
+        the tier root, so restamp_tier_manifest reports NO_WEIGHT_SLOT
+        internally (its own guard, exercised separately elsewhere) -- the
+        emptied-tier collection here is unaffected either way; see
+        test_emptied_tier_with_live_slot_is_restamped_to_zero_and_reaped for
+        the case where a slot DOES exist and IS restamped before the reap."""
         from paramem.memory.store import MemoryStore
 
         store = MemoryStore(replay_enabled=True)
@@ -1300,6 +1305,70 @@ class TestEraseKeysAndRestampManifest:
 
         assert result == {"episodic": tier_root}
         assert not store.registry("episodic").knows("graph1")
+
+    def test_emptied_tier_with_live_slot_is_restamped_to_zero_and_reaped(self, tmp_path):
+        """When an emptied tier DOES have a matching live slot, the door's
+        step 3 (restamp_tier_manifest) restamps it to key_count=0 BEFORE the
+        emptied-tier decision is made -- and the tier is still returned in
+        emptied_tiers for the caller to reap. A crash between the restamp
+        and the reap leaves a self-consistent empty tier, not an ambiguous
+        one (the documented delta on restamp_tier_manifest's emptied-tier
+        note)."""
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            find_live_slot,
+            read_manifest,
+            write_manifest,
+        )
+        from paramem.memory.store import MemoryStore
+
+        tier_name = "episodic"
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / tier_name
+        tier_root.mkdir(parents=True)
+
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        slot_dir.mkdir()
+        write_manifest(
+            slot_dir,
+            AdapterManifest(
+                schema_version=MANIFEST_SCHEMA_VERSION,
+                name=tier_name,
+                trained_at="2026-06-12T00:00:00Z",
+                base_model=BaseModelFingerprint(
+                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
+                ),
+                tokenizer=TokenizerFingerprint(
+                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+                ),
+                lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
+                registry_sha256=h_old,
+                key_count=1,
+            ),
+        )
+        assert find_live_slot(tier_root, h_old) == slot_dir
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {"episodic": tier_root}
+
+        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
+        assert find_live_slot(tier_root, h_new) == slot_dir
+        restamped = read_manifest(slot_dir)
+        assert restamped.key_count == 0
 
     def test_survivor_restamp_makes_slot_mountable(self, tmp_path):
         """After the helper runs on a surviving slot, find_live_slot accepts
@@ -1601,7 +1670,7 @@ class TestEraseKeysAndRestampManifest:
         assert result == {}
         mock_find_live_slot.assert_not_called()
         warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("had no readable pre-erase registry" in msg for msg in warning_messages)
+        assert any("had no readable pre-write registry" in msg for msg in warning_messages)
 
     def test_orphaned_slot_logs_error_without_raising(self, tmp_path, caplog):
         """A pre-erase hash that no on-disk slot matches (already orphaned,
@@ -1660,3 +1729,316 @@ class TestEraseKeysAndRestampManifest:
         assert result == {}
         error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert any("slot already orphaned" in msg for msg in error_messages)
+
+    def test_erase_door_still_reaps_an_emptied_tier(self, tmp_path):
+        """Through erase_keys_and_restamp_manifest, a tier the erase reduces
+        to zero known keys is still returned in the result for the caller to
+        reap, and its graph.json has had the erased key's edge removed --
+        unaffected by routing the registry-write + manifest-restamp step
+        through restamp_tier_manifest."""
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.registry("episodic").add("graph1")
+
+        adapter_dir = tmp_path / "adapters"
+        tier_root = adapter_dir / "episodic"
+        tier_root.mkdir(parents=True)
+
+        g = nx.MultiDiGraph()
+        _add_keyed_edge(
+            g, "Alice", "Berlin", indexed_key="graph1", predicate="lives_in", speaker_id="S0"
+        )
+        save_memory_to_disk(g, tier_root / "graph.json")
+
+        result = erase_keys_and_restamp_manifest(
+            store=store, adapter_dir=adapter_dir, keys=["graph1"]
+        )
+
+        assert result == {"episodic": tier_root}
+        g2 = load_memory_from_disk(tier_root / "graph.json")
+        assert list(iter_entries(g2)) == []
+
+    def test_erase_door_raises_on_a_malformed_tier_name_before_any_write(self, tmp_path):
+        """The pre-mutation raise (adapter_slot_root_for_name on a malformed
+        interim tier name) is unchanged: the door still resolves slot roots
+        AND captures each tier's pre-erase hash in its own pre-loop, before
+        store.discard_keys runs -- no registry file is ever written and the
+        store is left untouched."""
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+        from paramem.memory.store import MemoryStore
+
+        tier_name = f"{INTERIM_NAME_PREFIX}foo"  # does not parse as a stamp
+        store = MemoryStore(replay_enabled=True)
+        reg = store.registry(tier_name)
+        reg.add("graph1")
+
+        adapter_dir = tmp_path / "adapters"
+        with pytest.raises(ValueError):
+            erase_keys_and_restamp_manifest(store=store, adapter_dir=adapter_dir, keys=["graph1"])
+
+        assert reg.knows("graph1")
+        assert not adapter_dir.exists()
+
+    def test_second_tier_hash_read_raises_before_any_mutation(self, tmp_path):
+        """Regression pin: the door captures EVERY affected tier's pre-erase
+        hash in its own pre-loop, before store.discard_keys runs for ANY
+        tier -- so a decrypt/read failure on the SECOND tier's on-disk
+        registry raises before the FIRST tier's KeyRegistry (in-RAM or on
+        disk) is touched at all. Not mid-loop after an earlier tier has
+        already committed."""
+        from unittest.mock import patch
+
+        from paramem.adapters.manifest import tier_registry_sha256 as _real_tier_registry_sha256
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        ep_reg = store.registry("episodic")
+        ep_reg.add("graph1")
+        sem_reg = store.registry("semantic")
+        sem_reg.add("graph2")
+
+        adapter_dir = tmp_path / "adapters"
+        ep_root = adapter_dir / "episodic"
+        sem_root = adapter_dir / "semantic"
+        ep_root.mkdir(parents=True)
+        sem_root.mkdir(parents=True)
+        ep_reg.save(ep_root / "indexed_key_registry.json")
+        sem_reg.save(sem_root / "indexed_key_registry.json")
+
+        def _raising_for_semantic(tier_root):
+            if tier_root.name == "semantic":
+                raise RuntimeError("simulated decrypt failure")
+            return _real_tier_registry_sha256(tier_root)
+
+        with patch(
+            "paramem.adapters.manifest.tier_registry_sha256",
+            side_effect=_raising_for_semantic,
+        ):
+            with pytest.raises(RuntimeError, match="simulated decrypt failure"):
+                erase_keys_and_restamp_manifest(
+                    store=store, adapter_dir=adapter_dir, keys=["graph1", "graph2"]
+                )
+
+        # Both tiers' in-RAM registries still know their keys -- discard_keys
+        # never ran (the raise happened inside the pre-loop, before it).
+        assert ep_reg.knows("graph1")
+        assert sem_reg.knows("graph2")
+
+        # Both on-disk registries unchanged.
+        on_disk_ep = KeyRegistry.load(ep_root / "indexed_key_registry.json")
+        assert on_disk_ep.knows("graph1")
+        on_disk_sem = KeyRegistry.load(sem_root / "indexed_key_registry.json")
+        assert on_disk_sem.knows("graph2")
+
+        # No manifest anywhere -- restamp_tier_manifest was never called.
+        assert not any(ep_root.glob("*/meta.json"))
+        assert not any(sem_root.glob("*/meta.json"))
+
+
+# ---------------------------------------------------------------------------
+# restamp_tier_manifest — the no-retrain commit primitive extracted from
+# erase_keys_and_restamp_manifest. Fold-reusable: persists a registry, then
+# rebinds the tier's live weight-slot manifest.
+# ---------------------------------------------------------------------------
+
+
+class TestRestampTierManifest:
+    def _write_manifest_for(self, slot_dir: Path, tier_name: str, sha: str, key_count: int):
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            write_manifest,
+        )
+
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        manifest = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=tier_name,
+            trained_at="2026-06-12T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
+            registry_sha256=sha,
+            key_count=key_count,
+        )
+        write_manifest(slot_dir, manifest)
+        return manifest
+
+    def test_restamps_matching_slot(self, tmp_path):
+        """The matching guard: the slot whose manifest carries the pre-write
+        hash is re-stamped with the new hash and the new active count."""
+        from paramem.adapters.manifest import find_live_slot, read_manifest
+        from paramem.memory.persistence import RESTAMPED, restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        self._write_manifest_for(slot_dir, "episodic", h_old, key_count=2)
+
+        reg.remove("graph1")
+        result = restamp_tier_manifest(tier_root, registry=reg)
+
+        assert result.status == RESTAMPED
+        assert result.slot == slot_dir
+
+        h_new = hashlib.sha256(reg.save_bytes()).hexdigest()
+        assert find_live_slot(tier_root, h_new) == slot_dir
+        assert find_live_slot(tier_root, h_old) is None
+
+        restamped = read_manifest(slot_dir)
+        assert restamped.key_count == 1
+        assert restamped.registry_sha256 == h_new
+
+    def test_no_weight_slot_candidate_skips_with_debug_log(self, tmp_path, caplog):
+        """The venue guard: no on-disk weight-slot candidate at all (simulate
+        venue / never-trained tier) -- registry is still written, restamp
+        skipped, DEBUG (not WARNING/ERROR) logged."""
+        import logging
+
+        from paramem.memory.persistence import NO_WEIGHT_SLOT, restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+
+        caplog.set_level(logging.DEBUG, logger="paramem.memory.persistence")
+        result = restamp_tier_manifest(tier_root, registry=reg)
+
+        assert result.status == NO_WEIGHT_SLOT
+        assert result.slot is None
+        assert (tier_root / "indexed_key_registry.json").exists()
+        debug_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("no on-disk weight slot" in msg for msg in debug_messages)
+
+    def test_empty_pre_write_hash_refuses_with_warning(self, tmp_path, caplog):
+        """The empty-hash guard: no readable registry existed on disk before
+        this call -- registry is still written, restamp REFUSED (not bound
+        to a stray ""-stamped slot), WARNING logged."""
+        import logging
+
+        from paramem.memory.persistence import NO_PRE_WRITE_HASH, restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        reg = KeyRegistry()
+        reg.add("graph1")
+        # Deliberately NOT saved to disk before the call -- tier_registry_sha256
+        # reads "" for a tier root that does not exist yet.
+
+        # A weight-slot manifest must exist for the pre_sha == "" branch to be
+        # reached at all -- with zero slot candidates the venue gate fires first.
+        self._write_manifest_for(
+            tier_root / "20260101-000000", "episodic", "unrelated" * 8, key_count=0
+        )
+
+        caplog.set_level(logging.WARNING, logger="paramem.memory.persistence")
+        result = restamp_tier_manifest(tier_root, registry=reg)
+
+        assert result.status == NO_PRE_WRITE_HASH
+        assert result.slot is None
+        assert (tier_root / "indexed_key_registry.json").exists()
+        warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("had no readable pre-write registry" in msg for msg in warning_messages)
+
+    def test_no_matching_slot_errors_without_writing_manifest(self, tmp_path, caplog):
+        """The orphan guard: a pre-write hash no on-disk slot matches --
+        registry is still written, ERROR logged, no manifest write (the slot
+        is already orphaned and must not be adopted)."""
+        import logging
+
+        from paramem.adapters.manifest import read_manifest
+        from paramem.memory.persistence import SLOT_ORPHANED, restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        stray = self._write_manifest_for(slot_dir, "episodic", "deadbeef" * 8, key_count=1)
+
+        caplog.set_level(logging.ERROR, logger="paramem.memory.persistence")
+        result = restamp_tier_manifest(tier_root, registry=reg)
+
+        assert result.status == SLOT_ORPHANED
+        assert result.slot is None
+        assert read_manifest(slot_dir) == stray
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("slot already orphaned" in msg for msg in error_messages)
+
+    def test_key_count_is_active_only_and_sha_matches_written_file(self, tmp_path):
+        """Domain pin: with active AND stale keys present, the restamped
+        key_count is the ACTIVE count (not active+stale), and the stamped
+        registry_sha256 equals tier_registry_sha256 of the file this call
+        just wrote."""
+        from paramem.adapters.manifest import read_manifest, tier_registry_sha256
+        from paramem.memory.persistence import RESTAMPED, restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.add("graph3")
+        reg.stale("graph3")
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        self._write_manifest_for(slot_dir, "episodic", h_old, key_count=2)
+
+        result = restamp_tier_manifest(tier_root, registry=reg)
+
+        assert result.status == RESTAMPED
+        restamped = read_manifest(slot_dir)
+        assert restamped.key_count == 2, (
+            "key_count must be the ACTIVE count (graph1, graph2), excluding "
+            f"the stale graph3; got {restamped.key_count!r}"
+        )
+        assert restamped.registry_sha256 == tier_registry_sha256(tier_root)
+
+    def test_emptied_registry_is_restamped_to_zero(self, tmp_path):
+        """A registry reduced to zero KNOWN keys (active and stale both
+        gone) still restamps -- there is no emptied-tier rule inside the
+        primitive; key_count lands as the int 0 active count."""
+        from paramem.adapters.manifest import read_manifest
+        from paramem.memory.persistence import RESTAMPED, restamp_tier_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        h_old = hashlib.sha256(reg.save_bytes()).hexdigest()
+        reg.save(tier_root / "indexed_key_registry.json")
+
+        slot_dir = tier_root / "20260612-000000"
+        self._write_manifest_for(slot_dir, "episodic", h_old, key_count=1)
+
+        reg.remove("graph1")
+        assert reg.list_known() == []
+
+        result = restamp_tier_manifest(tier_root, registry=reg)
+
+        assert result.status == RESTAMPED
+        restamped = read_manifest(slot_dir)
+        assert restamped.key_count == 0
