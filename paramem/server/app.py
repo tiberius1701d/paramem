@@ -1516,7 +1516,7 @@ def _sweep_keyless_tier_artifacts(config) -> list[str]:
     """
     from paramem.memory.interim_adapter import (
         INTERIM_NAME_PREFIX,
-        iter_interim_dirs,
+        iter_tier_roots,
         slot_payload_kind,
     )
     from paramem.memory.persistence import reap_tier_artifacts, resume_pending_reaps
@@ -1524,9 +1524,7 @@ def _sweep_keyless_tier_artifacts(config) -> list[str]:
 
     resume_pending_reaps(config.adapter_dir)
 
-    roots: list[tuple[str, Path]] = [
-        (name, config.adapter_dir / name) for name in ("episodic", "semantic", "procedural")
-    ] + list(iter_interim_dirs(config.adapter_dir))
+    roots: list[tuple[str, Path]] = list(iter_tier_roots(config.adapter_dir))
 
     reaped: list[str] = []
     for name, root in roots:

@@ -33,10 +33,12 @@ a failure.
 
 Interim slot enumeration
 ------------------------
-Interim dirs are scanned under EVERY tier root (not only episodic) via
-``rglob("interim_*")`` so future-tier interim slots are covered.  Main tiers
-use :func:`paramem.memory.interim_adapter.adapter_slot_root_for_name` for
-their slot root; interim tiers use their on-disk dir directly.
+Tiers to check come from :func:`paramem.memory.interim_adapter.iter_tier_roots`:
+the three main tiers (root ``adapter_dir / tier``), then every interim dir
+found under ``episodic/interim_*`` — interim slots are episodic-only, never
+scanned under other tier roots. :func:`paramem.memory.interim_adapter.adapter_slot_root_for_name`
+is used only in the store-only addendum, to resolve the slot root for a tier
+the live store carries that has no on-disk match yet.
 
 Required-vs-optional matrix
 ----------------------------
@@ -95,10 +97,6 @@ def _no_key_detail(exc: Exception) -> str:
     if "age envelope" in msg or "daily identity" in msg:
         return _DETAIL_NO_KEY
     return str(exc)
-
-
-# Main tier names in the canonical order.
-_MAIN_TIERS = ("episodic", "semantic", "procedural")
 
 
 @dataclass(frozen=True)
@@ -397,7 +395,8 @@ _REQUIRED_SLOT_FILES: tuple[str, ...] = (
 def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
     """Delete partial-trained adapter slot directories under each main tier.
 
-    Walks ``<adapter_dir>/<tier>/`` for every tier in :data:`_MAIN_TIERS` and
+    Walks ``<adapter_dir>/<tier>/`` for every tier in
+    :data:`~paramem.memory.interim_adapter.MAIN_TIERS` and
     removes any subdirectory that is NOT a complete slot.  A "complete slot"
     has all three files in :data:`_REQUIRED_SLOT_FILES`; missing any one of
     them marks it as scratch from an interrupted training run and the
@@ -438,10 +437,10 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
 
         Returns an empty list when no partial slots are found.
     """
-    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
+    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX, MAIN_TIERS
 
     removed: list[dict] = []
-    for tier_name in _MAIN_TIERS:
+    for tier_name in MAIN_TIERS:
         tier_root = adapter_dir / tier_name
         if not tier_root.is_dir():
             continue
@@ -523,17 +522,16 @@ def verify_infrastructure_integrity(
     # -----------------------------------------------------------------------
     tiers_to_check: list[tuple[str, Path | None, str]] = []
     # (tier_name, slot_root_for_manifest, "main"|"interim")
-    for tier in _MAIN_TIERS:
-        tiers_to_check.append((tier, adapter_dir / tier, "main"))
-
+    #
     # Interim adapters are episodic-only: day-by-day session slots that
     # collapse into the main tiers on consolidation. (procedural/semantic
     # interim_* adapter slots do not exist; any procedural/interim_* dir holds
     # training debris — epoch_log/progress — not an adapter, and is ignored.)
-    from paramem.memory.interim_adapter import iter_interim_dirs
+    from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_tier_roots
 
-    for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
-        tiers_to_check.append((interim_name, interim_dir, "interim"))
+    for tier_name, tier_root in iter_tier_roots(adapter_dir):
+        kind = "interim" if tier_name.startswith(INTERIM_NAME_PREFIX) else "main"
+        tiers_to_check.append((tier_name, tier_root, kind))
 
     # Also add any tiers from the live store not yet on disk
     if store is not None:
@@ -542,7 +540,7 @@ def verify_infrastructure_integrity(
                 from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
                 slot_root = adapter_slot_root_for_name(adapter_dir, store_tier)
-                kind = "interim" if "interim" in store_tier else "main"
+                kind = "interim" if store_tier.startswith(INTERIM_NAME_PREFIX) else "main"
                 tiers_to_check.append((store_tier, slot_root, kind))
 
     # -----------------------------------------------------------------------

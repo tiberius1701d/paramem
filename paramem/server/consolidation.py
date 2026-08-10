@@ -313,7 +313,7 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
         logger.exception("prune_key_metadata_orphans: could not read %s — skipping", path)
         return 0
 
-    from paramem.memory.interim_adapter import iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_tier_roots
 
     keys_in = raw.get("keys", {}) if isinstance(raw, dict) else {}
     if not keys_in:
@@ -352,13 +352,8 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
     # from list_active() but present in list_stale(); pruning it would break the
     # stale-echo seam (bookkeeping is required to resolve speaker/relation_type).
     active: set[str] = set()
-    for tier in ("episodic", "semantic", "procedural"):
-        reg_path = config.adapter_dir / tier / "indexed_key_registry.json"
-        if reg_path.exists():
-            _loaded_reg = KeyRegistry.load(reg_path)
-            active.update(_loaded_reg.list_known())
-    for _name, interim_dir in iter_interim_dirs(config.adapter_dir):
-        reg_path = interim_dir / "indexed_key_registry.json"
+    for _tier, tier_root in iter_tier_roots(config.adapter_dir):
+        reg_path = tier_root / "indexed_key_registry.json"
         if reg_path.exists():
             _loaded_reg = KeyRegistry.load(reg_path)
             active.update(_loaded_reg.list_known())

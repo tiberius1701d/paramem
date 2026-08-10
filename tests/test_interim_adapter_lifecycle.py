@@ -24,16 +24,21 @@ import pytest
 
 from paramem.memory.interim_adapter import (
     INTERIM_NAME_PREFIX,
+    MAIN_TIERS,
     create_interim_adapter,
     current_interim_stamp,
     detect_legacy_adapter_layout,
     interim_dir_for_name,
     interim_stamp_from_name,
     interim_tiers_newest_first,
+    iter_tier_roots,
     unload_interim_adapters,
 )
+from paramem.memory.store import MemoryStore
 from paramem.models.loader import main_tier_backup_scope
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
+from paramem.training.donor import DONOR_STORE_PREFIX, iter_donor_stores
+from paramem.training.key_registry import KeyRegistry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1234,3 +1239,164 @@ class TestDetectLegacyAdapterLayout:
         (adapter_dir / f"{INTERIM_NAME_PREFIX}20260420T0000").write_text("not a directory")
 
         assert detect_legacy_adapter_layout(adapter_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# iter_tier_roots — THE shared tier-root enumeration
+# ---------------------------------------------------------------------------
+
+
+def _write_registry(path: Path, keys: list[str]) -> None:
+    """Write a minimal indexed_key_registry.json with a simhash entry per key."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reg = KeyRegistry()
+    for key in keys:
+        reg.add(key)
+        reg.set_simhash(key, 1)
+    path.write_bytes(reg.save_bytes())
+
+
+def _build_sample_adapter_tree(
+    adapter_dir: Path, *, main_tiers: tuple[str, ...] = MAIN_TIERS
+) -> dict[str, Path]:
+    """Build a temp adapter tree with main tiers, two interim slots, and
+    one donor store.
+
+    Returns a single-entry dict, ``{"donor_dir": <path>}``, giving the
+    donor store's root path — the only built path any caller needs back
+    (the main and interim tier roots are re-derivable from *adapter_dir*
+    and :data:`MAIN_TIERS`/the known stamps).
+
+    Args:
+        adapter_dir: Root to build the tree under.
+        main_tiers: Which of :data:`MAIN_TIERS` to actually write a
+            registry for. Defaults to all three; a caller testing the
+            absent-main-dir contract passes a subset so the omitted
+            tier's directory never exists on disk.
+
+    Shape (default *main_tiers*)::
+
+        adapter_dir/
+          episodic/indexed_key_registry.json
+          episodic/interim_20260417T0000/indexed_key_registry.json
+          episodic/interim_20260418T0000/indexed_key_registry.json
+          semantic/indexed_key_registry.json
+          procedural/indexed_key_registry.json
+          donor-x-b0011223/20260101T0000/meta.json
+    """
+    for tier in main_tiers:
+        _write_registry(adapter_dir / tier / "indexed_key_registry.json", [f"{tier}_key"])
+
+    for stamp in ("20260417T0000", "20260418T0000"):
+        interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
+        _write_registry(interim_dir / "indexed_key_registry.json", [f"interim_{stamp}_key"])
+
+    donor_dir = adapter_dir / f"{DONOR_STORE_PREFIX}x-b0011223"
+    donor_slot = donor_dir / "20260101T0000"
+    donor_slot.mkdir(parents=True)
+    (donor_slot / "meta.json").write_text("{}", encoding="utf-8")
+
+    return {"donor_dir": donor_dir}
+
+
+class TestIterTierRoots:
+    def test_main_tiers_yielded_even_when_absent(self, tmp_path: Path) -> None:
+        """A fresh, empty adapter_dir still yields exactly the three main
+        tiers, in MAIN_TIERS order — main tiers are named literally, not
+        discovered."""
+        result = list(iter_tier_roots(tmp_path))
+
+        assert result == [(tier, tmp_path / tier) for tier in MAIN_TIERS]
+
+    def test_donor_store_is_never_a_tier(self, tmp_path: Path) -> None:
+        """A donor store is yielded by iter_donor_stores and by no memory-tier
+        walk — donors are siblings of the tiers, not tiers themselves."""
+        built = _build_sample_adapter_tree(tmp_path)
+        donor_name = built["donor_dir"].name
+
+        donor_names = {name for name, _ in iter_donor_stores(tmp_path)}
+        tier_names = {name for name, _ in iter_tier_roots(tmp_path)}
+
+        assert donor_name in donor_names
+        assert donor_name not in tier_names
+
+    def test_every_tier_walk_agrees(self, tmp_path: Path) -> None:
+        """iter_tier_roots, MemoryStore's registry-path walk, and the
+        integrity checker's tier enumeration all name the same tier set —
+        and none of them ever names the donor store.
+
+        iter_tier_roots and MemoryStore._iter_tier_registry_paths are
+        compared as ORDERED lists — MemoryStore delegates straight to
+        iter_tier_roots, so mains-before-interims (and interim stamp order)
+        must match exactly, not just as a set. The integrity checker builds
+        its own tiers_to_check from the same walk but also folds in store
+        tiers and cross-consistency checks, so its surface is compared as a
+        set.
+        """
+        built = _build_sample_adapter_tree(tmp_path)
+        donor_name = built["donor_dir"].name
+
+        expected_order = [
+            *MAIN_TIERS,
+            "episodic_interim_20260417T0000",
+            "episodic_interim_20260418T0000",
+        ]
+
+        iter_tier_names = [name for name, _ in iter_tier_roots(tmp_path)]
+        store_tier_names = [name for name, _ in MemoryStore._iter_tier_registry_paths(tmp_path)]
+
+        from paramem.backup.integrity import verify_infrastructure_integrity
+
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path
+        cfg.consolidation.mode = "train"
+        cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
+        cfg.paths.data = tmp_path / "data"
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        integrity_tier_names = {c.tier for c in report.checks if c.category == "registry"}
+
+        assert iter_tier_names == expected_order
+        assert store_tier_names == expected_order
+        assert integrity_tier_names == set(expected_order)
+
+        assert donor_name not in iter_tier_names
+        assert donor_name not in store_tier_names
+        assert donor_name not in integrity_tier_names
+
+    def test_absent_main_tier_dir_still_named_everywhere(self, tmp_path: Path) -> None:
+        """A main tier with no on-disk directory (never trained) is still
+        named by every walk — main tiers are named literally by
+        iter_tier_roots regardless of existence, and
+        verify_infrastructure_integrity records a ``skipped`` registry check
+        for it rather than omitting it (``paramem/backup/integrity.py``:
+        ``if not tier_root.exists(): checks.append(FileCheck(..., _SKIPPED,
+        ""))`` — the tier name is still recorded, only the status differs
+        from a present tier)."""
+        built = _build_sample_adapter_tree(tmp_path, main_tiers=("episodic", "semantic"))
+        donor_name = built["donor_dir"].name
+
+        assert not (tmp_path / "procedural").exists()
+
+        iter_tier_names = [name for name, _ in iter_tier_roots(tmp_path)]
+        store_tier_names = [name for name, _ in MemoryStore._iter_tier_registry_paths(tmp_path)]
+
+        assert "procedural" in iter_tier_names
+        assert "procedural" in store_tier_names
+
+        from paramem.backup.integrity import verify_infrastructure_integrity
+
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path
+        cfg.consolidation.mode = "train"
+        cfg.key_metadata_path = tmp_path / "registry" / "key_metadata.json"
+        cfg.paths.data = tmp_path / "data"
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        registry_checks = {c.tier: c.status for c in report.checks if c.category == "registry"}
+
+        assert registry_checks.get("procedural") == "skipped"
+        assert registry_checks.get("episodic") == "ok"
+        assert registry_checks.get("semantic") == "ok"
+
+        assert donor_name not in iter_tier_names
+        assert donor_name not in store_tier_names
+        assert donor_name not in registry_checks

@@ -964,7 +964,7 @@ class TestCleanupPartialSlots:
         assert {r["tier"] for r in removed} == {"episodic", "semantic", "procedural"}
 
     def test_non_main_tier_untouched(self, tmp_path):
-        """A tier name outside _MAIN_TIERS is not walked."""
+        """A tier name outside MAIN_TIERS is not walked."""
         unrelated = self._make_partial_slot(
             tmp_path, "consolidation_refresh", "scratch", "meta.json"
         )

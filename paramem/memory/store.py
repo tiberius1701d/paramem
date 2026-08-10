@@ -1288,9 +1288,11 @@ class MemoryStore:
         """Yield ``(tier_name, registry_path)`` for every tier under *adapter_dir*.
 
         The single description of where an adapter tree keeps its
-        ``indexed_key_registry.json`` files: the three main tiers first (in
-        fixed order), then every interim slot found on disk.  Both on-disk
-        readers — :meth:`read_registries_from_disk` and
+        ``indexed_key_registry.json`` files: delegates to
+        :func:`~paramem.memory.interim_adapter.iter_tier_roots` (main tiers
+        first, in fixed order, then every interim slot found on disk) and
+        appends the registry filename to each yielded tier root.  Both
+        on-disk readers — :meth:`read_registries_from_disk` and
         :meth:`read_simhash_registry_from_disk` — walk this one generator, so
         they cannot disagree about which files belong to the store.
 
@@ -1307,16 +1309,11 @@ class MemoryStore:
         """
         from pathlib import Path
 
-        from paramem.memory.interim_adapter import iter_interim_dirs
+        from paramem.memory.interim_adapter import iter_tier_roots
 
         adapter_dir = Path(adapter_dir)
-        for tier in ("episodic", "semantic", "procedural"):
-            yield tier, adapter_dir / tier / "indexed_key_registry.json"
-        # Interim tiers — dynamic; yielded when their dirs exist.  Tier key is
-        # the PEFT adapter name so callers using ``peft_config`` keys can
-        # address the store consistently.
-        for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
-            yield interim_name, interim_dir / "indexed_key_registry.json"
+        for tier, tier_root in iter_tier_roots(adapter_dir):
+            yield tier, tier_root / "indexed_key_registry.json"
 
     @staticmethod
     def read_registries_from_disk(adapter_dir) -> "dict[str, KeyRegistry]":

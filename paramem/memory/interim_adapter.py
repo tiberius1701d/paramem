@@ -18,6 +18,11 @@ Schedule-string parsing (``compute_schedule_period_seconds``) lives in
 backup runner can share it without ``interim_adapter`` (a ``memory``-layer
 module) importing from ``backup``.
 
+This module also owns the on-disk tier-topology helpers for the adapter
+store: the main-tier name/order tuple (:data:`MAIN_TIERS`), the whole-store
+tier walk (:func:`iter_tier_roots`), and the interim-slot enumeration
+(:func:`iter_interim_dirs`, :func:`interim_tiers_newest_first`).
+
 Callers (wiring schedule):
   Scheduled consolidation path — calls create_interim_adapter when run_consolidation_cycle
       mints a new interim adapter slot during an interim training tick.
@@ -44,6 +49,7 @@ import logging
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Final
 
 from peft import PeftModel
 
@@ -84,6 +90,13 @@ INTERIM_DIR_PREFIX = "interim_"
 # (``app._full_cycle_deadline_dt``) composes from this one constant — the
 # shape is never re-declared as a pattern or a literal length.
 INTERIM_STAMP_FORMAT = "%Y%m%dT%H%M"
+
+# The three main tiers, in canonical order.  The main-tier tuple shared by
+# this store's tier walks (:func:`iter_tier_roots` and its consumers). Other
+# modules (``paramem.server.gates``, ``paramem.server.active_store_migration``,
+# ``paramem.models.loader``) still declare the literal triple independently —
+# this is not a project-wide canonical source.
+MAIN_TIERS: Final[tuple[str, str, str]] = ("episodic", "semantic", "procedural")
 
 
 def interim_stamp_from_name(name: str) -> str | None:
@@ -259,6 +272,36 @@ def iter_interim_dirs(
                 continue
         stamp = path.name[len(INTERIM_DIR_PREFIX) :]
         yield f"{INTERIM_NAME_PREFIX}{stamp}", path
+
+
+def iter_tier_roots(adapter_dir: Path) -> Iterator[tuple[str, Path]]:
+    """Yield ``(tier_name, tier_root)`` for every MEMORY tier of an adapter store.
+
+    Yields the three main tiers first, in :data:`MAIN_TIERS` order and
+    whether or not their directories exist (``tier_root = adapter_dir /
+    tier``), then every interim slot :func:`iter_interim_dirs` finds on disk
+    (existing directories only, default/unfiltered mode). ``tier_name`` is
+    the PEFT adapter name; ``tier_root`` is the resolved directory that
+    holds that tier's ``indexed_key_registry.json`` at its root.
+
+    DONOR STORES ARE NOT TIERS and are never yielded. ``donor-*``
+    directories (:data:`paramem.training.donor.DONOR_STORE_PREFIX`) are
+    siblings of the main tiers under the same root, with ``meta.json``
+    slots, an empty ``registry_sha256`` and no registry file by design.
+    This walk names the main tiers literally and delegates the rest to
+    :func:`iter_interim_dirs`, which globs ``episodic/interim_*`` only, so a
+    donor can never enter it. Donor discovery has its own enumeration,
+    :func:`paramem.training.donor.iter_donor_stores`.
+
+    An interim tier's root is the exact path :func:`iter_interim_dirs`
+    yielded — never re-derived.
+
+    Args:
+        adapter_dir: Adapter store root. Production: ``config.adapter_dir``.
+    """
+    for tier in MAIN_TIERS:
+        yield tier, adapter_dir / tier
+    yield from iter_interim_dirs(adapter_dir)
 
 
 def adapter_slot_root_for_name(adapter_dir: Path, name: str) -> Path:
