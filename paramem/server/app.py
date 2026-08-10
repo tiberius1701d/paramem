@@ -102,6 +102,7 @@ from paramem.server.vram_validator import (
 from paramem.training.consolidation import (
     AbortedDuringConsolidation,
     ActiveKeyHydrationFailure,
+    FoldAccountingRefusal,
     RecallGateRejected,
     RegistryBookkeepingDivergence,
 )
@@ -16132,7 +16133,9 @@ def _run_stage_b_cycle(
             # here only from the main-tiers fold (the interim fold catches it
             # and returns a normal recall_failed outcome instead) — it names
             # the tier that fell short of 100% recall over its own full key
-            # set.  Every other exception keeps the generic detail unchanged.
+            # set.  FoldAccountingRefusal names the keys a main-tiers fold
+            # could not account for (genuine_loss).  Every other exception
+            # keeps the generic detail unchanged.
             incident_detail = dict(failure_detail)
             if isinstance(exc, RegistryBookkeepingDivergence):
                 incident_detail["divergent_keys"] = exc.divergent_keys
@@ -16143,6 +16146,8 @@ def _run_stage_b_cycle(
                 incident_detail["adapter_name"] = exc.adapter_name
                 incident_detail["recall_rate"] = exc.recall_rate
                 incident_detail["threshold"] = exc.threshold
+            if isinstance(exc, FoldAccountingRefusal):
+                incident_detail["unexplained_keys"] = exc.unexplained_keys
             try:
                 record_incident(
                     config.paths.data / "state",
@@ -17342,14 +17347,15 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
         )
 
         # Layering boundary. ``loop.consolidate(...)`` already
-        # finished its internal finalize on its way out (registry rewrite,
-        # persist of the rebuilt main tiers — weights in train, per-tier
-        # graph.json in simulate — then interim reap and router reload; see its
-        # internal finalize block) regardless of whether anything was rebuilt.
-        # The merged main tiers are durably saved BEFORE the interim slots are
-        # reaped, inside the method, and a fold that persisted nothing reaps
-        # nothing — so there is no crash window in which the folded knowledge
-        # has no on-disk copy.
+        # finished its internal finalize on its way out (commit — registries
+        # and payload, weights in train or per-tier graph.json in simulate —
+        # then interim reap and router reload; see its internal finalize
+        # block) regardless of whether anything was rebuilt: even a fold
+        # that rebuilt nothing still commits its registry mutations (a
+        # no-retrain restamp) before returning.  Reaping the interim slots
+        # is the narrower guard — that only happens when the fold also
+        # rebuilt a tier, inside the method, after the commit — so there is
+        # no crash window in which the folded knowledge has no on-disk copy.
         # The post-cycle work below (key-metadata persistence, session marking,
         # ``_finalize_full``) is bookkeeping whose precondition is
         # ``tiers_rebuilt != []``. Calling it on the no-op outcome violates that
@@ -17391,7 +17397,7 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
             )
 
         # The rebuilt main tiers were already persisted to disk inside the fold's
-        # finalize (between the registry rewrite and the interim reap). In the
+        # finalize (its commit act, before the interim reap). In the
         # train venue that persist is verified and stamps each main slot's
         # meta.json with a fresh window_stamp + registry_sha256, so the slots
         # remount on restart; in the simulate venue it writes the per-tier

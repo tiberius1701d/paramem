@@ -380,8 +380,8 @@ class AbortedDuringConsolidation(Exception):
 
     The caller (app.py ``_run_full_cycle``) catches this, restores all three
     production tiers from their ``<tier>_backup`` slots via
-    ``copy_adapter_weights``, skips the atomic finalize step (registry rewrite
-    → persist → interim purge → router reload), and logs the cycle as
+    ``copy_adapter_weights``, skips the atomic finalize step (commit
+    → interim purge → router reload), and logs the cycle as
     ``mode="aborted"``.  Partial progress is lost but VRAM state is consistent
     with the pre-cycle baseline.
     """
@@ -449,6 +449,48 @@ class ActiveKeyHydrationFailure(RuntimeError):
         super().__init__(message)
         self.dropped_keys = dropped_keys
         self.venue = venue
+
+
+class FoldAccountingRefusal(RuntimeError):
+    """Raised by the main-tiers fold when the drift partition finds a
+    ``genuine_loss`` key — one with real content the fold cannot account
+    for under any of the other buckets (deduplicated, orphan, intended
+    removal).
+
+    A ``genuine_loss`` key is a bookkeeping gap, not a transient miss: the
+    key had content but produced no merged edge and matches no ledgered
+    reason, so silently retraining "with registry-true content" (the
+    former behaviour) would commit an unexplained drop without anyone ever
+    being told.  This exception makes that gap fold-fatal instead.
+
+    Fired BEFORE the backup scope, before any ``train_adapter`` call, and
+    before the staging->production promotion and every durable write for
+    this fold — so the prior weights, registries, manifests, and interim
+    slots stay exactly as they were.  The caller raises this only after
+    calling :meth:`ConsolidationLoop._discard_fold_work`, which reverses
+    the fold's three RAM-only store mutation classes applied ahead of the
+    raise site — soft-stale flips, inline promotions, and keyless-edge
+    mints.  One earlier RAM-only mutation is NOT reversed: the
+    drift-partition block stamps ``last_reinforced_cycle`` on every
+    surviving key's bookkeeping record (in place, ahead of the subtractive
+    removals) before this exception can even be known to be coming.
+    Harmless — that stamp is never written durably on this refusal path,
+    since the bookkeeping/registry rewrite this fold would have made never
+    happens.
+
+    Carries the unexplained key list so the caller's incident record names
+    exactly what could not be accounted for.
+    """
+
+    def __init__(self, *, unexplained_keys: "list[str]"):
+        unexplained_keys = sorted(unexplained_keys)
+        message = (
+            f"{len(unexplained_keys)} key(s) had content but produced no merged edge "
+            f"and matched no accounted bucket (deduplicated, orphan, intended_removal); "
+            f"refusing to persist an incomplete fold: {unexplained_keys[:10]}"
+        )
+        super().__init__(message)
+        self.unexplained_keys = unexplained_keys
 
 
 @dataclass(frozen=True)
@@ -2088,7 +2130,7 @@ class ConsolidationLoop:
 
         # --- SAVE main slots ---
         # The train fold persists+verifies the merged main weights itself
-        # (between its registry rewrite and interim purge), so a
+        # (its commit act, before the interim purge), so a
         # successful fold already wrote durable main slots.  Re-saving here would
         # just re-run the same atomic save + disk-integrity verify.  Only save
         # when the fold branch did NOT run (no interim/episodic adapter to roll),
@@ -2226,7 +2268,7 @@ class ConsolidationLoop:
 
         return _IndexedDataset(examples)
 
-    def _save_adapters(self) -> None:
+    def _save_adapters(self) -> "set[str]":
         """Save adapters and registries to disk using the atomic registry-last ordering.
 
         Saves to two locations:
@@ -2255,10 +2297,12 @@ class ConsolidationLoop:
           7. ``save_from_bytes`` — flush the identical registry bytes; this
              is the commit signal for ``find_live_slot``.
 
-        Crash semantics: a kill after step 4 but before step 8 leaves the
-        new slot present with a manifest stamping the new registry hash,
-        while the on-disk registry still carries the old hash.
-        ``find_live_slot`` won't match → slot is latent, harmless.
+        Crash semantics: a kill after step 4 (weights + manifest already
+        stamped with the NEW registry hash) but before step 7 (the identical
+        bytes flushed to the on-disk registry) leaves the new slot present
+        with a manifest stamping a hash the on-disk registry does not carry
+        yet.  ``find_live_slot`` won't match → slot is latent, harmless; the
+        next fold's save (or a restamp) resolves it.
 
         Every saved main slot is stamped with the cadence-window floor that is
         current at save time.  ``window_stamp`` is provenance only — no code
@@ -2266,6 +2310,16 @@ class ConsolidationLoop:
 
         The recall gate threshold is read from ``self.config.recall_sanity_threshold``
         (set once at construction from the YAML field of the same name).
+
+        Returns:
+            The set of main-tier names this call actually saved a weight
+            slot AND flushed registry bytes for — ``"episodic"`` always,
+            plus ``"semantic"``/``"procedural"`` when resident in
+            ``self.model.peft_config``.  :meth:`_persist_fold` uses this to
+            restamp (never retrain) every OTHER main tier's registry via
+            :func:`~paramem.memory.persistence.restamp_tier_manifest`, so a
+            main tier this call did not touch never gets a new registry on
+            disk with no matching manifest stamp.
         """
         import hashlib as _hashlib
 
@@ -2415,12 +2469,19 @@ class ConsolidationLoop:
         # Flush the indexed_key_registry per tier (the unified file now carries
         # active∪stale simhashes in its "simhash" key), then the registry commit signal.
         # The separate simhash_registry.json is no longer written.
+        # Iterates _saved_slots (NOT a hard-coded main-tier triple): a tier
+        # this call did not save a weight slot for must not have its
+        # registry flushed here either, or restamp_tier_manifest's
+        # read-inside pre_sha (called later, from _persist_fold, for every
+        # tier NOT in this method's returned set) would observe THIS call's
+        # write instead of the true pre-fold state — the flush-outruns-stamp
+        # hole this return value exists to close.
         if self.store.replay_enabled and tier_payloads:
             # LAST: flush the exact bytes that were hashed in step 2, so
             # ``find_live_slot`` on restart can match meta.registry_sha256
             # against hashlib.sha256(registry_path.read_bytes()).
             # Registry is written per-tier so each tier has its own signal.
-            for _tier in ("episodic", "semantic", "procedural"):
+            for _tier in _saved_slots:
                 _tier_payload, _ = tier_payloads.get(_tier, (None, None))
                 if _tier_payload is None:
                     continue
@@ -2442,6 +2503,8 @@ class ConsolidationLoop:
                 live_slot=_live_slot,
                 keep=self._keep_prior_slots,
             )
+
+        return set(_saved_slots)
 
     # ------------------------------------------------------------------
     # Fold-resume durable marker helpers
@@ -3124,12 +3187,13 @@ class ConsolidationLoop:
         # contradiction_same_pred: recency-backed contradiction (freshest last_seen wins).
         #   The merger only writes this entry when timestamps pick a unique winner;
         #   empty/tied → coexist (no entry) → safe to stale at the full fold too.
-        # attribute_key_superseded and unkeyable_no_predicate are deliberately
+        # attribute_key_superseded, unkeyable_no_predicate,
+        # display_name_absorbed, and duplicate_projection are deliberately
         # NOT listed here.  "dedup" is not a counter-example: a dedup key is
         # soft-staled through the SEPARATE _collapsed_set branch in the drift
         # partition (tested FIRST, before this helper's output is even
         # consulted, and simhash-retained) -- it never reaches this
-        # always-stale set at all.  The honest analogy for both new reasons is
+        # always-stale set at all.  The honest analogy for all four reasons is
         # "enrichment_same_as": ledgered so the full-fold drift partition
         # routes the key to drift_intended_removal instead of
         # drift_genuine_loss, but hard-dropped with NO soft-stale record.
@@ -3137,10 +3201,14 @@ class ConsolidationLoop:
         # when the SAME value carries forward under the new key (so
         # _credit_reinforcement transfers its maturity and it can be
         # promoted); a DIFFERENT value winning is the contradiction shape and
-        # omits survivor_key (no credit, no promotion).  unkeyable_no_predicate
-        # never carries a survivor: the key never re-enters the merge surface
-        # under any key.  On the interim dedup_target_keys path (which
-        # computes no drift partition) both reasons are inert -- the ledger
+        # omits survivor_key (no credit, no promotion).  duplicate_projection
+        # always carries a survivor_key -- the already-emitted key the fact
+        # carries forward under.  unkeyable_no_predicate and
+        # display_name_absorbed never carry a survivor: neither key
+        # re-enters the merge surface under any key (a display-name
+        # absorption survives only as the node's display surface, not as a
+        # trained fact).  On the interim dedup_target_keys path (which
+        # computes no drift partition) all four reasons are inert -- the ledger
         # entry is written but nothing consumes it before the next
         # reset_graph() clears it.
         _always_stale_reasons = {
@@ -3443,14 +3511,19 @@ class ConsolidationLoop:
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
         all_keyed: "list[dict] | None" = None,
+        # main_tiers input
+        tiers_rebuilt: "list[str] | None" = None,
     ) -> None:
         """Single persist tail for both fold scopes, in both venues.
 
         Dispatches on ``scope.persist`` for the scope and on ``scope.source``
         for the venue — never on a ``mode == "train"`` / ``mode == "simulate"``
         literal (the mode-fork guard is satisfied).  Each branch writes its
-        venue artifact and runs disk-integrity verification where adapter
-        weights were written:
+        venue artifact — including that tier's registry, the ONE place a
+        main-tier registry reaches disk WITHIN A FOLD (the operator-invoked
+        erase door and the active-store migration also write it, outside any
+        fold) — and runs disk-integrity verification where adapter weights
+        were written:
 
         - ``interim_slot`` (weights): passes a
           :meth:`_verify_committed_slot` callback into
@@ -3461,15 +3534,25 @@ class ConsolidationLoop:
         - ``interim_slot`` (disk): ``verify=None`` — no weights, no probe;
           ``commit_tier_slot`` writes the slot ``graph.json`` instead.
         - ``main_tiers`` (weights): :meth:`_save_adapters` rebuilds the main
-          adapter slots; its disk verify is already inside that method.
+          adapter slots this fold retrained (``tiers_rebuilt`` — skipped
+          entirely when empty, since there is nothing to retrain); its disk
+          verify and registry-last commit are already inside that method.
+          Every OTHER main tier — one this fold did not retrain, whose
+          registry may still have moved (soft-stale flips, drift removals)
+          — gets a no-retrain commit via
+          :func:`~paramem.memory.persistence.restamp_tier_manifest` instead,
+          so its on-disk registry and weight-slot manifest never drift out
+          of step with each other.
         - ``main_tiers`` (disk): each main tier's slice of the store is
           projected with
           :func:`~paramem.memory.persistence.build_tier_graph_from_store` and
           written to ``<output_dir>/<tier>/graph.json`` — the exact path
           :class:`~paramem.memory.source.DiskMemorySource` reads back, so the
-          round trip is symmetric.  All three main tiers are written
-          unconditionally, mirroring the unconditional per-tier registry
-          rewrite that immediately precedes this call in the spine.
+          round trip is symmetric — followed immediately by that tier's
+          registry write, the only registry write this venue performs.  All
+          three main tiers are written unconditionally: after the fold the
+          store is the post-fold truth, and a tier that ends with no keys
+          must end with no graph.json / registry content.
 
         Called by :meth:`_run_fold` in place of the independent persist tails
         that previously closed each fold branch.  The surrounding grooming
@@ -3485,6 +3568,10 @@ class ConsolidationLoop:
                 (``interim_slot`` path only).
             all_keyed: Full keyed-pair list for the interim slot
                 (``interim_slot`` path only).
+            tiers_rebuilt: Main tiers this fold actually retrained
+                (``main_tiers`` weights venue only).  ``None``/empty means
+                :meth:`_save_adapters` is skipped and every main tier is
+                committed via the no-retrain restamp.
         """
         from paramem.memory.persistence import (
             build_tier_graph_from_store,
@@ -3515,12 +3602,41 @@ class ConsolidationLoop:
                 verify=_verify,
             )
         elif scope.persist == "main_tiers":
+            from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
             if scope.source == "weights":
-                # Rebuild main adapter weights.  Disk verify is inside
-                # _save_adapters (already had it pre-unification).
-                self._save_adapters()
+                # Rebuild main adapter weights for the tiers this fold
+                # actually retrained.  Disk verify and the registry-last
+                # atomic commit are already inside _save_adapters (had them
+                # pre-unification); its return value is exactly the set of
+                # tiers it stamped a slot for AND flushed registry bytes to.
+                from paramem.memory.persistence import restamp_tier_manifest
+
+                _committed = self._save_adapters() if tiers_rebuilt else set()
+                if not isinstance(_committed, set):
+                    raise TypeError(
+                        "_save_adapters() must return a set[str] of committed tier"
+                        f" names; got {_committed!r} ({type(_committed).__name__})"
+                    )
+
+                # Every OTHER main tier's registry may still have moved this
+                # fold (soft-stale flips, drift removals) with no retrain to
+                # carry it to disk — commit it via the no-retrain restamp so
+                # its on-disk registry and weight-slot manifest never drift
+                # out of step.  pre_sha is omitted: nothing has written this
+                # tier's registry file earlier in this fold, so the
+                # read-inside arm of restamp_tier_manifest's contract applies.
+                for _pf_tier in ("episodic", "semantic", "procedural"):
+                    if _pf_tier in _committed:
+                        continue
+                    restamp_tier_manifest(
+                        adapter_slot_root_for_name(self.output_dir, _pf_tier),
+                        registry=self.store.registry(_pf_tier),
+                    )
             else:
-                # No weights: project the store's per-tier slice to graph.json.
+                # No weights: project the store's per-tier slice to graph.json,
+                # then that tier's registry — the only registry write this
+                # venue performs.
                 #
                 # No empty-projection guard here, and that is deliberate — the
                 # two call sites of build_tier_graph_from_store are consistent,
@@ -3536,8 +3652,12 @@ class ConsolidationLoop:
                 # end with no graph.json content.  Keeping the previous file
                 # would resurrect retired keys on the next boot, since
                 # DiskMemorySource hydrates entries from exactly these files.
-                from paramem.memory.interim_adapter import adapter_slot_root_for_name
-
+                # An entirely empty store (nothing ever registered) writes an
+                # empty graph.json over whatever was there before too — safe,
+                # since any tier with REGISTERED content that the fold could
+                # not account for already refused the fold upstream of this
+                # call (FoldAccountingRefusal), so this path is only ever
+                # reached with the store as the accounted, true post-fold state.
                 for _pf_tier in ("episodic", "semantic", "procedural"):
                     _pf_root = adapter_slot_root_for_name(self.output_dir, _pf_tier)
                     _pf_root.mkdir(parents=True, exist_ok=True)
@@ -3546,6 +3666,7 @@ class ConsolidationLoop:
                         _pf_root / "graph.json",
                     )
                     logger.info("_persist_fold: tier graph written to %s", _pf_root / "graph.json")
+                    self.store.registry(_pf_tier).save(_pf_root / "indexed_key_registry.json")
 
     def _run_fold(
         self,
@@ -3586,8 +3707,11 @@ class ConsolidationLoop:
         (:meth:`_materialize_consolidation_graph`,
         :meth:`_refine_consolidation_graph`, :meth:`_promote_mature_keys_inline`,
         :meth:`_build_all_edge_entries_into`, the drift partition,
-        :meth:`_apply_subtractive_removals_to_store`, the registry rewrite,
-        :meth:`_build_tier_delta`) are shared and venue-agnostic.
+        :meth:`_apply_subtractive_removals_to_store`,
+        :meth:`_build_tier_delta`) are shared and venue-agnostic.  The
+        registry write itself is no longer a separate shared step here — it
+        happens inside :meth:`_persist_fold`, as part of the same commit act
+        as the tier's payload (fork point 2 below).
 
         The two venues fork on ``scope.source`` at exactly two kinds of site:
 
@@ -4575,7 +4699,28 @@ class ConsolidationLoop:
                 graph_drift_count = 0
                 drift_deduplicated_count = 0
                 drift_orphan_count = 0
-                drift_genuine_loss_count = 0
+                # drift_genuine_loss is the one drift verdict that is NOT
+                # re-derived on resume (the merged graph that produced it is
+                # gone) — it is read back from the marker instead, patched
+                # in by the crashed process immediately after the
+                # fresh-derivation drift partition computed it (see
+                # _run_fold's fresh-derivation branch).  A marker predating
+                # that patch (absent field) means nothing durable happened
+                # in the crash window between the marker write and the
+                # patch, so 0 is the correct value.
+                if "drift_genuine_loss" in _resume_marker:  # type: ignore[operator]
+                    drift_genuine_loss: list[str] = list(
+                        _resume_marker.get("drift_genuine_loss", [])  # type: ignore[union-attr]
+                    )
+                else:
+                    drift_genuine_loss = []
+                    logger.warning(
+                        "_run_fold[main_tiers]: resumed fold_resume.json marker has no"
+                        " drift_genuine_loss field — treating as 0 (crash window between"
+                        " the marker write and the drift-partition patch; nothing durable"
+                        " happened in that window)"
+                    )
+                drift_genuine_loss_count = len(drift_genuine_loss)
                 drift_intended_removal_count = 0
                 drift_intended_removal_by_reason: dict[str, int] = {}
                 soft_stale_by_tier: dict[str, dict] = {}
@@ -4772,6 +4917,24 @@ class ConsolidationLoop:
                 drift_genuine_loss_count = len(drift_genuine_loss)
                 drift_intended_removal_count = len(drift_intended_removal)
 
+                # Patch the drift verdict into fold_resume.json (the marker
+                # already exists — _persist_fold_assignment wrote it above,
+                # before the drift partition ran) so a crash-resume re-entry
+                # can read the SAME verdict back instead of re-deriving it
+                # from a merged graph that no longer exists post-crash (see
+                # the resume fast-path's read-back, above).
+                _fr_state = self._read_fold_resume()
+                if _fr_state is not None:
+                    _fr_state["drift_genuine_loss"] = sorted(drift_genuine_loss)
+                    self._write_fold_resume(_fr_state)
+                else:
+                    logger.warning(
+                        "_run_fold[main_tiers]: fold_resume.json absent when patching"
+                        " drift_genuine_loss — a crash before this fold's own resume"
+                        " marker was written skips crash-resume entirely, so this is"
+                        " advisory only"
+                    )
+
                 _soft_stale_keys = {
                     k for tier_stale in soft_stale_by_tier.values() for k in tier_stale
                 }
@@ -4809,8 +4972,8 @@ class ConsolidationLoop:
                     logger.info(
                         "graph_drift_key key=%s bucket=genuine_loss"
                         " subject=%r predicate=%r object=%r"
-                        " (reconstruction failure — retrained with"
-                        " registry-true content; not a data loss)",
+                        " (content present but no merged edge produced;"
+                        " unaccounted for by any other bucket)",
                         _dk,
                         (_dk_entry or {}).get("subject", ""),
                         (_dk_entry or {}).get("predicate", ""),
@@ -4843,16 +5006,6 @@ class ConsolidationLoop:
                         drift_intended_removal_by_reason,
                     )
 
-                if drift_genuine_loss_count > 0:
-                    logger.warning(
-                        "_run_fold[main_tiers]: %d genuine reconstruction loss(es) — "
-                        "these keys had content but produced no merged edge (reconstruction"
-                        " failure or hydration-miss); they were retrained with registry-true"
-                        " content (should trend to ~0): %s",
-                        drift_genuine_loss_count,
-                        drift_genuine_loss,
-                    )
-
                 logger.info(
                     "_run_fold[main_tiers]: key distribution — episodic=%d semantic=%d "
                     "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
@@ -4868,6 +5021,32 @@ class ConsolidationLoop:
                 )
 
                 on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
+
+            # --- Accounting refusal (fresh-fold and resume-fold alike) ---
+            # A genuine_loss key had content but produced no merged edge and
+            # matched no other accounted bucket (deduplicated, orphan,
+            # intended_removal) — an unexplained gap, not a transient miss.
+            # Refuse the fold before the backup scope, before any
+            # train_adapter call, and before every durable write, so prior
+            # weights/registries/manifests/interim slots stay exactly as
+            # they were.  Common to both branches above: the fresh path just
+            # computed drift_genuine_loss; the resume path read the SAME
+            # list back from fold_resume.json (see the read-back above).
+            if drift_genuine_loss_count:
+                logger.error(
+                    "_run_fold[main_tiers]: %d key(s) had content but produced no merged"
+                    " edge and matched no accounted bucket (deduplicated, orphan,"
+                    " intended_removal) — refusing to persist an incomplete fold; prior"
+                    " weights, registries, and interim slots stay live: %s",
+                    drift_genuine_loss_count,
+                    drift_genuine_loss,
+                )
+                self._discard_fold_work(
+                    soft_stale_by_tier,
+                    relocated_keys=_relocated_keys_this_fold,
+                    minted_keys=_minted_keys_this_fold,
+                )
+                raise FoldAccountingRefusal(unexplained_keys=drift_genuine_loss)
 
             tiers_rebuilt: list[str] = []
 
@@ -5443,53 +5622,48 @@ class ConsolidationLoop:
                 self.write_key_metadata()
                 if _absorbed_interims:
                     self._drop_interim_tier_registries()
-                for _reg_tier in ("episodic", "semantic", "procedural"):
-                    _reg_tier_dir = self.output_dir / _reg_tier
-                    _reg_tier_dir.mkdir(parents=True, exist_ok=True)
-                    _reg_path = _reg_tier_dir / "indexed_key_registry.json"
-                    self.store.registry(_reg_tier).save(_reg_path)
-                    logger.info(
-                        "_run_fold[main_tiers]: registry rewritten to %s",
-                        _reg_path,
-                    )
 
-            # ONE predicate for persist AND reap.  A fold that wrote nothing must
-            # not destroy what it read: the interim slots are the only copy of
-            # their content until the merged main tiers are on disk (in the disk
-            # venue the slot's graph.json IS the payload; in the weights venue it
-            # is the slot adapter).  Reaping them after a no-persist fold is data
-            # loss by construction, so the two guards are the same expression,
-            # bound once so they cannot drift apart.
-            _fold_persisted = self.store.replay_enabled and bool(tiers_rebuilt)
-
-            if _fold_persisted:
-                self._persist_fold(scope)
+                # The registry write is no longer a separate, unstamped
+                # rewrite here: it happens INSIDE _persist_fold, as part of
+                # the same durable-write act as the tier's payload (weights
+                # or graph.json) — either via _save_adapters' registry-last
+                # atomic commit for a retrained tier, or via
+                # restamp_tier_manifest's no-retrain commit for a tier this
+                # fold did not retrain.  This closes the crash window where
+                # the registry was on disk with a new hash but the manifest
+                # still stamped the old one.
+                self._persist_fold(scope, tiers_rebuilt=tiers_rebuilt)
                 logger.info("_run_fold[main_tiers]: merged main tiers persisted")
-                # Clean fold-resume marker + retained scratch checkpoints after
-                # the persist succeeds.  On persist FAILURE (the except
-                # above re-raises) the marker is intentionally LEFT so a retry can
-                # resume completed tiers without retraining.
-                self._clear_fold_resume_and_scratch(reason="after _save_adapters")
+                # Clean fold-resume marker + retained scratch checkpoints
+                # after the persist succeeds.  On persist FAILURE (the
+                # except above re-raises) the marker is intentionally LEFT
+                # so a retry can resume completed tiers without retraining.
+                self._clear_fold_resume_and_scratch(reason="after persist")
 
-            if self.store.replay_enabled and soft_stale_by_tier:
-                for _st_tier in ("episodic", "semantic", "procedural"):
-                    self.store.registry(_st_tier).increment_stale_cycles()
-                logger.debug(
-                    "_run_fold[main_tiers]: stale_cycles advanced for %d soft-staled key(s)",
-                    sum(len(v) for v in soft_stale_by_tier.values()),
-                )
+                if soft_stale_by_tier:
+                    for _st_tier in ("episodic", "semantic", "procedural"):
+                        self.store.registry(_st_tier).increment_stale_cycles()
+                    logger.debug(
+                        "_run_fold[main_tiers]: stale_cycles advanced for %d soft-staled key(s)",
+                        sum(len(v) for v in soft_stale_by_tier.values()),
+                    )
 
             if not _absorbed_interims:
                 logger.info(
                     "_run_fold[main_tiers]: rebuilt from the main tiers' own keys"
                     " — interim slots untouched (not folded in, so not reaped)"
                 )
-            elif _fold_persisted:
+            elif self.store.replay_enabled and tiers_rebuilt:
+                # A fold that rebuilt nothing absorbed nothing: it still
+                # commits its registry mutations above (soft-stale flips,
+                # drift removals) via the no-retrain restamp, but there is
+                # no freshly-trained main-tier copy of the interim slots'
+                # content to justify reaping them.
                 unload_interim_adapters(self.model, self.output_dir)
                 logger.info("_run_fold[main_tiers]: interim slots reaped")
             else:
                 logger.info(
-                    "_run_fold[main_tiers]: nothing persisted — interim slots kept"
+                    "_run_fold[main_tiers]: nothing rebuilt — interim slots kept"
                     " (their content is still the only copy)"
                 )
 
@@ -5563,7 +5737,7 @@ class ConsolidationLoop:
         :class:`~paramem.memory.store.MemoryStore`, whose main-tier and
         interim-slot registries are hydrated at boot and after every cycle.
         Materialize → refine → promote → build entries → drift
-        partition → registry rewrite → persist → interim unload → router reload
+        partition → commit (registries + payload) → interim unload → router reload
         → tier delta is one code path.  *mode* selects only:
 
         - **train** (``source="weights"``): additionally probes the adapters for
@@ -5898,12 +6072,15 @@ class ConsolidationLoop:
         _local_indexed: int | None = None
         _local_procedural: int | None = None
 
-        # (subject, predicate) pairs emitted by the edge walk below — read by
-        # the node-attribute walk after it to skip a node attribute whose
-        # pair was already emitted as an edge (defensive dedup for a mixed
-        # graph left by an earlier fold layout, still carrying an edge for
-        # what a fresh extraction would now route to node["attributes"]).
-        _emitted_pairs: set[tuple[str, str]] = set()
+        # (subject, predicate) pairs emitted by the edge walk below, mapped
+        # to the key each was emitted under — read by the node-attribute
+        # walk after it to skip a node attribute whose pair was already
+        # emitted as an edge (defensive dedup for a mixed graph left by an
+        # earlier fold layout, still carrying an edge for what a fresh
+        # extraction would now route to node["attributes"]) and, when that
+        # attribute slot is itself a registered key, to ledger the collision
+        # with the emitted key as survivor (see the node-attribute walk).
+        _emitted_pairs: dict[tuple[str, str], str] = {}
 
         def _commit_keyless_mint(
             *,
@@ -6129,7 +6306,7 @@ class ConsolidationLoop:
                 # The ik_key attribute is intentionally NOT stamped onto the edge so
                 # the MultiDiGraph parallel-edge integer key field is not disturbed —
                 # _commit_keyless_mint never mutates the edge/node it was called for.
-                _commit_keyless_mint(
+                _minted_rec = _commit_keyless_mint(
                     subject_display=_subj_display,
                     predicate=pred,
                     object_value=_obj_display,
@@ -6144,7 +6321,7 @@ class ConsolidationLoop:
                     last_seen=_t_data.get("last_seen", ""),
                     first_seen=_t_data.get("first_seen", ""),
                 )
-                _emitted_pairs.add((_t_subj, pred))
+                _emitted_pairs[(_t_subj, pred)] = _minted_rec["key"]
 
             else:
                 # ---- Keyed branch: existing key, anti-forgetting replay ----
@@ -6199,7 +6376,7 @@ class ConsolidationLoop:
                 )
                 # Existing keyed entries are never counted as minted and never
                 # deferred — they are already in the store.
-                _emitted_pairs.add((_t_subj, pred))
+                _emitted_pairs[(_t_subj, pred)] = key
 
         # ---- Node-attribute walk: attribute-typed relations never become
         # edges (GraphMerger.merge diverts them onto the SUBJECT node's
@@ -6225,16 +6402,47 @@ class ConsolidationLoop:
             _n_subj_display = _n_attrs.get("name") or _n
             for attr_key, attr_value in _n_attrs.items():
                 if attr_key == "name":
-                    # Display surface, not a projected attribute fact.
+                    # Display surface, not a projected attribute fact.  A
+                    # name-predicate attribute relation (relation_type ==
+                    # "attribute", predicate strips to "name") is folded
+                    # onto this same node["attributes"]["name"] slot by
+                    # GraphMerger (merger.py's relation_type == "attribute"
+                    # branch) and registered in node["attribute_keys"]["name"]
+                    # when it carries an indexed_key -- so a REGISTERED key
+                    # can land here with no other bucket to explain its
+                    # absence from tier_keyed.  Ledger it as an intended
+                    # (not accidental) removal so the drift partition routes
+                    # it to drift_intended_removal instead of the unaccounted
+                    # genuine_loss bucket.  No survivor_key: the fact is
+                    # deliberately absorbed into the display surface, not
+                    # carried forward under another key.
+                    _name_key_id = _n_attr_keys.get("name")
+                    if _name_key_id:
+                        self.merger.record_removal(_name_key_id, reason="display_name_absorbed")
                     continue
                 attr_pred = attr_predicate(attr_key)
-                if (_n, attr_pred) in _emitted_pairs:
+                attr_key_id = _n_attr_keys.get(attr_key)
+                _emitted_pair_key = _emitted_pairs.get((_n, attr_pred))
+                if _emitted_pair_key is not None:
                     # Defensive dedup: a mixed graph left by an earlier fold
-                    # layout already emitted this (subject, predicate)
-                    # pair as an edge — never emit it twice.
+                    # layout already emitted this (subject, predicate) pair
+                    # as an edge — never emit it twice.  When this attribute
+                    # slot is itself a registered key, the fact carries
+                    # forward under the already-emitted key: ledger the
+                    # collision so the drift partition routes it to
+                    # drift_intended_removal (with reinforcement credit
+                    # flowing to the survivor) instead of an unaccounted
+                    # genuine_loss gap.  An unregistered (keyless) attribute
+                    # has no key to account for, so there is nothing to
+                    # ledger.
+                    if attr_key_id:
+                        self.merger.record_removal(
+                            attr_key_id,
+                            reason="duplicate_projection",
+                            survivor_key=_emitted_pair_key,
+                        )
                     continue
 
-                attr_key_id = _n_attr_keys.get(attr_key)
                 if attr_key_id and exclude_keys and attr_key_id in exclude_keys:
                     # Interim recital-dedup target (an attribute-typed fact —
                     # e.g. a speaker's phone/email — merged in by

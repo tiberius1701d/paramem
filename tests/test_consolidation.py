@@ -3823,7 +3823,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters") as mock_save,
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ) as mock_save,
             patch.object(
                 ConsolidationLoop,
                 "_clear_fold_resume",
@@ -4098,7 +4102,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters") as mock_save,
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ) as mock_save,
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -4189,7 +4197,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -4281,7 +4293,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -4387,7 +4403,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -4506,7 +4526,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -4595,7 +4619,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -4688,7 +4716,11 @@ class TestAbortSkipsCommit:
                 "_probe_passing_keys",
                 side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch.object(ConsolidationLoop, "_clear_fold_resume"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters"),
         ):
@@ -5540,7 +5572,11 @@ class TestConsolidateInterimAdaptersFullFlow:
                     "_probe_passing_keys",
                     side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
@@ -6704,19 +6740,27 @@ class TestDriftPartitioning:
             f"{[r.message for r in high_drift_warnings]}"
         )
 
-    def test_high_drift_warning_fires_on_genuine_loss(self, tmp_path, caplog):
-        """The 'genuine reconstruction loss' WARNING fires when genuine_loss > 0.
+    def test_genuine_loss_refuses_the_fold(self, tmp_path, caplog):
+        """A genuine_loss key raises ``FoldAccountingRefusal`` and logs an
+        ERROR naming it, instead of silently retraining with registry-true
+        content.
 
-        Under registry-true dedup mode, drift_genuine_loss fires for a key that
-        has non-empty subject content but an EMPTY predicate:
-        _build_registry_true_relations skips it (no predicate = not keyable), so
-        it never enters the merge and ends up absent from tier_keyed with its
-        content intact.  The drift-partition loop sees a key with non-empty
-        subject → genuine_loss bucket → WARNING.
-
-        This is distinct from a full-SPO key with no recon edge, which under
-        registry-true dedup IS included via registry-true SPO and survives in
-        tier_keyed (retry-not-drop).
+        Synthetic unit test of the REFUSAL MECHANISM only — it does not
+        model a real production genuine_loss cause.  The no-predicate skip
+        this fixture exploits (``key_no_pred`` has a subject but an empty
+        predicate) is, in production, ALREADY ledgered by
+        ``_build_registry_true_relations`` itself
+        (``self.merger.record_removal(key, reason="unkeyable_no_predicate")``)
+        and would land in ``drift_intended_removal``, never
+        ``drift_genuine_loss``.  It only reads as unaccounted here because
+        this fixture's ``loop.merger`` is a ``MagicMock`` (see
+        ``_make_loop``/``TestConsolidateInterimAdaptersFullFlow._make_loop``)
+        whose ``record_removal`` call is a no-op — the cheapest way to make
+        ANY key land unaccounted, without needing a real merger, so the
+        refusal path itself (raise, ERROR log, message contents) can be
+        pinned in isolation.  For real, unledgered production genuine_loss
+        causes over a real ``GraphMerger``, see
+        ``TestAccountingCoverageRealMerger``.
         """
         import logging
 
@@ -6724,8 +6768,9 @@ class TestDriftPartitioning:
 
         from paramem.graph.reconstruct import ReconstructionResult
         from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.consolidation import FoldAccountingRefusal
 
-        # key_ok has a recon edge and full SPO — survives normally.
+        # key_ok has a recon edge and full SPO — would survive normally.
         recon_g = nx.MultiDiGraph()
         eid = recon_g.add_edge("Dave", "London", predicate="lives_in")
         recon_g["Dave"]["London"][eid][_IK_KEY_ATTR] = "key_ok"
@@ -6767,21 +6812,19 @@ class TestDriftPartitioning:
             "key_no_pred", speaker_id="speaker0", relation_type="factual", first_seen=""
         )
 
-        caplog.set_level(logging.WARNING, logger="paramem.training.consolidation")
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+        caplog.set_level(logging.ERROR, logger="paramem.training.consolidation")
+        with pytest.raises(FoldAccountingRefusal) as excinfo:
+            self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        assert result["drift_genuine_loss"] == 1, (
-            f"Expected drift_genuine_loss=1 (key_no_pred has subject but no predicate "
-            f"— skipped by _build_registry_true_relations); got {result['drift_genuine_loss']}"
+        assert excinfo.value.unexplained_keys == ["key_no_pred"], (
+            f"Expected unexplained_keys=['key_no_pred']; got {excinfo.value.unexplained_keys}"
         )
-        # The genuine-loss WARNING must fire.
-        genuine_loss_warnings = [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "genuine reconstruction loss" in r.message
+        # An ERROR naming the key must fire.
+        genuine_loss_errors = [
+            r for r in caplog.records if r.levelno >= logging.ERROR and "key_no_pred" in r.message
         ]
-        assert genuine_loss_warnings, (
-            f"Expected a WARNING about genuine reconstruction loss; none emitted."
+        assert genuine_loss_errors, (
+            f"Expected an ERROR naming key_no_pred; none emitted."
             f" caplog had: {[r.message for r in caplog.records]}"
         )
 
@@ -6906,7 +6949,11 @@ class TestDriftPartitioning:
                     "_probe_passing_keys",
                     side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
@@ -7078,7 +7125,11 @@ class TestDriftIntendedRemoval:
                     "_probe_passing_keys",
                     side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
@@ -8935,6 +8986,7 @@ def _run_full_fold_mocked(
     copy_adapter_weights_side_effect=None,
     mode="train",
     consume_pending=False,
+    save_adapters_return_value=None,
 ):
     """Run consolidate with heavy ops mocked.
 
@@ -8969,6 +9021,14 @@ def _run_full_fold_mocked(
         caller-seeded keyless edge in ``loop.merger.graph`` (mimicking
         app.py's consume-pending pre-stage) survive the graph reset and
         mint a new key, exercising the fresh-mint path of a main-tiers fold.
+    save_adapters_return_value: override for the mocked ``_save_adapters``'s
+        return value (the committed-tier set ``_persist_fold`` uses to
+        decide which tiers get the no-retrain restamp).  Defaults to
+        ``{"episodic", "semantic", "procedural"}`` (every main tier reads as
+        already committed, so no test that does not care about the restamp
+        fallback pays for its real disk I/O). Pass ``set()`` for a test that
+        specifically wants every tier to route through
+        ``restamp_tier_manifest`` (and therefore ``KeyRegistry.save``).
     """
     from unittest.mock import MagicMock, patch
 
@@ -8983,6 +9043,8 @@ def _run_full_fold_mocked(
         unload_spy = MagicMock(return_value=[])
     if create_adapter_side_effect is None:
         create_adapter_side_effect = lambda m, c, n: m  # noqa: E731
+    if save_adapters_return_value is None:
+        save_adapters_return_value = {"episodic", "semantic", "procedural"}
     create_adapter_patch_kwargs = {"side_effect": create_adapter_side_effect}
     copy_adapter_weights_patch_kwargs = (
         {"side_effect": copy_adapter_weights_side_effect}
@@ -9021,7 +9083,11 @@ def _run_full_fold_mocked(
                 "_probe_passing_keys",
                 side_effect=probe_side_effect,
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value=save_adapters_return_value,
+            ),
             patch(
                 "paramem.training.trainer.train_adapter",
                 train_adapter_spy,
@@ -9623,7 +9689,9 @@ class TestMainTiersRecallCompletenessGate:
             semantic_keys=["graph3"],
             procedural_keys=["proc1"],
         )
-        save_spy = MagicMock(name="_save_adapters")
+        save_spy = MagicMock(
+            name="_save_adapters", return_value={"episodic", "semantic", "procedural"}
+        )
         loop._save_adapters = save_spy
 
         result = _run_full_fold_mocked(loop, keys_from="main_tiers")
@@ -9656,6 +9724,463 @@ class TestMainTiersRecallCompletenessGate:
             )
 
         unload_spy.assert_not_called()
+
+
+# =============================================================================
+# TestMainTiersAccountingRefusal — a genuine_loss key (real content, no
+# merged edge, no accounted bucket) refuses the fold via
+# FoldAccountingRefusal, reversibly and before any durable write -- the same
+# _discard_fold_work compensation TestMainTiersRecallCompletenessGate proves
+# for RecallGateRejected, triggered earlier in the spine (before the backup
+# scope, before any train_adapter call).
+# =============================================================================
+
+
+def _seed_unexplained_loss_key(loop, tier, key):
+    """Register *key* active in *tier* with full SPO content but no
+    merger-graph edge, no dedup collapse, and no removal-ledger entry --
+    an unaccounted genuine_loss key that must refuse the fold."""
+    _seed_keys(loop, tier, [key], relation_type="factual")
+
+
+class TestMainTiersAccountingRefusal:
+    def test_unexplained_loss_raises_naming_every_key(self, tmp_path):
+        """FoldAccountingRefusal carries every unexplained key."""
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"])
+        _seed_unexplained_loss_key(loop, "episodic", "graph_lost")
+
+        with pytest.raises(FoldAccountingRefusal) as excinfo:
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        assert excinfo.value.unexplained_keys == ["graph_lost"]
+        assert "graph_lost" in str(excinfo.value)
+
+    def test_unexplained_loss_logs_an_error(self, tmp_path, caplog):
+        """The refusal logs an ERROR naming the key -- not the retired
+        WARNING whose 'retrained with registry-true content' text was
+        false (the fold now refuses instead of silently retraining)."""
+        import logging
+
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"])
+        _seed_unexplained_loss_key(loop, "episodic", "graph_lost")
+
+        caplog.set_level(logging.WARNING, logger="paramem.training.consolidation")
+        with pytest.raises(FoldAccountingRefusal):
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        errors = [
+            r for r in caplog.records if r.levelno >= logging.ERROR and "graph_lost" in r.message
+        ]
+        assert errors, (
+            f"expected an ERROR naming graph_lost; caplog had:"
+            f" {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
+    def test_unexplained_loss_writes_nothing(self, tmp_path):
+        """Registries and key_metadata.json stay exactly as they were;
+        _save_adapters and _persist_fold never run."""
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"])
+        _seed_unexplained_loss_key(loop, "episodic", "graph_lost")
+        save_spy = MagicMock(name="_save_adapters")
+        persist_spy = MagicMock(name="_persist_fold")
+        loop._save_adapters = save_spy
+        loop._persist_fold = persist_spy
+        registry_path = loop.output_dir / "episodic" / "indexed_key_registry.json"
+
+        with pytest.raises(FoldAccountingRefusal):
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        save_spy.assert_not_called()
+        persist_spy.assert_not_called()
+        assert not registry_path.exists(), "no registry file must be written on refusal"
+        assert not loop._key_metadata_path.exists(), "no key_metadata.json must be written"
+
+    def test_unexplained_loss_never_trains_or_backs_up(self, tmp_path):
+        """The refusal fires before the backup scope, so ``train_adapter``,
+        ``main_tier_backup_scope``, and ``copy_adapter_weights`` are never
+        reached for any tier."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"], semantic_keys=["graph_sem"])
+        _seed_unexplained_loss_key(loop, "episodic", "graph_lost")
+
+        train_spy = MagicMock(return_value=({"aborted": False}, None))
+        backup_scope_spy = MagicMock(name="main_tier_backup_scope")
+        copy_spy = MagicMock(name="copy_adapter_weights")
+
+        with (
+            patch.object(ConsolidationLoop, "_train_tier_adapter", train_spy),
+            patch("paramem.models.loader.main_tier_backup_scope", backup_scope_spy),
+            patch("paramem.models.loader.copy_adapter_weights", copy_spy),
+            pytest.raises(FoldAccountingRefusal),
+        ):
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        train_spy.assert_not_called()
+        backup_scope_spy.assert_not_called()
+        copy_spy.assert_not_called()
+
+    def test_unexplained_loss_reverses_store_mutations(self, tmp_path):
+        """A refusal reverses this fold's promotions and mints exactly like
+        a RecallGateRejected refusal does -- the store's active key sets,
+        bookkeeping rows, and mint counter all match their pre-fold state."""
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_promote"])
+        _seed_unexplained_loss_key(loop, "episodic", "graph_lost")
+        loop.store.put_simhash("episodic", "graph_promote", 12345)
+        loop.store.set_bookkeeping(
+            "graph_promote",
+            speaker_id="S0",
+            relation_type="factual",
+            reinforcement_count=loop.config.promotion_threshold,
+            last_reinforced_cycle=1,
+            first_seen="",
+        )
+        loop._derive_key_counters()
+
+        pre_active = {
+            t: set(loop.store.active_keys_in_tier(t))
+            for t in ("episodic", "semantic", "procedural")
+        }
+        pre_bookkeeping_keys = {k for k, _ in loop.store.iter_bookkeeping()}
+        pre_indexed_index = loop._indexed_next_index
+
+        # A keyless edge mints a new key inside the fold, before the tier loop.
+        loop.merger.graph.add_edge(
+            "Alice",
+            "Freshtown",
+            predicate="visited",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s",
+            last_seen="s",
+            reinforcement_count=1,
+            sessions=["s"],
+        )
+
+        with pytest.raises(FoldAccountingRefusal):
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        post_active = {
+            t: set(loop.store.active_keys_in_tier(t))
+            for t in ("episodic", "semantic", "procedural")
+        }
+        assert post_active == pre_active, (
+            f"active keys changed by a refused fold: {pre_active} -> {post_active}"
+        )
+        assert loop.store.tier_for_active_key("graph_promote") == "episodic", (
+            "a refused fold's promotion must be reversed"
+        )
+        assert "graph_promote" not in loop.promoted_keys
+        post_bookkeeping_keys = {k for k, _ in loop.store.iter_bookkeeping()}
+        assert post_bookkeeping_keys == pre_bookkeeping_keys, (
+            f"bookkeeping rows changed by a refused fold:"
+            f" {pre_bookkeeping_keys} -> {post_bookkeeping_keys}"
+        )
+        assert loop._indexed_next_index == pre_indexed_index, (
+            f"mint counter not restored: {pre_indexed_index} -> {loop._indexed_next_index}"
+        )
+
+    def test_unexplained_loss_clears_fold_resume(self, tmp_path):
+        """A refusal clears fold_resume.json (via _discard_fold_work's
+        final step) rather than leaving a marker a genuinely deterministic
+        verdict would only reproduce on retry."""
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good"])
+        _seed_unexplained_loss_key(loop, "episodic", "graph_lost")
+
+        with pytest.raises(FoldAccountingRefusal):
+            _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        assert loop._read_fold_resume() is None, "a refused fold must clear fold_resume.json"
+
+
+# =============================================================================
+# TestAccountingCoverageRealMerger — a real GraphMerger, no mocks anywhere in
+# the merge/drop path, folding a representative key population.  Every key
+# must be accounted for (zero unexplained genuine_loss): the two removal
+# reasons added to close the fold-fatal rule's blind spots
+# (display_name_absorbed, duplicate_projection) are exercised alongside the
+# pre-existing dedup/orphan/intended-removal buckets.  This is the test that
+# would have caught both real (non-synthetic) genuine_loss producers the
+# fold-fatal rule shipped over: a name-predicate attribute key
+# (GraphMerger's relation_type == "attribute" branch,
+# node["attributes"]["name"] absorption) and an edge/attribute pair
+# colliding on (subject, predicate) (consolidation.py's _emitted_pairs
+# check).
+# =============================================================================
+
+
+class TestAccountingCoverageRealMerger:
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Real GraphMerger + real MemoryStore -- no mocking anywhere in the
+        merge/drop path.  Mirrors ``_make_fold_loop``'s model/config wiring
+        (needed for the tier-training loop and ``main_tier_backup_scope``)
+        but swaps its MagicMock merger for a real ``GraphMerger(model=None)``.
+        """
+        from paramem.graph.merger import GraphMerger
+
+        loop = _make_fold_loop(tmp_path)
+        loop.merger = GraphMerger(model=None)
+        return loop
+
+    def test_representative_population_has_zero_genuine_loss(self, tmp_path):
+        """Edge-typed, attribute-typed, a name-predicate attribute key, an
+        edge/attribute pair collision, a dedup pair, a promotable key, and a
+        keyless mint -- every key lands in ``tier_keyed`` or an accounted
+        drift bucket; none reaches the unexplained ``genuine_loss`` bucket.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+
+        # 1. Edge-typed key: a plain factual fact -- survives as a normal edge.
+        loop.store.put(
+            "episodic",
+            "graph_edge",
+            {
+                "key": "graph_edge",
+                "subject": "speaker0",
+                "predicate": "works_at",
+                "object": "Acme",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_edge", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+
+        # 2. Attribute-typed key (non-name predicate): folds onto node
+        #    attributes, survives via attribute_keys replay.
+        loop.store.put(
+            "episodic",
+            "graph_attr",
+            {
+                "key": "graph_attr",
+                "subject": "speaker0",
+                "predicate": "has phone",
+                "object": "0123",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_attr", speaker_id="speaker0", relation_type="attribute", first_seen=""
+        )
+
+        # 3. Name-predicate attribute key: absorbed onto the display
+        #    surface -- display_name_absorbed, no survivor.
+        loop.store.put(
+            "episodic",
+            "graph_name",
+            {
+                "key": "graph_name",
+                "subject": "speaker0",
+                "predicate": "has name",
+                "object": "Tobias",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_name", speaker_id="speaker0", relation_type="attribute", first_seen=""
+        )
+
+        # 4. Edge/attribute pair collision: the identical (subject,
+        #    predicate, object) fact keyed twice -- once factual (edge),
+        #    once attribute -- collides on (subject, predicate) in the
+        #    node-attribute walk's _emitted_pairs check.  The attribute key
+        #    is skipped as duplicate_projection; the fact carries forward
+        #    under the edge key.
+        loop.store.put(
+            "episodic",
+            "graph_pair_edge",
+            {
+                "key": "graph_pair_edge",
+                "subject": "speaker0",
+                "predicate": "has email",
+                "object": "t@example.com",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_pair_edge", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        loop.store.put(
+            "episodic",
+            "graph_pair_attr",
+            {
+                "key": "graph_pair_attr",
+                "subject": "speaker0",
+                "predicate": "has email",
+                "object": "t@example.com",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_pair_attr", speaker_id="speaker0", relation_type="attribute", first_seen=""
+        )
+
+        # 5. Dedup pair: two keys, identical (subject, predicate, object)
+        #    as edges -- Case-1 collapse, soft-staled as "dedup".
+        loop.store.put(
+            "episodic",
+            "graph_dup1",
+            {
+                "key": "graph_dup1",
+                "subject": "speaker0",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_dup1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        loop.store.put(
+            "episodic",
+            "graph_dup2",
+            {
+                "key": "graph_dup2",
+                "subject": "speaker0",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_dup2", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+
+        # 6. Promotable key: mature enough (reinforcement_count >=
+        #    promotion_threshold) -- promoted episodic -> semantic before
+        #    tier assignment.
+        loop.store.put(
+            "episodic",
+            "graph_promote",
+            {
+                "key": "graph_promote",
+                "subject": "speaker0",
+                "predicate": "employer",
+                "object": "Globex",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+            simhash=999,
+        )
+        loop.store.set_bookkeeping(
+            "graph_promote",
+            speaker_id="speaker0",
+            relation_type="factual",
+            reinforcement_count=loop.config.promotion_threshold,
+            last_reinforced_cycle=1,
+            first_seen="",
+        )
+
+        # 7. Keyless mint: a fresh (never-keyed) fact riding the
+        #    consume-pending pre-stage channel -- captured by
+        #    _capture_pending_relations before the graph reset, re-merged
+        #    via extra_relations, and minted as a brand-new key by the
+        #    keyless branch of _build_all_edge_entries_into.
+        loop.merger.graph.add_edge(
+            "speaker0",
+            "Guitar",
+            predicate="likes",
+            relation_type="preference",
+            confidence=1.0,
+            first_seen="s",
+            last_seen="s",
+            reinforcement_count=1,
+            sessions=["s"],
+        )
+
+        # The fold's own `finally` clears merger.removal_ledger
+        # (self.merger.reset_graph()) before returning, so the ledger this
+        # test asserts on must be captured DURING the fold via the
+        # on_removal_ledger artifact hook -- reading loop.merger.removal_ledger
+        # after the call sees only the post-reset empty dict.
+        captured_ledgers: list[dict] = []
+
+        def _capture_ledger(ledger: dict) -> None:
+            captured_ledgers.append(dict(ledger))
+
+        with patch(
+            "paramem.training.consolidation.on_removal_ledger",
+            side_effect=_capture_ledger,
+        ):
+            result = _run_full_fold_mocked(loop, keys_from="all_tiers", consume_pending=True)
+
+        assert result["drift_genuine_loss"] == 0, (
+            f"expected zero unexplained genuine_loss; got"
+            f" {result['drift_genuine_loss']} over a representative population"
+        )
+
+        assert captured_ledgers, "on_removal_ledger must have fired during the fold"
+        ledger = captured_ledgers[-1]
+        assert ledger["graph_name"]["reason"] == "display_name_absorbed", ledger.get("graph_name")
+        assert "survivor_key" not in ledger["graph_name"], (
+            "a display-name absorption has no surviving fact under any key"
+        )
+        assert ledger["graph_pair_attr"]["reason"] == "duplicate_projection", ledger.get(
+            "graph_pair_attr"
+        )
+        assert ledger["graph_pair_attr"]["survivor_key"] == "graph_pair_edge", (
+            f"the fact must carry forward under the already-emitted edge key;"
+            f" got {ledger['graph_pair_attr']}"
+        )
+        assert result["drift_intended_removal_by_reason"].get("display_name_absorbed") == 1, result[
+            "drift_intended_removal_by_reason"
+        ]
+        assert result["drift_intended_removal_by_reason"].get("duplicate_projection") == 1, result[
+            "drift_intended_removal_by_reason"
+        ]
+
+        assert loop.store.tier_for_active_key("graph_promote") == "semantic", (
+            "the mature key must be promoted before tier assignment"
+        )
+
+        keyed = {e["key"] for tier in result["tier_keyed"].values() for e in tier}
+        for expected_survivor in (
+            "graph_edge",
+            "graph_attr",
+            "graph_pair_edge",
+            "graph_promote",
+        ):
+            assert expected_survivor in keyed, f"{expected_survivor} must survive; got {keyed}"
+        # Exactly one of the dedup pair survives; the other is soft-staled.
+        assert len({"graph_dup1", "graph_dup2"} & keyed) == 1, (
+            f"exactly one of the dedup pair must survive; got {keyed}"
+        )
+        # The keyless mint produced a brand-new key not in the seeded set.
+        seeded_keys = {
+            "graph_edge",
+            "graph_attr",
+            "graph_name",
+            "graph_pair_edge",
+            "graph_pair_attr",
+            "graph_dup1",
+            "graph_dup2",
+            "graph_promote",
+        }
+        assert keyed - seeded_keys, (
+            f"the keyless consume-pending fact must have minted a new key; got {keyed}"
+        )
 
 
 # =============================================================================
@@ -9913,6 +10438,73 @@ class TestMainTiersCrashResumeBookkeeping:
         graph_path = loop.output_dir / "episodic" / "graph.json"
         assert graph_path.exists(), "simulate persist must have written graph.json"
 
+    def test_resumed_fold_refuses_when_marker_carries_drift_genuine_loss(self, tmp_path):
+        """A resumed fold reads back a non-empty ``drift_genuine_loss`` list
+        from the marker and refuses before training -- the SAME accounting
+        gate the fresh-derivation path enforces, applied via the read-back.
+        The refusal also reverses the resume path's own reconstitution (the
+        marker key's re-established store entry is gone again) and clears
+        ``fold_resume.json``."""
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        loop = self._make_loop(tmp_path)
+        entry = {
+            "key": "graph42",
+            "subject": "alice",
+            "predicate": "lives in",
+            "object": "berlin",
+            "speaker_id": "spk-a",
+        }
+        _craft_main_tiers_marker(loop, tier="episodic", entry=entry, rec_bearing=True)
+        marker = loop._read_fold_resume()
+        marker["drift_genuine_loss"] = ["graph_lost"]
+        loop._write_fold_resume(marker)
+
+        with pytest.raises(FoldAccountingRefusal) as excinfo:
+            self._run_resumed_fold(loop, mode="simulate")
+
+        assert excinfo.value.unexplained_keys == ["graph_lost"]
+        assert loop.store.get("graph42") is None, (
+            "a refusal must reverse the resume path's own reconstitution (the"
+            " pre-crash mint), leaving the store exactly as it was before this fold"
+        )
+        assert loop._read_fold_resume() is None, "a refused fold must clear fold_resume.json"
+
+    def test_resumed_fold_with_no_drift_genuine_loss_field_commits_with_warning(
+        self, tmp_path, caplog
+    ):
+        """A marker predating the ``drift_genuine_loss`` patch (absent
+        field) treats it as 0 and commits -- the only window is a crash
+        between the marker write and the patch, during which nothing
+        durable happened."""
+        import logging
+
+        loop = self._make_loop(tmp_path)
+        entry = {
+            "key": "graph9",
+            "subject": "carol",
+            "predicate": "has hobby",
+            "object": "chess",
+            "speaker_id": "spk-c",
+        }
+        _craft_main_tiers_marker(loop, tier="episodic", entry=entry, rec_bearing=True)
+        marker = loop._read_fold_resume()
+        assert "drift_genuine_loss" not in marker, "fixture guard: marker predates the patch"
+
+        caplog.set_level(logging.WARNING, logger="paramem.training.consolidation")
+        result = self._run_resumed_fold(loop, mode="simulate")
+
+        assert result["tiers_rebuilt"] == ["episodic"]
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "drift_genuine_loss" in r.message
+        ]
+        assert warnings, (
+            f"expected a WARNING naming drift_genuine_loss; caplog had:"
+            f" {[r.message for r in caplog.records]}"
+        )
+
 
 # =============================================================================
 # TestMainTiersKeyMetadataCoCommit — the fold itself is the durable writer of
@@ -9930,7 +10522,16 @@ class TestMainTiersKeyMetadataCoCommit:
 
     def test_write_key_metadata_precedes_registry_save(self, tmp_path):
         """ConsolidationLoop.write_key_metadata must be called before
-        KeyRegistry.save (the per-tier indexed_key_registry.json rewrite)."""
+        KeyRegistry.save (the per-tier indexed_key_registry.json rewrite).
+
+        The registry write itself now happens inside ``_save_adapters`` (a
+        committed tier) or ``restamp_tier_manifest`` (an uncommitted one) —
+        never as a call the finalize block makes directly.  This test forces
+        every tier through the restamp path
+        (``save_adapters_return_value=set()`` — nothing pre-committed) so
+        the patched ``KeyRegistry.save`` actually fires and the ordering
+        claim is observable.
+        """
         from unittest.mock import patch
 
         from paramem.training.consolidation import ConsolidationLoop
@@ -9966,7 +10567,7 @@ class TestMainTiersKeyMetadataCoCommit:
             patch.object(ConsolidationLoop, "write_key_metadata", _record_write_key_metadata),
             patch.object(KeyRegistry, "save", _record_registry_save),
         ):
-            _run_full_fold_mocked(loop, keys_from="main_tiers")
+            _run_full_fold_mocked(loop, keys_from="main_tiers", save_adapters_return_value=set())
 
         assert "write_key_metadata" in call_order, "write_key_metadata was not called"
         assert "registry_save" in call_order, "KeyRegistry.save was not called"
@@ -9980,7 +10581,14 @@ class TestMainTiersKeyMetadataCoCommit:
     def test_every_active_registry_key_has_a_bookkeeping_row(self, tmp_path):
         """After a full cycle, every active on-disk registry key has a row
         in the on-disk key_metadata.json bookkeeping file -- the co-commit
-        invariant."""
+        invariant.
+
+        ``_save_adapters`` is mocked (no real weight save), so the registry
+        only reaches disk via the ``restamp_tier_manifest`` fallback --
+        force it with ``save_adapters_return_value=set()`` (nothing
+        pre-committed) so the on-disk registry this test reads back is
+        actually written.
+        """
         import json
 
         from paramem.training.key_registry import KeyRegistry
@@ -10003,7 +10611,7 @@ class TestMainTiersKeyMetadataCoCommit:
             ],
         )
 
-        _run_full_fold_mocked(loop, keys_from="main_tiers")
+        _run_full_fold_mocked(loop, keys_from="main_tiers", save_adapters_return_value=set())
 
         registry = KeyRegistry.load(loop.output_dir / "episodic" / "indexed_key_registry.json")
         active_on_disk = set(registry.list_active())
@@ -10015,6 +10623,319 @@ class TestMainTiersKeyMetadataCoCommit:
         assert not missing, (
             f"every active on-disk registry key must have a bookkeeping row "
             f"in key_metadata.json; missing: {missing}"
+        )
+
+
+# =============================================================================
+# TestPersistFoldMainTiersCommit — the main-tiers weights-venue commit act:
+# _save_adapters commits the tiers a fold actually retrained; every OTHER
+# main tier is committed via restamp_tier_manifest (paramem.memory.persistence)
+# instead, so a tier this fold did not retrain never gets a new on-disk
+# registry with no matching manifest stamp (the flush-outruns-stamp hole).
+# =============================================================================
+
+
+class TestPersistFoldMainTiersCommit:
+    @staticmethod
+    def _make_loop(tmp_path, *, resident_tiers=("episodic", "semantic", "procedural")):
+        """A minimal ConsolidationLoop wired for real _save_adapters /
+        _persist_fold calls, with a fake ``save_pretrained`` side effect that
+        writes real (tiny) files so ``atomic_save_adapter`` and
+        ``restamp_tier_manifest`` run against a real on-disk slot.  Mirrors
+        ``TestSaveAdaptersManifest._make_save_loop``, parametrized over which
+        main tiers are resident in ``model.peft_config``.
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        model = MagicMock()
+        model.config._name_or_path = "test-base-model"
+        model.config._commit_hash = None
+        model.base_model.model.state_dict.return_value = {}
+
+        def _lora_cfg():
+            cfg = MagicMock()
+            cfg.r = 4
+            cfg.lora_alpha = 8
+            cfg.lora_dropout = 0.0
+            cfg.target_modules = ["q_proj"]
+            cfg.bias = "none"
+            return cfg
+
+        model.peft_config = {t: _lora_cfg() for t in resident_tiers}
+
+        def _fake_save_pretrained(path, selected_adapters=None):
+            from pathlib import Path
+
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"weights")
+            (p / "adapter_config.json").write_text("{}")
+
+        model.save_pretrained.side_effect = _fake_save_pretrained
+
+        tokenizer = MagicMock()
+        tokenizer.name_or_path = "test-tokenizer"
+        tokenizer.backend_tokenizer = None
+        tokenizer.vocab_size = 32000
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = model
+        loop.tokenizer = tokenizer
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.wandb_config = None
+        loop.output_dir = tmp_path
+        loop.snapshot_dir = None
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
+
+        from paramem.memory.store import MemoryStore
+
+        loop.store = MemoryStore(replay_enabled=True)
+        for t in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(t, KeyRegistry())
+        loop.cycle_count = 0
+        loop.merger = MagicMock()
+        return loop
+
+    @classmethod
+    def _bootstrap_tier_slot(cls, tmp_path, dest_output_dir, tier, keys):
+        """Build a real on-disk slot for *tier* under a PRIVATE staging root,
+        then copy it into *dest_output_dir*.
+
+        ``_save_adapters`` always saves ``"episodic"`` unconditionally,
+        regardless of ``model.peft_config`` residency — so bootstrapping a
+        slot by calling it against ``dest_output_dir`` directly would also
+        write a real episodic slot there, and the test's OWN later
+        ``_save_adapters()`` call (same ``dest_output_dir``, same
+        wall-clock second) would collide with it at
+        ``atomic_save_adapter``'s timestamp-named final slot. A private
+        staging root sidesteps that collision entirely.
+        """
+        import shutil
+
+        staging_root = tmp_path / f"_boot_{tier}_{len(keys)}"
+        boot = cls._make_loop(staging_root, resident_tiers=(tier,))
+        for k in keys:
+            boot.store.registry(tier).add(k)
+        boot._save_adapters()
+        dest_tier_dir = dest_output_dir / tier
+        dest_tier_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(staging_root / tier, dest_tier_dir, dirs_exist_ok=True)
+        return dest_tier_dir
+
+    def test_empty_fold_skips_save_adapters_and_restamps_all_three(self, tmp_path):
+        """``tiers_rebuilt=[]``: ``_save_adapters`` is never called, and
+        every main tier is committed via the no-retrain restamp instead —
+        no disk-integrity probe runs, since that lives inside
+        ``_save_adapters``, which never ran."""
+        from unittest.mock import patch
+
+        import paramem.memory.persistence as persistence_mod
+        from paramem.training.consolidation import FoldScope
+
+        loop = self._make_loop(tmp_path)
+        save_spy = MagicMock(name="_save_adapters")
+        loop._save_adapters = save_spy
+        restamp_spy = MagicMock(return_value=MagicMock(status="no_weight_slot", slot=None))
+        scope = FoldScope(
+            name="full", source="weights", persist="main_tiers", keys_from="all_tiers"
+        )
+
+        with patch.object(persistence_mod, "restamp_tier_manifest", restamp_spy):
+            loop._persist_fold(scope, tiers_rebuilt=[])
+
+        save_spy.assert_not_called()
+        restamped_tiers = {c.args[0].name for c in restamp_spy.call_args_list}
+        assert restamped_tiers == {"episodic", "semantic", "procedural"}, (
+            f"every main tier must be restamped when nothing was retrained; got {restamped_tiers}"
+        )
+
+    def test_procedural_absent_from_peft_config_untouched_by_save_adapters(self, tmp_path):
+        """procedural absent from ``model.peft_config``: ``_save_adapters``
+        returns ``{"episodic", "semantic"}`` and never writes procedural's
+        registry — confirming ``_save_adapters`` is inert for a
+        non-resident tier.  A pre-existing procedural slot stays resolvable
+        (``find_live_slot`` still matches), since nothing touched it."""
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+
+        # Bootstrap a real procedural slot, then treat it as non-resident —
+        # as if this fold's tier loop chose not to retrain it this cycle.
+        procedural_root = self._bootstrap_tier_slot(tmp_path, tmp_path, "procedural", ["proc1"])
+        pre_hash = tier_registry_sha256(procedural_root)
+        pre_slot = find_live_slot(procedural_root, pre_hash)
+        assert pre_slot is not None, (
+            "fixture guard: the bootstrap save must produce a resolvable slot"
+        )
+
+        loop = self._make_loop(tmp_path, resident_tiers=("episodic", "semantic"))
+        loop.store.registry("episodic").add("ep1")
+        loop.store.registry("semantic").add("sem1")
+
+        procedural_registry_path = procedural_root / "indexed_key_registry.json"
+        pre_write_bytes = procedural_registry_path.read_bytes()
+
+        committed = loop._save_adapters()
+
+        assert committed == {"episodic", "semantic"}, f"got {committed!r}"
+        assert procedural_registry_path.read_bytes() == pre_write_bytes, (
+            "_save_adapters must not touch a tier absent from peft_config"
+        )
+        assert find_live_slot(procedural_root, pre_hash) == pre_slot, (
+            "an untouched tier's pre-existing slot must stay resolvable after"
+            " _save_adapters commits only the OTHER tiers"
+        )
+
+    def test_persist_fold_restamps_a_tier_not_committed_by_save_adapters(self, tmp_path):
+        """A tier this fold did not retrain (procedural, absent from
+        ``model.peft_config``) but whose registry moved (e.g. a soft-stale
+        flip earlier in the fold) is committed via ``restamp_tier_manifest``
+        — exactly once — inside ``_persist_fold``, closing the
+        flush-outruns-stamp hole."""
+        from unittest.mock import patch
+
+        import paramem.memory.persistence as persistence_mod
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+        from paramem.training.consolidation import FoldScope
+        from paramem.training.key_registry import KeyRegistry
+
+        procedural_root = self._bootstrap_tier_slot(
+            tmp_path, tmp_path, "procedural", ["proc1", "proc2"]
+        )
+        pre_slot = find_live_slot(procedural_root, tier_registry_sha256(procedural_root))
+        assert pre_slot is not None
+
+        loop = self._make_loop(tmp_path, resident_tiers=("episodic", "semantic"))
+        proc_reg = KeyRegistry.load(procedural_root / "indexed_key_registry.json")
+        # This fold's own soft-stale flip on a procedural key, applied
+        # earlier in the spine, before the commit act runs.
+        proc_reg.stale("proc2")
+        loop.store.load_registry("procedural", proc_reg)
+        loop.store.registry("episodic").add("ep1")
+        loop.store.registry("semantic").add("sem1")
+
+        scope = FoldScope(
+            name="full", source="weights", persist="main_tiers", keys_from="all_tiers"
+        )
+        restamp_spy = MagicMock(wraps=persistence_mod.restamp_tier_manifest)
+        with patch.object(persistence_mod, "restamp_tier_manifest", restamp_spy):
+            loop._persist_fold(scope, tiers_rebuilt=["episodic", "semantic"])
+
+        procedural_calls = [c for c in restamp_spy.call_args_list if c.args[0].name == "procedural"]
+        assert len(procedural_calls) == 1, (
+            f"procedural must be restamped exactly once; got {len(procedural_calls)} calls"
+        )
+        on_disk = KeyRegistry.load(procedural_root / "indexed_key_registry.json")
+        assert set(on_disk.list_active()) == {"proc1"}, (
+            "procedural's on-disk registry must reflect this fold's soft-stale flip"
+        )
+        new_hash = tier_registry_sha256(procedural_root)
+        assert find_live_slot(procedural_root, new_hash) == pre_slot, (
+            "the pre-existing procedural slot must still resolve at the new (restamped) hash"
+        )
+
+    def test_soft_stale_only_fold_commits_once_and_advances_stale_cycles(self, tmp_path):
+        """A fold that only soft-stales a key (nothing retrained) commits
+        the flip to disk exactly once via the no-retrain restamp, and
+        ``stale_cycles`` advances — the increment now genuinely runs AFTER
+        a durable write, for every venue, not just the ones that retrained
+        a tier."""
+        from unittest.mock import patch
+
+        import paramem.memory.persistence as persistence_mod
+        from paramem.adapters.manifest import find_live_slot, tier_registry_sha256
+
+        # A real pre-existing episodic slot for restamp/find_live_slot to
+        # bind against — content-independent of the test loop's own store.
+        bootstrap = self._make_loop(tmp_path, resident_tiers=("episodic",))
+        bootstrap._save_adapters()
+        episodic_root = tmp_path / "episodic"
+        pre_slot = find_live_slot(episodic_root, tier_registry_sha256(episodic_root))
+        assert pre_slot is not None
+
+        loop = _make_fold_loop(tmp_path)
+        loop.merger.removal_ledger = {
+            "graph_stale": {
+                "reason": "predicate_synonym_collapse",
+                "subject": "Morgan",
+                "object": "German",
+                "existing_predicate": "speaks",
+                "incoming_predicate": "speaks_language",
+            }
+        }
+        loop.store.put(
+            "episodic",
+            "graph_stale",
+            {
+                "key": "graph_stale",
+                "subject": "Morgan",
+                "predicate": "speaks",
+                "object": "German",
+                "speaker_id": "Morgan",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_stale", speaker_id="Morgan", relation_type="factual", first_seen=""
+        )
+        # No merger-graph edge for graph_stale and no other active keys
+        # anywhere: tier_keyed ends up empty, so tiers_rebuilt == [].
+
+        restamp_spy = MagicMock(wraps=persistence_mod.restamp_tier_manifest)
+        with patch.object(persistence_mod, "restamp_tier_manifest", restamp_spy):
+            result = _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        assert result["tiers_rebuilt"] == [], (
+            f"fixture guard: nothing must be retrained; got {result['tiers_rebuilt']!r}"
+        )
+        assert loop.store.is_stale("graph_stale"), "graph_stale must be soft-staled"
+        episodic_calls = [c for c in restamp_spy.call_args_list if c.args[0].name == "episodic"]
+        assert len(episodic_calls) == 1, (
+            f"episodic's registry must be committed exactly once; got {len(episodic_calls)} calls"
+        )
+        assert loop.store.registry("episodic").is_stale("graph_stale")
+        # stale_cycles advanced from 0 to 1 for the just-staled key.
+        stale_rec = loop.store.registry("episodic")._stale["graph_stale"]  # noqa: SLF001
+        assert stale_rec["stale_cycles"] == 1, f"got {stale_rec}"
+        new_hash = tier_registry_sha256(episodic_root)
+        assert find_live_slot(episodic_root, new_hash) == pre_slot, (
+            "the pre-existing episodic slot must resolve at the new (restamped) hash"
+        )
+
+    def test_disk_venue_registry_lands_beside_graph_json(self, tmp_path):
+        """The simulate (disk) venue's per-tier registry write happens
+        inside ``_persist_fold``, immediately beside that tier's
+        ``graph.json`` projection — the ONE registry write this venue
+        performs."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_fold_loop(tmp_path)
+        loop.merger = GraphMerger(model=None)
+        _seed_keys(loop, "episodic", ["graph1"])
+        _build_merger_graph(
+            loop,
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
+
+        result = _run_full_fold_mocked(loop, keys_from="all_tiers", mode="simulate")
+
+        assert result["tiers_rebuilt"] == ["episodic"], f"got {result['tiers_rebuilt']!r}"
+        graph_path = loop.output_dir / "episodic" / "graph.json"
+        registry_path = loop.output_dir / "episodic" / "indexed_key_registry.json"
+        assert graph_path.exists(), "simulate persist must have written graph.json"
+        assert registry_path.exists(), (
+            "the disk venue must write the tier's registry beside graph.json"
+        )
+        on_disk_reg = KeyRegistry.load(registry_path)
+        assert "graph1" in on_disk_reg.list_active(), (
+            f"got active keys {on_disk_reg.list_active()!r}"
         )
 
 
@@ -10470,7 +11391,11 @@ class TestTierKeyedAssignmentInvariants:
                     "_probe_passing_keys",
                     side_effect=lambda a, e: {x["key"] for x in e},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch("paramem.training.trainer.train_adapter", train_spy),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
@@ -10643,7 +11568,11 @@ class TestTierKeyedAssignmentInvariants:
                     "_probe_passing_keys",
                     side_effect=lambda a, e: {x["key"] for x in e},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch("paramem.training.trainer.train_adapter", train_spy),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
@@ -18641,7 +19570,11 @@ class TestFoldResumeHelpers:
                     "_probe_passing_keys",
                     side_effect=lambda a, e: {x["key"] for x in e},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch.object(
                     GraphTierRefiner,
                     "run_normalization",
@@ -18671,13 +19604,23 @@ class TestFoldResumeHelpers:
         then proceeds with full derivation, writing a new marker with the correct stamp.
         The key invariant: the stale assignment is NEVER used as a resume source.
         """
+        from paramem.graph.merger import GraphMerger
+
         loop = self._make_loop(tmp_path)
+        # A real merger (the class default is an unwired MagicMock, which
+        # silently no-ops merge_relations) so k1's registry-true relation
+        # actually lands on a merged edge and survives the fold normally,
+        # rather than spuriously reading as an unaccounted genuine_loss key.
+        loop.merger = GraphMerger(model=None)
 
         # Seed one key so the fold has something to derive.
         loop.store.put(
             "episodic",
             "k1",
             {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "cats"},
+        )
+        loop.store.set_bookkeeping(
+            "k1", speaker_id="", relation_type="factual", first_seen="", allow_empty_speaker=True
         )
 
         # Write a marker whose stamp does NOT match the current store state.
@@ -18749,7 +19692,11 @@ class TestFoldResumeHelpers:
                     "_probe_passing_keys",
                     side_effect=lambda a, e: {x["key"] for x in e},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -19246,7 +20193,11 @@ class TestConsumePendingFullFold:
                     "_probe_passing_keys",
                     side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
                 ),
-                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 patch(
                     "paramem.training.trainer.train_adapter",
                     return_value={"aborted": False},
@@ -20766,6 +21717,7 @@ class TestConsolidateEntry:
             "adapter_name",
             "stamp",
             "all_keyed",
+            "tiers_rebuilt",
         }, "unexpected _persist_fold parameters"
 
         assert set(inspect.signature(ConsolidationLoop._save_adapters).parameters) == {"self"}, (
@@ -20804,10 +21756,33 @@ class TestFoldKeySource:
     INTERIM_TIER = "episodic_interim_20260701T1200"
 
     def _make_loop_with_an_interim_slot(self, tmp_path):
-        """Loop with two episodic keys in the merged graph and one interim key beside them."""
+        """Loop with two episodic keys in the merged graph and one interim key beside them.
+
+        The interim key (``graph9``) is deliberately content-empty (no
+        subject/predicate/object) rather than routed through ``_seed_keys``:
+        this fixture's ``loop.merger`` is the unwired class default
+        (MagicMock, no real ``merge_relations``), so a full-content key would
+        never re-merge via registry-true reconstruction here and would read
+        as an unaccounted ``genuine_loss`` — now fold-fatal — rather than the
+        deterministic, content-independent ``drift_orphan`` bucket this
+        fixture actually wants to exercise.
+        """
         loop = _make_fold_loop(tmp_path)
         _seed_keys(loop, "episodic", ["graph1", "graph2"])
-        _seed_keys(loop, self.INTERIM_TIER, ["graph9"])
+        loop.store.put(
+            self.INTERIM_TIER,
+            "graph9",
+            {"key": "graph9", "subject": "", "predicate": "", "object": "", "speaker_id": "S0"},
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph9",
+            speaker_id="S0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
+            first_seen="",
+        )
         _build_merger_graph(
             loop,
             [

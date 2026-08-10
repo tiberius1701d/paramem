@@ -1390,13 +1390,16 @@ class TestConsolidateSimulateFold:
         assert ep["active_after"] == 1, "One interim key folded into episodic → active_after == 1"
 
     def test_simulate_fold_with_nothing_to_fold_is_a_noop(self, tmp_path):
-        """Empty store, no interims: nothing is rebuilt and nothing is written.
+        """Empty store, no interims: nothing is rebuilt, but the fold still commits.
 
-        Same contract as the weights venue — a tier with no keys is skipped, so
-        ``tiers_rebuilt`` is empty and the persist tail never fires.  ``app.py``
-        reads exactly that (``tiers_rebuilt == []`` → ``noop``).  Persisting an
-        empty projection over whatever is on disk would be a write with no
-        content behind it.
+        Same contract as the weights venue — a tier with no keys is skipped
+        for training/retraining, so ``tiers_rebuilt`` is empty.  ``app.py``
+        reads exactly that (``tiers_rebuilt == []`` → ``noop``).  The persist
+        tail still fires: after the fold the store is the post-fold truth,
+        and every tier's registry mutations (even an empty diff) are the
+        same durable commit act regardless of whether anything was
+        retrained — so the disk venue's per-tier ``graph.json`` projection
+        (empty, matching the empty store) lands too.
         """
         loop = _make_bare_loop(tmp_path)
         # No interim slots, no store content.
@@ -1406,8 +1409,8 @@ class TestConsolidateSimulateFold:
         assert result["tiers_rebuilt"] == [], (
             f"nothing in the store → nothing rebuilt; got {result['tiers_rebuilt']!r}"
         )
-        assert not (tmp_path / "episodic" / "graph.json").exists(), (
-            "a fold that rebuilt nothing must not write a tier graph"
+        assert (tmp_path / "episodic" / "graph.json").exists(), (
+            "the fold commits (an empty projection) even when nothing was rebuilt"
         )
 
     def test_current_interim_stamp_stays_none_across_the_fold(self, tmp_path):
@@ -3179,12 +3182,15 @@ class TestSimulateFoldSpineStages:
         assert router.reload.called, "the simulate fold must reload the router"
 
     def test_interim_slot_survives_a_fold_that_persisted_nothing(self, tmp_path):
-        """Reap is gated on the same predicate as persist — no persist, no reap.
+        """Reap is gated on ``tiers_rebuilt`` — no rebuild, no reap — even though
+        the commit itself is unconditional.
 
         A slot whose content the store cannot see (boot-degraded hydration)
-        contributes no keys, so the fold rebuilds nothing and writes nothing.
-        Reaping it anyway would delete the only copy of its facts: on the disk
-        venue the slot's ``graph.json`` IS the payload.
+        contributes no keys, so the fold rebuilds nothing (``tiers_rebuilt ==
+        []``); the commit still runs (an empty per-tier ``graph.json``
+        projection), but reaping the interim slot anyway would delete the
+        only copy of its facts: on the disk venue the slot's ``graph.json``
+        IS the payload, and it was never folded into that empty projection.
         """
         loop = _make_bare_loop(tmp_path)
         interim_dir = _write_interim_graph(
@@ -3197,11 +3203,11 @@ class TestSimulateFoldSpineStages:
         result = loop.consolidate(mode="simulate")
 
         assert result["tiers_rebuilt"] == [], "nothing visible in the store → nothing rebuilt"
-        assert not (tmp_path / "episodic" / "graph.json").exists(), (
-            "a fold that rebuilt nothing must not write a tier graph"
+        assert (loop.output_dir / "episodic" / "graph.json").exists(), (
+            "the fold still commits (an empty per-tier projection) even though it rebuilt nothing"
         )
         assert interim_dir.exists(), (
-            "the fold persisted nothing, so it must not reap the slot it could not fold"
+            "the fold rebuilt nothing, so it must not reap the slot it could not fold"
         )
         assert (interim_dir / "graph.json").exists(), "the slot payload must survive intact"
 
@@ -3395,7 +3401,11 @@ class TestFoldHydratesAPartiallyPreloadedStore:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(ConsolidationLoop, "_save_adapters"),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),

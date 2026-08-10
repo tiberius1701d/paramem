@@ -356,7 +356,10 @@ class TestLockLeakGuard:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 result = loop.consolidate(mode="train")
         finally:
@@ -448,7 +451,10 @@ class TestTrainingFlagBracketing:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
@@ -581,7 +587,10 @@ class TestTrainingFlagBracketing:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
@@ -737,7 +746,10 @@ class TestPerTierInferenceFallbackAdapter:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
@@ -853,7 +865,10 @@ class TestPerTierInferenceFallbackAdapter:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
@@ -984,7 +999,10 @@ class TestCapacityCeilingRollback:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 result = loop.consolidate(mode="train")
         finally:
@@ -1056,7 +1074,10 @@ class TestCapacityCeilingRollback:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
             ):
                 result = loop.consolidate(mode="train")
         finally:
@@ -1074,10 +1095,16 @@ class TestAtomicFinalizeOrdering:
     """Registry rewrite before interim purge/unload; Router.reload() last."""
 
     def test_registry_rewrite_before_unload_and_router_reload(self, tmp_path: Path) -> None:
-        """Finalize ordering: KeyRegistry.save() → unload_interim_adapters → router.reload().
+        """Finalize ordering: _save_adapters() (the fold's commit act — weights
+        AND the registry-last atomic write) → unload_interim_adapters →
+        router.reload().
 
-        The finalize block creates fresh KeyRegistry instances and calls .save() on
-        each — patch KeyRegistry.save at the class level to capture the event.
+        The registry write itself now lives inside ``_save_adapters`` (a
+        committed tier) or ``restamp_tier_manifest`` (an uncommitted one),
+        never as a separate call the finalize block makes directly — so the
+        commit-act event this test tracks is the ``_save_adapters`` call
+        itself, mocked to also stand in for every tier being committed (no
+        tier reaches the restamp fallback).
         """
         from paramem.server.gpu_lock import _gpu_thread_lock
 
@@ -1109,8 +1136,9 @@ class TestAtomicFinalizeOrdering:
 
         call_order: list[str] = []
 
-        def _registry_save(self_reg, path) -> None:
+        def _save_adapters_side_effect() -> "set[str]":
             call_order.append("registry_save")
+            return {"episodic", "semantic", "procedural"}
 
         def _unload(m, adapter_dir) -> list:
             call_order.append("unload_interim_adapters")
@@ -1157,11 +1185,10 @@ class TestAtomicFinalizeOrdering:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
-                # Patch KeyRegistry.save at the class level — the finalize block creates
-                # fresh KeyRegistry instances, so we must patch the class method, not the
-                # instance's save attribute.
-                patch("paramem.training.key_registry.KeyRegistry.save", new=_registry_save),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    side_effect=_save_adapters_side_effect,
+                ),
             ):
                 loop.consolidate(mode="train", router=mock_router)
         finally:
@@ -1270,7 +1297,10 @@ class TestAtomicFinalizeOrdering:
                     "paramem.training.consolidation.reconstruct_graph",
                     side_effect=_faithful_reconstruct,
                 ),
-                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
+                patch(
+                    "paramem.training.consolidation.ConsolidationLoop._save_adapters",
+                    return_value={"episodic", "semantic", "procedural"},
+                ),
                 # Suppress real disk I/O in the finalize save.
                 patch("paramem.training.key_registry.KeyRegistry.save"),
             ):
@@ -1405,8 +1435,9 @@ class TestMainWeightsSavedBeforeInterimPurge:
 
         call_order: list[str] = []
 
-        def _save(self_loop, **kwargs) -> None:
+        def _save(self_loop, **kwargs) -> "set[str]":
             call_order.append("save_adapters")
+            return {"episodic"}
 
         def _unload(m, adapter_dir) -> list:
             call_order.append("unload_interim_adapters")

@@ -1303,3 +1303,29 @@ class TestStageBCycleRecallGateIncidentDetail:
         assert crashes[0].detail["phase"] == "fold", (
             "caller-supplied detail fields must survive the merge"
         )
+
+
+class TestStageBCycleFoldAccountingRefusalIncidentDetail:
+    """``_run_stage_b_cycle``'s crash envelope merges a
+    ``FoldAccountingRefusal``'s ``unexplained_keys`` into the incident
+    detail it records — a main-tiers fold that could not account for a
+    genuine_loss key reaches here uncaught, so the incident names exactly
+    what could not be accounted for."""
+
+    def test_unexplained_keys_reach_the_incident_detail(self, state):
+        """A FoldAccountingRefusal's unexplained_keys is folded into the
+        incident detail alongside the caller-supplied fields."""
+        from paramem.training.consolidation import FoldAccountingRefusal
+
+        exc = FoldAccountingRefusal(unexplained_keys=["graph_lost", "graph_gone"])
+        _drive_stage_b_cycle_crash(state, exc=exc)
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert crashes[0].detail["unexplained_keys"] == ["graph_gone", "graph_lost"]
+        assert crashes[0].detail["phase"] == "fold", (
+            "caller-supplied detail fields must survive the merge"
+        )

@@ -52,6 +52,8 @@ REMOVAL_REASONS: frozenset[str] = frozenset(
         "predicate_synonym_collapse",
         "attribute_key_superseded",
         "unkeyable_no_predicate",
+        "display_name_absorbed",
+        "duplicate_projection",
     }
 )
 
@@ -286,7 +288,8 @@ class GraphMerger:
         # every reason a previously-registered key is absent from the merged
         # graph this fold — an edge/attribute removal (dedup, contradiction,
         # synonym collapse, enrichment contraction, attribute-key
-        # supersession) OR a key that was never merged at all
+        # supersession, display-name absorption, duplicate-projection
+        # collision) OR a key that was never merged at all
         # (unkeyable_no_predicate — its store entry has no predicate, so it
         # never reaches the merge surface under any key).  Reset in
         # reset_graph(), NOT in merge() — must survive the fold's
@@ -300,18 +303,22 @@ class GraphMerger:
         # reason ∈ :data:`REMOVAL_REASONS` (``record_removal`` rejects any
         # other value).
         # ``survivor_key`` is present exactly when the removed fact carries
-        # forward under another indexed key — always true for "dedup" and
-        # "predicate_synonym_collapse", and true for "attribute_key_superseded"
-        # ONLY when the same value carries forward under the new key (a
-        # different value winning is the contradiction shape — see
-        # old_object/new_object — and omits it).  It is the fold's
-        # reinforcement-credit input: the survivor inherits the removed keys'
-        # maturity, which would otherwise be discarded when they are staled.
-        # A contradiction (either the edge kind or the different-value
-        # attribute-key kind) is a supersession (a DIFFERENT fact won, see
-        # old_object/new_object), an enrichment same_as is a node contraction
-        # (see keep_node), and an unkeyable-no-predicate removal has no
-        # surviving fact at all, so none of those carries a ``survivor_key``.
+        # forward under another indexed key — always true for "dedup",
+        # "predicate_synonym_collapse", and "duplicate_projection" (the
+        # fact carries forward under the already-emitted key), and true for
+        # "attribute_key_superseded" ONLY when the same value carries forward
+        # under the new key (a different value winning is the contradiction
+        # shape — see old_object/new_object — and omits it).  It is the
+        # fold's reinforcement-credit input: the survivor inherits the
+        # removed keys' maturity, which would otherwise be discarded when
+        # they are staled.  A contradiction (either the edge kind or the
+        # different-value attribute-key kind) is a supersession (a DIFFERENT
+        # fact won, see old_object/new_object), an enrichment same_as is a
+        # node contraction (see keep_node), a display-name absorption has no
+        # surviving fact under any key (the value lives on only as the
+        # node's display surface, not as a trained fact), and an
+        # unkeyable-no-predicate removal has no surviving fact at all — none
+        # of those four carries a ``survivor_key``.
         self.removal_ledger: dict[str, dict] = {}
         # adopt_reinforcements: main-tier ik_key -> (last_seen, first_seen) recorded
         # by any merge called with credit_adopt_reinforcement=True, from either
@@ -580,7 +587,8 @@ class GraphMerger:
                 the ``removal_ledger`` field comment in ``__init__``), e.g.
                 ``"dedup"``, ``"contradiction_same_pred"``,
                 ``"predicate_synonym_collapse"``, ``"enrichment_same_as"``,
-                ``"attribute_key_superseded"``, or ``"unkeyable_no_predicate"``.
+                ``"attribute_key_superseded"``, ``"unkeyable_no_predicate"``,
+                ``"display_name_absorbed"``, or ``"duplicate_projection"``.
             survivor_key: Set exactly when the removed fact carries forward
                 under another indexed key — that is what the fold's
                 reinforcement-credit pass

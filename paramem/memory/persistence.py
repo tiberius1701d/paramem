@@ -25,8 +25,9 @@ Public API
 - :func:`restamp_tier_manifest` — the no-retrain commit primitive
   ``erase_keys_and_restamp_manifest`` calls per tier: persists a registry to
   disk, then rebinds the tier's live weight-slot manifest to the new hash.
-  The one place any out-of-fold caller that mutates a tier's registry
-  without retraining commits that mutation.
+  The one place any caller — the erase door out-of-fold, or the fold's
+  persist for a tier it did not retrain — commits a registry mutation
+  without retraining.
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
   as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
@@ -639,9 +640,11 @@ def restamp_tier_manifest(
     Persists *registry* to ``tier_root/indexed_key_registry.json``, then
     rebinds the tier's live weight-slot manifest so
     :func:`~paramem.adapters.manifest.find_live_slot` matches the rewritten
-    registry on the next boot/reload. Used by every out-of-fold caller that
-    mutates a tier's registry without retraining an adapter (today:
-    :func:`erase_keys_and_restamp_manifest`).
+    registry on the next boot/reload. Used by every caller that mutates a
+    tier's registry without retraining an adapter: an out-of-fold caller
+    (today: :func:`erase_keys_and_restamp_manifest`) or, inside a main-tiers
+    fold, :meth:`~paramem.training.consolidation.ConsolidationLoop._persist_fold`
+    for a tier the fold did not retrain this cycle.
 
     Two production derivations of the pre-write registry hash
     (:func:`~paramem.adapters.manifest.tier_registry_sha256`) exist, both
