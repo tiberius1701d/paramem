@@ -53,6 +53,8 @@ def _make_dispatch_state(
     consolidation_mode: str = "train",
     max_interim_count: int = 7,
     tmp_path=None,
+    store=None,
+    consolidate_return: "dict | None" = None,
 ) -> dict:
     """Minimal ``_state`` dict for consolidation-dispatch tests.
 
@@ -67,6 +69,13 @@ def _make_dispatch_state(
             than creating a literal ``MagicMock/`` directory at the repo root.
             Tests that exercise the full cycle path (``_run_full_consolidation_sync``)
             must supply this; tests that only exercise dispatch guards do not.
+        store: Override for ``loop.store`` — a real ``MemoryStore`` (for a
+            test that needs real entry content) or a purpose-built
+            ``MagicMock`` (e.g. a spy-able ``.swap()``).  Defaults to a bare
+            ``MagicMock`` with ``replay_enabled=False`` (today's behaviour —
+            the post-fold refill block never runs).
+        consolidate_return: Override for ``loop.consolidate.return_value``.
+            Defaults to a successful noop-ish result with ``tiers_rebuilt=[]``.
     """
     mock_config = MagicMock()
     mock_config.consolidation.mode = consolidation_mode
@@ -83,19 +92,26 @@ def _make_dispatch_state(
     mock_loop = MagicMock()
     mock_loop.model = MagicMock(name="model")
     mock_loop.shutdown_requested = False
-    mock_loop.store.replay_enabled = False
+    if store is not None:
+        mock_loop.store = store
+    else:
+        mock_loop.store.replay_enabled = False
     # Default fold return: successful noop-ish result with tiers_rebuilt=[].
-    mock_loop.consolidate.return_value = {
-        "tiers_rebuilt": [],
-        "graph_drift_count": 0,
-        "drift_deduplicated": 0,
-        "drift_orphan": 0,
-        "drift_genuine_loss": 0,
-        "keys_per_tier": {},
-        "rolled_back": False,
-        "rollback_tier": None,
-        "tier_delta": {},
-    }
+    mock_loop.consolidate.return_value = (
+        consolidate_return
+        if consolidate_return is not None
+        else {
+            "tiers_rebuilt": [],
+            "graph_drift_count": 0,
+            "drift_deduplicated": 0,
+            "drift_orphan": 0,
+            "drift_genuine_loss": 0,
+            "keys_per_tier": {},
+            "rolled_back": False,
+            "rollback_tier": None,
+            "tier_delta": {},
+        }
+    )
 
     bg = None
     if bg_is_training:
@@ -1663,22 +1679,28 @@ class TestConsolidationRoutes:
 # ---------------------------------------------------------------------------
 
 
+def _run_sync(state: dict, monkeypatch, keys_from: str = "all_tiers") -> None:
+    """Run _run_full_consolidation_sync with an inlined BackgroundTrainer.
+
+    Module-level so other test modules driving the same fold-entry wiring
+    (e.g. ``tests/server/test_post_fold_hydration.py``) import this instead
+    of re-implementing it.
+    """
+    import paramem.server.app as app_module
+
+    monkeypatch.setattr(app_module, "_state", state)
+    mock_bt = MagicMock()
+    mock_bt.abort_requested = False
+    # submit() calls the closure synchronously so state can be inspected after.
+    mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+    with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
+        app_module._run_full_consolidation_sync(keys_from)
+
+
 class TestFullConsolidationFoldEntry:
     """_run_full_consolidation_sync drives the fold entry with its venue, key source
     and fold inputs."""
-
-    def _run_sync(self, state: dict, monkeypatch, keys_from: str = "all_tiers") -> None:
-        """Run _run_full_consolidation_sync with an inlined BackgroundTrainer."""
-        import paramem.server.app as app_module
-
-        monkeypatch.setattr(app_module, "_state", state)
-        mock_bt = MagicMock()
-        mock_bt.abort_requested = False
-        # submit() calls the closure synchronously so state can be inspected after.
-        mock_bt.submit.side_effect = lambda fn, **kw: fn()
-
-        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
-            app_module._run_full_consolidation_sync(keys_from)
 
     def test_fold_called_with_venue_key_source_and_fold_inputs_only(
         self, monkeypatch, tmp_path
@@ -1692,7 +1714,7 @@ class TestFullConsolidationFoldEntry:
         state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
 
         with patch("paramem.server.app._revalidate_adapter_manifests"):
-            self._run_sync(state, monkeypatch)
+            _run_sync(state, monkeypatch)
 
         loop = state["consolidation_loop"]
         loop.consolidate.assert_called_once()
@@ -1712,7 +1734,7 @@ class TestFullConsolidationFoldEntry:
         state = _make_dispatch_state(consolidation_mode="train", tmp_path=tmp_path)
 
         with patch("paramem.server.app._revalidate_adapter_manifests"):
-            self._run_sync(state, monkeypatch, keys_from="main_tiers")
+            _run_sync(state, monkeypatch, keys_from="main_tiers")
 
         _, kwargs = state["consolidation_loop"].consolidate.call_args
         assert kwargs["keys_from"] == "main_tiers"
@@ -1743,7 +1765,7 @@ class TestFullConsolidationFoldEntry:
             patch("paramem.server.app._revalidate_adapter_manifests"),
             patch.object(app_module, "_extract_pending_sessions", _record_extract),
         ):
-            self._run_sync(reconciling, monkeypatch, keys_from="main_tiers")
+            _run_sync(reconciling, monkeypatch, keys_from="main_tiers")
 
         _, kwargs = reconciling["consolidation_loop"].consolidate.call_args
         assert kwargs["consume_pending"] is False
@@ -1769,7 +1791,7 @@ class TestFullConsolidationFoldEntry:
                 ),
             ),
         ):
-            self._run_sync(absorbing, monkeypatch, keys_from="all_tiers")
+            _run_sync(absorbing, monkeypatch, keys_from="all_tiers")
 
         _, kwargs = absorbing["consolidation_loop"].consolidate.call_args
         assert kwargs["consume_pending"] is True
@@ -1779,7 +1801,7 @@ class TestFullConsolidationFoldEntry:
         state = _make_dispatch_state(consolidation_mode="simulate", tmp_path=tmp_path)
 
         with patch("paramem.server.app._revalidate_adapter_manifests"):
-            self._run_sync(state, monkeypatch)
+            _run_sync(state, monkeypatch)
 
         loop = state["consolidation_loop"]
         loop.consolidate.assert_called_once()
@@ -1798,7 +1820,7 @@ class TestFullConsolidationFoldEntry:
         state["consolidating"] = True  # set by the dispatcher before submit
 
         with patch("paramem.server.app._revalidate_adapter_manifests"):
-            self._run_sync(state, monkeypatch)
+            _run_sync(state, monkeypatch)
 
         assert state["consolidating"] is False, (
             "_state['consolidating'] must be cleared after the fold completes"

@@ -345,6 +345,21 @@ class MemoryStore:
             if register and self._replay_enabled:
                 self._registry.setdefault(tier, KeyRegistry()).add(key)
 
+    def drop_entry(self, tier: str, key: str) -> None:
+        """Remove *key*'s entry-cache slot under *tier* only.
+
+        Touches ``_entries`` exclusively — no registry, simhash, or
+        bookkeeping change.  No-op when *tier* has no entries bucket or
+        *key* is absent from it.  Used by a caller reassigning *key* to a
+        DIFFERENT tier via its own ``put`` (rather than :meth:`move`) so the
+        stale copy left behind in the key's former tier does not linger as
+        a duplicate.
+        """
+        with self._lock:
+            tier_entries = self._entries.get(tier)
+            if tier_entries is not None:
+                tier_entries.pop(key, None)
+
     # ------------------------------------------------------------------
     # Per-key bookkeeping — speaker_id / relation_type / reinforcement_count
     #                       / last_reinforced_cycle / last_seen / first_seen
@@ -830,13 +845,31 @@ class MemoryStore:
         with self._lock:
             return list(self._registry.keys())
 
-    def drop_registry(self, tier: str) -> KeyRegistry | None:
-        """Remove and return the registry for *tier*.
+    def drop_registry_and_entries(self, tier: str) -> KeyRegistry | None:
+        """Remove *tier*'s registry AND its ``_entries`` bucket; return the registry.
 
-        Used at end-of-full-cycle to retire interim slots after their keys
-        have been promoted into main.  Returns ``None`` when the tier had no
-        registry."""
+        Used at end-of-full-cycle to retire an interim slot after its keys
+        have been adopted into a main tier.  By the time this runs,
+        ``ConsolidationLoop._rebuild_main_tier_state`` has already
+        re-written every adopted key's content into its NEW main tier via
+        ``put(..., register=False)`` — so whatever is left in the interim
+        tier's own ``_entries`` bucket belongs to no active key (drift/dedup
+        casualties the fold did not adopt), and popping it here cannot
+        orphan a live key's content.  Popping the two together also closes
+        the window where the tier's registry is gone but its ``_entries``
+        bucket lingers, still holding stale content no registry claims.
+
+        Deliberately narrower than :meth:`drop_tier`: this primitive does
+        NOT touch ``_bookkeeping``.  ``drop_tier`` is the wrong primitive
+        for interim retirement — by the time retirement runs, an adopted
+        key is already registered (and bookkept) under a MAIN tier, so
+        popping bookkeeping keyed off the INTERIM tier's own
+        ``active_keys_in_tier``/``stale_keys_in_tier`` would delete live
+        main-tier provenance out from under a key that still exists.
+
+        Returns ``None`` when *tier* had no registry."""
         with self._lock:
+            self._entries.pop(tier, None)
             return self._registry.pop(tier, None)
 
     def active_keys_in_tier(self, tier: str) -> list[str]:

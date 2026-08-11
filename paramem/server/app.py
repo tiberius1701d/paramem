@@ -5812,21 +5812,43 @@ def _build_store_contents(
     model,
     tokenizer,
     should_abort=None,
+    materialized_entries: "dict[str, dict] | None" = None,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build fresh store contents entirely off-store.
 
-    Reads registries and bookkeeping from disk, optionally probes adapter
-    weights for entry content, and returns three fresh dicts plus a stats
-    dict.  The live store is NOT touched — callers publish via
+    Reads registries and bookkeeping from disk, then fills entry content
+    from one of two media, and returns three fresh dicts plus a stats dict.
+    The live store is NOT touched — callers publish via
     :meth:`~paramem.memory.store.MemoryStore.swap`.
 
-    This is the single canonical builder used by both:
+    **Two entry-content media, never both.** When *materialized_entries* is
+    supplied, every enumerated active key is looked up in that map, written
+    into a transient store, and accepted or dropped by
+    :meth:`~paramem.memory.store.MemoryStore.probe`'s SimHash gate — no
+    ``MemorySource`` is constructed and no GPU work runs.  When it is
+    ``None`` (the default), entry content is probed from the source medium
+    (adapter weights or on-disk ``graph.json``, selected by
+    ``config.consolidation.mode``) exactly as before this parameter existed.
+    Every entry entering ``new_entries`` is SimHash-verified against the
+    staged fingerprints exactly ONCE, at its own medium's boundary: the
+    source medium's own ``finalize_recalled`` gates it before it ever
+    reaches this function, and the materialized medium is gated by the
+    transient store's ``probe`` call below — the two gates are never both
+    applied to the same entry.
+
+    This is the single canonical builder used by:
 
     * :func:`_hydrate_memory_store_in_place` (boot / in-process reload) —
-      called immediately followed by ``store.swap()``.
-    * :func:`_run_full_cycle` (post-fold re-probe) — called on the BG worker
-      thread under ``gpu_lock`` so the GPU probe is off the event loop and
-      cannot race a concurrent ``/chat``.
+      called immediately followed by ``store.swap()``; always the source
+      medium (``materialized_entries`` stays ``None``).
+    * :func:`_run_full_cycle` (post-fold refill) — called on the BG worker
+      thread under ``gpu_lock``.  Uses the materialized medium after a
+      weights-venue fold (no GPU work at all — the training gate probe
+      already proved this content, see
+      :class:`~paramem.training.consolidation.ConsolidationLoop`'s
+      ``entries_gate_attested`` result field); falls back to the source
+      medium after a disk-venue fold, still inside ``gpu_lock`` so the GPU
+      probe cannot race a concurrent ``/chat``.
 
     **BASE-MODEL HOLDER INVARIANT** — the ``WeightMemorySource`` is a
     frame-local created and dropped within this function.  The caller passes
@@ -5834,7 +5856,8 @@ def _build_store_contents(
     caller local).  The three returned dicts hold NO model reference.
     Setting ``_source = None`` before return releases the only in-frame
     handle.  A surviving reference here would re-introduce the cloud-only
-    VRAM leak fixed 2026-05-21.
+    VRAM leak fixed 2026-05-21.  The materialized medium never creates a
+    ``_source`` at all, so this invariant is vacuously satisfied there.
 
     Parameters
     ----------
@@ -5848,12 +5871,23 @@ def _build_store_contents(
     should_abort:
         Optional zero-argument callable forwarded to the weight probe.  When
         it returns ``True`` the probe exits early with partial entry results;
-        registry and bookkeeping are still complete in that case.  A tier
-        whose registry binding fails verification (see
+        registry and bookkeeping are still complete in that case.  Reached
+        only on the source medium (``materialized_entries is None``) — the
+        materialized medium runs no GPU probe, so there is nothing to
+        interrupt.  A tier whose registry binding fails verification (see
         :func:`~paramem.adapters.registry_binding.verify_adapter_tree`) is
         simply ABSENT from ``new_registry``/``new_entries`` — every other
         tier still publishes normally.  ``None`` (default) means no abort
         check — used on the boot path.
+    materialized_entries:
+        Flat ``{key: entry}`` of already-materialised entry content —
+        production source: ``_run_full_cycle``'s ``loop.store.iter_entries()``
+        snapshot, taken only when the fold result carries
+        ``entries_gate_attested=True`` (weights venue).  ``None`` (default)
+        selects the source medium instead — used at the boot/reload caller
+        and at the post-fold refill after a disk-venue fold.  A key absent
+        from the map, or dropped by the SimHash gate, is a miss like any
+        other.
 
     Returns
     -------
@@ -5873,7 +5907,9 @@ def _build_store_contents(
         re-deriving it.
     """
     from paramem.adapters.registry_binding import verify_adapter_tree
+    from paramem.memory.entry import carries_content_fields, content_only_entry
     from paramem.memory.source import build_memory_source as _build_memory_source
+    from paramem.memory.store import MemoryStore as _MemoryStoreB
 
     stats: dict = {
         "boot_degraded": None,
@@ -5903,7 +5939,21 @@ def _build_store_contents(
             )
 
     # ------------------------------------------------------------------ #
-    # Entry content — probed from weights or disk depending on mode.      #
+    # Transient store — hoisted above the entry section so the           #
+    # materialized medium can put() candidates into it before the        #
+    # SimHash acceptance probe below.  Safe to build this early:         #
+    # tier_for_known_key (used later by load_bookkeeping_from_disk)      #
+    # reads only _registry, so pre-populated entries here cannot shift   #
+    # meta_loaded / meta_orphaned.  NOT the live store singleton.        #
+    # ------------------------------------------------------------------ #
+    _tmp_store = _MemoryStoreB(replay_enabled=True)
+    for _t, _r in new_registry.items():
+        _tmp_store.load_registry(_t, _r)
+
+    # ------------------------------------------------------------------ #
+    # Entry content — from the materialized medium (a caller-supplied    #
+    # map, e.g. a post-fold store snapshot) or the source medium         #
+    # (adapter weights / on-disk graph.json), depending on mode.         #
     # ------------------------------------------------------------------ #
     new_entries: dict = {}
 
@@ -5929,86 +5979,141 @@ def _build_store_contents(
             # No active keys — nothing to preload; store is correctly empty.
             stats["boot_degraded"] = None
         else:
-            # Mode-aware source, built by the one factory.  Select from
-            # config.consolidation.mode — NOT from _state["mode"] (that
-            # conflates consolidation persistence mode with runtime mode).
-            # BASE-MODEL HOLDER (_source frame-local — set to None before return)
-            _source = _build_memory_source(
-                mode=config.consolidation.mode,
-                adapter_dir=config.adapter_dir,
-                batch_size=config.consolidation.recall_probe_batch_size,
-                model=model,
-                tokenizer=tokenizer,
-            )
-            if _source is None:
+            _total = sum(len(v) for v in _preload_keys_by_tier.values())
+            # `_results` ends up in the shape both media speak:
+            # dict[key, result | None] (the MemorySource.probe contract).
+            # Staying None guards the one degenerate sub-case that produces
+            # no results at all (no model loaded on the source medium) —
+            # today's behavior there is to leave boot_degraded untouched,
+            # not to compute a partial-hydration verdict over zero results.
+            _results: "dict[str, dict | None] | None" = None
+            _medium_name = ""
+
+            if materialized_entries is not None:
+                # Materialized medium: this content already crossed its own
+                # verification boundary before it ever reached this
+                # function (see the docstring) — put it into the transient
+                # store and let THAT store's SimHash gate (not a second,
+                # redundant gate here) decide acceptance.  No MemorySource
+                # is constructed, so there is no GPU work to cooldown-gate
+                # or CUDA-fail-fast-wrap.  A malformed candidate is skipped
+                # here (never put) rather than left to raise KeyError out of
+                # content_only_entry — drop-to-miss, not fail-the-rebuild.
+                for _tier, _keys in _preload_keys_by_tier.items():
+                    for _key in _keys:
+                        _candidate = materialized_entries.get(_key)
+                        if carries_content_fields(_candidate):
+                            _tmp_store.put(
+                                _tier, _key, content_only_entry(_candidate), register=False
+                            )
                 logger.info(
-                    "preload_cache: skipping entry preload — no model loaded "
-                    "(cloud-only mode or model load failed); store will stay "
-                    "empty for entries and inference will pay source latency "
-                    "on each query"
-                )
-            else:
-                _total = sum(len(v) for v in _preload_keys_by_tier.values())
-                logger.info(
-                    "preload_cache: probing %d active key(s) across %d tier(s) via %s",
+                    "preload_cache: materialized medium — verifying %d active key(s) "
+                    "across %d tier(s) against staged fingerprints (no GPU probe)",
                     _total,
                     len(_preload_keys_by_tier),
-                    type(_source).__name__,
                 )
-                # T2a: pre-task GPU cooldown gate — wait until GPU is cool
-                # before the ~198-key generate burst.  Bounded by
-                # cooldown_gate_max_wait_boot_s (default 60 s <
-                # TimeoutStartSec=120) so boot cannot be SIGKILL-ed.
-                # Proceeds with a WARNING on timeout rather than hanging.
-                # Sits BEFORE the Tier-1-wrapped probe so the device settles
-                # before the fail-fast-guarded burst.
-                wait_for_cooldown(
-                    config.vram.cooldown_gate_threshold_c,
-                    config.vram.cooldown_gate_max_wait_boot_s,
-                    config.vram.cooldown_gate_poll_s,
-                    label="preload",
+                _results = _tmp_store.probe(_preload_keys_by_tier, source=None, memoize=False)
+                _medium_name = "fold_entries"
+            else:
+                # Source medium: unchanged from before this parameter
+                # existed.  NOTE — the result of this probe is NOT routed
+                # through the transient store's confidence gate below: the
+                # source's own finalize_recalled already gated it against
+                # the same on-disk fingerprints, so a second pass here would
+                # be a second invocation of the same transformation (and the
+                # boot-path tests drive this with MagicMock registries that
+                # carry no fingerprints at all).
+                #
+                # Mode-aware source, built by the one factory.  Select from
+                # config.consolidation.mode — NOT from _state["mode"] (that
+                # conflates consolidation persistence mode with runtime mode).
+                # BASE-MODEL HOLDER (_source frame-local — set to None before return)
+                _source = _build_memory_source(
+                    mode=config.consolidation.mode,
+                    adapter_dir=config.adapter_dir,
+                    batch_size=config.consolidation.recall_probe_batch_size,
+                    model=model,
+                    tokenizer=tokenizer,
                 )
-                try:
-                    _results = _source.probe(_preload_keys_by_tier, should_abort=should_abort)
-                except Exception as _probe_exc:
-                    if is_fatal_cuda_fault(_probe_exc):
-                        # Sticky context loss — do NOT swallow into boot_degraded.
-                        # Propagate so the lifespan fail-fast handler os._exit(1)s
-                        # into a fresh process (the only recovery).
-                        logger.critical(
-                            "preload_cache: FATAL CUDA context fault during probe "
-                            "— context poisoned, process restart required: %s",
-                            _probe_exc,
-                        )
-                        raise
-                    logger.exception(
-                        "preload_cache: source probe failed; store remains "
-                        "empty for entries (queries will retry per-key on demand)"
+                if _source is None:
+                    logger.info(
+                        "preload_cache: skipping entry preload — no model loaded "
+                        "(cloud-only mode or model load failed); store will stay "
+                        "empty for entries and inference will pay source latency "
+                        "on each query"
                     )
-                    _results = {}
+                else:
+                    logger.info(
+                        "preload_cache: probing %d active key(s) across %d tier(s) via %s",
+                        _total,
+                        len(_preload_keys_by_tier),
+                        type(_source).__name__,
+                    )
+                    # Pre-task GPU cooldown gate — wait until GPU is cool
+                    # before the ~198-key generate burst.  Bounded by
+                    # cooldown_gate_max_wait_boot_s (default 60 s <
+                    # TimeoutStartSec=120) so boot cannot be SIGKILL-ed.
+                    # Proceeds with a WARNING on timeout rather than hanging.
+                    # Sits BEFORE the probe below, whose exception handler
+                    # classifies a fault via is_fatal_cuda_fault, so the
+                    # device settles before that fail-fast-guarded burst.
+                    wait_for_cooldown(
+                        config.vram.cooldown_gate_threshold_c,
+                        config.vram.cooldown_gate_max_wait_boot_s,
+                        config.vram.cooldown_gate_poll_s,
+                        label="preload",
+                    )
+                    try:
+                        _results = _source.probe(_preload_keys_by_tier, should_abort=should_abort)
+                    except Exception as _probe_exc:
+                        if is_fatal_cuda_fault(_probe_exc):
+                            # Sticky context loss — do NOT swallow into boot_degraded.
+                            # Propagate so the lifespan fail-fast handler os._exit(1)s
+                            # into a fresh process (the only recovery).
+                            logger.critical(
+                                "preload_cache: FATAL CUDA context fault during probe "
+                                "— context poisoned, process restart required: %s",
+                                _probe_exc,
+                            )
+                            raise
+                        logger.exception(
+                            "preload_cache: source probe failed; store remains "
+                            "empty for entries (queries will retry per-key on demand)"
+                        )
+                        _results = {}
+                    _medium_name = type(_source).__name__
+                # Drop the WeightMemorySource frame-local — the preload probe is
+                # complete; the source must not outlive this function's frame.
+                _source = None
 
+            if _results is not None:
+                # Single shared tail over both media: bucket by the tier from
+                # the enumeration loop, project once through
+                # content_only_entry, count hits, collect misses.  The miss
+                # predicate covers a malformed source result too (absent, a
+                # failure marker, or missing one of the four content fields)
+                # so it becomes a clean miss instead of a cached empty-string
+                # triple.
                 _hits = 0
                 _missed_by_tier: dict[str, list[str]] = {}
                 for _tier, _keys in _preload_keys_by_tier.items():
                     for _key in _keys:
                         _entry = _results.get(_key)
-                        if _entry is None or "failure_reason" in _entry:
+                        if (
+                            _entry is None
+                            or "failure_reason" in _entry
+                            or not carries_content_fields(_entry)
+                        ):
                             _missed_by_tier.setdefault(_tier, []).append(_key)
                             continue
-                        # Content-only projection — the source result may carry
-                        # provenance/derived fields (confidence, fact_text,
-                        # raw_output, and historically speaker_id); the store's
-                        # entry cache holds SPO content only, exactly as the
-                        # probe-time memoize path writes it, so this staging
-                        # write and every ``store.probe`` write agree on shape.
-                        new_entries.setdefault(_tier, {})[_key] = {
-                            "key": _key,
-                            "subject": _entry.get("subject", ""),
-                            "predicate": _entry.get("predicate", ""),
-                            "object": _entry.get("object", ""),
-                        }
+                        new_entries.setdefault(_tier, {})[_key] = content_only_entry(_entry)
                         _hits += 1
-                logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
+                logger.info(
+                    "preload_cache: cached %d / %d active key(s) via %s",
+                    _hits,
+                    _total,
+                    _medium_name,
+                )
                 if _hits < _total:
                     stats["boot_degraded"] = {
                         "reason": "preload_partial",
@@ -6017,7 +6122,7 @@ def _build_store_contents(
                         "missed_by_tier": {
                             tier: keys[:10] for tier, keys in _missed_by_tier.items()
                         },
-                        "source": type(_source).__name__,
+                        "source": _medium_name,
                     }
                     # Recoverable partial cache miss only — a fatal CUDA context
                     # loss is re-raised at the probe catch above and never reaches
@@ -6029,34 +6134,18 @@ def _build_store_contents(
                         "probing; the cache re-warms on the next apply or /gpu/acquire",
                         _total - _hits,
                         _total,
-                        type(_source).__name__,
+                        _medium_name,
                     )
                 else:
                     # Full hydration — clear any prior degraded flag.
                     stats["boot_degraded"] = None
 
-            # Drop the WeightMemorySource frame-local — the preload probe is
-            # complete; the source must not outlive this function's frame.
-            _source = None
-
     # ------------------------------------------------------------------ #
     # Bookkeeping — read from key_metadata.json; entry-independent.      #
+    # Reuses the transient store hoisted above (with the fresh registries #
+    # already installed) so load_bookkeeping_from_disk can use            #
+    # tier_for_known_key() to skip orphans.                               #
     # ------------------------------------------------------------------ #
-    # Build a temporary MemoryStore view of the fresh registry so that
-    # load_bookkeeping_from_disk can use tier_for_known_key() to skip orphans.
-    # This is a transient helper — NOT the live store singleton.
-    from paramem.memory.store import MemoryStore as _MemoryStoreB
-
-    _tmp_store = _MemoryStoreB(
-        replay_enabled=True,
-    )
-    # Install the fresh registries into the temporary store.
-    for _t, _r in new_registry.items():
-        try:
-            _tmp_store.load_registry(_t, _r)
-        except RuntimeError:
-            pass  # replay_enabled is True above; this branch should not fire
-
     new_bookkeeping: dict = {}
     try:
         _meta_stats = _tmp_store.load_bookkeeping_from_disk(config.key_metadata_path)
@@ -6191,9 +6280,11 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
 
     * :func:`_preload_memory_store` (boot / in-process reload) — after a fresh
       :class:`MemoryStore` has been constructed and the base-swap gate has passed.
-    * The post-fold re-probe is now handled by :func:`_run_full_cycle` directly
-      (calling :func:`_build_store_contents` on the worker thread under
-      ``gpu_lock``), so ``_finalize_full`` no longer calls this function.
+    * The post-fold entry-cache refill is now handled by :func:`_run_full_cycle`
+      directly (calling :func:`_build_store_contents` on the worker thread under
+      ``gpu_lock``, with the materialized medium after a weights-venue fold and
+      the source medium otherwise), so ``_finalize_full`` no longer calls this
+      function.
 
     **NO-BASE-MODEL-PINNING INVARIANT** — enforced inside
     :func:`_build_store_contents`.  The caller passes ``model`` and
@@ -17798,35 +17889,41 @@ def _run_full_consolidation_sync(keys_from: "Literal['all_tiers', 'main_tiers']"
                 logger.exception("consume-pending success: mark_consolidated failed (non-fatal)")
 
         # ------------------------------------------------------------------ #
-        # Post-fold re-probe — runs HERE on the BG worker thread under        #
-        # gpu_lock (held by BackgroundTrainer._run_callable_queue).           #
+        # Post-fold entry-cache refill — runs HERE on the BG worker thread    #
+        # under gpu_lock (held by BackgroundTrainer._run_callable_queue).     #
         #                                                                      #
-        # Previously this ran inside _finalize_full, which was dispatched via  #
-        # call_soon_threadsafe onto the asyncio event loop.  That meant:       #
-        #   1. The GPU probe ran on the event loop thread without gpu_lock,    #
-        #      so a concurrent /chat could start a second CUDA generate on the  #
-        #      same model (documented 0x116 crash class).                       #
-        #   2. The probe blocked the event loop for the duration of the GPU    #
-        #      call (seconds), stalling all other asyncio handlers.            #
+        # A weights-venue fold that reached this point already ran its own    #
+        # training gate probe per tier, all-or-refuse, before promoting the   #
+        # staged weights (ConsolidationLoop._assert_tier_recall) -- and the   #
+        # fold's main-tier state rebuild wrote every rebuilt tier's content   #
+        # into the live store's entry cache from that SAME verified content   #
+        # (see _rebuild_main_tier_state).  result["entries_gate_attested"]    #
+        # names that: when it is True, the live store's entries are already  #
+        # gate-verified, so the refill takes a store snapshot instead of      #
+        # re-probing the weights a second time over the same content --       #
+        # no GPU work runs at all on this path.  A disk-venue fold runs no    #
+        # gate (entries_gate_attested is False there), so the refill falls    #
+        # back to the source medium exactly as before this change.           #
         #                                                                      #
-        # Moving the probe here keeps it inside the same gpu_lock window as    #
-        # the fold, so the event loop is never blocked by GPU work, and no     #
-        # concurrent CUDA call can race it.                                    #
-        #                                                                      #
-        # The should_abort=bt.abort_requested check makes the probe yield the  #
-        # GPU between adapter groups when a /chat arrives.  A failed rebuild    #
-        # (staged=None) is NOT published and the live store is preserved.      #
+        # Still runs inside the same gpu_lock window as the fold either way,  #
+        # so the event loop is never blocked by GPU work on the fallback      #
+        # path, and no concurrent CUDA call can race it.  A failed rebuild    #
+        # (staged=None) is NOT published and the live store is preserved.    #
         # Missing entry slots self-heal via on-miss probing.                    #
         # ------------------------------------------------------------------ #
         staged: "tuple[dict, dict, dict, dict] | None" = None
         if loop.store.replay_enabled:
             loop.model.eval()
+            _materialized = None
+            if result.get("entries_gate_attested"):
+                _materialized = {key: entry for _tier, key, entry in loop.store.iter_entries()}
             try:
                 staged = _build_store_contents(
                     config,
                     model=loop.model,
                     tokenizer=loop.tokenizer,
                     should_abort=bt.abort_requested,
+                    materialized_entries=_materialized,
                 )
             except Exception:
                 logger.exception(

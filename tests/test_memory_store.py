@@ -440,14 +440,59 @@ class TestRegistry:
         assert s.tier_for_active_key("graph42") == "semantic"
         assert s.tier_for_active_key("graph999") is None
 
-    def test_drop_registry_removes_tier(self):
+    def test_drop_registry_and_entries_removes_tier_and_entries_but_keeps_bookkeeping(self):
+        """``drop_registry_and_entries`` retires a tier's registry AND its
+        ``_entries`` bucket in one call, but — unlike ``drop_tier`` — leaves
+        the key's ``_bookkeeping`` row alone.  That contrast is the whole
+        point of this primitive: by the time it runs (interim retirement
+        after an absorbing fold), an adopted key's bookkeeping already
+        belongs to a MAIN tier, so a primitive that also swept bookkeeping
+        would delete live provenance out from under a key that still exists."""
         s = MemoryStore()
-        s.put("episodic_interim_20260514T0000", "graph1", _entry("graph1"))
-        assert s.has_registry("episodic_interim_20260514T0000")
-        dropped = s.drop_registry("episodic_interim_20260514T0000")
+        tier = "episodic_interim_20260514T0000"
+        s.put(tier, "graph1", _entry("graph1"))
+        s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
+        assert s.has_registry(tier)
+        assert "graph1" in s.entries_in_tier(tier)
+
+        dropped = s.drop_registry_and_entries(tier)
+
         assert dropped is not None
         assert "graph1" in dropped
-        assert not s.has_registry("episodic_interim_20260514T0000")
+        assert not s.has_registry(tier)
+        assert s.entries_in_tier(tier) == {}, "the tier's _entries bucket must be gone too"
+        assert s.bookkeeping_for_key("graph1") is not None, (
+            "bookkeeping must survive -- drop_registry_and_entries is not drop_tier"
+        )
+
+    def test_drop_registry_and_entries_on_unknown_tier_is_a_noop(self):
+        s = MemoryStore()
+        assert s.drop_registry_and_entries("never_existed") is None
+
+    def test_drop_entry_removes_only_the_named_tiers_copy(self):
+        """``drop_entry`` touches ``_entries`` exclusively -- a key's copy
+        under a DIFFERENT tier, its registry membership, and its
+        bookkeeping row all survive untouched."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), register=True)
+        s.put("semantic", "graph1", _entry("graph1", subject="Bob"), register=True)
+        s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual", first_seen="")
+
+        s.drop_entry("episodic", "graph1")
+
+        assert "graph1" not in s.entries_in_tier("episodic")
+        assert "graph1" in s.entries_in_tier("semantic")
+        assert "graph1" in s.registry("episodic"), "registry membership is untouched"
+        assert s.bookkeeping_for_key("graph1") is not None
+
+    def test_drop_entry_on_unknown_tier_or_key_is_a_noop(self):
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))
+
+        s.drop_entry("never_existed", "graph1")
+        s.drop_entry("episodic", "never_existed")
+
+        assert "graph1" in s.entries_in_tier("episodic")
 
 
 # ---------------------------------------------------------------------------

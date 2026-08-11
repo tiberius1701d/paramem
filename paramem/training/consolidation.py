@@ -420,7 +420,7 @@ class RegistryBookkeepingDivergence(RuntimeError):
     about to become active in a rebuilt tier registry has no paired store
     entry and/or no bookkeeping record.
 
-    Fired BEFORE :meth:`ConsolidationLoop._reset_main_tier_registries_and_simhashes`
+    Fired BEFORE :meth:`ConsolidationLoop._rebuild_main_tier_state`
     mutates any in-RAM registry and before any durable write to serving state
     for this fold, so the former (pre-fold) registries and on-disk state stay
     live and servable when it fires.  Fold-scratch writes made earlier in the
@@ -1505,7 +1505,7 @@ class ConsolidationLoop:
         bookkeeping record.
 
         Called from the main-tiers fold's atomic finalize, immediately BEFORE
-        :meth:`_reset_main_tier_registries_and_simhashes`, against
+        :meth:`_rebuild_main_tier_state`, against
         ``tier_keyed`` itself — the exact per-tier key set that call is about
         to admit into the rebuilt registries.  Every key reaching this point
         already cleared its tier's :meth:`_assert_tier_recall` verdict (100%
@@ -1563,24 +1563,41 @@ class ConsolidationLoop:
                 divergent_keys=divergent,
             )
 
-    def _reset_main_tier_registries_and_simhashes(
+    def _rebuild_main_tier_state(
         self,
         tier_keyed: dict[str, list[dict]],
         *,
         soft_stale_by_tier: "dict[str, dict[str, dict]] | None" = None,
     ) -> None:
-        """Reset each main tier's KeyRegistry AND SimHash registry from ``tier_keyed``.
+        """Reset each main tier's KeyRegistry, SimHash registry, AND entry
+        cache from ``tier_keyed``.
 
-        The registry and the SimHash registry MUST be rebuilt together: rewriting
-        the registry alone leaves a fold-rebuilt tier (e.g. episodic consolidated
-        from interim) with an EMPTY SimHash registry, so SimHash-confidence recall —
-        the primary recall metric — returns 0.000 for every key, breaking
-        ``reconstruct_graph`` / train→simulate and the hallucination/recall
-        verification.  Co-locating both updates here makes that pairing the only
-        callable form, so the registry can never be reset without its SimHashes.
-        Sets both registry keys and simhash fingerprints together — the active
-        simhash is written directly onto the fresh :class:`KeyRegistry` before
-        it is loaded into the store.
+        The registry, the SimHash registry, and the entry cache MUST be
+        rebuilt together: rewriting the registry alone leaves a fold-rebuilt
+        tier (e.g. episodic consolidated from interim) with an EMPTY SimHash
+        registry, so SimHash-confidence recall — the primary recall metric —
+        returns 0.000 for every key, breaking ``reconstruct_graph`` /
+        train→simulate and the hallucination/recall verification.
+        Co-locating all three updates here makes that pairing the only
+        callable form, so the registry can never be reset without its
+        SimHashes or its entry content.  Sets registry keys, simhash
+        fingerprints, and entry content together — the active simhash is
+        written directly onto the fresh :class:`KeyRegistry` before it is
+        loaded into the store, and each key's content is written into the
+        store's entry cache in the SAME pass, from the SAME ``tier_keyed``
+        object :func:`~paramem.memory.entry.build_registry` fingerprinted
+        one loop earlier — so entry and fingerprint can never disagree.
+        A key whose entry-cache copy currently sits under a DIFFERENT tier
+        (an interim slot it is being adopted from, or a main tier it is
+        being reclassified from) has that stale copy removed in the same
+        step its fresh copy is written, so a key is never present under two
+        ``_entries`` buckets at once.  This entry write is also what makes
+        the interim-tier retiring primitive
+        (:meth:`_drop_interim_tier_registries` →
+        :meth:`~paramem.memory.store.MemoryStore.drop_registry_and_entries`)
+        safe to pop an absorbed interim tier's ``_entries`` bucket
+        afterward: every key it adopted has already been moved out of that
+        bucket by the time the bucket is dropped, so nothing is orphaned.
 
         Every key in ``tier_keyed`` is registered unconditionally — there is no
         per-key filtering here.  The training-completeness verdict is enforced
@@ -1595,11 +1612,14 @@ class ConsolidationLoop:
         step.  Pass ``soft_stale_by_tier`` so the rebuilt registry seeds the stale
         partition BEFORE adding the active keys.  Stale simhashes are also
         merged back into the rebuilt simhash dict so they survive on disk for the
-        stale-echo seam.
+        stale-echo seam.  An EMPTY tier (no active keys) only resets its
+        registry and reseeds its stale partition this way — it has no
+        ``tier_keyed`` entries to write, so it touches no entry-cache content.
 
         Args:
             tier_keyed: Per-tier keyed-entry lists (full post-consolidation set).
-                Every key present is admitted into the rebuilt registry.
+                Every key present is admitted into the rebuilt registry and
+                written into the entry cache.
             soft_stale_by_tier: Per-tier dict of soft-staled keys captured at the
                 drift-partition step.  Keys map to
                 ``{"stale_cycles": int, "simhash": int | None}``.  When ``None``
@@ -1615,20 +1635,22 @@ class ConsolidationLoop:
                 # STILL seed any stale records (an empty tier with stale keys
                 # must retain them).  Stale simhashes live in _stale[key]["simhash"]
                 # so they are carried automatically into the new registry.
+                # Registry + stale partition only -- no tier_keyed entries
+                # exist for this tier, so no entry-cache write happens here.
                 new_reg = KeyRegistry()
                 new_reg._stale = dict(_stale_recs)  # seed stale partition
                 self.store.load_registry(_main_tier, new_reg)
                 continue
 
             logger.info(
-                "_reset_main_tier_registries_and_simhashes: tier %s — registering all %d key(s)",
+                "_rebuild_main_tier_state: tier %s — registering all %d key(s)",
                 _main_tier,
                 len(keyed),
             )
 
             # Build the fresh registry:
             # (a) seed stale records FIRST — they must survive the rebuild;
-            # (b) then add every key with its simhash.
+            # (b) then add every key with its simhash AND its entry content.
             # Simhashes are set directly on the registry; stale simhashes live
             # in _stale[key]["simhash"] already (carried by the stale records).
             new_reg = KeyRegistry()
@@ -1639,18 +1661,37 @@ class ConsolidationLoop:
                 fp = active_simhashes.get(kp["key"])
                 if fp is not None:
                     new_reg.set_simhash(kp["key"], fp)
+                # Write this key's content into its (possibly NEW) main
+                # tier here, in the same pass that fingerprints it.
+                # register=False — the registry rebuild above (new_reg.add)
+                # is the sole registry authority; this call touches only
+                # the entry cache.  A key reclassified from a different
+                # tier (an adopted interim key, or a main-tier key whose
+                # relation_type changed) still has its OLD entry-cache copy
+                # there until removed explicitly -- put() alone would leave
+                # a stale duplicate, so drop that copy first.
+                _prior_tier = self.store.tier_of(kp["key"])
+                if _prior_tier is not None and _prior_tier != _main_tier:
+                    self.store.drop_entry(_prior_tier, kp["key"])
+                self.store.put(_main_tier, kp["key"], content_only_entry(kp), register=False)
             self.store.load_registry(_main_tier, new_reg)
 
     def _drop_interim_tier_registries(self) -> int:
-        """Drop every interim tier registry from the store.
+        """Drop every interim tier registry — and its entry-cache bucket —
+        from the store.
 
         Returns the count of tiers dropped.  Called at the end of a full
         consolidation cycle when interim adapters are unloaded and their
-        per-tier registries are no longer needed.
+        per-tier registries are no longer needed.  Safe to call only after
+        :meth:`_rebuild_main_tier_state` has already re-written every
+        adopted key's content under its new main tier: what remains in an
+        interim tier's ``_entries`` bucket at this point belongs to no
+        active key (see
+        :meth:`~paramem.memory.store.MemoryStore.drop_registry_and_entries`).
         """
         interim_tiers = [t for t in self.store.tiers_with_registry() if "_interim_" in t]
         for t in interim_tiers:
-            self.store.drop_registry(t)
+            self.store.drop_registry_and_entries(t)
         return len(interim_tiers)
 
     def _entries_from_graph(
@@ -2526,12 +2567,14 @@ class ConsolidationLoop:
         """SHA-256 over the active registry-true SPO keyset at ``_run_fold`` entry.
 
         Stable across process restarts because (1) the on-disk registries (key
-        set + simhash) are not rewritten until the fold finalizes
-        (``_reset_main_tier_registries_and_simhashes`` at ``:4392``), and
+        set + simhash) are not rewritten until the fold finalizes (see
+        :meth:`_rebuild_main_tier_state`), and
         (2) ``preload_cache`` deterministically reconstructs identical SPO from
         the unchanged adapter weights — the weights are not retrained on a
-        crash-resume.  The registries carry keys + simhash only, not SPO
-        (``store.py:1170``); SPO comes from the weight probe.  If reconstruction
+        crash-resume.  The registries carry keys + simhash only, not SPO (the
+        inference cache contract documented at
+        :meth:`~paramem.memory.store.MemoryStore.probe`); SPO comes from the
+        weight probe.  If reconstruction
         yields different SPO than pre-crash the stamp diverges and the fold
         safely re-runs fresh rather than resuming on a stale stamp.
 
@@ -3148,7 +3191,7 @@ class ConsolidationLoop:
             ``soft_stale_by_tier`` — a per-tier dict mapping staled key strings
             to ``{"stale_cycles": int, "simhash": int|None}`` records.  Passed
             by the fold caller to
-            :meth:`_reset_main_tier_registries_and_simhashes` so the rebuilt
+            :meth:`_rebuild_main_tier_state` so the rebuilt
             registry seeds the stale partition.  The interim caller (in
             :meth:`_run_fold`) also captures it: on a failed commit those
             keys are re-activated via :meth:`MemoryStore.reactivate` before
@@ -3748,6 +3791,27 @@ class ConsolidationLoop:
                     "rollback_tier": str | None,
                     "tier_delta": dict,
                 }
+
+            The ``main_tiers`` path additionally carries::
+
+                {
+                    "entries_gate_attested": bool,
+                }
+
+            ``True`` only on the weights venue AND when ``store.replay_enabled``
+            is ``True`` — :meth:`_rebuild_main_tier_state` (the entry write)
+            runs only under that same guard, so the flag never attests
+            content that was never written.  When both hold, reaching this
+            return at all means every trained tier already passed
+            :meth:`_assert_tier_recall` — a failing tier raises before the
+            finalize — so the live store's rebuilt-tier entries (written by
+            :meth:`_rebuild_main_tier_state` from this SAME ``tier_keyed``)
+            are gate-verified content a caller may hydrate a refill from
+            without re-probing the weights.  ``False`` on the disk venue
+            (which runs no gate) and whenever replay is disabled.  Not given
+            to the ``interim_slot`` path — it would be permanently ``False``
+            there (the interim fold seeds the live store directly at commit
+            time, never via this field).
 
             The ``interim_slot`` path additionally carries::
 
@@ -5064,6 +5128,20 @@ class ConsolidationLoop:
                 raise FoldAccountingRefusal(unexplained_keys=drift_genuine_loss)
 
             tiers_rebuilt: list[str] = []
+            # Set once, from the venue -- never from a mode string literal
+            # (tests/test_mode_fork_guard.py).  Reaching this fold's return
+            # at all on the weights venue implies every trained tier already
+            # passed _assert_tier_recall (a failing tier raises before the
+            # finalize), so venue and attestation coincide by construction:
+            # True means _rebuild_main_tier_state has written this fold's
+            # rebuilt-tier content into the live store's entry cache from
+            # the SAME tier_keyed the gate verified, so a caller may hydrate
+            # the post-fold refill from a store snapshot with no re-probe.
+            # ANDed with store.replay_enabled because _rebuild_main_tier_state
+            # itself only runs under that same guard below -- with replay
+            # disabled the entry write never happens, so the attestation
+            # must not claim content that was never written.
+            entries_gate_attested = scope.source == "weights" and self.store.replay_enabled
 
             if scope.source != "weights":
                 # Disk venue: no adapter weights exist, so there is nothing to
@@ -5726,7 +5804,7 @@ class ConsolidationLoop:
                 # to resolve here.
                 self._assert_registry_bookkeeping_parity(tier_keyed)
 
-                self._reset_main_tier_registries_and_simhashes(
+                self._rebuild_main_tier_state(
                     tier_keyed,
                     soft_stale_by_tier=soft_stale_by_tier,
                 )
@@ -5816,6 +5894,7 @@ class ConsolidationLoop:
 
             return {
                 "tiers_rebuilt": tiers_rebuilt,
+                "entries_gate_attested": entries_gate_attested,
                 "graph_drift_count": graph_drift_count,
                 "drift_deduplicated": drift_deduplicated_count,
                 "drift_orphan": drift_orphan_count,

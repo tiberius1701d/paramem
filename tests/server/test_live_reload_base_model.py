@@ -659,7 +659,15 @@ def test_preload_source_selection_simulate_mode():
             disk_source_calls.append("init")
 
         def probe(self, keys_by_tier, should_abort=None):
-            return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
+            # SPO shape -- every production source's content-only result shape.
+            return {
+                "graph1": {
+                    "key": "graph1",
+                    "subject": "s",
+                    "predicate": "p",
+                    "object": "o",
+                }
+            }
 
     class FakeWeightSource:
         def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
@@ -740,7 +748,15 @@ def test_preload_source_selection_train_mode_uses_weight_source():
             weight_source_calls.append("init")
 
         def probe(self, keys_by_tier, should_abort=None):
-            return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
+            # SPO shape -- every production source's content-only result shape.
+            return {
+                "graph1": {
+                    "key": "graph1",
+                    "subject": "s",
+                    "predicate": "p",
+                    "object": "o",
+                }
+            }
 
     import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod
@@ -846,8 +862,18 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
             pass
 
         def probe(self, keys_by_tier, should_abort=None):
-            # Only graph1 found, graph2 missing.
-            return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
+            # Only graph1 found, graph2 missing.  SPO shape (subject/
+            # predicate/object) — every production source's content-only
+            # result shape; a result missing one of these four fields is
+            # itself a miss under the widened miss predicate.
+            return {
+                "graph1": {
+                    "key": "graph1",
+                    "subject": "s",
+                    "predicate": "p",
+                    "object": "o",
+                }
+            }
 
     import paramem.adapters.registry_binding as registry_binding_mod
     import paramem.memory.source as src_mod

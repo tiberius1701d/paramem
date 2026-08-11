@@ -753,7 +753,7 @@ class TestProbeRecall:
 
 # ---------------------------------------------------------------------------
 # Class I — TestResetRegistersEveryKey
-# _reset_main_tier_registries_and_simhashes admits every key it is given —
+# _rebuild_main_tier_state admits every key it is given —
 # there is no per-key recall filtering left in this method.  The
 # training-completeness verdict now lives one level up, in
 # ConsolidationLoop._assert_tier_recall.
@@ -798,7 +798,7 @@ class TestResetRegistersEveryKey:
             ],
         }
 
-        loop._reset_main_tier_registries_and_simhashes(tier_keyed)
+        loop._rebuild_main_tier_state(tier_keyed)
 
         assert set(loop.store.registry("episodic").list_active()) == {"graph1", "graph2"}
         assert set(loop.store.registry("semantic").list_active()) == {"graph3"}
@@ -829,9 +829,7 @@ class TestResetRegistersEveryKey:
         from unittest.mock import patch
 
         with patch.object(ConsolidationLoop, "_probe_recall") as mock_probe:
-            loop._reset_main_tier_registries_and_simhashes(
-                tier_keyed, soft_stale_by_tier=soft_stale_by_tier
-            )
+            loop._rebuild_main_tier_state(tier_keyed, soft_stale_by_tier=soft_stale_by_tier)
             mock_probe.assert_not_called()
 
         # Active keys registered in every tier.

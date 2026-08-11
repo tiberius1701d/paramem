@@ -2704,7 +2704,7 @@ class TestIndexedKeyCacheSchemaInvariant:
         )
 
 
-class TestResetMainTierRegistriesAndSimhashes:
+class TestRebuildMainTierState:
     """Regression guard for the consolidate finalize step.
 
     The fold rewrites each main tier's KeyRegistry from the post-consolidation
@@ -2724,9 +2724,7 @@ class TestResetMainTierRegistriesAndSimhashes:
     def _call(store, tier_keyed):
         from types import SimpleNamespace
 
-        ConsolidationLoop._reset_main_tier_registries_and_simhashes(
-            SimpleNamespace(store=store), tier_keyed
-        )
+        ConsolidationLoop._rebuild_main_tier_state(SimpleNamespace(store=store), tier_keyed)
 
     def test_registry_and_simhash_rebuilt_together(self):
         from paramem.memory.entry import build_registry
@@ -2773,6 +2771,79 @@ class TestResetMainTierRegistriesAndSimhashes:
 
         assert len(store.registry("semantic")) == 0
         assert store.tier_simhashes("semantic", include_stale=False) == {}
+
+    def test_entry_cache_written_in_the_same_pass_as_the_registry(self):
+        """Every key's content lands in the store's entry cache, under its
+        (possibly NEW) tier, in the same call that rebuilds the registry
+        and simhash — not left for a later ``store.put``.  This is what
+        lets the interim retiring primitive
+        (``MemoryStore.drop_registry_and_entries``) pop an absorbed interim
+        tier's ``_entries`` bucket afterward without orphaning an adopted
+        key's content."""
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        # Simulate an adopted key: its content currently sits under a
+        # different (interim) tier, mirroring the state before an absorbing
+        # fold's registry rebuild moves it to episodic.  DISTINCT content
+        # from the fresh episodic write below -- so a later store.get()
+        # resolving to the fresh value actually proves the rebuild wrote it
+        # (rather than passing vacuously because both copies happen to
+        # match).
+        store.put(
+            "episodic_interim_20260101T0000",
+            "graph1",
+            {"key": "graph1", "subject": "Stale Interim Value", "predicate": "p", "object": "o"},
+            register=True,
+        )
+        episodic = [self._entry("graph1"), self._entry("graph2", subject="Bob")]
+        self._call(store, {"episodic": episodic, "semantic": [], "procedural": []})
+
+        # store.get() resolves the FRESH content the rebuild wrote under
+        # episodic -- not the stale interim copy planted above.
+        assert store.get("graph1") == {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
+        assert "graph1" in store.entries_in_tier("episodic")
+        assert store.get("graph2") == {
+            "key": "graph2",
+            "subject": "Bob",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
+
+    def test_reclassified_key_leaves_no_duplicate_in_its_former_tier(self):
+        """A key reassigned to a DIFFERENT main tier (e.g. a procedural key
+        whose relation_type changed to factual, now keyed under episodic)
+        ends up under the new tier ONLY -- its former tier's entry-cache
+        bucket no longer carries a stale duplicate copy."""
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.put(
+            "procedural",
+            "graph1",
+            {"key": "graph1", "subject": "Alice", "predicate": "prefers", "object": "tea"},
+            register=True,
+        )
+        # graph1 is now keyed under episodic instead; procedural has nothing left.
+        episodic = [self._entry("graph1")]
+        self._call(store, {"episodic": episodic, "semantic": [], "procedural": []})
+
+        assert store.tier_of("graph1") == "episodic"
+        assert "graph1" not in store.entries_in_tier("procedural"), (
+            "the reclassified key's old-tier entry copy must be removed, "
+            "not left as a stale duplicate"
+        )
+        assert store.get("graph1") == {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
 
 
 def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
@@ -3742,7 +3813,7 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_reset_main_tier_registries_and_simhashes",
+                "_rebuild_main_tier_state",
                 side_effect=RuntimeError("registry rewrite exploded"),
             ),
         ):
@@ -11726,7 +11797,11 @@ class TestPersistFoldMainTiersCommit:
         """The simulate (disk) venue's per-tier registry write happens
         inside ``_persist_fold``, immediately beside that tier's
         ``graph.json`` projection — the ONE registry write this venue
-        performs."""
+        performs.
+
+        Also pins ``entries_gate_attested`` on the disk venue: the disk
+        venue runs no recall gate, so the flag reads False even though this
+        fold rebuilt a tier — venue-gated, not emptiness-gated."""
         from paramem.graph.merger import GraphMerger
         from paramem.training.key_registry import KeyRegistry
 
@@ -11741,6 +11816,9 @@ class TestPersistFoldMainTiersCommit:
         result = _run_full_fold_mocked(loop, keys_from="all_tiers", mode="simulate")
 
         assert result["tiers_rebuilt"] == ["episodic"], f"got {result['tiers_rebuilt']!r}"
+        assert result["entries_gate_attested"] is False, (
+            f"the disk venue runs no gate; got {result['entries_gate_attested']!r}"
+        )
         graph_path = loop.output_dir / "episodic" / "graph.json"
         registry_path = loop.output_dir / "episodic" / "indexed_key_registry.json"
         assert graph_path.exists(), "simulate persist must have written graph.json"
@@ -11754,9 +11832,63 @@ class TestPersistFoldMainTiersCommit:
 
 
 # =============================================================================
+# TestEntriesGateAttested — the weights-venue fold's post-fold-refill
+# attestation (result["entries_gate_attested"]).  True means the live
+# store's rebuilt-tier entries are exactly the content the training gate
+# probe verified (ConsolidationLoop._rebuild_main_tier_state wrote it there
+# from the SAME tier_keyed the gate probed).
+# =============================================================================
+
+
+class TestEntriesGateAttested:
+    def test_weights_venue_attests_and_store_matches_tier_keyed(self, tmp_path):
+        """result["entries_gate_attested"] is True on the weights venue, and
+        every key of every rebuilt tier resolves via store.get() to exactly
+        its tier_keyed content, under its registry tier — what the
+        attestation attests."""
+        from paramem.memory.entry import content_only_entry
+
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph1", "graph2"],
+            semantic_keys=["graph3"],
+        )
+
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert result["entries_gate_attested"] is True
+        assert set(result["tiers_rebuilt"]) == {"episodic", "semantic"}, (
+            f"got {result['tiers_rebuilt']!r}"
+        )
+        for tier in result["tiers_rebuilt"]:
+            for kp in result["tier_keyed"][tier]:
+                assert loop.store.get(kp["key"]) == content_only_entry(kp), (
+                    f"key {kp['key']!r}: store content diverges from tier_keyed"
+                )
+                assert loop.store.tier_of(kp["key"]) == tier, (
+                    f"key {kp['key']!r}: store.tier_of() diverges from its registry tier"
+                )
+
+    def test_weights_venue_with_replay_disabled_does_not_attest(self, tmp_path):
+        """A weights-venue fold whose store has replay disabled never runs
+        ``_rebuild_main_tier_state`` (it is gated on
+        ``store.replay_enabled``, same as the rest of the finalize) — so the
+        attestation must read False even though the venue is "weights"."""
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph1"],
+        )
+        loop.store._replay_enabled = False
+
+        result = _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert result["entries_gate_attested"] is False
+
+
+# =============================================================================
 # TestRegistryBookkeepingDivergenceGate — the main-tiers fold's integrity gate
 # (ConsolidationLoop._assert_registry_bookkeeping_parity), run immediately
-# before _reset_main_tier_registries_and_simhashes so a divergence fails the
+# before _rebuild_main_tier_state so a divergence fails the
 # cycle before any in-RAM registry mutation or durable write.
 # =============================================================================
 
@@ -11764,7 +11896,7 @@ class TestPersistFoldMainTiersCommit:
 class TestRegistryBookkeepingDivergenceGate:
     def test_divergent_key_raises_before_registry_mutation_or_disk_write(self, tmp_path):
         """A candidate key with a store entry but NO bookkeeping record raises
-        RegistryBookkeepingDivergence before _reset_main_tier_registries_and_simhashes
+        RegistryBookkeepingDivergence before _rebuild_main_tier_state
         mutates the in-RAM registry and before any durable write for this fold."""
         from paramem.training.consolidation import RegistryBookkeepingDivergence
 
@@ -11820,7 +11952,7 @@ class TestRegistryBookkeepingDivergenceGate:
         assert "ep_divergent" in str(excinfo.value.divergent_keys)
 
         # The in-RAM registry is exactly as it was going in -- the gate fired
-        # before _reset_main_tier_registries_and_simhashes ran, so the fold
+        # before _rebuild_main_tier_state ran, so the fold
         # never rebuilt (and never emptied-then-repopulated) the registry.
         assert set(loop.store.registry("episodic").list_active()) == active_before_fold
 
@@ -11919,7 +12051,7 @@ class TestActiveKeyHydrationFailureGate:
     def test_unhydratable_active_key_raises_before_registry_mutation_or_disk_write(self, tmp_path):
         """A registered active key with no entry in the store cache and no
         content in the venue (weights) raises ActiveKeyHydrationFailure before
-        _reset_main_tier_registries_and_simhashes mutates the in-RAM registry
+        _rebuild_main_tier_state mutates the in-RAM registry
         and before any durable write for this fold."""
         from unittest.mock import patch
 
@@ -11969,7 +12101,7 @@ class TestActiveKeyHydrationFailureGate:
         assert excinfo.value.venue == "train"
 
         # The in-RAM registry is exactly as it was going in -- the gate fired
-        # before _reset_main_tier_registries_and_simhashes ran.
+        # before _rebuild_main_tier_state ran.
         assert set(loop.store.registry("episodic").list_active()) == active_before_fold
 
         # Nothing durable changed: the on-disk registry is byte-identical,
@@ -22710,6 +22842,61 @@ class TestFoldKeySource:
 
         assert drift_all == 1, "the absorbing fold read graph9 and produced no keyed edge for it"
         assert drift_main == 0
+
+    def test_all_tiers_fold_leaves_adopted_key_resolvable_under_its_new_tier(self, tmp_path):
+        """An absorbing fold's adopted interim key resolves under its NEW
+        registry tier (episodic), not the reaped interim slot — the
+        store-consistency fix at work (``_rebuild_main_tier_state`` writes
+        the key's content into episodic; the retiring primitive then pops
+        the interim tier's registry AND its now-superseded ``_entries``
+        bucket without orphaning the adopted key).
+
+        Unlike ``_make_loop_with_an_interim_slot``'s ``graph9`` (deliberately
+        content-empty, so it drifts away instead of being adopted), this
+        fixture's interim key carries real content AND a matching
+        merger-graph edge, so the absorbing fold's keyed-edge branch
+        re-keys it into episodic (the fold-level companion to the store's
+        own retiring-primitive tests)."""
+        loop = _make_fold_loop(tmp_path)
+        loop.store.put(
+            self.INTERIM_TIER,
+            "graph9",
+            {"key": "graph9", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph9",
+            speaker_id="S0",
+            relation_type="factual",
+            reinforcement_count=1,
+            last_reinforced_cycle=1,
+            first_seen="",
+        )
+        _build_merger_graph(
+            loop,
+            [
+                {
+                    "key": "graph9",
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                }
+            ],
+        )
+
+        result = _run_full_fold_mocked(loop, keys_from="all_tiers")
+
+        assert "episodic" in result["tiers_rebuilt"], f"got {result['tiers_rebuilt']!r}"
+        assert self.INTERIM_TIER not in loop.store.tiers_with_registry(), (
+            "the absorbed interim tier's registry must be reaped"
+        )
+        assert loop.store.tier_of("graph9") == "episodic", f"got {loop.store.tier_of('graph9')!r}"
+        assert loop.store.get("graph9") == {
+            "key": "graph9",
+            "subject": "Alice",
+            "predicate": "lives_in",
+            "object": "Berlin",
+        }
 
 
 class TestFoldScopeColdInit:

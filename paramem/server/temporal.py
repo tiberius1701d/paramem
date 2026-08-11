@@ -61,10 +61,11 @@ class DateWindow:
 def last_seen_date(last_seen: object) -> date | None:
     """Parse a bookkeeping ``last_seen`` value into a local calendar date.
 
-    ``last_seen`` is disk-splatted, unvalidated data
-    (``paramem/memory/store.py:1449``) reaching a request path with no
-    exception handler around it — this is the one boundary that turns it
-    into a date without ever raising, rather than error suppression.
+    ``last_seen`` is disk-splatted, unvalidated data (see
+    :meth:`~paramem.memory.store.MemoryStore.load_bookkeeping_from_disk`)
+    reaching a request path with no exception handler around it — this is
+    the one boundary that turns it into a date without ever raising, rather
+    than error suppression.
 
     Non-``str`` values (``None``, an ``int``, ...) and the empty string
     return ``None``. A timezone-aware ISO string (the shape

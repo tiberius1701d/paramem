@@ -217,6 +217,27 @@ def format_entry_training(
     return examples
 
 
+# --- Content-only shape ---
+
+CONTENT_FIELDS: tuple[str, ...] = ("key", "subject", "predicate", "object")
+"""The four fields every entry-cache slot carries — the store's, the
+recall-parse's, and the content-only projection's shared vocabulary.  The
+one place this tuple is spelled; every consumer imports it rather than
+re-listing the field names."""
+
+
+def carries_content_fields(entry: "dict | None") -> bool:
+    """True when *entry* carries all four :data:`CONTENT_FIELDS`.
+
+    The one predicate for "is this usable entry content" — shared by every
+    write-in guard (skip a malformed candidate rather than let
+    :func:`content_only_entry` raise ``KeyError``) and every read-out miss
+    classification (a probe result missing a field is a miss, not a cached
+    partial triple) across the codebase.  ``None`` is not content.
+    """
+    return entry is not None and all(f in entry for f in CONTENT_FIELDS)
+
+
 # --- Recall parsing ---
 
 
@@ -242,7 +263,7 @@ def parse_recalled_entry(text: str) -> dict | None:
         output is not parseable or does not contain the required fields.
     """
     text = text.strip()
-    required = {"key", "subject", "predicate", "object"}
+    required = set(CONTENT_FIELDS)
     decoder = json.JSONDecoder()
 
     def _coerce(v) -> str:
@@ -261,7 +282,7 @@ def parse_recalled_entry(text: str) -> dict | None:
             except json.JSONDecodeError:
                 continue
             if isinstance(obj, dict) and required.issubset(obj.keys()):
-                return {k: _coerce(obj[k]) for k in ("key", "subject", "predicate", "object")}
+                return {k: _coerce(obj[k]) for k in CONTENT_FIELDS}
         return None
 
     # Try raw text first, then cleaned (only if cleaning changed anything).
@@ -401,12 +422,7 @@ def content_only_entry(entry: dict) -> dict:
     Returns:
         A new dict with exactly the four content fields.
     """
-    return {
-        "key": entry["key"],
-        "subject": entry["subject"],
-        "predicate": entry["predicate"],
-        "object": entry["object"],
-    }
+    return {f: entry[f] for f in CONTENT_FIELDS}
 
 
 def verify_confidence(
