@@ -8,14 +8,15 @@ Coverage:
 - ``_consolidation_dispatch_guards`` shared guard helper
 - ``_dispatch_consolidation`` — the arbitrator: ``AUTO`` is requested ONLY by
   ``/scheduled-tick`` (deadline resolution via ``_is_full_cycle_due``, the
-  catch-up gate, and the cadence stamp are its business alone).  ``FULL`` and
-  ``INTERIM`` are each requestable directly (``/consolidate``,
-  ``/consolidate/interim``) as well as via ``AUTO``'s resolution, and the
-  content gate applies identically either way — a manual door drops only the
-  TIME condition, never the CONTENT condition.  ``RECONCILE`` is the one
-  action exempt from the content gate (still subject to the shared safety
-  guards).  Also covers the executor submission ritual and the concurrency
-  guard.
+  catch-up gate, and the cadence stamp are its business alone).  ``FULL``,
+  ``INTERIM``, and ``RECONCILE`` are each requestable directly
+  (``/consolidate``, ``/consolidate/interim``, ``/reconsolidate``) as well as
+  ``FULL``/``INTERIM`` via ``AUTO``'s resolution, and the content gate applies
+  to every one of them — a manual door drops only the TIME condition, never
+  the CONTENT condition.  ``RECONCILE``'s content is any active key already
+  held by a main tier, so it is turned away only by an empty store, never by
+  the absence of new interim/pending material.  Also covers the executor
+  submission ritual and the concurrency guard.
 - ``_run_full_consolidation_sync`` noop terminal: an empty ``tiers_rebuilt``
   ends the cycle as a noop, and the sessions consumed by the pre-stage are
   still retired so they cannot accumulate unboundedly.
@@ -250,6 +251,7 @@ def _make_arbitrator_state(
     anon_sessions: int = 0,
     refresh_cadence: str = "12h",
     period_seconds: "int | None" = None,
+    store=None,
 ) -> dict:
     """``_state`` for arbitrator tests, with a REAL SessionBuffer and adapter dir.
 
@@ -284,6 +286,10 @@ def _make_arbitrator_state(
             default) is a manual-only cadence: no deadline, so
             ``_is_full_cycle_due`` is False for any interim ring.  A directly
             requested ``FULL`` never reads this at all.
+        store: Seeds ``_state["memory_store"]`` — the ``MemoryStore`` the
+            content gate reads for ``RECONCILE``.  ``None`` (the default)
+            preserves today's fixtures (no ``memory_store`` key at all, the
+            pre-boot/test posture the gate treats as unprovable).
     """
     from paramem.server.schedule_grammar import parse_schedule_atom
     from paramem.server.schedule_state import write_last_scheduled_run
@@ -318,13 +324,13 @@ def _make_arbitrator_state(
         buffer.append(f"conv-anon-{i}", "user", "Hello")
         buffer.append(f"conv-anon-{i}", "assistant", "Hi")
 
-    store = MagicMock()
-    store.is_anonymous.return_value = False
+    speaker_store = MagicMock()
+    speaker_store.is_anonymous.return_value = False
 
-    return {
+    state = {
         "config": cfg,
         "session_buffer": buffer,
-        "speaker_store": store,
+        "speaker_store": speaker_store,
         "consolidating": False,
         "mode": "local",
         "background_trainer": None,
@@ -333,6 +339,9 @@ def _make_arbitrator_state(
         "pending_rehydration": False,
         "integrity_check_failed": False,
     }
+    if store is not None:
+        state["memory_store"] = store
+    return state
 
 
 def _make_interim_slot(adapter_dir, stamp: str, *, payload: str | None) -> None:
@@ -643,11 +652,42 @@ class TestConsolidationArbitrator:
         assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
         assert due_calls == [], "_is_full_cycle_due must not be consulted for an explicit RECONCILE"
 
-    def test_reconcile_dispatches_on_an_empty_store_too(self, tmp_path, monkeypatch) -> None:
-        """RECONCILE never reaches the content gate — an empty store still dispatches."""
+    def test_reconcile_noops_on_an_empty_store(self, tmp_path, monkeypatch) -> None:
+        """RECONCILE reaches the content gate too — a store with no active key noops.
+
+        Also pins the gate's read-only contract: a fresh store has no
+        registry for any tier at all (``tiers_with_registry() == []``), and
+        the noop verdict must not mint one — guards against a future edit
+        that reads the gate's answer through ``MemoryStore.registry()``
+        (which MINTS an empty registry as a side effect) instead of the
+        non-mutating ``active_keys_in_tier()``.
+        """
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import ConsolidationAction
+
+        fresh_store = MemoryStore(replay_enabled=True)
+        assert fresh_store.tiers_with_registry() == [], "fixture sanity: a fresh store has none"
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, store=fresh_store)
+        status, resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_no_stored_keys"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert spy.call_count == 0
+        assert due_calls == []
+        assert fresh_store.tiers_with_registry() == [], (
+            "the gate must not mint a registry while answering the noop question"
+        )
+
+    def test_reconcile_dispatches_with_no_store_resident(self, tmp_path, monkeypatch) -> None:
+        """No live ``memory_store`` (pre-boot/test posture) is unprovable — it dispatches."""
         from paramem.server.app import ConsolidationAction
 
         state = _make_arbitrator_state(tmp_path, max_interim_count=7)
+        assert "memory_store" not in state, "fixture sanity: no store seeded"
+
         status, resolved, spy, due_calls = _dispatch(
             state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
         )
@@ -656,6 +696,101 @@ class TestConsolidationArbitrator:
         assert resolved is ConsolidationAction.RECONCILE
         assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
         assert due_calls == []
+
+    def test_reconcile_dispatches_when_a_main_tier_holds_one_active_key(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """One active key in a main tier is enough content to dispatch."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import ConsolidationAction
+
+        store = MemoryStore(replay_enabled=True)
+        store.put(
+            "semantic", "graph1", {"key": "graph1", "subject": "a", "predicate": "b", "object": "c"}
+        )
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, store=store)
+        status, resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_full"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
+        assert due_calls == []
+
+    def test_reconcile_noops_when_only_an_interim_tier_holds_keys(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A key parked in an interim tier is not RECONCILE's content — main tiers only."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import ConsolidationAction
+
+        store = MemoryStore(replay_enabled=True)
+        store.put(
+            "episodic_interim_20260101T0000",
+            "graph1",
+            {"key": "graph1", "subject": "a", "predicate": "b", "object": "c"},
+        )
+
+        state = _make_arbitrator_state(tmp_path, max_interim_count=7, store=store)
+        status, resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_no_stored_keys"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert spy.call_count == 0
+        assert due_calls == []
+
+    def test_reconcile_dispatches_when_replay_is_disabled(self, tmp_path, monkeypatch) -> None:
+        """``replay_enabled=False`` is unprovable too — the gate does not read the registry."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import ConsolidationAction
+
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=7, store=MemoryStore(replay_enabled=False)
+        )
+        status, resolved, spy, due_calls = _dispatch(
+            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
+        )
+
+        assert status == "started_full"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert _submitted_full_fold_key_sources(spy) == ["main_tiers"]
+        assert due_calls == []
+
+    def test_reconcile_noop_does_not_move_the_cadence_stamp(self, tmp_path, monkeypatch) -> None:
+        """A RECONCILE noop leaves the durable cadence-stamp file untouched.
+
+        Not an ordering pin — ``_stamp_scheduled_run`` only ever fires for an
+        ``AUTO``-originated dispatch, and ``RECONCILE`` is never resolved from
+        ``AUTO``, so this holds regardless of where the content gate sits
+        relative to the stamp write.  It is a direct-call-site invariant:
+        ``/reconsolidate`` never moves the cadence window, noop or not.  See
+        ``test_scheduled_full_or_interim_noop_does_not_move_the_cadence_stamp``
+        for the actual gate-before-stamp ordering pin (an ``AUTO`` tick that
+        noops).
+        """
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=7, store=MemoryStore(replay_enabled=True)
+        )
+        state_dir = state["config"].paths.data / "state"
+        seeded_stamp = time.time() - 86400
+        write_last_scheduled_run(state_dir, seeded_stamp)
+
+        status, resolved, spy, _ = _dispatch(
+            state, ConsolidationAction.RECONCILE, monkeypatch=monkeypatch
+        )
+
+        assert status == "noop_no_stored_keys"
+        assert resolved is ConsolidationAction.RECONCILE
+        assert spy.call_count == 0
+        assert read_last_scheduled_run(state_dir) == seeded_stamp
 
     def test_fold_entry_takes_venue_key_source_and_fold_inputs_only(self, tmp_path) -> None:
         """The arbitrator's intent stays in the arbitrator.
@@ -948,6 +1083,43 @@ class TestStampPredicate:
         assert status.startswith("noop_")
         assert resolved is getattr(ConsolidationAction, action_name)
         assert stamp_calls == 0, "a manual noop must not reset the cadence window"
+        assert read_last_scheduled_run(state_dir) == seeded_stamp
+
+    @pytest.mark.parametrize(
+        ("max_interim_count", "expected_resolved"),
+        [(0, "FULL"), (7, "INTERIM")],
+    )
+    def test_scheduled_tick_noop_does_not_stamp(
+        self, tmp_path, monkeypatch, max_interim_count, expected_resolved
+    ) -> None:
+        """The real ordering pin: an AUTO tick resolving to FULL or INTERIM,
+        with nothing for the content gate to consume, must not advance the
+        cadence stamp.
+
+        Unlike a directly requested door (never stamps regardless of outcome —
+        see the other tests in this class), an ``AUTO`` dispatch DOES stamp on
+        a successful one (:meth:`test_scheduled_full_stamps`,
+        :meth:`test_scheduled_interim_stamps`), so a stamp advancing here would
+        be a genuine call-site reordering bug — the content gate must run
+        BEFORE ``_stamp_scheduled_run`` inside ``_dispatch_consolidation``.
+        """
+        from paramem.server.app import ConsolidationAction
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=max_interim_count, refresh_cadence="every 5h"
+        )
+        state_dir = state["config"].paths.data / "state"
+        seeded_stamp = time.time() - 6 * 3600
+        write_last_scheduled_run(state_dir, seeded_stamp)
+
+        status, resolved, stamp_calls = self._dispatch_and_track_stamp(
+            state, ConsolidationAction.AUTO, monkeypatch=monkeypatch
+        )
+
+        assert status.startswith("noop_")
+        assert resolved is getattr(ConsolidationAction, expected_resolved)
+        assert stamp_calls == 0, "an AUTO noop must not advance the cadence window"
         assert read_last_scheduled_run(state_dir) == seeded_stamp
 
     def test_scheduled_full_stamps(self, tmp_path, monkeypatch) -> None:
@@ -1390,7 +1562,8 @@ class TestConsolidationRoutes:
     def test_reconsolidate_runs_with_nothing_new_to_consume(self, tmp_path, monkeypatch) -> None:
         """Nothing on disk, nothing pending → ``/reconsolidate`` still dispatches.
 
-        Its input is the knowledge already stored; "nothing new" is not a reason
+        Its input is the knowledge already stored, not the interim/pending
+        material the other three doors check; "nothing new" is not a reason
         to refuse it.  This is what it is for after a model/prompt/extraction
         change.
         """
@@ -1401,6 +1574,26 @@ class TestConsolidationRoutes:
 
         assert resp.json() == {"status": "started_full", "action": "reconcile"}
         assert _route_key_sources(submitted) == ["main_tiers"]
+
+    def test_reconsolidate_noops_on_an_empty_store(self, tmp_path, monkeypatch) -> None:
+        """A resident store with no active key in any main tier → ``noop_no_stored_keys``.
+
+        Route-level pin of the empty-store outcome, distinct from "nothing
+        new" above — an operator calling ``POST /reconsolidate`` before any
+        fact has ever been learned gets a `noop`, not a submitted GPU cycle.
+        """
+        from paramem.memory.store import MemoryStore
+
+        state = _make_arbitrator_state(
+            tmp_path, max_interim_count=7, store=MemoryStore(replay_enabled=True)
+        )
+
+        client, submitted = _route_client(state, monkeypatch)
+        resp = client.post("/reconsolidate")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "noop_no_stored_keys", "action": "reconcile"}
+        assert submitted == []
 
     def test_the_two_full_fold_doors_differ_only_in_the_key_source(
         self, tmp_path, monkeypatch
@@ -1470,7 +1663,7 @@ class TestConsolidationRoutes:
         assert resp.json() == {"status": "noop_no_interim_tier", "action": "interim"}
         assert submitted == []
 
-    def test_reconcile_is_the_only_door_the_content_gate_does_not_stop(
+    def test_reconcile_dispatches_with_no_new_material_and_no_store_resident(
         self, tmp_path, monkeypatch
     ) -> None:
         """Nothing new to consume: every door noops except ``/reconsolidate``.
@@ -1481,8 +1674,11 @@ class TestConsolidationRoutes:
         lack of a content-bearing interim slot — a DIFFERENT status, because
         it is a different action with a different input.
         ``/consolidate/interim`` requests ``INTERIM`` directly and noops the
-        same way the tick did.  ``/reconsolidate`` is the one action exempt:
-        its input (the main tiers' own stored keys) always exists.
+        same way the tick did.  ``/reconsolidate`` requests ``RECONCILE``, whose
+        content is the main tiers' own active keys, not the interim/pending
+        material the other three check — with no ``memory_store`` resident
+        (this fixture's default) that question is unprovable, so the gate
+        lets it proceed rather than reading it as empty.
         """
         import paramem.server.app as app_module
 

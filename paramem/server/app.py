@@ -9918,7 +9918,8 @@ async def consolidate():
     ``max_interim_count`` reduction to 0 as well, since the slot check does
     not depend on the CURRENT count.  To absorb only the recent conversations
     without touching main memory, use ``POST /consolidate/interim``; to
-    rebuild main memory from its own stored knowledge with no gate at all,
+    rebuild main memory from its own stored knowledge — turned away only by
+    an empty store, never by the absence of new interim/pending material —
     use ``POST /reconsolidate``.
 
     Takes no request body.
@@ -10000,13 +10001,15 @@ async def reconsolidate():
     recent material is still there for ``POST /consolidate`` or the schedule to
     absorb afterwards.
 
-    Its input is the knowledge already stored, so it does not go through the
-    content gate at all — it is the one door that runs with an empty input
-    set, because rebuilding the store from what it already holds IS its
-    purpose.  ``POST /consolidate`` and ``POST /consolidate/interim`` noop on
-    nothing new; this one never does.  The run does not move the cadence
-    window.  Being gate-exempt is not guard-exempt: it still passes through
-    the shared safety guards ahead of the gate — busy/cloud-only/bg-training
+    Its input is the knowledge already stored — every active key in a main
+    tier (episodic/semantic/procedural) — so it is turned away only by an
+    empty store, never by the absence of the NEW material ``POST /consolidate``
+    and ``POST /consolidate/interim`` require: a call with no interim slot
+    and no pending session still dispatches here.  It noops
+    (``noop_no_stored_keys``) only when the store itself holds no active key
+    in any main tier — nothing to rebuild.  The run does not move the cadence
+    window.  It still passes through the shared safety guards ahead of the
+    gate — busy/cloud-only/bg-training
     (``_consolidation_dispatch_guards``), a main tier's registry binding
     being unverified, the idle debounce, and the active-store migration
     pre-empt — so a busy server still defers it.
@@ -10017,6 +10020,8 @@ async def reconsolidate():
 
     - ``started_full`` — the rebuild was submitted; poll ``GET /status``
       (``consolidating``).  It seizes the GPU for the duration.
+    - ``noop_no_stored_keys`` — no main tier holds an active key; there is
+      nothing to rebuild.
     - ``deferred_*`` — busy (a run is already going, someone is chatting, the
       GPU is held, or the server is cloud-only).  Retry later.
 
@@ -15159,11 +15164,13 @@ class ConsolidationAction(str, Enum):
       Content is pending NAMED sessions.
     - ``RECONCILE`` — rebuild the main tiers from their OWN keys.  Same fold as
       ``FULL``, narrower key source: the interim slots are neither folded in
-      nor reaped, and pending sessions are left where they are.  The one
-      action exempt from the content gate — its input (the main tiers' own
-      stored keys) always exists — though it still passes through the shared
-      safety guards (busy/cloud-only/bg-training, idle debounce,
-      pending-rehydration).
+      nor reaped, and pending sessions are left where they are.  Content is
+      any active key in a main tier (episodic/semantic/procedural); with none
+      the store has nothing to rebuild and the dispatch noops
+      (``noop_no_stored_keys``).  It still passes through the shared safety
+      guards ahead of the content gate — busy/cloud-only/bg-training, a main
+      tier's registry binding being unverified, idle debounce, and
+      pending-rehydration.
 
     The arbitrator resolves ``AUTO`` and keeps the result: the training layer
     below receives the fold's mode, its key source and its fold inputs — never
@@ -15309,10 +15316,12 @@ def _triage_pending_sessions(config, buffer, store) -> "tuple[int, int]":
 
     An unconditional pre-stage of :func:`_dispatch_consolidation`, run on every
     dispatch regardless of action.  Retiring what can never be attributed is a
-    side effect, not a gate: ``RECONCILE`` bypassing the content gate must not
-    also switch orphan retirement off for that door.  The counts it returns are
-    what :func:`_consolidation_content_gate` decides on when it runs (every
-    ``FULL`` or ``INTERIM`` dispatch, whoever asked).
+    side effect, not a gate: it runs before :func:`_consolidation_content_gate`
+    and does not depend on that gate's outcome, so ``RECONCILE`` taking its own
+    branch through the gate does not switch orphan retirement off for that
+    door.  The counts it returns are what :func:`_consolidation_content_gate`
+    decides on for ``FULL``/``INTERIM`` (``RECONCILE``'s own branch reads the
+    store instead).
 
     Args:
         config: Live server config.
@@ -15378,11 +15387,12 @@ def _consolidation_content_gate(
     *,
     pending_count: int,
     named_count: int,
+    memory_store,
 ) -> "str | None":
-    """The ONE "is there anything to consolidate?" check for FULL and INTERIM.
+    """The ONE "is there anything to consolidate?" check for every action.
 
-    Both actions have an input set, and dispatching either with an empty one
-    seizes the GPU to learn nothing:
+    Each action has its own input set, and dispatching one with an empty
+    input seizes the GPU to learn nothing:
 
     - **INTERIM** — its only input is pending sessions.  With none there is
       nothing to extract and nothing to train.
@@ -15397,41 +15407,65 @@ def _consolidation_content_gate(
       noops; at ``== 0`` no interim slot is ever minted going forward, so
       pending NAMED sessions are the fold's own content and the gate falls
       through to the shared check below.
+    - **RECONCILE** — its input is the keys already active in a MAIN tier
+      (episodic/semantic/procedural), via ``memory_store.active_keys_in_tier``.
+      A store that cannot answer the question (no live store yet, or
+      ``replay_enabled`` is False) is unprovable rather than empty, and the
+      gate lets the dispatch proceed — the same "can't prove it's empty, so
+      don't block it" posture the rest of this function does not need because
+      ``pending_count``/``named_count`` are always countable.  Otherwise, no
+      active key in any main tier means there is nothing to rebuild.
 
     Interim slots are counted through the payload-aware primitive
     (``iter_interim_dirs(..., mode=config.consolidation.mode)``): a slot whose
     payload write never landed is a directory, not content, and must not
     satisfy the gate.
 
-    Called for every ``FULL`` or ``INTERIM`` dispatch, whoever reached it —
-    ``AUTO``'s resolved outcome (``/scheduled-tick``) or requested directly
-    (``/consolidate``, ``/consolidate/interim``).  A manual door drops only
-    the TIME condition (``_is_full_cycle_due``'s deadline math, which this
-    function never touches) — never the CONTENT condition checked here.  A
-    ``noop_*`` status reports "nothing to do" as information, not a refusal.
-    ``RECONCILE`` never reaches this function; its input is the main tiers'
-    own stored keys, which always exist.
+    Called for every dispatch that reaches it, whoever asked — ``AUTO``'s
+    resolved outcome (``/scheduled-tick``) or a direct request
+    (``/consolidate``, ``/consolidate/interim``, ``/reconsolidate``).  A
+    manual door drops only the TIME condition (``_is_full_cycle_due``'s
+    deadline math, which this function never touches) — never the CONTENT
+    condition checked here.  A ``noop_*`` status reports "nothing to do" as
+    information, not a refusal.
 
     The pending-session counts come from :func:`_triage_pending_sessions`,
     which the arbitrator runs as an unconditional pre-stage.  Passing them in
     (rather than triaging here) is what keeps orphan retirement independent of
     whether this gate runs at all, and leaves this function a pure decision:
-    same arguments, same answer, no side effects.
+    same arguments, same answer, no side effects — ``memory_store`` is a
+    parameter for the same reason, read but never mutated.
 
     Args:
-        action: ``FULL`` or ``INTERIM`` — never ``AUTO`` (resolved before this
-            is called) or ``RECONCILE`` (exempt, never calls this).
+        action: ``FULL``, ``INTERIM``, or ``RECONCILE`` — never ``AUTO``
+            (resolved before this is called).
         config: Live server config — the SAME object the caller resolved
             ``AUTO`` against, or the config in effect for a direct request.
         pending_count: Pending sessions seen by the triage pre-stage, counted
             BEFORE retirement.
         named_count: How many of those classified NAMED (attributable).
+        memory_store: The live ``MemoryStore`` (``_state["memory_store"]``) —
+            distinct from the ``SpeakerStore`` :func:`_triage_pending_sessions`
+            takes as its own ``store`` argument — or ``None`` when no store
+            has been constructed yet.  Read only for ``RECONCILE``.
 
     Returns:
         A terminal ``"noop_*"`` string when there is nothing to consolidate,
         ``None`` when the dispatch may proceed.
     """
-    from paramem.memory.interim_adapter import iter_interim_dirs
+    from paramem.memory.interim_adapter import MAIN_TIERS, iter_interim_dirs
+
+    if action is ConsolidationAction.RECONCILE:
+        if memory_store is None or not memory_store.replay_enabled:
+            return None
+        # active_keys_in_tier is the non-mutating accessor (paramem/memory/
+        # store.py) -- unlike MemoryStore.registry(), which MINTS an empty
+        # registry for a tier that has never seen one.  A noop verdict must
+        # not itself create the registry it just reported as empty.
+        if any(memory_store.active_keys_in_tier(tier) for tier in MAIN_TIERS):
+            return None
+        logger.info("Consolidation dispatch: no active keys in any main tier — noop")
+        return "noop_no_stored_keys"
 
     if action is ConsolidationAction.FULL:
         # Content-bearing interim slots are content for the full fold no
@@ -15482,7 +15516,8 @@ def _dispatch_consolidation(
     the deadline math or moves the cadence window; a manual door drops only
     the TIME condition (is a cycle due), never the CONTENT condition (is
     there anything to consume), which the content gate still enforces on the
-    resolved-or-direct ``FULL``/``INTERIM`` either way.
+    resolved-or-direct ``FULL``/``INTERIM``/``RECONCILE`` either way — each on
+    its own input.
 
     Order (unconditional gates first, so an explicit request cannot walk past a
     safety property):
@@ -15506,12 +15541,13 @@ def _dispatch_consolidation(
        resolution to ``FULL`` or ``INTERIM`` via :func:`_is_full_cycle_due`
        (its only call site).  Both belong to the schedule; a direct
        ``FULL``/``INTERIM``/``RECONCILE`` request skips straight past them.
-    7. **``FULL`` or ``INTERIM``, resolved or direct** — :func:`_consolidation_content_gate`.
+    7. **Every action reaching this point** — :func:`_consolidation_content_gate`.
        An empty input set is empty whether the schedule resolved into it or
        an operator named it directly.  A ``noop_*`` status is not a refusal —
-       it is the answer.  ``RECONCILE`` is the one action exempt: it is the
-       operator's explicit rebuild-the-store door, and its input (the main
-       tiers' own stored keys) always exists, so it never reaches this gate.
+       it is the answer.  ``FULL``/``INTERIM`` check for new material;
+       ``RECONCILE`` checks whether any main tier holds an active key —
+       unprovable (no live store, or replay disabled) is treated as
+       "proceed", not "empty".
     8. Dispatch via :func:`_dispatch_to_executor`, advancing the schedule stamp
        (:func:`_stamp_scheduled_run`) on an ``AUTO`` dispatch only — a direct
        ``FULL``/``INTERIM``/``RECONCILE`` request does not move the cadence
@@ -15692,20 +15728,20 @@ def _dispatch_consolidation(
         )
         return "noop_no_interim_tier", action
 
-    # The content gate applies to every FULL or INTERIM dispatch, resolved
-    # from AUTO or requested directly: a manual door drops only the TIME
-    # condition (the deadline math above), never the CONTENT condition here.
-    # RECONCILE never reaches this — its input (the main tiers' own stored
-    # keys) always exists.
-    if action in (ConsolidationAction.FULL, ConsolidationAction.INTERIM):
-        _gate_status = _consolidation_content_gate(
-            action,
-            config,
-            pending_count=_pending_count,
-            named_count=_named_count,
-        )
-        if _gate_status is not None:
-            return _gate_status, action
+    # The content gate applies to every action reaching this point (FULL,
+    # INTERIM, or RECONCILE — resolved from AUTO or requested directly): a
+    # manual door drops only the TIME condition (the deadline math above),
+    # never the CONTENT condition here.  Each action reads its own input
+    # through the gate's own branch — see `_consolidation_content_gate`.
+    _gate_status = _consolidation_content_gate(
+        action,
+        config,
+        pending_count=_pending_count,
+        named_count=_named_count,
+        memory_store=_state.get("memory_store"),
+    )
+    if _gate_status is not None:
+        return _gate_status, action
 
     if _scheduled:
         # This tick is going to dispatch, so it consumes its cadence window.  A
