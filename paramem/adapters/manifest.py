@@ -952,6 +952,21 @@ def build_manifest_for(
             lora_dropout = float(getattr(peft_cfg, "lora_dropout", 0.0))
             targets = getattr(peft_cfg, "target_modules", ())
             lora_targets = tuple(sorted(targets)) if targets else ()
+        else:
+            # Every production caller passes a model with `adapter_name`
+            # already resident in `peft_config` (created/promoted before
+            # the save that stamps this manifest). A miss here means the
+            # manifest will carry lora.rank=alpha=0 and empty
+            # target_modules with synthesized=False -- app.py's
+            # `_check_manifest_fingerprints` treats that combination as a
+            # fingerprint mismatch (red for episodic) rather than mounting
+            # it silently, but the condition is worth surfacing at the
+            # point it was written, not only at the next mount attempt.
+            logger.warning(
+                "build_manifest_for: no peft_config entry for adapter %s -- "
+                "lora fields will be recorded as zero/empty",
+                adapter_name,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "build_manifest_for: could not read LoRA config for %s: %s", adapter_name, exc

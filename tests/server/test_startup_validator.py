@@ -21,6 +21,19 @@ Covers:
   primary tier (episodic), yellow for a non-primary tier (semantic) — a red
   row renders as a failed-level "PA routing DISABLED" attention item, which
   is only true for the primary tier.
+- Zero/empty lora fields: synthesized=False → red fingerprint mismatch, not
+  mounted (the build-time hole where an absent peft_config entry left
+  lora.rank=alpha=0 with every other field known), pinned per-field (rank
+  alone, alpha alone with rank matching, target_modules alone with rank and
+  alpha matching — proves the collapsed LoRA-field comparison loop checks
+  all three fields independently); synthesized=True → still routes to
+  migrated_unverified via key_count=UNKNOWN and mounts.
+- Arc test (TestMigrationScriptBootArc): a migration-synthesized slot
+  produced by the real scripts/migrate/outputs_to_slot_dirs.py primitive
+  against a real, on-disk sibling registry resolves and mounts as
+  migrated_unverified at boot — the two migration-script hash fixes (hash
+  the plaintext, only ever look at adapter_dir.parent) are what let a
+  migrated slot's stamp match tier_registry_sha256 at mount time at all.
 - episodic_interim_* routes through the same _validate_adapter_slot decision
   tree as main tiers (fingerprints compared against config.adapters.episodic):
   no-weight-slot-candidate → INFO fresh install, no row; a real weight-slot
@@ -104,6 +117,8 @@ def _write_slot(
     registry_sha256: str = "",
     sha: str = "abc123",
     rank: int = 8,
+    alpha: "int | None" = None,
+    target_modules: "tuple[str, ...] | None" = None,
     synthesized: bool = False,
     key_count: "int | str" = 0,
 ) -> Path:
@@ -116,7 +131,18 @@ def _write_slot(
     registry with active keys, or specifically exercising
     KEY_COUNT_MISMATCH, pass an explicit key_count that matches (or
     deliberately disagrees with) their own registry.
+
+    ``alpha`` defaults to ``rank * 2`` and ``target_modules`` defaults to
+    ``("q_proj", "v_proj")`` when not given — matching ``_make_config``'s
+    ``rank=8, alpha=16, target_modules=["q_proj", "v_proj"]`` so a caller
+    that only overrides ``rank`` still gets a fully-matching LoRA shape.
+    Callers that need to pin a mismatch on ``alpha`` or ``target_modules``
+    independently of ``rank`` pass those explicitly.
     """
+    if alpha is None:
+        alpha = rank * 2
+    if target_modules is None:
+        target_modules = ("q_proj", "v_proj")
     slot = adapter_kind_dir / ts
     slot.mkdir(parents=True)
     # Write minimal adapter files so load won't fail on file-not-found
@@ -130,7 +156,7 @@ def _write_slot(
         tokenizer=TokenizerFingerprint(
             name_or_path="hf/model", vocab_size=32000, merges_hash="cafe"
         ),
-        lora=LoRAShape(rank=rank, alpha=rank * 2, dropout=0.0, target_modules=("q_proj", "v_proj")),
+        lora=LoRAShape(rank=rank, alpha=alpha, dropout=0.0, target_modules=target_modules),
         registry_sha256=registry_sha256,
         key_count=key_count,
         synthesized=synthesized,
@@ -749,6 +775,183 @@ class TestSynthesizedUnknown:
         assert row is not None
         assert row["severity"] == "yellow"
         assert row["status"] == "migrated_unverified"
+
+
+class TestZeroLoraFingerprint:
+    """A zero/empty ``lora`` field is only a legitimate skip on a
+    ``synthesized=True`` manifest. On a ``synthesized=False`` manifest it is
+    a fingerprint mismatch — pins the fix for the silent-mount hole where
+    ``build_manifest_for`` recorded ``lora.rank=alpha=0`` /
+    ``target_modules=()`` (``model.peft_config.get(name)`` returned
+    ``None`` at build time) and every other field was known, so the old
+    zero-skip plus ``_first_unknown_field`` (which never inspects ``lora``)
+    let the slot mount with no manifest row at all.
+    """
+
+    def test_zero_lora_rank_non_synthesized_is_red_mismatch_not_mounted(
+        self, tmp_path: Path
+    ) -> None:
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        _write_slot(kind_dir, rank=0, alpha=0, target_modules=(), synthesized=False, key_count=0)
+
+        model = _make_model(commit_hash="abc123")
+        result_model, state = _run(config, model=model)
+
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "mismatch"
+        assert row["reason"] == "fingerprint_mismatch"
+        assert row["severity"] == "red"
+        assert row["field"] == "lora.rank"
+        assert "episodic" not in getattr(result_model, "peft_config", {})
+
+    def test_zero_lora_alpha_only_non_synthesized_is_red_mismatch(self, tmp_path: Path) -> None:
+        """rank matches config (8); only alpha is zero. Pins the alpha arm of
+        the collapsed LoRA-field loop independently of rank — reverting just
+        that arm would still pass every rank-only pin in this file."""
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        _write_slot(kind_dir, rank=8, alpha=0, synthesized=False, key_count=0)
+
+        model = _make_model(commit_hash="abc123")
+        result_model, state = _run(config, model=model)
+
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "mismatch"
+        assert row["severity"] == "red"
+        assert row["field"] == "lora.alpha"
+        assert "episodic" not in getattr(result_model, "peft_config", {})
+
+    def test_zero_target_modules_only_non_synthesized_is_red_mismatch(self, tmp_path: Path) -> None:
+        """rank and alpha match config (8, 16); only target_modules is
+        empty. Pins the target_modules arm of the collapsed LoRA-field loop
+        independently of rank/alpha — reverting just that arm would still
+        pass every rank/alpha-only pin in this file."""
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        _write_slot(kind_dir, rank=8, alpha=16, target_modules=(), synthesized=False, key_count=0)
+
+        model = _make_model(commit_hash="abc123")
+        result_model, state = _run(config, model=model)
+
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "mismatch"
+        assert row["severity"] == "red"
+        assert row["field"] == "lora.target_modules"
+        assert "episodic" not in getattr(result_model, "peft_config", {})
+
+    def test_zero_lora_synthesized_true_still_migrated_unverified_and_mounts(
+        self, tmp_path: Path
+    ) -> None:
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        _write_slot(
+            kind_dir,
+            rank=0,
+            alpha=0,
+            target_modules=(),
+            synthesized=True,
+            key_count=UNKNOWN,
+        )
+
+        model = _make_model(commit_hash="abc123")
+
+        from peft import PeftModel
+
+        with patch.object(
+            PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)
+        ) as mock_from_pretrained:
+            _, state = _run(config, model=model)
+
+        mock_from_pretrained.assert_called_once()
+        assert mock_from_pretrained.call_args.kwargs.get("adapter_name") == "episodic", (
+            "Expected the migrated slot to actually be mounted"
+        )
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "migrated_unverified"
+        assert row["severity"] == "yellow"
+
+
+class TestMigrationScriptBootArc:
+    """Arc test tying the migration script's hash fix to the boot validator.
+
+    ``TestZeroLoraFingerprint`` and ``TestSynthesizedUnknown`` above both use
+    a manually-constructed manifest with ``registry_sha256=""`` (the
+    fresh-install / no-registry convention) — none of them exercise a
+    migrated slot's stamp actually matching a REAL, on-disk registry the way
+    ``scripts/migrate/outputs_to_slot_dirs.py`` produces it in practice.
+    Before the hash fix (hashing raw/ciphertext bytes and considering
+    unmatchable grandparent/simhash candidates), a synthesized stamp could
+    never equal ``tier_registry_sha256(kind_dir)`` at mount time — this test
+    drives ``_reshape_dir`` (the real migration primitive) against a real
+    sibling registry sitting exactly where a live tier keeps it, then boots
+    through ``_mount_adapters_from_slots`` and confirms the slot resolves
+    and mounts as ``migrated_unverified``.
+    """
+
+    def test_migration_synthesized_slot_with_real_registry_mounts_unverified(
+        self, tmp_path: Path
+    ) -> None:
+        from scripts.migrate.outputs_to_slot_dirs import _reshape_dir
+
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir(parents=True)
+
+        # The live registry -- exactly what tier_registry_sha256(kind_dir)
+        # hashes at mount time, and the sibling _find_sibling_registry must
+        # hash identically at migration time.
+        (kind_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["graph1"], "stale": {}, "simhash": {"graph1": 12345}}'
+        )
+
+        # Old-layout flat adapter dir, sibling to the registry -- reshape
+        # lands its slot directly under kind_dir (adapter_dir.parent).
+        old_adapter_dir = kind_dir / "old_adapter"
+        old_adapter_dir.mkdir()
+        (old_adapter_dir / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "base_model_name_or_path": "hf/model",
+                    "r": 8,
+                    "lora_alpha": 16,
+                    "target_modules": ["q_proj", "v_proj"],
+                }
+            )
+        )
+        (old_adapter_dir / "adapter_model.safetensors").write_bytes(b"fake weights")
+
+        _reshape_dir(
+            old_adapter_dir,
+            registry_path_override=None,
+            name_from_config=False,
+            dry_run=False,
+            verbose=False,
+        )
+
+        from peft import PeftModel
+
+        with patch.object(
+            PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)
+        ) as mock_from_pretrained:
+            _, state = _run(config)
+
+        mock_from_pretrained.assert_called_once()
+        assert mock_from_pretrained.call_args.kwargs.get("adapter_name") == "episodic", (
+            "Expected the migrated slot to actually resolve and mount"
+        )
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None
+        assert row["status"] == "migrated_unverified"
+        assert row["severity"] == "yellow"
 
 
 class TestRevalidateAdapterManifests:

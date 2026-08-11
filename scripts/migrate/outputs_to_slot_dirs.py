@@ -42,7 +42,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -112,49 +111,37 @@ def _pgrep_alive(patterns: list[str]) -> list[tuple[str, str]]:
     return alive
 
 
-def _sha256_file(path: Path) -> str:
-    """Return hex SHA-256 of a file's bytes.
-
-    Args:
-        path: Path to file.
-
-    Returns:
-        Hex digest string.
-    """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _find_sibling_registry(adapter_dir: Path, registry_path_override: Optional[Path]) -> str:
-    """Locate a registry file and return its SHA-256 hex, or UNKNOWN.
+    """Locate a registry file and return its plaintext SHA-256 hex, or UNKNOWN.
 
     Looks in the following order:
     1. ``registry_path_override`` (CLI flag).
-    2. ``<adapter_dir.parent>/indexed_key_registry.json``
-    3. ``<adapter_dir.parent.parent>/indexed_key_registry.json``
-    4. Any ``simhash_registry_*.json`` in the same locations.
+    2. ``<adapter_dir.parent>/indexed_key_registry.json`` — the tier root the
+       reshaped slot lands under (see :func:`_reshape_dir`), which is exactly
+       the root :func:`~paramem.adapters.manifest.tier_registry_sha256` hashes
+       at mount time. This is the only candidate whose hash a live mount can
+       ever match.
+
+    Hashing goes through :func:`~paramem.backup.hashing.plaintext_sha256` —
+    the same primitive ``tier_registry_sha256`` uses at mount time — so the
+    stamp matches on an encrypted install too; hashing the on-disk bytes
+    directly would hash ciphertext there and never match.
 
     Args:
         adapter_dir: The old flat adapter directory.
         registry_path_override: Optional explicit path from CLI.
 
     Returns:
-        SHA-256 hex of the registry file, or ``UNKNOWN``.
+        SHA-256 hex of the registry file's plaintext bytes, or ``UNKNOWN``.
     """
+    from paramem.backup.hashing import plaintext_sha256
+
     if registry_path_override is not None and registry_path_override.exists():
-        return _sha256_file(registry_path_override)
+        return plaintext_sha256(registry_path_override)
 
-    candidates = [
-        adapter_dir.parent / "indexed_key_registry.json",
-        adapter_dir.parent.parent / "indexed_key_registry.json",
-    ]
-    # Also try simhash registry as fallback.
-    for parent in (adapter_dir.parent, adapter_dir.parent.parent):
-        for p in parent.glob("simhash_registry_*.json"):
-            candidates.append(p)
-
-    for c in candidates:
-        if c.exists():
-            return _sha256_file(c)
+    candidate = adapter_dir.parent / "indexed_key_registry.json"
+    if candidate.exists():
+        return plaintext_sha256(candidate)
     return UNKNOWN
 
 
@@ -412,7 +399,15 @@ def migrate(
         force: Proceed even if training processes are alive.
 
     Returns:
-        Exit code (0 = success, 1 = blocked by alive processes).
+        Exit code (0 = success; 1 = blocked by alive processes, outputs_root
+        missing, or a sibling registry could not be hashed because it is an
+        age envelope and the daily identity is not loaded — the message from
+        :func:`~paramem.backup.encryption.read_maybe_encrypted` already
+        names the env var to set). On the identity failure, every directory
+        migrated earlier in this call stays migrated (rerun-safe once the
+        identity is loaded) — only the directory being hashed when the
+        failure hit, and everything after it in ``old_dirs`` order, is left
+        in old-layout.
     """
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -447,13 +442,24 @@ def migrate(
     )
     migrated = 0
     for adapter_dir in old_dirs:
-        ok = _reshape_dir(
-            adapter_dir,
-            registry_path_override=registry_path,
-            name_from_config=name_from_config,
-            dry_run=dry_run,
-            verbose=verbose,
-        )
+        try:
+            ok = _reshape_dir(
+                adapter_dir,
+                registry_path_override=registry_path,
+                name_from_config=name_from_config,
+                dry_run=dry_run,
+                verbose=verbose,
+            )
+        except RuntimeError as exc:
+            # A sibling registry is an age envelope and the daily identity
+            # is not loaded (paramem.backup.encryption.read_maybe_encrypted,
+            # reached via plaintext_sha256 in _find_sibling_registry). Every
+            # other failure path in this script logs and returns 1 rather
+            # than raising a traceback -- match that convention here too.
+            # Directories already migrated earlier in this call are left in
+            # place (rerun-safe once the identity is loaded).
+            logger.error("ERROR: %s", exc)
+            return 1
         if ok:
             migrated += 1
 

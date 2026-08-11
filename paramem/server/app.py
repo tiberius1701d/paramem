@@ -1139,7 +1139,6 @@ def _validate_adapter_slot(
     name: str,
     adapter_cfg,
     model,
-    tokenizer,
     kind_dir: Path,
     binding: "TierBinding",
     manifest_status: dict,
@@ -1257,7 +1256,7 @@ def _validate_adapter_slot(
     slot = binding.slot
     manifest = binding.manifest
 
-    mismatch_field = _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg)
+    mismatch_field = _check_manifest_fingerprints(manifest, model, adapter_cfg)
     if mismatch_field is not None:
         _record_manifest_row(
             manifest_status,
@@ -1345,9 +1344,9 @@ def _revalidate_adapter_manifests(state: dict) -> None:
     into the same ``.pending/`` dir. Do not move this call earlier in
     either finalizer, and do not call it from anywhere that runs
     concurrently with an in-flight save, on the strength of a "pure
-    validation" reading of this function — model + tokenizer are read but
-    never mutated, and nothing is ever mounted, but the pending-dir sweep is
-    a real, unconditional delete. Healthy adapters have their row removed;
+    validation" reading of this function — ``model`` is read but never
+    mutated, and nothing is ever mounted, but the pending-dir sweep is a
+    real, unconditional delete. Healthy adapters have their row removed;
     unhealthy ones get a fresh row stamped with the current ``checked_at``.
 
     Main tiers first (episodic/semantic/procedural, gated on
@@ -1395,7 +1394,6 @@ def _revalidate_adapter_manifests(state: dict) -> None:
             name,
             adapter_cfg,
             model,
-            tokenizer,
             _kind_dir,
             verify_tier_binding(name, _kind_dir),
             manifest_status,
@@ -1407,7 +1405,6 @@ def _revalidate_adapter_manifests(state: dict) -> None:
             _interim_name,
             config.adapters.episodic,
             model,
-            tokenizer,
             _interim_path,
             verify_tier_binding(_interim_name, _interim_path),
             manifest_status,
@@ -1887,7 +1884,6 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             name,
             adapter_cfg,
             model,
-            tokenizer,
             _kind_dir,
             verify_tier_binding(name, _kind_dir),
             manifest_status,
@@ -1914,7 +1910,6 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             _interim_name,
             config.adapters.episodic,
             model,
-            tokenizer,
             _interim_path,
             verify_tier_binding(_interim_name, _interim_path),
             manifest_status,
@@ -1930,17 +1925,42 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     return model
 
 
-def _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg) -> "str | None":
+def _check_manifest_fingerprints(manifest, model, adapter_cfg) -> "str | None":
     """Compare manifest fingerprints against live runtime state.
 
-    Skips UNKNOWN values (cannot verify) on the ``base_model``/``lora``
-    fields. Returns the name of the first mismatching field, or ``None``
-    when all checked fields match.
+    Skips UNKNOWN values (cannot verify) on the ``base_model`` fields.
+    Returns the name of the first mismatching field, or ``None`` when all
+    checked fields match.
+
+    LoRA shape: one loop over ``rank``/``alpha``/``target_modules`` pairs
+    each field's stamped value against its live ``adapter_cfg`` value.
+    ``manifest.synthesized`` decides only whether a falsy stamped value
+    (``0``, ``0.0``, or ``()``) is skipped rather than compared:
+
+    * ``synthesized=True`` — a falsy value is skipped (the migration script,
+      ``scripts/migrate/outputs_to_slot_dirs.py``, cannot recover LoRA
+      hyperparameters for some legacy layouts and legitimately leaves them
+      at zero; that manifest also carries ``key_count=UNKNOWN`` and is
+      routed to ``migrated_unverified`` by :func:`_first_unknown_field`,
+      never silently mounted). A truthy value is compared for equality.
+    * ``synthesized=False`` — nothing is skipped: a falsy OR
+      non-matching stamped value is a mismatch. A zero/empty field here
+      means :func:`~paramem.adapters.manifest.build_manifest_for` found no
+      ``model.peft_config`` entry for this adapter at build time — a real
+      fingerprint mismatch, not an unrecoverable unknown — and must not
+      mount silently (``base_model``/``tokenizer``/``registry_sha256`` are
+      typically all known in this shape, so :func:`_first_unknown_field`
+      alone would miss it). The strict equality check also means a non-int
+      stamped value reaching this function on a non-synthesized manifest
+      (a degraded/malformed stamp — schema declares ``lora.rank: int``, so
+      this should never happen in practice) always compares unequal to the
+      live int and is reported as a mismatch rather than silently passed
+      through: the previous ``isinstance(..., int)`` guard, which skipped
+      the comparison entirely for a non-int value, is deliberately removed.
 
     Args:
         manifest: :class:`~paramem.adapters.manifest.AdapterManifest` to check.
         model: Live base model (or PeftModel) with ``config`` attribute.
-        tokenizer: Live tokenizer.
         adapter_cfg: Per-adapter config from server.yaml (rank, alpha, etc.).
 
     Returns:
@@ -1960,17 +1980,18 @@ def _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg) -> "st
         if manifest.base_model.repo != live_repo:
             return "base_model.repo"
 
-    # LoRA shape
-    if isinstance(manifest.lora.rank, int) and manifest.lora.rank != 0:
-        if manifest.lora.rank != adapter_cfg.rank:
-            return "lora.rank"
-    if isinstance(manifest.lora.alpha, int) and manifest.lora.alpha != 0:
-        if manifest.lora.alpha != adapter_cfg.alpha:
-            return "lora.alpha"
-    if manifest.lora.target_modules:
-        live_targets = tuple(sorted(adapter_cfg.target_modules or []))
-        if manifest.lora.target_modules != live_targets:
-            return "lora.target_modules"
+    # LoRA shape — see docstring for the synthesized-gated skip semantics.
+    live_targets = tuple(sorted(adapter_cfg.target_modules or []))
+    lora_fields = (
+        ("lora.rank", manifest.lora.rank, adapter_cfg.rank),
+        ("lora.alpha", manifest.lora.alpha, adapter_cfg.alpha),
+        ("lora.target_modules", manifest.lora.target_modules, live_targets),
+    )
+    for field_name, stamped, live in lora_fields:
+        if manifest.synthesized and not stamped:
+            continue
+        if not stamped or stamped != live:
+            return field_name
 
     return None
 

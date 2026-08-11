@@ -337,6 +337,37 @@ class TestBuildManifestFor:
         )
         assert m.key_count == 42
 
+    def test_no_peft_config_entry_warns_and_yields_zero_lora(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """model.peft_config has no entry for the requested adapter name --
+        the write-side half of the zero-LoRA fingerprint-mismatch fix
+        (paramem.server.app._check_manifest_fingerprints treats a
+        synthesized=False manifest with zero/empty lora fields as a
+        mismatch, not a silent skip). build_manifest_for must still
+        complete (lora fields fall back to their zero/empty defaults) and
+        must log a WARNING naming the adapter, so the condition is visible
+        at write time rather than only at the next mount attempt."""
+        import logging
+
+        model = self._make_model()
+        model.peft_config = {}  # no entry for "episodic"
+
+        caplog.set_level(logging.WARNING, logger="paramem.adapters.manifest")
+        m = build_manifest_for(
+            model,
+            self._make_tokenizer(),
+            "episodic",
+        )
+
+        assert m.lora.rank == 0
+        assert m.lora.alpha == 0
+        assert m.lora.target_modules == ()
+        assert m.synthesized is False
+        assert any(
+            "episodic" in r.message and "peft_config" in r.message for r in caplog.records
+        ), f"Expected a warning naming the adapter; got: {[r.message for r in caplog.records]}"
+
     def test_file_hash_returns_sha256_when_safetensors_resolved(self, tmp_path: Path) -> None:
         """build_manifest_for returns a sha256 hash when safetensors files are resolved.
 
