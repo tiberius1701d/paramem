@@ -75,7 +75,7 @@ class BackupRecord:
     is_bundle:
         ``True`` when the slot is a ``snapshot_bundle`` with a
         ``bundle.meta.json`` manifest.  Callers that need bundle-specific
-        fields (``live_registry_sha256``, ``adapters``, ``files``) should
+        fields (``key_metadata_sha256``, ``adapters``, ``files``) should
         read the ``bundle.meta.json`` directly from ``slot_dir``.
     """
 

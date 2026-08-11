@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from paramem.backup.retention import _slot_size_bytes, compute_disk_usage
+from paramem.backup.types import BUNDLE_SCHEMA_VERSION
 from paramem.server.config import RetentionConfig, RetentionTierConfig, ServerBackupsConfig
 
 
@@ -53,11 +54,11 @@ def _make_bundle_slot(slot_dir: Path, *, adapter_size_bytes: int = 100_000) -> P
 
     # Top-level bundle manifest
     manifest = {
-        "bundle_schema_version": 1,
+        "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
         "created_at": "2026-05-20T20:55:00Z",
         "tier": "manual",
         "label": None,
-        "live_registry_sha256": "a" * 64,
+        "key_metadata_sha256": "a" * 64,
         "base_model": {},
         "files": [],
         "adapters": {},

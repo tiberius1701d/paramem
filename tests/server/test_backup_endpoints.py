@@ -32,7 +32,7 @@ from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
-from paramem.backup.types import ArtifactKind
+from paramem.backup.types import BUNDLE_SCHEMA_VERSION, ArtifactKind
 from paramem.server.config import (
     PathsConfig,
     SecurityConfig,
@@ -928,7 +928,8 @@ class TestCreateSnapshotBundleKind:
         fake_slot = config.paths.data / "backups" / "snapshot" / "20260521-040001"
         fake_slot.mkdir(parents=True, exist_ok=True)
         (fake_slot / "bundle.meta.json").write_text(
-            '{"bundle_schema_version": 1, "tier": "manual"}', encoding="utf-8"
+            f'{{"bundle_schema_version": {BUNDLE_SCHEMA_VERSION}, "tier": "manual"}}',
+            encoding="utf-8",
         )
 
         with patch("paramem.backup.backup.write_bundle", return_value=fake_slot):
@@ -952,7 +953,8 @@ class TestCreateSnapshotBundleKind:
         fake_slot = config.paths.data / "backups" / "snapshot" / "20260521-040002"
         fake_slot.mkdir(parents=True, exist_ok=True)
         (fake_slot / "bundle.meta.json").write_text(
-            '{"bundle_schema_version": 1, "tier": "daily"}', encoding="utf-8"
+            f'{{"bundle_schema_version": {BUNDLE_SCHEMA_VERSION}, "tier": "daily"}}',
+            encoding="utf-8",
         )
 
         with patch("paramem.backup.backup.write_bundle", return_value=fake_slot):

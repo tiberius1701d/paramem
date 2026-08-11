@@ -463,7 +463,7 @@ def donor_store_dir(adapter_root: "Path | str", base_model_id: str, lora_shape: 
     ``find_live_slot(store, "")``: :func:`build_donor` stamps every donor
     manifest with an empty ``registry_sha256`` (a donor has no key
     registry), which is the case that resolver documents an empty
-    *live_registry_sha256* as matching.
+    registry hash as matching.
 
     Args:
         adapter_root: The adapter root whose donor stores this resolves

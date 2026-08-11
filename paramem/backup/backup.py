@@ -53,6 +53,7 @@ from paramem.backup.encryption import (
 )
 from paramem.backup.hashing import (
     content_sha256_bytes,
+    plaintext_sha256,
 )
 from paramem.backup.meta import read_meta, verify_fingerprint, write_meta
 from paramem.backup.types import (
@@ -655,7 +656,6 @@ def write_bundle(
     backups_cfg: "ServerBackupsConfig | None",
     meta_fields: dict,
     adapter_scope: str = "live",
-    live_registry_sha256: str = "",
     speaker_profiles_path: Path | None = None,
     candidate_config_path: Path | None = None,
 ) -> Path:
@@ -714,14 +714,17 @@ def write_bundle(
         Path to the live ``server.yaml`` (or ``server.yaml.enc``).
     registry_path:
         Path to ``key_metadata.json`` (the ESSENTIAL registry that ties
-        weights to indexed keys).
+        weights to indexed keys).  Its plaintext SHA-256 is computed here
+        and recorded in the manifest as ``key_metadata_sha256`` (provenance
+        only — it is not used to select any slot).
     adapter_dirs:
         Mapping of adapter name → adapter-kind directory (e.g.
         ``{"episodic": Path("data/ha/adapters/episodic")}``) for every
         **enabled** adapter.  The function resolves the live main slot under
-        each directory using ``live_registry_sha256``.  The adapter-base dir
-        (parent of the episodic dir) is derived from the episodic entry to
-        discover interim families via ``iter_interim_dirs``.
+        each directory per-tier, via
+        ``find_live_slot(adapter_kind_dir, tier_registry_sha256(adapter_kind_dir))``.
+        The adapter-base dir (parent of the episodic dir) is derived from the
+        episodic entry to discover interim families via ``iter_interim_dirs``.
     backups_root:
         Root of the backup store (e.g. ``data/ha/backups/``).  The bundle-kind
         directory (``<backups_root>/snapshot/``) is derived internally and
@@ -756,11 +759,6 @@ def write_bundle(
         ``"main"`` — capture only finalized main slots.  Fails loud for the
         ``episodic`` tier when it has no finalized main slot, with an
         actionable message to switch to ``"live"`` or run a full consolidation.
-    live_registry_sha256:
-        SHA-256 hex of the current ``key_metadata.json`` bytes.  Used by
-        ``find_live_slot`` to select the correct adapter weight slot.  When
-        empty string (fresh-install / no registry), empty-registry slots are
-        matched.
     speaker_profiles_path:
         Optional path to ``speaker_profiles.json``.  When present and the
         file exists, it is included in the bundle.  When ``None`` or the file
@@ -840,11 +838,15 @@ def write_bundle(
         files_inventory.append(entry)
 
     # --- capture registry (key_metadata.json) ---
+    key_metadata_sha256 = ""
     if registry_path.exists():
         dst = pending_slot / "registry" / registry_path.name
         entry = _copy_artifact(registry_path, dst)
         entry["path"] = f"registry/{registry_path.name}"
         files_inventory.append(entry)
+        # Provenance hash for the manifest — plaintext content, independent of
+        # on-disk encryption state (see plaintext_sha256's rationale).
+        key_metadata_sha256 = plaintext_sha256(registry_path)
 
     # --- capture speaker_profiles.json ---
     if speaker_profiles_path is not None and speaker_profiles_path.exists():
@@ -950,7 +952,7 @@ def write_bundle(
         adapters_record[bundle_key] = {
             "slot_source": str(slot_path),
             # Each slot's OWN registry_sha256 — main and interim hashes differ;
-            # a single global live_registry_sha256 cannot address both.
+            # a single global key_metadata_sha256 cannot address both.
             "registry_sha256": slot_meta.get("registry_sha256", ""),
             "key_count": slot_meta.get("key_count", "unknown"),
             "indexed_key_registry_present": indexed_key_present,
@@ -1065,8 +1067,7 @@ def write_bundle(
         if not episodic_keys:
             raise BackupError(
                 "write_bundle: no live slot found for the primary episodic recall "
-                f"(adapter_scope={adapter_scope!r}, "
-                f"live_registry_sha256={live_registry_sha256!r}). "
+                f"(adapter_scope={adapter_scope!r}). "
                 "Cannot write a self-contained recovery bundle without episodic weights. "
                 "If consolidation has not run yet, use adapter_scope='live' so interim "
                 "slots are included."
@@ -1078,7 +1079,7 @@ def write_bundle(
         created_at=created_at,
         tier=tier,
         label=label,
-        live_registry_sha256=live_registry_sha256,
+        key_metadata_sha256=key_metadata_sha256,
         base_model=base_model_info,
         files=files_inventory,
         adapters=adapters_record,
@@ -1209,7 +1210,8 @@ def restore_bundle(
     by :func:`write_bundle`.  The sequence is:
 
     1. **Read + validate** ``bundle.meta.json`` → :class:`BundleManifest`.
-       Reject if missing or forward-version (``BundleManifestError``).
+       Reject if missing or not at the current schema version (forward or
+       legacy) (``BundleManifestError``).
     2. **Verify file hashes**: each entry in ``manifest.files`` must match the
        on-disk bundle file's SHA-256.  Fail loud on mismatch
        (``FingerprintMismatchError``) — no live mutation occurs.
@@ -1282,8 +1284,9 @@ def restore_bundle(
     Raises
     ------
     BundleManifestError
-        If ``bundle.meta.json`` is missing, unreadable, or schema-mismatched
-        (forward version).  **No mutation has occurred.**
+        If ``bundle.meta.json`` is missing, unreadable, or not at the
+        current schema version (forward or legacy).  **No mutation has
+        occurred.**
     FingerprintMismatchError
         If any file listed in the bundle manifest does not match its stored
         content hash (corrupt bundle).  **No mutation has occurred.**

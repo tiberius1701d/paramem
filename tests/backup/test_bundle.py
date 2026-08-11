@@ -38,6 +38,7 @@ import pytest
 
 from paramem.backup.backup import sweep_orphan_pending, write_bundle
 from paramem.backup.enumerate import enumerate_backups
+from paramem.backup.hashing import plaintext_sha256
 from paramem.backup.types import (
     BUNDLE_SCHEMA_VERSION,
     ArtifactKind,
@@ -277,7 +278,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         assert slot.is_dir(), f"Bundle slot not found at {slot}"
 
@@ -291,7 +291,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         assert (slot / "bundle.meta.json").exists()
 
@@ -305,7 +304,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         raw = json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
         manifest = BundleManifest.from_dict(raw)
@@ -322,7 +320,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
@@ -342,7 +339,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         assert (slot / "adapters" / "episodic" / "indexed_key_registry.json").exists(), (
             "indexed_key_registry.json must be captured for the main episodic tier"
@@ -363,7 +359,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
@@ -380,7 +375,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
@@ -404,7 +398,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         episodic_dir = slot / "adapters" / "episodic"
         assert (episodic_dir / "adapter_model.safetensors").exists()
@@ -425,7 +418,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
@@ -442,7 +434,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
@@ -459,20 +450,15 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
         )
         assert manifest.base_model.get("repo") == "mistralai/Mistral-7B-Instruct-v0.3"
 
-    def test_live_registry_sha256_recorded(self, tmp_path) -> None:
-        """bundle manifest records the live_registry_sha256 verbatim."""
+    def test_key_metadata_sha256_recorded(self, tmp_path) -> None:
+        """bundle manifest records the plaintext SHA-256 of the captured registry."""
         fixtures = _make_fixtures(tmp_path)
-        # live_registry_sha256 is stored verbatim in the bundle manifest regardless
-        # of its value; slot resolution uses tier_registry_sha256 (per-tier content
-        # hash), not this field.  Use the fixture's computed hash so the slot resolves.
-        reg_sha = fixtures["registry_sha256"]
         slot = write_bundle(
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
@@ -480,12 +466,11 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=reg_sha,
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
         )
-        assert manifest.live_registry_sha256 == reg_sha
+        assert manifest.key_metadata_sha256 == plaintext_sha256(fixtures["registry_path"])
 
     def test_no_artifact_meta_sidecar_written(self, tmp_path) -> None:
         """Per-artifact .meta.json sidecars must NOT be written."""
@@ -497,7 +482,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         # No file matching the ArtifactMeta sidecar pattern should exist.
         sidecars = list(slot.glob("**/*.meta.json"))
@@ -525,7 +509,6 @@ class TestWriteBundleHappyPath:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=reg_sha,
         )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
@@ -557,7 +540,6 @@ class TestNoBundleDoubleEncrypt:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
 
         on_disk = (slot / "adapters" / "episodic" / "adapter_model.safetensors").read_bytes()
@@ -578,7 +560,6 @@ class TestNoBundleDoubleEncrypt:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         on_disk = (slot / "adapters" / "episodic" / "adapter_model.safetensors").read_bytes()
         assert on_disk.startswith(age_magic)
@@ -630,7 +611,6 @@ class TestInterimSlotCapture:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=interim_hash,
         )
 
         assert slot.is_dir()
@@ -679,7 +659,6 @@ class TestInterimSlotCapture:
                 backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
                 adapter_scope="main",
-                live_registry_sha256=interim_hash,
             )
 
     def test_adapter_scope_main_message_is_actionable(self, tmp_path) -> None:
@@ -715,7 +694,6 @@ class TestInterimSlotCapture:
                 backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
                 adapter_scope="main",
-                live_registry_sha256=interim_hash,
             )
         msg = str(exc_info.value)
         assert "live" in msg.lower(), f"Error message should mention 'live': {msg}"
@@ -753,7 +731,6 @@ class TestInterimSlotCapture:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=interim_hash,
         )
 
         interim_key = "episodic_interim_20260517T1200"
@@ -801,7 +778,6 @@ class TestInterimSlotCapture:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=interim_hash,
         )
 
         interim_key = "episodic_interim_20260517T1200"
@@ -892,7 +868,9 @@ class TestMultiAdapterBundle:
         """Both procedural main and episodic interim are captured."""
         fx = self._build_multi_adapter_fixtures(tmp_path)
 
-        # Use interim_hash so the interim slot is the 'live' one.
+        # Slot resolution is per-tier via find_live_slot(dir, tier_registry_sha256(dir)):
+        # procedural's own registry content always matches its own main slot,
+        # independent of episodic's interim hash.
         slot = write_bundle(
             config_path=fx["config_path"],
             registry_path=fx["registry_path"],
@@ -901,7 +879,6 @@ class TestMultiAdapterBundle:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=fx["interim_hash"],
         )
 
         manifest = BundleManifest.from_dict(
@@ -911,19 +888,16 @@ class TestMultiAdapterBundle:
         assert "episodic_interim_20260517T1200" in manifest.adapters, (
             "Episodic interim not captured"
         )
-        # Procedural main must be present when its hash matches.
-        # Note: procedural has main_hash != interim_hash, so find_live_slot
-        # won't match procedural; it's recorded absent (non-episodic, no failure).
-        # To capture both we'd need two separate live_registry_sha256 values —
-        # that's not supported in one call.  This test verifies that procedural
-        # absent does NOT fail the bundle (only episodic failures are fatal).
-        assert slot.is_dir(), "Bundle must succeed even when procedural absent"
+        # Procedural main must be present — its own tier hash resolves it
+        # independently of the episodic interim's hash.
+        assert "procedural" in manifest.adapters, "Procedural main not captured"
+        assert slot.is_dir(), "Bundle must succeed"
 
     def test_multi_adapter_procedural_main_captured_when_hash_matches(self, tmp_path) -> None:
         """Both episodic and procedural main slots are captured when both have matching hashes.
 
         Both tiers share the same ``indexed_key_registry.json`` content (and thus
-        the same hash), so a single ``live_registry_sha256`` resolves both.
+        the same hash), so per-tier resolution matches both independently.
         """
         data_dir = tmp_path / "ha"
         data_dir.mkdir()
@@ -968,7 +942,6 @@ class TestMultiAdapterBundle:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=shared_hash,
         )
 
         manifest = BundleManifest.from_dict(
@@ -1028,7 +1001,6 @@ class TestMultiAdapterBundle:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=ep_main_hash,
         )
 
         manifest = BundleManifest.from_dict(
@@ -1088,7 +1060,6 @@ class TestMultiAdapterBundle:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=ep_hash,
         )
 
         assert (slot / "adapters" / "episodic" / "indexed_key_registry.json").exists()
@@ -1139,7 +1110,6 @@ class TestScaffoldingExclusion:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="live",
-            live_registry_sha256=interim_hash,
         )
 
         # No file in the bundle may come from checkpoint-*/ or in_training/.
@@ -1172,7 +1142,6 @@ class TestScaffoldingExclusion:
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
             adapter_scope="main",
-            live_registry_sha256=fixtures["registry_sha256"],
         )
 
         manifest = BundleManifest.from_dict(
@@ -1204,7 +1173,6 @@ class TestMissingOptionalArtifact:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         assert not (slot / "adapters" / "episodic" / "simhash_registry.json").exists()
 
@@ -1227,7 +1195,6 @@ class TestMissingOptionalArtifact:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
         assert slot.is_dir()
         manifest = BundleManifest.from_dict(
@@ -1253,7 +1220,6 @@ class TestSpeakerProfilesCapture:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
             speaker_profiles_path=fixtures["speaker_profiles_path"],
         )
         assert (slot / "speaker_profiles.json").exists()
@@ -1273,7 +1239,6 @@ class TestSpeakerProfilesCapture:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
             speaker_profiles_path=None,
         )
         assert not (slot / "speaker_profiles.json").exists()
@@ -1312,7 +1277,6 @@ class TestFailLoudNoSlot:
                 backups_root=fixtures["base_dir"].parent,
                 backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
-                live_registry_sha256=fixtures["registry_sha256"],
             )
 
     def test_no_slot_leaves_no_promoted_directory(self, tmp_path) -> None:
@@ -1334,7 +1298,6 @@ class TestFailLoudNoSlot:
                 backups_root=base_dir.parent,
                 backups_cfg=ServerBackupsConfig(),
                 meta_fields={"tier": "manual"},
-                live_registry_sha256=fixtures["registry_sha256"],
             )
         slots = (
             [d for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
@@ -1370,7 +1333,6 @@ class TestCrashSafety:
                     backups_root=base_dir.parent,
                     backups_cfg=ServerBackupsConfig(),
                     meta_fields={"tier": "manual"},
-                    live_registry_sha256=fixtures["registry_sha256"],
                 )
 
         assert len(rename_called) == 1
@@ -1398,7 +1360,6 @@ class TestCrashSafety:
                     backups_root=base_dir.parent,
                     backups_cfg=ServerBackupsConfig(),
                     meta_fields={"tier": "manual"},
-                    live_registry_sha256=fixtures["registry_sha256"],
                 )
 
         promoted = (
@@ -1425,7 +1386,6 @@ class TestEnumerateBundle:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
 
         backups_root = fixtures["base_dir"].parent
@@ -1446,7 +1406,6 @@ class TestEnumerateBundle:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
 
         backups_root = fixtures["base_dir"].parent
@@ -1481,7 +1440,6 @@ class TestCandidateConfigSidecar:
             backups_root=fixtures["base_dir"].parent,
             backups_cfg=ServerBackupsConfig(),
             meta_fields={"tier": "pre_base_swap"},
-            live_registry_sha256=fixtures["registry_sha256"],
             candidate_config_path=candidate_config_path,
         )
 
@@ -1590,7 +1548,6 @@ class TestWriteBundleDiskCapRefusal:
             backups_root=backups_root,
             backups_cfg=None,  # bypass the cap to seed the store
             meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
         )
 
         bundle_dir = fixtures["base_dir"]
@@ -1604,7 +1561,6 @@ class TestWriteBundleDiskCapRefusal:
                 backups_root=backups_root,
                 backups_cfg=cfg,
                 meta_fields={"tier": "manual"},
-                live_registry_sha256=fixtures["registry_sha256"],
             )
 
         slots_after = sorted(d.name for d in bundle_dir.iterdir() if d.is_dir())

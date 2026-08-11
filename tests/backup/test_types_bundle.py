@@ -2,7 +2,7 @@
 
 Covers:
 - ``ArtifactKind.SNAPSHOT_BUNDLE`` member present and has correct value.
-- ``BUNDLE_SCHEMA_VERSION`` constant present and equals 1.
+- ``BUNDLE_SCHEMA_VERSION`` constant present and equals 2.
 - ``BundleManifest`` round-trips through ``to_dict`` / ``from_dict``.
 - ``BundleManifest.from_dict`` raises ``BundleManifestError`` on schema-version
   mismatch and on missing required fields.
@@ -51,9 +51,9 @@ class TestBundleSchemaVersionConstant:
         """BUNDLE_SCHEMA_VERSION must be an integer."""
         assert isinstance(BUNDLE_SCHEMA_VERSION, int)
 
-    def test_bundle_schema_version_equals_one(self) -> None:
-        """BUNDLE_SCHEMA_VERSION must be 1 (initial version)."""
-        assert BUNDLE_SCHEMA_VERSION == 1
+    def test_bundle_schema_version_equals_two(self) -> None:
+        """BUNDLE_SCHEMA_VERSION must be 2."""
+        assert BUNDLE_SCHEMA_VERSION == 2
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ def _make_manifest(**overrides) -> BundleManifest:
         created_at="2026-05-20T20:55:00Z",
         tier="manual",
         label=None,
-        live_registry_sha256="a" * 64,
+        key_metadata_sha256="a" * 64,
         base_model={
             "repo": "mistralai/Mistral-7B-Instruct-v0.3",
             "sha": "abc123",
@@ -123,7 +123,7 @@ class TestBundleManifestRoundTrip:
             "created_at",
             "tier",
             "label",
-            "live_registry_sha256",
+            "key_metadata_sha256",
             "base_model",
             "files",
             "adapters",
@@ -197,10 +197,30 @@ class TestBundleManifestRoundTrip:
 
 class TestBundleManifestFromDictErrors:
     def test_wrong_schema_version_raises(self) -> None:
-        """from_dict with bundle_schema_version != 1 raises BundleManifestError."""
+        """from_dict with a wrong bundle_schema_version raises BundleManifestError."""
         bm = _make_manifest()
         d = bm.to_dict()
         d["bundle_schema_version"] = 999
+        with pytest.raises(BundleManifestError, match="bundle_schema_version"):
+            BundleManifest.from_dict(d)
+
+    def test_legacy_v1_manifest_raises(self) -> None:
+        """A well-formed version-1 manifest (pre-rename field name) is refused.
+
+        Pins the strict-refusal contract: a legacy bundle is never silently
+        accepted, even when every other field is well-formed.
+        """
+        d = {
+            "bundle_schema_version": 1,
+            "created_at": "2026-05-20T20:55:00Z",
+            "tier": "manual",
+            "label": None,
+            "live_registry_sha256": "a" * 64,
+            "base_model": {},
+            "files": [],
+            "adapters": {},
+            "excluded": [],
+        }
         with pytest.raises(BundleManifestError, match="bundle_schema_version"):
             BundleManifest.from_dict(d)
 
@@ -228,12 +248,12 @@ class TestBundleManifestFromDictErrors:
         with pytest.raises(BundleManifestError, match="tier"):
             BundleManifest.from_dict(d)
 
-    def test_missing_live_registry_sha256_raises(self) -> None:
-        """Missing 'live_registry_sha256' raises BundleManifestError."""
+    def test_missing_key_metadata_sha256_raises(self) -> None:
+        """Missing 'key_metadata_sha256' raises BundleManifestError."""
         bm = _make_manifest()
         d = bm.to_dict()
-        del d["live_registry_sha256"]
-        with pytest.raises(BundleManifestError, match="live_registry_sha256"):
+        del d["key_metadata_sha256"]
+        with pytest.raises(BundleManifestError, match="key_metadata_sha256"):
             BundleManifest.from_dict(d)
 
     def test_missing_files_raises(self) -> None:

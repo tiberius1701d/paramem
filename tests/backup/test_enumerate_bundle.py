@@ -30,7 +30,7 @@ _VALID_BUNDLE_MANIFEST: dict[str, Any] = {
     "created_at": "2026-05-20T20:55:00Z",
     "tier": "manual",
     "label": None,
-    "live_registry_sha256": "a" * 64,
+    "key_metadata_sha256": "a" * 64,
     "base_model": {},
     "files": [],
     "adapters": {},

@@ -42,7 +42,7 @@ SCHEMA_VERSION: int = 1
 # Bundle manifest schema version — independent of SCHEMA_VERSION.
 # ---------------------------------------------------------------------------
 
-BUNDLE_SCHEMA_VERSION: int = 1
+BUNDLE_SCHEMA_VERSION: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,9 @@ class BundleManifest:
     Schema versioning: ``bundle_schema_version`` is independent of the
     per-artifact ``SCHEMA_VERSION``.  Additions of optional fields (with
     defaults) are non-breaking.  Rename or removal requires a
-    ``BUNDLE_SCHEMA_VERSION`` bump and a migration helper.
+    ``BUNDLE_SCHEMA_VERSION`` bump; ``from_dict`` then strictly refuses any
+    bundle not at the current version (forward or legacy) — there is no
+    migration path for older bundles.
 
     Fields
     ------
@@ -158,14 +160,15 @@ class BundleManifest:
         ``"pre_migration"``, etc.
     label : str | None
         Optional operator-supplied annotation.
-    live_registry_sha256 : str
-        SHA-256 hex of ``key_metadata.json`` at bundle creation time.
-        Provenance only — it is not used to select any slot.  Slot selection
-        is per-tier: each captured slot is resolved with
+    key_metadata_sha256 : str
+        Plaintext SHA-256 hex of the ``key_metadata.json`` bytes captured
+        into this bundle, derived at write time by ``write_bundle`` (empty
+        string when no registry file was captured).  Provenance only — it
+        is not used to select any slot.  Slot selection is per-tier: each
+        captured slot is resolved with
         ``find_live_slot(adapter_kind_dir, tier_registry_sha256(adapter_kind_dir))``
-        (``backup.py:858``) and its own hash is recorded at
-        ``adapters.<name>.registry_sha256``; a single global hash cannot
-        address both main and interim tiers (``backup.py:847-848``).
+        and its own hash is recorded at ``adapters.<name>.registry_sha256``;
+        a single global hash cannot address both main and interim tiers.
     base_model : dict
         Base-model identity copied from the first enabled adapter's
         ``meta.json``.  Expected keys: ``repo`` (str), ``sha`` (str),
@@ -192,7 +195,7 @@ class BundleManifest:
     created_at: str
     tier: str
     label: str | None
-    live_registry_sha256: str
+    key_metadata_sha256: str
     base_model: dict
     files: list[dict]
     adapters: dict
@@ -235,7 +238,7 @@ class BundleManifest:
         required = (
             "created_at",
             "tier",
-            "live_registry_sha256",
+            "key_metadata_sha256",
             "base_model",
             "files",
             "adapters",
@@ -249,7 +252,7 @@ class BundleManifest:
             created_at=data["created_at"],
             tier=data["tier"],
             label=data.get("label"),
-            live_registry_sha256=data["live_registry_sha256"],
+            key_metadata_sha256=data["key_metadata_sha256"],
             base_model=data["base_model"],
             files=data["files"],
             adapters=data["adapters"],
@@ -302,7 +305,7 @@ class BundleManifestError(BackupError):
 
     Raised by ``BundleManifest.from_dict()`` on:
 
-    - ``bundle_schema_version`` mismatch (forward or unknown version).
+    - ``bundle_schema_version`` mismatch (forward or legacy version).
     - Missing required fields in the manifest dict.
 
     Callers must not treat bundle content as trustworthy when this is raised.

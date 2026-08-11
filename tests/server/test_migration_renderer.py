@@ -411,8 +411,9 @@ class TestComputeShapeChangesWithManifest:
 
 
 # ---------------------------------------------------------------------------
-# compute_shape_changes — per-tier registry hash (no live_registry_sha256
-# parameter; each adapter's own tier registry hash resolves its live slot)
+# compute_shape_changes — per-tier registry hash (no single caller-supplied
+# registry-hash parameter; each adapter's own tier registry hash resolves
+# its live slot)
 # ---------------------------------------------------------------------------
 
 
@@ -420,7 +421,7 @@ class TestComputeShapeChangesLiveSlotIntegration:
     """Regression coverage for the per-tier hash fix.
 
     Before the fix, ``compute_shape_changes`` took a single caller-supplied
-    ``live_registry_sha256`` hashed from ``key_metadata.json`` — a file no
+    registry hash computed from ``key_metadata.json`` — a file no
     manifest writer ever stamps a slot with (every writer stamps the
     *tier's own* ``indexed_key_registry.json`` hash via
     ``tier_registry_sha256``).  The two digests could never be equal, so

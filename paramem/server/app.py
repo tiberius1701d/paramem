@@ -11629,19 +11629,7 @@ async def _run_base_swap_orchestration(
                 )
             pre_trial_hash = _resume_marker.pre_trial_config_sha256
         else:
-            # Fresh start — compute from disk.
-            live_registry_sha256 = ""
-            try:
-                if hasattr(config, "paths") and config.paths.data is not None:
-                    reg_path = config.paths.key_metadata
-                    if reg_path.exists():
-                        from paramem.backup.hashing import plaintext_sha256
-
-                        live_registry_sha256 = plaintext_sha256(reg_path)
-            except Exception:  # noqa: BLE001
-                live_registry_sha256 = ""
-
-            # Build per-tier adapter_dirs dict from the live config.
+            # Fresh start — build per-tier adapter_dirs dict from the live config.
             adapter_dirs: dict[str, Path] = {}
             adapters_cfg = getattr(config, "adapters", None)
             for _tier_name in ("episodic", "semantic", "procedural"):
@@ -11664,7 +11652,6 @@ async def _run_base_swap_orchestration(
                 backups_cfg=config.security.backups,
                 meta_fields={"tier": "pre_base_swap", "label": f"pre_base_swap_{new_model}"},
                 adapter_scope="live",
-                live_registry_sha256=live_registry_sha256,
                 speaker_profiles_path=(
                     speaker_profiles_path if speaker_profiles_path.exists() else None
                 ),
