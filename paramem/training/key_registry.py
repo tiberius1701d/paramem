@@ -234,10 +234,10 @@ class KeyRegistry:
         """Active∪stale fingerprint map ``{key: fp}`` for all keys that have one.
 
         PRIVATE — intentionally not a public accessor.  Used by
-        :meth:`MemoryStore.tier_simhashes(include_stale=True)`,
-        :meth:`MemoryStore.snapshot`, the integrity check, and
-        :meth:`load_simhashes` (the on-disk leaf, which projects a
-        freshly-parsed payload through this same accessor).
+        :meth:`MemoryStore.tier_simhashes(include_stale=True)`, the
+        integrity check, and :meth:`load_simhashes` (the on-disk leaf,
+        which projects a freshly-parsed payload through this same
+        accessor).
 
         The returned map is what is serialised to ``indexed_key_registry.json``
         under the ``"simhash"`` key, so the on-disk file always holds the full

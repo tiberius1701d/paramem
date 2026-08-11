@@ -76,6 +76,7 @@ class TestServeTurnPhaseRecord:
                 model=MagicMock(),
                 tokenizer=MagicMock(),
                 config=config,
+                memory_store=_MS(replay_enabled=False),
             )
             serve_records = [r for r in trace.records if r.name == "serve_turn"]
 
@@ -107,6 +108,7 @@ class TestServeTurnPhaseRecord:
                     tokenizer=MagicMock(),
                     config=config,
                     router=router,
+                    memory_store=_MS(replay_enabled=False),
                 )
             serve_records = [r for r in trace.records if r.name == "serve_turn"]
 
@@ -142,6 +144,7 @@ class TestIsResidualUnconditional:
                 tokenizer=MagicMock(),
                 config=config,
                 router=router,
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.diagnostics["is_residual"] is True
@@ -207,6 +210,7 @@ class TestRoutingBranchDiagnostics:
             config=config,
             router=router,
             ha_client=ha_client,
+            memory_store=_MS(replay_enabled=False),
         )
 
         assert result.diagnostics["exit_via"] == "general_ha"
@@ -235,6 +239,7 @@ class TestRoutingBranchDiagnostics:
                 config=config,
                 router=router,
                 cloud_agent=MagicMock(),
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.diagnostics["exit_via"] == "general_cloud"
@@ -295,6 +300,7 @@ class TestRoutingBranchDiagnostics:
                 tokenizer=MagicMock(),
                 config=config,
                 router=None,
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.diagnostics["exit_via"] == "base_model"

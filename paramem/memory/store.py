@@ -47,7 +47,7 @@ The per-key bookkeeping fields live in :attr:`MemoryStore._bookkeeping` — a fl
 ``{key → {speaker_id, relation_type, reinforcement_count, last_reinforced_cycle,
 last_seen, first_seen}}`` dict SEPARATE from ``_entries``.  Populated by
 :meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
-Never enters :meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash path.
+Never enters :meth:`KeyRegistry.save_bytes` or any hash path.
 
 **Content-only invariant:**
 Every ``_entries`` slot — whether written by the INFERENCE cache (boot
@@ -62,14 +62,6 @@ exclusively in :attr:`MemoryStore._bookkeeping`:
 All ``store.get`` readers in ``consolidation.py`` are SPO-only readers, not
 bookkeeping sites; a fresh fold and a resumed fold write the identical entry
 shape.
-
-Snapshot / restore (:meth:`snapshot`, :meth:`restore`) capture the entry and
-simhash fingerprint state for the cycle-resume rollback rope.  The simhash map
-is captured as ``{"simhash": {tier: known_simhashes_dict}}`` — active∪stale per
-tier — so fingerprints survive rollback.  Registries persist via their own
-:meth:`KeyRegistry.save` / :meth:`KeyRegistry.load` lifecycle and are restored
-separately from disk on rollback.  ``_bookkeeping`` is NOT in the snapshot — it
-is reloaded from ``key_metadata.json`` on boot.
 
 **SimHash storage:**
 SimHash fingerprints live exclusively in :class:`KeyRegistry` (one per tier).
@@ -99,13 +91,13 @@ Rules for callers and maintainers:
 1. Every method that reads or writes any of the three structures holds
    ``self._lock`` for the duration of its in-RAM access.  RLock (not plain Lock)
    is used because compound mutators (``move``, ``delete``, ``discard_keys``,
-   ``restore``, compound ``put``) call other wrapped leaf methods reentrantly.
+   compound ``put``) call other wrapped leaf methods reentrantly.
 
 2. ``iter_entries()`` and ``iter_bookkeeping()`` materialise a snapshot list
    under the lock, then yield from the snapshot outside the lock.  Callers
    iterate lock-free without risk of observing a concurrent structural mutation.
 
-3. Compound mutators (``delete``, ``move``, ``discard_keys``, ``restore``,
+3. Compound mutators (``delete``, ``move``, ``discard_keys``,
    ``put`` when writing entry + simhash + registry) hold the lock ONCE around
    the whole compound so a reader never sees a half-updated multi-structure state.
    Nested leaf-method calls succeed via RLock reentrancy.
@@ -145,7 +137,6 @@ Rules for callers and maintainers:
 
 from __future__ import annotations
 
-import copy
 import logging
 import threading
 from collections.abc import Iterable, Iterator
@@ -232,8 +223,8 @@ class MemoryStore:
         #         "reinforcement_count": int, "last_reinforced_cycle": int,
         #         "last_seen": str, "first_seen": str}
         # Populated by load_bookkeeping_from_disk at boot.  Never enters
-        # snapshot/restore or KeyRegistry.save_bytes — stays out of the
-        # hash-frozen slot-identity path.
+        # KeyRegistry.save_bytes — stays out of the hash-frozen slot-identity
+        # path.
         self._bookkeeping: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
@@ -363,7 +354,7 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # Per-key bookkeeping — speaker_id / relation_type / reinforcement_count
     #                       / last_reinforced_cycle / last_seen / first_seen
-    # SEPARATE from _entries; never in snapshot or KeyRegistry.save_bytes.
+    # SEPARATE from _entries; never in KeyRegistry.save_bytes.
     # ------------------------------------------------------------------
     def set_bookkeeping(
         self,
@@ -626,23 +617,6 @@ class MemoryStore:
             # Retire bookkeeping in lockstep so _bookkeeping never drifts.
             self._bookkeeping.pop(key, None)
             return former
-
-    def clear_entries(self) -> int:
-        """Remove all entry payloads from the content cache.
-
-        Clears ``_entries`` only — registries (including their simhash maps)
-        and ``_bookkeeping`` are left intact so the authoritative key-lifecycle
-        state survives the purge.  The intended caller is
-        :func:`paramem.server.app._hydrate_memory_store_in_place`, which clears
-        the stale pre-fold cache before re-probing active keys against the
-        freshly-retrained weights.
-
-        Returns the total number of entries that were dropped across all tiers.
-        """
-        with self._lock:
-            total = sum(len(tier_entries) for tier_entries in self._entries.values())
-            self._entries.clear()
-            return total
 
     def move(self, key: str, new_tier: str) -> None:
         """Move *key* from its current tier to *new_tier* atomically.
@@ -1055,55 +1029,6 @@ class MemoryStore:
             if reg is None:
                 return
             reg.reactivate(key)
-
-    # ------------------------------------------------------------------
-    # Snapshot / restore — cycle-resume rollback rope
-    # ------------------------------------------------------------------
-    def snapshot(self) -> dict:
-        """Deep-copy the entry and simhash state for rollback.
-
-        The ``"simhash"`` entry captures active∪stale fingerprints per tier
-        from the registry (the unified source of truth), so fingerprints survive
-        rollback correctly.
-
-        Registries are NOT included — they have their own persistence
-        lifecycle (KeyRegistry.save / KeyRegistry.load to per-tier
-        ``indexed_key_registry.json`` files).  The rollback caller is
-        responsible for restoring registries from disk separately.
-
-        ``_bookkeeping`` is NOT included — it is reloaded from
-        ``key_metadata.json`` on boot."""
-        with self._lock:
-            simhash_snap: dict[str, dict[str, int]] = {}
-            for tier, reg in self._registry.items():
-                known = reg._known_simhashes()
-                if known:
-                    simhash_snap[tier] = known
-            return {
-                "entries": copy.deepcopy(self._entries),
-                "simhash": simhash_snap,
-            }
-
-    def restore(self, snap: dict) -> None:
-        """Restore entry and simhash state from :meth:`snapshot` output.
-
-        Re-seeds each tier's registry with the active fingerprints from the
-        snapshot map.  Stale fingerprints are reloaded from the registry
-        on-disk during the separate registry-restore step (callers are
-        responsible for that).
-
-        The entire compound rebind is performed under a single lock acquisition
-        so a concurrent reader never observes a half-restored state."""
-        with self._lock:
-            self._entries = copy.deepcopy(snap["entries"])
-            snap_simhash: dict[str, dict[str, int]] = snap.get("simhash", {})
-            # Clear existing registry active simhashes and re-seed from the snapshot.
-            for tier, fp_map in snap_simhash.items():
-                reg = self._registry.setdefault(tier, KeyRegistry())
-                reg._simhash.clear()
-                for key, fp in fp_map.items():
-                    if key not in reg._stale:
-                        reg._simhash[key] = fp
 
     # ------------------------------------------------------------------
     # Probe — resolve {key → entry} for inference, with optional source fallback

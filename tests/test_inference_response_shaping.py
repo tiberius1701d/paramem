@@ -581,40 +581,6 @@ class TestTemporalSelectionWiring(_PlanBuilder):
         )
         assert result.text == "final answer."
 
-    def test_memory_store_none_gate_skips_stage(self, monkeypatch):
-        """``memory_store=None`` alone gates the stage off — even with
-        ``temporal_selection_enabled`` at its True default and a
-        non-empty plan. ``select_date_groups`` must never be called; the
-        function then fails exactly where pre-feature code always would
-        (``memory_store.probe`` needs a real store), never inside the
-        temporal block — proof the gate, not an accident of call order,
-        is what skipped the stage."""
-
-        def exploding_select(*args, **kwargs):
-            raise AssertionError("select_date_groups must not be called when memory_store is None")
-
-        monkeypatch.setattr("paramem.server.inference.select_date_groups", exploding_select)
-
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-        model = self.make_model(["episodic"])
-
-        config = ServerConfig()
-        assert config.inference.temporal_selection_enabled is True
-
-        plan = self.make_plan([("episodic", ["e1"])])
-
-        with pytest.raises(AttributeError):
-            _probe_and_reason(
-                text="What do I like?",
-                plan=plan,
-                history=None,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-                memory_store=None,
-            )
-
     def test_selection_all_true_probe_set_identical_context_gains_headers(self, monkeypatch):
         """Selection stub returns ``all=True``: the probed key set is
         unchanged, and the only rendering delta is the Today header plus

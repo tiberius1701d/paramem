@@ -727,73 +727,6 @@ class TestReactivate:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot / restore — cycle-resume rollback rope
-# ---------------------------------------------------------------------------
-
-
-class TestSnapshotRestore:
-    def test_snapshot_then_mutate_then_restore(self):
-        """Snapshot captures both entries and simhash; restore brings both back.
-
-        This is the core cycle-resume rollback rope contract.  Simhash is now
-        captured from the registry so fingerprints survive
-        rollback correctly even after the registry simhash moved off _simhash.
-        """
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0xCAFE)
-        snap = s.snapshot()
-        # Mutate
-        s.put("episodic", "graph2", _entry("graph2"))
-        s.delete("graph1")
-        assert s.get("graph2") is not None
-        assert s.get("graph1") is None
-        # Restore
-        s.restore(snap)
-        assert s.get("graph1") == _entry("graph1")
-        # Simhash must survive restore.
-        assert s.simhash("episodic", "graph1") == 0xCAFE
-        assert s.get("graph2") is None
-
-    def test_snapshot_does_not_share_mutable_state(self):
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"))
-        snap = s.snapshot()
-        # Mutate snapshot — store must be unaffected.
-        snap["entries"]["episodic"]["graph1"]["subject"] = "Eve"
-        assert s.get("graph1")["subject"] == "Alice"
-
-    def test_snapshot_excludes_registry_lifecycle_but_includes_fingerprints(self):
-        """Registries persist via their own KeyRegistry.save/load lifecycle.
-
-        The snapshot DOES carry the fingerprint map so fingerprints
-        survive rollback, but the registry lifecycle (active/stale partitions)
-        is NOT included — that is restored from disk separately.
-        """
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0xDEAD)
-        snap = s.snapshot()
-        assert "entries" in snap
-        assert "simhash" in snap  # fingerprints ARE included
-        assert "registry" not in snap  # lifecycle partitions are NOT
-        # The fingerprint for graph1 must be in the snapshot map.
-        assert snap["simhash"].get("episodic", {}).get("graph1") == 0xDEAD
-
-    def test_snapshot_stale_fingerprint_included(self):
-        """Stale fingerprints are included in the snapshot simhash map.
-
-        When a key is staled its fingerprint moves to the stale record; the
-        snapshot must capture it from _known_simhashes (active∪stale) so the
-        stale-echo confidence gate still works after rollback.
-        """
-        s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"), simhash=0xBEEF)
-        s.discard_keys(["graph1"], mode="stale")
-        snap = s.snapshot()
-        # The stale fingerprint must appear in the snapshot.
-        assert snap["simhash"].get("episodic", {}).get("graph1") == 0xBEEF
-
-
-# ---------------------------------------------------------------------------
 # Stats — diagnostic surface
 # ---------------------------------------------------------------------------
 
@@ -976,14 +909,6 @@ class TestBookkeeping:
         assert set(probed) == {"k1", "k2"}
         assert results["k1"] is not None
         assert results["k2"] is not None
-
-    def test_snapshot_excludes_bookkeeping(self):
-        """_bookkeeping must not enter snapshot — it is boot-loaded from disk."""
-        s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="factual", first_seen="")
-        snap = s.snapshot()
-        assert "_bookkeeping" not in snap
-        assert "bookkeeping" not in snap
 
     # -- relation_type round-trip tests --
 

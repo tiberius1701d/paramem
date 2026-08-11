@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from paramem.memory.store import MemoryStore
 from paramem.server.config import load_server_config
 from paramem.server.inference import handle_chat
 from paramem.server.router import RoutingPlan
@@ -128,6 +129,7 @@ class TestAbstentionEndToEnd:
             config=server_config,
             router=empty_adapter_router,
             speaker_id="spk-integration-test",
+            memory_store=MemoryStore(replay_enabled=False),
         )
 
         assert result.text == server_config.abstention.load_cold_start_response()
@@ -151,6 +153,7 @@ class TestAbstentionEndToEnd:
             config=server_config,
             router=empty_adapter_router,
             speaker_id="spk-anon-77",
+            memory_store=MemoryStore(replay_enabled=False),
         )
 
         assert result.text == server_config.abstention.load_cold_start_response()
@@ -189,6 +192,7 @@ class TestAbstentionEndToEnd:
                 cloud_agent=None,
                 ha_client=None,
                 speaker_id="spk-integration-test",
+                memory_store=MemoryStore(replay_enabled=False),
             )
 
         mock_base_model.assert_called_once()

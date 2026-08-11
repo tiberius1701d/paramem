@@ -314,15 +314,18 @@ def handle_chat(
     model,
     tokenizer,
     config: ServerConfig,
+    memory_store,
     router=None,
     cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker_id: str | None = None,
     language: str | None = None,
     effective_mode: str | None = None,
-    memory_store=None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
+
+    ``memory_store`` is required: in production it is ``_state["memory_store"]``,
+    assigned unconditionally at lifespan (both local and cloud-only boot).
 
     Routing reads ``RoutingPlan.intent`` populated by the router's
     classify_intent() pass:
@@ -1028,6 +1031,7 @@ def _probe_and_reason(
     model,
     tokenizer,
     config: ServerConfig,
+    memory_store,
     cloud_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
@@ -1035,9 +1039,11 @@ def _probe_and_reason(
     language: str | None = None,
     is_personal: bool = False,
     effective_mode: str | None = None,
-    memory_store=None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
+
+    ``memory_store`` is required: in production it is ``_state["memory_store"]``,
+    threaded through :func:`handle_chat`.
 
     Builds a ``keys_by_adapter`` dict from the routing plan's steps
     (preserving router order: procedural → episodic → semantic → session
@@ -1065,8 +1071,8 @@ def _probe_and_reason(
     [ESCALATE]).  Personal-class queries never reach the cloud.
 
     Date-group selection stage: when ``config.inference.temporal_selection_enabled``
-    is True, ``memory_store`` is resolved, and ``plan.steps`` is non-empty,
-    asks the local model (adapter off, temperature 0, via
+    is True and ``plan.steps`` is non-empty, asks the local model
+    (adapter off, temperature 0, via
     :func:`~paramem.server.temporal_selection.select_date_groups`) which of
     the plan's keys — read from bookkeeping and parsed to a calendar date
     once via :func:`~paramem.server.temporal.build_date_by_key` — the
@@ -1122,11 +1128,7 @@ def _probe_and_reason(
         today: date | None = None
         date_by_key: dict[str, date | None] | None = None
         period_note: str | None = None
-        temporal_stage_active = (
-            config.inference.temporal_selection_enabled
-            and memory_store is not None
-            and bool(plan.steps)
-        )
+        temporal_stage_active = config.inference.temporal_selection_enabled and bool(plan.steps)
 
         if temporal_stage_active:
             today = date.today()
