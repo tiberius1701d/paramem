@@ -107,24 +107,6 @@ def _make_registry(n: int, tmp_path: Path, fname: str = "key_metadata.json") -> 
     return p
 
 
-def _make_enriched_registry(n: int, tmp_path: Path) -> Path:
-    """Write an enriched registry with ``n`` keys."""
-    registry = {
-        f"graph{i}": {
-            "simhash": i * 1000 + 1,
-            "created_at": "2026-04-22T00:00:00+00:00",
-            "last_seen_at": "2026-04-22T00:00:00+00:00",
-            "session_id": "s1",
-            "status": "active",
-            "stale_since": None,
-        }
-        for i in range(1, n + 1)
-    }
-    p = tmp_path / "registry_enriched.json"
-    p.write_text(json.dumps(registry))
-    return p
-
-
 def _make_trial_adapter(tmp_path: Path, with_registry: bool = True) -> Path:
     """Create a minimal trial adapter directory with placeholder files.
 
