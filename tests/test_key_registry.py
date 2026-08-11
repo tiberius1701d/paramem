@@ -141,6 +141,78 @@ class TestPersistence:
         assert loaded.list_active() == [f"key_{i:02d}" for i in range(10)]
 
 
+class TestStrictLoadShape:
+    """``KeyRegistry.load`` is the single shape predicate for
+    ``indexed_key_registry.json``: an ABSENT file loads empty (fresh-install
+    contract — pinned by ``TestPersistence.test_load_missing_file`` above,
+    not duplicated here), but an EXISTING file must be a dict with a
+    list-valued ``"active_keys"`` AND a dict-valued ``"simhash"`` or it is
+    refused.
+    """
+
+    def test_refuses_non_dict_payload(self, tmp_path):
+        """A JSON document that is not an object at all is not a registry file."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps(["graph1", "graph2"]))
+        with pytest.raises(ValueError, match="not a JSON object"):
+            KeyRegistry.load(path)
+
+    def test_refuses_existing_null_payload(self, tmp_path):
+        """A file containing the bare JSON literal ``null`` must NOT collapse
+        onto the absent-file sentinel.
+
+        ``json.loads("null")`` parses to Python ``None`` — the same value an
+        absent file's read short-circuits to before this check ever runs.
+        ``load`` distinguishes the two via ``path.exists()`` (checked before
+        any parse), so an EXISTING ``null`` file is refused like any other
+        non-dict payload rather than silently treated as fresh.
+        """
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text("null")
+        with pytest.raises(ValueError, match="not a JSON object"):
+            KeyRegistry.load(path)
+
+    def test_refuses_missing_active_keys(self, tmp_path):
+        """A dict payload with no ``"active_keys"`` at all is refused."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"simhash": {}}))
+        with pytest.raises(ValueError, match="active_keys"):
+            KeyRegistry.load(path)
+
+    def test_refuses_non_list_active_keys(self, tmp_path):
+        """A non-list ``"active_keys"`` is a schema fault, not tolerable input."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"active_keys": {"graph1": True}, "simhash": {}}))
+        with pytest.raises(ValueError, match="active_keys"):
+            KeyRegistry.load(path)
+
+    def test_refuses_missing_simhash(self, tmp_path):
+        """A dict payload with ``"active_keys"`` but no ``"simhash"`` is refused."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"active_keys": ["graph1"]}))
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load(path)
+
+    def test_refuses_non_dict_simhash(self, tmp_path):
+        """A ``"simhash"`` field that is not a map is a schema fault, not empty."""
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"active_keys": ["graph1"], "simhash": 5}))
+        with pytest.raises(ValueError, match="simhash"):
+            KeyRegistry.load(path)
+
+    def test_load_simhashes_delegates_to_load(self, tmp_path):
+        """``load_simhashes`` shares the same shape check — no second gate.
+
+        A payload carrying only ``"simhash"`` (no ``"active_keys"``) used to
+        pass ``load_simhashes``'s own standalone guard before the collapse;
+        it now raises exactly like ``load`` does on the identical file.
+        """
+        path = tmp_path / "indexed_key_registry.json"
+        path.write_text(_json.dumps({"simhash": {"graph1": 1}}))
+        with pytest.raises(ValueError, match="active_keys"):
+            KeyRegistry.load_simhashes(path)
+
+
 class TestPerTierSchema:
     """Per-tier KeyRegistry: each registry owns one tier's keys.
 
@@ -218,6 +290,7 @@ class TestPerTierSchema:
         payload = {
             "active_keys": ["graph1", "graph2", "graph3"],
             "fidelity_history": {"graph1": [0.9, 0.85]},
+            "simhash": {},
             "some_future_field": {"anything": True},
         }
         path.write_text(_json.dumps(payload))
@@ -399,6 +472,7 @@ class TestStaleSemantics:
         legacy = {
             "active_keys": ["graph1", "graph2"],
             "fidelity_history": {},
+            "simhash": {},
             # no "stale" key
         }
         path.write_text(_json.dumps(legacy))
@@ -695,18 +769,6 @@ class TestLoadSimhashes:
 
         assert KeyRegistry.load_simhashes(path) == {}
 
-    def test_load_stays_tolerant_of_an_absent_simhash_section(self, tmp_path):
-        """``load`` keeps the tolerance ``load_simhashes`` refuses.
-
-        The boot walk (``MemoryStore.read_registries_from_disk``) must not die
-        on a file without fingerprints; only the caller that specifically asks
-        for fingerprints is told the file cannot answer.
-        """
-        path = tmp_path / "indexed_key_registry.json"
-        path.write_text(_json.dumps({"active_keys": ["graph1"]}))
-
-        assert KeyRegistry.load(path).list_active() == ["graph1"]
-
     def test_key_metadata_shape_raises(self, tmp_path):
         """key_metadata.json carries bookkeeping, never a fingerprint.
 
@@ -723,22 +785,6 @@ class TestLoadSimhashes:
                 }
             )
         )
-
-        with pytest.raises(ValueError, match="simhash"):
-            KeyRegistry.load_simhashes(path)
-
-    def test_non_dict_simhash_section_raises(self, tmp_path):
-        """A ``"simhash"`` field that is not a map is a schema fault, not empty."""
-        path = tmp_path / "indexed_key_registry.json"
-        path.write_text(_json.dumps({"active_keys": ["graph1"], "simhash": 5}))
-
-        with pytest.raises(ValueError, match="simhash"):
-            KeyRegistry.load_simhashes(path)
-
-    def test_non_dict_payload_raises(self, tmp_path):
-        """A JSON document that is not an object at all is not a registry file."""
-        path = tmp_path / "indexed_key_registry.json"
-        path.write_text(_json.dumps(["graph1", "graph2"]))
 
         with pytest.raises(ValueError, match="simhash"):
             KeyRegistry.load_simhashes(path)

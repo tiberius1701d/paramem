@@ -303,9 +303,12 @@ class TestReadSimhashRegistryPerTierPaths:
         untrained tier writes an EMPTY map, which is accepted below), so its
         absence means the walk was handed something that is not one of ours.
         Contributing "no fingerprints" for it would silently un-gate every key
-        of that tier.  The boot walk that must survive such a file reads
-        ``KeyRegistry.load``, which is deliberately tolerant; only the caller
-        that asks for fingerprints is told the file cannot answer.
+        of that tier.  ``KeyRegistry.load`` is the single shape predicate for
+        this file and refuses anything that is not affirmatively
+        KeyRegistry-shaped (a dict with a list-valued ``"active_keys"`` AND a
+        dict-valued ``"simhash"``) — this assertion exercises exactly that
+        refusal, reached here via ``load_simhashes``, which delegates to
+        ``load`` for the same check.
         """
         adapter_dir = tmp_path / "adapters"
         (adapter_dir / "episodic").mkdir(parents=True)

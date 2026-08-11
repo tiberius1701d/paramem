@@ -150,6 +150,84 @@ class TestInterimOrphanPruneDataLoss:
         assert set(kept) == {"live0"}
 
 
+class TestPruneRefusesUnreadableRegistry:
+    """A tier registry that is not KeyRegistry-shaped (foreign JSON, corrupt
+    schema) makes the retention union unprovable — prune must refuse rather
+    than treat the tier as if it carried zero keys, which would delete
+    bookkeeping for keys the unreadable tier still legitimately knows about.
+    """
+
+    def test_foreign_shaped_registry_refuses_prune(self, tmp_path, caplog):
+        """A registry file missing the 'simhash' section (now a KeyRegistry.load
+        ValueError, not a tolerated empty read) makes prune refuse entirely —
+        0 removed, key_metadata.json untouched, logged at WARNING."""
+        import logging
+
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True, exist_ok=True)
+        # Foreign-shaped registry: has active_keys but no simhash section.
+        (adapter_dir / "episodic" / "indexed_key_registry.json").write_text(
+            json.dumps({"active_keys": ["live0"]})
+        )
+
+        km_path = tmp_path / "registry" / "key_metadata.json"
+        _write_key_metadata(km_path, ["live0", "stale0"])
+
+        cfg = _make_config(adapter_dir, km_path)
+        caplog.set_level(logging.WARNING, logger="paramem.server.consolidation")
+        removed = prune_key_metadata_orphans(cfg)
+
+        assert removed == 0, "prune must refuse when a tier registry is unreadable"
+        kept = _read_key_metadata(km_path)["keys"]
+        assert set(kept) == {"live0", "stale0"}, (
+            "key_metadata.json must be left untouched when prune refuses"
+        )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("indexed_key_registry.json" in msg for msg in warnings), (
+            f"expected a WARNING naming the unreadable registry, got: {warnings}"
+        )
+
+    def test_one_good_tier_does_not_save_a_sibling_foreign_tier(self, tmp_path, caplog):
+        """The exact case the guard defends: episodic reads cleanly and
+        contributes a live key, but semantic is foreign-shaped. The whole
+        prune must still refuse — a partially-built retention union (missing
+        semantic's legitimately-known keys) is just as unprovable as an
+        entirely-unreadable one. No key_metadata row is deleted (including
+        one keyed to the foreign tier), and the WARNING names semantic's
+        file, not episodic's."""
+        import logging
+
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True, exist_ok=True)
+        _write_registry(adapter_dir / "episodic" / "indexed_key_registry.json", ["live0"])
+
+        semantic_dir = adapter_dir / "semantic"
+        semantic_dir.mkdir(parents=True, exist_ok=True)
+        semantic_reg_path = semantic_dir / "indexed_key_registry.json"
+        # Foreign-shaped: has active_keys but no simhash section.
+        semantic_reg_path.write_text(json.dumps({"active_keys": ["ghost0"]}))
+
+        km_path = tmp_path / "registry" / "key_metadata.json"
+        _write_key_metadata(km_path, ["live0", "ghost0"])
+
+        cfg = _make_config(adapter_dir, km_path)
+        caplog.set_level(logging.WARNING, logger="paramem.server.consolidation")
+        removed = prune_key_metadata_orphans(cfg)
+
+        assert removed == 0, "one readable tier must not let prune ignore a foreign sibling"
+        kept = _read_key_metadata(km_path)["keys"]
+        assert set(kept) == {"live0", "ghost0"}, (
+            "no row may be dropped while the retention union is unprovable"
+        )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(str(semantic_reg_path) in msg for msg in warnings), (
+            f"expected a WARNING naming semantic's registry file, got: {warnings}"
+        )
+        assert not any(
+            "episodic" in msg and "indexed_key_registry.json" in msg for msg in warnings
+        ), f"episodic read cleanly and must not be named in the refusal WARNING, got: {warnings}"
+
+
 class TestSoftStaleBookkeepingRetention:
     """Soft-staled keys' bookkeeping must survive prune_key_metadata_orphans
     and be persisted by ConsolidationLoop.write_key_metadata.

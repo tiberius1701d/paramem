@@ -750,6 +750,41 @@ class TestGate3AdapterReloadQuad:
         )
         assert g.status == "skipped"
 
+    def test_foreign_shaped_registry_fails_not_raises(self, tmp_path):
+        """A foreign-shaped indexed_key_registry.json (missing 'simhash')
+        must surface as GateResult(status="fail") with a read-failure
+        reason — not propagate KeyRegistry.load's ValueError past the gate.
+
+        Regression for the strict-load collapse in _gate_3_reload_smoke:
+        the dead "legacy/flat registries" hand-parse fallback was deleted
+        in favor of KeyRegistry.load being the single reader, so this shape
+        must now fail at the FIRST read (all_keys), not silently produce a
+        key that later dies at the simhash load."""
+        d = tmp_path / "trial_adapter_foreign"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "adapter_config.json").write_text("{}")
+        (d / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+        episodic_dir = d / "episodic"
+        episodic_dir.mkdir(parents=True, exist_ok=True)
+        # Foreign-shaped: active_keys present, but no simhash section.
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            json.dumps({"active_keys": ["graph1", "graph2"]})
+        )
+
+        g = _gate_3_reload_smoke(
+            session_buffer_empty=False,
+            summary={"status": "complete"},
+            model=_make_mock_model(),
+            tokenizer=MagicMock(),
+            trial_adapter_dir=d,
+            mount_state={},
+        )
+
+        assert g.status == "fail"
+        assert g.gate == 3
+        assert "failed to read indexed_key_registry.json" in g.reason
+        assert "simhash" in g.reason
+
     # test_default_qa_path_unchanged: removed with QA-format retirement.
 
 

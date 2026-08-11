@@ -244,6 +244,26 @@ class TestRegistryFailure:
         sim_checks = [c for c in report.checks if c.category == "simhash" and c.tier == "episodic"]
         assert all(c.status in (_OK, _SKIPPED) for c in sim_checks)
 
+    def test_foreign_shaped_registry_is_schema_error(self, tmp_path):
+        """A registry file that fails KeyRegistry.load's strict shape check
+        (foreign JSON, missing 'simhash') reports schema_error for the
+        registry category — the ValueError -> _SCHEMA_ERROR arm in
+        _check_registry, the live-half counterpart to the manifest one
+        pinned below (TestManifestFailure.test_bad_schema_manifest)."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        # Foreign-shaped: has active_keys but no simhash section.
+        (ep_dir / "indexed_key_registry.json").write_text(
+            json.dumps({"active_keys": ["key1"]}), encoding="utf-8"
+        )
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        assert report.ok is False
+        registry_failures = [f for f in report.failures if f.category == "registry"]
+        assert len(registry_failures) >= 1
+        assert registry_failures[0].status == _SCHEMA_ERROR
+
 
 class TestManifestFailure:
     def test_bad_schema_manifest(self, tmp_path):

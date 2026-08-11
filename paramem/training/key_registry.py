@@ -335,10 +335,10 @@ class KeyRegistry:
         (``_known_simhashes()``).  This is the unified on-disk layout; the
         separate ``simhash_registry.json`` file has been removed.
 
-        A file written by this method will be read back by :meth:`load`
-        which expects ``"simhash"`` to be present — files without it (old
-        schema or fresh-start) are treated as a fresh/empty store per the
-        fresh-start mandate.
+        A file written by this method will be read back by :meth:`load`,
+        which REQUIRES ``"simhash"`` (and ``"active_keys"``) to be present —
+        a file missing either is refused with :class:`ValueError`, not
+        silently treated as a fresh/empty store.
         """
         data = {
             "active_keys": self._active_keys,
@@ -383,19 +383,51 @@ class KeyRegistry:
     def load(cls, path: str | Path) -> "KeyRegistry":
         """Load a tier's registry from ``path`` (empty registry if absent).
 
-        Tolerant by design: any section the file does not carry is loaded as
-        empty.  In particular a pre-unification file without ``"simhash"``
-        loads its active keys with an empty fingerprint map rather than
-        failing — the boot walk
-        (:meth:`paramem.memory.store.MemoryStore.read_registries_from_disk`)
-        must not die on one.  Callers that specifically ask for fingerprints
-        use :meth:`load_simhashes`, which refuses a file that cannot answer.
+        The single shape predicate for ``indexed_key_registry.json``: an
+        ABSENT file loads as an empty registry — the fresh-install contract
+        every caller (including the boot walk,
+        :meth:`paramem.memory.store.MemoryStore.read_registries_from_disk`)
+        depends on. An EXISTING file must be affirmatively KeyRegistry-shaped
+        — a dict with a list-valued ``"active_keys"`` AND a dict-valued
+        ``"simhash"`` — or this raises :class:`ValueError` naming the path and
+        what is missing, rather than silently coercing a foreign JSON schema
+        into a partial or empty registry. :meth:`load_simhashes` delegates
+        here for the identical check — there is exactly one shape check for
+        this file.
+
+        Raises:
+            ValueError: *path* exists but is not KeyRegistry-shaped.
         """
+        from paramem.backup.encryption import read_maybe_encrypted
+
         path = Path(path)
-        data = cls._read_payload(path)
-        if data is None:
+        if not path.exists():
             logger.info("No registry at %s, starting fresh", path)
             return cls()
+
+        # Existence is checked above, not inferred from the parsed payload:
+        # a file whose content is the JSON literal ``null`` parses to the
+        # same Python ``None`` an absent file would collapse to, and must
+        # NOT be read as "fresh" — it is an existing file that fails the
+        # shape check below.  Existence-check and read are atomic within
+        # this one method — no separate helper carries the "confirm
+        # existence first" contract that nothing else enforced.
+        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
+
+        missing: list[str] = []
+        if not isinstance(data, dict):
+            missing.append("payload is not a JSON object")
+        else:
+            if not isinstance(data.get("active_keys"), list):
+                missing.append("list-valued 'active_keys'")
+            if not isinstance(data.get("simhash"), dict):
+                missing.append("dict-valued 'simhash'")
+        if missing:
+            raise ValueError(
+                f"{path} is not a KeyRegistry-shaped registry file "
+                f"(missing: {'; '.join(missing)}) — refusing to coerce a "
+                "foreign registry schema into a KeyRegistry"
+            )
 
         registry = cls._from_payload(data)
         logger.info(
@@ -417,21 +449,11 @@ class KeyRegistry:
         is the wrong one) and the adapter-tree walk
         (:meth:`paramem.memory.store.MemoryStore.read_simhash_registry_from_disk`)
         go through here, so the encryption read, the on-disk shape and the
-        wrong-file guard exist exactly once.
+        wrong-file guard exist exactly once — delegated entirely to
+        :meth:`load`, which is the single shape check for this file.
 
         Returns the active∪stale fingerprint superset — the same map
-        :meth:`save_bytes` serialises under ``"simhash"`` — with non-integer
-        values dropped.  Sharing :meth:`_from_payload` with :meth:`load` means
-        the active/stale partition routing cannot drift between the two.
-
-        A file that cannot answer the question is a caller error, not an empty
-        map: it must carry a dict-valued ``"simhash"`` section or this raises.
-        ``key_metadata.json`` (``{"cycle_count", "promoted_keys", "keys"}`` —
-        per-key bookkeeping, never a fingerprint) has no such section, so
-        pointing this method at it fails immediately instead of silently
-        un-gating every key it was supposed to verify.  An EMPTY ``"simhash"``
-        map is accepted — that is what a registered-but-untrained tier
-        serialises, and it truthfully answers "no fingerprints".
+        :meth:`save_bytes` serialises under ``"simhash"``.
 
         Args:
             path: Path to one tier's ``indexed_key_registry.json``.
@@ -441,64 +463,47 @@ class KeyRegistry:
             install / tier not yet trained) or its ``"simhash"`` map is empty.
 
         Raises:
-            ValueError: When the parsed JSON is not a registry payload — not a
-                dict, or carrying no dict-valued ``"simhash"`` section.
+            ValueError: When *path* exists but is not KeyRegistry-shaped —
+                see :meth:`load`.  ``key_metadata.json``
+                (``{"cycle_count", "promoted_keys", "keys"}`` — per-key
+                bookkeeping, never a fingerprint) has no ``"active_keys"``/
+                ``"simhash"`` section, so pointing this method at it fails
+                immediately instead of silently un-gating every key it was
+                supposed to verify.
         """
-        path = Path(path)
-        data = cls._read_payload(path)
-        if data is None:
-            return {}
-        if not isinstance(data, dict) or not isinstance(data.get("simhash"), dict):
-            raise ValueError(
-                f"{path} is not a KeyRegistry-shaped registry file (missing a "
-                "dict-valued 'simhash' section) — refusing to coerce a foreign "
-                "registry schema into a simhash map"
-            )
-        return cls._from_payload(data)._known_simhashes()
-
-    @classmethod
-    def _read_payload(cls, path: Path) -> dict | None:
-        """Decrypt and parse one registry file; ``None`` when it does not exist.
-
-        The only read of ``indexed_key_registry.json`` — every consumer
-        (:meth:`load`, :meth:`load_simhashes`) goes through here so the
-        encryption-aware read exists once.
-        """
-        from paramem.backup.encryption import read_maybe_encrypted
-
-        if not path.exists():
-            return None
-        return json.loads(read_maybe_encrypted(path).decode("utf-8"))
+        return cls.load(path)._known_simhashes()
 
     @classmethod
     def _from_payload(cls, data: dict) -> "KeyRegistry":
         """Build a registry from a parsed ``indexed_key_registry.json`` payload.
 
         The only place that knows the on-disk field layout written by
-        :meth:`save_bytes`.  Absent sections load as empty (see :meth:`load`).
+        :meth:`save_bytes`.  :meth:`load` is the sole caller and has already
+        enforced the shape predicate (dict payload, list-valued
+        ``"active_keys"``, dict-valued ``"simhash"``) before calling here, so
+        those two sections are read directly with no default/isinstance
+        fallback.  ``"fidelity_history"`` and ``"stale"`` are genuinely
+        optional (absent on an untouched/pre-stale-extension registry) and
+        stay ``.get``-tolerant.
         """
         registry = cls()
-        registry._active_keys = data.get("active_keys", [])
+        registry._active_keys = data["active_keys"]
         for key, scores in data.get("fidelity_history", {}).items():
             registry._fidelity_history[key] = scores
         stale_raw = data.get("stale", {})
         if isinstance(stale_raw, dict):
             registry._stale = {k: dict(v) for k, v in stale_raw.items() if isinstance(v, dict)}
 
-        # Load the unified simhash map (active∪stale fingerprints).
-        # New schema: "simhash" key is present.  Old-schema files that pre-date
-        # the unification lack this key; per the fresh-start mandate they are
-        # treated as having an empty fingerprint map — no legacy-file fallback
-        # (i.e. never read simhash_registry.json or any other file).
-        simhash_raw = data.get("simhash", {})
-        if isinstance(simhash_raw, dict):
-            for k, fp in simhash_raw.items():
-                if isinstance(fp, int):
-                    # Route to the correct partition: stale keys' fingerprints
-                    # go into the stale record; active keys' go into _simhash.
-                    if k in registry._stale:
-                        registry._stale[k]["simhash"] = fp
-                    else:
-                        registry._simhash[k] = fp
+        # Load the unified simhash map (active∪stale fingerprints). No
+        # legacy-file fallback (i.e. never read simhash_registry.json or any
+        # other file).
+        for k, fp in data["simhash"].items():
+            if isinstance(fp, int):
+                # Route to the correct partition: stale keys' fingerprints
+                # go into the stale record; active keys' go into _simhash.
+                if k in registry._stale:
+                    registry._stale[k]["simhash"] = fp
+                else:
+                    registry._simhash[k] = fp
 
         return registry

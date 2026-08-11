@@ -188,7 +188,7 @@ def _check_registry(path: Path, tier: str) -> tuple[FileCheck, list[str] | None,
         return check, None, None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return FileCheck(path_str, "registry", tier, _PARSE_ERROR, str(exc)), None, None
-    except KeyError as exc:
+    except (KeyError, ValueError) as exc:
         return FileCheck(path_str, "registry", tier, _SCHEMA_ERROR, str(exc)), None, None
 
 
@@ -220,8 +220,7 @@ def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
         return FileCheck(path_str, "simhash", tier, _SKIPPED, ""), None
 
     try:
-        reg = KeyRegistry.load(path)
-        sh_dict = reg._known_simhashes()
+        sh_dict = KeyRegistry.load_simhashes(path)
         return FileCheck(path_str, "simhash", tier, _OK, ""), sh_dict
     except RuntimeError as exc:
         return FileCheck(path_str, "simhash", tier, _UNDECRYPTABLE, _no_key_detail(exc)), None
@@ -229,7 +228,7 @@ def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
         return FileCheck(path_str, "simhash", tier, _UNDECRYPTABLE, _DETAIL_BAD_KEY), None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return FileCheck(path_str, "simhash", tier, _PARSE_ERROR, str(exc)), None
-    except KeyError as exc:
+    except (KeyError, ValueError) as exc:
         return FileCheck(path_str, "simhash", tier, _SCHEMA_ERROR, str(exc)), None
 
 

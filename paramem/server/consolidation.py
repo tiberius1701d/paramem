@@ -296,8 +296,16 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
     stale entries between a wipe and the next consolidation cycle.
 
     Reads every tier's ``indexed_key_registry.json`` (main + interim slots),
-    takes the union of active keys, and rewrites ``key_metadata.json`` keeping
-    only keys in that union.  ``promoted_keys`` is filtered to the same set.
+    takes the union of known keys (active ∪ stale, via ``list_known()`` — a
+    soft-staled key's bookkeeping must survive the prune), and rewrites
+    ``key_metadata.json`` keeping only keys in that union.  ``promoted_keys``
+    is filtered to the same set.
+
+    An unreadable or foreign-shaped registry (:class:`KeyRegistry.load`
+    raising :class:`ValueError`) makes the retention union unprovable for
+    that tier — the whole prune is refused (0 removed, logged at WARNING)
+    rather than risk deleting bookkeeping for keys the unreadable tier still
+    knows about.
 
     Returns the number of orphan keys removed (0 when nothing to prune).
     """
@@ -355,7 +363,18 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
     for _tier, tier_root in iter_tier_roots(config.adapter_dir):
         reg_path = tier_root / "indexed_key_registry.json"
         if reg_path.exists():
-            _loaded_reg = KeyRegistry.load(reg_path)
+            try:
+                _loaded_reg = KeyRegistry.load(reg_path)
+            except ValueError as exc:
+                logger.warning(
+                    "prune_key_metadata_orphans: %s is not a KeyRegistry-shaped "
+                    "registry file — refusing to prune (retention union "
+                    "unprovable): %s (%s)",
+                    reg_path,
+                    path,
+                    exc,
+                )
+                return 0
             active.update(_loaded_reg.list_known())
 
     if not active:

@@ -329,8 +329,9 @@ class TestKeysCountSourceOfTruth:
     Branch A: live store present with main + interim tier → count includes
     interim keys so the 202-vs-225 class of drift cannot recur.
 
-    Branch B: store is None (cloud-only / pre-preload) → cold path loads from
-    disk via MemoryStore.load_registries_from_disk and counts correctly.
+    Branch B: store is None (cloud-only / pre-preload) → cold path walks
+    iter_tier_roots and reads each tier's registry directly via
+    KeyRegistry.load, counting correctly.
     """
 
     def test_keys_count_reads_live_store_including_interim(self, client, state, tmp_path):
@@ -357,13 +358,14 @@ class TestKeysCountSourceOfTruth:
         assert body["keys_count"] == 8  # 5 main + 3 interim
 
     def test_keys_count_cold_path_when_store_is_none(self, tmp_path, monkeypatch):
-        """When _state["memory_store"] is None, the cold path loads registries
-        from disk via MemoryStore.load_registries_from_disk and returns the
-        correct count — including keys written after the last boot."""
+        """When _state["memory_store"] is None, the cold path walks
+        iter_tier_roots and reads each tier's registry directly via
+        KeyRegistry.load, returning the correct count — including keys
+        written after the last boot."""
         # Write a small on-disk registry under adapter_dir/episodic/.
         episodic_dir = tmp_path / "adapters" / "episodic"
         episodic_dir.mkdir(parents=True)
-        reg_data = {"active_keys": ["cold_key_0", "cold_key_1", "cold_key_2"]}
+        reg_data = {"active_keys": ["cold_key_0", "cold_key_1", "cold_key_2"], "simhash": {}}
         (episodic_dir / "indexed_key_registry.json").write_text(json.dumps(reg_data))
 
         # Build a minimal _state with no memory_store but a valid adapter_dir.
@@ -418,3 +420,84 @@ class TestKeysCountSourceOfTruth:
         resp = cold_client.get("/status")
         assert resp.status_code == 200, resp.text
         assert resp.json()["keys_count"] == 3
+
+    def test_keys_count_cold_path_survives_foreign_shaped_tier_registry(
+        self, tmp_path, monkeypatch
+    ):
+        """A foreign-shaped tier registry (not KeyRegistry-shaped) must not
+        500 the cold /status path — the tier is excluded from the count
+        instead of raising past the endpoint.  Regression for the strict
+        KeyRegistry.load shape check (missing 'simhash') widening
+        ValueError into an unguarded cold-path read.  Tier readability is
+        NOT re-surfaced here — that is _record_unverified_tier_incidents'
+        job (the attention block); this endpoint only needs an honest
+        count."""
+        adapters_dir = tmp_path / "adapters"
+        # Episodic reads cleanly.
+        episodic_dir = adapters_dir / "episodic"
+        episodic_dir.mkdir(parents=True)
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            json.dumps({"active_keys": ["good_key_0"], "simhash": {}})
+        )
+        # Semantic is foreign-shaped: has active_keys but no simhash section.
+        semantic_dir = adapters_dir / "semantic"
+        semantic_dir.mkdir(parents=True)
+        (semantic_dir / "indexed_key_registry.json").write_text(
+            json.dumps({"active_keys": ["ghost_key_0"]})
+        )
+
+        cfg = _base_config(tmp_path)
+        cfg.adapter_dir = adapters_dir
+
+        buf = MagicMock()
+        buf.get_summary.return_value = {
+            "total": 0,
+            "orphaned": 0,
+            "oldest_age_seconds": None,
+            "per_speaker": {},
+        }
+        buf.pending_count = 0
+
+        fresh_state = {
+            "model": None,
+            "tokenizer": None,
+            "config": cfg,
+            "config_path": str(tmp_path / "server.yaml"),
+            "session_buffer": buf,
+            "speaker_store": None,
+            "router": None,
+            "cloud_agent": None,
+            "ha_client": None,
+            "consolidation_loop": None,
+            "memory_store": None,
+            "consolidating": False,
+            "last_consolidation": None,
+            "background_trainer": None,
+            "mode": "local",
+            "cloud_only_reason": None,
+            "tts_manager": None,
+            "stt": None,
+            "speaker_embedding_backend": None,
+            "unknown_speakers": {},
+            "pending_enrollments": set(),
+            "migration": initial_migration_state(),
+            "server_started_at": "2026-06-02T08:00:00+00:00",
+            "config_drift": {
+                "detected": False,
+                "loaded_hash": "a1b2c3d4e5f6a7b8",
+                "disk_hash": "a1b2c3d4e5f6a7b8",
+                "last_checked_at": "2026-06-02T08:00:00+00:00",
+            },
+            "adapter_manifest_status": {},
+            "last_consolidation_result": None,
+        }
+        monkeypatch.setattr(app_module, "_state", fresh_state)
+        cold_client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        resp = cold_client.get("/status")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Only the readable tier's key is counted.
+        assert body["keys_count"] == 1
+        assert body["tier_key_counts"].get("episodic") == 1
+        assert "semantic" not in body["tier_key_counts"]

@@ -1104,6 +1104,8 @@ class TestRunBaseSwapPhaseA:
         write_bundle_error: Exception | None = None,
         patch_gates: bool = True,
         resume_phase: str = "",
+        use_thread_submit: bool = False,
+        phase_a_migrate_error: Exception | None = None,
     ):
         """Helper: run _run_base_swap_orchestration with mocks via asyncio.run().
 
@@ -1128,6 +1130,17 @@ class TestRunBaseSwapPhaseA:
         real rather than through a recording stub.
         ``resume_phase`` — forwarded to ``_run_base_swap_orchestration``;
         default ``""`` (fresh start).
+        ``use_thread_submit`` — when ``True``, ``BackgroundTrainer.submit``
+        dispatches the worker function on a real ``threading.Thread`` instead
+        of calling it inline — the faithful reproduction of production
+        semantics (an exception escaping the worker's target function does
+        NOT propagate back to this coroutine's frame; it can only reach the
+        awaiter via the worker's own ``done_event`` signal).  The default
+        (inline call) cannot distinguish "worker caught its own exception and
+        set the event" from "worker raised and the exception happened to
+        propagate through the fake synchronous submit".
+        ``phase_a_migrate_error`` — when given, the Phase A ``migrate()``
+        call (first call) raises this instead of returning a result.
         """
         import asyncio
         import contextlib
@@ -1168,7 +1181,14 @@ class TestRunBaseSwapPhaseA:
             m = read_trial_marker(state_dir)
             if m is not None:
                 marker_at_submit.append(m.base_swap_phase)
-            fn()
+            if use_thread_submit:
+                import threading
+
+                t = threading.Thread(target=fn, daemon=True)
+                t.start()
+                t.join(timeout=10)
+            else:
+                fn()
 
         mock_bt = MagicMock()
         mock_bt.submit = _fake_submit
@@ -1211,6 +1231,8 @@ class TestRunBaseSwapPhaseA:
 
         def _fake_migrate(loop, cfg, ms):
             migrate_call[0] += 1
+            if migrate_call[0] == 1 and phase_a_migrate_error is not None:
+                raise phase_a_migrate_error
             if migrate_call[0] == 2:
                 # Regression guard (review CRITICAL): Phase B must load the
                 # (Mistral) registries — its to-retrain tier list — into the store
@@ -1301,16 +1323,22 @@ class TestRunBaseSwapPhaseA:
                 )
             )
             asyncio.run(
-                app_module._run_base_swap_orchestration(
-                    candidate_path_str=str(cand_yaml),
-                    live_config_path=live_yaml,
-                    state_dir=state_dir,
-                    backups_root=backups_root,
-                    old_model="mistral",
-                    new_model="qwen3-4b",
-                    started_at="2026-05-24T00:00:00+00:00",
-                    candidate_hash="aabb",
-                    resume_phase=resume_phase,
+                asyncio.wait_for(
+                    app_module._run_base_swap_orchestration(
+                        candidate_path_str=str(cand_yaml),
+                        live_config_path=live_yaml,
+                        state_dir=state_dir,
+                        backups_root=backups_root,
+                        old_model="mistral",
+                        new_model="qwen3-4b",
+                        started_at="2026-05-24T00:00:00+00:00",
+                        candidate_hash="aabb",
+                        resume_phase=resume_phase,
+                    ),
+                    # Bounds the run so a reintroduced Phase-A-worker hang
+                    # (done_event never set) fails this test with a clear
+                    # timeout instead of hanging the suite.
+                    timeout=15,
                 )
             )
 
@@ -1391,6 +1419,52 @@ class TestRunBaseSwapPhaseA:
         assert any(g.get("status") == "phase_a_failed" for g in gates_received), (
             f"Expected phase_a_failed gate status; got {gates_received}"
         )
+
+    def test_phase_a_worker_exception_does_not_hang_and_surfaces(self, tmp_path, monkeypatch):
+        """A real background-thread submit (matching production
+        BackgroundTrainer.submit semantics — an uncaught exception on the
+        worker thread does NOT propagate back to the awaiting coroutine, and
+        BackgroundTrainer._run_callable_queue additionally swallows it with
+        only a log) proves the worker's try/finally: Phase A's migrate()
+        call raising must still let ``await done_event.wait()`` resolve (not
+        hang forever) and the exception must surface as a real orchestration
+        failure (``phase_a_failed``), not be silently lost.
+
+        Regression for the widened KeyRegistry.load ValueError reaching
+        migrate()'s "0 registered tiers but on-disk content exists" guard —
+        the sibling of the Phase B hang fix, same shape, same fix."""
+        state = self._make_phase_a_state(tmp_path)
+        call_order, rename_calls, gates_received, _, state_dir = self._run_phase_a(
+            state,
+            monkeypatch,
+            tmp_path,
+            succeed=True,
+            use_thread_submit=True,
+            phase_a_migrate_error=RuntimeError(
+                "active-store migration: live store registered 0 tiers but "
+                "on-disk content exists — registries failed to load"
+            ),
+        )
+
+        # Phase A was submitted and the run completed (no hang — asyncio.wait_for
+        # inside _run_phase_a would have raised TimeoutError otherwise).
+        assert "phase_a_submit" in call_order
+
+        # Config must NOT have been renamed — Phase A never reached success.
+        assert not rename_calls, "Config must not be renamed when Phase A raises"
+
+        # The exception surfaced as a real orchestration failure, not silence.
+        assert any(g.get("status") == "phase_a_failed" for g in gates_received), (
+            f"Expected phase_a_failed gate status; got {gates_received}"
+        )
+        _failed = next(g for g in gates_received if g.get("status") == "phase_a_failed")
+        assert "registered 0 tiers" in _failed["exception"]
+
+        # Marker preserved for rollback (same posture as the non-raising
+        # incomplete-migration failure above).
+        marker = read_trial_marker(state_dir)
+        assert marker is not None, "Marker must be preserved on Phase A failure"
+        assert marker.base_swap_phase == "phaseA"
 
     def test_fresh_start_with_base_swap_active_does_not_409(self, tmp_path, monkeypatch):
         """Regression: the orchestration itself sets
@@ -1826,8 +1900,30 @@ class TestBaseSwapOrchestration:
         tmp_path,
         *,
         reload_mode: str = "local",
+        use_thread_submit: bool = False,
+        phase_b_migrate_error: Exception | None = None,
     ):
-        """Run orchestration with mocks; return (call_order, gates_received, state_dir)."""
+        """Run orchestration with mocks; return (call_order, gates_received, state_dir).
+
+        ``use_thread_submit`` — when ``True``, ``BackgroundTrainer.submit``
+        dispatches the worker function on a real ``threading.Thread`` instead
+        of calling it inline.  This is the faithful reproduction of
+        production semantics: an exception escaping the worker's target
+        function does NOT propagate back to this coroutine's frame (Python
+        threads swallow it at the thread boundary), so it can only reach the
+        awaiting coroutine via the worker's own ``done_event`` signal.  The
+        default (inline call) cannot distinguish "worker caught its own
+        exception and set the event" from "worker raised and the exception
+        happened to propagate through the fake synchronous submit" — both
+        look identical to an inline caller.  ``asyncio.wait_for`` bounds the
+        run so a regression (the event never getting set) fails the test
+        with a clear timeout instead of hanging the suite.
+        ``phase_b_migrate_error`` — when given, the Phase B ``migrate()``
+        call (second call) raises this instead of returning a result,
+        exercising the worker's try/finally around both
+        ``load_registries_from_disk`` and the sibling ``migrate()`` call in
+        the same frame.
+        """
         import asyncio as _asyncio
 
         import paramem.server.app as _app
@@ -1857,7 +1953,14 @@ class TestBaseSwapOrchestration:
         def _fake_submit(fn, **kwargs):
             submit_count[0] += 1
             call_order.append("phase_a_submit" if submit_count[0] == 1 else "phase_b_submit")
-            fn()
+            if use_thread_submit:
+                import threading
+
+                t = threading.Thread(target=fn, daemon=True)
+                t.start()
+                t.join(timeout=10)
+            else:
+                fn()
 
         mock_bt = MagicMock()
         mock_bt.submit = _fake_submit
@@ -1892,6 +1995,8 @@ class TestBaseSwapOrchestration:
                 # store empty; without this load migrate() would see 0 tiers and
                 # raise "0 tiers but on-disk content exists", failing every swap.
                 loop.store.load_registries_from_disk.assert_called()
+                if phase_b_migrate_error is not None:
+                    raise phase_b_migrate_error
             return fake_updated_a if migrate_call[0] == 1 else fake_updated_b
 
         async def _fake_update_gates(payload):
@@ -1939,15 +2044,21 @@ class TestBaseSwapOrchestration:
             ),
         ):
             _asyncio.run(
-                _app._run_base_swap_orchestration(
-                    candidate_path_str=str(cand_yaml),
-                    live_config_path=live_yaml,
-                    state_dir=state_dir,
-                    backups_root=backups_root,
-                    old_model="mistral",
-                    new_model="qwen3-4b",
-                    started_at="2026-05-24T00:00:00+00:00",
-                    candidate_hash="aabb",
+                _asyncio.wait_for(
+                    _app._run_base_swap_orchestration(
+                        candidate_path_str=str(cand_yaml),
+                        live_config_path=live_yaml,
+                        state_dir=state_dir,
+                        backups_root=backups_root,
+                        old_model="mistral",
+                        new_model="qwen3-4b",
+                        started_at="2026-05-24T00:00:00+00:00",
+                        candidate_hash="aabb",
+                    ),
+                    # Bounds the run so a reintroduced Phase-B-worker hang
+                    # (done_event never set) fails this test with a clear
+                    # timeout instead of hanging the suite.
+                    timeout=15,
                 )
             )
 
@@ -2014,6 +2125,37 @@ class TestBaseSwapOrchestration:
         from paramem.server.trial_state import read_trial_marker as _rtm
 
         assert _rtm(state_dir) is None, "Marker must be cleared on full success"
+
+    def test_phase_b_worker_exception_does_not_hang_and_surfaces(self, tmp_path, monkeypatch):
+        """A real background-thread submit (matching production
+        BackgroundTrainer.submit semantics — an uncaught exception on the
+        worker thread does NOT propagate back to the awaiting coroutine)
+        proves the worker's try/finally: Phase B's migrate() call raising
+        must still let ``await done_event_b.wait()`` resolve (not hang
+        forever) and the exception must surface as a real orchestration
+        failure (``phase_b_failed``), not be silently lost.
+
+        Regression for the widened KeyRegistry.load ValueError reaching this
+        worker via load_registries_from_disk / migrate() — both calls share
+        one frame, covered by the same finally."""
+        state = self._make_state(tmp_path)
+        call_order, gates_received, state_dir = self._run_orchestration(
+            state,
+            monkeypatch,
+            tmp_path,
+            reload_mode="local",
+            use_thread_submit=True,
+            phase_b_migrate_error=ValueError("simulated foreign-shaped tier registry"),
+        )
+
+        # Phase B was submitted and the run completed (no hang — asyncio.wait_for
+        # inside _run_orchestration would have raised TimeoutError otherwise).
+        assert "phase_b_submit" in call_order
+
+        # The exception surfaced as a real orchestration failure, not silence.
+        assert gates_received, "expected a gates update reporting the Phase B failure"
+        assert gates_received[-1]["status"] == "phase_b_failed"
+        assert "simulated foreign-shaped tier registry" in gates_received[-1]["exception"]
 
     def test_phase_b_marker_set_before_phase_b_runs(self, tmp_path, monkeypatch):
         """Marker transitions to 'phaseB' before Phase B is submitted.

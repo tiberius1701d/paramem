@@ -5160,14 +5160,32 @@ async def status():
             tier: len(store.active_keys_in_tier(tier)) for tier in store.tiers_with_registry()
         }
     else:
-        from paramem.memory.store import MemoryStore as _MemoryStore
+        # No live store yet (cloud-only before preload) — read each tier's
+        # registry directly via the one shape predicate (KeyRegistry.load)
+        # instead of a fresh MemoryStore.load_registries_from_disk, which
+        # aborts the WHOLE read on the first tier that fails the shape
+        # check.  One foreign-shaped tier registry must not 500 the whole
+        # endpoint; skip that tier and keep counting the rest.  Tier
+        # "unreadable" is already owned end-to-end by
+        # _record_unverified_tier_incidents (surfaced via the attention
+        # block) — this cold path only needs an honest count, not a second
+        # reporter, so a skip is logged and otherwise silent here.
+        from paramem.memory.interim_adapter import iter_tier_roots
+        from paramem.training.key_registry import KeyRegistry
 
-        _cold = _MemoryStore(replay_enabled=True)
-        _cold.load_registries_from_disk(config.adapter_dir)
-        keys_count = len(_cold.all_active_keys())
-        tier_key_counts = {
-            tier: len(_cold.active_keys_in_tier(tier)) for tier in _cold.tiers_with_registry()
-        }
+        tier_key_counts = {}
+        for tier, tier_root in iter_tier_roots(config.adapter_dir):
+            reg_path = tier_root / "indexed_key_registry.json"
+            try:
+                tier_key_counts[tier] = len(KeyRegistry.load(reg_path).list_active())
+            except ValueError:
+                logger.warning(
+                    "/status: %s is not a KeyRegistry-shaped registry file — "
+                    "excluding tier %s from keys_count",
+                    reg_path,
+                    tier,
+                )
+        keys_count = sum(tier_key_counts.values())
 
     # Session buffer summary (pending counts, orphan attribution, age)
     buf = _state.get("session_buffer")
@@ -11692,23 +11710,45 @@ async def _run_base_swap_orchestration(
             # _state["event_loop"] is not yet populated (e.g. during unit tests).
             _phase_a_aio_loop = asyncio.get_event_loop()
             done_event = asyncio.Event()
-            phase_a_error: list[Exception] = []
+            phase_a_error: list[BaseException] = []
 
             def _run_phase_a_on_worker() -> None:
-                """Run on the BG-trainer worker thread under the GPU lock."""
+                """Run on the BG-trainer worker thread under the GPU lock.
+
+                The whole body runs inside try/finally: ``BackgroundTrainer.
+                _run_callable_queue`` catches and merely logs any exception
+                escaping the submitted job — it never re-raises to this
+                coroutine — so ``done_event.set()`` is the ONLY signal that
+                can wake ``await done_event.wait()`` below.  ANY exception
+                here — including one newly reachable from ``migrate()``'s
+                "0 registered tiers but on-disk content exists" guard (now
+                also tripped by a strict-load refusal on a foreign-shaped
+                tier registry) — must still reach the ``finally`` or the
+                await hangs forever instead of surfacing the failure.
+                ``except BaseException`` (not just ``Exception``) mirrors
+                ``BackgroundTrainer.submit_and_wait``'s own wrapper — a
+                worker-thread ``BaseException`` must still set the event
+                rather than escape ``_run_callable_queue``'s narrower
+                ``except Exception`` and kill the persistent worker thread.
+                Caught exceptions are appended to ``phase_a_error`` (checked
+                after the await) rather than swallowed.
+                """
                 from paramem.server.active_store_migration import load_state as _phase_a_load_state
 
-                _fresh_state = _phase_a_load_state(Path(config.adapter_dir))
-                if _fresh_state is None:
-                    phase_a_error.append(RuntimeError("Phase A: migration state file vanished"))
+                try:
+                    _fresh_state = _phase_a_load_state(Path(config.adapter_dir))
+                    if _fresh_state is None:
+                        phase_a_error.append(RuntimeError("Phase A: migration state file vanished"))
+                        return
+                    updated = migrate(loop, config, _fresh_state)
+                    _state["model"] = loop.model
+                    if not updated.all_tiers_done(loop.store.tiers_with_registry()):
+                        first_fail = next(iter(updated.failed_tiers.values()), "unknown")
+                        phase_a_error.append(RuntimeError(f"Phase A incomplete: {first_fail}"))
+                except BaseException as exc:  # noqa: BLE001 — must surface, never hang the awaiter
+                    phase_a_error.append(exc)
+                finally:
                     _phase_a_aio_loop.call_soon_threadsafe(done_event.set)
-                    return
-                updated = migrate(loop, config, _fresh_state)
-                _state["model"] = loop.model
-                if not updated.all_tiers_done(loop.store.tiers_with_registry()):
-                    first_fail = next(iter(updated.failed_tiers.values()), "unknown")
-                    phase_a_error.append(RuntimeError(f"Phase A incomplete: {first_fail}"))
-                _phase_a_aio_loop.call_soon_threadsafe(done_event.set)
 
             bt.submit(_run_phase_a_on_worker, inference_fallback_adapter="episodic")
             await done_event.wait()
@@ -11967,35 +12007,58 @@ async def _run_base_swap_orchestration(
 
         _phase_b_aio_loop = asyncio.get_event_loop()
         done_event_b = asyncio.Event()
-        phase_b_error: list[Exception] = []
+        phase_b_error: list[BaseException] = []
 
         def _run_phase_b_on_worker() -> None:
-            """Run Phase B on the BG-trainer worker thread under the GPU lock."""
+            """Run Phase B on the BG-trainer worker thread under the GPU lock.
+
+            The whole body runs inside try/finally: ``BackgroundTrainer.
+            _run_callable_queue`` catches and merely logs any exception
+            escaping the submitted job — it never re-raises to this
+            coroutine — so ``done_event_b.set()`` is the ONLY signal that
+            can wake ``await done_event_b.wait()`` below.  ANY exception
+            here — including one newly reachable from
+            ``load_registries_from_disk``'s per-tier ``KeyRegistry.load``
+            (a foreign-shaped on-disk registry now raises instead of
+            silently loading empty) or the sibling ``migrate()`` call —
+            must still reach the ``finally`` or the await hangs forever
+            instead of surfacing the failure.  ``except BaseException``
+            (not just ``Exception``) mirrors ``BackgroundTrainer.
+            submit_and_wait``'s own wrapper — a worker-thread
+            ``BaseException`` must still set the event rather than escape
+            ``_run_callable_queue``'s narrower ``except Exception`` and
+            kill the persistent worker thread.  Caught exceptions are
+            appended to ``phase_b_error`` (checked after the await) rather
+            than swallowed.
+            """
             from paramem.server.active_store_migration import load_state as _phase_b_load_state
 
-            _fresh_state_b = _phase_b_load_state(Path(config_b.adapter_dir))
-            if _fresh_state_b is None:
-                phase_b_error.append(
-                    RuntimeError("Phase B: migration state file vanished before Phase B ran")
-                )
+            try:
+                _fresh_state_b = _phase_b_load_state(Path(config_b.adapter_dir))
+                if _fresh_state_b is None:
+                    phase_b_error.append(
+                        RuntimeError("Phase B: migration state file vanished before Phase B ran")
+                    )
+                    return
+                # The base-swap preload gate left the live store empty — the on-disk
+                # registries belong to the OLD (Mistral) model and are NOT model B's
+                # inference state.  They ARE, however, Phase B's training INPUT:
+                # migrate() iterates loop.store.tiers_with_registry() to know which
+                # tiers to retrain.  Load them into loop_b's store now (worker thread,
+                # GPU lock held → inference is cloud-routed) so migrate has the tier
+                # list; it rebuilds each tier from graph.json into model B's fresh
+                # registry.  Without this the store is empty → migrate refuses with
+                # "0 tiers but on-disk content exists".
+                loop_b.store.load_registries_from_disk(config_b.adapter_dir)
+                updated_b = migrate(loop_b, config_b, _fresh_state_b)
+                _state["model"] = loop_b.model
+                if not updated_b.all_tiers_done(loop_b.store.tiers_with_registry()):
+                    first_fail = next(iter(updated_b.failed_tiers.values()), "unknown")
+                    phase_b_error.append(RuntimeError(f"Phase B incomplete: {first_fail}"))
+            except BaseException as exc:  # noqa: BLE001 — must surface, never hang the awaiter
+                phase_b_error.append(exc)
+            finally:
                 _phase_b_aio_loop.call_soon_threadsafe(done_event_b.set)
-                return
-            # The base-swap preload gate left the live store empty — the on-disk
-            # registries belong to the OLD (Mistral) model and are NOT model B's
-            # inference state.  They ARE, however, Phase B's training INPUT:
-            # migrate() iterates loop.store.tiers_with_registry() to know which
-            # tiers to retrain.  Load them into loop_b's store now (worker thread,
-            # GPU lock held → inference is cloud-routed) so migrate has the tier
-            # list; it rebuilds each tier from graph.json into model B's fresh
-            # registry.  Without this the store is empty → migrate refuses with
-            # "0 tiers but on-disk content exists".
-            loop_b.store.load_registries_from_disk(config_b.adapter_dir)
-            updated_b = migrate(loop_b, config_b, _fresh_state_b)
-            _state["model"] = loop_b.model
-            if not updated_b.all_tiers_done(loop_b.store.tiers_with_registry()):
-                first_fail = next(iter(updated_b.failed_tiers.values()), "unknown")
-                phase_b_error.append(RuntimeError(f"Phase B incomplete: {first_fail}"))
-            _phase_b_aio_loop.call_soon_threadsafe(done_event_b.set)
 
         bt_b.submit(_run_phase_b_on_worker, inference_fallback_adapter="episodic")
         await done_event_b.wait()

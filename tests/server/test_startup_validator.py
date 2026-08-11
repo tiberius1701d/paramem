@@ -228,7 +228,7 @@ class TestCorruptManifest:
         config = _make_config(tmp_path)
         kind_dir = config.adapter_dir / "episodic"
         kind_dir.mkdir()
-        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": [], "simhash": {}}')
         slot = kind_dir / "20260421-000000"
         slot.mkdir()
         (slot / "adapter_config.json").write_text("{}")
@@ -298,7 +298,9 @@ class TestNoMatchingSlot:
         kind_dir.mkdir()
         # A real, readable registry so the binding is REGISTRY-present — the
         # slot's stamped hash simply does not match it.
-        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        (kind_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "simhash": {}}'
+        )
         _write_slot(kind_dir, registry_sha256="old_hash")
 
         _, state = _run(config)
@@ -373,7 +375,9 @@ class TestNoMatchingSlot:
         kind_dir = config.adapter_dir / "episodic"
         kind_dir.mkdir()
         # A real, readable registry so the binding is REGISTRY-present.
-        (kind_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        (kind_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "simhash": {}}'
+        )
         # Real slot: meta.json written with a non-matching registry_sha256.
         _write_slot(kind_dir, registry_sha256="stale_hash_from_old_training_run")
         # Also place a progress.json stub alongside it — must not affect outcome.
@@ -416,7 +420,9 @@ class TestInterimNoMatchingSlotLogLevel:
         interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
         interim_dir.mkdir(parents=True)
         (interim_dir / "graph.json").write_text("{}")
-        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        (interim_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "simhash": {}}'
+        )
 
         caplog.set_level(logging.INFO, logger="paramem.server.app")
         model, state = _run(config)
@@ -451,7 +457,9 @@ class TestInterimNoMatchingSlotLogLevel:
         config = _make_config(tmp_path)
         interim_dir = config.adapter_dir / "episodic" / "interim_20260619T1200"
         interim_dir.mkdir(parents=True)
-        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        (interim_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "simhash": {}}'
+        )
         # Real weight-slot candidate whose registry_sha256 will not match the
         # live (non-empty, drifted) registry's hash.
         _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
@@ -807,7 +815,9 @@ class TestRevalidateAdapterManifests:
         episodic_dir.mkdir(parents=True, exist_ok=True)
         # A real, readable registry so the binding is REGISTRY-present — the
         # slot's stamped hash simply does not match it.
-        (episodic_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": [], "simhash": {}}'
+        )
         _write_slot(episodic_dir, ts="20260427-105338", registry_sha256="stale_hash_123")
 
         state = self._state_from_config(config)
@@ -931,7 +941,7 @@ class TestRevalidateAdapterManifests:
         interim_dir = config.adapter_dir / "episodic" / "interim_20260803T1200"
         interim_dir.mkdir(parents=True)
         # A real, readable registry so the binding is REGISTRY-present.
-        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": []}')
+        (interim_dir / "indexed_key_registry.json").write_text('{"active_keys": [], "simhash": {}}')
         _write_slot(interim_dir, registry_sha256="stale_hash_from_old_training_run")
 
         state = self._state_from_config(config)
@@ -1608,7 +1618,9 @@ class TestKeylessTierSweepBindingAwareGuard:
         config = _make_config(tmp_path)
         episodic_dir = config.adapter_dir / "episodic"
         episodic_dir.mkdir(parents=True)
-        (episodic_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "simhash": {}}'
+        )
         _write_slot(episodic_dir, registry_sha256="stale_hash_does_not_match", key_count=1)
 
         write_erase_marker(config.adapter_dir, ["episodic"])
@@ -1700,7 +1712,9 @@ class TestKeylessTierSweepBindingAwareGuard:
         config = _make_config(tmp_path)
         episodic_dir = config.adapter_dir / "episodic"
         episodic_dir.mkdir(parents=True)
-        (episodic_dir / "indexed_key_registry.json").write_text('{"active_keys": ["k1"]}')
+        (episodic_dir / "indexed_key_registry.json").write_text(
+            '{"active_keys": ["k1"], "simhash": {}}'
+        )
         _write_slot(episodic_dir, registry_sha256="stale_hash_does_not_match", key_count=1)
 
         caplog.set_level(logging.DEBUG, logger="paramem.server.app")

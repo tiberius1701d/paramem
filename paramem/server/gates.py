@@ -840,30 +840,17 @@ def _gate_3_reload_smoke(
         )
 
     _tier_kind, tier_registry_path = tier_result
+    # KeyRegistry.load is the single strict shape predicate for
+    # indexed_key_registry.json — no hand-parsed "legacy/flat registries"
+    # fallback here.  A foreign-shaped file now fails right here, at this
+    # load (KeyRegistry.load refuses anything without a list-valued
+    # "active_keys" AND a dict-valued "simhash"), so it never reaches the
+    # simhash load below at all; a fallback that hand-parsed all_keys/
+    # first_key from a shape KeyRegistry.load refuses could never have
+    # produced a passing gate either way — reading it here would just be
+    # dead code.
     try:
-        from paramem.backup.encryption import read_maybe_encrypted as _rme
-
-        registry_content = _rme(tier_registry_path)
-        registry_parsed = json.loads(registry_content)
-        # New per-tier KeyRegistry schema: {active_keys: [...], ...}
-        # Fall back to dict keys for legacy/flat registries during upgrade.
-        if isinstance(registry_parsed, dict) and "active_keys" in registry_parsed:
-            all_keys = list(registry_parsed["active_keys"])
-        elif isinstance(registry_parsed, dict):
-            all_keys = list(registry_parsed.keys())
-        else:
-            all_keys = []
-        if not all_keys:
-            return GateResult(
-                gate=3,
-                name="adapter_reload",
-                status="fail",
-                reason=(
-                    f"indexed_key_registry.json at {tier_registry_path} is empty — no key to probe"
-                ),
-                metrics=None,
-            )
-        first_key = all_keys[0]
+        all_keys = KeyRegistry.load(tier_registry_path).list_active()
     except Exception as exc:  # noqa: BLE001
         return GateResult(
             gate=3,
@@ -872,6 +859,17 @@ def _gate_3_reload_smoke(
             reason=f"failed to read indexed_key_registry.json: {exc}",
             metrics=None,
         )
+    if not all_keys:
+        return GateResult(
+            gate=3,
+            name="adapter_reload",
+            status="fail",
+            reason=(
+                f"indexed_key_registry.json at {tier_registry_path} is empty — no key to probe"
+            ),
+            metrics=None,
+        )
+    first_key = all_keys[0]
 
     try:
         simhash_map = KeyRegistry.load_simhashes(tier_registry_path)

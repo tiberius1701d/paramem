@@ -263,7 +263,9 @@ class TestKeyRegistrySimhash:
     def test_load_reads_simhash_from_new_schema(self, tmp_path):
         """KeyRegistry.load reads the 'simhash' field from the new schema (no .get fallback).
 
-        A registry file without 'simhash' raises KeyError — fresh-start mandate.
+        A registry file without 'simhash' raises ValueError — see
+        tests/test_key_registry.py::TestStrictLoadShape for the shape-refusal
+        pins (single home, not duplicated here).
         """
         import json
 
@@ -279,31 +281,6 @@ class TestKeyRegistrySimhash:
 
         reg = KeyRegistry.load(path)
         assert reg.simhash_for("graph1") == 0xABCDEF
-
-    def test_load_old_schema_without_simhash_loads_as_empty_fingerprints(self, tmp_path):
-        """KeyRegistry.load gracefully handles old-schema files without 'simhash'.
-
-        The fresh-start mandate means no legacy-file fallback (no reading
-        simhash_registry.json), but the load still succeeds — the registry
-        is loaded with an empty fingerprint map rather than crashing.
-        """
-        import json
-
-        path = tmp_path / "indexed_key_registry.json"
-        # Old schema — no simhash key.
-        data = {
-            "active_keys": ["graph1"],
-            "fidelity_history": {},
-            "stale": {},
-        }
-        path.write_text(json.dumps(data))
-
-        reg = KeyRegistry.load(path)
-        # Registry loads the active keys.
-        assert reg.list_active() == ["graph1"]
-        # No fingerprints (old schema had none).
-        assert reg.simhash_for("graph1") is None
-        assert not reg.has_simhash("graph1")
 
 
 class TestTierSimhashes:
