@@ -42,8 +42,15 @@ from paramem.server.trial_state import trial_active
 from paramem.training import graph_tier
 from paramem.training.donor import DONOR_BUILD_ADAPTER_NAME, DONOR_KEY_FLOOR
 from paramem.training.key_registry import KeyRegistry
+from paramem.training.recall_eval import RecallProbe
 from paramem.training.thermal_throttle import ThermalPolicy
-from paramem.training.trainer import TrainingHooks
+from paramem.training.trainer import (
+    STAGING_ADAPTER,
+    TrainingHooks,
+    assert_staging_absent,
+    promote_staging_adapter,
+    staged_weights,
+)
 from paramem.utils.artifacts import (
     debug_run,
     on_cycle_end,
@@ -338,12 +345,15 @@ class TrialActiveError(RuntimeError):
 class RecallGateRejected(RuntimeError):
     """Raised when a recall verdict falls short of the required bar.
 
-    Two raise sites: :meth:`ConsolidationLoop._verify_saved_adapter_from_disk`
-    (post-save disk-integrity probe below ``recall_sanity_threshold``) and
+    Three raise sites: :meth:`ConsolidationLoop._verify_saved_adapter_from_disk`
+    (post-save disk-integrity probe below ``recall_sanity_threshold``),
     :meth:`ConsolidationLoop._assert_tier_recall` (a main-tier fold's own
-    training-completeness verdict below 100% over its full key set).
+    training-completeness verdict below 100% over its full key set, probed
+    on the staged weights before promotion), and
+    :func:`~paramem.server.active_store_migration._migrate_tier_simulate_to_train`
+    (the migration path's own probe of its staged weights).
 
-    A deterministic quality verdict, NOT a crash: the adapter trained and saved
+    A deterministic quality verdict, NOT a crash: the adapter trained
     successfully, and the probe simply did not reach the threshold.  The interim
     fold catches this specific type, rolls back the cycle's store mutations, and
     returns ``mode="recall_failed"`` with the contributing session ids — the
@@ -352,12 +362,20 @@ class RecallGateRejected(RuntimeError):
     propagate as a bare exception skips that bookkeeping entirely, which leaves
     the durable retry counter at zero and the release valve unreachable.
 
-    Main-tiers compensation is scoped to ONE of its two raise sites.  A
-    ``_assert_tier_recall`` rejection is raised inside
-    ``main_tier_backup_scope``, caught by the ``except RecallGateRejected``
-    wrapped around it, and discards the fold's in-flight work before
-    re-raising unchanged (see :meth:`ConsolidationLoop._discard_fold_work`).
-    A ``_verify_saved_adapter_from_disk`` rejection is raised later — from
+    Main-tiers compensation is scoped to ONE of its two consolidation-side raise
+    sites.  An ``_assert_tier_recall`` rejection is raised INSIDE the tier's
+    ``staged_weights`` scope, before the staging slot is ever copied into the
+    production tier — the tier's ON-DISK slot is therefore untouched by the
+    refusal.  That is a claim about disk, not about VRAM: donor seeding, a
+    cold-init reconcile, or a LoRA-config mismatch recreate can already have
+    rewritten the tier's live adapter before this fold's training started, so
+    the surrounding ``main_tier_backup_scope``'s ``except BaseException``
+    restore arm still matters for THIS tier, exactly as it does for any
+    EARLIER tier this same fold already promoted — and the
+    ``except RecallGateRejected`` wrapped around the whole tier loop discards the
+    fold's other in-flight work before re-raising unchanged (see
+    :meth:`ConsolidationLoop._discard_fold_work`).  A
+    ``_verify_saved_adapter_from_disk`` rejection is raised later — from
     ``_save_adapters`` inside ``_persist_fold``, downstream of that same
     ``except`` block's ``try`` — so it is NOT caught there: it propagates
     with ``fold_resume.json`` left intact, the same retry-on-next-cycle
@@ -367,11 +385,20 @@ class RecallGateRejected(RuntimeError):
     path keep their current behaviour.
     """
 
-    def __init__(self, message: str, *, adapter_name: str, recall_rate: float, threshold: float):
+    def __init__(
+        self,
+        message: str,
+        *,
+        adapter_name: str,
+        recall_rate: float,
+        threshold: float,
+        failed_keys: tuple[str, ...] = (),
+    ):
         super().__init__(message)
         self.adapter_name = adapter_name
         self.recall_rate = recall_rate
         self.threshold = threshold
+        self.failed_keys = failed_keys
 
 
 class AbortedDuringConsolidation(Exception):
@@ -621,6 +648,15 @@ class FoldScope:
         rebuild semantics; no new behaviour is invented).
         """
         return self.persist == "main_tiers" and self.keys_from == "main_tiers"
+
+
+#: Sample cap for the post-save disk-integrity probe (:meth:`ConsolidationLoop
+#: ._run_recall_sanity_probe`).  Answers "did the bytes survive the write?" —
+#: a truncated or mis-decrypted safetensors file fails every key, not a
+#: selective few, so a fixed sample settles it at bounded cost.  Distinct from
+#: the training-completeness gate (:meth:`ConsolidationLoop._assert_tier_recall`),
+#: which is always uncapped.
+_DISK_VERIFY_PROBE_SAMPLE = 100
 
 
 class ConsolidationLoop:
@@ -1249,127 +1285,69 @@ class ConsolidationLoop:
             for key in self.store.active_keys_in_tier(tier)
         ]
 
-    def _recall_passing_keys(
-        self,
-        state: "object | None",
-        entries: "list[dict]",
-    ) -> "set[str] | None":
-        """Return the set of keys whose ``exact_match`` verdict is True.
+    def _probe_recall(self, adapter_name: str, entries: "list[dict]") -> RecallProbe:
+        """Run an uncapped per-key recall probe of *adapter_name* over *entries*.
 
-        Reads ``state.last_per_key`` — the per-key verdict from the final
-        fill probe written by ``RecallEarlyStopCallback.on_epoch_end``.
+        The ONE probe primitive every staged-weights verdict is built on:
+        the main-tier gate (:meth:`_assert_tier_recall`), the interim
+        registration gate, and the disk-integrity verify
+        (:meth:`_run_recall_sanity_probe`) all route through this method.
+        Always probes the FULL entries list — no sampling cap.
 
-        Returns a set of passing key strings when the verdict is available,
-        or ``None`` when ``state`` is ``None`` (early-stop disabled) or
-        ``state.last_per_key`` is ``None`` (no probe has run yet).  A ``None``
-        return is the explicit "no verdict" signal; callers MUST route it to
-        ``_probe_passing_keys`` — never treat it as an empty passing-set.
+        Exceptions propagate — a probe that cannot run is not a verdict.
 
-        Two surviving consumers: the interim fold's per-key registration gate
-        (a failing key stays unregistered and its session stays pending), and
-        :meth:`_assert_tier_recall` — the main fold's single training-
-        completeness verdict, which falls back to ``_probe_passing_keys`` on
-        a ``None`` return.
+        Gradient checkpointing is disabled by ``evaluate_indexed_recall``
+        itself for the duration of the probe and re-enabled here afterward
+        (when configured on), since this now runs mid-fold — before the
+        promote and before the next tier trains — rather than after training
+        has fully finished.
 
         Args:
-            state: The ``_EarlyStopState`` returned alongside the callback by
-                ``_maybe_make_recall_callback``, or ``None`` when the callback
-                was not constructed.
-            entries: The key-entry list (used only for logging; not filtered
-                here).
-
-        Returns:
-            ``set[str]`` of passing key names, or ``None`` if no verdict.
-        """
-        if state is None:
-            return None
-        last_per_key = getattr(state, "last_per_key", None)
-        if last_per_key is None:
-            return None
-        return {r["key"] for r in last_per_key if r["exact_match"]}
-
-    def _probe_passing_keys(
-        self,
-        adapter_name: str,
-        entries: "list[dict]",
-    ) -> "set[str]":
-        """Run a dedicated per-key recall probe and return the passing set.
-
-        Called when ``_recall_passing_keys`` returns ``None`` — i.e. when the
-        early-stop callback was not active (``recall_early_stopping=False``) or
-        had not yet run a probe.  This ensures a verdict on the FINAL trained
-        weights always exists, regardless of whether the callback fired.
-
-        Two surviving consumers: the interim fold's per-key registration gate
-        (``_run_fold``'s interim branch, ~:4082) and :meth:`_assert_tier_recall`
-        — the main fold's single training-completeness verdict, whose
-        no-verdict fallback runs this probe over a rebuilt tier's full key set.
-
-        Uses the full entries list without any sampling cap (unlike
-        ``_run_recall_sanity_probe`` which caps at max_probe=100).  Probe
-        failures propagate as raised exceptions — do NOT swallow errors.
-
-        Gradient checkpointing is disabled before the probe (required for
-        ``model.generate()`` to use the KV cache) and NOT re-enabled
-        afterward, because this is called after training has completed.
-
-        Args:
-            adapter_name: Active adapter name for the probe.
+            adapter_name: Active adapter name for the probe (the staging
+                slot for a just-trained tier; a production tier name for a
+                disk-verify re-load).
             entries: Full per-tier entry list to probe (no truncation).
 
         Returns:
-            Set of key strings whose ``exact_match`` verdict is True.
+            :class:`~paramem.training.recall_eval.RecallProbe` carrying the
+            per-key verdict.
         """
         from paramem.memory.entry import build_registry as _build_registry_inner
         from paramem.training.recall_eval import evaluate_indexed_recall
 
-        self._disable_gradient_checkpointing()
-        result = evaluate_indexed_recall(
-            self.model,
-            self.tokenizer,
-            entries,
-            _build_registry_inner(entries),
-            adapter_name=adapter_name,
-            batch_size=self.training_config.recall_probe_batch_size,
-        )
-        return {r["key"] for r in result["per_key"] if r["exact_match"]}
+        try:
+            result = evaluate_indexed_recall(
+                self.model,
+                self.tokenizer,
+                entries,
+                _build_registry_inner(entries),
+                adapter_name=adapter_name,
+                batch_size=self.training_config.recall_probe_batch_size,
+            )
+        finally:
+            self._enable_gradient_checkpointing()
+        return RecallProbe(per_key=tuple(result["per_key"]))
 
-    def _assert_tier_recall(
-        self,
-        adapter_name: str,
-        entries: "list[dict]",
-        recall_state: "object | None",
-    ) -> float:
+    def _assert_tier_recall(self, adapter_name: str, probe: RecallProbe) -> None:
         """The ONE main-tier training-completeness verdict.
 
-        Called at each rebuilt tier's training end, and — for a
-        crash-resumed tier — before it joins ``tiers_rebuilt``.  Both call
-        sites sit inside ``main_tier_backup_scope`` and before every durable
-        write, so a refusal restores the pre-fold weights (the backup
-        scope's own ``except BaseException`` restore arm) and leaves disk
-        untouched.
+        Called against the staged weights (:data:`~paramem.training.trainer.STAGING_ADAPTER`)
+        BEFORE the tier is promoted into production — for both a freshly
+        trained tier and a crash-resumed one.  A refusal therefore never
+        touches the tier's ON-DISK production slot.  It says nothing about
+        the tier's VRAM state: donor seeding, a cold-init reconcile, or a
+        LoRA-config mismatch recreate may already have rewritten the live
+        adapter before this fold's training started, so the surrounding
+        ``main_tier_backup_scope`` restore
+        (:func:`~paramem.models.loader.main_tier_backup_scope`) still covers
+        THIS tier, not only earlier-promoted ones.
 
-        Verdict over the tier's FULL key set, never a sample: reads
-        ``state.last_per_key`` via :meth:`_recall_passing_keys` when the
-        early-stop callback produced one (its probe target is the same
-        ``entries`` list, and a probe is forced on the final epoch);
-        otherwise runs a dedicated probe over the full ``entries`` list
-        (:meth:`_probe_passing_keys`).  For a tier trained THIS run, this is
-        the identical fallback call the pre-refusal finalize step used to
-        run for a ``None`` verdict — only moved earlier in the call
-        sequence, so the happy-path GPU cost for that tier is unchanged, not
-        added.  A crash-resumed tier (``recall_state=None``, its weights
-        loaded from a checkpoint this process never probed) always takes
-        this branch too; the pre-refusal finalize step already ran an
-        equivalent probe against a resumed tier's weights, so this is not
-        new GPU spend per tier — but the RESULT is now load-bearing where
-        before it only filtered which keys registered: a resumed tier's
-        probe can now refuse the whole fold, which the pre-refusal finalize
-        step never did.
+        Verdict over the tier's FULL key set, never a sample: *probe* already
+        ran against every entry this fold assembled for the tier.
 
-        Duplicate-tolerant: the denominator is the DISTINCT key count
-        (``len({key set})``), not ``len(entries)`` — a caller that passed a
-        list with a repeated key must never refuse at genuine 100% recall.
+        Duplicate-tolerant: the denominator is ``probe.distinct_total``, the
+        DISTINCT key count — a caller that probed a list with a repeated key
+        must never refuse at genuine 100% recall.
 
         Deliberately not threshold-fed: unlike the disk-integrity probe
         (``recall_sanity_threshold``), this gate never admits a partial
@@ -1377,35 +1355,25 @@ class ConsolidationLoop:
 
         Args:
             adapter_name: The tier's adapter name (``"episodic"`` /
-                ``"semantic"`` / ``"procedural"``) — also the active adapter
-                the fallback probe runs against.
-            entries: The tier's full keyed-entry list for this fold (the
-                same list the tier trained on).
-            recall_state: The ``_EarlyStopState`` returned by
-                ``_train_tier_adapter``, or ``None`` (early-stop disabled,
-                or a crash-resumed tier this process never trained).
-
-        Returns:
-            The tier's recall rate (``passing / total``) — always ``1.0``
-            on return, since a lower rate raises instead.
+                ``"semantic"`` / ``"procedural"``) — named in the refusal
+                message, not the probe target (the probe already ran against
+                the staged weights before this is called).
+            probe: The :class:`~paramem.training.recall_eval.RecallProbe`
+                already run against the tier's staged weights.
 
         Raises:
-            RecallGateRejected: when any key in ``entries`` failed recall
-                on the final trained weights.  Names the tier, the
-                passing/total count, and the two operator levers: the
-                tier's LoRA ``rank``/``alpha`` under ``adapters:`` in
-                ``server.yaml``, and the training-budget table in
-                ``paramem/utils/config.py``.
+            RecallGateRejected: when any key fell short of exact-match
+                recall on the staged weights.  Names the tier, the
+                passing/total count, the failing key names, and the two
+                operator levers: the tier's LoRA ``rank``/``alpha`` under
+                ``adapters:`` in ``server.yaml``, and the training-budget
+                table in ``paramem/utils/config.py``.
         """
-        passing = self._recall_passing_keys(recall_state, entries)
-        if passing is None:
-            passing = self._probe_passing_keys(adapter_name, entries)
-        # Distinct key count, not len(entries) — a caller that passed a
-        # list with a repeated key must never refuse at genuine 100% recall.
-        total = len({e["key"] for e in entries})
-        n_passing = len(passing)
-        rate = n_passing / total
+        total = probe.distinct_total
+        n_passing = len(probe.passing_keys)
+        rate = n_passing / total if total else 1.0
         if n_passing < total:
+            failed_keys = tuple(sorted({r["key"] for r in probe.failed}))
             raise RecallGateRejected(
                 f"_assert_tier_recall: tier '{adapter_name}' reached {n_passing}/{total} "
                 f"keys ({rate:.3f}) on its own trained weights — short of the required "
@@ -1418,8 +1386,8 @@ class ConsolidationLoop:
                 adapter_name=adapter_name,
                 recall_rate=rate,
                 threshold=1.0,
+                failed_keys=failed_keys,
             )
-        return rate
 
     def _reactivate_fold_soft_stales(
         self, soft_stale_by_tier: "dict[str, dict[str, dict]]"
@@ -1451,16 +1419,18 @@ class ConsolidationLoop:
     ) -> None:
         """Return the store to its pre-fold state after a deterministic refusal.
 
-        Called by the main-tiers fold immediately before a
-        ``RecallGateRejected`` it cannot recover from propagates — resuming
-        a deterministic verdict would only reproduce it, and the
-        crash-resume marker's content fingerprint
+        Called by the main-tiers fold immediately before a deterministic
+        refusal it cannot recover from propagates: a ``RecallGateRejected``,
+        or the crash-resume no-checkpoint arm's ``RuntimeError`` when
+        ``verify_tier_binding`` cannot resolve a publishable production slot
+        to resume from.  Resuming a deterministic verdict would only
+        reproduce it, and the crash-resume marker's content fingerprint
         (:meth:`_compute_fold_stamp`) does not move when the operator's
-        remedy (raising a tier's LoRA rank/alpha) changes, so a surviving
-        marker would send the next cycle down the crash-resume branch and
-        reload the pre-abort checkpoint at the OLD rank — defeating the
-        remedy.  A crash or ``AbortedDuringConsolidation`` must NOT reach
-        this: both keep the marker so a genuine crash can resume.
+        remedy (raising a tier's LoRA rank/alpha, or repairing the tier's
+        on-disk binding) changes, so a surviving marker would send the next
+        cycle down the crash-resume branch and hit the identical dead end —
+        defeating the remedy.  A crash or ``AbortedDuringConsolidation`` must
+        NOT reach this: both keep the marker so a genuine crash can resume.
 
         The fold mutates the LIVE store, with ``defer=False``, BEFORE the
         tier loop that can trigger this refusal — inline promotion
@@ -1483,11 +1453,16 @@ class ConsolidationLoop:
         Four steps, in order:
 
         1. Reactivate every key this fold soft-staled
-           (:meth:`_reactivate_fold_soft_stales`) — by the time this runs,
-           ``main_tier_backup_scope``'s own ``except BaseException`` arm has
-           already restored the pre-fold adapter weights, so this only
-           needs to undo the OTHER in-flight mutations (RAM soft-stale
-           flips, promotions/relocations, mints).
+           (:meth:`_reactivate_fold_soft_stales`) — for a caller reached
+           AFTER ``main_tier_backup_scope`` has already exited (unwound by an
+           earlier exception), its ``except BaseException`` arm has already
+           restored the pre-fold adapter weights by the time this runs. The
+           crash-resume no-checkpoint arm calls this from INSIDE the scope,
+           before its ``RuntimeError`` propagates out and triggers that
+           restore — the ordering is reversed for that caller, but the two
+           touch disjoint state (VRAM adapter weights vs. the backing
+           store's soft-stale flips/relocations/mints), so either ordering
+           reaches the same pre-fold state.
         2. Reverse every relocation — ``store.move(key, original_tier)`` —
            and drop the key from ``self.promoted_keys`` so a future fold
            reconsiders it for promotion rather than skipping it forever
@@ -2416,7 +2391,6 @@ class ConsolidationLoop:
                     adapter_name,
                     slot,
                     _entries_for_tier(simhash),
-                    threshold=self.config.recall_sanity_threshold,
                 )
             except Exception:
                 # Delete the bad slot so a latent corrupted artifact is not
@@ -3500,7 +3474,6 @@ class ConsolidationLoop:
             adapter_name,
             slot,
             entries,
-            threshold=self.config.recall_sanity_threshold,
         )
 
     def _persist_fold(
@@ -4191,7 +4164,15 @@ class ConsolidationLoop:
                             _telemetry_int_record: dict = {
                                 "tier": adapter_name,
                                 "fold_stamp": _fold_stamp_b,
-                                "adapter_count": len(self.model.peft_config),
+                                # STAGING_ADAPTER ("in_training") is resident here
+                                # on the normal-completion path (train_adapter's
+                                # staging+promote contract leaves it mounted for
+                                # this caller's own probe/promote below) — exclude
+                                # it so the count matches what a reader before the
+                                # staging redesign would have seen.
+                                "adapter_count": len(
+                                    [a for a in self.model.peft_config if a != STAGING_ADAPTER]
+                                ),
                                 "interim_count": len(
                                     [
                                         a
@@ -4296,9 +4277,19 @@ class ConsolidationLoop:
                         logger.info("_run_fold[interim]: training aborted — skipping commit")
                         return {"mode": "aborted", "adapter_name": adapter_name}
 
-                    _epi_passing = self._recall_passing_keys(recall_state, all_interim_keyed)
-                    if _epi_passing is None:
-                        _epi_passing = self._probe_passing_keys(adapter_name, all_interim_keyed)
+                    # Probe the staged weights and promote regardless of the
+                    # per-key verdict — an interim slot is minted for this
+                    # cycle and holds no prior knowledge a partial pass could
+                    # destroy (unlike a main tier).  The verdict below decides
+                    # REGISTRATION only: a failing key stays unregistered and
+                    # its contributing sessions stay pending for retry.
+                    with staged_weights(self.model, fallback_adapter="episodic"):
+                        _probe = self._probe_recall(STAGING_ADAPTER, all_interim_keyed)
+                        on_recall_probe(
+                            list(_probe.per_key), phase="train_gate", adapter_name=adapter_name
+                        )
+                        _epi_passing = _probe.passing_keys
+                        promote_staging_adapter(self.model, adapter_name)
                 else:
                     _epi_passing = None
 
@@ -4405,26 +4396,50 @@ class ConsolidationLoop:
                     # fresh on the next fold attempt, so re-entry's init state
                     # is whatever the standard mechanism provides (cold today,
                     # donor-seeded when that mechanism is enabled) rather than
-                    # the rejected checkpoint.  Switch off the slot before
-                    # deleting it — PEFT's delete_adapter silently reassigns
-                    # the active adapter to whichever resident adapter it
-                    # encounters first when the deleted one was active, which
-                    # would leave the post-rejection active adapter
-                    # non-deterministic; switching to episodic first (the same
-                    # pattern already used by _verify_saved_adapter_from_disk's
-                    # own verify-slot teardown) keeps it deterministic.  The
-                    # "Restore episodic as active adapter" step below is
-                    # idempotent on an already-active episodic and never
-                    # touches a slot this block already removed.
+                    # the rejected checkpoint.  Routes through the one "delete
+                    # a transient slot" primitive
+                    # (paramem.models.loader.drop_adapter_slot) instead of a
+                    # hand-rolled switch-off-then-delete.  The "Restore
+                    # episodic as active adapter" step below is idempotent on
+                    # an already-active episodic and never touches a slot
+                    # this block already removed — it is what makes the
+                    # post-rejection active adapter deterministic ONLY when
+                    # drop_adapter_slot actually deletes here; per its own
+                    # sole-adapter rule it SKIPS the delete when the fallback
+                    # switch does not land, which is exactly the case the
+                    # post-condition below turns loud instead of silent.
                     if adapter_name in self.model.peft_config:
-                        if "episodic" in self.model.peft_config:
-                            switch_adapter(self.model, "episodic")
-                        self.model.delete_adapter(adapter_name)
-                        logger.info(
-                            "_run_fold[interim]: deleted rejected interim adapter"
-                            " %s from VRAM — retry starts cold",
-                            adapter_name,
-                        )
+                        from paramem.models.loader import drop_adapter_slot
+
+                        drop_adapter_slot(self.model, adapter_name, fallback_adapter="episodic")
+                        if adapter_name not in self.model.peft_config:
+                            logger.info(
+                                "_run_fold[interim]: deleted rejected interim adapter"
+                                " %s from VRAM — retry starts cold",
+                                adapter_name,
+                            )
+                        else:
+                            # drop_adapter_slot skipped the delete (no fallback
+                            # landed) — the rejected weights are still resident.
+                            # The mint guard above only recreates adapter_name
+                            # when it is ABSENT from peft_config, so a surviving
+                            # slot here is not a cosmetic leak: the next cycle
+                            # would silently warm-start training from weights
+                            # that failed this cycle's recall gate and exist
+                            # nowhere on disk. Raise loudly instead of letting
+                            # that happen silently — this propagates out of
+                            # _run_fold/run_consolidation_cycle to the
+                            # scheduled-extract executor future's generic
+                            # exception handling
+                            # (``_scheduled_extract_done_callback`` in
+                            # app.py), which logs it loudly regardless of
+                            # exception type.
+                            raise RuntimeError(
+                                f"_run_fold[interim]: rejected interim adapter {adapter_name!r} "
+                                "survived drop_adapter_slot's teardown (fallback switch to "
+                                "'episodic' did not land) — rejected interim weights must not "
+                                "survive in VRAM, they would silently warm-start the next cycle"
+                            )
                     _recall_gate_rejected = True
                     _recall_failed_session_ids.update(_pending_session_ids_b)
                     logger.warning(
@@ -5118,13 +5133,21 @@ class ConsolidationLoop:
                 )
                 try:
                     # RecallGateRejected raised anywhere in the tier loop
-                    # below (either _assert_tier_recall call site) means
-                    # main_tier_backup_scope's own except BaseException arm
-                    # has already restored every snapshotted tier from its
-                    # <tier>_backup before this handler runs -- so
-                    # _discard_fold_work only needs to undo the fold's
-                    # OTHER in-flight work (soft-staled keys, the resume
-                    # marker, retained scratch), never the weights.
+                    # below (either _assert_tier_recall call site) is raised
+                    # BEFORE the failing tier is ever promoted -- its ON-DISK
+                    # production slot is untouched.  Its VRAM slot may already
+                    # differ from that on-disk state: donor seeding
+                    # (_maybe_seed_from_donor, reached unconditionally on the
+                    # weights venue), a cold-init reconcile (RECONCILE mode),
+                    # or a LoRA-config mismatch recreate can all have
+                    # rewritten the live adapter before training started this
+                    # fold.  main_tier_backup_scope's own except BaseException
+                    # arm restores every snapshotted tier -- the refused tier
+                    # included, not only EARLIER tiers this same fold already
+                    # promoted -- from its <tier>_backup, before this handler
+                    # runs -- so _discard_fold_work only needs to undo the
+                    # fold's OTHER in-flight work (soft-staled keys, the
+                    # resume marker, retained scratch), never the weights.
                     with main_tier_backup_scope(self.model, tier_config_for_backup) as _bscope:
                         self.model = _bscope.model
                         if torch.cuda.is_available() and _telemetry_free_before is not None:
@@ -5195,113 +5218,6 @@ class ConsolidationLoop:
                                 )
                                 continue
 
-                            # --- Crash-resume: reload completed tiers from durable checkpoint ---
-                            if _resume_c and tier in _completed_in_marker:
-                                # The checkpoint path stored in the marker (may be absent
-                                # when _latest_checkpoint_in_dir found no checkpoint-N dir
-                                # for this tier).
-                                _ckpt_path = _marker_checkpoints.get(tier)
-                                logger.info(
-                                    "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
-                                    " durable checkpoint (no retrain); checkpoint=%s",
-                                    tier,
-                                    _ckpt_path or "production-slot",
-                                )
-                                # Delete the stale production slot (pre-crash _save_adapters never
-                                # ran — weights are stale) and reload from the checkpoint dir or the
-                                # existing production slot when no checkpoint was recorded.
-                                # The per-tier backups created above mean the deleted
-                                # slot is never the last adapter on the PeftModel
-                                # (no base-unwrap needed).
-                                if tier in self.model.peft_config:
-                                    if backup_name in self.model.peft_config:
-                                        from paramem.models.loader import switch_adapter as _sw_pre
-
-                                        _sw_pre(self.model, backup_name)
-                                    self.model.delete_adapter(tier)
-                                    logger.debug(
-                                        "_run_fold[main_tiers]: crash-resume deleted stale slot %s",
-                                        tier,
-                                    )
-                                if _ckpt_path and Path(_ckpt_path).is_dir():
-                                    # checkpoint-N dir present — load the staged adapter
-                                    # from it.  HF Trainer saves all PEFT adapters under
-                                    # checkpoint-N/<adapter_name>/ (one subdir per adapter).
-                                    # The training adapter staging slot is "in_training"
-                                    # (trainer._STAGING_ADAPTER), so the weights live at
-                                    # checkpoint-N/in_training/adapter_model.safetensors.
-                                    # Decrypt into /dev/shm when security is ON (mirrors
-                                    # trainer.py:962-976).
-                                    from paramem.backup import key_store as _ks
-                                    from paramem.training.trainer import (
-                                        _STAGING_ADAPTER as _STAGING_SLOT,
-                                    )
-
-                                    # Resolve to the staging-adapter subdir within the checkpoint.
-                                    _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
-                                    _ckpt_effective = (
-                                        str(_ckpt_staging_path)
-                                        if _ckpt_staging_path.is_dir()
-                                        else _ckpt_path
-                                    )
-                                    _ckpt_shm_dir = None
-                                    if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-                                        from paramem.backup.checkpoint_shard import (
-                                            materialize_checkpoint_to_shm,
-                                        )
-
-                                        _ckpt_shm_dir = materialize_checkpoint_to_shm(
-                                            Path(_ckpt_effective)
-                                        )
-                                        _ckpt_load_path = str(_ckpt_shm_dir)
-                                    else:
-                                        _ckpt_load_path = _ckpt_effective
-                                    try:
-                                        self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
-                                        logger.info(
-                                            "_run_fold[main_tiers]: crash-resume loaded %s from"
-                                            " checkpoint %s (staging slot=%s)",
-                                            tier,
-                                            _ckpt_path,
-                                            _STAGING_SLOT,
-                                        )
-                                    finally:
-                                        if (
-                                            _ckpt_shm_dir is not None
-                                            and Path(str(_ckpt_shm_dir)).exists()
-                                        ):
-                                            import shutil as _s
-
-                                            _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
-                                else:
-                                    # no checkpoint-N dir recorded for this tier (see
-                                    # _latest_checkpoint_in_dir). Reload from the EXISTING
-                                    # production slot on disk — it was not overwritten
-                                    # (final _save_adapters never ran on crash).
-                                    from paramem.memory.interim_adapter import (
-                                        adapter_slot_root_for_name as _asr_fn,
-                                    )
-                                    from paramem.models.loader import load_adapter as _la
-
-                                    _prod_root = _asr_fn(self.output_dir, tier)
-                                    _la(self.model, _prod_root.parent, tier)
-                                    logger.info(
-                                        "_run_fold[main_tiers]: crash-resume (no recorded"
-                                        " checkpoint) loaded %s from production slot %s",
-                                        tier,
-                                        _prod_root.parent,
-                                    )
-                                from paramem.models.loader import switch_adapter as _sw_resume
-
-                                _sw_resume(self.model, tier)
-                                # Crash-resumed weights come from a checkpoint
-                                # this process never probed -- gate before the
-                                # tier joins tiers_rebuilt (recall_state=None
-                                # forces the dedicated probe fallback).
-                                self._assert_tier_recall(tier, job.entries, None)
-                                tiers_rebuilt.append(tier)
-                                continue
-
                             tier_cfg = (
                                 self.episodic_config
                                 if tier == "episodic"
@@ -5311,6 +5227,186 @@ class ConsolidationLoop:
                                     else (self.procedural_config or self.episodic_config)
                                 )
                             )
+
+                            # --- Crash-resume: reload completed tiers from durable checkpoint ---
+                            if _resume_c and tier in _completed_in_marker:
+                                # The checkpoint path stored in the marker (may be absent
+                                # when _latest_checkpoint_in_dir found no checkpoint-N dir
+                                # for this tier).
+                                _ckpt_path = _marker_checkpoints.get(tier)
+                                logger.info(
+                                    "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading"
+                                    " staged weights for gate + promote (no retrain);"
+                                    " checkpoint=%s",
+                                    tier,
+                                    _ckpt_path or "production-slot",
+                                )
+                                # The production slot is untouched by this branch — the
+                                # retained checkpoint is loaded into STAGING_ADAPTER and
+                                # gated there; a refused tier never touches production.
+                                assert_staging_absent(self.model)
+                                # Enter the staging disposal scope BEFORE the load (not
+                                # after ensure_adapter_matching, as before) -- staged_weights'
+                                # finally is a no-op when STAGING_ADAPTER never got created,
+                                # so entering early costs nothing on the happy path, but it
+                                # closes the crash window where a raise between the load and
+                                # the probe below left the slot resident with no caller
+                                # positioned to dispose of it -- permanently tripping the
+                                # next training event's assert_staging_absent.
+                                with staged_weights(self.model, fallback_adapter=tier):
+                                    if _ckpt_path and Path(_ckpt_path).is_dir():
+                                        # checkpoint-N dir present — load the staged adapter
+                                        # from it.  HF Trainer saves all PEFT adapters under
+                                        # checkpoint-N/<adapter_name>/ (one subdir per adapter).
+                                        # The training adapter staging slot is STAGING_ADAPTER
+                                        # ("in_training"), so the weights live at
+                                        # checkpoint-N/in_training/adapter_model.safetensors.
+                                        # Decrypt into /dev/shm when security is ON (mirrors
+                                        # the checkpoint materialize step in train_adapter).
+                                        from paramem.backup import key_store as _ks
+
+                                        # Resolve to the staging-adapter subdir within
+                                        # the checkpoint.
+                                        _ckpt_staging_path = Path(_ckpt_path) / STAGING_ADAPTER
+                                        _ckpt_effective = (
+                                            str(_ckpt_staging_path)
+                                            if _ckpt_staging_path.is_dir()
+                                            else _ckpt_path
+                                        )
+                                        _ckpt_shm_dir = None
+                                        if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+                                            from paramem.backup.checkpoint_shard import (
+                                                materialize_checkpoint_to_shm,
+                                            )
+
+                                            _ckpt_shm_dir = materialize_checkpoint_to_shm(
+                                                Path(_ckpt_effective)
+                                            )
+                                            _ckpt_load_path = str(_ckpt_shm_dir)
+                                        else:
+                                            _ckpt_load_path = _ckpt_effective
+                                        try:
+                                            self.model.load_adapter(
+                                                _ckpt_load_path, adapter_name=STAGING_ADAPTER
+                                            )
+                                            logger.info(
+                                                "_run_fold[main_tiers]: crash-resume loaded %s from"
+                                                " checkpoint %s into %s",
+                                                tier,
+                                                _ckpt_path,
+                                                STAGING_ADAPTER,
+                                            )
+                                        finally:
+                                            if (
+                                                _ckpt_shm_dir is not None
+                                                and Path(str(_ckpt_shm_dir)).exists()
+                                            ):
+                                                import shutil as _s
+
+                                                _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
+                                    else:
+                                        # No checkpoint-N dir recorded for this tier (see
+                                        # _latest_checkpoint_in_dir). Reload the tier's EXISTING
+                                        # production slot on disk — it was not overwritten
+                                        # (final _save_adapters never ran on crash) — into
+                                        # STAGING_ADAPTER.  The tier's slot ROOT
+                                        # (<adapter_dir>/<tier>/) is not itself a loadable
+                                        # adapter dir — the real weights live in a stamped
+                                        # child slot (<adapter_dir>/<tier>/<ts>/) chosen by
+                                        # registry-hash match, same as the boot mount
+                                        # (app.py's ``_load_one``).  Resolve it through the
+                                        # one canonical resolver (``verify_tier_binding`` →
+                                        # ``find_live_slot``) rather than hand-rolling a
+                                        # second one, then hand the resolved slot to
+                                        # ``_adapter_slot_for_load`` — the same
+                                        # content-sniffing decrypt boundary the boot mount
+                                        # (app.py's ``_load_one``) and the donor build use —
+                                        # rather than gating on
+                                        # ``daily_identity_loadable`` (which only says
+                                        # whether THIS process can decrypt an age envelope,
+                                        # not whether the slot on disk actually is one; an
+                                        # unloadable identity on an encrypted slot would
+                                        # otherwise hand ciphertext straight to
+                                        # ``model.load_adapter``). This mirrors the checkpoint
+                                        # arm above only in shape — that arm decrypts a
+                                        # checkpoint scratch dir, a different artifact, so it
+                                        # keeps ``materialize_checkpoint_to_shm``.
+                                        from paramem.adapters.registry_binding import (
+                                            verify_tier_binding,
+                                        )
+                                        from paramem.memory.interim_adapter import (
+                                            adapter_slot_root_for_name as _asr_fn,
+                                        )
+                                        from paramem.models.loader import _adapter_slot_for_load
+
+                                        _prod_root = _asr_fn(self.output_dir, tier)
+                                        _prod_binding = verify_tier_binding(tier, _prod_root)
+                                        # verify_tier_binding also resolves `slot` for a
+                                        # KEY_COUNT_MISMATCH verdict — a tier the boot mount
+                                        # itself refuses to publish (see `.publishable` /
+                                        # `_PUBLISHABLE` in registry_binding.py). Gate the
+                                        # crash-resume load on the same predicate so a
+                                        # non-publishable tier refuses here instead of
+                                        # silently loading a binding the rest of the system
+                                        # would never trust.
+                                        if (
+                                            _prod_binding.slot is None
+                                            or not _prod_binding.publishable
+                                        ):
+                                            # This is a deterministic verdict over the
+                                            # tree as it stands — resuming it would only
+                                            # reproduce it every cycle (see
+                                            # _discard_fold_work's docstring), so discard
+                                            # this fold's other in-flight mutations and
+                                            # clear fold_resume.json before propagating.
+                                            # The next cycle then starts a fresh fold
+                                            # instead of resuming into the same dead end.
+                                            self._discard_fold_work(
+                                                soft_stale_by_tier,
+                                                relocated_keys=_relocated_keys_this_fold,
+                                                minted_keys=_minted_keys_this_fold,
+                                            )
+                                            raise RuntimeError(
+                                                f"_run_fold[main_tiers]: crash-resume could not "
+                                                f"resolve tier {tier!r}'s publishable live "
+                                                f"production slot under {_prod_root} "
+                                                f"(verify_tier_binding status="
+                                                f"{_prod_binding.status!r}, "
+                                                f"detail={_prod_binding.detail!r})"
+                                            )
+                                        with _adapter_slot_for_load(
+                                            _prod_binding.slot
+                                        ) as _prod_load_path:
+                                            self.model.load_adapter(
+                                                str(_prod_load_path),
+                                                adapter_name=STAGING_ADAPTER,
+                                            )
+                                        logger.info(
+                                            "_run_fold[main_tiers]: crash-resume (no recorded"
+                                            " checkpoint) loaded %s from production slot %s"
+                                            " into %s",
+                                            tier,
+                                            _prod_binding.slot,
+                                            STAGING_ADAPTER,
+                                        )
+                                    # The promote's destination must exist and match this
+                                    # fold's config — today's load_adapter created the tier
+                                    # slot as a side effect of loading directly into it;
+                                    # mounting under STAGING_ADAPTER removes that side
+                                    # effect, so ensure the tier explicitly.
+                                    self.model = ensure_adapter_matching(self.model, tier_cfg, tier)
+                                    # Crash-resumed weights come from a checkpoint this
+                                    # process never probed -- gate the staged weights BEFORE
+                                    # they ever touch the tier's production slot, so a
+                                    # refusal here leaves production untouched.
+                                    probe = self._probe_recall(STAGING_ADAPTER, job.entries)
+                                    on_recall_probe(
+                                        list(probe.per_key), phase="train_gate", adapter_name=tier
+                                    )
+                                    self._assert_tier_recall(tier, probe)
+                                    promote_staging_adapter(self.model, tier)
+                                tiers_rebuilt.append(tier)
+                                continue
 
                             if backup_name in self.model.peft_config:
                                 from paramem.models.loader import switch_adapter as _sw_backup
@@ -5335,10 +5431,12 @@ class ConsolidationLoop:
                                 )
                             else:
                                 # Warm default: keep the resident tier's weights —
-                                # the funnel's staging copy (trainer.py:944-948)
-                                # warm-starts training from them. Recreates cold
-                                # only on first-boot absence or a genuine LoRA
-                                # config mismatch (never as blanket policy).
+                                # the funnel's staging copy (train_adapter's
+                                # production→staging copy_adapter_weights call,
+                                # right after _ensure_staging_slot) warm-starts
+                                # training from them. Recreates cold only on
+                                # first-boot absence or a genuine LoRA config
+                                # mismatch (never as blanket policy).
                                 self.model = ensure_adapter_matching(self.model, tier_cfg, tier)
 
                             from paramem.models.loader import switch_adapter as _sw
@@ -5450,7 +5548,20 @@ class ConsolidationLoop:
                                     _telemetry_tier_record: dict = {
                                         "tier": tier,
                                         "fold_stamp": _fold_stamp_c,
-                                        "adapter_count": len(self.model.peft_config),
+                                        # STAGING_ADAPTER ("in_training") is resident
+                                        # here on the normal-completion path
+                                        # (train_adapter's staging+promote contract
+                                        # leaves it mounted for this caller's own
+                                        # probe/promote below) — exclude it so the
+                                        # count matches what a reader before the
+                                        # staging redesign would have seen.
+                                        "adapter_count": len(
+                                            [
+                                                a
+                                                for a in self.model.peft_config
+                                                if a != STAGING_ADAPTER
+                                            ]
+                                        ),
                                         "interim_count": len(
                                             [
                                                 a
@@ -5556,23 +5667,28 @@ class ConsolidationLoop:
                                         exc_info=True,
                                     )
 
-                            if recall_state is not None and recall_state.last_per_key is not None:
+                            # ONE main-tier training-completeness verdict, probed
+                            # on the STAGED weights before this tier ever touches
+                            # its production slot.  A refusal here means the
+                            # promote below never runs, so the tier's ON-DISK
+                            # production slot is untouched.  Its VRAM slot may
+                            # already differ (donor seeding, a cold-init
+                            # reconcile, or a LoRA-config mismatch recreate can
+                            # all have rewritten the live adapter before this
+                            # fold's training started) -- main_tier_backup_scope's
+                            # own except BaseException arm restores THIS tier
+                            # too, the same as any EARLIER tier this fold already
+                            # promoted; the surrounding try/except here only
+                            # needs to discard the fold's OTHER in-flight work
+                            # (soft-staled keys, the resume marker, retained
+                            # scratch).
+                            with staged_weights(self.model, fallback_adapter=tier):
+                                probe = self._probe_recall(STAGING_ADAPTER, job.entries)
                                 on_recall_probe(
-                                    recall_state.last_per_key,
-                                    phase="train_fill",
-                                    adapter_name=tier,
+                                    list(probe.per_key), phase="train_gate", adapter_name=tier
                                 )
-                            # ONE main-tier training-completeness verdict, run on
-                            # the FINAL trained weights before this tier is
-                            # allowed to join tiers_rebuilt.  Raises
-                            # RecallGateRejected when any key of this tier's own
-                            # full key set fell short -- caught by the
-                            # try/except wrapping the backup scope below, which
-                            # discards this fold's in-flight work before
-                            # re-raising (the scope's own except BaseException
-                            # arm has already restored every snapshotted tier's
-                            # pre-fold weights by the time that handler runs).
-                            self._assert_tier_recall(tier, job.entries, recall_state)
+                                self._assert_tier_recall(tier, probe)
+                                promote_staging_adapter(self.model, tier)
                             tiers_rebuilt.append(tier)
                             # Mark this tier complete in the fold_resume.json marker so that a
                             # crash AFTER training but BEFORE _save_adapters can reload it without
@@ -7390,25 +7506,25 @@ class ConsolidationLoop:
                 _adopted_key,
             )
 
-    def _run_recall_sanity_probe(
-        self,
-        adapter_name: str,
-        entries: list[dict],
-        *,
-        max_probe: int = 100,
-        debug_phase: str | None = None,
-    ) -> float:
-        """Probe up to *max_probe* entries against *adapter_name* and return the recall rate.
+    def _run_recall_sanity_probe(self, adapter_name: str, entries: list[dict]) -> float:
+        """Sampled recall of a slot reloaded from disk; ``0.0`` when the probe cannot run.
 
         Used by :meth:`_verify_saved_adapter_from_disk` to check the recall
-        of an adapter reloaded from disk.  Keeping the logic in one place
-        makes the sanity contract identical everywhere: same sample size,
-        same probe harness, same failure semantics (probe exception → ``0.0``
-        so callers treat it as a rollback trigger rather than a mysterious
-        skip).
+        of an adapter reloaded from disk.  Built on :meth:`_probe_recall`,
+        with the two properties that method deliberately does NOT have:
+        sampled at :data:`_DISK_VERIFY_PROBE_SAMPLE` (not uncapped — this
+        answers "did the bytes survive the write?", which a bounded sample
+        settles at bounded cost) and a probe exception is swallowed to
+        ``0.0`` (boundary error handling for a corrupt on-disk artifact — the
+        caller's contract is "below threshold ⇒ reject the slot", so a probe
+        that cannot run must read as a failing rate here, unlike
+        :meth:`_probe_recall`'s own contract where a probe that cannot run is
+        not a verdict at all).
 
-        The caller is responsible for deciding what to do with the
-        returned rate (threshold compare, rollback, health update).
+        The per-key verdict is persisted via
+        :func:`~paramem.utils.artifacts.on_recall_probe` under phase
+        ``"disk_verify"`` on the success path; a probe exception returns
+        ``0.0`` without writing.
 
         Args:
             adapter_name: Adapter to probe.  Must be loaded and switchable
@@ -7416,18 +7532,9 @@ class ConsolidationLoop:
                 in :func:`evaluate_indexed_recall` is deliberately NOT
                 relied on — silently probing the wrong tier would mask
                 tier-specific regressions.
-            entries: Candidate entries to probe.  Sampled uniformly
-                down to *max_probe* when longer.  An empty list returns
-                ``1.0`` (nothing to prove → healthy by default).
-            max_probe: Cap on probe size.  100 is chosen to keep the
-                probe cheap enough to run inline even inside the
-                interim training path.
-            debug_phase: When not ``None``, the per-key verdict (including
-                ``raw_output``) is persisted to the debug snapshot via
-                :func:`~paramem.utils.artifacts.on_recall_probe`
-                under ``<debug_base>/recall_probes/<debug_phase>_<adapter_name>.json``.
-                Only written on the success path (where ``recall_result`` is
-                available); probe exceptions still return ``0.0`` without writing.
+            entries: Candidate entries to probe.  Sampled uniformly down to
+                :data:`_DISK_VERIFY_PROBE_SAMPLE` when longer.  An empty list
+                returns ``1.0`` (nothing to prove → healthy by default).
 
         Returns:
             Recall rate in ``[0.0, 1.0]``.  On probe-harness exception,
@@ -7437,31 +7544,14 @@ class ConsolidationLoop:
             return 1.0
 
         probe_pairs = entries
-        if len(probe_pairs) > max_probe:
-            probe_pairs = random.sample(probe_pairs, max_probe)
+        if len(probe_pairs) > _DISK_VERIFY_PROBE_SAMPLE:
+            probe_pairs = random.sample(probe_pairs, _DISK_VERIFY_PROBE_SAMPLE)
 
         try:
-            from paramem.memory.entry import build_registry
-            from paramem.training.recall_eval import evaluate_indexed_recall
-
-            probe_registry = build_registry(probe_pairs)
-            self._disable_gradient_checkpointing()
-            recall_result = evaluate_indexed_recall(
-                self.model,
-                self.tokenizer,
-                probe_pairs,
-                probe_registry,
-                adapter_name=adapter_name,
-                batch_size=self.training_config.recall_probe_batch_size,
-            )
-            if debug_phase is not None:
-                with self._artifact_scope():
-                    on_recall_probe(
-                        recall_result["per_key"],
-                        phase=debug_phase,
-                        adapter_name=adapter_name,
-                    )
-            return float(recall_result["rate"])
+            probe = self._probe_recall(adapter_name, probe_pairs)
+            with self._artifact_scope():
+                on_recall_probe(list(probe.per_key), phase="disk_verify", adapter_name=adapter_name)
+            return probe.rate
         except Exception:
             logger.exception(
                 "_run_recall_sanity_probe: recall probe failed for adapter %s — "
@@ -7517,9 +7607,6 @@ class ConsolidationLoop:
         adapter_name: str,
         slot_path: Path,
         entries: list[dict],
-        *,
-        threshold: "float | None" = None,
-        max_probe: int = 100,
     ) -> float:
         """Reload an adapter from its on-disk slot and probe recall integrity.
 
@@ -7558,29 +7645,23 @@ class ConsolidationLoop:
                 ``adapter_config.json``) sit directly inside this directory
                 (post-flatten step of ``atomic_save_adapter``).
             entries: Entries encoded into the adapter.  Sampled down to
-                *max_probe* if longer.  An empty list returns ``1.0`` (no keys
-                to verify → healthy by default).
-            threshold: Minimum recall the disk artifact must achieve.  When
-                ``None`` (default), the value is read from
-                ``self.config.recall_sanity_threshold``.
-            max_probe: Maximum number of entries to probe.  Passed through to
-                :meth:`_run_recall_sanity_probe`.
+                :data:`_DISK_VERIFY_PROBE_SAMPLE` if longer (via
+                :meth:`_run_recall_sanity_probe`).  An empty list returns
+                ``1.0`` (no keys to verify → healthy by default).
 
         Returns:
             Recall rate from the disk-loaded adapter in ``[0.0, 1.0]``.
 
         Raises:
-            RuntimeError: When ``recall < threshold``, signalling that the
-                on-disk artifact is corrupt or degraded.  The caller's
-                try/except in ``_run_extraction_phase`` (app.py) will then skip
-                ``mark_consolidated``, leaving sessions pending for the next
-                cycle to retry.
+            RuntimeError: When ``recall < self.config.recall_sanity_threshold``,
+                signalling that the on-disk artifact is corrupt or degraded.
+                The caller's try/except in ``_run_extraction_phase`` (app.py)
+                will then skip ``mark_consolidated``, leaving sessions pending
+                for the next cycle to retry.
         """
         from peft import PeftModel
 
-        # Resolve threshold from config when the caller did not supply an override.
-        if threshold is None:
-            threshold = self.config.recall_sanity_threshold
+        threshold = self.config.recall_sanity_threshold
 
         if not entries:
             logger.debug(
@@ -7596,7 +7677,7 @@ class ConsolidationLoop:
             verify_name,
         )
 
-        from paramem.models.loader import _adapter_slot_for_load
+        from paramem.models.loader import _adapter_slot_for_load, drop_adapter_slot
 
         recall_rate: float = 0.0
         try:
@@ -7630,12 +7711,7 @@ class ConsolidationLoop:
 
             # Activate verify slot, probe, then restore original.
             switch_adapter(self.model, verify_name)
-            recall_rate = self._run_recall_sanity_probe(
-                verify_name,
-                entries,
-                max_probe=max_probe,
-                debug_phase="disk_verify",
-            )
+            recall_rate = self._run_recall_sanity_probe(verify_name, entries)
             switch_adapter(self.model, adapter_name)
 
             logger.info(
@@ -7646,17 +7722,25 @@ class ConsolidationLoop:
                 threshold,
             )
         finally:
-            # Always drop the verify slot — even if the probe raised.
-            # Re-activate the original adapter so the model is left in the
-            # same state as on entry regardless of which branch was taken.
-            if verify_name in self.model.peft_config:
-                try:
-                    switch_adapter(self.model, adapter_name)
-                except Exception:  # noqa: BLE001
-                    pass
-                self.model.delete_adapter(verify_name)
+            # Always drop the verify slot — even if the probe raised.  Routes
+            # through the one "delete a transient slot" primitive
+            # (:func:`~paramem.models.loader.drop_adapter_slot`) instead of a
+            # hand-rolled switch-off-then-delete, re-activating *adapter_name*
+            # so the model is left in the same state as on entry.  The whole
+            # disposal is guarded and swallowed (logged, never re-raised) —
+            # boundary teardown: a failure here must never replace an
+            # in-flight exception from the probe above (same posture as
+            # :func:`~paramem.training.trainer.staged_weights`'s ``finally``).
+            try:
+                drop_adapter_slot(self.model, verify_name, fallback_adapter=adapter_name)
                 logger.debug(
                     "_verify_saved_adapter_from_disk: verify slot '%s' dropped",
+                    verify_name,
+                )
+            except Exception:  # noqa: BLE001  # boundary: must never replace an
+                # in-flight exception from the probe above — see comment above.
+                logger.exception(
+                    "_verify_saved_adapter_from_disk: drop_adapter_slot(%s) failed during disposal",
                     verify_name,
                 )
 
@@ -7738,9 +7822,12 @@ class ConsolidationLoop:
         Returns ``(None, None)`` when ``training_config.recall_early_stopping``
         is False or when the entries list is empty (probing an empty set is
         a no-op).  Returns ``(callback, state)`` otherwise, where ``state``
-        is the ``_EarlyStopState`` shared with the callback; callers read
-        ``state.last_per_key`` after ``_train_adapter`` returns to obtain the
-        per-key recall verdict from the FINAL trained weights.
+        is the ``_EarlyStopState`` shared with the callback; the callback's
+        only responsibility is the stop signal (``state.stop_epoch`` and the
+        first/stable-perfect epoch markers) — the per-key recall verdict on
+        the FINAL trained weights is the caller's own staged-weights probe
+        (:meth:`_probe_recall`) after training returns, never read from this
+        state.
 
         The probe target is the unmodified entries list — the same per-tier
         full-replay set that ``format_entry_training`` consumes.  This
@@ -8113,7 +8200,7 @@ class ConsolidationLoop:
                 )
                 return False
 
-        from paramem.models.loader import active_adapter_name, copy_adapter_weights
+        from paramem.models.loader import copy_adapter_weights, drop_adapter_slot
 
         try:
             load_donor_into_transient_slot(self.model, store_dir, DONOR_LOAD_ADAPTER_NAME)
@@ -8142,7 +8229,14 @@ class ConsolidationLoop:
             )
             return False
         finally:
-            if DONOR_LOAD_ADAPTER_NAME in self.model.peft_config:
-                if active_adapter_name(self.model) == DONOR_LOAD_ADAPTER_NAME:
-                    switch_adapter(self.model, adapter_name)
-                self.model.delete_adapter(DONOR_LOAD_ADAPTER_NAME)
+            # Routes through the one "delete a transient slot" primitive
+            # (paramem.models.loader.drop_adapter_slot) instead of a
+            # hand-rolled switch-off-then-delete -- no swallow here (matches
+            # this site's prior posture) for a DELETE failure: drop_adapter_slot
+            # itself still propagates a raised model.delete_adapter, same as
+            # before. A failed SWITCH to the fallback no longer propagates,
+            # though -- drop_adapter_slot's own sole-adapter rule catches that
+            # case internally and skips the delete instead of raising (see its
+            # docstring), leaving DONOR_LOAD_ADAPTER_NAME resident for the
+            # lifecycle backstop to catch at the next training event.
+            drop_adapter_slot(self.model, DONOR_LOAD_ADAPTER_NAME, fallback_adapter=adapter_name)

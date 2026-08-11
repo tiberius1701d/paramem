@@ -705,7 +705,11 @@ class TestStagingAdapterGPU:
            greater than leg 1's.
         """
         from paramem.memory.entry import assign_keys, format_entry_training
-        from paramem.training.trainer import train_adapter
+        from paramem.training.trainer import (
+            promote_staging_adapter,
+            staged_weights,
+            train_adapter,
+        )
         from paramem.utils.config import AdapterConfig, TrainingConfig
 
         model, tokenizer = staging_model
@@ -753,6 +757,14 @@ class TestStagingAdapterGPU:
             "(selected_adapters=None) would serialize every attached adapter "
             "('episodic' + 'in_training') instead."
         )
+
+        # Caller obligation under the staging contract: leg 1 left
+        # 'in_training' resident and active for this test to own. Probe
+        # + promote + dispose here, on real PEFT, before leg 2 reuses the
+        # slot — otherwise leg 2's train_adapter call trips
+        # assert_staging_absent.
+        with staged_weights(model, fallback_adapter="episodic"):
+            promote_staging_adapter(model, "episodic")
 
         # --- Leg 2: resume from the single-adapter checkpoint ----------
         # A fresh output_dir decouples this leg's own staging_resume.json

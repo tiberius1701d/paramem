@@ -247,12 +247,15 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     # consolidate calls GraphTierRefiner.run_enrichment() via _refine_consolidation_graph
     # when scope.enrich is True.  The config default (refinement_enrichment="off",
     # cloud master switch off) yields enrich=False — no enrichment runs in these ordering tests.
-    # Admit-all probe stub for the training-completeness gate: when no recall
-    # verdict is available, _assert_tier_recall runs _probe_passing_keys,
-    # whose real evaluate_indexed_recall feeds the MagicMock model into re.sub and
-    # TypeErrors.  Admitting every key matches the prior no-gate behavior, so it is
-    # inert for these ordering/registry tests.
-    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+    # Admit-all probe stub for the training-completeness gate: _assert_tier_recall
+    # is driven by _probe_recall, whose real evaluate_indexed_recall feeds the
+    # MagicMock model into re.sub and TypeErrors.  Admitting every key matches
+    # the prior no-gate behavior, so it is inert for these ordering/registry tests.
+    from paramem.training.recall_eval import RecallProbe
+
+    loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+        per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+    )
     # _promote_mature_keys_inline (called inside consolidate) reads
     # cycle_count, promoted_keys, and store.  Wire sensible defaults so the method
     # runs without error.

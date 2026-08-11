@@ -39,6 +39,25 @@ from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingCon
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
+
+def _probe_of(passing_keys):
+    """Return a ``(adapter_name, entries) -> RecallProbe`` stub whose
+    ``passing_keys`` is exactly *passing_keys* (every entry's key when
+    *passing_keys* is ``None``).
+
+    Stands in for ``loop._probe_recall`` — these tests exercise
+    ``run_consolidation_cycle``/``consolidate`` orchestration and parity, not
+    the recall probe itself.
+    """
+    from paramem.training.recall_eval import RecallProbe
+
+    def _stub(adapter_name, entries):
+        keys = passing_keys if passing_keys is not None else {e["key"] for e in entries}
+        return RecallProbe(per_key=tuple({"key": k, "exact_match": True} for k in keys))
+
+    return _stub
+
+
 _EPISODIC_RELS: list[dict] = [
     {
         "subject": "Alice",
@@ -197,7 +216,7 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     # feed it into re.sub (which raises TypeError on non-string input).
     # These tests verify slot layout / GAP fixes, not recall gating; the
     # probe is covered separately in test_consolidation_recall_early_stop.py.
-    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+    loop._probe_recall = _probe_of(None)
 
     # Stub out _materialize_consolidation_graph so the materialize step does not
     # call reconstruct_graph / probe_entries on the MagicMock model.
@@ -223,6 +242,10 @@ def _patches_for_train_mode():
     - ``paramem.memory.interim_adapter.create_interim_adapter`` → populates
       peft_config[adapter_name] so the ring-full check in run_consolidation_cycle
       works; returns the model unchanged.
+    - ``paramem.models.loader.switch_adapter`` / ``copy_adapter_weights`` →
+      no-ops for the fold's own probe-then-promote sequence
+      (``staged_weights``/``promote_staging_adapter``), which resolves both
+      fresh from ``paramem.models.loader`` at call time.
     """
 
     def _fake_create_interim(model, cfg, stamp):
@@ -242,6 +265,8 @@ def _patches_for_train_mode():
             "paramem.memory.interim_adapter.create_interim_adapter",
             side_effect=_fake_create_interim,
         ),
+        patch("paramem.models.loader.switch_adapter"),
+        patch("paramem.models.loader.copy_adapter_weights"),
     ]
 
 
@@ -289,7 +314,7 @@ class TestSimulateTrainParity:
     def _run_train(self, loop: ConsolidationLoop) -> dict:
         """Run one train cycle with the deterministic fixture relations."""
         patches = _patches_for_train_mode()
-        with patches[0], patches[1], patches[2], patches[3]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             return loop.run_consolidation_cycle(
                 list(_EPISODIC_RELS),
                 list(_PROCEDURAL_RELS),
@@ -570,7 +595,7 @@ class TestSimulateTrainParity:
         # set_adapter was called with adapter_name at step 9
         # (switch_adapter before training).
         patches = _patches_for_train_mode()
-        with patches[0], patches[1], patches[2], patches[3]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             loop_train.run_consolidation_cycle(
                 list(_EPISODIC_RELS),
                 list(_PROCEDURAL_RELS),
@@ -692,7 +717,7 @@ class TestInterimRecitalDedupSimulateTrainParity:
         loop._procedural_next_index = 1
         loop.promoted_keys: set = set()
         loop.fingerprint_cache = None
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop._probe_recall = _probe_of(None)
         loop.full_consolidation_period_string = ""
         return loop
 
@@ -770,7 +795,7 @@ class TestInterimRecitalDedupSimulateTrainParity:
             )
 
             patches = _patches_for_train_mode()
-            with patches[0], patches[1], patches[2], patches[3]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
                 loop_train.run_consolidation_cycle(
                     list(episodic_rels),
                     [],
@@ -3393,6 +3418,7 @@ class TestFoldHydratesAPartiallyPreloadedStore:
             patches[1],
             patches[2],
             patches[3],
+            patches[5],  # copy_adapter_weights; switch_adapter patched separately below
             # The per-tier training loop (reached now that the accumulate
             # guard is retired) touches real PEFT/model calls this MagicMock
             # model cannot satisfy — stub them the same way the full-fold

@@ -971,24 +971,6 @@ def donor_entries(seed: int, n: int) -> list[dict]:
     return entries
 
 
-def _drop_transient_slot(model, name: str, *, fallback_adapter: str) -> None:
-    """Delete transient PEFT slot *name* from *model* if resident.
-
-    Mirrors the switch-off-before-delete pattern
-    ``ConsolidationLoop._verify_saved_adapter_from_disk`` already uses for
-    its own transient ``f"{adapter_name}_verify"`` slot: PEFT refuses to
-    leave the model with no active adapter, so *fallback_adapter* (a
-    production tier guaranteed resident) is activated first when *name* is
-    currently active.
-    """
-    from paramem.models.loader import active_adapter_name, switch_adapter
-
-    if name in model.peft_config:
-        if active_adapter_name(model) == name and fallback_adapter in model.peft_config:
-            switch_adapter(model, fallback_adapter)
-        model.delete_adapter(name)
-
-
 def build_donor(
     loop: "ConsolidationLoop",
     *,
@@ -1019,11 +1001,11 @@ def build_donor(
     build time instead since the donor is never touched at boot).
 
     ``create_adapter``/``switch_adapter`` run INSIDE the ``try`` (not before
-    it): deleting the transient slot on ANY failure past that point —
+    it): deleting the transient build slot on ANY failure past that point —
     including a ``switch_adapter`` failure — requires the ``finally`` to
     already be active, otherwise a mid-setup failure would leak
     ``DONOR_BUILD_ADAPTER_NAME`` on the model permanently. The initial
-    ``_drop_transient_slot`` call before the ``try`` is safe to leave outside
+    ``drop_adapter_slot`` call before the ``try`` is safe to leave outside
     it: it only clears a slot a PRIOR failed call left behind and switches to
     ``"episodic"`` first when needed — episodic is unconditionally created
     at ``ConsolidationLoop`` construction (``ensure_adapters``) and is never
@@ -1038,7 +1020,12 @@ def build_donor(
     raises :class:`DonorBuildIncomplete` instead — persisting a checkpoint
     from a run that never actually trained would seed every future
     measured-cold fold from LoRA-zero-equivalent weights forever, silently
-    defeating the whole mechanism.
+    defeating the whole mechanism.  There is no gate here (a donor is
+    synthetic weights, excluded from the seeding recursion), but the staged
+    weights must still be explicitly promoted into ``build_name`` before
+    save — persisting the transient staging slot unpromoted would silently
+    save LoRA-zero into the donor store, and every future measured-cold fold
+    would seed from it.
 
     On success, saves via :func:`~paramem.models.loader.atomic_save_adapter`
     (the same primitive every production tier save uses — atomic write,
@@ -1058,10 +1045,12 @@ def build_donor(
     shape. Every other slot within the SAME store is then pruned through
     the shared ``ConsolidationLoop._prune_old_slots`` at ``keep=0`` (exactly
     one donor artifact per (base model, topology) persists at a time), and
-    the transient slot is deleted in a ``finally`` regardless of outcome.
-    Nothing outside this store is touched: another base model's or
-    topology's store is left intact, because a config change makes a donor
-    inapplicable, never wrong.
+    both the staging slot and the transient build slot are dropped in a
+    ``finally`` regardless of outcome — each disposal individually guarded
+    so the first failing one cannot skip the second or mask the original
+    exception.  Nothing outside this store is touched: another base model's
+    or topology's store is left intact, because a config change makes a
+    donor inapplicable, never wrong.
 
     Args:
         loop: The live :class:`~paramem.training.consolidation.ConsolidationLoop`
@@ -1091,9 +1080,11 @@ def build_donor(
     from paramem.models.loader import (
         atomic_save_adapter,
         create_adapter,
+        drop_adapter_slot,
         lora_shape_fields,
         switch_adapter,
     )
+    from paramem.training.trainer import STAGING_ADAPTER, promote_staging_adapter
 
     entries = donor_entries(seed, n)
     base_model_id = getattr(loop.model.get_base_model().config, "_name_or_path", None)
@@ -1102,7 +1093,7 @@ def build_donor(
     store_dir = donor_store_dir(loop.donor_adapter_root, base_model_id, lora_shape)
     sweep_orphan_pending(store_dir)
     build_name = DONOR_BUILD_ADAPTER_NAME
-    _drop_transient_slot(loop.model, build_name, fallback_adapter="episodic")
+    drop_adapter_slot(loop.model, build_name, fallback_adapter="episodic")
 
     recipe_config = _dataclasses_replace(
         adapter_config,
@@ -1126,6 +1117,7 @@ def build_donor(
             raise DonorBuildIncomplete(
                 f"donor training did not complete (metrics={metrics!r}) -- no checkpoint persisted"
             )
+        promote_staging_adapter(loop.model, build_name)
         store_dir.mkdir(parents=True, exist_ok=True)
         # A donor's storage metadata is an AdapterManifest like any other
         # store's: base-model + tokenizer fingerprint and LoRA shape come from
@@ -1171,7 +1163,20 @@ def build_donor(
         )
         return final_slot
     finally:
-        _drop_transient_slot(loop.model, build_name, fallback_adapter="episodic")
+        # Two stacked disposals, each independently guarded so the first
+        # failing one cannot skip the second or mask the exception this
+        # finally may be running under (the try above can raise
+        # DonorBuildIncomplete, or any other exception from training/save).
+        try:
+            drop_adapter_slot(loop.model, STAGING_ADAPTER, fallback_adapter="episodic")
+        except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
+            # never replace an in-flight exception from the try above.
+            logger.warning("build_donor: could not drop staging slot", exc_info=True)
+        try:
+            drop_adapter_slot(loop.model, build_name, fallback_adapter="episodic")
+        except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
+            # never replace an in-flight exception from the try above.
+            logger.warning("build_donor: could not drop build slot %s", build_name, exc_info=True)
 
 
 def load_donor_into_transient_slot(model, store_dir: Path, transient_name: str) -> None:

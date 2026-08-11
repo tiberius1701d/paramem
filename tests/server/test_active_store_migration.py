@@ -37,10 +37,27 @@ from paramem.server.active_store_migration import (
     save_state,
     state_path,
 )
+from paramem.training.recall_eval import RecallProbe
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _recall_probe(rate: float, n: int = 100) -> RecallProbe:
+    """Build a ``RecallProbe`` whose distinct-key rate is exactly *rate*.
+
+    Stands in for ``loop._probe_recall(...)``'s return value across this
+    file's migration-gate tests — the migration gate reads only
+    ``probe.rate`` (threshold compare) and ``probe.failed`` (failed-key
+    names), never the individual key content.  ``n=100`` gives exact
+    decimal fractions for every rate this file uses (1.0, 0.9, 0.7, 0.66).
+    """
+    n_passing = round(rate * n)
+    per_key = tuple(
+        {"key": f"k{i}", "exact_match": i < n_passing, "raw_output": ""} for i in range(n)
+    )
+    return RecallProbe(per_key=per_key)
 
 
 def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
@@ -591,11 +608,9 @@ class TestMigrateOrchestrator:
         # Real float so the migration gate's `recall < loop.config.recall_sanity_threshold`
         # comparison does not raise TypeError against a MagicMock.
         loop.config.recall_sanity_threshold = 1.0
-        loop._run_recall_sanity_probe.return_value = 1.0
-        # _migrate_tier_simulate_to_train routes training through the shared
         # funnel (_train_tier_adapter); the per-tier pass/fail split below is
-        # driven entirely by _run_recall_sanity_probe, so the funnel always
-        # reports a clean (non-aborted) result.
+        # driven entirely by _probe_recall, so the funnel always reports a
+        # clean (non-aborted) result.
         loop._train_tier_adapter.return_value = ({"aborted": False}, None)
         loop.wandb_config = None
         loop.fingerprint_cache = None
@@ -612,18 +627,19 @@ class TestMigrateOrchestrator:
 
         call_count = [0]
 
-        def probe_side_effect(tier_name, entries, max_probe=None):
+        def probe_side_effect(adapter_name, entries):
             call_count[0] += 1
             if call_count[0] == 1:
-                return 0.0  # episodic fails
-            return 1.0  # semantic + procedural pass
+                return _recall_probe(0.0)  # episodic fails
+            return _recall_probe(1.0)  # semantic + procedural pass
 
-        loop._run_recall_sanity_probe.side_effect = probe_side_effect
+        loop._probe_recall.side_effect = probe_side_effect
 
         with (
             patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
@@ -657,8 +673,7 @@ class TestMigrateOrchestrator:
         # Real float so the migration gate's `recall < loop.config.recall_sanity_threshold`
         # comparison does not raise TypeError against a MagicMock.
         loop.config.recall_sanity_threshold = 1.0
-        loop._run_recall_sanity_probe.return_value = 1.0
-        # _migrate_tier_simulate_to_train routes training through the shared
+        loop._probe_recall.return_value = _recall_probe(1.0)
         # funnel (_train_tier_adapter) rather than train_adapter directly.
         loop._train_tier_adapter.return_value = ({"aborted": False}, None)
         loop.wandb_config = None
@@ -678,6 +693,7 @@ class TestMigrateOrchestrator:
             patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
@@ -827,8 +843,8 @@ class TestMigrateTierSimulateToTrain:
         # 2-tuple from it.  A bare MagicMock unpacks as an empty iterable ->
         # "not enough values to unpack", so every test needs a real 2-tuple
         # return.  The migration path ignores recall_state and gates on its
-        # own _run_recall_sanity_probe.  Tests exercising the aborted/empty
-        # branches override this return_value explicitly.
+        # own staged-weights probe (loop._probe_recall).  Tests exercising
+        # the aborted/empty branches override this return_value explicitly.
         loop._train_tier_adapter.return_value = ({"aborted": False}, None)
 
         def _fake_cache_entry(
@@ -885,7 +901,7 @@ class TestMigrateTierSimulateToTrain:
         # Unified layout: graph.json lives under adapter_dir.
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
@@ -895,6 +911,7 @@ class TestMigrateTierSimulateToTrain:
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -919,6 +936,40 @@ class TestMigrateTierSimulateToTrain:
         # Per-tier registry (carrying unified simhash map) persisted at tier path.
         assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
 
+    def test_duplicate_graph_key_still_gates_correctly(self, tmp_path):
+        """A source graph carrying two edges under the SAME ik_key (the
+        pathological case the migration gate's distinct-key denominator must
+        tolerate) neither double-counts nor under-counts the gate: with both
+        occurrences passing, the tier still promotes; with the probe
+        reporting a genuine miss, it still refuses.
+
+        Migration's entries are unique per key by construction (one graph
+        edge per ik_key, assigned once per fact); this pins that the gate's
+        RecallProbe.rate — a distinct-key denominator — reads correctly even
+        if that invariant were ever violated, rather than silently passing
+        or failing on the duplicate.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad("g0"), _full_quad("g0")]  # duplicate key, two edges
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._probe_recall.return_value = _recall_probe(1.0)
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        # A full pass still promotes and persists, regardless of the
+        # duplicate — the distinct-key rate is 1.0 either way.
+        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
+
     def test_binds_slot_to_registry(self, tmp_path):
         """Regression: the trained slot's manifest carries a NON-empty
         registry_sha256 (== sha256 of the tier registry bytes) AND the tier
@@ -934,7 +985,7 @@ class TestMigrateTierSimulateToTrain:
         entries = [_full_quad(f"g{i}") for i in range(2)]
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         captured: dict = {}
 
@@ -947,6 +998,7 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch(
                 "paramem.adapters.manifest.build_manifest_for",
@@ -984,7 +1036,7 @@ class TestMigrateTierSimulateToTrain:
         entries = [_full_quad("g0"), _full_quad("g1")]
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         reg = loop.store.registry("episodic")
         reg.add("g0")
@@ -1007,6 +1059,7 @@ class TestMigrateTierSimulateToTrain:
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch(
                 "paramem.adapters.manifest.build_manifest_for",
@@ -1036,7 +1089,7 @@ class TestMigrateTierSimulateToTrain:
         # Unified layout: graph.json lives under adapter_dir.
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         built_registry = {"g0": 123, "g1": 456}
@@ -1047,6 +1100,7 @@ class TestMigrateTierSimulateToTrain:
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1060,24 +1114,42 @@ class TestMigrateTierSimulateToTrain:
         on_disk = reg._known_simhashes()
         assert on_disk == built_registry
 
-    def test_probe_failure_rolls_back(self, tmp_path):
+    def test_probe_failure_never_promotes_and_never_re_resets_to_lora_zero(self, tmp_path):
+        """A below-threshold probe on the staged weights raises
+        RecallGateRejected, never promotes, and never touches the tier a
+        second time — the tier is left at exactly the LoRA-zero state Step 3
+        already put it in, with no compensating rollback needed.
+
+        Kills: keeping the old delete+recreate LoRA-zero rollback (which
+        would call create_adapter a second time for the same tier).
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(3)]
         # Unified layout: graph.json lives under adapter_dir.
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 0.66  # below 1.0 → rollback
+        loop._probe_recall.return_value = _recall_probe(0.66)
 
         with (
             patch("paramem.memory.entry.build_registry", return_value={}),
-            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch(
+                "paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m
+            ) as create_mock,
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights") as copy_mock,
             patch("paramem.models.loader.atomic_save_adapter") as save_mock,
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            with pytest.raises(RuntimeError, match=r"recall .* < 1.0"):
+            with pytest.raises(RecallGateRejected, match=r"recall .* < 1.0"):
                 _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
+        # Step 3's single reset-to-LoRA-zero create_adapter call — never a
+        # second one for a rollback that no longer exists.
+        assert create_mock.call_count == 1
+        # No promote copy (in_training -> episodic) was ever attempted.
+        copy_mock.assert_not_called()
         # No save was attempted (probe failed first)
         save_mock.assert_not_called()
         # Source preserved (unified layout: adapter_dir).
@@ -1100,7 +1172,7 @@ class TestMigrateTierSimulateToTrain:
         # Unified layout: graph.json lives under adapter_dir.
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
@@ -1110,6 +1182,7 @@ class TestMigrateTierSimulateToTrain:
             ) as entry_reg,
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1118,19 +1191,18 @@ class TestMigrateTierSimulateToTrain:
         entry_reg.assert_called_once()
 
     def test_recall_probe_is_uncapped(self, tmp_path):
-        """_migrate_tier_simulate_to_train passes max_probe=len(entries) to the probe.
+        """_migrate_tier_simulate_to_train probes the FULL entries list.
 
-        The Phase B gate must probe ALL entries (100 % requirement), not just
-        the default max_probe=100.  Verify that the call uses an explicit
-        max_probe keyword equal to the number of graph entries so the probe
-        cannot silently pass on a small subset of a large adapter.
+        The Phase B gate must probe ALL entries (100 % requirement).  The
+        gate primitive (``loop._probe_recall``) is uncapped by
+        construction — no sampling parameter exists to pass — so this pins
+        that the full entries list (not a subset) reaches the probe call.
         """
         cfg = _make_config(tmp_path, mode="train")
-        # Use 5 entries; max_probe=5 expected, not the default 100.
         entries = [_full_quad(f"g{i}") for i in range(5)]
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
@@ -1140,23 +1212,19 @@ class TestMigrateTierSimulateToTrain:
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-        # The probe must have been called with max_probe equal to the entry count.
-        assert loop._run_recall_sanity_probe.call_count == 1
-        call_kwargs = loop._run_recall_sanity_probe.call_args
-        # Accept either positional or keyword for max_probe.
-        if call_kwargs.kwargs:
-            actual_max_probe = call_kwargs.kwargs.get("max_probe")
-        else:
-            # (tier, entries, max_probe) positional
-            actual_max_probe = call_kwargs.args[2] if len(call_kwargs.args) > 2 else None
-        assert actual_max_probe == len(entries), (
-            f"Expected max_probe={len(entries)} (uncapped); got {actual_max_probe!r}. "
-            "Phase B gate must probe ALL entries, not the default 100."
+        assert loop._probe_recall.call_count == 1
+        call_args = loop._probe_recall.call_args
+        probed_entries = (
+            call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("entries")
+        )
+        assert len(probed_entries) == len(entries), (
+            f"Expected all {len(entries)} entries probed (uncapped); got {len(probed_entries)!r}."
         )
 
     def test_recall_sanity_threshold_config_knob(self, tmp_path):
@@ -1177,13 +1245,14 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop.config = ConsolidationConfig(recall_sanity_threshold=0.8)
-        loop._run_recall_sanity_probe.return_value = 0.9
+        loop._probe_recall.return_value = _recall_probe(0.9)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1195,13 +1264,14 @@ class TestMigrateTierSimulateToTrain:
         _write_simulate_graph(cfg2.adapter_dir, "episodic", entries)
         loop2 = self._make_loop()
         loop2.config = ConsolidationConfig(recall_sanity_threshold=0.8)
-        loop2._run_recall_sanity_probe.return_value = 0.7
+        loop2._probe_recall.return_value = _recall_probe(0.7)
 
         slot_path2 = cfg2.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path2),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
@@ -1222,13 +1292,14 @@ class TestMigrateTierSimulateToTrain:
         # The tier registry only knows g1 — g0 was already erased (forget ran,
         # registry.save completed) but its graph.json edge survived a crash.
         loop.store.registry("episodic").add("g1")
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1256,13 +1327,14 @@ class TestMigrateTierSimulateToTrain:
         loop = self._make_loop()
         assert loop.store.registry("episodic").list_known() == []
         assert not (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1307,13 +1379,14 @@ class TestMigrateTierSimulateToTrain:
         entries = [_full_quad("g0"), _full_quad("g1")]
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1343,13 +1416,14 @@ class TestMigrateTierSimulateToTrain:
         ]
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1385,13 +1459,14 @@ class TestMigrateTierSimulateToTrain:
             )
         )
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1428,7 +1503,7 @@ class TestMigrateTierSimulateToTrain:
             )
         )
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
         loop.store.set_bookkeeping(
             "g0",
             speaker_id="speaker_live",
@@ -1443,6 +1518,7 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1466,13 +1542,14 @@ class TestMigrateTierSimulateToTrain:
         entries = [_full_quad("g0")]
         _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"g0": 0}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
@@ -1688,13 +1765,14 @@ class TestSlotPathResolverInterim:
         _write_simulate_graph_at(expected_slot_root, entries)
 
         loop = TestMigrateTierSimulateToTrain()._make_loop()
-        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._probe_recall.return_value = _recall_probe(1.0)
 
         slot_path = expected_slot_root / "20260430-000000"
         with (
             patch("paramem.memory.entry.build_registry", return_value={"ik1": 99}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.models.loader.atomic_save_adapter",
                 return_value=slot_path,
@@ -1840,10 +1918,25 @@ class TestTerminologyGuard:
         return Path(spec.origin).read_text(encoding="utf-8")
 
     def test_no_fallback_in_source(self):
+        """The 'source store is authoritative, not a fallback' narrative must
+        never reappear in this module's prose or identifiers.
+
+        The single recognized exception is ``fallback_adapter`` — the
+        staging lifecycle's own cross-module parameter name
+        (``paramem.training.trainer.staged_weights``/``drop_adapter_slot``,
+        naming which adapter a transient slot's disposal switches to before
+        deleting it).  That is an unrelated PEFT-lifecycle concept, not the
+        migration source-authority story this guard protects; every other
+        occurrence of 'fallback' is still banned.
+        """
+        import re
+
         src = self._module_source()
-        assert "fallback" not in src.lower(), (
+        stripped = re.sub(r"fallback_adapter", "", src, flags=re.IGNORECASE)
+        assert "fallback" not in stripped.lower(), (
             "The word 'fallback' must not appear in active_store_migration.py "
-            "(the source store is authoritative, not a fallback)"
+            "(the source store is authoritative, not a fallback) outside the "
+            "recognized 'fallback_adapter' staging-lifecycle parameter name"
         )
 
     def test_no_drift_in_source(self):

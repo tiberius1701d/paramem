@@ -162,6 +162,12 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ),
         ("experiments/quadruple_adapter.py", "paramem.training.trainer", "TrainingHooks"),
         ("experiments/quadruple_adapter.py", "paramem.training.trainer", "train_adapter"),
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.training.trainer",
+            "promote_staging_adapter",
+        ),
+        ("experiments/quadruple_adapter.py", "paramem.training.trainer", "staged_weights"),
         ("experiments/quadruple_adapter.py", "paramem.utils.config", "AdapterConfig"),
         ("experiments/quadruple_adapter.py", "paramem.utils.config", "TrainingConfig"),
         # smoke_procedural_mlp.py
@@ -233,6 +239,12 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "evaluate_indexed_recall",
         ),
         ("experiments/test16_repair_sweep.py", "paramem.training.trainer", "train_adapter"),
+        (
+            "experiments/test16_repair_sweep.py",
+            "paramem.training.trainer",
+            "promote_staging_adapter",
+        ),
+        ("experiments/test16_repair_sweep.py", "paramem.training.trainer", "staged_weights"),
         ("experiments/test16_repair_sweep.py", "paramem.utils.config", "AdapterConfig"),
         ("experiments/test16_repair_sweep.py", "paramem.utils.config", "TrainingConfig"),
         # test18_probe_batching.py
@@ -273,6 +285,12 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "evaluate_indexed_recall",
         ),
         ("experiments/test18_probe_batching.py", "paramem.training.trainer", "train_adapter"),
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.training.trainer",
+            "promote_staging_adapter",
+        ),
+        ("experiments/test18_probe_batching.py", "paramem.training.trainer", "staged_weights"),
         ("experiments/test18_probe_batching.py", "paramem.utils.config", "AdapterConfig"),
         ("experiments/test18_probe_batching.py", "paramem.utils.config", "TrainingConfig"),
         # test20_smallN_cold_gate.py
@@ -316,6 +334,12 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "evaluate_indexed_recall",
         ),
         ("experiments/test20_smallN_cold_gate.py", "paramem.training.trainer", "train_adapter"),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.trainer",
+            "promote_staging_adapter",
+        ),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.training.trainer", "staged_weights"),
         # --donor-init (donor-init validation): builds its own donor checkpoint
         # via donor_entries -- the SAME seed+recipe pure function production
         # donor building uses -- rather than duplicating a second synthetic

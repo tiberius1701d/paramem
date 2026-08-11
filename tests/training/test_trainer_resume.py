@@ -31,14 +31,16 @@ from paramem.utils.config import AdapterConfig, TrainingConfig
 
 
 def _make_peft_model(adapter_name: str = "episodic") -> MagicMock:
-    """Return a PeftModel stub that satisfies train_adapter's staging+promote contract.
+    """Return a PeftModel stub that satisfies train_adapter's staging contract.
 
     Both the production slot *adapter_name* and the staging slot ``in_training``
-    are present with matching rank/target_modules so ``_ensure_staging_slot``
-    is a no-op.  ``named_parameters`` yields one real tensor per
-    ``(target_module, slot)`` pair so ``copy_adapter_weights`` finds parallel
-    src/dst key sets at entry (production→staging) and at promote
-    (staging→production).
+    are present with matching rank/target_modules — the fixtures using this
+    model patch ``_ensure_staging_slot`` to a no-op, so the pre-populated
+    staging slot never trips the lifecycle guard.  ``named_parameters``
+    yields one real tensor per ``(target_module, slot)`` pair so
+    ``copy_adapter_weights`` finds parallel src/dst key sets at entry
+    (production→staging); a caller-side promote (staging→production) is not
+    exercised by this model — that lives in the trainer-contract tests.
     """
     import torch
 
@@ -475,7 +477,8 @@ class TestStagingSlotCrashCleanup:
         path never calls _clean_scratch — only success/abort do), and a
         subsequent _ensure_staging_slot call succeeds (consolidation is not
         permanently blocked)."""
-        from paramem.training.trainer import _STAGING_ADAPTER, _ensure_staging_slot
+        from paramem.training.trainer import STAGING_ADAPTER as _STAGING_ADAPTER
+        from paramem.training.trainer import _ensure_staging_slot
 
         model = self._make_crash_test_model()
         tokenizer = _make_tokenizer()
@@ -512,14 +515,22 @@ class TestStagingSlotCrashCleanup:
         _ensure_staging_slot(model, _minimal_adapter_config())
         assert _STAGING_ADAPTER in model.peft_config
 
-    def test_active_adapter_guard_skips_delete_when_switch_fails(self, tmp_path):
-        """If the best-effort switch_adapter(model, adapter_name) restore
-        fails, active stays on the staging slot — the guard must then skip
-        the delete (never remove the active adapter)."""
+    def test_staging_slot_left_resident_when_fallback_absent_after_exception(self, tmp_path):
+        """The best-effort switch_adapter(model, adapter_name) restore fails
+        (absorbed by the exception handler's own try/except), and no
+        fallback adapter is resident either — drop_adapter_slot's
+        fallback-absent behavior SKIPS the delete rather than deleting the
+        model's own active adapter with no confirmed successor (see
+        loader.py's drop_adapter_slot docstring: that would leave PeftModel
+        with a stale/absent active config, the state the project's PEFT
+        rule forbids). The leaked in_training slot stays resident; the
+        lifecycle backstop (assert_staging_absent) surfaces it loudly at the
+        next training event. The original exception still propagates
+        unchanged."""
         import torch
         from peft import PeftModel
 
-        from paramem.training.trainer import _STAGING_ADAPTER
+        from paramem.training.trainer import STAGING_ADAPTER as _STAGING_ADAPTER
 
         model = MagicMock()
         model.peft_config = {}
@@ -561,10 +572,21 @@ class TestStagingSlotCrashCleanup:
             )
 
         # switch_adapter("episodic") raised, so active_adapter never left
-        # in_training — the guard must have skipped delete_adapter entirely.
+        # in_training, and "episodic" was never created (no fallback
+        # resident) — drop_adapter_slot skips the delete rather than
+        # deleting the model's own active adapter with no confirmed
+        # successor.
         model.delete_adapter.assert_not_called()
-        assert _STAGING_ADAPTER in model.peft_config
-        assert model.active_adapter == _STAGING_ADAPTER
+        assert _STAGING_ADAPTER in model.peft_config, (
+            "the leaked slot must stay resident for the lifecycle backstop to catch"
+        )
+
+        # The lifecycle backstop trips loudly at the next training event
+        # instead of this primitive silently breaking the live model.
+        from paramem.training.trainer import _ensure_staging_slot
+
+        with pytest.raises(RuntimeError, match="Lifecycle invariant violated"):
+            _ensure_staging_slot(model, _minimal_adapter_config())
 
 
 class TestTrainAdapterSavePath:

@@ -95,7 +95,11 @@ from paramem.training.recall_eval import (  # noqa: E402
     derive_stop_ids,
     evaluate_indexed_recall,
 )
-from paramem.training.trainer import train_adapter  # noqa: E402
+from paramem.training.trainer import (  # noqa: E402
+    promote_staging_adapter,
+    staged_weights,
+    train_adapter,
+)
 from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -512,7 +516,7 @@ def train_bench_adapter(model, tokenizer, entries: list[dict], num_epochs: int):
         gradient_checkpointing=True,
         recall_early_stopping=False,
     )
-    train_adapter(
+    metrics = train_adapter(
         model=model,
         tokenizer=tokenizer,
         train_dataset=_Dataset(),
@@ -520,6 +524,9 @@ def train_bench_adapter(model, tokenizer, entries: list[dict], num_epochs: int):
         training_config=train_cfg,
         adapter_config=adapter_cfg,
     )
+    if not metrics.get("aborted"):
+        with staged_weights(model, fallback_adapter=ADAPTER_NAME):
+            promote_staging_adapter(model, ADAPTER_NAME)
     return model
 
 

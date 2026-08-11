@@ -1328,6 +1328,64 @@ class TestStageBCycleDivergentKeysIncidentDetail:
         assert "divergent_keys" not in crashes[0].detail
         assert crashes[0].detail == {"phase": "fold"}
 
+    def test_recall_gate_rejected_failed_keys_merged_into_incident_detail(self, state):
+        """A RecallGateRejected's failed_keys is folded into the incident
+        detail alongside adapter_name/recall_rate/threshold -- naming exactly
+        which keys fell short, not just the tier and rate.
+
+        Kills: dropping the failed_keys payload at the incident-recording site.
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
+        exc = RecallGateRejected(
+            "tier 'episodic' reached 1/2 keys",
+            adapter_name="episodic",
+            recall_rate=0.5,
+            threshold=1.0,
+            failed_keys=("graph_bad",),
+        )
+        _drive_stage_b_cycle_crash(state, exc=exc)
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert crashes[0].detail["adapter_name"] == "episodic"
+        assert crashes[0].detail["recall_rate"] == 0.5
+        assert crashes[0].detail["threshold"] == 1.0
+        assert crashes[0].detail["failed_keys"] == ["graph_bad"]
+        assert crashes[0].detail["phase"] == "fold", (
+            "caller-supplied detail fields must survive the merge"
+        )
+
+    def test_recall_gate_rejected_empty_failed_keys_omitted_from_incident_detail(self, state):
+        """A RecallGateRejected with no per-key data (the disk-verify raise
+        site never populates failed_keys) omits the field entirely rather
+        than publishing an empty list next to a failing recall_rate -- an
+        empty ``failed_keys: []`` reads as "no keys failed", which is wrong
+        when the tier plainly did fail (recall_rate < threshold).
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
+        exc = RecallGateRejected(
+            "post-save disk-integrity probe failed for adapter 'episodic'",
+            adapter_name="episodic",
+            recall_rate=0.5,
+            threshold=1.0,
+            failed_keys=(),
+        )
+        _drive_stage_b_cycle_crash(state, exc=exc)
+
+        incidents = read_incidents(_state_dir(state))
+        crashes = [i for i in incidents if i.type == "consolidation_crash"]
+        assert len(crashes) == 1, (
+            f"expected exactly one consolidation_crash incident; got {incidents}"
+        )
+        assert crashes[0].detail["adapter_name"] == "episodic"
+        assert crashes[0].detail["recall_rate"] == 0.5
+        assert "failed_keys" not in crashes[0].detail
+
 
 class TestStageBCycleHydrationFailureIncidentDetail:
     """``_run_stage_b_cycle``'s crash envelope merges an

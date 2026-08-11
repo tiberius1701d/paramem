@@ -5,10 +5,11 @@ import json
 import logging
 import os
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import torch
 from peft import PeftModel
@@ -31,8 +32,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Singleton PEFT adapter name used as a scratch training slot.  Must match
-#: the name used in ``ConsolidationLoop.ensure_adapters``.
-_STAGING_ADAPTER = "in_training"
+#: the name used in ``ConsolidationLoop.ensure_adapters``.  Caller-facing —
+#: every venue that trains through :func:`train_adapter` reads this name to
+#: probe and promote the staged weights.
+STAGING_ADAPTER = "in_training"
 
 
 @dataclass(frozen=True)
@@ -325,19 +328,38 @@ class GracefulShutdownCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 
 
+def assert_staging_absent(model: PeftModel) -> None:
+    """Raise when ``STAGING_ADAPTER`` is already resident on *model*.
+
+    The single statement of the staging lifecycle invariant: the slot is
+    transient and must be absent at the start of any operation that is about
+    to (re)create it.  A pre-existing slot means the PRIOR training event's
+    caller did not dispose of it — either via :func:`staged_weights` on
+    success, or via :func:`train_adapter`'s own abort/exception cleanup.
+
+    Raises:
+        RuntimeError: when ``STAGING_ADAPTER`` is present in
+            ``model.peft_config``.
+    """
+    if STAGING_ADAPTER in model.peft_config:
+        raise RuntimeError(
+            f"Lifecycle invariant violated: {STAGING_ADAPTER!r} already present "
+            "in model.peft_config at training entry. The prior training event's "
+            "caller did not dispose of the staged weights — every non-aborted "
+            "train_adapter() return leaves this slot resident for the caller to "
+            "probe, promote, and dispose of via staged_weights()."
+        )
+
+
 def _ensure_staging_slot(model: PeftModel, adapter_config: AdapterConfig) -> None:
     """Create the transient ``in_training`` PEFT adapter for this training event.
 
     Per the staging+promote contract, the staging slot is transient: it exists
-    only while a training event is in flight, and it is deleted by the caller
-    at the post-save cleanup step.  Every training event therefore enters this
-    helper with the slot absent and creates a byte-fresh adapter from seeded
-    LoRA initialisation.
-
-    Pre-existing slot at entry is a lifecycle-invariant violation — it means
-    the prior training event did not clean up after itself.  Raising here
-    surfaces the bug loudly rather than silently inheriting potentially-stale
-    weights.  This is the "no room for side effects" property of the design.
+    only while a training event is in flight, and the caller disposes of it
+    (via :func:`staged_weights`) after applying its own verdict to the staged
+    weights.  Every training event therefore enters this helper with the slot
+    absent (:func:`assert_staging_absent`) and creates a byte-fresh adapter
+    from seeded LoRA initialisation.
 
     Args:
         model: Live ``PeftModel`` to mutate.  Must NOT carry an existing
@@ -346,20 +368,81 @@ def _ensure_staging_slot(model: PeftModel, adapter_config: AdapterConfig) -> Non
 
     Raises:
         RuntimeError: when ``in_training`` already exists in ``model.peft_config``.
-            Indicates a missing cleanup at the prior training event's success or
-            rollback path.
+            Indicates a missing disposal at the prior training event's caller.
     """
     from paramem.models.loader import create_adapter
 
-    if _STAGING_ADAPTER in model.peft_config:
-        raise RuntimeError(
-            f"Lifecycle invariant violated: {_STAGING_ADAPTER!r} already present "
-            "in model.peft_config at training entry. The prior training event "
-            "did not delete the slot — check the post-save cleanup site "
-            "(active_store_migration.migrate / consolidation._save_adapters) "
-            "and the recall-gate-failure rollback path."
-        )
-    create_adapter(model, adapter_config, _STAGING_ADAPTER)
+    assert_staging_absent(model)
+    create_adapter(model, adapter_config, STAGING_ADAPTER)
+
+
+def promote_staging_adapter(model: PeftModel, adapter_name: str) -> None:
+    """Copy the staged weights into *adapter_name* and activate it.
+
+    The caller's half of the staging+promote contract: called after the
+    caller has applied its own verdict to the staged weights (probed via
+    ``STAGING_ADAPTER``).  Does NOT delete the staging slot — disposal has
+    exactly one owner, :func:`staged_weights`.
+
+    Args:
+        model: Live ``PeftModel`` carrying both ``STAGING_ADAPTER`` and
+            *adapter_name*.
+        adapter_name: Destination adapter — the production tier (or donor
+            build slot) the staged weights are promoted into.
+    """
+    from paramem.models.loader import copy_adapter_weights, switch_adapter
+
+    copy_adapter_weights(model, src=STAGING_ADAPTER, dst=adapter_name)
+    switch_adapter(model, adapter_name)
+    logger.info("Staging: promoted %s → %s (VRAM)", STAGING_ADAPTER, adapter_name)
+
+
+@contextmanager
+def staged_weights(model: PeftModel, *, fallback_adapter: str) -> Iterator[None]:
+    """Scope guard: dispose of ``STAGING_ADAPTER`` on every exit.
+
+    Every caller that trains through :func:`train_adapter` and receives a
+    resident staging slot back MUST run its probe-then-promote sequence
+    inside this context manager. It is the enforcement of "the caller
+    disposes" — without it, the same disposal ``try/finally`` would need to
+    be written at every venue (main-tier fold, interim fold, migration,
+    donor build).
+
+    Disposal in ``finally`` is deliberately best-effort: this is the one
+    disposal that can run with an in-flight exception by design — the
+    refusal path raises ``RecallGateRejected`` from inside this scope, and
+    that verdict outranks the slot. If ``drop_adapter_slot`` itself raised
+    here, it would replace the in-flight exception, the caller's
+    compensation (e.g. the fold's ``except RecallGateRejected`` handling)
+    would never run, and the incident detail carried by the original
+    exception would be lost. So a disposal failure is logged and swallowed,
+    never re-raised — a leaked staging slot is made loud later by the
+    lifecycle backstop (:func:`assert_staging_absent` /
+    :func:`_ensure_staging_slot`), which is preferable to losing a verdict.
+
+    Args:
+        model: Live ``PeftModel`` carrying ``STAGING_ADAPTER``.
+        fallback_adapter: Adapter to switch to first if ``STAGING_ADAPTER``
+            is still active at disposal time (e.g. a refused verdict never
+            reached :func:`promote_staging_adapter`, which would otherwise
+            have switched away).  Must be a tier guaranteed resident.
+    """
+    from paramem.models.loader import drop_adapter_slot
+
+    try:
+        yield
+    finally:
+        try:
+            drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=fallback_adapter)
+        except Exception:  # noqa: BLE001  # boundary: must never replace an
+            # in-flight exception (e.g. RecallGateRejected) — see the
+            # docstring above for the full trade.
+            logger.exception(
+                "staged_weights: drop_adapter_slot(%s) failed during disposal — "
+                "leaked slot will be caught by assert_staging_absent on the next "
+                "training event",
+                STAGING_ADAPTER,
+            )
 
 
 def _to_jsonable(obj):
@@ -781,20 +864,43 @@ def train_adapter(
     hooks: Optional[TrainingHooks] = None,
     retain_scratch_until_external_commit: bool = False,
 ) -> dict:
-    """Train a LoRA adapter on the given dataset with staging+promote contract.
+    """Train a LoRA adapter on the given dataset with the staging contract.
 
-    Implements the staging+promote contract that prevents mutation of
-    production adapter weights until training has successfully completed.
-    The staging slot (``in_training``) is **transient** — created at
-    training entry, deleted at training exit (both success and abort paths)
-    — so it never carries weights from one training event into the next.
+    Trains the transient staging slot (``STAGING_ADAPTER``, ``"in_training"``)
+    and, on a successful non-aborted return, hands it to the caller still
+    resident and active — this function does NOT promote or verify.  The
+    caller owns the probe → verdict → promote → dispose sequence against the
+    staged weights, run inside :func:`staged_weights`.
+
+    | termination path | staging slot | active adapter |
+    |---|---|---|
+    | normal (``aborted`` False) | resident — caller owns it | ``STAGING_ADAPTER`` |
+    | abort (``aborted`` True) | deleted here | *adapter_name* |
+    | exception | deleted here (best-effort) | *adapter_name* (best-effort) |
+    | compose mode | never created | as set by the caller |
+
+    Scratch (``staging_resume.json``, ``checkpoint-N/``) is cleaned on both
+    the normal-completion and abort paths (unless
+    ``retain_scratch_until_external_commit=True`` on the normal path) and
+    preserved on the exception path for crash-resume.
+
+    Why the trainer still cleans the staging slot on abort and on exception:
+    an abort produced no verdict-worthy weights — every caller already
+    branches on ``metrics["aborted"]`` and takes a no-commit exit, so handing
+    it a resident slot would put a disposal obligation on an exit that does
+    nothing.  An exception propagates past the caller's promote site by
+    definition, so no caller frame is in a position to dispose; leaving the
+    slot resident would arm the next training event's lifecycle guard
+    (:func:`assert_staging_absent`) and permanently block training.  The slot
+    survives ONLY on success, because — and only because — the verdict that
+    decides whether it may be promoted is not this function's to make.
 
     Steps:
 
     1. ``_ensure_staging_slot`` creates a byte-fresh ``in_training`` PEFT
        adapter from seeded LoRA initialisation.  If the slot is already
-       present at entry, the prior training event failed to clean up — raises
-       ``RuntimeError`` (lifecycle invariant guard).
+       present at entry, the prior training event's caller did not dispose of
+       it — raises ``RuntimeError`` (:func:`assert_staging_absent`).
     2. Copies production weights into the staging slot.  Consolidation:
        production holds prior-cycle weights → staging starts there (incremental
        learning).  Migration: caller force-resets production to LoRA-zero
@@ -804,24 +910,24 @@ def train_adapter(
        resolves the best available checkpoint (RAM → disk epoch-mirror →
        legacy, in preference order).
     5. Runs HF Trainer.
-    6. On normal completion: promotes staging weights into the production slot
-       (``copy_adapter_weights(staging → production)``), switches the active
-       adapter to production, cleans scratch state, **deletes the staging
-       slot**.
-       On abort: restores the production adapter without promoting, cleans
-       scratch, **deletes the staging slot**.
-       On exception (crash): restores the production adapter (best-effort),
-       leaves scratch intact for the next crash-resume.  PEFT state dies with
-       the process; the next process boot enters this function with a fresh
+    6. On normal completion: leaves the staging slot resident and active,
+       cleans scratch state (unless the caller retained it).
+       On abort: restores the active adapter to *adapter_name* without
+       promoting, cleans scratch, deletes the staging slot.
+       On exception (crash): restores the active adapter to *adapter_name*
+       (best-effort), deletes the staging slot (best-effort), leaves scratch
+       intact for the next crash-resume.  PEFT state dies with the process;
+       the next process boot enters this function with a fresh
        ``model.peft_config`` (no staging slot present).
 
-    Caller responsibilities (post-return):
+    Caller responsibilities (post-return, on a non-aborted result):
 
-    - Run the 1.0 recall sanity gate against the prior-model key-triple set
-      (``loop._run_recall_sanity_probe`` in migration,
-      ``_verify_saved_adapter_from_disk`` in consolidation).  On failure, roll
-      back the production adapter to LoRA-zero — staging is already gone, no
-      cleanup needed.
+    - Run its own uncapped per-key recall probe against ``STAGING_ADAPTER``
+      and apply its own verdict (main-tier: all-or-refuse; interim:
+      per-key registration).
+    - :func:`promote_staging_adapter` on pass, inside :func:`staged_weights`
+      so the slot is disposed of on every exit — pass, refuse, or a raise
+      from the probe itself.
     - ``atomic_save_adapter(production)`` to persist the slot durably.
 
     If ``active_adapters`` is provided, the staging+promote path is skipped
@@ -865,16 +971,15 @@ def train_adapter(
         hooks: Caller-supplied ``TrainingHooks`` (inference yielding, epoch
             persist, shutdown predicate).  Installed before the thermal throttle
             so yielding pre-empts throttle waits.
-        retain_scratch_until_external_commit: When ``True``, the success path
-            (Step 6a) skips ``_clean_scratch`` and ``scratch_path.unlink`` so
-            the durable ``checkpoint-N`` directory under *output_dir* and the
-            ``staging_resume.json`` marker survive after training completes.
-            The caller is then responsible for deleting these scratch artefacts
-            after its own external commit (e.g. the fold's ``_save_adapters``).
-            The in-VRAM staging→production promotion and the ``in_training``
-            slot deletion happen regardless.  Default ``False`` preserves the
-            existing clean-on-success behaviour for all current callers (BG
-            trainer, replay, migration, interim).
+        retain_scratch_until_external_commit: When ``True``, the normal-completion
+            path (Step 6) skips ``_clean_scratch`` and ``scratch_path.unlink``
+            so the durable ``checkpoint-N`` directory under *output_dir* and
+            the ``staging_resume.json`` marker survive after this function
+            returns.  The caller is then responsible for deleting these
+            scratch artefacts after its own external commit (e.g. the fold's
+            ``_save_adapters``).  Default ``False`` preserves the existing
+            clean-on-success behaviour for all current callers (BG trainer,
+            replay, migration, interim).
 
     Returns:
         Training metrics dict with the following keys:
@@ -945,9 +1050,9 @@ def train_adapter(
         if adapter_name in model.peft_config:
             from paramem.models.loader import copy_adapter_weights
 
-            copy_adapter_weights(model, src=adapter_name, dst=_STAGING_ADAPTER)
+            copy_adapter_weights(model, src=adapter_name, dst=STAGING_ADAPTER)
             logger.debug(
-                "Staging: copied production weights %s → %s", adapter_name, _STAGING_ADAPTER
+                "Staging: copied production weights %s → %s", adapter_name, STAGING_ADAPTER
             )
         else:
             logger.info(
@@ -956,7 +1061,7 @@ def train_adapter(
             )
 
         # Step 3: Switch active adapter to staging so HF Trainer trains there.
-        model.set_adapter(_STAGING_ADAPTER)
+        model.set_adapter(STAGING_ADAPTER)
 
     # ------------------------------------------------------------------
     # Crash-resume: check staging_resume.json (overridden by explicit arg)
@@ -1145,9 +1250,9 @@ def train_adapter(
 
         for _cb in callbacks:
             if isinstance(_cb, RecallEarlyStopCallback):
-                _cb.set_probe_adapter(_STAGING_ADAPTER)
+                _cb.set_probe_adapter(STAGING_ADAPTER)
 
-    _save_target = _STAGING_ADAPTER if _use_staging else adapter_name
+    _save_target = STAGING_ADAPTER if _use_staging else adapter_name
     trainer = ParamemTrainer(
         model=model,
         args=training_args,
@@ -1162,7 +1267,7 @@ def train_adapter(
     logger.info(
         "Starting training: adapter=%s (staging=%s), epochs=%d, lr=%e",
         adapter_name,
-        _STAGING_ADAPTER if _use_staging else "compose-mode",
+        STAGING_ADAPTER if _use_staging else "compose-mode",
         training_config.num_epochs,
         adapter_config.learning_rate,
     )
@@ -1221,12 +1326,14 @@ def train_adapter(
 
         if _use_staging:
             if not aborted:
-                # Step 6a: NORMAL completion — promote staging → production.
-                from paramem.models.loader import copy_adapter_weights, switch_adapter
-
-                copy_adapter_weights(model, src=_STAGING_ADAPTER, dst=adapter_name)
-                switch_adapter(model, adapter_name)
-                logger.info("Staging: promoted %s → %s (VRAM)", _STAGING_ADAPTER, adapter_name)
+                # Step 6: NORMAL completion — leave the staging slot resident
+                # and active.  The caller owns the probe -> verdict -> promote
+                # -> dispose sequence against STAGING_ADAPTER from here; this
+                # function does not promote or delete it.
+                logger.info(
+                    "Staging: training complete — %s resident and active for caller",
+                    STAGING_ADAPTER,
+                )
                 # Clean scratch on success unless the caller owns cleanup.
                 # When retain_scratch_until_external_commit=True the caller (e.g.
                 # the fold's _run_fold) keeps the durable checkpoint-N dir and
@@ -1239,16 +1346,9 @@ def train_adapter(
                     scratch_path.unlink(missing_ok=True)
                 else:
                     logger.debug("Staging: scratch retained for external commit at %s", output_dir)
-                # Delete the staging slot now that promote is done.
-                # The staging slot is transient — exists only during this training
-                # event.  Crash-safety + rollback rationale no longer applies: the
-                # new weights are in production (VRAM), and if save fails later, the
-                # prior production state on disk is still recoverable.
-                model.delete_adapter(_STAGING_ADAPTER)
-                logger.info("Staging: deleted %s (lifecycle: per-training-event)", _STAGING_ADAPTER)
             else:
                 # Step 6b: ABORT — restore active adapter, do NOT promote.
-                from paramem.models.loader import switch_adapter
+                from paramem.models.loader import drop_adapter_slot, switch_adapter
 
                 switch_adapter(model, adapter_name)
                 logger.info(
@@ -1259,12 +1359,12 @@ def train_adapter(
                 scratch_path.unlink(missing_ok=True)
                 # Delete the staging slot on abort too.  The staging slot is
                 # transient and must not survive past this training event,
-                # otherwise the next event's _ensure_staging_slot will trip its
-                # lifecycle-invariant guard.
-                model.delete_adapter(_STAGING_ADAPTER)
+                # otherwise the next event's assert_staging_absent will trip
+                # its lifecycle-invariant guard.
+                drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
                 logger.info(
                     "Staging: deleted %s after abort (lifecycle: per-training-event)",
-                    _STAGING_ADAPTER,
+                    STAGING_ADAPTER,
                 )
         else:
             # Compose-training path: clean up RAM dir on success.
@@ -1298,31 +1398,32 @@ def train_adapter(
                     adapter_name,
                     exc_info=True,
                 )
-            # Delete the transient in_training VRAM slot — success (1238) and
-            # abort (1255) both already do this; leaving it resident here
-            # trips _ensure_staging_slot's lifecycle-invariant guard on the
-            # next training event, permanently blocking consolidation until a
-            # restart.  The guard below skips the delete if active is still
-            # the staging slot (the switch_adapter above may have failed) —
-            # the active adapter must never be deleted.
-            from paramem.models.loader import active_adapter_name
+            # Delete the transient in_training VRAM slot.  The normal (Step 6)
+            # path deliberately does NOT do this — it hands the slot back to
+            # the caller resident, for the caller's own probe -> promote ->
+            # dispose sequence.  Only the abort (Step 6b) path and this
+            # exception (Step 6c) path delete it here, because neither has a
+            # caller frame positioned to run that sequence: an abort produced
+            # no verdict-worthy weights, and an exception propagates past the
+            # caller's promote site by definition.  Leaving the slot resident
+            # here trips assert_staging_absent's lifecycle-invariant guard on
+            # the next training event, permanently blocking training until a
+            # restart.  Its own try/except must never replace the in-flight
+            # exception this handler is re-raising below.
+            from paramem.models.loader import drop_adapter_slot
 
-            if (
-                _STAGING_ADAPTER in model.peft_config
-                and active_adapter_name(model) != _STAGING_ADAPTER
-            ):
-                try:
-                    model.delete_adapter(_STAGING_ADAPTER)  # VRAM slot only; on-disk scratch kept
-                    logger.info(
-                        "Staging: deleted %s after exception (lifecycle: per-training-event)",
-                        _STAGING_ADAPTER,
-                    )
-                except Exception:  # noqa: BLE001  # best-effort teardown; original exception must
-                    # still propagate — see the try/except above for the same contract.
-                    logger.warning(
-                        "Staging: could not delete %s after exception",
-                        _STAGING_ADAPTER,
-                        exc_info=True,
-                    )
+            try:
+                drop_adapter_slot(model, STAGING_ADAPTER, fallback_adapter=adapter_name)
+                logger.info(
+                    "Staging: deleted %s after exception (lifecycle: per-training-event)",
+                    STAGING_ADAPTER,
+                )
+            except Exception:  # noqa: BLE001  # best-effort teardown; original exception must
+                # still propagate — see the try/except above for the same contract.
+                logger.warning(
+                    "Staging: could not delete %s after exception",
+                    STAGING_ADAPTER,
+                    exc_info=True,
+                )
         # Do NOT clean scratch — it is needed for crash-resume on next start.
         raise

@@ -825,7 +825,12 @@ def train_phase(
     from paramem.memory.entry import format_entry_training
     from paramem.models.loader import create_adapter
     from paramem.training.early_stop import EarlyStopPolicy
-    from paramem.training.trainer import TrainingHooks, train_adapter
+    from paramem.training.trainer import (
+        TrainingHooks,
+        promote_staging_adapter,
+        staged_weights,
+        train_adapter,
+    )
     from paramem.utils.config import AdapterConfig, TrainingConfig
 
     # Recover ES parameters from persisted config when called via --resume
@@ -956,6 +961,10 @@ def train_phase(
             resume_from_checkpoint=resume_ckpt,
         )
         elapsed = time.time() - t0
+
+        if not metrics.get("aborted"):
+            with staged_weights(model, fallback_adapter="quad_episodic"):
+                promote_staging_adapter(model, "quad_episodic")
 
     # If pause fired mid-training, do NOT write train_done.json.
     # Find the latest checkpoint path for the paused.json payload.

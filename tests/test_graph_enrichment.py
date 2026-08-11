@@ -126,10 +126,14 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         output_dir=tmp_path,
         **defaults,
     )
-    # Admit-all probe stub: the real _probe_passing_keys runs evaluate_indexed_recall,
+    # Admit-all probe stub: the real _probe_recall runs evaluate_indexed_recall,
     # which feeds the MagicMock model into re.sub and TypeErrors.  Admitting every key
     # is the prior implicit behavior (no recall gate), so it is inert for these tests.
-    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+    from paramem.training.recall_eval import RecallProbe
+
+    loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+        per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+    )
     return loop
 
 
@@ -3516,7 +3520,11 @@ class TestHarvestKeylessEdges:
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
         )
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        from paramem.training.recall_eval import RecallProbe
+
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
 
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
@@ -3607,7 +3615,11 @@ class TestHarvestKeylessEdges:
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
         )
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        from paramem.training.recall_eval import RecallProbe
+
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
 
         # Constructor must have picked up graph250 -> _indexed_next_index == 251.
         assert loop._indexed_next_index == 251, (

@@ -111,7 +111,11 @@ from paramem.models.loader import (  # noqa: E402
 from paramem.training.recall_eval import (  # noqa: E402
     evaluate_indexed_recall as evaluate_entry_recall,
 )
-from paramem.training.trainer import train_adapter  # noqa: E402
+from paramem.training.trainer import (  # noqa: E402
+    promote_staging_adapter,
+    staged_weights,
+    train_adapter,
+)
 from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
 
 setup_logging()
@@ -882,6 +886,10 @@ def _run_phase(
     )
     wall = time.time() - t0
 
+    if not metrics.get("aborted"):
+        with staged_weights(model, fallback_adapter=adapter_name):
+            promote_staging_adapter(model, adapter_name)
+
     probe_state.first_perfect_epoch = early_state.first_perfect_epoch
     probe_state.stable_perfect_epoch = early_state.stable_perfect_epoch
     probe_state.stop_epoch = early_state.stop_epoch
@@ -1121,6 +1129,10 @@ def run_repair_loop_v2(
         )
         ep_wall = time.time() - t0
         train_loss = metrics.get("train_loss")
+
+        if not metrics.get("aborted"):
+            with staged_weights(model, fallback_adapter=adapter_name):
+                promote_staging_adapter(model, adapter_name)
 
         # Probe full unchanged set after this episode.
         probe_result = _safe_probe(

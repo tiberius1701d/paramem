@@ -11,6 +11,7 @@ from paramem.memory.store import MemoryStore as _MS
 from paramem.models.loader import (
     atomic_save_adapter,
     copy_adapter_weights,
+    drop_adapter_slot,
 )
 
 
@@ -98,6 +99,141 @@ class TestCopyAdapterWeights:
         for name, p in model.named_parameters():
             if ".dst.weight" in name:
                 assert not torch.all(p.data == 999.0)
+
+
+class _FakeActiveModel:
+    """Minimal model stub implementing the interface ``drop_adapter_slot`` needs:
+    a mutable ``peft_config`` dict, an ``active_adapter`` attribute, and
+    recording ``set_adapter``/``delete_adapter`` methods that actually mutate
+    state (unlike a bare ``MagicMock``, whose methods are no-ops).
+
+    *fail_switch_to*, when set, makes ``set_adapter`` raise instead of
+    switching when called with that name -- simulates PEFT's own switch call
+    failing on a broken model state.
+
+    *silent_no_land_switch_to*, when set, makes ``set_adapter`` record the
+    call and return normally WITHOUT updating ``active_adapter`` when called
+    with that name -- simulates a switch call that does not raise but also
+    does not land, distinct from *fail_switch_to*'s raising failure.
+    """
+
+    def __init__(
+        self,
+        adapters: list[str],
+        active: "str | None",
+        *,
+        fail_switch_to=None,
+        silent_no_land_switch_to=None,
+    ):
+        self.peft_config = {name: MagicMock() for name in adapters}
+        self.active_adapter = active
+        self.set_adapter_calls: list[str] = []
+        self.delete_adapter_calls: list[str] = []
+        self._fail_switch_to = fail_switch_to
+        self._silent_no_land_switch_to = silent_no_land_switch_to
+
+    def set_adapter(self, name):
+        self.set_adapter_calls.append(name)
+        if name == self._fail_switch_to:
+            raise RuntimeError("switch failed")
+        if name == self._silent_no_land_switch_to:
+            return
+        self.active_adapter = name
+
+    def delete_adapter(self, name):
+        self.delete_adapter_calls.append(name)
+        self.peft_config.pop(name, None)
+
+
+class TestDropAdapterSlot:
+    """Unit coverage for ``paramem.models.loader.drop_adapter_slot`` — the
+    one "delete a transient slot" primitive shared by the staging lifecycle
+    and the donor build's transient slot."""
+
+    def test_switches_to_fallback_then_deletes_when_target_active_and_fallback_present(self):
+        model = _FakeActiveModel(adapters=["in_training", "episodic"], active="in_training")
+
+        drop_adapter_slot(model, "in_training", fallback_adapter="episodic")
+
+        assert model.set_adapter_calls == ["episodic"], (
+            "expected a switch to the fallback before delete"
+        )
+        assert model.delete_adapter_calls == ["in_training"]
+        assert "in_training" not in model.peft_config
+        assert model.active_adapter == "episodic"
+
+    def test_skips_delete_when_fallback_absent(self):
+        """Deleting the model's own ACTIVE adapter with no confirmed
+        successor would leave PeftModel with a stale/absent active config --
+        the state the project's PEFT rule forbids. With no fallback
+        resident, the delete is skipped entirely (not attempted with a
+        stale active pointer): the leaked slot stays resident for the
+        lifecycle backstop (``assert_staging_absent``) to catch loudly at
+        the next training event."""
+        model = _FakeActiveModel(adapters=["in_training"], active="in_training")
+
+        drop_adapter_slot(model, "in_training", fallback_adapter="episodic")
+
+        assert model.set_adapter_calls == [], "no switch when the fallback is not resident"
+        assert model.delete_adapter_calls == [], "no delete when the fallback is not resident"
+        assert "in_training" in model.peft_config
+        assert model.active_adapter == "in_training"
+
+    def test_skips_delete_when_fallback_switch_fails(self):
+        """A failed switch to the fallback is treated identically to an
+        absent fallback: the delete is skipped and the active adapter stays
+        exactly where it was, leaving no active-adapter-less window."""
+        model = _FakeActiveModel(
+            adapters=["in_training", "episodic"], active="in_training", fail_switch_to="episodic"
+        )
+
+        drop_adapter_slot(model, "in_training", fallback_adapter="episodic")
+
+        assert model.delete_adapter_calls == [], "no delete when the fallback switch fails"
+        assert "in_training" in model.peft_config
+        assert model.active_adapter == "in_training"
+
+    def test_skips_delete_when_fallback_switch_does_not_land(self):
+        """A switch to the fallback that returns normally WITHOUT actually
+        landing (``active_adapter_name`` re-checked after the switch attempt
+        still reports the old value, e.g. a broken PEFT internal state that
+        no-ops the switch silently) is treated identically to a raised
+        switch failure and an absent fallback: the delete is skipped and the
+        active adapter stays exactly where it was."""
+        model = _FakeActiveModel(
+            adapters=["in_training", "episodic"],
+            active="in_training",
+            silent_no_land_switch_to="episodic",
+        )
+
+        drop_adapter_slot(model, "in_training", fallback_adapter="episodic")
+
+        assert model.set_adapter_calls == ["episodic"], "the switch is still attempted"
+        assert model.delete_adapter_calls == [], "no delete when the switch does not land"
+        assert "in_training" in model.peft_config
+        assert model.active_adapter == "in_training"
+
+    def test_noop_when_target_absent(self):
+        model = _FakeActiveModel(adapters=["episodic"], active="episodic")
+
+        drop_adapter_slot(model, "in_training", fallback_adapter="episodic")
+
+        assert model.set_adapter_calls == []
+        assert model.delete_adapter_calls == []
+        assert set(model.peft_config) == {"episodic"}
+
+    def test_deletes_without_switch_when_target_not_active(self):
+        """When *name* is not the currently active adapter, no switch is
+        needed -- the delete proceeds unconditionally, even with no
+        fallback resident at all."""
+        model = _FakeActiveModel(adapters=["in_training", "episodic"], active="episodic")
+
+        drop_adapter_slot(model, "in_training", fallback_adapter="semantic")
+
+        assert model.set_adapter_calls == [], "no switch needed when the target is not active"
+        assert model.delete_adapter_calls == ["in_training"]
+        assert "in_training" not in model.peft_config
+        assert model.active_adapter == "episodic"
 
 
 class TestAtomicSaveAdapter:
@@ -232,6 +368,62 @@ class TestAtomicSaveAdapter:
         # Final slot must also be flat
         assert (final_slot / "adapter_model.safetensors").exists()
         assert not (final_slot / "episodic").exists()
+
+
+class TestStagedWeightsDisposalGuard:
+    """``paramem.training.trainer.staged_weights``' ``finally`` is the ONE
+    disposal designed to run with an in-flight exception (the refusal path
+    -- ``RecallGateRejected`` raised from inside the ``with`` body) -- a
+    failure disposing of the staging slot must never replace that in-flight
+    exception, or the caller's compensation and the incident detail it
+    carries would both be lost."""
+
+    def test_disposal_failure_never_replaces_an_in_flight_exception(self):
+        from paramem.training.trainer import staged_weights
+
+        model = MagicMock()
+
+        class _Verdict(RuntimeError):
+            pass
+
+        with patch(
+            "paramem.models.loader.drop_adapter_slot",
+            side_effect=RuntimeError("disposal boom"),
+        ):
+            with pytest.raises(_Verdict, match="original verdict"):
+                with staged_weights(model, fallback_adapter="episodic"):
+                    raise _Verdict("original verdict")
+
+    def test_disposal_failure_is_logged(self, caplog):
+        import logging
+
+        from paramem.training.trainer import staged_weights
+
+        model = MagicMock()
+
+        with patch(
+            "paramem.models.loader.drop_adapter_slot",
+            side_effect=RuntimeError("disposal boom"),
+        ):
+            with caplog.at_level(logging.ERROR, logger="paramem.training.trainer"):
+                with pytest.raises(RuntimeError, match="original verdict"):
+                    with staged_weights(model, fallback_adapter="episodic"):
+                        raise RuntimeError("original verdict")
+
+        assert any("drop_adapter_slot" in record.getMessage() for record in caplog.records), (
+            "expected the disposal failure to be logged, not silently swallowed"
+        )
+
+    def test_disposal_still_runs_on_success(self):
+        from paramem.training.trainer import STAGING_ADAPTER, staged_weights
+
+        model = MagicMock()
+
+        with patch("paramem.models.loader.drop_adapter_slot") as mock_drop:
+            with staged_weights(model, fallback_adapter="episodic"):
+                pass
+
+        mock_drop.assert_called_once_with(model, STAGING_ADAPTER, fallback_adapter="episodic")
 
 
 class TestStagingFlowContracts:

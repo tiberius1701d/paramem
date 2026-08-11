@@ -626,6 +626,15 @@ def _donor_build_env(tmp_path, monkeypatch):
         MagicMock(side_effect=_fake_build_manifest_for),
     )
 
+    # promote_staging_adapter / staged_weights (called directly by
+    # _build_donor_checkpoint after the faked train_adapter above) reach
+    # into paramem.models.loader themselves — the experiment-module-level
+    # switch_adapter/create_adapter patches above do not cover them, and
+    # the stub model has no peft_config for the real primitives to inspect.
+    monkeypatch.setattr("paramem.models.loader.copy_adapter_weights", MagicMock())
+    monkeypatch.setattr("paramem.models.loader.switch_adapter", MagicMock())
+    monkeypatch.setattr("paramem.models.loader.drop_adapter_slot", MagicMock())
+
     monkeypatch.setattr(
         "experiments.test20_smallN_cold_gate.atomic_save_adapter",
         MagicMock(side_effect=_fake_atomic_save_adapter),

@@ -22,6 +22,12 @@ Public API
     :func:`probe_entries` (all batch sizes — ``probe_entries`` handles
     ``batch_size=1`` correctly as single-prompt chunks).
 
+:class:`RecallProbe` — the one per-key verdict type consolidation's staged
+    probe returns (``ConsolidationLoop._probe_recall``), wrapping
+    ``evaluate_indexed_recall(...)["per_key"]`` with the distinct-key
+    derivations (``passing_keys``, ``failed``, ``distinct_total``, ``rate``)
+    its callers need.
+
 Patching note: ``functools.partial`` snapshots the target function at
 construction time.  Any test exercising ``batch_size > 1`` via
 ``_maybe_make_recall_callback`` must either (a) patch
@@ -34,12 +40,53 @@ construction do NOT redirect the already-captured partial.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Iterator
 
 from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD
 from paramem.models.loader import switch_adapter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RecallProbe:
+    """Per-key verdict of one recall probe, with the derivations its consumers need.
+
+    ``per_key`` is ``evaluate_indexed_recall(...)["per_key"]`` verbatim: each
+    record carries ``key``, ``exact_match``, ``confidence``, the ground-truth
+    ``subject``/``predicate``/``object``, the ``recalled_*`` triple,
+    ``failure_reason`` and ``raw_output``.
+
+    Duplicate-tolerant: every derived property counts DISTINCT keys, never
+    ``len(per_key)`` — a caller that probed a list with a repeated key must
+    never see a denominator inflated by the repeat.
+    """
+
+    per_key: tuple[dict, ...]
+
+    @property
+    def passing_keys(self) -> frozenset[str]:
+        """Keys whose ``exact_match`` verdict is True."""
+        return frozenset(r["key"] for r in self.per_key if r["exact_match"])
+
+    @property
+    def failed(self) -> tuple[dict, ...]:
+        """Records whose ``exact_match`` verdict is False."""
+        return tuple(r for r in self.per_key if not r["exact_match"])
+
+    @property
+    def distinct_total(self) -> int:
+        """Count of distinct keys probed."""
+        return len({r["key"] for r in self.per_key})
+
+    @property
+    def rate(self) -> float:
+        """Fraction of distinct keys passing; ``1.0`` when nothing was probed."""
+        total = self.distinct_total
+        if total == 0:
+            return 1.0
+        return len(self.passing_keys) / total
 
 
 def evaluate_indexed_recall(

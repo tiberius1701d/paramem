@@ -120,6 +120,18 @@ def _make_minimal_loop(tmp_path):
     return loop
 
 
+def _probe(passing_keys):
+    """Build a RecallProbe whose passing_keys is exactly *passing_keys*.
+
+    Stands in for ``loop._probe_recall(...)``'s return value — the interim
+    commit reads only ``probe.passing_keys`` for its per-key registration
+    gate, never the individual record content.
+    """
+    from paramem.training.recall_eval import RecallProbe
+
+    return RecallProbe(per_key=tuple({"key": k, "exact_match": True} for k in passing_keys))
+
+
 def _common_patches(loop):
     """Return the context-manager list shared across cycle-level tests.
 
@@ -143,6 +155,13 @@ def _common_patches(loop):
         patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
         patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)),
         patch("paramem.training.consolidation.switch_adapter"),
+        # staged_weights/promote_staging_adapter (the interim commit's own
+        # probe-then-promote sequence) resolve copy_adapter_weights and
+        # switch_adapter fresh from paramem.models.loader at call time —
+        # the paramem.training.consolidation.switch_adapter patch above
+        # covers only consolidation.py's own direct calls, not these.
+        patch("paramem.models.loader.switch_adapter"),
+        patch("paramem.models.loader.copy_adapter_weights"),
         patch(
             "paramem.training.consolidation.format_entry_training",
             return_value=[{"input_ids": [1], "labels": [1]}],
@@ -237,7 +256,7 @@ class TestProceduralRoutedToInterim:
         patches = _common_patches(loop) + [
             patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
             patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_passing_keys", return_value={"proc1"}),
+            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc1"})),
         ]
 
         with _stack(patches):
@@ -262,6 +281,62 @@ class TestProceduralRoutedToInterim:
         assert len(train_calls) == 1, f"Expected 1 train call; got {train_calls}"
         assert train_calls[0] == "episodic_interim_20260417T0000", (
             f"Procedural facts must train on interim slot; adapter was {train_calls[0]}"
+        )
+
+    def test_interim_probe_targets_staging_adapter_before_promote(self, monkeypatch, tmp_path):
+        """The interim commit's recall probe runs against STAGING_ADAPTER,
+        before the promote — never the interim slot's own name.
+
+        Kills: probing the interim slot itself (post-promote), which would
+        read whatever was resident there before this cycle rather than the
+        weights this cycle just trained.
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = _make_minimal_loop(tmp_path)
+
+        g = nx.MultiDiGraph()
+        g.add_node("bob", speaker_id="speaker0", attributes={"name": "Bob"})
+        g.add_node("jazz", attributes={"name": "Jazz"})
+        g.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
+        loop.merger.graph = g
+
+        probe_calls: list[str] = []
+
+        def _capture_probe(adapter_name, entries):
+            probe_calls.append(adapter_name)
+            return _probe({e["key"] for e in entries})
+
+        patches = _common_patches(loop) + [
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.1, "aborted": False},
+            ),
+            patch("paramem.memory.persistence.commit_tier_slot"),
+            patch.object(ConsolidationLoop, "_probe_recall", side_effect=_capture_probe),
+        ]
+
+        with _stack(patches):
+            loop.run_consolidation_cycle(
+                [
+                    {
+                        "subject": "Bob",
+                        "predicate": "likes",
+                        "object": "Jazz",
+                        "relation_type": "preference",
+                        "speaker_id": "speaker0",
+                    }
+                ],
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="test_interim_probe_target",
+                stamp="20260417T0000",
+            )
+
+        assert probe_calls == [STAGING_ADAPTER], (
+            f"expected exactly one probe of {STAGING_ADAPTER!r}; got {probe_calls}"
         )
 
 
@@ -390,9 +465,10 @@ class TestProceduralSessionPending:
         loop.merger.graph = g
 
         # Train succeeds but probe admits NO keys (simulates recall failure).
-        # Patching at class level so self._probe_passing_keys returns set() for
-        # ALL keys, causing them to be excluded from store.put and their
-        # session_ids to accumulate in _recall_failed_session_ids.
+        # Patching ConsolidationLoop._probe_recall so it returns a probe whose
+        # passing() set is empty for every key, causing them to be excluded
+        # from store.put and their session_ids to accumulate in
+        # _recall_failed_session_ids.
         patches = _common_patches(loop) + [
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -400,7 +476,7 @@ class TestProceduralSessionPending:
             ),
             patch("paramem.memory.persistence.commit_tier_slot"),
             # Probe passes nothing — all new keys "fail" recall.
-            patch.object(ConsolidationLoop, "_probe_passing_keys", return_value=set()),
+            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe(set())),
         ]
 
         with _stack(patches):
@@ -474,7 +550,7 @@ class TestProceduralKeyRegisteredInInterimTier:
                 return_value={"train_loss": 0.05, "aborted": False},
             ),
             patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_passing_keys", return_value={"proc0"}),
+            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc0"})),
             patch.object(loop.store, "put", side_effect=_spy_put),
         ]
 
@@ -536,7 +612,7 @@ class TestProceduralKeyRegisteredInInterimTier:
                 return_value={"train_loss": 0.05, "aborted": False},
             ),
             patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_passing_keys", return_value={"proc0"}),
+            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc0"})),
             patch.object(loop.store, "set_bookkeeping", side_effect=_spy_bk),
         ]
 
@@ -589,7 +665,7 @@ class TestProceduralKeyRegisteredInInterimTier:
                 return_value={"train_loss": 0.05, "aborted": False},
             ),
             patch("paramem.memory.persistence.commit_tier_slot"),
-            patch.object(ConsolidationLoop, "_probe_passing_keys", return_value={"proc0"}),
+            patch.object(ConsolidationLoop, "_probe_recall", return_value=_probe({"proc0"})),
         ]
 
         with _stack(patches):

@@ -539,7 +539,11 @@ from paramem.training.donor import (  # noqa: E402
     donor_entries,
 )
 from paramem.training.recall_eval import evaluate_indexed_recall  # noqa: E402
-from paramem.training.trainer import train_adapter  # noqa: E402
+from paramem.training.trainer import (  # noqa: E402
+    promote_staging_adapter,
+    staged_weights,
+    train_adapter,
+)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -1132,6 +1136,10 @@ def _build_donor_checkpoint(
     )
     wall_train = time.time() - t0
     train_loss = (metrics or {}).get("train_loss")
+
+    if not (metrics or {}).get("aborted"):
+        with staged_weights(model, fallback_adapter=DONOR_BUILD_ADAPTER_NAME):
+            promote_staging_adapter(model, DONOR_BUILD_ADAPTER_NAME)
 
     realized_donor_steps = step_cb.global_step
     assert realized_donor_steps is not None, (
@@ -2167,6 +2175,10 @@ def _run_seed(
     wall_train = time.time() - t0
     train_loss = (metrics or {}).get("train_loss")
     logger.info("Seed %d training done: wall=%.0fs loss=%s", seed, wall_train, train_loss)
+
+    if not (metrics or {}).get("aborted"):
+        with staged_weights(model, fallback_adapter=adapter_name):
+            promote_staging_adapter(model, adapter_name)
 
     # Step 9: Hard Assertion #1 — realized optimizer steps.
     realized_steps = step_cb.global_step

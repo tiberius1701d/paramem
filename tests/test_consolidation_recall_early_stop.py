@@ -24,6 +24,8 @@ import ast
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.early_stop import RecallEarlyStopCallback
 from paramem.utils.config import (
@@ -154,16 +156,16 @@ class TestMaybeMakeRecallCallback:
         assert cb._pause_file is None  # production pause via gpu_lock_sync
 
     def test_num_epochs_propagates_to_callback(self, tmp_path: Path) -> None:
-        """Regression: the callback's forced final-epoch probe must fire at
-        the CALLER'S num_epochs, not at training_config.num_epochs.
+        """Regression: the callback's progress display (progress.json's
+        total_epochs) must reflect the CALLER'S num_epochs, not
+        training_config.num_epochs.
 
         num_epochs is a required argument — the sole production caller
         (_train_tier_adapter) always passes the derived per-fold budget from
         paramem.utils.config.budget_for, which can differ from
         training_config.num_epochs (30 by default). A callback that silently
-        fell back to training_config.num_epochs would skip the forced probe
-        and leave state.last_per_key with a mid-training cadence verdict —
-        wrong registration admission/rejection.
+        fell back to training_config.num_epochs would report the wrong
+        budget to operator-facing progress tooling.
         """
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         assert loop.training_config.num_epochs != 20, (
@@ -571,7 +573,9 @@ class TestProbeTargetIsFullReplaySet:
 
 class TestCallbackStateTuple:
     """_maybe_make_recall_callback returns (callback, state) so callers can
-    read state.last_per_key after training to gate registration."""
+    read state.stop_epoch after training to bind fold telemetry — the
+    per-key recall verdict is a separate, later staged-weights probe
+    (ConsolidationLoop._probe_recall), never read off this state."""
 
     def test_returns_tuple_when_enabled(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
@@ -586,8 +590,8 @@ class TestCallbackStateTuple:
         cb, state = result
         assert isinstance(cb, RecallEarlyStopCallback)
         assert state is not None
-        # state should initially have no verdict
-        assert state.last_per_key is None
+        # state should initially have no stop signal
+        assert state.stop_epoch is None
 
     def test_returns_none_none_when_disabled(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=False)
@@ -613,20 +617,19 @@ class TestCallbackStateTuple:
         )
         # Mutate through the callback's internal state; the returned state
         # should reflect the change (same object).
-        cb._state.last_per_key = [{"key": "graph1", "exact_match": True}]
-        assert state.last_per_key == [{"key": "graph1", "exact_match": True}]
+        cb._state.stop_epoch = 5
+        assert state.stop_epoch == 5
 
 
 # ---------------------------------------------------------------------------
-# Class H — TestRecallPassingKeys
-# Tests for the _recall_passing_keys / _probe_passing_keys helpers.
+# Class H — TestProbeRecall
+# Tests for the ConsolidationLoop._probe_recall primitive.
 # ---------------------------------------------------------------------------
 
 
-class TestRecallPassingKeys:
-    """_recall_passing_keys converts state.last_per_key to a passing set.
-    _probe_passing_keys is the fail-safe path when no verdict is available.
-    """
+class TestProbeRecall:
+    """_probe_recall runs the one staged-weights recall probe and returns a
+    RecallProbe carrying the per-key verdict."""
 
     def _make_loop_with_helpers(self, tmp_path: Path) -> "ConsolidationLoop":
         from paramem.utils.config import TrainingConfig
@@ -640,40 +643,12 @@ class TestRecallPassingKeys:
         )
         return loop
 
-    def test_recall_passing_keys_returns_passing_set(self, tmp_path: Path) -> None:
-        from paramem.training.early_stop import _EarlyStopState
-
-        loop = self._make_loop_with_helpers(tmp_path)
-        state = _EarlyStopState()
-        state.last_per_key = [
-            {"key": "graph1", "exact_match": True},
-            {"key": "graph2", "exact_match": False},
-            {"key": "graph3", "exact_match": True},
-        ]
-        entries = [
-            {"key": f"graph{i}", "subject": "S", "predicate": "p", "object": "O"}
-            for i in range(1, 4)
-        ]
-        result = loop._recall_passing_keys(state, entries)
-        assert result == {"graph1", "graph3"}
-
-    def test_recall_passing_keys_returns_none_when_state_none(self, tmp_path: Path) -> None:
-        loop = self._make_loop_with_helpers(tmp_path)
-        result = loop._recall_passing_keys(None, _kp(3))
-        assert result is None
-
-    def test_recall_passing_keys_returns_none_when_last_per_key_none(self, tmp_path: Path) -> None:
-        from paramem.training.early_stop import _EarlyStopState
-
-        loop = self._make_loop_with_helpers(tmp_path)
-        state = _EarlyStopState()
-        assert state.last_per_key is None
-        result = loop._recall_passing_keys(state, _kp(3))
-        assert result is None
-
-    def test_probe_passing_keys_calls_evaluate_indexed_recall(self, tmp_path: Path) -> None:
-        """_probe_passing_keys calls evaluate_indexed_recall and returns passing set."""
+    def test_probe_recall_calls_evaluate_indexed_recall(self, tmp_path: Path) -> None:
+        """_probe_recall calls evaluate_indexed_recall and wraps the result
+        in a RecallProbe carrying per_key verbatim."""
         from unittest.mock import patch
+
+        from paramem.training.recall_eval import RecallProbe
 
         loop = self._make_loop_with_helpers(tmp_path)
         entries = [
@@ -694,10 +669,86 @@ class TestRecallPassingKeys:
         with patch(
             "paramem.training.recall_eval.evaluate_indexed_recall", return_value=fake_result
         ) as mock_eval:
-            result = loop._probe_passing_keys("episodic", entries)
+            result = loop._probe_recall("episodic", entries)
 
         mock_eval.assert_called_once()
-        assert result == {"graph1"}
+        assert isinstance(result, RecallProbe)
+        assert result.passing_keys == {"graph1"}
+        assert result.per_key == tuple(fake_result["per_key"])
+
+    def test_probe_recall_propagates_exceptions(self, tmp_path: Path) -> None:
+        """A probe that cannot run is not a verdict — _probe_recall must not
+        swallow the exception into an empty/failing result."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_with_helpers(tmp_path)
+        entries = [{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}]
+
+        with (
+            patch(
+                "paramem.training.recall_eval.evaluate_indexed_recall",
+                side_effect=RuntimeError("probe harness broke"),
+            ),
+            pytest.raises(RuntimeError, match="probe harness broke"),
+        ):
+            loop._probe_recall("episodic", entries)
+
+    def test_probe_recall_re_enables_gradient_checkpointing_when_configured(
+        self, tmp_path: Path
+    ) -> None:
+        """When training_config.gradient_checkpointing is True, the probe
+        re-enables it afterward (in a finally) — the probe now runs mid-fold,
+        before the promote and before the next tier trains, so the pre-probe
+        state must be restored rather than left disabled.
+        """
+        from unittest.mock import patch
+
+        from paramem.utils.config import TrainingConfig
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+            gradient_checkpointing=True,
+        )
+        entries = [{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}]
+        fake_result = {"per_key": [{"key": "graph1", "exact_match": True}]}
+
+        with patch(
+            "paramem.training.recall_eval.evaluate_indexed_recall", return_value=fake_result
+        ):
+            loop._probe_recall("episodic", entries)
+
+        loop.model.gradient_checkpointing_enable.assert_called_once()
+
+    def test_probe_recall_leaves_checkpointing_off_when_not_configured(
+        self, tmp_path: Path
+    ) -> None:
+        """When training_config.gradient_checkpointing is False, the probe
+        does not force it back on."""
+        from unittest.mock import patch
+
+        from paramem.utils.config import TrainingConfig
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+            gradient_checkpointing=False,
+        )
+        entries = [{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}]
+        fake_result = {"per_key": [{"key": "graph1", "exact_match": True}]}
+
+        with patch(
+            "paramem.training.recall_eval.evaluate_indexed_recall", return_value=fake_result
+        ):
+            loop._probe_recall("episodic", entries)
+
+        loop.model.gradient_checkpointing_enable.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -754,8 +805,8 @@ class TestResetRegistersEveryKey:
         assert set(loop.store.registry("procedural").list_active()) == {"proc1"}
 
     def test_reset_never_probes(self, tmp_path: Path) -> None:
-        """_probe_passing_keys is never called by the reset -- registration
-        is unconditional now that the training-completeness verdict is
+        """_probe_recall is never called by the reset -- registration is
+        unconditional now that the training-completeness verdict is
         enforced earlier, by _assert_tier_recall.  Also carries the
         stale-seeding and simhash-pairing coverage the deleted
         TestRegistrationFilter class exercised, so that coverage survives."""
@@ -777,7 +828,7 @@ class TestResetRegistersEveryKey:
 
         from unittest.mock import patch
 
-        with patch.object(ConsolidationLoop, "_probe_passing_keys") as mock_probe:
+        with patch.object(ConsolidationLoop, "_probe_recall") as mock_probe:
             loop._reset_main_tier_registries_and_simhashes(
                 tier_keyed, soft_stale_by_tier=soft_stale_by_tier
             )

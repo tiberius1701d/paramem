@@ -28,6 +28,25 @@ from paramem.memory.store import MemoryStore
 # ---------------------------------------------------------------------------
 
 
+def _probe_of(passing_keys) -> "callable":
+    """Return a ``(adapter_name, entries) -> RecallProbe`` stub whose
+    ``passing_keys`` is exactly *passing_keys*.
+
+    Stands in for ``loop._probe_recall`` across this file's orchestration
+    tests — those exercise ``run_consolidation_cycle`` control flow, not the
+    recall probe itself (covered separately in
+    ``test_consolidation_recall_early_stop.py``), so only ``passing_keys``
+    needs to be controllable.
+    """
+    from paramem.training.recall_eval import RecallProbe
+
+    def _stub(adapter_name, entries):
+        keys = passing_keys if passing_keys is not None else {e["key"] for e in entries}
+        return RecallProbe(per_key=tuple({"key": k, "exact_match": True} for k in keys))
+
+    return _stub
+
+
 def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     """Return a minimal ConsolidationLoop-like object for unit testing.
 
@@ -43,6 +62,15 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     # Minimal mock model whose peft_config behaves like a dict.
     model = MagicMock()
     model.peft_config = {name: MagicMock() for name in adapter_names}
+    # Real active_adapter/peft_config mutation on switch/delete -- mirrors
+    # tests/test_donor.py::_make_bare_loop's wiring.  drop_adapter_slot
+    # re-checks active_adapter_name(model) after its switch attempt (treats
+    # a switch that does not actually land the same as a failed one), so a
+    # bare no-op set_adapter would make any switch-then-delete assertion
+    # vacuous -- the delete would always take the "target not active"
+    # shortcut regardless of whether the fallback switch actually worked.
+    model.set_adapter.side_effect = lambda name: setattr(model, "active_adapter", name)
+    model.delete_adapter.side_effect = lambda name: model.peft_config.pop(name, None)
 
     tokenizer = MagicMock()
 
@@ -128,7 +156,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     # These tests verify run_consolidation_cycle orchestration, not recall
     # gating; the probe is covered separately in
     # test_consolidation_recall_early_stop.py.
-    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+    loop._probe_recall = _probe_of(None)
 
     # Stub out _materialize_consolidation_graph so the materialize step does not
     # call reconstruct_graph / probe_entries on the MagicMock model.
@@ -244,6 +272,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch(
@@ -306,6 +335,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter"),
@@ -330,6 +360,169 @@ class TestRegistryLastWriteOrder:
         assert write_meta_idx < save_from_bytes_idx, (
             f"write_key_metadata must come before the registry flush "
             f"(save_from_bytes); order was: {call_order}"
+        )
+
+    def test_promotes_staging_before_saving_so_a_measured_cold_checkpoint_is_never_persisted(
+        self, tmp_path: Path
+    ) -> None:
+        """The interim mint promotes the staged weights (copy_adapter_weights
+        src=STAGING_ADAPTER -> the interim adapter_name) BEFORE save_adapter
+        persists the slot -- persisting the transient staging slot unpromoted
+        would silently save LoRA-zero into the interim slot's on-disk weights.
+
+        Interim equivalent of
+        ``TestBuildDonor::test_promotes_staging_before_saving_so_a_measured_cold_checkpoint_is_never_persisted``.
+
+        Kills: dropping ``promote_staging_adapter(self.model, adapter_name)``
+        at the interim mint's ``staged_weights`` scope.
+        """
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260418T1430"
+        adapter_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[adapter_name] = _matching_interim_config(loop.episodic_config)
+
+        call_order: list[str] = []
+
+        def _record_copy_adapter_weights(model, src, dst):
+            if src == STAGING_ADAPTER:
+                call_order.append(f"promote:{src}->{dst}")
+
+        def _record_save_adapter(*args, **kwargs):
+            call_order.append("save_adapter")
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_record_copy_adapter_weights,
+            ),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch(
+                "paramem.models.loader.save_adapter",
+                side_effect=_record_save_adapter,
+            ),
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(2),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-003",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        promote_call = f"promote:{STAGING_ADAPTER}->{adapter_name}"
+        assert promote_call in call_order, f"expected the promote copy; got {call_order}"
+        assert "save_adapter" in call_order, "save_adapter was not called"
+        assert call_order.index(promote_call) < call_order.index("save_adapter"), (
+            f"promote must happen before save; got order={call_order}"
+        )
+
+    def test_on_recall_probe_records_full_key_list_before_promotion(self, tmp_path: Path) -> None:
+        """The interim mint's ``on_recall_probe`` artifact call
+        (``phase="train_gate"``) records the FULL per-key probe result --
+        both the passing AND the failing key -- and runs BEFORE
+        ``promote_staging_adapter`` consumes the verdict to filter
+        registration.  A failing key must still appear in the recorded
+        artifact even though it is excluded from registration -- the
+        refusal path is the whole point of the record.
+
+        Kills: swapping ``on_recall_probe`` and the promote/filter step, or
+        dropping the artifact call.
+        """
+        from paramem.training.recall_eval import RecallProbe
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260418T1430"
+        adapter_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[adapter_name] = _matching_interim_config(loop.episodic_config)
+
+        # One key passes, one fails -- the discriminating case: a call with
+        # only the passing key would hide the refusal from the record.
+        def _probe_fail_one(adapter_name, entries):
+            keys = sorted({e["key"] for e in entries})
+            failing = keys[-1] if keys else None
+            return RecallProbe(
+                per_key=tuple(
+                    {"key": e["key"], "exact_match": e["key"] != failing} for e in entries
+                )
+            )
+
+        loop._probe_recall = _probe_fail_one
+
+        call_order: list[str] = []
+        recorded_probe_calls: list = []
+
+        def _record_on_recall_probe(per_key, *, phase, adapter_name):
+            recorded_probe_calls.append(list(per_key) if per_key is not None else None)
+            call_order.append("on_recall_probe")
+
+        def _record_promote_copy(model, src, dst):
+            if src == STAGING_ADAPTER:
+                call_order.append("promote")
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_record_promote_copy,
+            ),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch(
+                "paramem.training.consolidation.on_recall_probe",
+                side_effect=_record_on_recall_probe,
+            ),
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(2),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-004",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        assert recorded_probe_calls, "on_recall_probe was never called"
+        recorded = recorded_probe_calls[0]
+        assert len(recorded) == 2, (
+            f"expected the FULL per-key list (both keys, not filtered down to "
+            f"only the passing one); got {recorded}"
+        )
+        assert any(not r["exact_match"] for r in recorded), (
+            f"expected the failing key to still appear in the recorded artifact; got {recorded}"
+        )
+        assert "on_recall_probe" in call_order and "promote" in call_order
+        assert call_order.index("on_recall_probe") < call_order.index("promote"), (
+            f"on_recall_probe must record the verdict before promote consumes it; "
+            f"got order={call_order}"
         )
 
     def test_interim_telemetry_records_derived_epochs(self, tmp_path: Path) -> None:
@@ -364,6 +557,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter"),
@@ -437,6 +631,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch.object(loop, "_maybe_seed_from_donor", return_value=False),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter"),
@@ -476,6 +671,84 @@ class TestRegistryLastWriteOrder:
                 )
                 if field == "init":
                     assert value in {"cold", "warm", "donor"}
+
+    def test_interim_telemetry_excludes_staging_slot_from_adapter_count(
+        self, tmp_path: Path
+    ) -> None:
+        """The interim fold's ``interim_tier_train`` telemetry ``adapter_count``
+        must exclude STAGING_ADAPTER ("in_training") -- it is resident in
+        ``model.peft_config`` at telemetry-sampling time on every normal
+        completion (``train_adapter``'s staging+promote contract leaves it
+        mounted for this caller's own probe/promote, which runs AFTER the
+        telemetry finally block), and counting it would silently inflate the
+        interim record the same way it would the main-tier one (already
+        covered by
+        ``test_consolidation.py::test_main_tier_telemetry_excludes_staging_slot_from_adapter_count``).
+        ``_make_mock_loop`` seeds ``in_training`` into ``peft_config`` from
+        the start, so no extra mocking is needed to exercise the exclusion.
+        """
+        import torch as _torch
+
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = _make_mock_loop(tmp_path)
+        loop._telemetry_dir = tmp_path / "telemetry"
+        stamp = "20260418T1430"
+        interim_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[interim_name] = _matching_interim_config(loop.episodic_config)
+        loop.model.named_parameters.return_value = [
+            (f"base_model.model.x.lora_B.{interim_name}.weight", _torch.zeros(2, 2)),
+        ]
+
+        assert STAGING_ADAPTER in loop.model.peft_config, (
+            "fixture must already carry the staging slot for this test to be meaningful"
+        )
+        _expected_adapter_count = len(loop.model.peft_config) - 1
+
+        with (
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch.object(loop, "_maybe_seed_from_donor", return_value=False),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch("paramem.models.loader.save_adapter"),
+            patch.object(KeyRegistry, "save_from_bytes"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+        ):
+            loop.run_consolidation_cycle(
+                _fake_qa(1),
+                [],
+                speaker_id="speaker0",
+                mode="train",
+                run_label="conv-i5-005",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        interim_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "interim_tier_train"
+        ]
+        assert interim_calls, "expected at least one interim_tier_train telemetry record"
+        record = interim_calls[0].kwargs["record"]
+        assert record["adapter_count"] == _expected_adapter_count, (
+            f"adapter_count must exclude {STAGING_ADAPTER!r}, "
+            f"got {record['adapter_count']}, expected {_expected_adapter_count}"
+        )
 
     def test_interim_telemetry_tags_donor_seeded_fold(self, tmp_path: Path) -> None:
         """A cold interim adapter seeded from a VALID donor checkpoint must be
@@ -573,6 +846,7 @@ class TestRegistryLastWriteOrder:
                 return_value=({"aborted": False, "train_loss": 0.05}, fake_recall_state),
             ),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter"),
@@ -630,6 +904,7 @@ class TestRegistryLastWriteOrder:
                 return_value=({"aborted": False, "train_loss": 0.05}, fake_recall_state),
             ),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter"),
@@ -854,6 +1129,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter", side_effect=_fail_save_adapter),
@@ -919,6 +1195,7 @@ class TestInterimMintWarmInit:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter"),
@@ -1090,6 +1367,7 @@ class TestManifestWritten:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
         ):
             result = loop.run_consolidation_cycle(
@@ -1171,6 +1449,7 @@ class TestInterTierCommitRecoverable:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch(
                 "paramem.memory.persistence.commit_tier_slot",
@@ -1248,6 +1527,14 @@ class TestRecallGateRejectedVramCleanup:
     def test_rejection_deletes_vram_slot_and_restores_episodic(self, tmp_path: Path) -> None:
         """A rejected fold must remove the interim adapter from
         ``model.peft_config`` and leave ``episodic`` as the active adapter.
+
+        Does NOT patch ``paramem.models.loader.switch_adapter`` -- that would
+        neuter ``drop_adapter_slot``'s fallback switch to a no-op, which
+        (against ``_make_mock_loop``'s wired ``active_adapter`` tracking)
+        would make its post-switch ``active_adapter_name`` re-check see the
+        switch as "did not land" and skip the delete -- the real REAL switch
+        (``model.set_adapter``, already a recording ``MagicMock``) must run
+        so this test exercises the actual switch-then-delete branch.
         """
         from paramem.training.consolidation import RecallGateRejected
 
@@ -1255,11 +1542,6 @@ class TestRecallGateRejectedVramCleanup:
         interim_name = f"episodic_interim_{self._STAMP}"
 
         create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
-
-        def _delete_adapter(name: str) -> None:
-            loop.model.peft_config.pop(name, None)
-
-        loop.model.delete_adapter.side_effect = _delete_adapter
 
         def _commit_side_effect(*args, **kwargs):
             raise RecallGateRejected(
@@ -1282,7 +1564,7 @@ class TestRecallGateRejectedVramCleanup:
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch(
                 "paramem.memory.persistence.commit_tier_slot",
@@ -1305,10 +1587,15 @@ class TestRecallGateRejectedVramCleanup:
             f"call was {loop.model.set_adapter.call_args_list[-1]}"
         )
 
-    def test_same_window_retry_remints_fresh_slot_after_rejection(self, tmp_path: Path) -> None:
-        """A retry within the same window (same stamp) after a rejection must
-        recreate the interim slot from scratch (the mint guard sees it absent)
-        and the retry must succeed once the gate passes.
+    def test_rejection_raises_loudly_when_fallback_switch_fails(self, tmp_path: Path) -> None:
+        """When ``drop_adapter_slot``'s fallback switch to "episodic" fails,
+        it (correctly, per the sole-adapter rule) SKIPS the delete rather
+        than leaving the model with no active adapter -- but that means the
+        rejected interim adapter survives in VRAM, which would silently
+        warm-start the next cycle from weights that failed this cycle's
+        recall gate. The post-condition in the ``except RecallGateRejected``
+        branch must turn that into a loud ``RuntimeError`` instead of
+        letting the cycle return normally as if the teardown had succeeded.
         """
         from paramem.training.consolidation import RecallGateRejected
 
@@ -1317,10 +1604,75 @@ class TestRecallGateRejectedVramCleanup:
 
         create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
 
-        def _delete_adapter(name: str) -> None:
-            loop.model.peft_config.pop(name, None)
+        def _set_adapter_fails_for_episodic(name):
+            if name == "episodic":
+                raise RuntimeError("simulated broken switch to the episodic fallback")
+            loop.model.active_adapter = name
 
-        loop.model.delete_adapter.side_effect = _delete_adapter
+        loop.model.set_adapter.side_effect = _set_adapter_fails_for_episodic
+
+        def _commit_side_effect(*args, **kwargs):
+            raise RecallGateRejected(
+                "simulated post-save disk-integrity failure",
+                adapter_name=interim_name,
+                recall_rate=0.5,
+                threshold=1.0,
+            )
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                create_interim_spy,
+            ),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch(
+                "paramem.memory.persistence.commit_tier_slot",
+                side_effect=_commit_side_effect,
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError, match="rejected interim weights must not survive in VRAM"
+            ):
+                self._run_cycle(loop, stamp=self._STAMP)
+
+        assert interim_name in loop.model.peft_config, (
+            "the rejected interim adapter must still be resident -- drop_adapter_slot "
+            "skipped the delete because its fallback switch failed"
+        )
+        delete_calls = [
+            c for c in loop.model.delete_adapter.call_args_list if c.args == (interim_name,)
+        ]
+        assert not delete_calls, (
+            f"delete_adapter must never be called for {interim_name!r} when the "
+            f"fallback switch fails, got {delete_calls}"
+        )
+
+    def test_same_window_retry_remints_fresh_slot_after_rejection(self, tmp_path: Path) -> None:
+        """A retry within the same window (same stamp) after a rejection must
+        recreate the interim slot from scratch (the mint guard sees it absent)
+        and the retry must succeed once the gate passes.
+
+        Does NOT patch ``paramem.models.loader.switch_adapter`` -- see
+        ``test_rejection_deletes_vram_slot_and_restores_episodic``'s
+        docstring for why: the real switch must run against
+        ``_make_mock_loop``'s wired ``active_adapter`` tracking so the first
+        (rejected) attempt exercises the real switch-then-delete branch.
+        """
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _make_mock_loop(tmp_path)
+        interim_name = f"episodic_interim_{self._STAMP}"
+
+        create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
 
         _commit_calls = {"n": 0}
 
@@ -1348,7 +1700,7 @@ class TestRecallGateRejectedVramCleanup:
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch(
                 "paramem.memory.persistence.commit_tier_slot",
@@ -1394,6 +1746,7 @@ class TestRecallGateRejectedVramCleanup:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.memory.persistence.commit_tier_slot"),
         ):
@@ -1433,6 +1786,12 @@ class TestRecallGateRejectedVramCleanup:
         6. a follow-up cycle at the SAME stamp re-mints a fresh slot and, once
            its gate passes, returns ``mode == "trained"`` with the counters
            advanced.
+
+        Does NOT patch ``paramem.models.loader.switch_adapter`` -- see
+        ``test_rejection_deletes_vram_slot_and_restores_episodic``'s
+        docstring for why: the real switch must run against
+        ``_make_mock_loop``'s wired ``active_adapter`` tracking so the first
+        (rejected) attempt exercises the real switch-then-delete branch.
         """
         from paramem.training.consolidation import RecallGateRejected
 
@@ -1440,11 +1799,6 @@ class TestRecallGateRejectedVramCleanup:
         interim_name = f"episodic_interim_{self._STAMP}"
 
         create_interim_spy = MagicMock(side_effect=self._fake_create_interim_adapter)
-
-        def _delete_adapter(name: str) -> None:
-            loop.model.peft_config.pop(name, None)
-
-        loop.model.delete_adapter.side_effect = _delete_adapter
 
         # A pre-existing episodic key that this cycle's subtractive-removal
         # stage soft-stales (mirrors a synonym/dedup collapse discovered
@@ -1499,7 +1853,7 @@ class TestRecallGateRejectedVramCleanup:
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch(
                 "paramem.memory.persistence.commit_tier_slot",
@@ -1754,7 +2108,7 @@ class TestRecallFailedSessionStaysPending:
       probe stub precisely.
     - Set up the merger graph with an edge tagged with a real session id so
       rec["session_ids"] carries it through the harvest path.
-    - Override _probe_passing_keys to exclude one key, triggering the drop
+    - Override _probe_recall to exclude one key, triggering the drop
       site at step 11b.
     - Assert result["recall_failed_session_ids"] and downstream behavior.
 
@@ -1774,6 +2128,7 @@ class TestRecallFailedSessionStaysPending:
         "paramem.training.trainer.train_adapter",
         "paramem.training.consolidation.format_entry_training",
         "paramem.models.loader.switch_adapter",
+        "paramem.models.loader.copy_adapter_weights",
         "paramem.training.consolidation.build_registry",
         "paramem.models.loader.save_adapter",
     ]
@@ -1840,6 +2195,7 @@ class TestRecallFailedSessionStaysPending:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.models.loader.save_adapter"),
         ):
@@ -1872,8 +2228,7 @@ class TestRecallFailedSessionStaysPending:
         )
 
         # Override probe so it fails ALL new keys (empty passing set for new keys).
-        # _recall_passing_keys returns None → falls through to _probe_passing_keys.
-        loop._probe_passing_keys = lambda adapter_name, entries: set()
+        loop._probe_recall = _probe_of(set())
 
         result = self._run_cycle(loop, mode="train")
 
@@ -1900,7 +2255,7 @@ class TestRecallFailedSessionStaysPending:
             tmp_path, session_id=session_id, refinement_normalization="on"
         )
         # Even with a failing probe, simulate admits all without the gate.
-        loop._probe_passing_keys = lambda adapter_name, entries: set()
+        loop._probe_recall = _probe_of(set())
 
         result = self._run_cycle(loop, mode="simulate")
 
@@ -1948,7 +2303,7 @@ class TestRecallFailedSessionStaysPending:
         loop = self._make_loop_with_session_edge(
             tmp_path, session_id=session_id, refinement_normalization="off"
         )
-        loop._probe_passing_keys = lambda adapter_name, entries: set()
+        loop._probe_recall = _probe_of(set())
 
         result = self._run_cycle(loop, mode="train")
 
@@ -2084,7 +2439,7 @@ class TestRecallFailedSessionStaysPending:
         loop = self._make_loop_with_session_edge(
             tmp_path, session_id=session_id, refinement_normalization="on"
         )
-        loop._probe_passing_keys = lambda adapter_name, entries: set()
+        loop._probe_recall = _probe_of(set())
 
         result = self._run_cycle(loop, mode="train")
 
@@ -2142,14 +2497,19 @@ class TestRecallFailedSessionStaysPending:
         _minted_keys: list[str] = []
 
         def _probe_partial(adapter_name, entries):
+            from paramem.training.recall_eval import RecallProbe
+
             # Collect keys as they are minted; fail the second one.
             for e in entries:
                 if e["key"] not in _minted_keys:
                     _minted_keys.append(e["key"])
             # Fail the last-minted key.
-            return set(_minted_keys[:-1]) if _minted_keys else set()
+            passing = set(_minted_keys[:-1]) if _minted_keys else set()
+            return RecallProbe(
+                per_key=tuple({"key": k, "exact_match": k in passing} for k in _minted_keys)
+            )
 
-        loop._probe_passing_keys = _probe_partial
+        loop._probe_recall = _probe_partial
 
         with (
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
@@ -2162,6 +2522,7 @@ class TestRecallFailedSessionStaysPending:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.models.loader.save_adapter"),
         ):
@@ -2205,8 +2566,8 @@ class TestRecallFailedSessionStaysPending:
 
         Proc facts flow through merger.graph (merged by extract_session/run_cycle).
         The session_id rides on the graph edge's ``sessions`` set (same path as
-        episodic).  When _probe_passing_keys returns an empty set, every new
-        key fails and the session id lands in recall_failed_session_ids.
+        episodic).  When _probe_recall returns a probe with no passing keys,
+        every new key fails and the session id lands in recall_failed_session_ids.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         loop.model.peft_config["episodic_interim_20260617T0000"] = _matching_interim_config(
@@ -2228,7 +2589,7 @@ class TestRecallFailedSessionStaysPending:
         )
 
         # Override probe to fail all keys — every deferred write stays pending.
-        loop._probe_passing_keys = lambda adapter_name, entries: set()
+        loop._probe_recall = _probe_of(set())
 
         with (
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
@@ -2241,6 +2602,7 @@ class TestRecallFailedSessionStaysPending:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.models.loader.save_adapter"),
         ):
@@ -2429,6 +2791,7 @@ class TestInterimFoldResume:
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.memory.persistence.commit_tier_slot"),
             patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
         ):
@@ -2533,12 +2896,13 @@ class TestInterimFoldResume:
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.memory.persistence.commit_tier_slot"),
             patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda a, e: {x["key"] for x in e},
+                "_probe_recall",
+                side_effect=_probe_of(None),
             ),
         ):
             loop.run_consolidation_cycle(
@@ -2602,6 +2966,7 @@ class TestInterimFoldResume:
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.memory.persistence.commit_tier_slot"),
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -2613,8 +2978,8 @@ class TestInterimFoldResume:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda a, e: {x["key"] for x in e},
+                "_probe_recall",
+                side_effect=_probe_of(None),
             ),
         ):
             result = loop.run_consolidation_cycle(

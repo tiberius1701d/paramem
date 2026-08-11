@@ -5,16 +5,20 @@ thermal throttle so a yield request pre-empts a throttle wait within the
 same step. The order is locked by registration order in ``train_adapter``;
 this test asserts it by inspecting the constructed list directly.
 
-The ``TestStagingPromoteContract`` class verifies the staging+promote invariants:
+The ``TestStagingPromoteContract`` class verifies the staging contract:
 - staging slot created/reshaped at entry
 - production weights copied to staging at entry
-- normal completion promotes staging → production and cleans scratch
-- abort path does NOT promote and still cleans scratch
-- crash path preserves scratch for crash-resume
+- normal completion leaves staging resident and active for the caller, and
+  cleans scratch — train_adapter itself never promotes or deletes the slot
+- promote_staging_adapter (called by the caller) copies staging into
+  production and switches the active adapter
+- a second call without caller disposal trips the lifecycle guard
+- abort path does NOT promote, deletes staging, and still cleans scratch
+- crash path preserves scratch for crash-resume and still deletes staging
 - 3-way resume resolution (RAM → disk → absent)
 
 No GPU required: the test patches ``ParamemTrainer``, PEFT, and encryption
-helpers so staging+promote logic runs without a real training run.
+helpers so staging logic runs without a real training run.
 """
 
 from __future__ import annotations
@@ -43,11 +47,11 @@ class _MarkerCallback(TrainerCallback):
 def _capture_callbacks(**train_adapter_kwargs):
     """Run ``train_adapter`` with ``Trainer`` mocked; return the callbacks list.
 
-    Builds a model that satisfies the staging+promote contract end-to-end —
-    both production and staging slots present with matching shape, and
+    Builds a model that satisfies the staging contract end-to-end — both
+    production and staging slots present with matching shape, and
     ``named_parameters`` returns one real tensor per ``(target_module, slot)``
-    pair so ``copy_adapter_weights`` runs cleanly at entry and at promote.
-    Tests here cover callback assembly, not staging behaviour itself.
+    pair so ``copy_adapter_weights`` runs cleanly at entry.  Tests here cover
+    callback assembly, not staging behaviour itself.
     """
     import torch
 
@@ -455,8 +459,16 @@ def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False
     stack.enter_context(patch("paramem.training.trainer.ParamemTrainer", new=trainer_cls))
 
     # --- Loader helpers (deferred import inside _ensure_staging_slot et al) ---
+    # create_adapter's side effect mirrors real PEFT: it registers the new
+    # adapter name in peft_config.  Without this, drop_adapter_slot's
+    # presence guard (`if name in model.peft_config`) sees the staging slot
+    # as never having been created and silently no-ops the delete.
+    def _mock_create_adds_slot(model_arg, adapter_config, name):
+        model_arg.peft_config[name] = MagicMock()
+        return model_arg
+
     mock_create = stack.enter_context(
-        patch("paramem.models.loader.create_adapter", return_value=MagicMock())
+        patch("paramem.models.loader.create_adapter", side_effect=_mock_create_adds_slot)
     )
     mock_copy = stack.enter_context(
         patch("paramem.models.loader.copy_adapter_weights", return_value=None)
@@ -562,8 +574,46 @@ class TestStagingPromoteContract:
                 output_dir=tmp_path / "adapter",
             )
 
-    def test_staging_deleted_at_normal_completion(self, tmp_path):
-        """On normal completion, model.delete_adapter('in_training') is called."""
+    def test_second_call_without_caller_disposal_raises(self, tmp_path):
+        """A second train_adapter call on the same model, without the caller
+        having disposed of the first call's staged weights, raises the
+        lifecycle-invariant RuntimeError.
+
+        Kills: a caller obligation that is not actually enforced (e.g. the
+        guard silently rebuilding the slot instead of refusing).
+        """
+        import pytest
+
+        model = _make_staging_model(has_staging=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        with stack:
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter_1",
+            )
+            # No disposal here — the caller obligation is violated deliberately.
+            with pytest.raises(RuntimeError, match="Lifecycle invariant violated"):
+                train_adapter(
+                    model=model,
+                    tokenizer=MagicMock(),
+                    train_dataset=_minimal_dataset(),
+                    adapter_name="episodic",
+                    training_config=_minimal_tc(),
+                    adapter_config=_minimal_ac(),
+                    output_dir=tmp_path / "adapter_2",
+                )
+
+    def test_staging_active_at_normal_completion(self, tmp_path):
+        """On normal completion, 'in_training' is the active adapter — the caller
+        probes it directly by name, with no extra switch of its own.
+
+        Kills: leaving some other adapter active after training returns.
+        """
         model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
@@ -577,7 +627,62 @@ class TestStagingPromoteContract:
                 output_dir=tmp_path / "adapter",
             )
 
-        model.delete_adapter.assert_called_with("in_training")
+        assert model.set_adapter.call_args_list[-1] == call("in_training"), (
+            f"Expected 'in_training' to be the last-activated adapter; "
+            f"calls: {model.set_adapter.call_args_list}"
+        )
+
+    def test_exception_path_still_deletes_staging_slot(self, tmp_path):
+        """The crash (exception) path leaves 'in_training' absent — the same
+        disposal normal-path abort gets, but here it must survive being
+        routed through a re-raise.
+
+        Kills: an exception path that stops disposing of the staged slot
+        (which would permanently block the next training event).
+        """
+        import pytest as _pytest
+
+        model = _make_staging_model(has_staging=False)
+        stack, _, _, _ = _staging_patches(tmp_path, trainer_cls=_RaisingTrainer)
+        with stack, _pytest.raises(RuntimeError, match="simulated crash"):
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter_crash",
+            )
+        assert call("in_training") in model.delete_adapter.call_args_list, (
+            "Exception path must still delete the staging slot (best-effort)"
+        )
+
+    def test_staging_survives_at_normal_completion(self, tmp_path):
+        """On normal completion, 'in_training' is left resident — the caller owns disposal.
+
+        Kills: putting the promote (and the staging delete that used to
+        follow it) back inside the trainer.
+        """
+        model = _make_staging_model(has_staging=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        with stack:
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+            )
+
+        assert "in_training" not in [c.args[0] for c in model.delete_adapter.call_args_list], (
+            "in_training must NOT be deleted by train_adapter on normal completion"
+        )
+        assert "in_training" in model.peft_config, (
+            "in_training must remain resident for the caller to probe and promote"
+        )
 
     def test_staging_deleted_at_abort(self, tmp_path):
         """On abort, model.delete_adapter('in_training') is called."""
@@ -601,12 +706,18 @@ class TestStagingPromoteContract:
     def test_two_sequential_calls_do_not_trip_lifecycle_guard(self, tmp_path):
         """Multi-tier consolidation safety: episodic→semantic in the same process.
 
-        The load-bearing staging invariant is that the staging slot is DELETED
-        on training exit so the next training event enters ``_ensure_staging_slot``
-        with a clean slate.  This test simulates the consolidation cycle's
-        per-tier sequential ``train_adapter`` calls and asserts that the second
-        call does not trip the lifecycle guard.
+        Under the caller-owns-disposal contract, the caller MUST run its
+        probe/promote sequence inside ``staged_weights`` between successive
+        ``train_adapter`` calls on the same model — this is the caller
+        obligation the lifecycle guard (``assert_staging_absent``) enforces.
+        This test disposes via ``staged_weights``/``promote_staging_adapter``
+        after each call and asserts the second call does not trip the guard.
+
+        Kills: softening the lifecycle backstop to silently rebuild instead
+        of raising when a caller fails to dispose.
         """
+        from paramem.training.trainer import promote_staging_adapter, staged_weights
+
         # The mock's peft_config is a dict; treat delete_adapter as a real mutation
         # so the second train_adapter call sees an absent in_training slot.
         model = _make_staging_model(has_staging=False)
@@ -617,15 +728,6 @@ class TestStagingPromoteContract:
         model.delete_adapter.side_effect = _delete_from_peft_config
 
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
-
-        # mock_create normally returns a fresh MagicMock; have it also add the
-        # in_training key to peft_config so _ensure_staging_slot's first-time
-        # path realistically updates state on each call.
-        def _create_adds_slot(model_arg, cfg, name):
-            model.peft_config[name] = cfg
-            return model
-
-        mock_create.side_effect = _create_adds_slot
 
         with stack:
             for tier in ("episodic", "semantic"):
@@ -638,14 +740,23 @@ class TestStagingPromoteContract:
                     adapter_config=_minimal_ac(),
                     output_dir=tmp_path / f"adapter_{tier}",
                 )
+                # Caller obligation: probe/promote/dispose before the next
+                # training event reuses the staging slot.
+                with staged_weights(model, fallback_adapter=tier):
+                    promote_staging_adapter(model, tier)
 
         # The slot must be absent at the end of the sequence.
         assert "in_training" not in model.peft_config, (
-            "in_training must be deleted after every training event"
+            "in_training must be deleted after every caller disposal"
         )
 
     def test_production_weights_copied_to_staging_at_entry(self, tmp_path):
-        """copy_adapter_weights(src='episodic', dst='in_training') is called at entry."""
+        """copy_adapter_weights(src='episodic', dst='in_training') is called at entry,
+        and train_adapter itself never issues the reverse (promote) copy —
+        that copy belongs to the caller's promote_staging_adapter call.
+
+        Kills: putting the promote back inside the trainer.
+        """
         model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
@@ -659,21 +770,26 @@ class TestStagingPromoteContract:
                 output_dir=tmp_path / "adapter",
             )
 
-        # At entry: copy_adapter_weights(model, src="episodic", dst="in_training").
-        # At normal completion: copy_adapter_weights(model, src="in_training", dst="episodic").
-        # Both calls must be present; the entry copy must come first.
         entry_copy = call(model, src="episodic", dst="in_training")
         promote_copy = call(model, src="in_training", dst="episodic")
         all_calls = mock_copy.call_args_list
-        assert entry_copy in all_calls, (
-            f"Expected entry copy (episodic → in_training); got {all_calls}"
+        assert all_calls == [entry_copy], (
+            f"Expected exactly the entry copy (episodic → in_training) and no "
+            f"promote copy; got {all_calls}"
         )
-        assert all_calls.index(entry_copy) < all_calls.index(promote_copy), (
-            "Entry copy must precede promote copy"
-        )
+        assert promote_copy not in all_calls
 
-    def test_normal_completion_promotes_staging_to_production(self, tmp_path):
-        """On normal completion, staging weights are promoted back to the production slot."""
+    def test_normal_completion_leaves_promote_to_caller(self, tmp_path):
+        """On normal completion, promote_staging_adapter (called by the caller,
+        not by train_adapter) is what copies staging into production and
+        switches the active adapter.
+
+        Kills: reintroducing an internal promote inside train_adapter, and
+        kills promote_staging_adapter itself skipping either the copy or the
+        switch.
+        """
+        from paramem.training.trainer import promote_staging_adapter
+
         model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
@@ -686,9 +802,12 @@ class TestStagingPromoteContract:
                 adapter_config=_minimal_ac(),
                 output_dir=tmp_path / "adapter",
             )
+            # train_adapter itself must not have promoted.
+            promote_copy = call(model, src="in_training", dst="episodic")
+            assert promote_copy not in mock_copy.call_args_list
 
-        # Promote: copy_adapter_weights(model, src="in_training", dst="episodic").
-        promote_copy = call(model, src="in_training", dst="episodic")
+            promote_staging_adapter(model, "episodic")
+
         assert promote_copy in mock_copy.call_args_list, (
             f"Expected promote copy (in_training → episodic); got {mock_copy.call_args_list}"
         )
@@ -975,11 +1094,11 @@ class TestStagingPromoteContract:
 class TestRetainScratchFlag:
     """Verify ``retain_scratch_until_external_commit`` semantics.
 
-    When True on NORMAL completion (Step 6a):
+    When True on NORMAL completion:
     - ``checkpoint-N`` dir under ``output_dir`` survives.
     - ``staging_resume.json`` survives.
-    - Staging→production VRAM promote still happens (copy_adapter_weights called).
-    - ``in_training`` slot still deleted (staging lifecycle invariant upheld).
+    - ``in_training`` stays resident and active — the flag governs on-disk
+      scratch only, never the in-VRAM staging slot's caller-owned lifecycle.
 
     When False (default), behaviour is identical to today: both are cleaned.
     The abort branch is NOT changed by this flag (the abort path is separate scope).
@@ -1042,24 +1161,16 @@ class TestRetainScratchFlag:
             "staging_resume.json must survive when retain_scratch_until_external_commit=True"
         )
 
-    def test_retain_true_still_promotes_staging_to_production(self, tmp_path):
-        """retain=True must not skip the VRAM promote: copy_adapter_weights called for promote."""
+    def test_retain_true_still_leaves_staging_resident(self, tmp_path):
+        """retain=True does not change the in-VRAM staging contract: 'in_training'
+        stays resident for the caller, exactly as it does with retain=False.
+        """
         metrics, out_dir, model, mock_copy, mock_switch = self._run_train(tmp_path, retain=True)
 
-        from unittest.mock import call
-
-        promote_copy = call(model, src="in_training", dst="episodic")
-        assert promote_copy in mock_copy.call_args_list, (
-            "Staging → production promote must still happen with retain=True; "
-            f"calls: {mock_copy.call_args_list}"
+        assert "in_training" not in [c.args[0] for c in model.delete_adapter.call_args_list], (
+            "in_training must NOT be deleted by train_adapter regardless of retain"
         )
-        mock_switch.assert_called_with(model, "episodic")
-
-    def test_retain_true_still_deletes_staging_slot(self, tmp_path):
-        """retain=True must not skip the in_training slot deletion (lifecycle invariant)."""
-        metrics, out_dir, model, mock_copy, mock_switch = self._run_train(tmp_path, retain=True)
-
-        model.delete_adapter.assert_called_with("in_training")
+        assert "in_training" in model.peft_config
 
     def test_abort_always_cleans_regardless_of_retain(self, tmp_path):
         """The abort branch (Step 6b) is NOT changed by the retain flag — always cleans.

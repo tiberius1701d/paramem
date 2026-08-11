@@ -88,6 +88,13 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     # that does nothing either, those assertions passed whether or not the
     # cleanup code ran at all.
     loop.model.delete_adapter.side_effect = lambda name: loop.model.peft_config.pop(name, None)
+    # Real active_adapter mutation on switch -- drop_adapter_slot re-checks
+    # active_adapter_name(model) after its switch attempt (treats a switch
+    # that does not actually land the same as a failed one), so a bare
+    # no-op set_adapter would make every switch-then-delete assertion here
+    # vacuous (the delete would be skipped as "switch did not land" even
+    # though nothing about the fake actually failed).
+    loop.model.set_adapter.side_effect = lambda name: setattr(loop.model, "active_adapter", name)
     loop.model.get_base_model.return_value.config._name_or_path = _BASE_ID
     loop.tokenizer = MagicMock()
     loop.training_config = TrainingConfig()
@@ -881,11 +888,18 @@ def _fake_build_manifest_for(
 
 @contextlib.contextmanager
 def _patched_build_donor_primitives(*, save_side_effect=_fake_atomic_save_adapter):
-    """Patch the three ``paramem.models.loader`` primitives ``build_donor``
-    calls through (``atomic_save_adapter``/``create_adapter``/
-    ``switch_adapter``) -- the identical 3-patch block every ``TestBuildDonor``
-    case needs (F8: collapses the 13 duplicated inline copies of this block
-    into one).
+    """Patch the ``paramem.models.loader`` primitives ``build_donor`` calls
+    through (``atomic_save_adapter``/``create_adapter``/``switch_adapter``/
+    ``copy_adapter_weights``) -- the identical patch block every
+    ``TestBuildDonor`` case needs, collapsing 13 duplicated inline copies
+    of this block into one.
+
+    ``copy_adapter_weights`` is patched because ``_train_tier_adapter`` is
+    itself mocked in every ``TestBuildDonor`` case (returning a canned
+    ``(metrics, recall_state)`` tuple) -- the real staging slot the funnel
+    would have populated never exists on the stub model, so
+    ``build_donor``'s ``promote_staging_adapter(loop.model, build_name)``
+    call must not attempt a real tensor copy against it.
 
     Yields the ``atomic_save_adapter`` mock so a caller that needs to assert
     on it (e.g. "no checkpoint was ever saved" in the abort/incomplete
@@ -901,6 +915,7 @@ def _patched_build_donor_primitives(*, save_side_effect=_fake_atomic_save_adapte
         ) as mock_save,
         patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
         patch("paramem.models.loader.switch_adapter"),
+        patch("paramem.models.loader.copy_adapter_weights"),
         # The loop stub's model is a MagicMock, so the real fingerprinter
         # would read MagicMocks into the manifest and fail to serialise.
         # Stand in a manifest whose base/shape match what these tests assert
@@ -978,6 +993,40 @@ class TestBuildDonor:
         created_cfg = loop.model._last_create_adapter_cfg
         assert created_cfg.learning_rate == DONOR_RECIPE_LEARNING_RATE
         assert created_cfg.dropout == DONOR_RECIPE_DROPOUT
+
+    def test_promotes_staging_before_saving_so_a_measured_cold_checkpoint_is_never_persisted(
+        self, tmp_path
+    ):
+        """build_donor promotes the staged weights into the build slot
+        BEFORE atomic_save_adapter runs -- persisting the staging slot
+        unpromoted would silently save LoRA-zero into the donor store, and
+        every future measured-cold fold would seed from it.
+
+        Kills: forgetting the donor promote (the silent failure).
+        """
+        order: list[str] = []
+
+        def _copy_spy(model, src, dst):
+            order.append(f"copy:{src}->{dst}")
+
+        def _save_spy(model, target_dir, adapter_name, *, manifest=None):
+            order.append("save")
+            return _fake_atomic_save_adapter(model, target_dir, adapter_name, manifest=manifest)
+
+        loop = _make_bare_loop(tmp_path)
+        loop._train_tier_adapter = MagicMock(return_value=({"aborted": False}, None))
+
+        with (
+            _patched_build_donor_primitives(save_side_effect=_save_spy),
+            patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy_spy),
+        ):
+            build_donor(loop, adapter_config=loop.episodic_config, seed=42, n=DONOR_MIN_ENTRIES)
+
+        promote_call = f"copy:in_training->{DONOR_BUILD_ADAPTER_NAME}"
+        assert promote_call in order, f"expected the promote copy; got {order}"
+        assert order.index(promote_call) < order.index("save"), (
+            f"promote must happen before save; got order={order}"
+        )
 
     def test_persists_donor_content_meta_and_a_storage_manifest(self, tmp_path):
         """Storage metadata in meta.json, donor content in donor_meta.json --
@@ -1177,6 +1226,43 @@ class TestBuildDonor:
         assert donor_checkpoint_valid(attn_dir, base_id, _PROC_LORA_SHAPE) is False
         assert donor_checkpoint_valid(proc_dir, base_id, _PROC_LORA_SHAPE) is True
         assert donor_checkpoint_valid(proc_dir, base_id, _LORA_SHAPE) is False
+
+    def test_second_disposal_runs_and_original_exception_survives_when_first_disposal_raises(
+        self, tmp_path
+    ):
+        """The two ``finally`` disposals (STAGING_ADAPTER, then the transient
+        build slot) are independently guarded: the first raising must not
+        skip the second, and neither disposal failure may replace the
+        ORIGINAL exception the ``finally`` is running under (here,
+        DonorBuildIncomplete from an aborted training run)."""
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = _make_bare_loop(tmp_path)
+        loop._train_tier_adapter = MagicMock(return_value=({"aborted": True}, None))
+
+        drop_calls: list[str] = []
+
+        def _drop_side_effect(model, name, *, fallback_adapter):
+            drop_calls.append(name)
+            if name == STAGING_ADAPTER:
+                raise RuntimeError("disposal boom")
+
+        with (
+            _patched_build_donor_primitives(),
+            patch("paramem.models.loader.drop_adapter_slot", side_effect=_drop_side_effect),
+            pytest.raises(DonorBuildIncomplete),
+        ):
+            build_donor(loop, adapter_config=loop.episodic_config, seed=1, n=DONOR_MIN_ENTRIES)
+
+        # First call is the pre-try sweep of a leaked build slot; the
+        # STAGING_ADAPTER disposal (raising) and the build-slot disposal
+        # (still running despite the raise above it) are the two finally
+        # calls this test targets.
+        assert drop_calls == [
+            DONOR_BUILD_ADAPTER_NAME,
+            STAGING_ADAPTER,
+            DONOR_BUILD_ADAPTER_NAME,
+        ], f"expected both finally disposals to run despite the first raising; got {drop_calls}"
 
 
 class TestSeedingHook:

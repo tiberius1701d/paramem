@@ -54,11 +54,18 @@ def _make_peft_model(adapter_names: list[str] | None = None) -> MagicMock:
     # Simulate get_base_model().config._name_or_path
     model.get_base_model.return_value.config._name_or_path = "test-base-model"
 
+    # ``active_adapter`` is set as an INSTANCE attribute on the real
+    # ``PeftModel`` (not a class-level attribute/property), so ``spec=PeftModel``
+    # never auto-provides it -- ``paramem.models.loader.active_adapter_name``
+    # (read by the shared ``drop_adapter_slot`` primitive) needs a real value
+    # here, tracked through ``set_adapter`` like the genuine object.
+    model.active_adapter = adapter_names[0] if adapter_names else None
+
     # set_adapter / delete_adapter side effects that mutate peft_config so
     # subsequent membership checks (``verify_name in model.peft_config``)
     # reflect the real operation.
     def _set_adapter(name: str) -> None:
-        pass  # no-op; active adapter tracking not needed for these tests
+        model.active_adapter = name
 
     def _load_adapter(slot_path: str, *, adapter_name: str) -> None:
         lora_cfg_new = MagicMock()
@@ -172,8 +179,6 @@ class TestVerifySavedAdapterHappyPath:
         loop._run_recall_sanity_probe.assert_called_once_with(
             "episodic_verify",
             _SAMPLE_KEYED_PAIRS,
-            max_probe=100,
-            debug_phase="disk_verify",
         )
 
     def test_no_exception_when_recall_at_exact_threshold(self, tmp_path: Path) -> None:
@@ -206,6 +211,68 @@ class TestVerifySavedAdapterHappyPath:
         assert rate == pytest.approx(1.0)
         # No disk load occurred.
         model.load_adapter.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _run_recall_sanity_probe: sample cap and exception-swallow boundary
+# ---------------------------------------------------------------------------
+
+
+class TestRunRecallSanityProbeSamplingAndSwallow:
+    """``_run_recall_sanity_probe`` keeps its own sample cap and its
+    exception-to-0.0 swallow — both deliberately NOT inherited by the
+    underlying ``_probe_recall`` primitive, whose own contract is uncapped
+    and exception-propagating."""
+
+    def test_samples_at_the_fixed_cap_when_entries_exceed_it(self, tmp_path: Path) -> None:
+        """More than the sample cap's worth of entries are downsampled
+        before reaching ``_probe_recall`` — the disk verify answers "did the
+        bytes survive the write?", not the training-completeness question.
+
+        Kills: uncapping the disk verify (letting it probe every entry).
+        """
+        from paramem.training.consolidation import _DISK_VERIFY_PROBE_SAMPLE
+        from paramem.training.recall_eval import RecallProbe
+
+        loop = _make_verify_loop(tmp_path)
+        entries = [{"key": f"graph{i}"} for i in range(_DISK_VERIFY_PROBE_SAMPLE + 50)]
+
+        captured: list[list[dict]] = []
+
+        def _fake_probe_recall(adapter_name, probe_entries):
+            captured.append(probe_entries)
+            return RecallProbe(
+                per_key=tuple({"key": e["key"], "exact_match": True} for e in probe_entries)
+            )
+
+        loop._probe_recall = _fake_probe_recall  # type: ignore[assignment]
+
+        rate = loop._run_recall_sanity_probe("episodic", entries)
+
+        assert rate == pytest.approx(1.0)
+        assert len(captured) == 1
+        assert len(captured[0]) == _DISK_VERIFY_PROBE_SAMPLE
+
+    def test_returns_zero_when_the_probe_raises(self, tmp_path: Path) -> None:
+        """A probe-harness exception is swallowed to 0.0 here — the disk
+        verify's contract is "below threshold => reject the slot", the
+        opposite of _probe_recall's "a probe that cannot run is not a
+        verdict".
+
+        Kills: letting the exception propagate out of the disk verify, or
+        migrating the swallow into _probe_recall itself.
+        """
+        loop = _make_verify_loop(tmp_path)
+        entries = [{"key": "graph1"}]
+
+        def _raising_probe_recall(adapter_name, probe_entries):
+            raise RuntimeError("corrupt safetensors")
+
+        loop._probe_recall = _raising_probe_recall  # type: ignore[assignment]
+
+        rate = loop._run_recall_sanity_probe("episodic", entries)
+
+        assert rate == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -564,9 +631,6 @@ class TestSaveAdaptersCallsVerify:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             calls.append((adapter_name, slot_path))
             return 1.0
@@ -588,9 +652,6 @@ class TestSaveAdaptersCallsVerify:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             received_slots.append(slot_path)
             return 1.0
@@ -611,9 +672,6 @@ class TestSaveAdaptersCallsVerify:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             raise RuntimeError("Post-save disk-integrity probe failed for adapter 'episodic'")
 
@@ -793,9 +851,6 @@ class TestPostSaveSlotCleanup:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             received_slots.append(slot_path)
             raise RuntimeError(
@@ -820,9 +875,6 @@ class TestPostSaveSlotCleanup:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             raise RuntimeError("Post-save disk-integrity probe failed for adapter 'episodic'")
 
@@ -957,9 +1009,6 @@ class TestVerifyCommittedSlot:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             captured_entries.append(entries)
             return 1.0
@@ -1010,9 +1059,6 @@ class TestVerifyCommittedSlot:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             verify_called.append((adapter_name, slot_path))
             return 1.0
@@ -1039,9 +1085,6 @@ class TestVerifyCommittedSlot:
             adapter_name: str,
             slot_path: Path,
             entries: list[dict],
-            *,
-            threshold: float | None = None,
-            max_probe: int = 100,
         ) -> float:
             raise RuntimeError("Post-save disk-integrity probe failed for adapter 'x'")
 

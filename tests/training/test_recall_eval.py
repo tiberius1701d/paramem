@@ -78,6 +78,58 @@ def _build_real_registry(entries: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# RecallProbe
+# ---------------------------------------------------------------------------
+
+
+class TestRecallProbe:
+    """RecallProbe's derived properties, in particular the distinct-key
+    denominator every consumer (the main-tier gate, the disk verify) relies
+    on."""
+
+    def test_rate_uses_distinct_key_denominator(self):
+        """A per_key list with a repeated passing key yields rate 1.0, not
+        0.5 — the denominator is the distinct key count, never len(per_key).
+
+        Kills: len(per_key) as the denominator.
+        """
+        from paramem.training.recall_eval import RecallProbe
+
+        probe = RecallProbe(
+            per_key=(
+                {"key": "graph1", "exact_match": True},
+                {"key": "graph1", "exact_match": True},
+            )
+        )
+        assert probe.rate == 1.0
+        assert probe.distinct_total == 1
+        assert probe.passing_keys == frozenset({"graph1"})
+
+    def test_rate_is_one_when_no_keys_probed(self):
+        """An empty per_key list reads as healthy by default (nothing to prove)."""
+        from paramem.training.recall_eval import RecallProbe
+
+        probe = RecallProbe(per_key=())
+        assert probe.rate == 1.0
+        assert probe.distinct_total == 0
+        assert probe.passing_keys == frozenset()
+        assert probe.failed == ()
+
+    def test_failed_returns_only_non_passing_records(self):
+        from paramem.training.recall_eval import RecallProbe
+
+        probe = RecallProbe(
+            per_key=(
+                {"key": "graph1", "exact_match": True},
+                {"key": "graph2", "exact_match": False},
+            )
+        )
+        assert probe.passing_keys == frozenset({"graph1"})
+        assert [r["key"] for r in probe.failed] == ["graph2"]
+        assert probe.rate == 0.5
+
+
+# ---------------------------------------------------------------------------
 # test_finalize_recalled_contract
 # ---------------------------------------------------------------------------
 

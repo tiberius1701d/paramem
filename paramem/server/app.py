@@ -11342,8 +11342,9 @@ async def _run_base_swap_orchestration(
        ``migrate()`` entry point as Phase A so there is no hand-rolled per-tier
        loop here.  Marker → ``phaseB`` before the job is submitted; ``done``
        after success.
-    5. **Recall gate** — Phase B's ``migrate()`` call uses the uncapped probe
-       (``max_probe=len(entries)``).  If any tier fails the 1.0 gate, the
+    5. **Recall gate** — Phase B's ``migrate()`` call probes every entry in
+       the tier (uncapped by construction — there is no sampling knob to
+       set).  If any tier fails the 1.0 gate, the
        ``MigrationState.all_tiers_done`` check inside ``migrate()`` catches it
        and the state file stays on disk.
     6. **Post-Phase-B in-process reload** — call
@@ -16454,9 +16455,10 @@ def _run_stage_b_cycle(
             # here only from the main-tiers fold (the interim fold catches it
             # and returns a normal recall_failed outcome instead) — it names
             # the tier that fell short of 100% recall over its own full key
-            # set.  FoldAccountingRefusal names the keys a main-tiers fold
-            # could not account for (genuine_loss).  Every other exception
-            # keeps the generic detail unchanged.
+            # set, and the individual keys that failed.  FoldAccountingRefusal
+            # names the keys a main-tiers fold could not account for
+            # (genuine_loss).  Every other exception keeps the generic detail
+            # unchanged.
             incident_detail = dict(failure_detail)
             if isinstance(exc, RegistryBookkeepingDivergence):
                 incident_detail["divergent_keys"] = exc.divergent_keys
@@ -16467,6 +16469,12 @@ def _run_stage_b_cycle(
                 incident_detail["adapter_name"] = exc.adapter_name
                 incident_detail["recall_rate"] = exc.recall_rate
                 incident_detail["threshold"] = exc.threshold
+                # Only publish failed_keys when non-empty — the disk-verify
+                # raise site (_verify_saved_adapter_from_disk) has no per-key
+                # data, so an empty list next to a failing recall_rate reads
+                # as "no keys failed" rather than "not applicable here".
+                if exc.failed_keys:
+                    incident_detail["failed_keys"] = exc.failed_keys
             if isinstance(exc, FoldAccountingRefusal):
                 incident_detail["unexplained_keys"] = exc.unexplained_keys
             try:

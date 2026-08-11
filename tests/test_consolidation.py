@@ -12,6 +12,8 @@ import pytest
 from paramem.memory.store import MemoryStore as _MS  # noqa: F401
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.graph_tier import GraphTierRefiner
+from paramem.training.recall_eval import RecallProbe
+from paramem.training.trainer import STAGING_ADAPTER
 from paramem.utils.artifacts import (
     debug_run,
     on_calibration_result,
@@ -3202,7 +3204,12 @@ class TestAbortSkipsCommit:
         loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.wandb_config = None
         loop._thermal_policy = None
-        loop.output_dir = tmp_path
+        # A subdir, not tmp_path itself: _fold_state_dir resolves to
+        # output_dir.parent / "state", and pytest's tmp_path fixture nests
+        # every test's directory under one shared per-session parent — using
+        # tmp_path directly here would alias every test's fold_resume.json
+        # onto the same physical "state" directory.
+        loop.output_dir = tmp_path / "rundir"
         loop.store = MemoryStore(replay_enabled=True)
         loop.promoted_keys = set()
         loop.cycle_count = 0
@@ -3314,6 +3321,8 @@ class TestAbortSkipsCommit:
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
@@ -3415,6 +3424,8 @@ class TestAbortSkipsCommit:
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
@@ -3724,8 +3735,10 @@ class TestAbortSkipsCommit:
             # test is actually about.
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -3820,8 +3833,10 @@ class TestAbortSkipsCommit:
             # — stub it out like TestDriftIntendedRemoval does.
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4099,8 +4114,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4194,8 +4211,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4290,8 +4309,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4400,8 +4421,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4432,6 +4455,127 @@ class TestAbortSkipsCommit:
                 )
                 if field == "init":
                     assert value in {"cold", "warm", "donor"}
+
+    def test_main_tier_telemetry_excludes_staging_slot_from_adapter_count(
+        self, monkeypatch, tmp_path
+    ):
+        """``tier_train`` telemetry's ``adapter_count`` must exclude
+        STAGING_ADAPTER ("in_training") -- it is resident in
+        ``model.peft_config`` at telemetry-sampling time on every normal
+        completion (``train_adapter``'s staging+promote contract leaves it
+        mounted for this caller's own probe/promote, which runs AFTER the
+        telemetry finally block), and counting it would silently inflate
+        every reader against what the pre-staging-redesign ring recorded.
+        ``_make_minimal_loop`` seeds ``in_training`` into ``peft_config``
+        from the start (mirroring a slot already resident at fold entry),
+        so no extra mocking is needed to exercise the exclusion.
+        """
+        from unittest.mock import patch
+
+        import networkx as _nx
+        import torch as _torch
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+        loop.output_dir = tmp_path / "rundir"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "speaker0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
+
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+        loop.model.named_parameters.return_value = [
+            ("base_model.model.x.lora_B.episodic.weight", _torch.zeros(2, 2)),
+        ]
+        loop._telemetry_dir = tmp_path / "telemetry"
+
+        assert STAGING_ADAPTER in loop.model.peft_config, (
+            "fixture must already carry the staging slot for this test to be meaningful"
+        )
+        _expected_adapter_count = len(loop.model.peft_config) - 1
+
+        trained_metrics = {"train_loss": 0.1, "aborted": False}
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            patch("paramem.server.gpu_lock._gpu_thread_lock"),
+            patch.multiple(
+                "paramem.training.consolidation.torch.cuda",
+                is_available=MagicMock(return_value=False),
+            ),
+            patch("paramem.training.consolidation.record_fold_telemetry") as mock_telemetry,
+            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
+            patch.object(ConsolidationLoop, "_maybe_seed_from_donor", return_value=False),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_save_adapters",
+                return_value={"episodic", "semantic", "procedural"},
+            ),
+            patch.object(ConsolidationLoop, "_clear_fold_resume"),
+            patch("paramem.memory.interim_adapter.unload_interim_adapters"),
+        ):
+            loop.consolidate(mode="train", trainer=None, router=None)
+
+        assert mock_telemetry.called
+        tier_train_calls = [
+            c for c in mock_telemetry.call_args_list if c.kwargs.get("kind") == "tier_train"
+        ]
+        assert tier_train_calls, "expected at least one tier_train telemetry record"
+        record = tier_train_calls[0].kwargs["record"]
+        assert record["adapter_count"] == _expected_adapter_count, (
+            f"adapter_count must exclude {STAGING_ADAPTER!r}, "
+            f"got {record['adapter_count']}, expected {_expected_adapter_count}"
+        )
 
     def test_main_tier_telemetry_tags_donor_seeded_fold(self, monkeypatch, tmp_path):
         """A cold target adapter seeded from a VALID donor checkpoint must be
@@ -4523,8 +4667,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4616,8 +4762,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -4713,8 +4861,10 @@ class TestAbortSkipsCommit:
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch.object(
                 ConsolidationLoop,
@@ -5141,10 +5291,14 @@ class TestInterimCommitFailureRollback:
             # the commit window with a non-empty deferred-write set.
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                "_probe_recall",
+                side_effect=lambda adapter_name, entries: RecallProbe(
+                    per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                ),
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
@@ -5569,8 +5723,10 @@ class TestConsolidateInterimAdaptersFullFlow:
                 # admit all keys from the probe fallback to avoid requiring a real model.
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                    "_probe_recall",
+                    side_effect=lambda adapter_name, entries: RecallProbe(
+                        per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -6946,8 +7102,10 @@ class TestDriftPartitioning:
                 ),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                    "_probe_recall",
+                    side_effect=lambda adapter_name, entries: RecallProbe(
+                        per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -7122,8 +7280,10 @@ class TestDriftIntendedRemoval:
                 ),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                    "_probe_recall",
+                    side_effect=lambda adapter_name, entries: RecallProbe(
+                        per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -8994,8 +9154,14 @@ def _run_full_fold_mocked(
     delegates its body to _run_fold(FoldScope(persist="main_tiers", ...)).
     Heavy GPU ops are mocked so this runs without hardware.
 
-    probe_side_effect: callable(adapter_name, entries) → set[str].
-        Defaults to returning all keys (pass-all probe).
+    probe_side_effect: callable(adapter_name, entries) → set[str] of passing
+        keys.  Defaults to returning all keys (pass-all probe).  Wrapped
+        internally into a RecallProbe-returning stub bound to
+        ConsolidationLoop._probe_recall — *adapter_name* the callable
+        receives is always STAGING_ADAPTER ("in_training"), never a tier
+        name, since the probe now runs against the staged weights before
+        promotion; per-tier differentiation must come from *entries*
+        content.
     train_adapter_spy: mock.MagicMock or None.  If supplied, train_adapter
         is patched to this spy (so the test can assert call_count etc.).
     keys_from: The fold's key source ("all_tiers" | "main_tiers").
@@ -9034,15 +9200,31 @@ def _run_full_fold_mocked(
 
     from paramem.server.gpu_lock import _gpu_thread_lock
     from paramem.training.consolidation import ConsolidationLoop
+    from paramem.training.recall_eval import RecallProbe
 
     if probe_side_effect is None:
         probe_side_effect = lambda adapter_name, entries: {e["key"] for e in entries}  # noqa: E731
-    if train_adapter_spy is None:
-        train_adapter_spy = MagicMock(return_value={"aborted": False})
-    if unload_spy is None:
-        unload_spy = MagicMock(return_value=[])
+
+    def _recall_probe_side_effect(adapter_name, entries):
+        passing = probe_side_effect(adapter_name, entries)
+        return RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": e["key"] in passing} for e in entries)
+        )
+
     if create_adapter_side_effect is None:
         create_adapter_side_effect = lambda m, c, n: m  # noqa: E731
+    if train_adapter_spy is None:
+        # Mirror the real train_adapter's _ensure_staging_slot effect: every
+        # non-aborted training event leaves STAGING_ADAPTER resident, shaped
+        # from the tier's own adapter_config -- the promote step this fold
+        # runs right after (promote_staging_adapter) reads it.
+        def _default_train_adapter(*, model, adapter_config, **kwargs):
+            create_adapter_side_effect(model, adapter_config, STAGING_ADAPTER)
+            return {"aborted": False}
+
+        train_adapter_spy = MagicMock(side_effect=_default_train_adapter)
+    if unload_spy is None:
+        unload_spy = MagicMock(return_value=[])
     if save_adapters_return_value is None:
         save_adapters_return_value = {"episodic", "semantic", "procedural"}
     create_adapter_patch_kwargs = {"side_effect": create_adapter_side_effect}
@@ -9080,8 +9262,8 @@ def _run_full_fold_mocked(
             ),
             patch.object(
                 ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=probe_side_effect,
+                "_probe_recall",
+                side_effect=_recall_probe_side_effect,
             ),
             patch.object(
                 ConsolidationLoop,
@@ -9162,18 +9344,109 @@ def _seed_gate_loop(tmp_path, *, episodic_keys=(), semantic_keys=(), procedural_
 
 
 def _probe_fails_one_episodic_key(adapter_name, entries):
-    """Admit-all probe stub except episodic, which drops 'graph_bad'."""
+    """Admit-all probe stub except for the entries set carrying 'graph_bad'
+    (episodic's own key set in these tests).
+
+    Driven by entries CONTENT, not *adapter_name* — the probe target is
+    always the staged weights (STAGING_ADAPTER) under the new contract, so
+    per-tier differentiation has to come from which tier's entries are being
+    probed, never from the (constant) adapter name.
+    """
     keys = {e["key"] for e in entries}
-    if adapter_name == "episodic":
-        keys.discard("graph_bad")
+    keys.discard("graph_bad")
     return keys
+
+
+def _stage_lifecycle_fakes(loop):
+    """Wire ``loop.model`` so ``create_adapter``/``load_adapter``/
+    ``delete_adapter`` fakes actually mutate ``peft_config`` -- mirrors the
+    real ``_ensure_staging_slot`` / crash-resume reload / ``drop_adapter_slot``
+    effect on ``STAGING_ADAPTER``, which the harness's bare no-op fakes
+    (``lambda m, c, n: m`` for ``create_adapter``; a ``Mock`` ``load_adapter``/
+    ``delete_adapter`` with no side effect) do not reproduce.  Without this, a
+    test asserting ``STAGING_ADAPTER not in loop.model.peft_config`` is
+    vacuous -- the key was never added in the first place (by EITHER the
+    normal-training ``create_adapter`` path or the crash-resume
+    ``model.load_adapter`` path), so removing the disposal entirely from
+    ``staged_weights`` would still pass.
+
+    Returns the ``create_adapter_side_effect`` callable to pass into
+    ``_run_full_fold_mocked``; also mutates ``loop.model.load_adapter``'s and
+    ``loop.model.delete_adapter``'s ``side_effect`` in place.
+    """
+
+    def _create_adapter_side_effect(model, config, name):
+        model.peft_config[name] = MagicMock()
+        return model
+
+    def _load_adapter_side_effect(slot_path, *, adapter_name):
+        loop.model.peft_config[adapter_name] = MagicMock()
+
+    def _delete_adapter_side_effect(name):
+        loop.model.peft_config.pop(name, None)
+
+    loop.model.load_adapter.side_effect = _load_adapter_side_effect
+    loop.model.delete_adapter.side_effect = _delete_adapter_side_effect
+    return _create_adapter_side_effect
+
+
+def _write_live_tier_slot(tier_root, keys, *, name="episodic"):
+    """Write a synthetic on-disk live slot under *tier_root* -- a
+    ``KeyRegistry`` with *keys* active plus a stamped manifest whose
+    ``registry_sha256`` matches it (``key_count=UNKNOWN`` so the verdict
+    never depends on the exact active count).  Stands in for a tier's
+    previously-committed production slot: what the crash-resume "no
+    recorded checkpoint" arm resolves via
+    ``verify_tier_binding``/``find_live_slot`` (the same resolver the boot
+    mount uses).  Returns the stamped slot ``Path``.
+    """
+    from paramem.adapters.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+        UNKNOWN,
+        AdapterManifest,
+        BaseModelFingerprint,
+        LoRAShape,
+        TokenizerFingerprint,
+        tier_registry_sha256,
+        write_manifest,
+    )
+    from paramem.training.key_registry import KeyRegistry
+
+    tier_root.mkdir(parents=True, exist_ok=True)
+    registry = KeyRegistry()
+    for key in keys:
+        registry.add(key)
+    registry.save(tier_root / "indexed_key_registry.json")
+    registry_sha256 = tier_registry_sha256(tier_root)
+    slot = tier_root / "20260101-000000"
+    slot.mkdir(parents=True, exist_ok=True)
+    write_manifest(
+        slot,
+        AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name=name,
+            trained_at="2026-01-01T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+            ),
+            lora=LoRAShape(rank=4, alpha=8, dropout=0.0, target_modules=("q_proj",)),
+            registry_sha256=registry_sha256,
+            key_count=UNKNOWN,
+        ),
+    )
+    return slot
 
 
 class TestMainTiersRecallCompletenessGate:
     def test_tier_below_threshold_aborts_the_fold(self, tmp_path):
         """A tier whose own trained weights fall short of 100% recall over
         its full key set raises RecallGateRejected carrying adapter_name,
-        rate, and threshold; the message names the operator levers."""
+        rate, threshold, and the failing key names; the message names the
+        operator levers.
+
+        Kills: dropping the failed_keys payload.
+        """
         from paramem.training.consolidation import RecallGateRejected
 
         loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
@@ -9187,6 +9460,7 @@ class TestMainTiersRecallCompletenessGate:
         assert exc.adapter_name == "episodic"
         assert exc.recall_rate == pytest.approx(0.5)
         assert exc.threshold == 1.0
+        assert exc.failed_keys == ("graph_bad",)
         message = str(exc)
         assert "rank" in message and "server.yaml" in message, (
             f"expected the message to name the LoRA rank/alpha remedy; got: {message}"
@@ -9225,6 +9499,45 @@ class TestMainTiersRecallCompletenessGate:
             assert (f"{tier}_backup", tier) in restore_calls, (
                 f"expected a restore copy for tier {tier!r}; got {copy_calls}"
             )
+
+    def test_refusal_never_promotes_and_leaves_staging_absent(self, tmp_path):
+        """A refused tier's staged weights are never copied into production
+        (no promote), and the staging slot is gone from peft_config once the
+        fold's exception has propagated -- staged_weights disposed of it on
+        the refusal exit.
+
+        Kills: promote-before-gate, and dropping the staged_weights guard.
+        """
+        from paramem.training.consolidation import RecallGateRejected
+        from paramem.training.trainer import STAGING_ADAPTER
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        create_adapter_side_effect = _stage_lifecycle_fakes(loop)
+        copy_calls: list = []
+
+        def _copy_spy(model, src, dst):
+            copy_calls.append((src, dst))
+            if src == STAGING_ADAPTER:
+                model.peft_config[dst] = model.peft_config.get(src)
+
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop,
+                keys_from="main_tiers",
+                probe_side_effect=_probe_fails_one_episodic_key,
+                copy_adapter_weights_side_effect=_copy_spy,
+                create_adapter_side_effect=create_adapter_side_effect,
+            )
+
+        assert (STAGING_ADAPTER, "episodic") not in copy_calls, (
+            f"the refused tier's staged weights must never be promoted; got {copy_calls}"
+        )
+        assert any(
+            c.args == (STAGING_ADAPTER,) for c in loop.model.delete_adapter.call_args_list
+        ), f"expected drop_adapter_slot to delete {STAGING_ADAPTER!r}"
+        assert STAGING_ADAPTER not in loop.model.peft_config, (
+            "the staging slot must be disposed of on refusal"
+        )
 
     def test_abort_writes_nothing(self, tmp_path):
         """Registries, key_metadata.json, and slot dirs stay exactly as they
@@ -9431,6 +9744,11 @@ class TestMainTiersRecallCompletenessGate:
         loop._derive_key_counters()
         pre_indexed_index = loop._indexed_next_index
 
+        # Simulate the tier's previously-committed production slot on disk --
+        # the crash-resume "no recorded checkpoint" arm resolves this via
+        # verify_tier_binding/find_live_slot before reloading into STAGING_ADAPTER.
+        _write_live_tier_slot(loop.output_dir / "episodic", ["graph_good", "graph_bad"])
+
         stamp = loop._compute_fold_stamp(tier=None)
         marker = {
             "version": loop._FOLD_RESUME_VERSION,
@@ -9488,15 +9806,12 @@ class TestMainTiersRecallCompletenessGate:
         }
         loop._write_fold_resume(marker)
 
-        from unittest.mock import patch
-
-        with patch("paramem.models.loader.load_adapter"):
-            with pytest.raises(RecallGateRejected):
-                _run_full_fold_mocked(
-                    loop,
-                    keys_from="main_tiers",
-                    probe_side_effect=_probe_fails_one_episodic_key,
-                )
+        with pytest.raises(RecallGateRejected):
+            _run_full_fold_mocked(
+                loop,
+                keys_from="main_tiers",
+                probe_side_effect=_probe_fails_one_episodic_key,
+            )
 
         # Reconstituted mint fully reversed: gone from every structure.
         assert not loop.store.has("graph_crashmint"), (
@@ -9600,14 +9915,23 @@ class TestMainTiersRecallCompletenessGate:
 
     def test_resumed_tier_is_probed_and_gated(self, tmp_path):
         """A crash-resumed tier (marked completed pre-crash, no recorded
-        checkpoint) is probed exactly once via _assert_tier_recall's
-        no-verdict fallback, and refuses below 100% before joining
-        tiers_rebuilt."""
-        from unittest.mock import patch
+        checkpoint) reloads its LIVE on-disk production slot -- resolved via
+        ``verify_tier_binding``/``find_live_slot``, the same resolver the
+        boot mount uses, never the slot ROOT directly -- into
+        STAGING_ADAPTER, is probed exactly once against the staged weights,
+        and refuses below 100% before joining tiers_rebuilt."""
+        from pathlib import Path
 
         from paramem.training.consolidation import RecallGateRejected
 
         loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+
+        # Simulate a tier that already has a committed production slot on
+        # disk from a prior successful fold -- the state the crash-resume
+        # "no recorded checkpoint" arm reloads from.  The slot lives at a
+        # STAMPED child of the tier root, never at the tier root itself.
+        live_slot = _write_live_tier_slot(loop.output_dir / "episodic", ["graph_good", "graph_bad"])
+
         stamp = loop._compute_fold_stamp(tier=None)
         marker = {
             "version": loop._FOLD_RESUME_VERSION,
@@ -9646,21 +9970,506 @@ class TestMainTiersRecallCompletenessGate:
         probe_calls: list = []
 
         def _probe(adapter_name, entries):
-            probe_calls.append(adapter_name)
+            probe_calls.append((adapter_name, frozenset(e["key"] for e in entries)))
             return {e["key"] for e in entries} - {"graph_bad"}
 
-        with patch("paramem.models.loader.load_adapter"):
-            with pytest.raises(RecallGateRejected) as excinfo:
-                _run_full_fold_mocked(loop, keys_from="main_tiers", probe_side_effect=_probe)
+        copy_calls: list = []
+
+        def _copy_spy(model, src, dst):
+            copy_calls.append((src, dst))
+
+        create_adapter_side_effect = _stage_lifecycle_fakes(loop)
+
+        with pytest.raises(RecallGateRejected) as excinfo:
+            _run_full_fold_mocked(
+                loop,
+                keys_from="main_tiers",
+                probe_side_effect=_probe,
+                copy_adapter_weights_side_effect=_copy_spy,
+                create_adapter_side_effect=create_adapter_side_effect,
+            )
 
         assert excinfo.value.adapter_name == "episodic"
-        assert probe_calls.count("episodic") == 1, (
-            f"expected exactly one probe of the resumed tier; got {probe_calls}"
+        # The probe target is always the staged weights (STAGING_ADAPTER),
+        # never the tier name -- the resumed tier's own key set identifies
+        # which tier was probed.
+        assert probe_calls == [(STAGING_ADAPTER, frozenset({"graph_good", "graph_bad"}))], (
+            f"expected exactly one probe of the resumed tier's staged weights; got {probe_calls}"
+        )
+        # The tier's production slot is untouched by a refused resume -- the
+        # crash-resume branch loads the checkpoint into STAGING_ADAPTER and
+        # never promotes it into the tier name.
+        assert (STAGING_ADAPTER, "episodic") not in copy_calls, (
+            f"a refused resumed tier must never be promoted; got {copy_calls}"
+        )
+        assert STAGING_ADAPTER not in loop.model.peft_config, (
+            "the staging slot must be disposed of on refusal"
+        )
+        # Resolved through verify_tier_binding/find_live_slot -- the STAMPED
+        # child slot, never the tier root -- and mounted under STAGING_ADAPTER.
+        load_calls = [
+            c
+            for c in loop.model.load_adapter.call_args_list
+            if c.kwargs.get("adapter_name") == STAGING_ADAPTER
+        ]
+        assert len(load_calls) == 1, (
+            f"expected exactly one load into {STAGING_ADAPTER!r}; "
+            f"got {loop.model.load_adapter.call_args_list}"
+        )
+        assert Path(load_calls[0].args[0]) == live_slot, (
+            f"expected the resolved live slot {live_slot} to be loaded; got {load_calls[0].args[0]}"
+        )
+
+    @staticmethod
+    def _write_resume_marker(loop, *, completed_tiers=("episodic",), extra_episodic_entries=()):
+        """Write a ``fold_resume.json`` marker claiming *completed_tiers* were
+        finished pre-crash with no recorded checkpoint (the "no checkpoint"
+        arm this class's crash-resume tests exercise).
+
+        *extra_episodic_entries* are appended to the episodic
+        ``train_assignment`` list verbatim, after the two standard replay
+        keys -- used by tests that need a newly-minted entry (carries
+        ``relation_type``) or a cross-tier-relocated entry (omits it, under
+        an outer tier key that disagrees with the key's pre-marker store
+        tier) alongside the two replay keys.
+        """
+        stamp = loop._compute_fold_stamp(tier=None)
+        marker = {
+            "version": loop._FOLD_RESUME_VERSION,
+            "scope": "main_tiers",
+            "fold_stamp": stamp,
+            "completed_tiers": list(completed_tiers),
+            "tier_checkpoints": {},
+            "in_flight_tier": None,
+            "train_assignment": {
+                "episodic": [
+                    {
+                        "key": "graph_good",
+                        "subject": "Alice",
+                        "predicate": "pgraph_good",
+                        "object": "ograph_good",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    {
+                        "key": "graph_bad",
+                        "subject": "Alice",
+                        "predicate": "pgraph_bad",
+                        "object": "ograph_bad",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    *extra_episodic_entries,
+                ],
+                "semantic": [],
+                "procedural": [],
+            },
+            "dataset_fingerprint": {},
+            "pending_session_ids": [],
+        }
+        loop._write_fold_resume(marker)
+
+    def test_resume_slot_unresolvable_discards_fold_work_and_clears_marker(self, tmp_path):
+        """The no-checkpoint arm's unresolvable-slot verdict must not be
+        sticky: with no live production slot on disk at all
+        (``verify_tier_binding`` resolves ``slot=None``), the RuntimeError
+        must discard the fold's other in-flight work (the same
+        ``_discard_fold_work`` compensation ``RecallGateRejected`` gets) and
+        clear ``fold_resume.json`` BEFORE propagating -- otherwise every next
+        cycle re-enters this identical arm against an unchanged tree and
+        re-raises forever. Proven three ways: the marker's absence (a
+        surviving marker is exactly what would resend the next cycle into
+        the same dead end), a cross-tier relocation reconstituted by the
+        resume fast-path landing back on its ORIGINAL tier (not the
+        marker's), and a key newly minted pre-crash (reconstituted by the
+        resume fast-path, per ``_rec_from_persisted``'s ``relation_type``
+        gate) no longer active anywhere in the store."""
+        loop = _seed_gate_loop(
+            tmp_path,
+            episodic_keys=["graph_good", "graph_bad"],
+            semantic_keys=["graph_reloc"],
+        )
+        assert loop.store.tier_for_active_key("graph_reloc") == "semantic", (
+            "fixture must seed graph_reloc under semantic for the relocation "
+            "assertion below to be meaningful"
+        )
+        assert loop.store.get("graph_minted") is None, (
+            "fixture must not pre-seed graph_minted for the mint-reversal "
+            "assertion below to be meaningful"
+        )
+        self._write_resume_marker(
+            loop,
+            extra_episodic_entries=[
+                # Replay entry (no relation_type) under the OUTER "episodic"
+                # key while the store still has it active under "semantic" --
+                # the resume fast-path's ownership-drift branch relocates it
+                # to episodic before the tier loop raises; _discard_fold_work
+                # must reverse that relocation.
+                {
+                    "key": "graph_reloc",
+                    "subject": "Alice",
+                    "predicate": "pgraph_reloc",
+                    "object": "ograph_reloc",
+                    "speaker_id": "S0",
+                    "tier": "episodic",
+                },
+                # Newly-minted entry (carries relation_type) never seeded in
+                # the store -- the resume fast-path reconstitutes it via
+                # store.put/set_bookkeeping before the tier loop raises;
+                # _discard_fold_work must reverse the mint (store.delete).
+                {
+                    "key": "graph_minted",
+                    "subject": "Alice",
+                    "predicate": "pgraph_minted",
+                    "object": "ograph_minted",
+                    "speaker_id": "S0",
+                    "relation_type": "factual",
+                    "tier": "episodic",
+                },
+            ],
+        )
+        # Deliberately no _write_live_tier_slot call -- the tier root has no
+        # candidate slot, so verify_tier_binding resolves slot=None.
+
+        with pytest.raises(RuntimeError, match="crash-resume could not resolve"):
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        fold_resume_path = loop._fold_state_dir / "fold_resume.json"
+        assert not fold_resume_path.exists(), (
+            "an unresolvable-slot verdict must clear fold_resume.json -- a surviving "
+            "marker would resend the next cycle into the identical dead end"
+        )
+        assert loop.store.tier_for_active_key("graph_reloc") == "semantic", (
+            "the resume fast-path's relocation of graph_reloc to episodic must be "
+            "reversed back to its original tier (semantic), not left relocated"
+        )
+        assert loop.store.get("graph_minted") is None, (
+            "the resume fast-path's reconstituted mint of graph_minted must be "
+            "reversed (deleted), not left active in the store"
+        )
+        assert loop.store.tier_for_active_key("graph_minted") is None
+
+    def test_resume_slot_key_count_mismatch_refuses_instead_of_silently_loading(self, tmp_path):
+        """A KEY_COUNT_MISMATCH binding still resolves ``TierBinding.slot``
+        (see ``verify_tier_binding``'s step 5) -- a bare ``slot is None``
+        check would silently load it, even though it is exactly the binding
+        the boot mount itself refuses to publish (``TierBinding.publishable``
+        / ``_PUBLISHABLE`` in ``registry_binding.py``). The crash-resume arm
+        must gate on the same predicate and refuse rather than silently
+        mounting an untrustworthy binding."""
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            tier_registry_sha256,
+            write_manifest,
+        )
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        self._write_resume_marker(loop)
+        live_slot = _write_live_tier_slot(loop.output_dir / "episodic", ["graph_good", "graph_bad"])
+        # Overwrite the manifest with a key_count that disagrees with the
+        # registry's 2 active keys -- forces KEY_COUNT_MISMATCH instead of
+        # _write_live_tier_slot's default UNKNOWN stamp.
+        registry_sha256 = tier_registry_sha256(loop.output_dir / "episodic")
+        write_manifest(
+            live_slot,
+            AdapterManifest(
+                schema_version=MANIFEST_SCHEMA_VERSION,
+                name="episodic",
+                trained_at="2026-01-01T00:00:00Z",
+                base_model=BaseModelFingerprint(
+                    repo="hf/model", sha="abc123", hash="sha256:deadbeef"
+                ),
+                tokenizer=TokenizerFingerprint(
+                    name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+                ),
+                lora=LoRAShape(rank=4, alpha=8, dropout=0.0, target_modules=("q_proj",)),
+                registry_sha256=registry_sha256,
+                key_count=1,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="publishable"):
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert not loop.model.load_adapter.called, (
+            "a non-publishable binding must never reach model.load_adapter"
+        )
+        fold_resume_path = loop._fold_state_dir / "fold_resume.json"
+        assert not fold_resume_path.exists(), (
+            "a non-publishable-binding refusal must also clear fold_resume.json"
+        )
+
+    def test_resume_slot_encrypted_content_decrypts_before_load(self, tmp_path):
+        """The production-slot arm routes through ``_adapter_slot_for_load``'s
+        content-sniffing decrypt boundary -- the same one the boot mount
+        (``app.py``'s ``_load_one``) and the donor build use -- instead of
+        gating on ``daily_identity_loadable``, which only says whether THIS
+        process can decrypt an age envelope, not whether the on-disk slot
+        actually is one. An age-encrypted slot must never reach
+        ``model.load_adapter`` as ciphertext; this mocks the decrypt
+        boundary (``read_maybe_encrypted``), not the content sniff, so the
+        real magic-bytes detection in ``_adapter_slot_for_load`` is what
+        classifies the slot as encrypted."""
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from paramem.backup.age_envelope import AGE_MAGIC
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        self._write_resume_marker(loop)
+        live_slot = _write_live_tier_slot(loop.output_dir / "episodic", ["graph_good", "graph_bad"])
+        (live_slot / "adapter_model.safetensors").write_bytes(AGE_MAGIC + b"fake-ciphertext-bytes")
+
+        captured: dict = {}
+
+        def _load_adapter_spy(path, *, adapter_name):
+            if adapter_name == STAGING_ADAPTER:
+                captured["path"] = path
+                captured["content"] = (Path(path) / "adapter_model.safetensors").read_bytes()
+
+        loop.model.load_adapter.side_effect = _load_adapter_spy
+
+        # Only fake the decrypt for the target slot's safetensors -- the fold
+        # also reads OTHER (unrelated, plaintext JSON) files through the same
+        # read_maybe_encrypted boundary (e.g. the simhash registry), which
+        # must keep resolving through the real function.
+        from paramem.backup.encryption import read_maybe_encrypted as _real_read_maybe_encrypted
+
+        def _decrypt_side_effect(path, *args, **kwargs):
+            if Path(path).name == "adapter_model.safetensors":
+                return b"FAKE-DECRYPTED-WEIGHTS"
+            return _real_read_maybe_encrypted(path, *args, **kwargs)
+
+        with patch(
+            "paramem.backup.encryption.read_maybe_encrypted",
+            side_effect=_decrypt_side_effect,
+        ):
+            _run_full_fold_mocked(loop, keys_from="main_tiers")
+
+        assert "path" in captured, "expected model.load_adapter to be called for STAGING_ADAPTER"
+        assert Path(captured["path"]) != live_slot, (
+            "an encrypted slot must be materialized to a temporary path, never the raw slot"
+        )
+        assert captured["content"] == b"FAKE-DECRYPTED-WEIGHTS", (
+            "model.load_adapter must receive the DECRYPTED bytes, never the ciphertext read "
+            f"from disk; got {captured['content']!r}"
+        )
+
+    def test_raise_between_load_and_probe_still_disposes_the_staging_slot(self, tmp_path):
+        """A raise inside the ``with staged_weights(...)`` scope, between the
+        crash-resume load and the probe (here: ``ensure_adapter_matching``
+        failing), must not leak ``STAGING_ADAPTER`` -- ``staged_weights``'
+        disposal runs on ANY exit, not only the deterministic-refusal path.
+        The staging load and ``ensure_adapter_matching`` now run INSIDE the
+        disposal scope (moved up from after the load), closing the crash
+        window where a raise there left ``in_training`` resident with no
+        caller positioned to drop it -- permanently tripping the next
+        training event's ``assert_staging_absent``."""
+        from unittest.mock import patch
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        self._write_resume_marker(loop)
+        _write_live_tier_slot(loop.output_dir / "episodic", ["graph_good", "graph_bad"])
+        create_adapter_side_effect = _stage_lifecycle_fakes(loop)
+
+        # ensure_adapter_matching is ALSO called earlier, once per resident
+        # tier, by the fold's pre-backup config reconciliation -- BEFORE the
+        # crash-resume arm is ever reached. Raising unconditionally would hit
+        # that earlier call instead and never exercise the arm under test
+        # (load_adapter would never run, making the assertion below vacuous).
+        # Only raise once STAGING_ADAPTER is actually resident -- i.e. AFTER
+        # this arm's own load_adapter call has run.
+        def _ensure_adapter_matching_side_effect(model, cfg, name):
+            if STAGING_ADAPTER in model.peft_config:
+                raise RuntimeError("boom-between-load-and-probe")
+            return model
+
+        with (
+            patch(
+                "paramem.models.loader.ensure_adapter_matching",
+                side_effect=_ensure_adapter_matching_side_effect,
+            ),
+            pytest.raises(RuntimeError, match="boom-between-load-and-probe"),
+        ):
+            _run_full_fold_mocked(
+                loop,
+                keys_from="main_tiers",
+                create_adapter_side_effect=create_adapter_side_effect,
+            )
+
+        assert STAGING_ADAPTER not in loop.model.peft_config, (
+            "a raise between the crash-resume load and the probe must still dispose of "
+            "the staging slot -- leaving it resident permanently blocks the next training "
+            "event's assert_staging_absent"
+        )
+
+    def test_resume_arm_raises_lifecycle_error_when_staging_slot_already_present(self, tmp_path):
+        """assert_staging_absent guards the crash-resume reload arm -- a
+        pre-existing STAGING_ADAPTER slot (the prior training event's caller
+        failed to dispose of it) makes the resume arm raise the lifecycle
+        RuntimeError rather than silently overwriting/reusing the stale slot."""
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        stamp = loop._compute_fold_stamp(tier=None)
+        marker = {
+            "version": loop._FOLD_RESUME_VERSION,
+            "scope": "main_tiers",
+            "fold_stamp": stamp,
+            "completed_tiers": ["episodic"],
+            "tier_checkpoints": {},
+            "in_flight_tier": None,
+            "train_assignment": {
+                "episodic": [
+                    {
+                        "key": "graph_good",
+                        "subject": "Alice",
+                        "predicate": "pgraph_good",
+                        "object": "ograph_good",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    {
+                        "key": "graph_bad",
+                        "subject": "Alice",
+                        "predicate": "pgraph_bad",
+                        "object": "ograph_bad",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                ],
+                "semantic": [],
+                "procedural": [],
+            },
+            "dataset_fingerprint": {},
+            "pending_session_ids": [],
+        }
+        loop._write_fold_resume(marker)
+        # Simulate a prior training event that never disposed of its staging slot.
+        loop.model.peft_config[STAGING_ADAPTER] = MagicMock()
+
+        # fold_resume.json lives under output_dir.parent / "state" -- shared
+        # across every test in this pytest session that reuses tmp_path's
+        # parent (the session-level tmp root), NOT scoped to this test's own
+        # tmp_path.  A RuntimeError (unlike RecallGateRejected) intentionally
+        # LEAVES the marker in place for crash-resume, so it must be cleaned
+        # up here explicitly -- otherwise a sibling test whose seed data
+        # happens to hash to the SAME fold_stamp (_compute_fold_stamp hashes
+        # the active SPO keyset) would spuriously enter crash-resume too.
+        try:
+            with pytest.raises(RuntimeError, match="Lifecycle invariant violated"):
+                _run_full_fold_mocked(loop, keys_from="main_tiers")
+        finally:
+            (loop._fold_state_dir / "fold_resume.json").unlink(missing_ok=True)
+
+    def test_on_recall_probe_records_full_key_list_before_the_refusal_raise(self, tmp_path):
+        """The normal (non-crash-resume) main-tier training-completeness
+        gate's ``on_recall_probe`` artifact call records the FULL per-key
+        verdict -- including the failing key -- BEFORE ``_assert_tier_recall``
+        raises.  If the order were reversed, the raise would propagate past
+        ``on_recall_probe`` and the refusal record would never be written --
+        the refusal path is the whole point of the record."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        recorded_calls: list = []
+
+        def _record_on_recall_probe(per_key, *, phase, adapter_name):
+            recorded_calls.append((adapter_name, list(per_key) if per_key is not None else None))
+
+        with patch(
+            "paramem.training.consolidation.on_recall_probe", side_effect=_record_on_recall_probe
+        ):
+            with pytest.raises(RecallGateRejected):
+                _run_full_fold_mocked(
+                    loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+                )
+
+        assert recorded_calls, "on_recall_probe was never called before the refusal raise"
+        adapter_name, per_key = recorded_calls[0]
+        assert adapter_name == "episodic"
+        recorded_keys = {r["key"] for r in per_key}
+        assert recorded_keys == {"graph_good", "graph_bad"}, (
+            f"expected the full per-key list including the failing key; got {recorded_keys}"
+        )
+
+    def test_on_recall_probe_records_full_key_list_before_the_crash_resume_checkpoint_refusal_raise(
+        self, tmp_path
+    ):
+        """Same on_recall_probe-before-raise invariant at the crash-resume
+        WITH-a-recorded-checkpoint arm -- a distinct code path from the
+        no-recorded-checkpoint arm covered by the sibling test above."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import RecallGateRejected
+
+        loop = _seed_gate_loop(tmp_path, episodic_keys=["graph_good", "graph_bad"])
+        ckpt_dir = tmp_path / "consolidation_refresh" / "episodic" / "checkpoint-1"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        stamp = loop._compute_fold_stamp(tier=None)
+        marker = {
+            "version": loop._FOLD_RESUME_VERSION,
+            "scope": "main_tiers",
+            "fold_stamp": stamp,
+            "completed_tiers": ["episodic"],
+            "tier_checkpoints": {"episodic": str(ckpt_dir)},
+            "in_flight_tier": None,
+            "train_assignment": {
+                "episodic": [
+                    {
+                        "key": "graph_good",
+                        "subject": "Alice",
+                        "predicate": "pgraph_good",
+                        "object": "ograph_good",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                    {
+                        "key": "graph_bad",
+                        "subject": "Alice",
+                        "predicate": "pgraph_bad",
+                        "object": "ograph_bad",
+                        "speaker_id": "S0",
+                        "tier": "episodic",
+                    },
+                ],
+                "semantic": [],
+                "procedural": [],
+            },
+            "dataset_fingerprint": {},
+            "pending_session_ids": [],
+        }
+        loop._write_fold_resume(marker)
+
+        recorded_calls: list = []
+
+        def _record_on_recall_probe(per_key, *, phase, adapter_name):
+            recorded_calls.append((adapter_name, list(per_key) if per_key is not None else None))
+
+        with patch(
+            "paramem.training.consolidation.on_recall_probe", side_effect=_record_on_recall_probe
+        ):
+            with pytest.raises(RecallGateRejected):
+                _run_full_fold_mocked(
+                    loop, keys_from="main_tiers", probe_side_effect=_probe_fails_one_episodic_key
+                )
+
+        assert recorded_calls, "on_recall_probe was never called before the refusal raise"
+        adapter_name, per_key = recorded_calls[0]
+        assert adapter_name == "episodic"
+        recorded_keys = {r["key"] for r in per_key}
+        assert recorded_keys == {"graph_good", "graph_bad"}, (
+            f"expected the full per-key list including the failing key; got {recorded_keys}"
         )
 
     def test_no_verdict_tier_is_probed_once_at_the_training_site(self, tmp_path):
-        """Early stopping off -- _probe_passing_keys runs once per trained
-        tier, at the training-completeness gate, never again afterward."""
+        """Early stopping off -- _probe_recall runs once per trained
+        tier, always against the staged weights, at the training-completeness
+        gate, never again afterward."""
         loop = _seed_gate_loop(
             tmp_path,
             episodic_keys=["graph1"],
@@ -9670,13 +10479,18 @@ class TestMainTiersRecallCompletenessGate:
         probe_calls: list = []
 
         def _probe(adapter_name, entries):
-            probe_calls.append(adapter_name)
+            probe_calls.append((adapter_name, frozenset(e["key"] for e in entries)))
             return {e["key"] for e in entries}
 
         result = _run_full_fold_mocked(loop, keys_from="main_tiers", probe_side_effect=_probe)
 
-        assert probe_calls == ["episodic", "semantic", "procedural"], (
-            f"expected exactly one probe per tier, in training order; got {probe_calls}"
+        assert probe_calls == [
+            (STAGING_ADAPTER, frozenset({"graph1"})),
+            (STAGING_ADAPTER, frozenset({"graph2"})),
+            (STAGING_ADAPTER, frozenset({"proc1"})),
+        ], (
+            "expected exactly one probe per tier, always on the staged "
+            f"weights, in training order; got {probe_calls}"
         )
         assert set(result["tiers_rebuilt"]) == {"episodic", "semantic", "procedural"}
 
@@ -11388,8 +12202,10 @@ class TestTierKeyedAssignmentInvariants:
                 ),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
+                    "_probe_recall",
+                    side_effect=lambda a, e: RecallProbe(
+                        per_key=tuple({"key": x["key"], "exact_match": True} for x in e)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -11565,8 +12381,10 @@ class TestTierKeyedAssignmentInvariants:
                 ),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
+                    "_probe_recall",
+                    side_effect=lambda a, e: RecallProbe(
+                        per_key=tuple({"key": x["key"], "exact_match": True} for x in e)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -12549,7 +13367,9 @@ class TestMaterializeInterimExtraRelations:
             store.load_registry(tier, KeyRegistry())
         loop.store = store
 
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
         return loop
 
     @staticmethod
@@ -13021,7 +13841,9 @@ class TestInterimRecitalDedup:
             store.load_registry(tier, KeyRegistry())
         loop.store = store
 
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
         return loop
 
     @staticmethod
@@ -14248,6 +15070,8 @@ class TestInterimRecitalDedup:
                 side_effect=self._fake_reconstruct,
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, stamp: m,
@@ -14289,6 +15113,8 @@ class TestInterimRecitalDedup:
                 side_effect=self._fake_reconstruct,
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, stamp: m,
@@ -14740,6 +15566,8 @@ class TestInterimRecitalDedup:
                 side_effect=self._fake_reconstruct,
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_mock_create_interim_adapter,
@@ -14793,6 +15621,8 @@ class TestInterimRecitalDedup:
                 side_effect=self._fake_reconstruct,
             ),
             patch("paramem.training.consolidation.switch_adapter"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.copy_adapter_weights"),
             patch(
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_mock_create_interim_adapter,
@@ -14912,7 +15742,9 @@ class TestInterimKeyedWalk:
             store.load_registry(tier, KeyRegistry())
         loop.store = store
 
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
         return loop
 
     @staticmethod
@@ -15106,7 +15938,9 @@ class TestMergeRegistryRelationsUnification:
             store.load_registry(tier, KeyRegistry())
         loop.store = store
 
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
         return loop
 
     @staticmethod
@@ -15583,7 +16417,9 @@ class TestSameAsSpeakerPairGuard:
             extraction_plausibility_max_tokens=8192,
             extraction_anonymize_token_envelope=8192,
         )
-        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop._probe_recall = lambda adapter_name, entries: RecallProbe(
+            per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+        )
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
@@ -19567,8 +20403,10 @@ class TestFoldResumeHelpers:
                 patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
+                    "_probe_recall",
+                    side_effect=lambda a, e: RecallProbe(
+                        per_key=tuple({"key": x["key"], "exact_match": True} for x in e)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -19595,6 +20433,14 @@ class TestFoldResumeHelpers:
         )
         assert "semantic" in trained_tiers, (
             f"semantic MUST be trained on crash-resume; trained_tiers={trained_tiers}"
+        )
+        # The recorded checkpoint is loaded into STAGING_ADAPTER, never
+        # directly under the tier name -- the tier slot is only ever written
+        # by the promote, after the gate passes.
+        load_calls = [c.kwargs.get("adapter_name") for c in loop.model.load_adapter.call_args_list]
+        assert STAGING_ADAPTER in load_calls, (
+            f"expected the retained checkpoint loaded into {STAGING_ADAPTER!r}; "
+            f"got load_adapter calls with adapter_name={load_calls}"
         )
 
     def test_stale_marker_is_never_resumed_on_stamp_mismatch(self, tmp_path):
@@ -19689,8 +20535,10 @@ class TestFoldResumeHelpers:
                 patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda a, e: {x["key"] for x in e},
+                    "_probe_recall",
+                    side_effect=lambda a, e: RecallProbe(
+                        per_key=tuple({"key": x["key"], "exact_match": True} for x in e)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,
@@ -20190,8 +21038,10 @@ class TestConsumePendingFullFold:
                 ),
                 patch.object(
                     ConsolidationLoop,
-                    "_probe_passing_keys",
-                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                    "_probe_recall",
+                    side_effect=lambda adapter_name, entries: RecallProbe(
+                        per_key=tuple({"key": e["key"], "exact_match": True} for e in entries)
+                    ),
                 ),
                 patch.object(
                     ConsolidationLoop,

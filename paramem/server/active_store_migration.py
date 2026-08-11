@@ -17,9 +17,10 @@ The distinction between modes is whether adapter weight slot subdirectories
 Two directions:
 
 * ``simulate_to_train``: read ``<adapter_dir>/<name>/graph.json`` →
-  train into ``<name>`` adapter → recall probe at
-  ``loop.config.recall_sanity_threshold`` → on pass, atomic-save the
-  slot. On fail, leave the graph intact.
+  train into a staging slot → recall probe the staged weights at
+  ``loop.config.recall_sanity_threshold`` → on pass, promote into
+  ``<name>`` and atomic-save the slot. On fail, ``<name>`` is never
+  touched (it stays at LoRA-zero) and the graph is left intact.
 
 * ``train_to_simulate``: verify ``<adapter_dir>/<name>/graph.json`` exists
   and covers all active keys; reconstruct from weights if missing →
@@ -60,6 +61,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+from paramem.training.consolidation import RecallGateRejected
+from paramem.training.trainer import STAGING_ADAPTER, promote_staging_adapter, staged_weights
 
 if TYPE_CHECKING:
     from paramem.server.config import ServerConfig
@@ -547,14 +550,20 @@ def _migrate_tier_simulate_to_train(
        formats entries, builds the HF dataset, derives the per-fold training
        budget from ``len(entries)``, wires the recall-early-stop callback,
        and calls ``train_adapter``. Budget and callback wiring are inherited
-       here rather than duplicated.
-    6. Recall probe via ``loop._run_recall_sanity_probe(name, entries)``
-       at ``loop.config.recall_sanity_threshold`` (the unified recall gate knob).
+       here rather than duplicated.  Training leaves the staged weights
+       resident under ``STAGING_ADAPTER``; *name* stays at the LoRA-zero
+       state Step 3 put it in until the promote below.
+    6. Probe the staged weights (``loop._probe_recall(STAGING_ADAPTER,
+       entries)``) at ``loop.config.recall_sanity_threshold`` (the unified
+       recall gate knob), inside :func:`~paramem.training.trainer.staged_weights`.
+       On pass, :func:`~paramem.training.trainer.promote_staging_adapter`
+       copies the staged weights into *name*; on refusal, raises
+       :class:`~paramem.training.consolidation.RecallGateRejected` and *name*
+       is never touched — it stays exactly at Step 3's LoRA-zero state, so
+       there is nothing to roll back.
     7. On pass: ``atomic_save_adapter`` writes the slot under the resolved
        slot root.  ``indexed_key_registry.json`` (carrying the unified simhash
        map) is written as the commit signal.  Delete the source graph.json.
-    8. On fail: reset the adapter back to LoRA-zero so failure does not
-       leave half-trained weights resident, raise ``RuntimeError``.
     """
     from paramem.adapters.manifest import build_manifest_for
     from paramem.memory.entry import build_registry as _build_reg
@@ -722,7 +731,7 @@ def _migrate_tier_simulate_to_train(
     # slot layout.
     _migrate_output_dir = Path(config.adapter_dir) / "active_store_migration" / name
     # recall_state is intentionally unused here — the migration path uses its
-    # own _run_recall_sanity_probe gate below; no recall-gated registration
+    # own staged-weights probe gate below; no recall-gated registration
     # needed.
     _migrate_metrics, _recall_state = loop._train_tier_adapter(
         entries,
@@ -738,25 +747,32 @@ def _migrate_tier_simulate_to_train(
     if _migrate_metrics.get("aborted"):
         raise _TierSkipped(f"aborted mid-migration for {name}")
 
-    # Step 6: recall probe at the configured sanity threshold.
-    # Pass max_probe=len(entries) so the gate is uncapped — all keys must pass,
-    # not just a 100-entry sample.  The RecallEarlyStopCallback already probes
-    # the full entry set (no cap), so this call is now consistent with it.
+    # Step 6: probe the staged weights and gate at the configured sanity
+    # threshold, BEFORE promotion — uncapped by construction (the gate
+    # primitive probes the full entries list; no sampling cap).  ``entries``
+    # is unique per key (one graph edge per ik_key — see the module's own
+    # key-assignment invariant), so RecallProbe.rate's distinct-key
+    # denominator here is the same as len(entries).
     # Deliberate: the uncapped probe applies to ALL simulate→train migrations
     # (both the ordinary mode-switch path and Phase B of a base-swap).  Full
     # coverage is strictly safer than a sampled gate, matching the callback.
     # Cost: O(n) inference calls per store — budget accordingly for large stores.
     _migration_threshold = loop.config.recall_sanity_threshold
-    recall = loop._run_recall_sanity_probe(name, entries, max_probe=len(entries))
-    if recall < _migration_threshold:
-        # Rollback: reset adapter to LoRA-zero. The slot was not yet saved to
-        # disk so there's nothing to delete on the filesystem side.
-        loop.model.delete_adapter(name)
-        loop.model = create_adapter(loop.model, tier_config, name)
-        raise RuntimeError(
-            f"simulate_to_train store {name} recall {recall:.3f} < {_migration_threshold:.3f}; "
-            f"rolled back trained adapter to LoRA-zero"
-        )
+    with staged_weights(loop.model, fallback_adapter=name):
+        probe = loop._probe_recall(STAGING_ADAPTER, entries)
+        if probe.rate < _migration_threshold:
+            # No rollback needed: the staged weights are disposed of by
+            # staged_weights' own finally, and production never left the
+            # LoRA-zero state Step 3 put it in.
+            raise RecallGateRejected(
+                f"simulate_to_train store {name} recall {probe.rate:.3f} < "
+                f"{_migration_threshold:.3f}",
+                adapter_name=name,
+                recall_rate=probe.rate,
+                threshold=_migration_threshold,
+                failed_keys=tuple(sorted({r["key"] for r in probe.failed})),
+            )
+        promote_staging_adapter(loop.model, name)
 
     # Step 7a: atomic-save the slot. Manifest building can fail (e.g. base-model
     # hash unavailable); we save without manifest in that case so the weights

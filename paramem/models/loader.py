@@ -708,6 +708,79 @@ def active_adapter_name(model: PeftModel) -> Optional[str]:
     return raw
 
 
+def drop_adapter_slot(model: PeftModel, name: str, *, fallback_adapter: str) -> None:
+    """Delete transient PEFT slot *name* from *model* if resident.
+
+    Switch-off-before-delete: PEFT refuses to leave the model with no active
+    adapter, so deleting *name* while it is the ACTIVE adapter is only safe
+    once *fallback_adapter* (a production tier guaranteed resident) is
+    confirmed switched onto. No-op when *name* is already absent from
+    ``model.peft_config``.
+
+    When *name* is currently active, the delete proceeds ONLY when
+    *fallback_adapter* is resident AND the switch to it actually lands
+    (re-checked via :func:`active_adapter_name` after the switch attempt — a
+    raised switch is treated identically to an absent fallback). Otherwise
+    the delete is SKIPPED entirely and the leaked slot is logged: deleting
+    the model's own active adapter with no confirmed successor would leave
+    PeftModel with a stale/absent active config — the exact state the
+    project's PEFT rule forbids (never delete the last/active adapter
+    without a switch already landed; see ``paramem/server/gates.py``'s sole-
+    adapter guard and ``paramem/memory/interim_adapter.py``'s SOLE-ADAPTER
+    TRAP NOTE). The trade: a caller that mints a transient slot can be left
+    holding a leaked one when its own fallback is broken, but the lifecycle
+    backstop (``paramem.training.trainer.assert_staging_absent`` /
+    ``_ensure_staging_slot``) surfaces that leak loudly at the next training
+    event rather than this primitive silently breaking the live model.
+
+    When *name* is NOT the active adapter, no switch is needed and the
+    delete always proceeds.
+
+    The one implementation of the "delete a transient slot" primitive —
+    shared by the staging lifecycle (``paramem.training.trainer``), the donor
+    build's transient slot, and any other caller that mints a PEFT adapter
+    for the duration of one operation and must tear it down afterward.
+    """
+    if name not in model.peft_config:
+        return
+    if active_adapter_name(model) == name:
+        if fallback_adapter not in model.peft_config:
+            logger.warning(
+                "drop_adapter_slot: skipping delete of active adapter %r — fallback "
+                "%r is not resident; leaving %r in place to avoid an active-adapter-"
+                "less PeftModel (the lifecycle backstop will catch the leaked slot "
+                "at the next training event)",
+                name,
+                fallback_adapter,
+                name,
+            )
+            return
+        try:
+            switch_adapter(model, fallback_adapter)
+        except Exception:  # noqa: BLE001  # boundary: PEFT's own switch call is an
+            # external API that can genuinely fail on a sufficiently broken model
+            # state; a failed switch must be treated identically to an absent
+            # fallback (skip the delete), never propagate out of this primitive.
+            logger.warning(
+                "drop_adapter_slot: switch to fallback %r failed — skipping delete "
+                "of active adapter %r (the lifecycle backstop will catch the leaked "
+                "slot at the next training event)",
+                fallback_adapter,
+                name,
+                exc_info=True,
+            )
+            return
+        if active_adapter_name(model) != fallback_adapter:
+            logger.warning(
+                "drop_adapter_slot: switch to fallback %r did not land — skipping "
+                "delete of active adapter %r",
+                fallback_adapter,
+                name,
+            )
+            return
+    model.delete_adapter(name)
+
+
 def detach_adapters(model: PeftModel, names: Iterable[str]) -> list[str]:
     """Delete every adapter in *names* from a live PeftModel, deterministically.
 
@@ -1210,11 +1283,11 @@ def measured_adapter_init_state(model: PeftModel, adapter_name: str) -> "str | N
     unchanged — those indicate a genuinely broken caller state, not an
     unmeasurable-but-otherwise-healthy adapter. In production the model is
     always a real ``PeftModel`` with *adapter_name* already created by
-    ``create_adapter`` (main-tier fold, ``consolidation.py:4390``) or
-    ``create_interim_adapter`` (interim fold, ``consolidation.py:3142``)
-    before this is called, so this path is expected to always measure
-    successfully; the ``None`` branch exists for the introspection
-    boundary, not as a normal outcome.
+    ``create_adapter`` (the main-tiers branch of
+    ``ConsolidationLoop._run_fold``) or ``create_interim_adapter`` (that
+    method's interim branch) before this is called, so this path is
+    expected to always measure successfully; the ``None`` branch exists for
+    the introspection boundary, not as a normal outcome.
 
     Args:
         model: PeftModel carrying *adapter_name*.
@@ -1249,8 +1322,9 @@ def ensure_adapter_matching(
       to preserve, so there is nothing to compare or keep warm.
     - Present, config matches (:func:`lora_shape_fields`: ``r``,
       ``lora_alpha``, ``target_modules``): no-op. This is the warm path —
-      the caller's staging copy (``trainer.py:944-948``) then warm-starts
-      from these weights.
+      the caller's staging copy (``train_adapter``'s production→staging
+      ``copy_adapter_weights`` call, right after ``_ensure_staging_slot``)
+      then warm-starts from these weights.
     - Present, config differs: deleted and recreated cold, with a warning
       naming the mismatched field(s). The comparison is on the PEFT
       ``LoraConfig`` fields, deliberately never on parameter key sets — a
