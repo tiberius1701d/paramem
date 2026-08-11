@@ -111,9 +111,43 @@ def _write_graph(path: Path) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def _write_manifest(slot_dir: Path, name: str = "episodic") -> None:
-    """Write a minimal valid meta.json for a weight slot."""
+def _write_manifest(
+    slot_dir: Path,
+    name: str = "episodic",
+    *,
+    registry_path: Path | None = None,
+    registry_sha256: str | None = None,
+    key_count: int | None = None,
+) -> None:
+    """Write a minimal valid meta.json for a weight slot.
+
+    Defaults to the legacy no-binding shape (``registry_sha256=""``,
+    ``key_count=0``) — sufficient for schema-only tests that never resolve
+    the slot through :func:`~paramem.adapters.registry_binding.verify_tier_binding`.
+
+    When *registry_path* is given, ``registry_sha256`` is derived as the
+    live plaintext hash of that file (mirroring what
+    :func:`~paramem.adapters.manifest.tier_registry_sha256` computes in
+    production) and ``key_count`` defaults to the registry's active-key
+    count — this is what makes the written slot the tier's LIVE weight slot
+    under the binding, i.e. resolves to
+    :data:`~paramem.adapters.registry_binding.VERIFIED`.
+
+    *registry_sha256* / *key_count* explicit overrides always win over the
+    derived values — used to construct a deliberate hash or key-count
+    mismatch against a real registry.
+    """
     slot_dir.mkdir(parents=True, exist_ok=True)
+    resolved_sha = registry_sha256 if registry_sha256 is not None else ""
+    resolved_count = key_count if key_count is not None else 0
+    if registry_path is not None:
+        from paramem.backup.hashing import plaintext_sha256
+        from paramem.training.key_registry import KeyRegistry
+
+        if registry_sha256 is None:
+            resolved_sha = plaintext_sha256(registry_path)
+        if key_count is None:
+            resolved_count = len(KeyRegistry.load(registry_path).list_active())
     manifest = {
         "schema_version": 4,
         "name": name,
@@ -122,8 +156,8 @@ def _write_manifest(slot_dir: Path, name: str = "episodic") -> None:
         "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
         "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
         "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
-        "registry_sha256": "",
-        "key_count": 0,
+        "registry_sha256": resolved_sha,
+        "key_count": resolved_count,
     }
     (slot_dir / "meta.json").write_text(json.dumps(manifest), encoding="utf-8")
 
@@ -146,7 +180,7 @@ def train_store_dir(tmp_path):
         ep_dir / "indexed_key_registry.json", ["key1", "key2"], simhash={"key1": 1, "key2": 2}
     )
     slot = ep_dir / "20260501-000000"
-    _write_manifest(slot, "episodic")
+    _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
     # semantic tier (empty registry — skipped)
     sem_dir = adapter_dir / "semantic"
@@ -249,7 +283,8 @@ class TestRegistryFailure:
         (foreign JSON, missing 'simhash') reports schema_error for the
         registry category — the ValueError -> _SCHEMA_ERROR arm in
         _check_registry, the live-half counterpart to the manifest one
-        pinned below (TestManifestFailure.test_bad_schema_manifest)."""
+        pinned below
+        (TestManifestFailure.test_malformed_manifest_is_non_ok_via_binding)."""
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
@@ -266,8 +301,16 @@ class TestRegistryFailure:
 
 
 class TestManifestFailure:
-    def test_bad_schema_manifest(self, tmp_path):
-        """meta.json with missing required field → schema_error failure."""
+    def test_malformed_manifest_is_non_ok_via_binding(self, tmp_path):
+        """meta.json with a missing required field → non-ok, via the binding.
+
+        verify_tier_binding's slot resolution (find_live_slot) reads and
+        validates every candidate's manifest to compare it against the live
+        registry hash; a candidate that fails to parse is skipped rather
+        than matched, so the tier resolves NO_MATCHING_SLOT — reported here
+        as an inconsistent binding row, not a manifest schema_error (there
+        is no longer a single resolved slot left to schema-check once the
+        binding itself cannot match one)."""
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
@@ -282,8 +325,8 @@ class TestManifestFailure:
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         assert report.ok is False
         manifest_failures = [f for f in report.failures if f.category == "manifest"]
-        assert len(manifest_failures) >= 1
-        assert manifest_failures[0].status == _SCHEMA_ERROR
+        assert len(manifest_failures) == 1, manifest_failures
+        assert manifest_failures[0].status == _INCONSISTENT
 
 
 class TestGraphFailure:
@@ -308,7 +351,7 @@ class TestGraphFailure:
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
         # No graph.json — expected in train mode
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
@@ -392,7 +435,7 @@ class TestCrossConsistency:
             ep_dir / "indexed_key_registry.json", ["key1", "key2"], simhash={"key1": 1}
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         assert report.ok is False
@@ -410,7 +453,7 @@ class TestCrossConsistency:
             ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1, "key2": 2}
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         assert report.ok is False
@@ -425,7 +468,7 @@ class TestCrossConsistency:
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         # Write key_metadata with an extra orphan key
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -462,7 +505,7 @@ class TestCrossConsistency:
             simhash={"key1": 1, "key2": 2},
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         # key_metadata only has key1 — key2 is absent (that's fine)
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -512,7 +555,7 @@ class TestStaleKeyCrossConsistency:
             simhash={"key1": 1, "proc52": 2},
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         # No inconsistent failure may mention proc52.
@@ -530,7 +573,7 @@ class TestStaleKeyCrossConsistency:
             simhash={"key1": 1, "ghost": 99},
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         inconsistent = [f for f in report.failures if f.status == _INCONSISTENT]
@@ -555,7 +598,7 @@ class TestStaleKeyCrossConsistency:
             simhash={"key1": 1},
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         old1_fails = [f for f in report.failures if "old1" in f.detail]
@@ -573,7 +616,7 @@ class TestStaleKeyCrossConsistency:
             simhash={"key1": 1, "proc52": 2},
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
@@ -606,7 +649,7 @@ class TestStaleKeyCrossConsistency:
             ep_dir / "indexed_key_registry.json", active=["key1"], simhash={"key1": 1}
         )
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
@@ -661,7 +704,7 @@ class TestRequiredVsOptional:
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         # semantic failures should not appear
@@ -675,7 +718,7 @@ class TestRequiredVsOptional:
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         # Create a partial interim slot (dir present, no registry)
         interim_dir = ep_dir / "interim_20260517T1200"
@@ -695,7 +738,7 @@ class TestRequiredVsOptional:
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
-        _write_manifest(slot, "episodic")
+        _write_manifest(slot, "episodic", registry_path=ep_dir / "indexed_key_registry.json")
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         # Common optional files absent → only skipped
@@ -709,13 +752,15 @@ class TestRequiredVsOptional:
 
 
 class TestInterimManifestResolution:
-    """Regression: _find_live_slot_for_tier must resolve interim's NESTED slot root.
+    """Regression: manifest resolution must use interim's NESTED slot root.
 
     Interim adapter dirs are NESTED at ``<adapter_dir>/episodic/interim_<stamp>/``
-    rather than flat at ``<adapter_dir>/episodic_interim_<stamp>/``.  Before the
-    fix, the manifest check passed the flat tier *name* which produced a
-    non-existent path, causing every interim tier with keys to emit a spurious
-    ``no weight slot`` failure.
+    rather than flat at ``<adapter_dir>/episodic_interim_<stamp>/``. The
+    manifest check resolves its slot through
+    :func:`~paramem.adapters.registry_binding.verify_tier_binding`, called
+    with the already-resolved interim tier root — passing the flat tier
+    *name* instead would produce a non-existent path, causing every interim
+    tier with keys to emit a spurious ``no weight slot`` failure.
     """
 
     def _build_interim_dir(
@@ -735,15 +780,16 @@ class TestInterimManifestResolution:
         interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
         interim_dir.mkdir(parents=True, exist_ok=True)
 
+        reg_path = interim_dir / "indexed_key_registry.json"
         _write_key_registry(
-            interim_dir / "indexed_key_registry.json",
+            reg_path,
             keys,
             simhash={k: i for i, k in enumerate(keys)},
         )
 
         if include_slot:
             slot = interim_dir / "20260603-000000"
-            _write_manifest(slot, f"{INTERIM_NAME_PREFIX}{stamp}")
+            _write_manifest(slot, f"{INTERIM_NAME_PREFIX}{stamp}", registry_path=reg_path)
 
         tier_name = f"{INTERIM_NAME_PREFIX}{stamp}"
         return tier_name, interim_dir
@@ -760,8 +806,9 @@ class TestInterimManifestResolution:
         # Main episodic tier with keys + slot
         ep_dir = adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
-        _write_manifest(ep_dir / "20260603-000000", "episodic")
+        ep_reg = ep_dir / "indexed_key_registry.json"
+        _write_key_registry(ep_reg, ["key1"], simhash={"key1": 1})
+        _write_manifest(ep_dir / "20260603-000000", "episodic", registry_path=ep_reg)
 
         # Nested interim slot with keys + nested weight slot
         self._build_interim_dir(adapter_dir, "20260603T0000", ["ikey1"], include_slot=True)
@@ -775,9 +822,13 @@ class TestInterimManifestResolution:
         assert manifest_failures == [], f"Spurious interim manifest failure(s): {manifest_failures}"
 
     def test_interim_missing_weight_slot_still_reported(self, tmp_path):
-        """train mode: interim tier with keys but NO nested slot → 'no weight slot' IS reported.
+        """train mode: interim tier with keys but NO nested slot → non-ok, reported.
 
-        Ensures the fix does not mask genuine missing-slot failures for interim tiers.
+        Ensures the binding-based resolution does not mask genuine
+        missing-slot failures for interim tiers. Exactly ONE manifest-category
+        row appears for this tier — the binding's NO_CANDIDATES verdict — with
+        the same detail text verify_tier_binding always uses for "no
+        weight-slot candidates on disk".
         """
         cfg = _make_config(tmp_path, mode="train")
         adapter_dir = cfg.adapter_dir
@@ -785,8 +836,9 @@ class TestInterimManifestResolution:
         # Main episodic with keys + slot (must be valid so it doesn't mask interim)
         ep_dir = adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
-        _write_manifest(ep_dir / "20260603-000000", "episodic")
+        ep_reg = ep_dir / "indexed_key_registry.json"
+        _write_key_registry(ep_reg, ["key1"], simhash={"key1": 1})
+        _write_manifest(ep_dir / "20260603-000000", "episodic", registry_path=ep_reg)
 
         # Interim with keys but NO nested weight slot
         self._build_interim_dir(adapter_dir, "20260603T0000", ["ikey1"], include_slot=False)
@@ -800,25 +852,31 @@ class TestInterimManifestResolution:
         assert len(manifest_failures) == 1, (
             f"Expected exactly one interim manifest failure, got: {manifest_failures}"
         )
-        assert manifest_failures[0].detail == "no weight slot"
+        assert manifest_failures[0].status == _MISSING
+        assert "no weight-slot candidates" in manifest_failures[0].detail
 
     def test_main_tier_manifest_still_resolves_flat(self, tmp_path):
         """train mode: main tier slot is still found correctly after the refactor.
 
-        Verifies the fix does not break main-tier (flat) weight-slot resolution.
+        Verifies the binding-based resolution does not break main-tier
+        (flat) weight-slot resolution. Exactly ONE ok manifest-category row
+        is expected — the binding verdict, with no second, independently
+        re-derived row.
         """
         cfg = _make_config(tmp_path, mode="train")
         adapter_dir = cfg.adapter_dir
 
         ep_dir = adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
+        ep_reg = ep_dir / "indexed_key_registry.json"
         _write_key_registry(
-            ep_dir / "indexed_key_registry.json",
+            ep_reg,
             ["key1", "key2"],
             simhash={"key1": 1, "key2": 2},
         )
         # Flat slot under episodic/
-        _write_manifest(ep_dir / "20260501-000000", "episodic")
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic", registry_path=ep_reg)
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
 
@@ -826,8 +884,287 @@ class TestInterimManifestResolution:
         manifest_checks = [
             c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
         ]
-        assert len(manifest_checks) == 1
+        assert len(manifest_checks) == 1, manifest_checks
         assert manifest_checks[0].status == _OK
+        # The row's path is the resolved slot's meta.json, not the registry file.
+        assert manifest_checks[0].path == str(slot / "meta.json")
+
+
+# ---------------------------------------------------------------------------
+# Registry↔slot binding — verify_tier_binding consumption
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryBinding:
+    """verify_infrastructure_integrity resolves the manifest check's slot
+    through verify_tier_binding and reports the binding verdict as THE one
+    manifest-category row for a keyed train-mode tier — no second,
+    independently re-derived row — so a hash-mismatched, count-mismatched,
+    or slot-less tier is a visible non-ok check even when a candidate
+    manifest is otherwise well-formed JSON, and never alongside a false
+    second row (e.g. "no weight slot" when a slot exists but doesn't bind)."""
+
+    def test_hash_mismatched_slot_is_non_ok(self, tmp_path):
+        """A slot whose manifest registry_sha256 does not match the live
+        registry hash is a visible non-ok check (NO_MATCHING_SLOT) —
+        exactly ONE failure, not a second row falsely claiming no slot
+        exists (one real candidate slot IS on disk, it just doesn't bind)."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
+        slot = ep_dir / "20260501-000000"
+        # Deliberately wrong hash — does not correspond to the live registry.
+        _write_manifest(slot, "episodic", registry_sha256="0" * 64)
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is False
+        assert len(report.failures) == 1, report.failures
+        binding_failures = [
+            f for f in report.failures if f.category == "manifest" and f.status == _INCONSISTENT
+        ]
+        assert len(binding_failures) == 1, report.failures
+        assert binding_failures[0].tier == "episodic"
+
+    def test_key_count_mismatch_is_non_ok(self, tmp_path):
+        """A slot whose registry_sha256 matches but key_count disagrees with
+        the registry's active count is a visible non-ok check
+        (KEY_COUNT_MISMATCH) — exactly ONE manifest-category row total, the
+        binding row itself (no second, independently re-parsed schema row)."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        reg_path = ep_dir / "indexed_key_registry.json"
+        _write_key_registry(reg_path, ["key1"], simhash={"key1": 1})
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic", registry_path=reg_path, key_count=99)
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is False
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
+        ]
+        assert len(manifest_checks) == 1, manifest_checks
+        assert manifest_checks[0].status == _INCONSISTENT
+        assert "key_count" in manifest_checks[0].detail
+        # The row's path is the resolved (mismatched-count, but hash-matched) slot.
+        assert manifest_checks[0].path == str(slot / "meta.json")
+
+    def test_no_candidates_on_keyed_tier_is_failure(self, tmp_path):
+        """A keyed train-mode tier with NO weight-slot candidates at all
+        (never trained, or the slot was fully removed) is a FAILURE row via
+        the binding — NO_CANDIDATES maps to missing, never skipped. Pins
+        against a mutation that would downgrade NO_CANDIDATES to skipped,
+        which would otherwise pass silently now that there is no longer a
+        second, independently-derived fallback row also carrying the
+        failure signal."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
+        # No slot directory at all.
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is False
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
+        ]
+        assert len(manifest_checks) == 1, manifest_checks
+        assert manifest_checks[0].status == _MISSING
+        assert manifest_checks[0] in report.failures
+
+    def test_registry_absent_with_slots_is_inconsistent(self, tmp_path):
+        """REGISTRY_ABSENT_WITH_SLOTS -- a keyed tier whose weight slots
+        remain on disk but whose registry file was deleted (a registry
+        loss, distinct from a tier that was simply never trained) -- maps
+        to inconsistent via _binding_check.
+
+        Constructed directly against a synthetic TierBinding rather than
+        through verify_infrastructure_integrity's full per-tier walk: that
+        walk short-circuits (registry-absent -> skipped, not a failure)
+        before ever calling verify_tier_binding whenever the on-disk
+        registry is absent, by design -- a tier that was NEVER trained
+        looks identical on disk to one whose registry was lost, and the
+        walk cannot tell them apart. This pins _binding_check's own mapping
+        table for the corruption case, which app.py's boot mount path
+        (verify_tier_binding called directly, no registry-absence gate)
+        does reach in production.
+        """
+        from paramem.adapters.registry_binding import REGISTRY_ABSENT_WITH_SLOTS, TierBinding
+        from paramem.backup.integrity import _binding_check
+        from paramem.training.key_registry import KeyRegistry
+
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir(parents=True, exist_ok=True)
+        registry = KeyRegistry()
+        registry.add("key1")
+        binding = TierBinding(
+            tier="episodic",
+            tier_root=tier_root,
+            status=REGISTRY_ABSENT_WITH_SLOTS,
+            registry=registry,
+            registry_present=False,
+            slot=None,
+            manifest=None,
+            candidate_count=1,
+            detail=(
+                "1 candidate slot(s) present but no indexed_key_registry.json exists for this tier"
+            ),
+        )
+
+        check = _binding_check(binding, "episodic")
+
+        assert check.category == "manifest"
+        assert check.status == _INCONSISTENT
+        assert check.detail == binding.detail
+
+    def test_foreign_shaped_registry_with_slot_present_is_schema_error(self, tmp_path):
+        """A registry that fails KeyRegistry.load's shape check reports
+        schema_error even when a weight-slot manifest sits alongside it —
+        has_keys stays False for an unreadable registry, so the binding is
+        never computed and cannot mask the registry failure as ok."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        # Foreign-shaped: has active_keys but no simhash section.
+        (ep_dir / "indexed_key_registry.json").write_text(
+            json.dumps({"active_keys": ["key1"]}), encoding="utf-8"
+        )
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is False
+        registry_failures = [f for f in report.failures if f.category == "registry"]
+        assert len(registry_failures) == 1
+        assert registry_failures[0].status == _SCHEMA_ERROR
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
+        ]
+        assert manifest_checks == [], (
+            f"No binding/manifest row expected for an unreadable registry: {manifest_checks}"
+        )
+
+    def test_donor_store_contributes_no_checks(self, tmp_path):
+        """A donor-store directory beside the memory tiers contributes no
+        checks.
+
+        Two independent reasons, either one sufficient on its own:
+        iter_tier_roots enumerates only the three literal main tiers plus
+        interim dirs found under episodic/interim_*, so a donor directory
+        sitting alongside them is structurally never yielded to the
+        per-tier loop at all. And even if it somehow were, a donor store
+        carries no indexed_key_registry.json by design (donor stores are
+        keyless), so has_keys would stay False and the loop would exit via
+        the registry-absent skip/continue before verify_tier_binding's
+        donor guard (which raises ValueError for a donor tier_root) is
+        ever called."""
+        from paramem.training.donor import DONOR_STORE_PREFIX
+
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        ep_reg = ep_dir / "indexed_key_registry.json"
+        _write_key_registry(ep_reg, ["key1"], simhash={"key1": 1})
+        _write_manifest(ep_dir / "20260501-000000", "episodic", registry_path=ep_reg)
+
+        donor_dir = cfg.adapter_dir / f"{DONOR_STORE_PREFIX}20260501-000000"
+        donor_slot = donor_dir / "20260501-000000"
+        donor_slot.mkdir(parents=True, exist_ok=True)
+        donor_manifest = {
+            "schema_version": 4,
+            "name": donor_dir.name,
+            "trained_at": "2026-05-01T00:00:00Z",
+            "window_stamp": "",
+            "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
+            "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
+            "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
+            "registry_sha256": "",
+            "key_count": 3,
+        }
+        (donor_slot / "meta.json").write_text(json.dumps(donor_manifest), encoding="utf-8")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is True, report.failures
+        assert all(donor_dir.name != c.tier for c in report.checks)
+
+
+# ---------------------------------------------------------------------------
+# Simulate mode's manifest row — unconditional, oracle-free skip
+# ---------------------------------------------------------------------------
+
+
+class TestSimulateManifestRow:
+    """simulate mode's manifest check is one unconditional, oracle-free
+    'skipped' row per committed tier — no slot resolution happens, so its
+    presence (and detail) never depends on whether a weight slot happens to
+    exist on disk, whether its hash would match, or whether the tier has
+    any active keys."""
+
+    def test_skip_row_present_with_no_slot_on_disk(self, tmp_path):
+        """simulate mode, tier has keys, NO weight slot anywhere on disk →
+        still exactly one skipped manifest row (not absent, not a failure)."""
+        cfg = _make_config(tmp_path, mode="simulate")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
+        _write_graph(ep_dir / "graph.json")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is True, report.failures
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
+        ]
+        assert len(manifest_checks) == 1, manifest_checks
+        assert manifest_checks[0].status == _SKIPPED
+        assert manifest_checks[0].detail == "simulate mode"
+
+    def test_skip_row_present_with_matching_slot_on_disk(self, tmp_path):
+        """simulate mode, a weight slot happens to exist and matches the
+        live registry hash → the row is still just 'skipped', unaffected by
+        the slot's presence or hash match (no oracle call is made)."""
+        cfg = _make_config(tmp_path, mode="simulate")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        reg_path = ep_dir / "indexed_key_registry.json"
+        _write_key_registry(reg_path, ["key1"], simhash={"key1": 1})
+        _write_graph(ep_dir / "graph.json")
+        _write_manifest(ep_dir / "20260501-000000", "episodic", registry_path=reg_path)
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is True, report.failures
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
+        ]
+        assert len(manifest_checks) == 1, manifest_checks
+        assert manifest_checks[0].status == _SKIPPED
+        assert manifest_checks[0].detail == "simulate mode"
+        assert manifest_checks[0].path == str(reg_path)
+
+    def test_skip_row_present_even_when_registry_empty(self, tmp_path):
+        """simulate mode, a tier with a present-but-empty registry (no
+        active keys) still gets the unconditional skip row — it is not
+        gated on has_keys."""
+        cfg = _make_config(tmp_path, mode="simulate")
+        sem_dir = cfg.adapter_dir / "semantic"
+        sem_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(sem_dir / "indexed_key_registry.json", [])
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is True, report.failures
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "semantic"
+        ]
+        assert len(manifest_checks) == 1, manifest_checks
+        assert manifest_checks[0].status == _SKIPPED
 
 
 # ---------------------------------------------------------------------------

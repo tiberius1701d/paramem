@@ -328,6 +328,8 @@ class TestBootDegradedPath:
         # train-mode integrity check requires for a keyed tier) and
         # re-applies config — the real production recovery path re-runs
         # _preload_memory_store.
+        from paramem.backup.hashing import plaintext_sha256
+
         _write_valid_registry(ep_dir, ["key1"])
         slot_dir = ep_dir / "20260501-000000"
         slot_dir.mkdir(parents=True, exist_ok=True)
@@ -339,7 +341,9 @@ class TestBootDegradedPath:
             "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
             "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
             "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
-            "registry_sha256": "",
+            # registry_sha256 must match the live registry for
+            # verify_tier_binding to resolve this slot as VERIFIED.
+            "registry_sha256": plaintext_sha256(ep_dir / "indexed_key_registry.json"),
             "key_count": 1,
         }
         (slot_dir / "meta.json").write_text(_json.dumps(manifest), encoding="utf-8")
@@ -408,6 +412,8 @@ class TestArmActiveMigrationIntegrityGate:
         # Use train mode so graph.json is not required
         cfg.consolidation.mode = "train"
 
+        from paramem.backup.hashing import plaintext_sha256
+
         ep_dir = Path(cfg.adapter_dir) / "episodic"
         _write_valid_registry(ep_dir, ["key1"])
         # Write a minimal manifest slot so the train-mode manifest check passes
@@ -421,7 +427,9 @@ class TestArmActiveMigrationIntegrityGate:
             "base_model": {"repo": "test/model", "sha": "abc", "hash": "sha256:deadbeef"},
             "tokenizer": {"name_or_path": "test/model", "vocab_size": 32000, "merges_hash": "abc"},
             "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
-            "registry_sha256": "",
+            # registry_sha256 must match the live registry for
+            # verify_tier_binding to resolve this slot as VERIFIED.
+            "registry_sha256": plaintext_sha256(ep_dir / "indexed_key_registry.json"),
             "key_count": 1,
         }
         (slot_dir / "meta.json").write_text(_json.dumps(manifest), encoding="utf-8")

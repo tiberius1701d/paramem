@@ -50,6 +50,20 @@ Required-vs-optional matrix
   always optional (skipped when absent — fresh installs lack them).
 - Empty/absent semantic, absent interim, and partial interim slots (dir present
   but registry absent) → skipped, NOT a failure.
+
+Registry↔slot binding
+----------------------
+The live weight slot (train mode, keyed tiers) is resolved through
+:func:`~paramem.adapters.registry_binding.verify_tier_binding` — the one
+oracle for "does this tier's on-disk registry bind to a slot manifest",
+shared with the boot mount loop and post-fold revalidation. This module never
+re-derives hash/slot resolution itself and never re-parses a manifest the
+binding already parsed. Each such tier gets exactly ONE ``"manifest"``-category
+:class:`FileCheck` row (:func:`_binding_check`) reporting the binding verdict
+directly — so a keyed tier with no weight slot at all, a hash-mismatched
+slot, or a key-count-mismatched slot is each a single visible non-ok check,
+never a second row that could assert something the binding already knows is
+false (e.g. "no weight slot" for a tier whose slot exists but doesn't bind).
 """
 
 from __future__ import annotations
@@ -59,8 +73,12 @@ import logging
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pyrage
+
+if TYPE_CHECKING:
+    from paramem.adapters.registry_binding import TierBinding
 
 logger = logging.getLogger(__name__)
 
@@ -232,35 +250,6 @@ def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
         return FileCheck(path_str, "simhash", tier, _SCHEMA_ERROR, str(exc)), None
 
 
-def _check_manifest(slot_dir: Path, tier: str) -> FileCheck:
-    """Check a ``meta.json`` via :func:`paramem.adapters.manifest.read_manifest`.
-
-    The manifest is PLAINTEXT — no decrypt branch.  Raises
-    ``ManifestNotFoundError``/``ManifestSchemaError`` on failure.
-
-    Returns:
-        :class:`FileCheck` with category ``"manifest"`` and the resolved status.
-    """
-    from paramem.adapters.manifest import (
-        ManifestNotFoundError,
-        ManifestSchemaError,
-        read_manifest,
-    )
-
-    meta_path = slot_dir / "meta.json"
-    path_str = str(meta_path)
-
-    try:
-        read_manifest(slot_dir)
-        return FileCheck(path_str, "manifest", tier, _OK, "")
-    except ManifestNotFoundError:
-        return FileCheck(path_str, "manifest", tier, _MISSING, "meta.json not found")
-    except ManifestSchemaError as exc:
-        return FileCheck(path_str, "manifest", tier, _SCHEMA_ERROR, str(exc))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        return FileCheck(path_str, "manifest", tier, _PARSE_ERROR, str(exc))
-
-
 def _check_graph(path: Path, tier: str) -> FileCheck:
     """Check a ``graph.json`` via :func:`paramem.memory.persistence.load_memory_from_disk`.
 
@@ -329,37 +318,57 @@ def _check_common_file(path: Path, category: str) -> tuple[FileCheck, dict | Non
         return FileCheck(path_str, category, "common", _PARSE_ERROR, str(exc)), None
 
 
-def _find_live_slot_for_tier(tier_root: Path) -> Path | None:
-    """Find the newest slot dir under *tier_root* that has a meta.json.
+def _binding_check(binding: "TierBinding", tier: str) -> FileCheck:
+    """Map one tier's :class:`~paramem.adapters.registry_binding.TierBinding`
+    verdict onto this module's status vocabulary.
 
-    Used to locate the live weight slot for manifest checking in train mode.
-    Returns the newest slot by mtime, or ``None`` when none exists.
+    THE single manifest-category row for a keyed train-mode tier — never
+    paired with a second, independently-derived row. Deliberately does not
+    re-read ``meta.json``: :func:`~paramem.adapters.registry_binding.verify_tier_binding`
+    already parsed it (``binding.manifest``) when it resolved a slot, and
+    ``find_live_slot`` (the module docstring's "consumers must read the
+    manifest from the binding, never re-read" contract) already skips
+    candidates that fail to parse — so a second read could only ever repeat
+    the same verdict, except across the exact TOCTOU race that contract
+    guards against.
 
-    The caller is responsible for resolving *tier_root* to the correct
-    on-disk directory before calling this function.  Main tiers are flat
-    (``<adapter_dir>/<tier>/``); interim tiers are nested
-    (``<adapter_dir>/episodic/interim_<stamp>/``).  Both are handled by
-    passing the already-resolved path rather than recomputing it here.
+    :data:`~paramem.adapters.registry_binding.VERIFIED` is ``"ok"``.
+    :data:`~paramem.adapters.registry_binding.NO_CANDIDATES` is ``"missing"``
+    — no weight-slot candidate exists yet (fresh tier, or one whose slot was
+    fully removed). Every other verdict
+    (:data:`~paramem.adapters.registry_binding.NO_MATCHING_SLOT`,
+    :data:`~paramem.adapters.registry_binding.KEY_COUNT_MISMATCH`,
+    :data:`~paramem.adapters.registry_binding.REGISTRY_UNREADABLE`,
+    :data:`~paramem.adapters.registry_binding.REGISTRY_ABSENT_WITH_SLOTS`) is
+    a registry↔slot disagreement and maps to ``"inconsistent"`` — the same
+    vocabulary entry already used elsewhere in this module for cross-artifact
+    disagreement (registry vs simhash).
 
     Args:
-        tier_root: Resolved directory to search for slot subdirectories.
+        binding: The tier's already-resolved
+            :class:`~paramem.adapters.registry_binding.TierBinding`.
+        tier: Tier name, for the :class:`FileCheck` row.
 
     Returns:
-        Path to the slot directory, or ``None``.
+        :class:`FileCheck` with category ``"manifest"`` reporting the
+        binding verdict. ``path`` is ``binding.slot / "meta.json"`` when the
+        binding resolved a slot (:data:`VERIFIED`,
+        :data:`KEY_COUNT_MISMATCH`) — the manifest a weight slot actually
+        does exist at, even when it doesn't bind. Otherwise ``path`` is the
+        tier's registry file, since no slot was resolved for this verdict.
     """
-    if not tier_root.is_dir():
-        return None
-    candidates: list[Path] = []
-    for entry in tier_root.iterdir():
-        if entry.name.startswith("."):
-            continue
-        if not entry.is_dir():
-            continue
-        if (entry / "meta.json").exists():
-            candidates.append(entry)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    from paramem.adapters.registry_binding import NO_CANDIDATES, VERIFIED
+
+    if binding.slot is not None:
+        path_str = str(binding.slot / "meta.json")
+    else:
+        path_str = str(binding.tier_root / "indexed_key_registry.json")
+
+    if binding.status == VERIFIED:
+        return FileCheck(path_str, "manifest", tier, _OK, "")
+    if binding.status == NO_CANDIDATES:
+        return FileCheck(path_str, "manifest", tier, _MISSING, binding.detail)
+    return FileCheck(path_str, "manifest", tier, _INCONSISTENT, binding.detail)
 
 
 def _is_no_key_check(check: FileCheck) -> bool:
@@ -507,6 +516,15 @@ def verify_infrastructure_integrity(
     ``speaker_profiles.json``, ``observed_languages.json``, and
     ``state/backup.json``.
 
+    In train mode, a keyed tier's live weight slot and its registry↔slot
+    binding verdict are both resolved via a single call to
+    :func:`~paramem.adapters.registry_binding.verify_tier_binding` (see the
+    module docstring's "Registry↔slot binding" section) — every such tier
+    gets exactly one ``"manifest"``-category binding row; no second,
+    independently re-derived manifest row is ever added. In simulate mode
+    the manifest row is an unconditional, oracle-free ``"skipped"`` marker
+    (the payload there is ``graph.json``, not weights).
+
     Runs cross-consistency checks on tiers whose registry loaded ``"ok"``:
     registry keys vs simhash keys, and key_metadata orphans.
 
@@ -542,6 +560,7 @@ def verify_infrastructure_integrity(
     # collapse into the main tiers on consolidation. (procedural/semantic
     # interim_* adapter slots do not exist; any procedural/interim_* dir holds
     # training debris — epoch_log/progress — not an adapter, and is ignored.)
+    from paramem.adapters.registry_binding import verify_tier_binding
     from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, iter_tier_roots
 
     for tier_name, tier_root in iter_tier_roots(adapter_dir):
@@ -654,29 +673,29 @@ def verify_infrastructure_integrity(
 
         # --- Manifest check (train mode only, live weight slot) ---
         if mode == "train" and has_keys:
-            # Find the live weight slot dir (has meta.json).
+            # verify_tier_binding is the one oracle for "does this tier's
+            # on-disk registry bind to a slot manifest" — it resolves the
+            # live weight slot (hash-matched, not newest-mtime) AND reports
+            # whether the registry and the slot corroborate each other, in
+            # a single verdict. _binding_check is THE one manifest-category
+            # row for this tier — never paired with a second, independently
+            # resolved row (a second row would either restate the same
+            # verdict or, worse, assert something the binding already knows
+            # is false, e.g. "no weight slot" for a tier whose slot exists
+            # but simply doesn't bind).
             # tier_root is already resolved for both main and interim tiers:
             # main  → <adapter_dir>/<tier>/
             # interim → <adapter_dir>/episodic/interim_<stamp>/   (nested)
-            live_slot = _find_live_slot_for_tier(tier_root)
-            if live_slot is None:
-                # No slot dir found — manifest missing
-                meta_path = tier_root / "meta.json"
-                checks.append(
-                    FileCheck(str(meta_path), "manifest", tier_name, _MISSING, "no weight slot")
-                )
-            else:
-                manifest_check = _check_manifest(live_slot, tier_name)
-                checks.append(manifest_check)
+            binding = verify_tier_binding(tier_name, tier_root)
+            checks.append(_binding_check(binding, tier_name))
         elif mode == "simulate":
-            # simulate: manifest is optional (no weight slot expected)
-            live_slot = _find_live_slot_for_tier(tier_root)
-            if live_slot is not None:
-                meta_path = live_slot / "meta.json"
-                checks.append(
-                    FileCheck(str(meta_path), "manifest", tier_name, _SKIPPED, "simulate mode")
-                )
-            # else: no slot, no check needed
+            # simulate: manifest is optional — the payload is graph.json,
+            # nothing binds to it. One unconditional, oracle-free row per
+            # tier: no slot resolution, no I/O beyond the FileCheck itself,
+            # and it can never fail.
+            checks.append(
+                FileCheck(str(reg_path), "manifest", tier_name, _SKIPPED, "simulate mode")
+            )
 
     # -----------------------------------------------------------------------
     # Common files (always optional — fresh installs lack them)
