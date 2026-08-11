@@ -598,7 +598,7 @@ class TestBuildTierGraphStaleProjection:
         )
         # Register stale key — simhash present, entry INTENTIONALLY absent.
         # (Mimics the scenario where the stale key's entry was reaped but the
-        # simhash is retained for the stale-echo seam.)
+        # simhash is retained on the stale record.)
         store.put_simhash("episodic", "graph_stale", 0xBBBB2222)
         # Flip to stale via the registry.
         ep_reg = store.registry("episodic")

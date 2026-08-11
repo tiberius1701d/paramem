@@ -1317,7 +1317,7 @@ class TestKeylessTierSweep:
                 {
                     "active_keys": [],
                     "fidelity_history": {},
-                    "stale": {"k1": {"stale_since": "2026-08-01T00:00:00Z", "stale_cycles": 0}},
+                    "stale": {"k1": {"stale_since": "2026-08-01T00:00:00Z"}},
                     "simhash": {},
                 }
             )

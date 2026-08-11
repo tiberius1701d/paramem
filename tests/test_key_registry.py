@@ -332,9 +332,7 @@ class TestStaleSemantics:
     it; list_stale includes it; is_stale returns True; remove purges from BOTH
     active and stale; save/load round-trips the "stale" field; loading a
     pre-existing registry JSON with no "stale" key yields zero stale keys
-    (backward-compat); stale_cycles starts at 0 and increment_stale_cycles
-    advances it (a newly staled key has stale_cycles=0 at the durable write,
-    unobservable until the second fold reads it back and increments).
+    (backward-compat).
     """
 
     def test_stale_moves_key_from_active_to_stale(self):
@@ -405,32 +403,6 @@ class TestStaleSemantics:
         assert "graph1" not in reg.list_active()
         assert "graph2" in reg.list_stale()
 
-    def test_stale_cycles_starts_at_zero(self):
-        """A freshly staled key has stale_cycles=0."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.stale("graph1")
-        assert reg._stale["graph1"]["stale_cycles"] == 0
-
-    def test_increment_stale_cycles_advances_all_stale_keys(self):
-        """increment_stale_cycles advances stale_cycles for every stale key.
-
-        A key staled in fold N has stale_cycles=0 at the durable write;
-        stale_cycles=1 after increment_stale_cycles (unobservable until
-        the NEXT fold reads it from disk).
-        """
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph1")
-        reg.stale("graph2")
-        reg.increment_stale_cycles()
-        assert reg._stale["graph1"]["stale_cycles"] == 1
-        assert reg._stale["graph2"]["stale_cycles"] == 1
-        # Second increment → 2.
-        reg.increment_stale_cycles()
-        assert reg._stale["graph1"]["stale_cycles"] == 2
-
     def test_save_load_roundtrip_stale_field(self, tmp_path):
         """save_bytes / load round-trips the "stale" partition."""
         reg = KeyRegistry()
@@ -464,33 +436,63 @@ class TestStaleSemantics:
         assert loaded.list_active() == ["graph1", "graph2"]
         assert loaded.list_stale() == []
 
-    def test_two_fold_stale_cycle_sequence(self, tmp_path):
-        """stale_cycles=0 at durable write; =1 after increment.
+    def test_load_legacy_stale_record_with_stale_cycles_field(self, tmp_path):
+        """A stale record carrying a retired ``stale_cycles`` field loads cleanly.
 
-        Two-fold sequence: fold N stales a key and saves (stale_cycles=0 on
-        disk); increment_stale_cycles runs after the durable write (stale_cycles=1
-        in-memory); fold N+1 reads from disk (stale_cycles=0), then increment
-        advances to 1.
+        Legacy-file tolerance: production registries written before the
+        stale-cycle mechanism was deleted may still have ``stale_cycles`` on
+        a stale record. ``_from_payload`` copies the record's fields
+        wholesale (``dict(v)``, no field allowlist), so the extra key is
+        carried into ``_stale`` inert — never read by anything — rather than
+        rejected. The next ``save_bytes()`` still round-trips it (nothing
+        strips it), which is fine: it is dead weight, not a correctness
+        hazard.
+        """
+        path = tmp_path / "legacy_stale_cycles.json"
+        legacy = {
+            "active_keys": ["graph1"],
+            "fidelity_history": {},
+            "stale": {
+                "graph2": {
+                    "stale_since": "2026-08-01T00:00:00Z",
+                    "stale_cycles": 3,
+                    "simhash": 0xCAFE,
+                }
+            },
+            "simhash": {"graph2": 0xCAFE},
+        }
+        path.write_text(_json.dumps(legacy))
+
+        loaded = KeyRegistry.load(path)
+        assert loaded.list_active() == ["graph1"]
+        assert loaded.is_stale("graph2")
+        assert loaded.simhash_for("graph2") == 0xCAFE
+
+    def test_stale_partition_round_trips_across_two_folds(self, tmp_path):
+        """The stale partition survives a two-fold save/load sequence unchanged.
+
+        Fold N stales a key and saves; fold N+1 loads that file and saves it
+        back unmodified (as a no-op fold would) — the stale record's content
+        (``stale_since``, and any simhash) round-trips intact both times.
         """
         reg = KeyRegistry()
         reg.add("graph1")
         reg.stale("graph1")
         path = tmp_path / "registry.json"
-        # Fold N: durable write with stale_cycles=0.
+
+        # Fold N: durable write.
         reg.save(path)
         loaded_at_write = KeyRegistry.load(path)
-        assert loaded_at_write._stale["graph1"]["stale_cycles"] == 0
+        assert "graph1" in loaded_at_write.list_stale()
+        assert (
+            loaded_at_write._stale["graph1"]["stale_since"] == reg._stale["graph1"]["stale_since"]
+        )
 
-        # After durable write, increment runs (in-memory only).
-        reg.increment_stale_cycles()
-        assert reg._stale["graph1"]["stale_cycles"] == 1
-
-        # Fold N+1: load from disk (still 0 — disk was saved before increment).
+        # Fold N+1: load from disk, save again — round-trip is stable.
+        loaded_at_write.save(path)
         loaded_fold_n1 = KeyRegistry.load(path)
-        assert loaded_fold_n1._stale["graph1"]["stale_cycles"] == 0
-        # Then increment again to simulate fold N+1 post-durable-write.
-        loaded_fold_n1.increment_stale_cycles()
-        assert loaded_fold_n1._stale["graph1"]["stale_cycles"] == 1
+        assert "graph1" in loaded_fold_n1.list_stale()
+        assert loaded_fold_n1._stale["graph1"]["stale_since"] == reg._stale["graph1"]["stale_since"]
 
 
 class TestReactivateSemantics:

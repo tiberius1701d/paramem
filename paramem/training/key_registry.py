@@ -60,10 +60,10 @@ class KeyRegistry:
     def __init__(self) -> None:
         self._active_keys: list[str] = []
         self._fidelity_history: dict[str, list[float]] = defaultdict(list)
-        # Stale partition: key -> {"stale_since": ISO, "stale_cycles": int,
+        # Stale partition: key -> {"stale_since": ISO,
         #                          "simhash": int (optional but written by stale())}.
         # Keys here are EXCLUDED from normal enumeration and the SimHash gate.
-        # Their simhash entries are retained for the stale-echo seam.
+        # Their simhash entries are retained on the stale record.
         self._stale: dict[str, dict] = {}
         # Active-key SimHash fingerprints.  Stale fingerprints live in _stale records.
         self._simhash: dict[str, int] = {}
@@ -95,12 +95,11 @@ class KeyRegistry:
         """Move *key* from active to the stale partition (idempotent).
 
         A stale key is excluded from :meth:`list_active`, :meth:`__contains__`,
-        and :meth:`__len__`, but retained in ``_stale`` for the stale-echo probe
-        seam.  Its simhash entry is carried into the stale record so the
-        fingerprint cannot be silently dropped by forgetting the move dance.
+        and :meth:`__len__`, but retained in ``_stale``.  Its simhash entry is
+        carried into the stale record so the fingerprint cannot be silently
+        dropped by forgetting the move dance.
 
-        :meth:`stale_cycles` starts at 0.  Calling ``stale`` on an already-stale
-        or absent key is a no-op.
+        Calling ``stale`` on an already-stale or absent key is a no-op.
         """
         if key in self._active_keys:
             self._active_keys = [k for k in self._active_keys if k != key]
@@ -108,7 +107,6 @@ class KeyRegistry:
             if key not in self._stale:
                 rec: dict = {
                     "stale_since": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                    "stale_cycles": 0,
                 }
                 # Carry the active simhash into the stale record atomically.
                 active_fp = self._simhash.pop(key, None)
@@ -147,9 +145,9 @@ class KeyRegistry:
 
         Distinct from :meth:`__contains__` (active-only, serving semantics): a
         stale key is still KNOWN — its simhash and key_metadata are retained on
-        disk for the stale-echo seam.  Membership-legitimacy consumers (orphan
-        checks, bookkeeping retention) must use this; serving/enumeration
-        consumers keep using :meth:`__contains__` / :meth:`list_active`.
+        disk.  Membership-legitimacy consumers (orphan checks, bookkeeping
+        retention) must use this; serving/enumeration consumers keep using
+        :meth:`__contains__` / :meth:`list_active`.
         """
         return key in self._active_keys or key in self._stale
 
@@ -203,7 +201,7 @@ class KeyRegistry:
 
         Returns ``None`` when the key has no stored fingerprint in either
         partition.  Reading both partitions is load-bearing: a stale key that
-        still has a fingerprint must be verifiable by the stale-echo confidence
+        still has a fingerprint must be verifiable by the SimHash confidence
         gate without first knowing which partition holds it.
         """
         fp = self._simhash.get(key)
@@ -239,10 +237,11 @@ class KeyRegistry:
         """Active∪stale fingerprint map ``{key: fp}`` for all keys that have one.
 
         PRIVATE — intentionally not a public accessor.  Used by
-        :meth:`MemoryStore.tier_simhashes(include_stale=True)`, the
-        integrity check, and :meth:`load_simhashes` (the on-disk leaf,
-        which projects a freshly-parsed payload through this same
-        accessor).
+        :meth:`save_bytes` (the on-disk serialization) and
+        :meth:`load_simhashes` (the on-disk leaf, which projects a
+        freshly-parsed payload through this same accessor), plus
+        :meth:`MemoryStore.simhash_count_in_tier` for the consolidation-summary
+        key counts.
 
         The returned map is what is serialised to ``indexed_key_registry.json``
         under the ``"simhash"`` key, so the on-disk file always holds the full
@@ -254,19 +253,6 @@ class KeyRegistry:
             if "simhash" in rec:
                 result[k] = rec["simhash"]
         return result
-
-    def increment_stale_cycles(self) -> None:
-        """Advance ``stale_cycles`` by 1 for every entry in the stale partition.
-
-        Called by the fold finalize after a durable write so un-persisted
-        stale sets do not advance decay on abort. Called at fold N: a key
-        staled in fold N has stale_cycles=0 at the durable write; this call
-        raises it to 1 in memory only — the registry file was already
-        written before this call and is not rewritten after it, so the
-        on-disk value stays 0.
-        """
-        for rec in self._stale.values():
-            rec["stale_cycles"] = rec.get("stale_cycles", 0) + 1
 
     def __len__(self) -> int:
         return len(self._active_keys)

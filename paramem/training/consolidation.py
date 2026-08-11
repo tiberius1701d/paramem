@@ -1124,8 +1124,10 @@ class ConsolidationLoop:
 
         Per the wipe invariant (2026-05-14): ``key_metadata.json`` is
         bookkeeping for active keys, not a recovery source.  Persists
-        bookkeeping for BOTH active and stale keys — stale-echo probes need
-        to resolve speaker/relation_type for a soft-staled key.  A key with
+        bookkeeping for BOTH active and stale keys — a soft-staled key is
+        still known (:meth:`~paramem.training.key_registry.KeyRegistry.knows`)
+        and its speaker/relation_type bookkeeping must survive the
+        active→stale transition.  A key with
         no bookkeeping record is skipped rather than given a fabricated one;
         it stays recordless on reload, which every bookkeeping read site
         already tolerates via ``bookkeeping_for_key(k) or {}``.
@@ -1611,8 +1613,8 @@ class ConsolidationLoop:
         live registry would wipe any stale flip applied during the drift-partition
         step.  Pass ``soft_stale_by_tier`` so the rebuilt registry seeds the stale
         partition BEFORE adding the active keys.  Stale simhashes are also
-        merged back into the rebuilt simhash dict so they survive on disk for the
-        stale-echo seam.  An EMPTY tier (no active keys) only resets its
+        merged back into the rebuilt simhash dict so they survive on disk.
+        An EMPTY tier (no active keys) only resets its
         registry and reseeds its stale partition this way — it has no
         ``tier_keyed`` entries to write, so it touches no entry-cache content.
 
@@ -1621,10 +1623,9 @@ class ConsolidationLoop:
                 Every key present is admitted into the rebuilt registry and
                 written into the entry cache.
             soft_stale_by_tier: Per-tier dict of soft-staled keys captured at the
-                drift-partition step.  Keys map to
-                ``{"stale_cycles": int, "simhash": int | None}``.  When ``None``
-                (the default, for callers that do not have a stale partition), no
-                stale seeding occurs.
+                drift-partition step.  Keys map to ``{"simhash": int | None}``.
+                When ``None`` (the default, for callers that do not have a
+                stale partition), no stale seeding occurs.
         """
         _stale_partition = soft_stale_by_tier or {}
         for _main_tier in ("episodic", "semantic", "procedural"):
@@ -3189,7 +3190,7 @@ class ConsolidationLoop:
 
         Returns:
             ``soft_stale_by_tier`` — a per-tier dict mapping staled key strings
-            to ``{"stale_cycles": int, "simhash": int|None}`` records.  Passed
+            to ``{"simhash": int|None}`` records.  Passed
             by the fold caller to
             :meth:`_rebuild_main_tier_state` so the rebuilt
             registry seeds the stale partition.  The interim caller (in
@@ -3253,7 +3254,7 @@ class ConsolidationLoop:
             self.store.discard_keys([_ik], mode="stale")
 
             if _dk_tier is not None:
-                _stale_rec: dict = {"stale_cycles": 0}
+                _stale_rec: dict = {}
                 if _dk_simhash is not None:
                     _stale_rec["simhash"] = _dk_simhash
                 soft_stale_by_tier.setdefault(_dk_tier, {})[_ik] = _stale_rec
@@ -4970,7 +4971,7 @@ class ConsolidationLoop:
                             _dk_simhash = self.store.simhash(_dk_tier, _dk)
                         self.store.discard_keys([_dk], mode="stale")
                         if _dk_tier is not None:
-                            _stale_rec = {"stale_cycles": 0}
+                            _stale_rec = {}
                             if _dk_simhash is not None:
                                 _stale_rec["simhash"] = _dk_simhash
                             soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
@@ -5033,8 +5034,7 @@ class ConsolidationLoop:
                     logger.info(
                         "graph_drift_key key=%s bucket=deduplicated"
                         " subject=%r predicate=%r object=%r"
-                        " (registry-true duplicate — soft-staled; record retained"
-                        " for stale-echo seam)",
+                        " (registry-true duplicate — soft-staled; record retained)",
                         _dk,
                         (_dk_entry or {}).get("subject", ""),
                         (_dk_entry or {}).get("predicate", ""),
@@ -5833,14 +5833,6 @@ class ConsolidationLoop:
                 # except above re-raises) the marker is intentionally LEFT
                 # so a retry can resume completed tiers without retraining.
                 self._clear_fold_resume_and_scratch(reason="after persist")
-
-                if soft_stale_by_tier:
-                    for _st_tier in ("episodic", "semantic", "procedural"):
-                        self.store.registry(_st_tier).increment_stale_cycles()
-                    logger.debug(
-                        "_run_fold[main_tiers]: stale_cycles advanced for %d soft-staled key(s)",
-                        sum(len(v) for v in soft_stale_by_tier.values()),
-                    )
 
             if not _absorbed_interims:
                 logger.info(

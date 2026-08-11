@@ -11725,12 +11725,10 @@ class TestPersistFoldMainTiersCommit:
             "the pre-existing procedural slot must still resolve at the new (restamped) hash"
         )
 
-    def test_soft_stale_only_fold_commits_once_and_advances_stale_cycles(self, tmp_path):
+    def test_soft_stale_only_fold_commits_once(self, tmp_path):
         """A fold that only soft-stales a key (nothing retrained) commits
-        the flip to disk exactly once via the no-retrain restamp, and
-        ``stale_cycles`` advances — the increment now genuinely runs AFTER
-        a durable write, for every venue, not just the ones that retrained
-        a tier."""
+        the flip to disk exactly once via the no-retrain restamp — for
+        every venue, not just the ones that retrained a tier."""
         from unittest.mock import patch
 
         import paramem.memory.persistence as persistence_mod
@@ -11785,9 +11783,6 @@ class TestPersistFoldMainTiersCommit:
             f"episodic's registry must be committed exactly once; got {len(episodic_calls)} calls"
         )
         assert loop.store.registry("episodic").is_stale("graph_stale")
-        # stale_cycles advanced from 0 to 1 for the just-staled key.
-        stale_rec = loop.store.registry("episodic")._stale["graph_stale"]  # noqa: SLF001
-        assert stale_rec["stale_cycles"] == 1, f"got {stale_rec}"
         new_hash = tier_registry_sha256(episodic_root)
         assert find_live_slot(episodic_root, new_hash) == pre_slot, (
             "the pre-existing episodic slot must resolve at the new (restamped) hash"

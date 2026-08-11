@@ -357,8 +357,8 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
 
     # The retention union includes BOTH active and stale keys so that a
     # soft-staled key's bookkeeping survives the prune.  A stale key is absent
-    # from list_active() but present in list_stale(); pruning it would break the
-    # stale-echo seam (bookkeeping is required to resolve speaker/relation_type).
+    # from list_active() but present in list_stale(); pruning it would delete
+    # bookkeeping still needed to resolve speaker/relation_type for that key.
     active: set[str] = set()
     for _tier, tier_root in iter_tier_roots(config.adapter_dir):
         reg_path = tier_root / "indexed_key_registry.json"

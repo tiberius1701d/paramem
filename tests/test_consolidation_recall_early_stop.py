@@ -823,7 +823,7 @@ class TestResetRegistersEveryKey:
             ],
         }
         soft_stale_by_tier = {
-            "episodic": {"graph_stale": {"stale_cycles": 1, "simhash": 0xDEAD}},
+            "episodic": {"graph_stale": {"simhash": 0xDEAD}},
         }
 
         from unittest.mock import patch

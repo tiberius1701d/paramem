@@ -235,7 +235,7 @@ class TestSoftStaleBookkeepingRetention:
     A stale key is absent from list_active() but present in list_stale().  Before
     the soft-stale fix, the retention union only included active keys, so a
     soft-staled key's bookkeeping was silently pruned after the next consolidation
-    cycle — breaking the stale-echo seam (no speaker/relation_type to resolve).
+    cycle — losing the speaker/relation_type needed to resolve it.
     """
 
     def test_prune_does_not_delete_stale_key_metadata(self, tmp_path):

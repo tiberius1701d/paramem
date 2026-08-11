@@ -117,7 +117,6 @@ def _make_enriched_registry(n: int, tmp_path: Path) -> Path:
             "session_id": "s1",
             "status": "active",
             "stale_since": None,
-            "stale_cycles": 0,
         }
         for i in range(1, n + 1)
     }

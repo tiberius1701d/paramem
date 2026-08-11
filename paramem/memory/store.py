@@ -965,7 +965,7 @@ class MemoryStore:
             For each key, call :meth:`KeyRegistry.stale` on the owning tier.
             The stale transition automatically carries the active simhash into
             the stale record (encapsulated in :meth:`KeyRegistry.stale`), so
-            the fingerprint is retained for the stale-echo probe.  Entries
+            the fingerprint is retained on the stale record.  Entries
             and bookkeeping are untouched — only the erase branch retires
             those.
 
