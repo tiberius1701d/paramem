@@ -248,6 +248,41 @@ def render_service_unit(endpoint: str, project_root: str) -> str:
     (e.g. 401 / 403) so a future misconfiguration surfaces as a failed
     systemd unit rather than a silent no-op.
 
+    ``--retry 3 --retry-connrefused --retry-delay 120`` covers the observed
+    startup race where ``paramem-server.service`` is ordered (``After=``)
+    but not gated on readiness: systemd starts the server process and the
+    tick unit in process order, not listener-ready order, and the server
+    has taken up to ~4 minutes to reach ``listen()``. A firing that lands
+    in that window previously hit connection-refused and was lost outright
+    (there is no cross-firing retry — the next attempt is the *next*
+    scheduled tick). With these flags curl attempts at t=0/2/4/6 minutes
+    (fixed ``--retry-delay``, not the default exponential backoff) and then
+    gives up until the next scheduled firing.
+    ``--retry-connrefused`` (curl 7.52.0+) is required because plain
+    ``--retry`` classes only timeouts, FTP 4xx, and HTTP
+    408/429/500/502/503/504 as transient (``man curl`` / ``curl --help
+    all``, verified curl 8.5.0) — ECONNREFUSED is not on that list without
+    it. A ``200`` deferral response is not a transient error and is never
+    retried; a 401/403 refusal is likewise not on the transient list (only
+    408/429 among 4xx are) and, combined with ``--fail-with-body``, still
+    fails the unit on the first attempt without retrying. 5xx/408/429
+    responses DO retry under ``--retry`` — accepted, since those are
+    legitimately transient on this server too.
+    A ``refresh_cadence`` shorter than the ~6-minute retry window (the
+    grammar's only floor is `count > 0`, e.g. ``"every 1m"`` parses) can let
+    the next scheduled firing land while a retry sequence from the previous
+    firing is still in flight. This is harmless, not raced: per
+    ``man systemd.timer``, "in case the unit to activate is already active
+    at the time the timer elapses it is not restarted, but simply left
+    running — there is no concept of spawning new service instances in this
+    case"; a redundant ``start`` job for a still-activating unit is merged
+    with the pending one under systemd's default ``--job-mode=replace``
+    (``man systemctl``), not queued as a second concurrent run. So the
+    in-flight retry continues undisturbed and the redundant trigger is a
+    no-op — no concurrent curl, no duplicate dispatch. (The dispatcher's own
+    durable last-attempt stamp, see the module docstring, is a second,
+    independent guard against a duplicate dispatch reaching the arbitrator.)
+
     Parameters
     ----------
     endpoint:
@@ -281,7 +316,8 @@ def render_service_unit(endpoint: str, project_root: str) -> str:
         # e.g. ``/bin/bash``); systemd expands ``%%s`` -> literal ``%s`` in the
         # rendered unit so ``sh``/``printf`` receives the intended format string.
         'ExecStart=/bin/sh -c \'printf "%%s" "Authorization: Bearer $PARAMEM_API_TOKEN"'
-        f" | /usr/bin/curl -sS --fail-with-body -X POST --max-time 10 -H @- {endpoint}'\n"
+        f" | /usr/bin/curl -sS --fail-with-body -X POST --max-time 10"
+        f" --retry 3 --retry-connrefused --retry-delay 120 -H @- {endpoint}'\n"
     )
 
 

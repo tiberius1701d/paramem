@@ -439,6 +439,61 @@ class TestRenderServiceUnitAuth:
             "Bare -f flag conflicts with --fail-with-body and must be absent"
         )
 
+    def test_retry_flags_present(self):
+        """curl must retry connection-refused failures during server startup.
+
+        ``--retry 3 --retry-connrefused --retry-delay 120`` covers the
+        observed ~4-minute server startup window with attempts at
+        t=0/2/4/6 minutes (see ``render_service_unit`` docstring).
+        """
+        text = self._render()
+        assert "--retry 3" in text, "curl must retry up to 3 times"
+        assert "--retry-connrefused" in text, (
+            "curl must treat connection-refused as a transient, retryable error"
+        )
+        assert "--retry-delay 120" in text, "retry delay must be fixed at 120s"
+
+    def test_retry_connrefused_present(self):
+        """Dedicated pin: dropping only ``--retry-connrefused`` must fail this test.
+
+        Plain ``--retry`` does not class ECONNREFUSED as transient (``man
+        curl``: transient means a timeout, an FTP 4xx response, or HTTP
+        408/429/500/502/503/504) — ``--retry-connrefused`` (curl 7.52.0+) is
+        required to cover the connection-refused failure this retry was
+        added for.
+        """
+        text = self._render()
+        assert "--retry-connrefused" in text
+
+    def test_retry_window_fits_documented_startup_gap(self):
+        """The retry window (delay x retries) must match the documented 0/2/4/6-minute schedule.
+
+        This is not a floor derived from the schedulable-cadence grammar —
+        overlap with a faster-firing ``refresh_cadence`` is harmless per
+        ``man systemd.timer`` (an already-active/activating unit is left
+        running, not restarted) plus systemd's default job-merge behavior
+        (``man systemctl --job-mode=replace``); see the docstring note on
+        ``render_service_unit``. This test only pins the retry arithmetic
+        against the observed ~4-minute startup gap it was sized for.
+        """
+        import re
+
+        text = self._render()
+        retry_match = re.search(r"--retry (\d+)", text)
+        delay_match = re.search(r"--retry-delay (\d+)", text)
+        assert retry_match is not None
+        assert delay_match is not None
+        retries = int(retry_match.group(1))
+        delay_seconds = int(delay_match.group(1))
+        total_window_seconds = retries * delay_seconds
+        # 3 retries x 120s = 360s (6 minutes) - comfortably covers the
+        # observed ~4-minute connection-refused window from last night's
+        # 00:00:50 firing.
+        assert total_window_seconds == 360, (
+            f"Expected a 6-minute total retry window (3 x 120s), got "
+            f"{retries} x {delay_seconds}s = {total_window_seconds}s"
+        )
+
     def test_execstart_is_single_logical_line(self):
         """ExecStart must be a single physical line (no backslash line-continuations)."""
         text = self._render()
