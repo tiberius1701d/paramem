@@ -1048,10 +1048,9 @@ repetition_penalty=1.1.
    adds per-key: `created_at`, `last_seen_at`, `session_id`, `status`
    (active/stale), `stale_since`, `stale_cycles`. Backward compatible.
 
-4. **Rolling key reclamation:** `mark_stale()`, `get_reclaimable_keys()`,
-   `get_active_keys()`. Stale keys are deregistered (Layer 1 rejects them).
-   After a configurable number of cycles, key IDs can be recycled. Mechanism
-   in place, not yet wired into the training loop.
+4. **Stale key lifecycle:** A key moved to the stale partition is deregistered
+   (excluded from retrieval enumeration; the untrained-key layer rejects it).
+   Key-id recycling is not implemented.
 
 ---
 

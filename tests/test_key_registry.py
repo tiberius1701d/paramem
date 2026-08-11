@@ -330,12 +330,11 @@ class TestStaleSemantics:
 
     Covers: stale(key) moves a key from active to stale; list_active excludes
     it; list_stale includes it; is_stale returns True; remove purges from BOTH
-    active and stale; get_reclaimable returns stale keys past the cycle
-    threshold; save/load round-trips the "stale" field; loading a pre-existing
-    registry JSON with no "stale" key yields zero stale keys (backward-compat);
-    stale_cycles starts at 0 and increment_stale_cycles advances it (a newly
-    staled key has stale_cycles=0 at the durable write, unobservable until
-    the second fold reads it back and increments).
+    active and stale; save/load round-trips the "stale" field; loading a
+    pre-existing registry JSON with no "stale" key yields zero stale keys
+    (backward-compat); stale_cycles starts at 0 and increment_stale_cycles
+    advances it (a newly staled key has stale_cycles=0 at the durable write,
+    unobservable until the second fold reads it back and increments).
     """
 
     def test_stale_moves_key_from_active_to_stale(self):
@@ -405,21 +404,6 @@ class TestStaleSemantics:
         reg.remove("graph1")
         assert "graph1" not in reg.list_active()
         assert "graph2" in reg.list_stale()
-
-    def test_get_reclaimable_threshold(self):
-        """get_reclaimable returns stale keys with stale_cycles >= threshold."""
-        reg = KeyRegistry()
-        reg.add("graph1")
-        reg.add("graph2")
-        reg.stale("graph1")
-        reg.stale("graph2")
-        # Both start at stale_cycles=0.
-        assert reg.get_reclaimable(min_stale_cycles=1) == []
-        # Advance graph1 to stale_cycles=1.
-        reg._stale["graph1"]["stale_cycles"] = 1
-        reclaimable = reg.get_reclaimable(min_stale_cycles=1)
-        assert reclaimable == ["graph1"]
-        assert "graph2" not in reclaimable
 
     def test_stale_cycles_starts_at_zero(self):
         """A freshly staled key has stale_cycles=0."""

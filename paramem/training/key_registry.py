@@ -38,12 +38,14 @@ class KeyRegistry:
 
     Keys can be in one of three states:
     - **active**: in ``_active_keys``, enumerated by all normal paths.
-    - **stale**: in ``_stale``, excluded from enumeration and the SimHash gate,
-      retained for the stale-echo research seam and id-recycling via
-      ``get_reclaimable``.  Named :meth:`stale` (not ``mark_stale``) to avoid
-      colliding with the dead free function ``persistence.mark_stale``.
+    - **stale**: in ``_stale``, excluded from enumeration and the SimHash gate
+      (``__contains__``, ``list_active``, ``_active_simhashes``), but still
+      retained in ``list_known()``'s active∪stale union — the bookkeeping
+      retention set :func:`paramem.server.consolidation.prune_key_metadata_orphans`
+      reads to decide which ``key_metadata.json`` rows survive an orphan
+      sweep.
     - **removed**: not present anywhere; via :meth:`remove` (hard erasure,
-      used by ``/forget`` and reclaim).
+      used by ``/forget``).
 
     SimHash fingerprints are co-located on this record.  Active key fingerprints
     live in ``_simhash``; stale fingerprints are carried inside the stale record
@@ -78,8 +80,11 @@ class KeyRegistry:
     def remove(self, key: str) -> None:
         """Hard-remove a key from this tier (active list, stale set, fidelity, simhash).
 
-        Used by ``/forget`` (privacy erasure) and the reclaim path.  A removed
-        key is GONE — neither active nor stale.  Does not raise on absent keys.
+        Reached via :meth:`MemoryStore.delete` (every hard-erasure door —
+        ``/forget``, ``/debug/erase-keys``, and mint-reversal on a fold
+        refusal — funnel through it) and :meth:`MemoryStore.move` (tier
+        promotion).  A removed key is GONE — neither active nor stale.
+        Does not raise on absent keys.
         """
         self._active_keys = [k for k in self._active_keys if k != key]
         self._fidelity_history.pop(key, None)
@@ -250,26 +255,15 @@ class KeyRegistry:
                 result[k] = rec["simhash"]
         return result
 
-    def get_reclaimable(self, min_stale_cycles: int) -> list[str]:
-        """Return stale keys whose ``stale_cycles`` >= *min_stale_cycles*.
-
-        # STALE-RECLAIM SEAM — the reclaim *tick* that actually recycles
-        # stale key-ids is deliberately deferred.  This primitive is wired
-        # so the on-disk ``stale_cycles`` field advances truthfully (via
-        # ``increment_stale_cycles``); the reclaim caller is not yet built.
-        """
-        return [
-            k for k, rec in self._stale.items() if rec.get("stale_cycles", 0) >= min_stale_cycles
-        ]
-
     def increment_stale_cycles(self) -> None:
         """Advance ``stale_cycles`` by 1 for every entry in the stale partition.
 
-        # STALE-RECLAIM SEAM — called by the fold finalize after a durable
-        # write so un-persisted stale sets do not advance decay on abort.
-        Called at fold N: a key staled in fold N has stale_cycles=0 at the
-        durable write; stale_cycles=1 after this call (unobservable until
-        fold N+1 reads it from disk).
+        Called by the fold finalize after a durable write so un-persisted
+        stale sets do not advance decay on abort. Called at fold N: a key
+        staled in fold N has stale_cycles=0 at the durable write; this call
+        raises it to 1 in memory only — the registry file was already
+        written before this call and is not rewritten after it, so the
+        on-disk value stays 0.
         """
         for rec in self._stale.values():
             rec["stale_cycles"] = rec.get("stale_cycles", 0) + 1
