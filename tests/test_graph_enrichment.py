@@ -172,14 +172,15 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
 
     Nodes are keyed in canonical form (lowercase, separator-folded) matching
     the live merger's node-key convention post-model-A.  Surface display names
-    are stored in attributes["name"] where needed by individual tests.
+    are stored on the node's display_name field where needed by individual
+    tests.
     """
     for i in range(n_persons):
         name = f"person{i}"
         graph.add_node(
             name,
             entity_type="person",
-            attributes={"name": f"Person{i}"},
+            display_name=f"Person{i}",
             reinforcement_count=i + 1,
             sessions=[f"s{i:03d}"],
             first_seen=f"s{i:03d}",
@@ -190,7 +191,7 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
     graph.add_node(
         org,
         entity_type="organization",
-        attributes={"name": "AcmeCorp"},
+        display_name="AcmeCorp",
         reinforcement_count=n_persons,
         sessions=["s000"],
         first_seen="s000",
@@ -233,7 +234,7 @@ def _populate_disjoint_clusters(
         graph.add_node(
             hub,
             entity_type="organization",
-            attributes={"name": f"Hub{c}"},
+            display_name=f"Hub{c}",
             reinforcement_count=10_000 - c,
             sessions=[f"s{c}00"],
             first_seen=f"s{c}00",
@@ -244,7 +245,7 @@ def _populate_disjoint_clusters(
             graph.add_node(
                 person,
                 entity_type="person",
-                attributes={"name": f"Cluster{c}Person{j}"},
+                display_name=f"Cluster{c}Person{j}",
                 reinforcement_count=1,
                 sessions=[f"s{c}{j:02d}"],
                 first_seen=f"s{c}{j:02d}",
@@ -496,7 +497,7 @@ class TestSameAsContractsNodes:
         graph.add_node(
             "alice",
             entity_type="person",
-            attributes={"name": "Alice"},
+            display_name="Alice",
             reinforcement_count=3,
             sessions=["s010"],
             first_seen="s010",
@@ -505,7 +506,7 @@ class TestSameAsContractsNodes:
         graph.add_node(
             "alicia",
             entity_type="person",
-            attributes={"name": "Alicia"},
+            display_name="Alicia",
             reinforcement_count=1,
             sessions=["s011"],
             first_seen="s011",
@@ -666,7 +667,7 @@ class TestSameAsDedupAcrossChunks:
             graph.add_node(
                 key,
                 entity_type="person",
-                attributes={"name": display},
+                display_name=display,
                 reinforcement_count=3,
                 sessions=["s040"],
                 first_seen="s040",
@@ -709,7 +710,7 @@ class TestSameAsDedupAcrossChunks:
             graph.add_node(
                 key,
                 entity_type="person",
-                attributes={"name": display},
+                display_name=display,
                 reinforcement_count=3,
                 sessions=["s050"],
                 first_seen="s050",
@@ -762,7 +763,7 @@ class TestSameAsDedupAcrossChunks:
         graph.add_node(
             "yang ming",
             entity_type="person",
-            attributes={"name": "Yang Ming"},
+            display_name="Yang Ming",
             reinforcement_count=3,
             sessions=["s030"],
             first_seen="s030",
@@ -771,7 +772,7 @@ class TestSameAsDedupAcrossChunks:
         graph.add_node(
             "mr. yang",
             entity_type="person",
-            attributes={"name": "Mr. Yang"},
+            display_name="Mr. Yang",
             reinforcement_count=2,
             sessions=["s031"],
             first_seen="s031",
@@ -936,7 +937,7 @@ class TestCorefRemapBeforeEdgeInsert:
         graph.add_node(
             "alexander",
             entity_type="person",
-            attributes={"name": "Alexander"},
+            display_name="Alexander",
             reinforcement_count=3,
             sessions=["s050"],
             first_seen="s050",
@@ -945,7 +946,7 @@ class TestCorefRemapBeforeEdgeInsert:
         graph.add_node(
             "alex",
             entity_type="person",
-            attributes={"name": "Alex"},
+            display_name="Alex",
             reinforcement_count=1,
             sessions=["s051"],
             first_seen="s051",
@@ -954,7 +955,7 @@ class TestCorefRemapBeforeEdgeInsert:
         graph.add_node(
             "acme",
             entity_type="organization",
-            attributes={"name": "Acme"},
+            display_name="Acme",
             reinforcement_count=5,
             sessions=["s050"],
             first_seen="s050",
@@ -1396,7 +1397,7 @@ class TestEmptyMappingProceeds:
                 sid,
                 entity_type="person",
                 speaker_id=sid,
-                attributes={"name": sid},
+                display_name=sid,
                 reinforcement_count=1,
                 sessions=["s000"],
                 first_seen="s000",
@@ -1567,7 +1568,7 @@ class TestGuardDomainSeparation:
                 sid,
                 entity_type="person",
                 speaker_id=sid,
-                attributes={"name": sid},
+                display_name=sid,
                 reinforcement_count=100,
                 sessions=["s000"],
                 first_seen="s000",
@@ -1588,7 +1589,7 @@ class TestGuardDomainSeparation:
         graph.add_node(
             "bridge",
             entity_type="concept",
-            attributes={"name": "Bridge"},
+            display_name="Bridge",
             reinforcement_count=1,
             sessions=[],
             first_seen="",
@@ -1606,7 +1607,7 @@ class TestGuardDomainSeparation:
         graph.add_node(
             "x_node",
             entity_type="concept",
-            attributes={"name": "XNode"},
+            display_name="XNode",
             reinforcement_count=1,
             sessions=[],
             first_seen="",
@@ -1631,7 +1632,7 @@ class TestGuardDomainSeparation:
             graph.add_node(
                 filler,
                 entity_type="concept",
-                attributes={"name": filler},
+                display_name=filler,
                 reinforcement_count=0,
                 sessions=[],
                 first_seen="",
@@ -1651,7 +1652,7 @@ class TestGuardDomainSeparation:
             graph.add_node(
                 filler,
                 entity_type="concept",
-                attributes={"name": filler},
+                display_name=filler,
                 reinforcement_count=0,
                 sessions=[],
                 first_seen="",
@@ -1950,7 +1951,7 @@ class TestSliceCounters:
             graph.add_node(
                 name,
                 entity_type="person",
-                attributes={"name": f"Emp{i}"},
+                display_name=f"Emp{i}",
                 reinforcement_count=i + 1,
                 sessions=[],
                 first_seen=f"s{i:03d}",
@@ -3953,7 +3954,7 @@ class TestEnrichmentRemovalLedger:
         graph.add_node(
             "alice",
             entity_type="person",
-            attributes={"name": "Alice"},
+            display_name="Alice",
             reinforcement_count=3,
             sessions=["s010"],
             first_seen="s010",
@@ -3962,7 +3963,7 @@ class TestEnrichmentRemovalLedger:
         graph.add_node(
             "alicia",
             entity_type="person",
-            attributes={"name": "Alicia"},
+            display_name="Alicia",
             reinforcement_count=1,
             sessions=["s011"],
             first_seen="s011",
@@ -4180,8 +4181,8 @@ class TestInterimKeyingSeams:
             loop.store.load_registry(tier, KeyRegistry())
 
         # Concept node — no speaker_id attr, edge carries no speaker_id.
-        loop.merger.graph.add_node("concept_b", attributes={"name": "ConceptB"})
-        loop.merger.graph.add_node("london", attributes={"name": "London"})
+        loop.merger.graph.add_node("concept_b", display_name="ConceptB")
+        loop.merger.graph.add_node("london", display_name="London")
         loop.merger.graph.add_edge(
             "concept_b", "london", predicate="visits", relation_type="factual"
         )
@@ -4270,8 +4271,8 @@ class TestInterimKeyingSeams:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        loop.merger.graph.add_node("frank", speaker_id="speaker1", attributes={"name": "Frank"})
-        loop.merger.graph.add_node("hamburg", attributes={"name": "Hamburg"})
+        loop.merger.graph.add_node("frank", speaker_id="speaker1", display_name="Frank")
+        loop.merger.graph.add_node("hamburg", display_name="Hamburg")
         loop.merger.graph.add_edge(
             "frank", "hamburg", predicate="works_in", relation_type="factual"
         )
@@ -4400,7 +4401,7 @@ class TestEnrichmentThroughMergerComposition:
             loop.merger.graph.add_node(
                 name,
                 entity_type="person",
-                attributes={"name": name.capitalize()},
+                display_name=name.capitalize(),
                 reinforcement_count=2,
                 sessions=["s099"],
                 first_seen="s099",
@@ -4449,7 +4450,7 @@ class TestEnrichmentThroughMergerComposition:
             loop.merger.graph.add_node(
                 name,
                 entity_type="person",
-                attributes={"name": name.capitalize()},
+                display_name=name.capitalize(),
                 reinforcement_count=1,
                 sessions=["s001"],
                 first_seen="s001",
@@ -4521,8 +4522,8 @@ class TestDeferredFlushAllowEmpty:
             loop.store.load_registry(tier, KeyRegistry())
 
         # Concept edge — no speaker attribution.
-        loop.merger.graph.add_node("idea_x", attributes={"name": "IdeaX"})
-        loop.merger.graph.add_node("idea_y", attributes={"name": "IdeaY"})
+        loop.merger.graph.add_node("idea_x", display_name="IdeaX")
+        loop.merger.graph.add_node("idea_y", display_name="IdeaY")
         loop.merger.graph.add_edge(
             "idea_x", "idea_y", predicate="related_to", relation_type="factual"
         )
@@ -4611,7 +4612,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         # by the canonical speaker_id: "speaker0".
         _seed_speaker_node(loop, "speaker0", "Alex")
         # A concept node the speaker relates to.
-        loop.merger.graph.add_node("mentoring", attributes={"name": "Mentoring"})
+        loop.merger.graph.add_node("mentoring", display_name="Mentoring")
 
         # Confirm the key convention: canonical lowercase key only.
         assert "speaker0" in loop.merger.graph.nodes
@@ -4639,14 +4640,14 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         assert "speaker0" in loop.merger.graph.nodes
         # The speaker node carries its speaker_id.  _synth_speaker_entities emits
         # Entity(name="speaker0", speaker_id="speaker0") which refreshes
-        # attributes["name"] to "speaker0" (the canonical speaker_id).
+        # display_name to "speaker0" (the canonical speaker_id).
         node = loop.merger.graph.nodes["speaker0"]
         assert node.get("speaker_id") == "speaker0", (
             f"Speaker node must carry speaker_id='speaker0'; got {node.get('speaker_id')!r}"
         )
-        assert node["attributes"].get("name") == "speaker0", (
-            f"Speaker node attributes['name'] must be 'speaker0' after enrichment; "
-            f"got {node['attributes'].get('name')!r}"
+        assert node.get("display_name") == "speaker0", (
+            f"Speaker node display_name must be 'speaker0' after enrichment; "
+            f"got {node.get('display_name')!r}"
         )
         # The enrichment edge roots at the canonical speaker node and carries
         # speaker_id="speaker0" (from the node's attribute).
@@ -4662,7 +4663,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             f"Edge speaker_id must be 'speaker0' (from the node attribute); "
             f"got {d.get('speaker_id')!r}"
         )
-        # The minted training subject reads attributes["name"] = "speaker0".
+        # The minted training subject reads display_name = "speaker0".
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
         enrichment_entries = [
@@ -4676,6 +4677,64 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         minted_subject = enrichment_entries[0]["subject"]
         assert minted_subject == "speaker0", (
             f"Minted indexed-key training subject must be 'speaker0'; got {minted_subject!r}"
+        )
+
+    def test_non_speaker_endpoint_uses_the_node_display_name(self, tmp_path, monkeypatch):
+        """``_endpoint_str`` passes the node's ``display_name`` for a
+        non-speaker endpoint that already has one — not the bare canonical
+        node key.  Captures the ``Relation`` objects reaching
+        ``GraphMerger.merge_relations`` (the direct consumer of
+        ``_endpoint_str``'s return value) so a regression to the canonical
+        key is caught even though the merger's own first-seen-wins guard
+        would otherwise mask it downstream."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        _populate_graph(loop.merger.graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # _populate_graph seeds "person0" (display "Person0") and "acmecorp"
+        # (display "AcmeCorp") among the 10 persons + 1 org, already linked
+        # by "works at" — neither node carries a speaker_id, so both
+        # endpoints exercise the display branch.
+        assert loop.merger.graph.nodes["person0"]["display_name"] == "Person0"
+        assert loop.merger.graph.nodes["acmecorp"]["display_name"] == "AcmeCorp"
+
+        rels = [
+            {
+                "subject": "person0",
+                "predicate": "mentioned_alongside",
+                "object": "acmecorp",
+                "relation_type": "factual",
+                "confidence": 0.9,
+                "symmetric": False,
+            }
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.graph_enrich.request_graph_enrichment",
+                return_value=(rels, [], "raw", 0),
+            ),
+            patch.object(
+                loop.merger, "merge_relations", wraps=loop.merger.merge_relations
+            ) as spy_merge_relations,
+        ):
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert spy_merge_relations.called, "the enrichment relation must reach merge_relations"
+        (captured_relations,), _kwargs = spy_merge_relations.call_args
+        assert len(captured_relations) == 1
+        captured = captured_relations[0]
+        assert captured.subject == "Person0", (
+            f"non-speaker subject endpoint must carry the node's display_name "
+            f"'Person0', not the canonical key; got {captured.subject!r}"
+        )
+        assert captured.object == "AcmeCorp", (
+            f"non-speaker object endpoint must carry the node's display_name "
+            f"'AcmeCorp', not the canonical key; got {captured.object!r}"
         )
 
     def test_speaker_to_speaker_two_keys_distinct_speakers_router_filed(
@@ -4784,14 +4843,14 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         loop.merger.graph.add_node(
             "alex",
             entity_type="person",
-            attributes={"name": "Alex"},
+            display_name="Alex",
             reinforcement_count=1,
             sessions=["s200"],
             first_seen="s200",
             last_seen="s200",
         )
         # Give "alex" an edge so the contraction has something to move.
-        loop.merger.graph.add_node("rust", attributes={"name": "Rust"})
+        loop.merger.graph.add_node("rust", display_name="Rust")
         loop.merger.graph.add_edge("alex", "rust", predicate="knows", relation_type="factual")
 
         assert "speaker0" in loop.merger.graph.nodes
@@ -5155,7 +5214,7 @@ class TestSpeakerPredecessorInheritance:
         tier_keyed2: dict = {"episodic": [], "semantic": [], "procedural": []}
 
         # Add a raw edge whose edge data carries speaker_id (simulates extraction stamp).
-        loop.merger.graph.add_node("work_item", attributes={"name": "Work Item"})
+        loop.merger.graph.add_node("work_item", display_name="Work Item")
         loop.merger.graph.add_edge(
             "concept_x",
             "work_item",
@@ -5164,7 +5223,7 @@ class TestSpeakerPredecessorInheritance:
             speaker_id="speaker0",  # edge-level stamp
             confidence=0.9,
         )
-        loop.merger.graph.add_node("concept_x", attributes={"name": "Concept X"})
+        loop.merger.graph.add_node("concept_x", display_name="Concept X")
 
         loop._build_all_edge_entries_into(tier_keyed2)
 
@@ -5256,7 +5315,7 @@ class TestSpeakerPredecessorInheritance:
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
-            attributes={"name": "speaker0"},
+            display_name="speaker0",
         )
 
         # Concept node that the speaker is the UNIQUE predecessor of
@@ -5264,7 +5323,7 @@ class TestSpeakerPredecessorInheritance:
         loop.merger.graph.add_node(
             "acme corp",
             entity_type="organization",
-            attributes={"name": "Acme Corp"},
+            display_name="Acme Corp",
         )
         loop.merger.graph.add_edge(
             "speaker0",
@@ -5280,9 +5339,7 @@ class TestSpeakerPredecessorInheritance:
         # No edge_source (extraction), no speaker_id on the edge, no speaker_id
         # on the subject node.  Even though speaker0 is the unique predecessor
         # of "acme corp", the fallback must NOT fire — deliberate unattributed fact.
-        loop.merger.graph.add_node(
-            "germany", entity_type="location", attributes={"name": "Germany"}
-        )
+        loop.merger.graph.add_node("germany", entity_type="location", display_name="Germany")
         loop.merger.graph.add_edge(
             "acme corp",
             "germany",
@@ -5741,7 +5798,7 @@ class TestGraphTierAnonymizationContract:
                 sid,
                 entity_type="person",
                 speaker_id=sid,
-                attributes={"name": sid},
+                display_name=sid,
                 reinforcement_count=20,
                 sessions=["s100"],
                 first_seen="s100",
@@ -5805,7 +5862,7 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
         graph.add_node(
             name,
             entity_type="concept",
-            attributes={"name": f"Person{i}"},
+            display_name=f"Person{i}",
             reinforcement_count=i + 1,
             sessions=[f"s{i:03d}"],
             first_seen=f"s{i:03d}",
@@ -5815,7 +5872,7 @@ def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None
     graph.add_node(
         org,
         entity_type="concept",
-        attributes={"name": "AcmeCorp"},
+        display_name="AcmeCorp",
         reinforcement_count=n_persons,
         sessions=["s000"],
         first_seen="s000",
@@ -6042,7 +6099,7 @@ class TestGraphTierMappingReconciliation:
         graph.add_node(
             subject_key,
             entity_type="concept",
-            attributes={"name": subject_key},
+            display_name=subject_key,
             reinforcement_count=10,
             sessions=["s000"],
             first_seen="s000",
@@ -6051,7 +6108,7 @@ class TestGraphTierMappingReconciliation:
         graph.add_node(
             object_key,
             entity_type="concept",
-            attributes={"name": object_key},
+            display_name=object_key,
             reinforcement_count=9,
             sessions=["s000"],
             first_seen="s000",
@@ -6160,7 +6217,7 @@ class TestGraphTierMappingReconciliation:
             graph.add_node(
                 key,
                 entity_type="concept",
-                attributes={"name": key},
+                display_name=key,
                 reinforcement_count=10,
                 sessions=["s000"],
                 first_seen="s000",

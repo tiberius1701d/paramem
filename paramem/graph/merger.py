@@ -52,7 +52,6 @@ REMOVAL_REASONS: frozenset[str] = frozenset(
         "predicate_synonym_collapse",
         "attribute_key_superseded",
         "unkeyable_no_predicate",
-        "display_name_absorbed",
         "duplicate_projection",
     }
 )
@@ -177,6 +176,48 @@ def _strip_has_prefix(pred: str) -> str:
     return pred
 
 
+def node_display(node_data: dict, node_key: str) -> str:
+    """The display surface for a merged-graph node.
+
+    Returns the node's first-seen display surface when it carries one, else
+    *node_key* (already the canonical identity form). The ONE place display
+    is RESOLVED for a node (the write-side first-seen guards read
+    ``display_name`` directly, since they exist to decide whether to write
+    it): the fold's edge walk and node-attribute walk
+    (:mod:`paramem.training.consolidation`), the cloud-enrichment endpoint
+    surface (:mod:`paramem.training.graph_enrich`) and this module's dedup
+    ``pre_surfaces`` record all resolve display through here, so the
+    "surface, else key" rule has one implementation.
+
+    Args:
+        node_data: A node's data dict from ``GraphMerger.graph.nodes``.
+        node_key: The node's canonical key, used as the fallback.
+    """
+    return node_data.get("display_name") or node_key
+
+
+def _set_display_name(node: dict, value: str, *, refresh: bool = False) -> None:
+    """Write *value* onto *node*'s ``display_name`` field under the
+    project-wide display-write rule: first-seen wins by default.
+
+    Only writes when the node carries no ``display_name`` yet, UNLESS
+    *refresh* is ``True`` — the speaker-refresh case, where the caller's
+    value is always the current canonical ``speaker{N}`` token and must
+    overwrite whatever is stored.  The single implementation of the
+    "first-seen wins, speaker refreshes" rule spelled at every node-update
+    call site that writes ``display_name``.
+
+    Args:
+        node: A node's data dict from ``GraphMerger.graph.nodes``, mutated
+            in place.
+        value: The display surface to write.
+        refresh: When ``True``, overwrite unconditionally.  Default
+            ``False`` (first-seen-wins).
+    """
+    if refresh or not node.get("display_name"):
+        node["display_name"] = value
+
+
 def _synth_speaker_entities(relations: "list[Relation]") -> "list[Entity]":
     """Synthesise :class:`Entity` objects for speaker-attributed subjects.
 
@@ -216,8 +257,8 @@ def _synth_speaker_entities(relations: "list[Relation]") -> "list[Entity]":
                 entities.append(
                     Entity(
                         # Use _r.subject (== _r.speaker_id) as the entity name.
-                        # This refreshes attributes["name"] to the lowercase
-                        # speaker_id on the existing speaker node.
+                        # This refreshes the node's display_name field to the
+                        # lowercase speaker_id on the existing speaker node.
                         name=_r.subject,
                         entity_type="person",
                         speaker_id=_r.speaker_id,
@@ -288,14 +329,13 @@ class GraphMerger:
         # every reason a previously-registered key is absent from the merged
         # graph this fold — an edge/attribute removal (dedup, contradiction,
         # synonym collapse, enrichment contraction, attribute-key
-        # supersession, display-name absorption, duplicate-projection
-        # collision) OR a key that was never merged at all
-        # (unkeyable_no_predicate — its store entry has no predicate, so it
-        # never reaches the merge surface under any key).  Reset in
-        # reset_graph(), NOT in merge() — must survive the fold's
-        # reset_graph→re-merge→enrich→classify span.  The ONLY writer is
-        # :meth:`record_removal`; every in-module removal site calls it, and
-        # the two out-of-module writers
+        # supersession, duplicate-projection collision) OR a key that was
+        # never merged at all (unkeyable_no_predicate — its store entry has
+        # no predicate, so it never reaches the merge surface under any
+        # key).  Reset in reset_graph(), NOT in merge() — must survive the
+        # fold's reset_graph→re-merge→enrich→classify span.  The ONLY writer
+        # is :meth:`record_removal`; every in-module removal site calls it,
+        # and the two out-of-module writers
         # (:meth:`~paramem.training.graph_tier.GraphTierRefiner.run_normalization`
         # and :func:`~paramem.training.graph_enrich.enrich_graph`, both of
         # which already hold the merger they mutate) call it through the
@@ -314,11 +354,9 @@ class GraphMerger:
         # they are staled.  A contradiction (either the edge kind or the
         # different-value attribute-key kind) is a supersession (a DIFFERENT
         # fact won, see old_object/new_object), an enrichment same_as is a
-        # node contraction (see keep_node), a display-name absorption has no
-        # surviving fact under any key (the value lives on only as the
-        # node's display surface, not as a trained fact), and an
-        # unkeyable-no-predicate removal has no surviving fact at all — none
-        # of those four carries a ``survivor_key``.
+        # node contraction (see keep_node), and an unkeyable-no-predicate
+        # removal has no surviving fact at all — none of those three carries
+        # a ``survivor_key``.
         self.removal_ledger: dict[str, dict] = {}
         # adopt_reinforcements: main-tier ik_key -> (last_seen, first_seen) recorded
         # by any merge called with credit_adopt_reinforcement=True, from either
@@ -457,7 +495,8 @@ class GraphMerger:
                     self.graph.add_node(
                         subject,
                         entity_type="concept",
-                        attributes={"name": subj_surface},
+                        attributes={},
+                        display_name=subj_surface,
                         reinforcement_count=1,
                         sessions=[session_id],
                     )
@@ -465,10 +504,7 @@ class GraphMerger:
                     # Node already exists but display name not yet set
                     # (first-seen wins) — same rule the endpoint loop below
                     # applies.
-                    node_attrs = self.graph.nodes[subject].get("attributes", {})
-                    if not node_attrs.get("name"):
-                        node_attrs["name"] = subj_surface
-                        self.graph.nodes[subject]["attributes"] = node_attrs
+                    _set_display_name(self.graph.nodes[subject], subj_surface)
 
                 node = self.graph.nodes[subject]
                 node_attrs = node.get("attributes", {})
@@ -518,7 +554,7 @@ class GraphMerger:
 
             # Build a display-name map for endpoints not resolved through entities.
             # Keys in entity_name_map already have _upsert_entity called for them
-            # (which writes attributes["name"]).  Remaining endpoints are raw relation
+            # (which writes display_name).  Remaining endpoints are raw relation
             # endpoints that arrived without a corresponding Entity; they need the
             # surface form stashed so downstream display reads work.
             _endpoint_display: dict[str, str] = {}
@@ -533,16 +569,14 @@ class GraphMerger:
                     self.graph.add_node(
                         name,
                         entity_type="concept",
-                        attributes={"name": _endpoint_display[name]},
+                        attributes={},
+                        display_name=_endpoint_display[name],
                         reinforcement_count=1,
                         sessions=[session_id],
                     )
                 elif name in _endpoint_display:
                     # Node already exists but display name not yet set (first-seen wins).
-                    node_attrs = self.graph.nodes[name].get("attributes", {})
-                    if not node_attrs.get("name"):
-                        node_attrs["name"] = _endpoint_display[name]
-                        self.graph.nodes[name]["attributes"] = node_attrs
+                    _set_display_name(self.graph.nodes[name], _endpoint_display[name])
 
             self._upsert_relation(
                 subject,
@@ -588,7 +622,7 @@ class GraphMerger:
                 ``"dedup"``, ``"contradiction_same_pred"``,
                 ``"predicate_synonym_collapse"``, ``"enrichment_same_as"``,
                 ``"attribute_key_superseded"``, ``"unkeyable_no_predicate"``,
-                ``"display_name_absorbed"``, or ``"duplicate_projection"``.
+                or ``"duplicate_projection"``.
             survivor_key: Set exactly when the removed fact carries forward
                 under another indexed key — that is what the fold's
                 reinforcement-credit pass
@@ -721,7 +755,7 @@ class GraphMerger:
         and by :meth:`~paramem.server.speaker.SpeakerStore._mint_anon_speaker_id`).
         No casing step is needed.  Both the entity path and the relation-endpoint
         fallback path produce the same node key, preventing casing-collision dups.
-        The display name lives at ``node_data["attributes"]["name"]``; for speakers
+        The display name lives at ``node_data["display_name"]``; for speakers
         this is the same lowercase ``speaker{N}`` string — resolved to a human
         name only at the reply boundary, by
         :func:`~paramem.server.speaker.resolve_speaker_tokens`.
@@ -737,8 +771,8 @@ class GraphMerger:
 
         * **Speaker entity** (``entity.speaker_id`` set) — node key is
           ``entity.speaker_id`` verbatim (lowercase).  No name-based matching;
-          no fuzzy match.  The display name is stored as a mutable attribute
-          downstream.
+          no fuzzy match.  The display name is stored on the dedicated
+          ``display_name`` node field downstream.
         * **Non-speaker entity** (``entity.speaker_id is None``) —
           two-tier name resolution:
 
@@ -802,22 +836,24 @@ class GraphMerger:
         With node-key model A, every node is keyed by its canonical form
         (``canonical_id(name)`` for non-speakers; ``entity.speaker_id`` verbatim
         for speakers — always lowercase ``speaker{N}``).  The human-readable
-        display name is stored as a mutable attribute under ``attributes["name"]``
-        for ALL node types — not just speakers — so downstream consumers never need
-        to use the node key for display.  First-seen surface wins: the ``"name"``
-        attribute is set on insertion and NOT overwritten on subsequent updates
-        (idempotent).
+        display name is stored on the dedicated ``display_name`` node field for
+        ALL node types — not just speakers — so downstream consumers never need
+        to use the node key for display.  ``entity.attributes`` (including a
+        model-emitted ``"name"`` key, if present) is folded onto ``attributes``
+        as an ordinary trained fact and never read for display.  First-seen
+        surface wins for non-speakers: ``display_name`` is set on insertion and
+        NOT overwritten on subsequent updates (idempotent).
 
         Speaker entities (``entity.speaker_id`` set) are keyed by
         ``entity.speaker_id`` verbatim (lowercase ``speaker{N}``,
         e.g. ``"speaker0"`` — see :meth:`_resolve_entity`).  The node's
         ``speaker_id`` attribute carries the same lowercase id.
-        ``attributes["name"]`` stores the same lowercase ``speaker{N}`` id
-        and IS refreshed on update.  Display-name resolution happens only at
-        the reply boundary via
+        ``display_name`` stores the same lowercase ``speaker{N}`` id and IS
+        refreshed on update.  Display-name resolution happens only at the
+        reply boundary via
         :func:`~paramem.server.speaker.resolve_speaker_tokens`, not at
-        graph-write time.  For non-speaker entities ``attributes["name"]``
-        is first-seen-wins only.
+        graph-write time.  For non-speaker entities ``display_name`` is
+        first-seen-wins only.
         """
         is_speaker = entity.speaker_id is not None
 
@@ -840,17 +876,12 @@ class GraphMerger:
                 if _attr_value_is_empty(v):
                     continue
                 existing_attrs[k] = v
-            # All entities: store display name in attributes["name"].
-            # For speaker entities, refresh on update (captures attribute
-            # changes; entity.name is always the lowercase speaker{N} id).
-            # For non-speaker entities, first-seen wins — only write when
-            # the attribute is absent or empty.
-            if entity.name and not _attr_value_is_empty(entity.name):
-                if is_speaker:
-                    existing_attrs["name"] = entity.name
-                elif not existing_attrs.get("name"):
-                    existing_attrs["name"] = entity.name
             node["attributes"] = existing_attrs
+            # Display surface, never read from entity.attributes.  Speaker
+            # entities refresh on update (entity.name is always the lowercase
+            # speaker{N} id); non-speaker entities are first-seen-wins only.
+            if entity.name and not _attr_value_is_empty(entity.name):
+                _set_display_name(node, entity.name, refresh=is_speaker)
             # The node key equals entity.speaker_id (lowercase speaker{N}).
             # The ``speaker_id`` node attribute carries the same value.
             # Defensive: populate the attribute when it is missing (e.g. a node
@@ -859,16 +890,17 @@ class GraphMerger:
                 node["speaker_id"] = entity.speaker_id
         else:
             attributes = {k: v for k, v in entity.attributes.items() if not _attr_value_is_empty(v)}
-            # Store display name for all entities.  The node key is now the
-            # canonical form so the node ID is no longer the display name.
-            if entity.name and not _attr_value_is_empty(entity.name):
-                attributes["name"] = entity.name
             node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
                 attributes=attributes,
                 reinforcement_count=1,
                 sessions=[session_id],
             )
+            # Display surface, never read from entity.attributes.  The node
+            # key is now the canonical form so the node ID is no longer the
+            # display name.
+            if entity.name and not _attr_value_is_empty(entity.name):
+                node_kwargs["display_name"] = entity.name
             if is_speaker:
                 node_kwargs["speaker_id"] = entity.speaker_id
             self.graph.add_node(node_key, **node_kwargs)
@@ -1006,18 +1038,14 @@ class GraphMerger:
                 # Raw-surface evidence for dedup collapses (observability hook).
                 # The incoming raw surfaces (relation.*, only .strip()ed at
                 # extraction) are recorded alongside the surviving twin's
-                # first-seen surfaces (stored in node attributes["name"] and
-                # edge["predicate"]).  pre_surfaces is the ground-truth record
-                # of what was discarded vs. what survived; readers compare
-                # incoming vs. surviving directly rather than relying on a
-                # derived boolean.
-                _surviving_subj_surface = (
-                    self.graph.nodes.get(subject, {}).get("attributes", {}).get("name", subject)
-                )
+                # first-seen surfaces (stored in the node's display_name field
+                # and edge["predicate"]).  pre_surfaces is the ground-truth
+                # record of what was discarded vs. what survived; readers
+                # compare incoming vs. surviving directly rather than relying
+                # on a derived boolean.
+                _surviving_subj_surface = node_display(self.graph.nodes.get(subject, {}), subject)
                 _surviving_pred_surface = edge.get("predicate", "")
-                _surviving_obj_surface = (
-                    self.graph.nodes.get(obj, {}).get("attributes", {}).get("name", obj)
-                )
+                _surviving_obj_surface = node_display(self.graph.nodes.get(obj, {}), obj)
                 self.record_removal(
                     relation.indexed_key,
                     reason="dedup",

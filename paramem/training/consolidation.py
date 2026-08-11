@@ -21,7 +21,7 @@ from paramem.backup.encryption import write_infra_json
 from paramem.cloud.admission import evaluate_cloud_egress
 from paramem.config.taxonomy import fallback_relation_type, relation_types
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
-from paramem.graph.merger import GraphMerger, min_nonempty
+from paramem.graph.merger import GraphMerger, min_nonempty, node_display
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.relation_prep import (
@@ -3205,13 +3205,13 @@ class ConsolidationLoop:
         # contradiction_same_pred: recency-backed contradiction (freshest last_seen wins).
         #   The merger only writes this entry when timestamps pick a unique winner;
         #   empty/tied → coexist (no entry) → safe to stale at the full fold too.
-        # attribute_key_superseded, unkeyable_no_predicate,
-        # display_name_absorbed, and duplicate_projection are deliberately
-        # NOT listed here.  "dedup" is not a counter-example: a dedup key is
-        # soft-staled through the SEPARATE _collapsed_set branch in the drift
-        # partition (tested FIRST, before this helper's output is even
-        # consulted, and simhash-retained) -- it never reaches this
-        # always-stale set at all.  The honest analogy for all four reasons is
+        # attribute_key_superseded, unkeyable_no_predicate, and
+        # duplicate_projection are deliberately NOT listed here.  "dedup" is
+        # not a counter-example: a dedup key is soft-staled through the
+        # SEPARATE _collapsed_set branch in the drift partition (tested
+        # FIRST, before this helper's output is even consulted, and
+        # simhash-retained) -- it never reaches this always-stale set at
+        # all.  The honest analogy for all three reasons is
         # "enrichment_same_as": ledgered so the full-fold drift partition
         # routes the key to drift_intended_removal instead of
         # drift_genuine_loss, but hard-dropped with NO soft-stale record.
@@ -3221,14 +3221,12 @@ class ConsolidationLoop:
         # promoted); a DIFFERENT value winning is the contradiction shape and
         # omits survivor_key (no credit, no promotion).  duplicate_projection
         # always carries a survivor_key -- the already-emitted key the fact
-        # carries forward under.  unkeyable_no_predicate and
-        # display_name_absorbed never carry a survivor: neither key
-        # re-enters the merge surface under any key (a display-name
-        # absorption survives only as the node's display surface, not as a
-        # trained fact).  On the interim dedup_target_keys path (which
-        # computes no drift partition) all four reasons are inert -- the ledger
-        # entry is written but nothing consumes it before the next
-        # reset_graph() clears it.
+        # carries forward under.  unkeyable_no_predicate never carries a
+        # survivor: the key re-enters the merge surface under no key at
+        # all.  On the interim dedup_target_keys path (which computes no
+        # drift partition) all three reasons are inert -- the ledger entry
+        # is written but nothing consumes it before the next reset_graph()
+        # clears it.
         _always_stale_reasons = {
             "predicate_synonym_collapse",
             "contradiction_same_pred",
@@ -6442,19 +6440,15 @@ class ConsolidationLoop:
                 _rt_raw = _t_data.get("relation_type", _FALLBACK_RTYPE)
                 _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
 
-                # Resolve endpoint surface from node attributes["name"].
-                # For speaker subjects: _endpoint_str returns the node key (lowercase
+                # Resolve endpoint surface from the node's display_name field.
+                # For speaker subjects: this yields the node key (lowercase
                 # speaker{N}); paramem.graph.merger._synth_speaker_entities emits
-                # Entity(name=speaker_id) which refreshes attributes["name"] to the
+                # Entity(name=speaker_id) which refreshes display_name to the
                 # lowercase speaker_id during GraphMerger.merge_relations.  So
                 # _subj_display yields the lowercase speaker_id for speaker subjects.
                 # For non-speaker subjects this yields the stored display name.
-                _subj_display = (
-                    self.merger.graph.nodes[_t_subj].get("attributes", {}).get("name") or _t_subj
-                )
-                _obj_display = (
-                    self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
-                )
+                _subj_display = node_display(self.merger.graph.nodes[_t_subj], _t_subj)
+                _obj_display = node_display(self.merger.graph.nodes[_t_obj], _t_obj)
                 # Resolve speaker_id from the edge first (the merger stamps it
                 # there from Relation.speaker_id on a net-new edge), then fall back
                 # to the subject node's top-level speaker_id attribute.  When both
@@ -6586,27 +6580,8 @@ class ConsolidationLoop:
             if not _n_attrs:
                 continue
             _n_attr_keys = _n_data.get("attribute_keys", {}) or {}
-            _n_subj_display = _n_attrs.get("name") or _n
+            _n_subj_display = node_display(_n_data, _n)
             for attr_key, attr_value in _n_attrs.items():
-                if attr_key == "name":
-                    # Display surface, not a projected attribute fact.  A
-                    # name-predicate attribute relation (relation_type ==
-                    # "attribute", predicate strips to "name") is folded
-                    # onto this same node["attributes"]["name"] slot by
-                    # GraphMerger (merger.py's relation_type == "attribute"
-                    # branch) and registered in node["attribute_keys"]["name"]
-                    # when it carries an indexed_key -- so a REGISTERED key
-                    # can land here with no other bucket to explain its
-                    # absence from tier_keyed.  Ledger it as an intended
-                    # (not accidental) removal so the drift partition routes
-                    # it to drift_intended_removal instead of the unaccounted
-                    # genuine_loss bucket.  No survivor_key: the fact is
-                    # deliberately absorbed into the display surface, not
-                    # carried forward under another key.
-                    _name_key_id = _n_attr_keys.get("name")
-                    if _name_key_id:
-                        self.merger.record_removal(_name_key_id, reason="display_name_absorbed")
-                    continue
                 attr_pred = attr_predicate(attr_key)
                 attr_key_id = _n_attr_keys.get(attr_key)
                 _emitted_pair_key = _emitted_pairs.get((_n, attr_pred))

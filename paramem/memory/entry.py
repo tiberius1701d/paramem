@@ -547,7 +547,7 @@ def entry_fact_text(entry: dict) -> str:
     * ``subject`` / ``object`` are **identity-folded** — the graph merger keys
       them via :func:`paramem.utils.identity.canonical` at the node-identity
       boundary and keeps the first-seen display surface in the node's
-      ``attributes["name"]`` — so they are emitted as-is here; no further
+      ``display_name`` field — so they are emitted as-is here; no further
       transformation happens at this boundary.  A ``speaker{N}`` token in
       subject or object position is emitted verbatim too — it is NOT resolved
       to a display name here.  Every model-facing surface (recalled facts,

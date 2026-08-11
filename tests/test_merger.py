@@ -284,12 +284,12 @@ class TestSessionTracking:
         )
         merger.merge(g1)
         merger.merge(g2)
-        # Node key is canonical: "alex"; display name in attributes["name"]
+        # Node key is canonical: "alex"; display name on the node's display_name field
         attrs = merger.graph.nodes["alex"]["attributes"]
         assert attrs["age"] == "29"
         assert attrs["role"] == "engineer"
-        # Display name preserved in attributes
-        assert attrs["name"] == "Alex"
+        # Display name preserved on the dedicated node field
+        assert merger.graph.nodes["alex"]["display_name"] == "Alex"
 
 
 class TestPersistence:
@@ -397,7 +397,7 @@ class TestSpeakerIdDedup:
 
     def test_speaker_node_keyed_by_speaker_id(self):
         """Speaker entity is keyed by entity.speaker_id verbatim in the graph;
-        the display name moves to ``attributes["name"]``.
+        the display name moves to the node's ``display_name`` field.
 
         Under lowercase-uniform identity the ingest safety-net guarantees
         speaker_id is always lowercase ``speaker{N}`` before it reaches the
@@ -422,7 +422,7 @@ class TestSpeakerIdDedup:
         assert "speaker0" in m.graph.nodes
         assert "Alex" not in m.graph.nodes
         assert m.graph.nodes["speaker0"]["speaker_id"] == "speaker0"
-        assert m.graph.nodes["speaker0"]["attributes"]["name"] == "Alex"
+        assert m.graph.nodes["speaker0"]["display_name"] == "Alex"
 
     def test_non_speaker_entities_still_dedup_by_name(self):
         """Object entities (speaker_id=None) must still dedup by name (regression)."""
@@ -477,12 +477,14 @@ class TestSpeakerIdDedup:
         )
         m.merge(sg1)
         m.merge(sg2)
-        # Speaker entity is keyed by casefolded speaker_id ("speaker0"); display name
-        # lives in attributes alongside the merged role / last_name.
-        attrs = m.graph.nodes["speaker0"]["attributes"]
+        # Speaker entity is keyed by casefolded speaker_id ("speaker0"); the
+        # display name lives on the dedicated node field, separate from the
+        # merged role / last_name attributes.
+        node = m.graph.nodes["speaker0"]
+        attrs = node["attributes"]
         assert attrs.get("role") == "engineer"
         assert attrs.get("has_last_name") == "Kim"
-        assert attrs.get("name") == "Alex"
+        assert node.get("display_name") == "Alex"
 
 
 class TestEmptyAttributeValueDoesNotOverwrite:
@@ -1052,8 +1054,8 @@ class TestIkKeyProvenance:
 
         m = GraphMerger()
         # Pre-seed with canonical node keys (node-key model A).
-        m.graph.add_node("alex", attributes={"name": "Alex"})
-        m.graph.add_node("cat", attributes={"name": "cat"})
+        m.graph.add_node("alex", display_name="Alex")
+        m.graph.add_node("cat", display_name="cat")
         eid_old = m.graph.add_edge(
             "alex",
             "cat",
@@ -1210,8 +1212,8 @@ class TestCollapsedTracking:
 
         m = GraphMerger()
         # Pre-seed with canonical node keys and canonical predicate form.
-        m.graph.add_node("alice", attributes={"name": "Alice"})
-        m.graph.add_node("berlin", attributes={"name": "Berlin"})
+        m.graph.add_node("alice", display_name="Alice")
+        m.graph.add_node("berlin", display_name="Berlin")
         existing_eid = m.graph.add_edge(
             "alice",
             "berlin",
@@ -1255,8 +1257,8 @@ class TestCollapsedTracking:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger()
-        m.graph.add_node("alice", attributes={"name": "Alice"})
-        m.graph.add_node("berlin", attributes={"name": "Berlin"})
+        m.graph.add_node("alice", display_name="Alice")
+        m.graph.add_node("berlin", display_name="Berlin")
         existing_eid = m.graph.add_edge(
             "alice",
             "berlin",
@@ -1313,8 +1315,8 @@ class TestCollapsedTracking:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger()
-        m.graph.add_node("alice", attributes={"name": "Alice"})
-        m.graph.add_node("berlin", attributes={"name": "Berlin"})
+        m.graph.add_node("alice", display_name="Alice")
+        m.graph.add_node("berlin", display_name="Berlin")
         existing_eid = m.graph.add_edge(
             "alice",
             "berlin",
@@ -1360,8 +1362,8 @@ class TestCollapsedTracking:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        m.graph.add_node("alex", attributes={"name": "Alex"})
-        m.graph.add_node("munich", attributes={"name": "Munich"})
+        m.graph.add_node("alex", display_name="Alex")
+        m.graph.add_node("munich", display_name="Munich")
 
         eid_old = m.graph.add_edge(
             "alex",
@@ -1446,8 +1448,8 @@ class TestCollapsedTracking:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        m.graph.add_node("alex", attributes={"name": "Alex"})
-        m.graph.add_node("munich", attributes={"name": "Munich"})
+        m.graph.add_node("alex", display_name="Alex")
+        m.graph.add_node("munich", display_name="Munich")
 
         eid_old = m.graph.add_edge(
             "alex",
@@ -1523,8 +1525,8 @@ class TestCollapsedTracking:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        m.graph.add_node("alex", attributes={"name": "Alex"})
-        m.graph.add_node("munich", attributes={"name": "Munich"})
+        m.graph.add_node("alex", display_name="Alex")
+        m.graph.add_node("munich", display_name="Munich")
 
         same_ts = "2026-01-01T00:00:00Z"
         eid_old = m.graph.add_edge(
@@ -1756,8 +1758,8 @@ class TestRemovalLedger:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        m.graph.add_node("alex", attributes={"name": "Alex"})
-        m.graph.add_node("munich", attributes={"name": "Munich"})
+        m.graph.add_node("alex", display_name="Alex")
+        m.graph.add_node("munich", display_name="Munich")
 
         eid_old = m.graph.add_edge(
             "alex",
@@ -1903,12 +1905,18 @@ class TestRemovalLedger:
         assert pre["incoming"]["object"] == "berlin", (
             f"incoming object must be raw 'berlin'; got {pre['incoming']['object']!r}"
         )
-        # Surviving surfaces record the first-seen stored form; they differ from incoming.
-        assert pre["surviving"]["subject"] != pre["incoming"]["subject"], (
-            "surviving subject must differ from incoming subject for a case-variant collapse"
+        # Surviving surfaces record the first-seen DISPLAY surface, not the
+        # canonical node key and not the incoming drifted surface — pinning
+        # this against the exact stored strings (not merely "differs from
+        # incoming") catches a regression to the bare node key ("alice"),
+        # which would also differ from "ALICE" and pass a weaker check.
+        assert pre["surviving"]["subject"] == "Alice", (
+            f"surviving subject must be the first-seen display surface 'Alice'; "
+            f"got {pre['surviving']['subject']!r}"
         )
-        assert pre["surviving"]["object"] != pre["incoming"]["object"], (
-            "surviving object must differ from incoming object for a case-variant collapse"
+        assert pre["surviving"]["object"] == "Berlin", (
+            f"surviving object must be the first-seen display surface 'Berlin'; "
+            f"got {pre['surviving']['object']!r}"
         )
 
     def test_dedup_ledger_records_pre_surfaces_for_predicate_normalized_duplicate(self):
@@ -2010,6 +2018,17 @@ class TestRemovalLedger:
         assert entry == {"reason": "enrichment_same_as", "keep_node": "alice"}, (
             f"unexpected entry shape: {entry}"
         )
+
+    def test_record_removal_rejects_the_retired_display_name_reason(self):
+        """``display_name_absorbed`` is gone from the removal vocabulary — a
+        name attribute is now an ordinary keyable fact, so nothing ever
+        absorbs it into the display surface without a trace.  Cheap
+        regression guard against re-minting the reason."""
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        with pytest.raises(ValueError):
+            m.record_removal("key_x", reason="display_name_absorbed")
 
     def test_record_removal_is_the_only_ledger_writer(self):
         """AST scan: no mutation of ``removal_ledger`` exists outside
@@ -2119,8 +2138,8 @@ class TestRecencyAnyEmpty:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        m.graph.add_node("alex", attributes={"name": "Alex"})
-        m.graph.add_node("munich", attributes={"name": "Munich"})
+        m.graph.add_node("alex", display_name="Alex")
+        m.graph.add_node("munich", display_name="Munich")
         eid = m.graph.add_edge(
             "alex",
             "munich",
@@ -2244,7 +2263,7 @@ class TestRecencyAnyEmpty:
             ("paris", "2026-01-02T00:00:00Z", "key_paris"),
             ("madrid", "2026-01-01T00:00:00Z", "key_madrid"),
         ]:
-            m.graph.add_node(city, attributes={"name": city})
+            m.graph.add_node(city, display_name=city)
             eid = m.graph.add_edge(
                 "alex",
                 city,
@@ -2305,7 +2324,7 @@ class TestRecencyAnyEmpty:
             ("paris", "2026-01-02T00:00:00Z", "key_paris"),
             ("madrid", "2026-01-02T00:00:00Z", "key_madrid"),
         ]:
-            m.graph.add_node(city, attributes={"name": city})
+            m.graph.add_node(city, display_name=city)
             eid = m.graph.add_edge(
                 "alex",
                 city,
@@ -2417,10 +2436,10 @@ class TestObjectVariantDedup:
             "Collapsed edge must have reinforcement_count=2 (one per session)"
         )
 
-    def test_display_name_preserved_in_node_attributes(self):
-        """After collapsing object variants, the first-seen surface form is in
-        ``attributes["name"]`` — recall text is the human-readable original, not
-        the canonical key.
+    def test_display_name_preserved_on_node(self):
+        """After collapsing object variants, the first-seen surface form is on
+        the node's ``display_name`` field — recall text is the human-readable
+        original, not the canonical key.
         """
         m = GraphMerger()
         s1 = SessionGraph(
@@ -2442,11 +2461,11 @@ class TestObjectVariantDedup:
         )
         m.merge(s1)
 
-        # The display name is stored in attributes["name"], not the node key.
+        # The display name is stored on display_name, not the node key.
         node_data = m.graph.nodes["execution speed"]
-        assert node_data["attributes"]["name"] == "Execution Speed", (
-            "First-seen surface form must be preserved in attributes['name']; "
-            f"got {node_data['attributes'].get('name')!r}"
+        assert node_data["display_name"] == "Execution Speed", (
+            "First-seen surface form must be preserved in display_name; "
+            f"got {node_data.get('display_name')!r}"
         )
 
 
@@ -3029,10 +3048,10 @@ class TestSpeakerCasingCollisionRegression:
             f"Speaker node key must be lowercase 'speaker0', got {speaker_nodes[0]!r}"
         )
 
-        # Under lowercase-uniform identity, attributes["name"] is also lowercase speaker0.
+        # Under lowercase-uniform identity, display_name is also lowercase speaker0.
         node_data = merger.graph.nodes["speaker0"]
-        assert node_data.get("attributes", {}).get("name") == "speaker0", (
-            "attributes['name'] must be lowercase 'speaker0' under lowercase-uniform identity"
+        assert node_data.get("display_name") == "speaker0", (
+            "display_name must be lowercase 'speaker0' under lowercase-uniform identity"
         )
 
 

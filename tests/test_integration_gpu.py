@@ -303,7 +303,7 @@ class TestGraphEnrichmentDegradeGPU:
             graph.add_node(
                 f"person{i}",
                 entity_type="person",
-                attributes={"name": f"Person{i}"},
+                display_name=f"Person{i}",
                 reinforcement_count=i + 1,
                 sessions=[f"s{i:03d}"],
                 first_seen=f"s{i:03d}",
@@ -312,7 +312,7 @@ class TestGraphEnrichmentDegradeGPU:
         graph.add_node(
             "acmecorp",
             entity_type="organization",
-            attributes={"name": "AcmeCorp"},
+            display_name="AcmeCorp",
             reinforcement_count=10,
             sessions=["s000"],
             first_seen="s000",

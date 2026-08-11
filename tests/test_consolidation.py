@@ -3353,8 +3353,8 @@ class TestAbortSkipsCommit:
         # (defer=True) finds a keyless edge and produces a non-empty deferred write →
         # all_interim_keyed is non-empty → training is triggered.
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
-        real_graph.add_node("millfield", attributes={"name": "Millfield"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", display_name="Alex")
+        real_graph.add_node("millfield", display_name="Millfield")
         real_graph.add_edge(
             "speaker0",
             "millfield",
@@ -3452,8 +3452,8 @@ class TestAbortSkipsCommit:
         # Populate merger.graph with a procedural-typed keyless edge so the
         # graph-walk mints a "proc…" key into _deferred_writes.
         proc_graph = nx.MultiDiGraph()
-        proc_graph.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
-        proc_graph.add_node("tea", attributes={"name": "Tea"})
+        proc_graph.add_node("alice", speaker_id="speaker0", display_name="Alice")
+        proc_graph.add_node("tea", display_name="Tea")
         proc_graph.add_edge(
             "alice",
             "tea",
@@ -5327,8 +5327,8 @@ class TestInterimCommitFailureRollback:
         import networkx as nx
 
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
-        real_graph.add_node("millfield", attributes={"name": "Millfield"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", display_name="Alex")
+        real_graph.add_node("millfield", display_name="Millfield")
         real_graph.add_edge(
             "speaker0",
             "millfield",
@@ -5512,8 +5512,8 @@ class TestInterimCommitFailureRollbackSimulate:
         import networkx as nx
 
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
-        real_graph.add_node("millfield", attributes={"name": "Millfield"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", display_name="Alex")
+        real_graph.add_node("millfield", display_name="Millfield")
         real_graph.add_edge(
             "speaker0",
             "millfield",
@@ -8475,9 +8475,9 @@ class TestLastSeenFlowThroughMint:
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
-            attributes={"name": "Alex"},
+            display_name="Alex",
         )
-        g.add_node("berlin", entity_type="place", attributes={"name": "Berlin"})
+        g.add_node("berlin", entity_type="place", display_name="Berlin")
         # Edge carries the real session wall-clock (written by merger._upsert_relation).
         g.add_edge(
             "speaker0",
@@ -8510,9 +8510,9 @@ class TestLastSeenFlowThroughMint:
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
-            attributes={"name": "Alex"},
+            display_name="Alex",
         )
-        g.add_node("paris", entity_type="place", attributes={"name": "Paris"})
+        g.add_node("paris", entity_type="place", display_name="Paris")
         # No last_seen on the edge — simulates legacy / migrated data.
         g.add_edge(
             "speaker0",
@@ -8543,9 +8543,9 @@ class TestLastSeenFlowThroughMint:
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
-            attributes={"name": "Alex"},
+            display_name="Alex",
         )
-        g.add_node("berlin", entity_type="place", attributes={"name": "Berlin"})
+        g.add_node("berlin", entity_type="place", display_name="Berlin")
         g.add_edge(
             "speaker0",
             "berlin",
@@ -8679,7 +8679,7 @@ class TestLastSeenFlowThroughMint:
 
 
 class TestAttributeGateNodeWalk:
-    """``_build_all_edge_entries_into``'s node-attribute walk (Unit 4).
+    """``_build_all_edge_entries_into``'s node-attribute walk.
 
     A ``relation_type == "attribute"`` relation never becomes an edge
     (``GraphMerger.merge`` diverts it onto the subject node's
@@ -8730,16 +8730,23 @@ class TestAttributeGateNodeWalk:
         loop.merger = GraphMerger()
         return loop
 
-    def _attr_relation(self, indexed_key=None):
+    def _attr_relation(
+        self,
+        subject="speaker0",
+        predicate="has_phone",
+        obj="+1 555 123 4567",
+        speaker_id="speaker0",
+        indexed_key=None,
+    ):
         from paramem.graph.schema import Relation
 
         return Relation(
-            subject="speaker0",
-            predicate="has_phone",
-            object="+1 555 123 4567",
+            subject=subject,
+            predicate=predicate,
+            object=obj,
             relation_type="attribute",
             confidence=1.0,
-            speaker_id="speaker0",
+            speaker_id=speaker_id,
             indexed_key=indexed_key,
         )
 
@@ -8822,20 +8829,176 @@ class TestAttributeGateNodeWalk:
         assert loop.merger.graph.number_of_nodes() == 1
         assert loop.merger.graph.number_of_edges() == 0
 
-    def test_name_attribute_excluded_from_walk(self, tmp_path):
-        """The node's own display-name attribute is never itself minted as
-        an attribute fact."""
+    def test_name_attribute_mints_a_key(self, tmp_path):
+        """A model-emitted ``name`` node attribute is an ordinary trained
+        fact — the walk mints it like any other attribute, it is not
+        skipped in favour of the node's separate ``display_name`` field."""
         loop = self._make_loop(tmp_path)
         loop.merger.graph.add_node(
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
             attributes={"name": "Alex"},
+            display_name="speaker0",
         )
         tier_keyed: dict = {"episodic": [], "procedural": []}
         minted_by_tier, _ = loop._build_all_edge_entries_into(tier_keyed)
-        assert minted_by_tier["episodic"] == 0
-        assert tier_keyed["episodic"] == []
+        assert minted_by_tier["episodic"] == 1
+        entry = tier_keyed["episodic"][0]
+        assert entry["predicate"] == "has name"
+        assert entry["object"] == "Alex"
+
+    def test_name_attribute_keyless_mint_matches_flatten_entity_attributes_fingerprint(
+        self, tmp_path
+    ):
+        """A keyless ``has name`` attribute fact mints exactly like any
+        other attribute: one mint, subject sourced from the node's
+        display_name, and the same predicate surface
+        ``_flatten_entity_attributes`` (the interim path) projects for the
+        identical fact — the one-SimHash-fingerprint contract shared by
+        both doors onto an attribute fact."""
+        from paramem.graph.relation_prep import _flatten_entity_attributes
+        from paramem.graph.schema import Entity
+        from paramem.memory.entry import entry_simhash
+
+        loop = self._make_loop(tmp_path)
+        loop.merger.merge_relations(
+            [
+                self._attr_relation(
+                    subject="Alex Morgan", predicate="has_name", obj="Alex", speaker_id=""
+                )
+            ],
+            session_id="s0",
+            log_label="test",
+        )
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        minted_by_tier, _ = loop._build_all_edge_entries_into(tier_keyed)
+
+        assert minted_by_tier["episodic"] == 1
+        entry = tier_keyed["episodic"][0]
+        assert entry["predicate"] == "has name"
+        assert entry["subject"] == "Alex Morgan"
+        assert entry["object"] == "Alex"
+
+        flattened = _flatten_entity_attributes(
+            [Entity(name="Alex Morgan", entity_type="person", attributes={"name": "Alex"})]
+        )
+        assert entry["predicate"] == flattened[0]["predicate"], (
+            "the node-attribute walk and _flatten_entity_attributes must share one predicate"
+        )
+
+        # Byte-identical predicates are necessary but not sufficient for the
+        # one-fingerprint contract -- verify the actual registered SimHash
+        # matches too, sharing the minted key so only subject/predicate/object
+        # can move the hash.
+        walk_entry = {
+            "key": entry["key"],
+            "subject": entry["subject"],
+            "predicate": entry["predicate"],
+            "object": entry["object"],
+        }
+        flatten_entry = {
+            "key": entry["key"],
+            "subject": flattened[0]["subject"],
+            "predicate": flattened[0]["predicate"],
+            "object": flattened[0]["object"],
+        }
+        assert entry_simhash(walk_entry) == entry_simhash(flatten_entry), (
+            "the node-attribute walk and _flatten_entity_attributes must register "
+            "the same SimHash fingerprint for the identical name fact"
+        )
+
+    def test_name_attribute_replays_its_key_on_a_second_fold(self, tmp_path):
+        """Mirrors test_full_reconsolidation_round_trip_reuses_key for the
+        ``has name`` predicate: mint once, reset the keying graph, re-merge
+        with the indexed_key set, walk again — zero mints, same key, value
+        intact, zero edges, zero concept nodes."""
+        loop = self._make_loop(tmp_path)
+        loop.merger.merge_relations(
+            [self._attr_relation(predicate="has_name", obj="Alex")],
+            session_id="s0",
+            log_label="test",
+        )
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+        minted_key = tier_keyed["episodic"][0]["key"]
+
+        loop.merger.reset_graph()
+        loop.merger.merge_relations(
+            [self._attr_relation(predicate="has_name", obj="Alex", indexed_key=minted_key)],
+            session_id="__full_consolidation_recon__",
+            log_label="recon",
+        )
+
+        tier_keyed2: dict = {"episodic": [], "procedural": []}
+        minted_by_tier2, _ = loop._build_all_edge_entries_into(tier_keyed2)
+
+        assert minted_by_tier2["episodic"] == 0, "must replay, never re-mint"
+        assert len(tier_keyed2["episodic"]) == 1
+        replayed = tier_keyed2["episodic"][0]
+        assert replayed["key"] == minted_key
+        assert replayed["object"] == "Alex"
+        assert loop.merger.graph.number_of_nodes() == 1
+        assert loop.merger.graph.number_of_edges() == 0
+
+    def test_name_attribute_survives_a_second_fold_without_drift(self, tmp_path):
+        """Sibling of the replay pin: run mint -> fold -> replay TWICE,
+        proving a name key neither re-mints nor drifts on a second fold.
+        This is the shape that regressed before the split: a `has name`
+        key stayed registry-active forever while never entering a training
+        set."""
+        loop = self._make_loop(tmp_path)
+        loop.merger.merge_relations(
+            [self._attr_relation(predicate="has_name", obj="Alex")],
+            session_id="s0",
+            log_label="test",
+        )
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+        minted_key = tier_keyed["episodic"][0]["key"]
+
+        for _ in range(2):
+            loop.merger.reset_graph()
+            loop.merger.merge_relations(
+                [self._attr_relation(predicate="has_name", obj="Alex", indexed_key=minted_key)],
+                session_id="__full_consolidation_recon__",
+                log_label="recon",
+            )
+            tier_keyed_n: dict = {"episodic": [], "procedural": []}
+            minted_by_tier_n, _ = loop._build_all_edge_entries_into(tier_keyed_n)
+            assert minted_by_tier_n["episodic"] == 0
+            assert tier_keyed_n["episodic"][0]["key"] == minted_key
+            assert tier_keyed_n["episodic"][0]["object"] == "Alex"
+
+    def test_speaker_node_mints_no_name_tautology(self, tmp_path):
+        """A speaker node's own display refresh (``_synth_speaker_entities``
+        stamping ``entity.name == speaker_id``) must never mint a
+        ``speaker0 has name speaker0`` fact — the synthesised speaker
+        Entity carries no ``attributes``, so the display write lands only
+        on ``display_name``."""
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+        ordinary_relation = Relation(
+            subject="speaker0",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+        )
+        loop.merger.merge_relations([ordinary_relation], session_id="s0", log_label="test")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        all_entries = tier_keyed["episodic"] + tier_keyed["procedural"]
+        assert not any(e["predicate"] == "has name" for e in all_entries)
+        node = loop.merger.graph.nodes["speaker0"]
+        assert "name" not in node.get("attributes", {})
+        assert node.get("display_name") == "speaker0"
 
     def test_keyed_replay_content_sourced_from_store_not_reminted(self, tmp_path):
         """A node whose attribute_keys already carries a registered key
@@ -8856,7 +9019,8 @@ class TestAttributeGateNodeWalk:
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
-            attributes={"name": "Alex", "email": "alex@example.com"},
+            attributes={"email": "alex@example.com"},
+            display_name="Alex",
             attribute_keys={"email": "graph9"},
         )
         tier_keyed: dict = {"episodic": [], "procedural": []}
@@ -8876,9 +9040,10 @@ class TestAttributeGateNodeWalk:
             "speaker0",
             entity_type="person",
             speaker_id="speaker0",
-            attributes={"name": "Alex", "email": "stale@example.com"},
+            attributes={"email": "stale@example.com"},
+            display_name="Alex",
         )
-        g.add_node("email-node", entity_type="concept", attributes={"name": "alex@example.com"})
+        g.add_node("email-node", entity_type="concept", display_name="alex@example.com")
         g.add_edge(
             "speaker0",
             "email-node",
@@ -8908,7 +9073,8 @@ class TestAttributeGateNodeWalk:
             speaker_id="speaker0",
             # Verbatim underscore key — mirrors _upsert_entity's
             # existing_attrs[k] = v copy of Entity.attributes.
-            attributes={"name": "Alex", "last_name": "Morgan"},
+            attributes={"last_name": "Morgan"},
+            display_name="Alex",
         )
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
@@ -10793,16 +10959,16 @@ class TestMainTiersAccountingRefusal:
 # =============================================================================
 # TestAccountingCoverageRealMerger — a real GraphMerger, no mocks anywhere in
 # the merge/drop path, folding a representative key population.  Every key
-# must be accounted for (zero unexplained genuine_loss): the two removal
-# reasons added to close the fold-fatal rule's blind spots
-# (display_name_absorbed, duplicate_projection) are exercised alongside the
-# pre-existing dedup/orphan/intended-removal buckets.  This is the test that
-# would have caught both real (non-synthetic) genuine_loss producers the
-# fold-fatal rule shipped over: a name-predicate attribute key
-# (GraphMerger's relation_type == "attribute" branch,
-# node["attributes"]["name"] absorption) and an edge/attribute pair
-# colliding on (subject, predicate) (consolidation.py's _emitted_pairs
-# check).
+# must be accounted for (zero unexplained genuine_loss): the removal reason
+# added to close the fold-fatal rule's blind spot (duplicate_projection) is
+# exercised alongside the pre-existing dedup/orphan/intended-removal buckets.
+# A name-predicate attribute key is an ordinary keyable fact (the display
+# surface lives on a dedicated node field, never on the trained attribute) so
+# it survives into tier_keyed like any other attribute key, rather than
+# being absorbed and ledgered.  This is the test that would have caught the
+# real (non-synthetic) genuine_loss producer the fold-fatal rule shipped
+# over: an edge/attribute pair colliding on (subject, predicate)
+# (consolidation.py's _emitted_pairs check).
 # =============================================================================
 
 
@@ -10821,7 +10987,8 @@ class TestAccountingCoverageRealMerger:
         return loop
 
     def test_representative_population_has_zero_genuine_loss(self, tmp_path):
-        """Edge-typed, attribute-typed, a name-predicate attribute key, an
+        """Edge-typed, attribute-typed, a name-predicate attribute key (which
+        survives into ``tier_keyed`` like any other attribute fact), an
         edge/attribute pair collision, a dedup pair, a promotable key, and a
         keyless mint -- every key lands in ``tier_keyed`` or an accounted
         drift bucket; none reaches the unexplained ``genuine_loss`` bucket.
@@ -10865,8 +11032,9 @@ class TestAccountingCoverageRealMerger:
             "graph_attr", speaker_id="speaker0", relation_type="attribute", first_seen=""
         )
 
-        # 3. Name-predicate attribute key: absorbed onto the display
-        #    surface -- display_name_absorbed, no survivor.
+        # 3. Name-predicate attribute key: an ordinary keyable fact -- lands
+        #    in tier_keyed via the keyed-replay branch, the display surface
+        #    lives on a separate node field and never absorbs it.
         loop.store.put(
             "episodic",
             "graph_name",
@@ -11018,9 +11186,9 @@ class TestAccountingCoverageRealMerger:
 
         assert captured_ledgers, "on_removal_ledger must have fired during the fold"
         ledger = captured_ledgers[-1]
-        assert ledger["graph_name"]["reason"] == "display_name_absorbed", ledger.get("graph_name")
-        assert "survivor_key" not in ledger["graph_name"], (
-            "a display-name absorption has no surviving fact under any key"
+        assert "graph_name" not in ledger, (
+            f"a name-predicate attribute key must survive unledgered;"
+            f" got {ledger.get('graph_name')}"
         )
         assert ledger["graph_pair_attr"]["reason"] == "duplicate_projection", ledger.get(
             "graph_pair_attr"
@@ -11029,9 +11197,6 @@ class TestAccountingCoverageRealMerger:
             f"the fact must carry forward under the already-emitted edge key;"
             f" got {ledger['graph_pair_attr']}"
         )
-        assert result["drift_intended_removal_by_reason"].get("display_name_absorbed") == 1, result[
-            "drift_intended_removal_by_reason"
-        ]
         assert result["drift_intended_removal_by_reason"].get("duplicate_projection") == 1, result[
             "drift_intended_removal_by_reason"
         ]
@@ -11044,6 +11209,7 @@ class TestAccountingCoverageRealMerger:
         for expected_survivor in (
             "graph_edge",
             "graph_attr",
+            "graph_name",
             "graph_pair_edge",
             "graph_promote",
         ):
@@ -12665,10 +12831,10 @@ class TestHarvestKeylessEdgesSpeakerId:
             "spk-1",
             entity_type="person",
             speaker_id="spk-1",
-            attributes={"name": "Alex Morgan"},
+            display_name="Alex Morgan",
         )
         # Add a plain object node.
-        g.add_node("python", entity_type="skill", attributes={"name": "Python"})
+        g.add_node("python", entity_type="skill", display_name="Python")
         # Add a keyless edge (no ik_key attribute) with a predicate.
         g.add_edge("spk-1", "python", predicate="has_skill", relation_type="factual")
 
@@ -12690,8 +12856,8 @@ class TestHarvestKeylessEdgesSpeakerId:
         g = loop.merger.graph
 
         # Add a non-speaker role node (no speaker_id attribute).
-        g.add_node("developer", entity_type="role", attributes={"name": "Developer"})
-        g.add_node("python", entity_type="skill", attributes={"name": "Python"})
+        g.add_node("developer", entity_type="role", display_name="Developer")
+        g.add_node("python", entity_type="skill", display_name="Python")
         # Keyless edge with predicate.
         g.add_edge("developer", "python", predicate="requires", relation_type="factual")
 
@@ -12791,8 +12957,8 @@ class TestHarvestKeylessEdgesSpeakerId:
         loop = self._make_loop(tmp_path)
         g = loop.merger.graph
 
-        g.add_node("concept_x", entity_type="concept", attributes={"name": "ConceptX"})
-        g.add_node("concept_y", entity_type="concept", attributes={"name": "ConceptY"})
+        g.add_node("concept_x", entity_type="concept", display_name="ConceptX")
+        g.add_node("concept_y", entity_type="concept", display_name="ConceptY")
         g.add_edge("concept_x", "concept_y", predicate="related_to", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
@@ -13172,8 +13338,8 @@ class TestCollectKeyedEdgesInto:
         )
 
         # (b) Keyless edge (no ik_key) with a speaker_id-bearing subject node.
-        g.add_node("bob", speaker_id="spk-new", attributes={"name": "Bob"})
-        g.add_node("paris", attributes={"name": "Paris"})
+        g.add_node("bob", speaker_id="spk-new", display_name="Bob")
+        g.add_node("paris", display_name="Paris")
         g.add_edge("bob", "paris", predicate="visits", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
@@ -13214,8 +13380,8 @@ class TestCollectKeyedEdgesInto:
         store entry shape."""
         loop = self._make_loop(tmp_path)
         g = loop.merger.graph
-        g.add_node("bob", speaker_id="spk-new", attributes={"name": "Bob"})
-        g.add_node("paris", attributes={"name": "Paris"})
+        g.add_node("bob", speaker_id="spk-new", display_name="Bob")
+        g.add_node("paris", display_name="Paris")
         g.add_edge("bob", "paris", predicate="visits", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
@@ -16556,7 +16722,7 @@ class TestSameAsSpeakerPairGuard:
         graph.add_node(
             org,
             entity_type="organization",
-            attributes={"name": "AcmeCorp"},
+            display_name="AcmeCorp",
             reinforcement_count=10,
             sessions=["s000"],
             first_seen="s000",
@@ -16567,7 +16733,7 @@ class TestSameAsSpeakerPairGuard:
             graph.add_node(
                 name,
                 entity_type="person",
-                attributes={"name": f"Person{i}"},
+                display_name=f"Person{i}",
                 reinforcement_count=i + 1,
                 sessions=[f"s{i:03d}"],
                 first_seen=f"s{i:03d}",
@@ -16714,7 +16880,7 @@ class TestSameAsSpeakerPairGuard:
             graph.add_node(
                 name,
                 entity_type="person",
-                attributes={"name": name.capitalize()},
+                display_name=name.capitalize(),
                 reinforcement_count=2,
                 sessions=["s100"],
                 first_seen="s100",
@@ -17778,7 +17944,7 @@ class TestRunGraphNormalizationApply:
 
         g = nx.MultiDiGraph()
         for i in range(node_count):
-            g.add_node(f"node{i}", reinforcement_count=0, attributes={"name": f"node{i}"})
+            g.add_node(f"node{i}", reinforcement_count=0, display_name=f"node{i}")
         loop.merger.graph = g
 
         store = MemoryStore(replay_enabled=True)
@@ -17818,8 +17984,8 @@ class TestRunGraphNormalizationApply:
             "confidence": 0.9,
             _IK_KEY_ATTR: ik_key,
         }
-        graph.add_node(subj, reinforcement_count=1, attributes={"name": subj})
-        graph.add_node(obj, reinforcement_count=1, attributes={"name": obj})
+        graph.add_node(subj, reinforcement_count=1, display_name=subj)
+        graph.add_node(obj, reinforcement_count=1, display_name=obj)
         graph.add_edge(subj, obj, **attrs)
 
     @staticmethod
@@ -17837,8 +18003,8 @@ class TestRunGraphNormalizationApply:
             "reinforcement_count": recurrence,
             "confidence": 0.9,
         }
-        graph.add_node(subj, reinforcement_count=1, attributes={"name": subj})
-        graph.add_node(obj, reinforcement_count=1, attributes={"name": obj})
+        graph.add_node(subj, reinforcement_count=1, display_name=subj)
+        graph.add_node(obj, reinforcement_count=1, display_name=obj)
         graph.add_edge(subj, obj, **attrs)
 
     # Prompt stub: only {predicates_json} placeholder (matches normalize_predicates).
@@ -18368,7 +18534,7 @@ class TestRunGraphNormalizationCloudEngine:
 
         g = nx.MultiDiGraph()
         for i in range(node_count):
-            g.add_node(f"node{i}", reinforcement_count=0, attributes={"name": f"node{i}"})
+            g.add_node(f"node{i}", reinforcement_count=0, display_name=f"node{i}")
         loop.merger.graph = g
 
         store = MemoryStore(replay_enabled=True)
@@ -18393,8 +18559,8 @@ class TestRunGraphNormalizationCloudEngine:
             "confidence": 0.9,
             _IK_KEY_ATTR: ik_key,
         }
-        graph.add_node(subj, reinforcement_count=1, attributes={"name": subj})
-        graph.add_node(obj, reinforcement_count=1, attributes={"name": obj})
+        graph.add_node(subj, reinforcement_count=1, display_name=subj)
+        graph.add_node(obj, reinforcement_count=1, display_name=obj)
         graph.add_edge(subj, obj, **attrs)
 
     _PROMPT_STUB = "dummy {predicates_json}"
@@ -21549,8 +21715,8 @@ class TestConsumePendingReinforcementCredit:
         before = loop.store.bookkeeping_for_key("graph1")
         before_count = before["reinforcement_count"]
 
-        loop.merger.graph.add_node("alice", speaker_id="spk-a", attributes={"name": "Alice"})
-        loop.merger.graph.add_node("berlin", attributes={"name": "Berlin"})
+        loop.merger.graph.add_node("alice", speaker_id="spk-a", display_name="Alice")
+        loop.merger.graph.add_node("berlin", display_name="Berlin")
         loop.merger.graph.add_edge(
             "alice",
             "berlin",

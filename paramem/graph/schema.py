@@ -15,10 +15,12 @@ class Entity(BaseModel):
 
     When the entity represents a speaker, ``speaker_id`` is populated with
     the speaker store's stable system ID (e.g. ``speaker0``) and that ID is
-    the canonical graph identity — ``name`` is a mutable display attribute
-    that can change (anonymous "speaker0" → disclosed "Alex") without
-    re-keying the graph. For non-speaker entities (places, organisations,
-    concepts), ``speaker_id`` stays ``None`` and identity is ``name``.
+    the canonical graph identity. ``name`` is folded onto the merger node's
+    ``display_name`` field (anonymous "speaker0" → disclosed "Alex") without
+    re-keying the graph; a model-emitted ``attributes["name"]``, if present,
+    is instead an ordinary trained fact. For non-speaker entities (places,
+    organisations, concepts), ``speaker_id`` stays ``None`` and identity is
+    ``name``.
     """
 
     name: str = Field(description="Canonical name (or display name when speaker_id is set)")
@@ -40,7 +42,8 @@ class Entity(BaseModel):
         description=(
             "Speaker store ID (e.g. 'speaker0'). Populated iff this entity "
             "represents a speaker. When set, ``speaker_id`` is the canonical "
-            "graph identity; ``name`` is a mutable display attribute."
+            "graph identity; ``name`` is folded onto the merger node's "
+            "display_name field."
         ),
     )
 

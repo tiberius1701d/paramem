@@ -138,11 +138,11 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     # The _materialize_consolidation_graph stub below skips reset_graph(), so the
     # graph survives intact through the keyed-walk step.
     _real_graph = nx.MultiDiGraph()
-    _real_graph.add_node("subject1", attributes={"name": "Subject1"})
-    _real_graph.add_node("object1", attributes={"name": "Object1"})
+    _real_graph.add_node("subject1", display_name="Subject1")
+    _real_graph.add_node("object1", display_name="Object1")
     _real_graph.add_edge("subject1", "object1", predicate="knows", relation_type="factual")
-    _real_graph.add_node("subject2", attributes={"name": "Subject2"})
-    _real_graph.add_node("object2", attributes={"name": "Object2"})
+    _real_graph.add_node("subject2", display_name="Subject2")
+    _real_graph.add_node("object2", display_name="Object2")
     _real_graph.add_edge("subject2", "object2", predicate="knows", relation_type="factual")
     loop.merger.graph = _real_graph
     # Graph-enrichment knobs. Default neighborhood hops for these unit tests.
@@ -1965,8 +1965,8 @@ class TestSessionIdsProvenanceCarry:
 
         loop = _make_mock_loop(tmp_path)
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
-        real_graph.add_node("berlin", attributes={"name": "Berlin"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", display_name="Alex")
+        real_graph.add_node("berlin", display_name="Berlin")
         real_graph.add_edge(
             "speaker0",
             "berlin",
@@ -2058,8 +2058,8 @@ class TestSessionIdsProvenanceCarry:
 
         loop = _make_mock_loop(tmp_path)
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
-        real_graph.add_node("berlin", attributes={"name": "Berlin"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", display_name="Alex")
+        real_graph.add_node("berlin", display_name="Berlin")
         # No 'sessions' key on the edge (legacy graph or edge without stamps).
         real_graph.add_edge("speaker0", "berlin", predicate="lives_in", relation_type="factual")
         loop.merger.graph = real_graph
@@ -2151,8 +2151,8 @@ class TestRecallFailedSessionStaysPending:
             refinement_normalization=refinement_normalization,
         )
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
-        real_graph.add_node("paris", attributes={"name": "Paris"})
+        real_graph.add_node("alice", speaker_id="speaker0", display_name="Alice")
+        real_graph.add_node("paris", display_name="Paris")
         real_graph.add_edge(
             "alice",
             "paris",
@@ -2470,9 +2470,9 @@ class TestRecallFailedSessionStaysPending:
             refinement_normalization="on",
         )
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
-        real_graph.add_node("paris", attributes={"name": "Paris"})
-        real_graph.add_node("london", attributes={"name": "London"})
+        real_graph.add_node("alice", speaker_id="speaker0", display_name="Alice")
+        real_graph.add_node("paris", display_name="Paris")
+        real_graph.add_node("london", display_name="London")
         # Edge 1: contributing session "session-pass"
         real_graph.add_edge(
             "alice",
@@ -2577,8 +2577,8 @@ class TestRecallFailedSessionStaysPending:
         proc_sid = "session-proc-fail"
         # Inject the procedural fact into merger.graph with the session_id on
         # the edge's sessions set — that's how extract_session delivers it in prod.
-        loop.merger.graph.add_node("Alice", attributes={"name": "Alice"})
-        loop.merger.graph.add_node("Tea", attributes={"name": "Tea"})
+        loop.merger.graph.add_node("Alice", display_name="Alice")
+        loop.merger.graph.add_node("Tea", display_name="Tea")
         loop.merger.graph.add_edge(
             "Alice",
             "Tea",

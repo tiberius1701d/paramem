@@ -1,6 +1,6 @@
 """Unit tests for GraphMerger's ``relation_type == "attribute"`` gate.
 
-Covers the merger-gate authority relocation (Unit 4): a relation the model
+Covers the merger-gate authority relocation: a relation the model
 tags ``relation_type="attribute"`` folds onto the SUBJECT node's
 ``attributes`` dict instead of becoming an edge to a (potentially
 colliding) concept node. Pure graph-state assertions — no model, no
@@ -117,7 +117,7 @@ class TestAttributeGateFoldsOntoNode:
         merger.merge(_session(_attr_relation(subject="Alex Morgan", obj="x@y.com")))
         node_key = "alex morgan"
         assert node_key in merger.graph
-        assert merger.graph.nodes[node_key]["attributes"]["name"] == "Alex Morgan"
+        assert merger.graph.nodes[node_key]["display_name"] == "Alex Morgan"
 
 
 class TestAttributeGateNoCollision:
@@ -165,6 +165,19 @@ class TestAttributeKeysBookkeeping:
         data = nx.node_link_data(merger.graph)
         reloaded = nx.node_link_graph(data, multigraph=True, directed=True)
         assert reloaded.nodes["speaker0"]["attribute_keys"]["email"] == "graph7"
+
+    def test_display_name_round_trips_through_node_link_serialization(self):
+        """display_name is an unknown top-level node field to
+        nx.node_link_data and must survive a save/load round trip — the RAM
+        graph is serialised by GraphMerger.save_bytes() into the
+        pre-migration backup."""
+        import networkx as nx
+
+        merger = GraphMerger()
+        merger.merge(_session(_attr_relation(indexed_key="graph7")))
+        data = nx.node_link_data(merger.graph)
+        reloaded = nx.node_link_graph(data, multigraph=True, directed=True)
+        assert reloaded.nodes["speaker0"]["display_name"] == "speaker0"
 
 
 class TestAttributeKeySupersession:
@@ -227,6 +240,51 @@ class TestAttributeKeySupersession:
         )
         assert entry["old_object"] == "old@example.com", f"got {entry}"
         assert entry["new_object"] == "new@example.com", f"got {entry}"
+
+    def test_same_value_carry_forward_survives_speaker_refresh_between_merges(self):
+        """A same-value `has name` carry-forward on a speaker node must still
+        be read as a carry-forward (`survivor_key`) even though
+        `merge_relations` synthesises a speaker Entity for every call and
+        `_upsert_entity`'s speaker refresh runs before the attribute gate
+        reads the incumbent value.  Before the display/fact split, the
+        refresh clobbered the incumbent FACT value with the display token,
+        so a same-value re-observation was misread as a different-value
+        contradiction (`old_object`/`new_object`, no `survivor_key`)."""
+        merger = GraphMerger()
+        old_rel = _attr_relation(predicate="has_name", obj="Alex", indexed_key="graph_old")
+        new_rel = _attr_relation(predicate="has_name", obj="Alex", indexed_key="graph_new")
+        merger.merge_relations([old_rel], session_id="s0", log_label="name facts")
+        merger.merge_relations([new_rel], session_id="s1", log_label="name facts")
+
+        assert merger.removal_ledger["graph_old"] == {
+            "reason": "attribute_key_superseded",
+            "survivor_key": "graph_new",
+        }
+
+
+class TestAttributeDisplaySurfaceSeparation:
+    """`display_name` and the trained `attributes["name"]` fact are
+    independent node fields: a fact can never clobber the first-seen display
+    surface, and the display surface is never read as a fact."""
+
+    def test_first_seen_display_survives_a_later_name_fact(self):
+        merger = GraphMerger()
+        edge_rel = Relation(
+            subject="Alex Morgan",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            speaker_id="",
+        )
+        name_rel = _attr_relation(
+            subject="Alex Morgan", predicate="has_name", obj="Alexandra Morgan", speaker_id=""
+        )
+        merger.merge_relations([edge_rel], session_id="s0", log_label="edge")
+        merger.merge_relations([name_rel], session_id="s1", log_label="name fact")
+
+        node = merger.graph.nodes["alex morgan"]
+        assert node["display_name"] == "Alex Morgan"
+        assert node["attributes"]["name"] == "Alexandra Morgan"
 
 
 class TestAttributeGateDoesNotReachUpsertRelation:

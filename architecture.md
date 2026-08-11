@@ -330,18 +330,26 @@ mechanism.
 
 ### AD-23: Reply-Boundary Speaker Resolution and the Speakerless Relay Path
 
-**Identity stays `speaker{N}` everywhere the model operates.**
-Recalled facts, the reasoning context, generated replies,
-persisted turn text, and cloud payloads all carry the raw
-token, never a display name — with the one documented
+**The speaker referent always stays `speaker{N}`
+wherever a model operates.** Recalled facts, the
+reasoning context, generated replies, persisted turn
+text, and cloud payloads refer to the speaker by the raw
+token, never by a display name — with the one documented
 exception at AD-16 step 1 (consolidation-time extraction
 receives the display name as comprehension context,
-substituted for the id only at the reply boundary). One
-resolver, `resolve_speaker_tokens`
+substituted for the id only at the reply boundary). A
+remembered fact whose *object* happens to be a personal
+name is ordinary memory content: it is learned, recalled
+and reasoned over like any other fact. The invariant
+governs how the speaker is *referred to*, not which words
+a remembered fact may contain.
+
+One resolver, `resolve_speaker_tokens`
 (`paramem/server/speaker.py`), owns every token-to-name
 substitution, and it fires only where text is about to be
-shown or spoken to a person — never on text a model will
-read. Four such exits exist: the `/chat` response text, the
+shown or spoken to a person; no `speaker{N}` token is
+ever rewritten to a name on its way into a model. Four
+such exits exist: the `/chat` response text, the
 `spoken_text` `POST /voice` both returns as its own response
 text and hands to TTS synthesis (one resolution, reused for
 both), the admin `/debug/probe` endpoint's response text, and

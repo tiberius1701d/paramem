@@ -27,7 +27,7 @@ from paramem.config.taxonomy import (
     relation_types,
 )
 from paramem.graph.extractor import request_graph_enrichment
-from paramem.graph.merger import GraphMerger, min_nonempty
+from paramem.graph.merger import GraphMerger, min_nonempty, node_display
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.memory.persistence import _IK_KEY_ATTR
@@ -910,12 +910,13 @@ def enrich_graph(
             # key (lowercase canonical speaker{N} id) so
             # paramem.graph.merger._synth_speaker_entities can emit the
             # correct Entity from the canonical key.
-            # Non-speaker endpoint: pass the display surface from node attributes.
+            # Non-speaker endpoint: pass the display surface from the node's
+            # display_name field.
             def _endpoint_str(canon: str) -> str:
                 _n = graph.nodes.get(canon, {})
                 if _n.get("speaker_id"):
                     return canon
-                return _n.get("attributes", {}).get("name", canon)
+                return node_display(_n, canon)
 
             subj_endpoint = _endpoint_str(subj_canon)
             obj_endpoint = _endpoint_str(obj_canon)

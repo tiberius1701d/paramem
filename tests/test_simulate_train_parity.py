@@ -187,11 +187,11 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
         _subj = _rel["subject"].lower().replace(" ", "_")
         _obj = _rel["object"].lower().replace(" ", "_")
         # Stamp speaker_id on the node only when the relation carries it explicitly.
-        _node_kwargs: dict = {"attributes": {"name": _rel["subject"]}}
+        _node_kwargs: dict = {"display_name": _rel["subject"]}
         if "speaker_id" in _rel:
             _node_kwargs["speaker_id"] = _rel["speaker_id"]
         _real_graph.add_node(_subj, **_node_kwargs)
-        _real_graph.add_node(_obj, attributes={"name": _rel["object"]})
+        _real_graph.add_node(_obj, display_name=_rel["object"])
         _real_graph.add_edge(
             _subj,
             _obj,
@@ -3368,8 +3368,8 @@ class TestFoldHydratesAPartiallyPreloadedStore:
         # entry content — is the thing under test.
         keyed_graph = nx.MultiDiGraph()
         for triple in self._TRIPLES:
-            keyed_graph.add_node(triple["subject"], attributes={"name": triple["subject"]})
-            keyed_graph.add_node(triple["object"], attributes={"name": triple["object"]})
+            keyed_graph.add_node(triple["subject"], display_name=triple["subject"])
+            keyed_graph.add_node(triple["object"], display_name=triple["object"])
             eid = keyed_graph.add_edge(
                 triple["subject"],
                 triple["object"],
