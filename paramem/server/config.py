@@ -292,6 +292,13 @@ class SecurityConfig:
     backups: ServerBackupsConfig = field(default_factory=ServerBackupsConfig)
     require_encryption: bool = False
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.require_encryption, bool):
+            raise ValueError(
+                f"security.require_encryption must be a boolean (true/false), "
+                f"got {self.require_encryption!r}"
+            )
+
 
 @dataclass
 class RestartConfig:
@@ -2388,7 +2395,8 @@ def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
             schedule=schedule,
             artifacts=artifacts,
             max_total_disk_gb=max_total_disk_gb,
-        )
+        ),
+        require_encryption=security_raw.get("require_encryption", False),
     )
 
     return config

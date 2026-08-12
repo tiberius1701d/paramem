@@ -768,9 +768,9 @@ vram:
 # slots, migration-rollback pre-mortem backups) are exempt from rule 1 by
 # design. Must be > 0 — a non-positive value is a config error at boot.
 #
-# Defaults shown below. Uncomment to override.
-# security:
-#   require_encryption: false
+# Backup defaults shown below. Uncomment to override.
+security:
+  require_encryption: false
 #   backups:
 #     orphan_sweep:
 #       max_age_hours: 24

@@ -143,6 +143,70 @@ class TestSecurityOrphanSweepConfig:
         )
 
 
+class TestSecurityRequireEncryptionLoader:
+    """``security.require_encryption`` must round-trip from YAML to the config.
+
+    Regression: the loader built ``SecurityConfig`` from the parsed
+    ``security:`` block but only passed ``backups`` — the flag was silently
+    dropped and the dataclass default (False) always won, making the
+    fail-loud opt-in a no-op through ``load_server_config``.
+    """
+
+    def test_true_round_trips_from_yaml(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            security:
+              require_encryption: true
+            """,
+        )
+        config = load_server_config(yaml_file)
+        assert config.security.require_encryption is True
+
+    def test_false_round_trips_from_yaml(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            security:
+              require_encryption: false
+            """,
+        )
+        config = load_server_config(yaml_file)
+        assert config.security.require_encryption is False
+
+    def test_absent_security_section_defaults_false(self, tmp_path):
+        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
+        config = load_server_config(yaml_file)
+        assert config.security.require_encryption is False
+
+    def test_empty_security_section_defaults_false(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            security:
+            """,
+        )
+        config = load_server_config(yaml_file)
+        assert config.security.require_encryption is False
+
+    def test_string_value_rejected_at_load(self, tmp_path):
+        """A YAML string like ``"true"`` is truthy under ``bool()`` — reject
+        non-bool values at load rather than silently coercing."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            security:
+              require_encryption: "true"
+            """,
+        )
+        with pytest.raises(ValueError, match="security.require_encryption"):
+            load_server_config(yaml_file)
+
+
 class TestPathsConfigKeyMetadata:
     """Canonical Paths.key_metadata must match the on-disk layout.
 
