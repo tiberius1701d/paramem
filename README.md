@@ -1,6 +1,6 @@
 # ParaMem
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19502523.svg)](https://doi.org/10.5281/zenodo.19502523)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19502522.svg)](https://doi.org/10.5281/zenodo.19502522)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
@@ -10,14 +10,14 @@ ParaMem stores facts in LoRA adapter weights rather than an external store — e
 
 The repository is two things at once:
 
-- **A rigorously evaluated method.** 17 tests in 8 thematic parts ([benchmarking.md](benchmarking.md#test-suite-overview); [paper (PDF)](https://doi.org/10.5281/zenodo.19502523)), with the negative results stated as plainly as the positive ones. Successes: indexed-key recall scales to 550/550 facts at 100% with no ceiling observed (Test 8); contradiction overwrite in one cycle with zero forgetting (Tests 2, 2b); apparent catastrophic forgetting is mostly recoverable in ~2 epochs with zero collateral (Tests 13b, 15, 16). Failures, reported in full: training new keys without replay forgets the old ones (0/40 old-key survival on Mistral); additive adapter composition and weight-merging both collapse recall (0–1/50 — use adapter switching); no grokking emerges through 1,590 epochs of extended training; and a pre-registered scaffold-then-fill retention advantage did not survive multi-seed replication (Test 15).
+- **A rigorously evaluated method.** 17 tests in 8 thematic parts ([benchmarking.md](benchmarking.md#test-suite-overview); [paper (PDF)](https://doi.org/10.5281/zenodo.19502522)), with the negative results stated as plainly as the positive ones. Successes: indexed-key recall scales to 550/550 facts at 100% with no ceiling observed (Test 8); contradiction overwrite in one cycle with zero forgetting (Tests 2, 2b); apparent catastrophic forgetting is mostly recoverable in ~2 epochs with zero collateral (Tests 13b, 15, 16). Failures, reported in full: training new keys without replay forgets the old ones (0/40 old-key survival on Mistral); additive adapter composition and weight-merging both collapse recall (0–1/50 — use adapter switching); no grokking emerges through 1,590 epochs of extended training; and a pre-registered scaffold-then-fill retention advantage did not survive multi-seed replication (Test 15).
 - **A production-grade operational substrate.** Crash-safe background training with epoch-level resume and SHA-256 fingerprint validation; atomic full-cycle consolidation that rolls back to the pre-finalize snapshot on a recall-sanity-check failure; a VRAM topology validator that gates model load before an OOM can happen mid-request; GPU lifecycle handoff with orphan-hold recovery; and a multi-stage privacy-aware extraction pipeline. The ML is wrapped in the reliability discipline of a safety-critical system.
 
 Scope is deliberate and the project is active: a solo build on consumer hardware. The core mechanism went from blueprint to working prototype in about a week; the production substrate and evaluation suite are the work of the months since. The aim is working depth in the ML stack and its tooling, not large-model scale.
 
 A local multi-speaker voice assistant runs as the system's **live load test** — the harness under continuous real-world conditions — not the deliverable.
 
-**For researchers:** [Findings](#findings-worth-looking-at) · [paper (PDF)](https://doi.org/10.5281/zenodo.19502523) · full protocols in [benchmarking.md](benchmarking.md).
+**For researchers:** [Findings](#findings-worth-looking-at) · [paper (PDF)](https://doi.org/10.5281/zenodo.19502522) · full protocols in [benchmarking.md](benchmarking.md).
 **For developers / operators:** [Quick Start](#quick-start) · [Deployment guide](DEPLOYMENT.md).
 
 ## Results
@@ -449,8 +449,8 @@ The output is `paper/main.pdf`. LaTeX build artifacts are gitignored.
   author       = {Preusser, Tobias},
   year         = {2026},
   publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.19502523},
-  url          = {https://doi.org/10.5281/zenodo.19502523},
+  doi          = {10.5281/zenodo.19502522},
+  url          = {https://doi.org/10.5281/zenodo.19502522},
   note         = {Preprint}
 }
 ```
