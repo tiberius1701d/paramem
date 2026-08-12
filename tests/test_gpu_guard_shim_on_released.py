@@ -7,8 +7,8 @@ A normal training run that acquires a free GPU calls on_acquired (stamping
 PARAMEM_HOLD_PID); without the paired on_released, PARAMEM_HOLD_PID is left
 stale in the systemd environment across runs.
 
-This test uses a recording stub for subprocess.run that captures the
-``systemctl --user unset-environment`` call.
+This test uses a recording stub for ``paramem.utils.systemctl.run`` that
+captures the ``unset-environment``/``set-environment`` calls.
 """
 
 from __future__ import annotations
@@ -31,10 +31,10 @@ class TestParamemHoldEnvVarClearedOnRelease:
         """After a free-GPU acquire-and-release the paramem consumer's
         on_released() must be called, which issues systemctl unset-environment.
         """
-        # Build a stub consumer whose subprocess.run calls we can inspect.
+        # Build a stub consumer whose systemctl.run calls we can inspect.
         run_calls: list[list] = []
 
-        def recording_run(args, **kwargs):
+        def recording_run(*args, **kwargs):
             run_calls.append(list(args))
             m = MagicMock()
             m.returncode = 0
@@ -49,8 +49,8 @@ class TestParamemHoldEnvVarClearedOnRelease:
             patch.object(_core_module, "read_all_live", return_value=[]),
             patch.object(_core_module, "write_holder"),
             patch.object(_core_module, "remove_holder"),
-            # Patch subprocess.run inside gpu_consumer so we capture its calls.
-            patch("paramem.utils.gpu_consumer.subprocess.run", side_effect=recording_run),
+            # Patch the systemctl transport seam so we capture its calls.
+            patch("paramem.utils.systemctl.run", side_effect=recording_run),
         ):
             from gpu_guard._core import acquire_gpu
             from gpu_guard.inhibitor import NullInhibitor
@@ -65,14 +65,10 @@ class TestParamemHoldEnvVarClearedOnRelease:
             ):
                 pass  # normal body
 
-        # Verify that at least one call was "systemctl --user unset-environment"
-        unset_calls = [
-            args
-            for args in run_calls
-            if len(args) >= 3 and args[1] == "--user" and args[2] == "unset-environment"
-        ]
+        # Verify that at least one call was "unset-environment".
+        unset_calls = [args for args in run_calls if args and args[0] == "unset-environment"]
         assert unset_calls, (
-            "Expected systemctl --user unset-environment to be called in on_released, "
+            "Expected systemctl unset-environment to be called in on_released, "
             f"but recorded calls were: {run_calls}"
         )
         # Verify the hold vars are included in the unset call.
@@ -83,7 +79,7 @@ class TestParamemHoldEnvVarClearedOnRelease:
         """on_acquired must also be called so PARAMEM_HOLD_PID gets stamped initially."""
         run_calls: list[list] = []
 
-        def recording_run(args, **kwargs):
+        def recording_run(*args, **kwargs):
             run_calls.append(list(args))
             m = MagicMock()
             m.returncode = 0
@@ -98,7 +94,7 @@ class TestParamemHoldEnvVarClearedOnRelease:
             patch.object(_core_module, "read_all_live", return_value=[]),
             patch.object(_core_module, "write_holder"),
             patch.object(_core_module, "remove_holder"),
-            patch("paramem.utils.gpu_consumer.subprocess.run", side_effect=recording_run),
+            patch("paramem.utils.systemctl.run", side_effect=recording_run),
         ):
             from gpu_guard._core import acquire_gpu
             from gpu_guard.inhibitor import NullInhibitor
@@ -114,13 +110,9 @@ class TestParamemHoldEnvVarClearedOnRelease:
                 pass
 
         # set-environment should appear (on_acquired).
-        set_calls = [
-            args
-            for args in run_calls
-            if len(args) >= 3 and args[1] == "--user" and args[2] == "set-environment"
-        ]
+        set_calls = [args for args in run_calls if args and args[0] == "set-environment"]
         assert set_calls, (
-            "Expected systemctl --user set-environment to be called in on_acquired, "
+            "Expected systemctl set-environment to be called in on_acquired, "
             f"but recorded calls were: {run_calls}"
         )
         set_args_flat = " ".join(set_calls[0])

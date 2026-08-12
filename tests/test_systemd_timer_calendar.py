@@ -19,6 +19,7 @@ from paramem.server.systemd_timer import (
     _minutes_to_calendar,
     parse_schedule,
 )
+from paramem.utils import systemctl
 
 # Every-1h produces 24 hour marks; too long to inline cleanly.
 _1H_CAL = "*-*-* 00,01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22,23:00:00"
@@ -553,7 +554,7 @@ class TestReconcileProjectRoot:
         svc_path = tmp_path / "paramem-consolidate.service"
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", svc_path)
         custom_root = "/opt/myparamem"
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             systemd_timer.reconcile("every 12h", project_root=custom_root)
         svc_text = svc_path.read_text()
         assert f"EnvironmentFile=-{custom_root}/.env" in svc_text, (
@@ -610,7 +611,7 @@ class TestReconcileDetailString:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("every 12h")
         assert "with catch-up" in msg
         assert "no catch-up" not in msg
@@ -622,7 +623,7 @@ class TestReconcileDetailString:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("every 5h")
         assert "with catch-up" in msg
         assert "no catch-up" not in msg
@@ -631,7 +632,7 @@ class TestReconcileDetailString:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("03:00")
         assert "with catch-up" in msg
 
@@ -658,7 +659,7 @@ class TestCurrentTimerStateJsonParser:
         return p
 
     def _make_show_run(self, active_state: str = "active", last_trigger: str = "") -> object:
-        """Return a mock _run_systemctl that handles 'show' and 'list-timers' calls."""
+        """Return a mock systemctl.run that handles 'show' and 'list-timers' calls."""
         import subprocess
 
         def _run(*args, **kwargs):
@@ -674,7 +675,7 @@ class TestCurrentTimerStateJsonParser:
         return _run
 
     def _make_list_timers_run(self, next_us: int, timer_name: str = "") -> object:
-        """Return a mock _run_systemctl whose list-timers call returns next_us."""
+        """Return a mock systemctl.run whose list-timers call returns next_us."""
         import json
         import subprocess
 
@@ -701,7 +702,7 @@ class TestCurrentTimerStateJsonParser:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         self._timer_file(tmp_path)
         _next = 1_782_856_800_000_000
-        with patch.object(systemd_timer, "_run_systemctl", self._make_list_timers_run(_next)):
+        with patch.object(systemctl, "run", self._make_list_timers_run(_next)):
             state = systemd_timer.current_timer_state()
         assert state["installed"] is True
         assert state["next_elapse_us"] == str(_next)
@@ -711,7 +712,7 @@ class TestCurrentTimerStateJsonParser:
         """'next':0 means no scheduled elapse — must return empty string."""
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         self._timer_file(tmp_path)
-        with patch.object(systemd_timer, "_run_systemctl", self._make_list_timers_run(0)):
+        with patch.object(systemctl, "run", self._make_list_timers_run(0)):
             state = systemd_timer.current_timer_state()
         assert state["next_elapse_us"] == ""
 
@@ -719,7 +720,7 @@ class TestCurrentTimerStateJsonParser:
         """An empty list-timers array (unit not loaded) must return empty string."""
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         self._timer_file(tmp_path)
-        with patch.object(systemd_timer, "_run_systemctl", self._make_show_run()):
+        with patch.object(systemctl, "run", self._make_show_run()):
             state = systemd_timer.current_timer_state()
         assert state["next_elapse_us"] == ""
 
@@ -743,7 +744,7 @@ class TestCurrentTimerStateJsonParser:
                 return subprocess.CompletedProcess(args_list, 0, stdout=payload, stderr="")
             return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
 
-        with patch.object(systemd_timer, "_run_systemctl", _run):
+        with patch.object(systemctl, "run", _run):
             state = systemd_timer.current_timer_state()
         assert state["next_elapse_us"] == ""
 
@@ -773,7 +774,7 @@ class TestCurrentTimerStateJsonParser:
                 return subprocess.CompletedProcess(args_list, 0, stdout=payload, stderr="")
             return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
 
-        with patch.object(systemd_timer, "_run_systemctl", _run):
+        with patch.object(systemctl, "run", _run):
             state = systemd_timer.current_timer_state()
         assert state["active"] is True
         assert state["last_trigger_us"] == "1782000000000000"
@@ -805,7 +806,7 @@ class TestCurrentTimerStateJsonParser:
                 )
             return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
 
-        with patch.object(systemd_timer, "_run_systemctl", _run):
+        with patch.object(systemctl, "run", _run):
             state = systemd_timer.current_timer_state()
         assert state["next_elapse_us"] == ""
         assert state["installed"] is True
@@ -832,7 +833,7 @@ class TestCurrentTimerStateJsonParser:
             return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
 
         # max_age_seconds=0 bypasses the module-level cache to force a fresh read.
-        with patch.object(systemd_timer, "_run_systemctl", _run):
+        with patch.object(systemctl, "run", _run):
             state = systemd_timer.cached_timer_state("paramem-backup", max_age_seconds=0)
         assert state["installed"] is True
         assert state["next_elapse_us"] == str(_next)

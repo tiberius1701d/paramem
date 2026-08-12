@@ -3808,7 +3808,7 @@ class TestGpuAcquireBaseSwapResume:
 
         monkeypatch.setattr(_app, "_run_base_swap_orchestration", _fake_orchestration)
 
-        def _fake_reload():
+        def _fake_reload(**_kw):
             state["mode"] = "local"
             state["cloud_only_reason"] = None
 
@@ -3820,11 +3820,14 @@ class TestGpuAcquireBaseSwapResume:
                 return_value={"hold_active": False, "owner_pid": None, "owner_alive": False},
             ),
             patch("paramem.server.app._clear_hold_env", return_value=False),
+            patch("paramem.server.app._restart_service") as mock_restart,
         ):
             client = TestClient(_app.app, raise_server_exceptions=False)
             resp = client.post("/gpu/acquire")
 
         assert resp.status_code == 200, resp.text
+        assert state["mode"] == "local", "Reload must have succeeded"
+        mock_restart.assert_not_called()
         assert len(orchestration_calls) == 0, (
             "Must not re-launch orchestration when no phaseA_done marker"
         )

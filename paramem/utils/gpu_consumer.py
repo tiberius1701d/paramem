@@ -12,8 +12,9 @@ stamping ``PARAMEM_HOLD_*`` on GPU acquire, and clearing them on release.
 
 from __future__ import annotations
 
-import subprocess
 import time
+
+from paramem.utils import systemctl
 
 
 class ParamemEnvStampAdapter:
@@ -104,8 +105,6 @@ class ParamemEnvStampAdapter:
 
         hint = format_cmd_hint(argv)
         stamp_args = [
-            "systemctl",
-            "--user",
             "set-environment",
             f"PARAMEM_HOLD_PID={own_pid}",
             f"PARAMEM_HOLD_STARTED_AT={int(time.time())}",
@@ -113,7 +112,7 @@ class ParamemEnvStampAdapter:
         if hint:
             stamp_args.append(f"PARAMEM_HOLD_CMD={hint}")
         try:
-            subprocess.run(stamp_args, check=False, capture_output=True, timeout=5)
+            systemctl.run(*stamp_args, timeout=5)
         except Exception:
             pass
 
@@ -125,18 +124,12 @@ class ParamemEnvStampAdapter:
         hook; auto-reclaim's GPU-free check handles that case independently.
         """
         try:
-            subprocess.run(
-                [
-                    "systemctl",
-                    "--user",
-                    "unset-environment",
-                    "PARAMEM_EXTRA_ARGS",
-                    "PARAMEM_HOLD_PID",
-                    "PARAMEM_HOLD_STARTED_AT",
-                    "PARAMEM_HOLD_CMD",
-                ],
-                check=False,
-                capture_output=True,
+            systemctl.run(
+                "unset-environment",
+                "PARAMEM_EXTRA_ARGS",
+                "PARAMEM_HOLD_PID",
+                "PARAMEM_HOLD_STARTED_AT",
+                "PARAMEM_HOLD_CMD",
                 timeout=5,
             )
         except Exception:

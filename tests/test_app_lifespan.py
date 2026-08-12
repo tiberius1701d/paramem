@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from paramem.utils import systemctl
+
 # ---------------------------------------------------------------------------
 # TestIdleDebounceConfig — ConsolidationScheduleConfig.training_idle_debounce_s
 # ---------------------------------------------------------------------------
@@ -219,9 +221,9 @@ class TestSchedulerIdleDebounce:
 # TestApplyConfigLiveSchedulerParticipation — _apply_config_live re-reads
 # consolidation.refresh_cadence from config B and reconciles the systemd
 # timer to it, so a cadence-only edit applies live and drift clears without
-# a restart. All systemctl calls are mocked (_run_systemctl) and unit files
-# are redirected into tmp_path — no test here can reach the live user
-# systemd session.
+# a restart. All systemctl calls are mocked (paramem.utils.systemctl.run) and
+# unit files are redirected into tmp_path — no test here can reach the live
+# user systemd session.
 # ---------------------------------------------------------------------------
 
 
@@ -292,7 +294,7 @@ class TestApplyConfigLiveSchedulerParticipation:
         """
         import paramem.server.app as app_module
 
-        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
+        self._install_timer_paths(tmp_path, monkeypatch)
         self._install_backup_timer_paths(tmp_path, monkeypatch)
 
         config_a = _make_apply_live_config(refresh_cadence="12h", backups_schedule="off")
@@ -315,7 +317,7 @@ class TestApplyConfigLiveSchedulerParticipation:
             ),
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
-            patch.object(systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl),
+            patch.object(systemctl, "run", side_effect=_mock_run_systemctl),
             patch.object(app_module, "_live_reload_base_model"),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
@@ -335,7 +337,7 @@ class TestApplyConfigLiveSchedulerParticipation:
         """
         import paramem.server.app as app_module
 
-        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
+        self._install_timer_paths(tmp_path, monkeypatch)
 
         config_a = _make_apply_live_config(refresh_cadence="12h")
         config_b = _make_apply_live_config(refresh_cadence="6h")
@@ -357,9 +359,7 @@ class TestApplyConfigLiveSchedulerParticipation:
             ),
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
-            patch.object(
-                systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl
-            ) as mock_systemctl,
+            patch.object(systemctl, "run", side_effect=_mock_run_systemctl) as mock_systemctl,
             patch.object(app_module, "_live_reload_base_model"),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
@@ -388,7 +388,7 @@ class TestApplyConfigLiveSchedulerParticipation:
         systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
 
         # Pre-install an active timer (as if a prior '12h' cadence was live).
-        with patch.object(systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl):
+        with patch.object(systemctl, "run", side_effect=_mock_run_systemctl):
             systemd_timer.reconcile("every 12h")
         assert (tmp_path / "paramem-consolidate.timer").exists()
 
@@ -412,7 +412,7 @@ class TestApplyConfigLiveSchedulerParticipation:
             ),
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
-            patch.object(systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl),
+            patch.object(systemctl, "run", side_effect=_mock_run_systemctl),
             patch.object(app_module, "_live_reload_base_model"),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
@@ -429,7 +429,7 @@ class TestApplyConfigLiveSchedulerParticipation:
         (nothing to read) rather than acting on a stale/absent config."""
         import paramem.server.app as app_module
 
-        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
+        self._install_timer_paths(tmp_path, monkeypatch)
 
         config_a = _make_apply_live_config(refresh_cadence="12h")
 
@@ -453,9 +453,7 @@ class TestApplyConfigLiveSchedulerParticipation:
             ),
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", _failing_load),
-            patch.object(
-                systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl
-            ) as mock_systemctl,
+            patch.object(systemctl, "run", side_effect=_mock_run_systemctl) as mock_systemctl,
             patch.object(app_module, "_live_reload_base_model"),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):

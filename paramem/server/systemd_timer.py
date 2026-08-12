@@ -66,12 +66,12 @@ Accepted schedule strings (same parser as before, plus "off"):
 from __future__ import annotations
 
 import logging
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from paramem.server import schedule_grammar
 from paramem.server.schedule_grammar import parse_schedule_atom
+from paramem.utils import systemctl
 from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
@@ -352,15 +352,6 @@ def render_timer_unit(
     return "\n".join(lines)
 
 
-def _run_systemctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["systemctl", "--user", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
 def _write_if_changed(path: Path, content: str) -> bool:
     """Write content only if it differs from current file. Returns True on change."""
     try:
@@ -430,11 +421,11 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
     if spec.kind == "off":
         changed = False
         if target.timer_path.exists():
-            _run_systemctl("stop", f"{target.timer_name}.timer")
-            _run_systemctl("disable", f"{target.timer_name}.timer")
+            systemctl.run("stop", f"{target.timer_name}.timer")
+            systemctl.run("disable", f"{target.timer_name}.timer")
             target.timer_path.unlink(missing_ok=True)
             target.service_path.unlink(missing_ok=True)
-            _run_systemctl("daemon-reload")
+            systemctl.run("daemon-reload")
             changed = True
         return f"{target.timer_name}: disabled" + (" (removed)" if changed else "")
 
@@ -446,9 +437,9 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
     changed = svc_changed or tmr_changed
 
     if changed:
-        _run_systemctl("daemon-reload")
+        systemctl.run("daemon-reload")
 
-        enable = _run_systemctl("enable", "--now", f"{target.timer_name}.timer")
+        enable = systemctl.run("enable", "--now", f"{target.timer_name}.timer")
         if enable.returncode != 0:
             logger.warning(
                 "systemctl enable --now %s.timer failed: %s",
@@ -459,7 +450,7 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
 
         # If unit already enabled, systemd won't restart it on daemon-reload —
         # force a restart so the new OnCalendar takes effect.
-        _run_systemctl("restart", f"{target.timer_name}.timer")
+        systemctl.run("restart", f"{target.timer_name}.timer")
 
     # Every non-off kind is OnCalendar + Persistent=true — catch-up always
     # applies, whether the grid is exact or a heartbeat (see module docstring).
@@ -532,7 +523,7 @@ def current_timer_state(timer_name: str = TIMER_NAME) -> dict:
     timer_path = UNIT_DIR / f"{timer_name}.timer"
     if not timer_path.exists():
         return {"installed": False}
-    show = _run_systemctl(
+    show = systemctl.run(
         "show",
         f"{timer_name}.timer",
         "--property=ActiveState,LastTriggerUSec",
@@ -552,7 +543,7 @@ def current_timer_state(timer_name: str = TIMER_NAME) -> dict:
     import json as _json
 
     next_elapse_us = ""
-    list_out = _run_systemctl(
+    list_out = systemctl.run(
         "list-timers",
         f"{timer_name}.timer",
         "--output=json",

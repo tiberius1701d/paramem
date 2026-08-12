@@ -9,6 +9,7 @@ from paramem.backup.timer import reconcile, render_service_unit
 from paramem.server import systemd_timer as server_systemd_timer
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.server.systemd_timer import TimerSpec
+from paramem.utils import systemctl
 
 # ---------------------------------------------------------------------------
 # parse_schedule reuse
@@ -110,7 +111,7 @@ class TestReconcileOff:
             calls_made.append(args)
             return MagicMock(returncode=0, stderr="")
 
-        monkeypatch.setattr(server_systemd_timer, "_run_systemctl", fake_systemctl)
+        monkeypatch.setattr(systemctl, "run", fake_systemctl)
 
         result = reconcile(
             "off",
@@ -129,8 +130,8 @@ class TestReconcileOff:
 
         calls_made = []
         monkeypatch.setattr(
-            server_systemd_timer,
-            "_run_systemctl",
+            systemctl,
+            "run",
             lambda *a: calls_made.append(a) or MagicMock(returncode=0),
         )
 
@@ -150,9 +151,7 @@ class TestReconcileWritesUnits:
         monkeypatch.setattr(backup_timer, "TIMER_PATH", timer_path)
         monkeypatch.setattr(backup_timer, "SERVICE_PATH", service_path)
         monkeypatch.setattr(backup_timer, "UNIT_DIR", tmp_path)
-        monkeypatch.setattr(
-            server_systemd_timer, "_run_systemctl", lambda *a: MagicMock(returncode=0, stderr="")
-        )
+        monkeypatch.setattr(systemctl, "run", lambda *a: MagicMock(returncode=0, stderr=""))
         return timer_path, service_path
 
     def test_reconcile_writes_unit_files(self, tmp_path, monkeypatch):
@@ -180,7 +179,7 @@ class TestReconcileWritesUnits:
                 daemon_reloads.append(1)
             return MagicMock(returncode=0, stderr="")
 
-        monkeypatch.setattr(server_systemd_timer, "_run_systemctl", fake_systemctl)
+        monkeypatch.setattr(systemctl, "run", fake_systemctl)
         reconcile("daily 04:00", python_path="/usr/bin/python", project_root="/opt/paramem")
         count_after_first = len(daemon_reloads)
         reconcile("daily 04:00", python_path="/usr/bin/python", project_root="/opt/paramem")

@@ -135,7 +135,9 @@ def _run_pstatus(status_dict: dict) -> subprocess.CompletedProcess:
     # Run bash without a live PID check — pstatus checks `lsof -i :PORT -t`
     # which would return nothing for our test server.  Inject a fake lsof via
     # PATH substitution so the PID check sees a non-empty result and does not
-    # take the "NOT RUNNING" early-exit branch.
+    # take the "NOT RUNNING" early-exit branch. Also shadow systemctl,
+    # nvidia-smi, and powershell.exe with fakes so the script's read-only
+    # host queries never reach the real host during a test run.
     import os
     import stat
     import tempfile
@@ -143,7 +145,40 @@ def _run_pstatus(status_dict: dict) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as fake_bin:
         fake_lsof = Path(fake_bin) / "lsof"
         fake_lsof.write_text("#!/bin/sh\necho $$\n")
-        fake_lsof.chmod(fake_lsof.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+
+        fake_systemctl = Path(fake_bin) / "systemctl"
+        fake_systemctl.write_text(
+            "#!/bin/sh\n"
+            'case "$2" in\n'
+            "  is-active)\n"
+            "    echo active\n"
+            "    ;;\n"
+            "  show)\n"
+            "    echo 'ActiveEnterTimestamp=Mon 2026-08-10 08:00:00 UTC'\n"
+            "    ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
+
+        fake_nvidia_smi = Path(fake_bin) / "nvidia-smi"
+        fake_nvidia_smi.write_text(
+            "#!/bin/sh\n"
+            'for arg in "$@"; do\n'
+            '  case "$arg" in\n'
+            "    --query-gpu=temperature.gpu*) echo 45 ;;\n"
+            "    --query-gpu=power.draw*) echo 15.00 ;;\n"
+            "    --query-gpu=memory.used*) echo 1024 ;;\n"
+            "    --query-gpu=memory.total*) echo 8192 ;;\n"
+            "  esac\n"
+            "done\n"
+            "exit 0\n"
+        )
+
+        fake_powershell = Path(fake_bin) / "powershell.exe"
+        fake_powershell.write_text("#!/bin/sh\nexit 0\n")
+
+        for fake_exe in (fake_lsof, fake_systemctl, fake_nvidia_smi, fake_powershell):
+            fake_exe.chmod(fake_exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
 
         env = os.environ.copy()
         env["PATH"] = f"{fake_bin}:{env.get('PATH', '/usr/bin:/bin')}"

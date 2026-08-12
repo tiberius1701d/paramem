@@ -224,35 +224,27 @@ class TestParamemHoldEnvVarsStampedAndCleared:
 
         run_calls: list[list] = []
 
-        def recording_run(args, **kwargs):
+        def recording_run(*args, **kwargs):
             run_calls.append(list(args))
             m = MagicMock()
             m.returncode = 0
             return m
 
-        with patch("paramem.utils.gpu_consumer.subprocess.run", side_effect=recording_run):
+        with patch("paramem.utils.systemctl.run", side_effect=recording_run):
             import sys
 
             adapter.on_acquired(own_pid=12345, argv=sys.argv)
             adapter.on_released()
 
         # set-environment must appear (on_acquired).
-        set_calls = [
-            args
-            for args in run_calls
-            if len(args) >= 3 and args[1] == "--user" and args[2] == "set-environment"
-        ]
+        set_calls = [args for args in run_calls if args and args[0] == "set-environment"]
         assert set_calls, f"Expected set-environment call, got: {run_calls}"
         assert any("PARAMEM_HOLD_PID=12345" in arg for arg in set_calls[0]), (
             f"PARAMEM_HOLD_PID=12345 not in set-environment args: {set_calls[0]}"
         )
 
         # unset-environment must appear (on_released).
-        unset_calls = [
-            args
-            for args in run_calls
-            if len(args) >= 3 and args[1] == "--user" and args[2] == "unset-environment"
-        ]
+        unset_calls = [args for args in run_calls if args and args[0] == "unset-environment"]
         assert unset_calls, f"Expected unset-environment call, got: {run_calls}"
         assert "PARAMEM_HOLD_PID" in unset_calls[0], (
             f"PARAMEM_HOLD_PID missing from unset-environment args: {unset_calls[0]}"

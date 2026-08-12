@@ -16,6 +16,7 @@ from paramem.server.systemd_timer import (
     _minutes_to_calendar,
     parse_schedule,
 )
+from paramem.utils import systemctl
 
 
 class TestParseSchedule:
@@ -124,7 +125,7 @@ class TestReconcile:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("bogus")
         assert "disabled" in msg
 
@@ -132,7 +133,7 @@ class TestReconcile:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("every 2h")
         assert "with catch-up" in msg
         timer = (tmp_path / "paramem-consolidate.timer").read_text()
@@ -149,7 +150,7 @@ class TestReconcile:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("every 5h")
         assert "with catch-up" in msg
         timer = (tmp_path / "paramem-consolidate.timer").read_text()
@@ -162,7 +163,7 @@ class TestReconcile:
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             systemd_timer.reconcile("03:30")
         timer = (tmp_path / "paramem-consolidate.timer").read_text()
         assert "OnCalendar=*-*-* 03:30:00" in timer
@@ -174,7 +175,7 @@ class TestReconcile:
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
         (tmp_path / "paramem-consolidate.timer").write_text("stub")
         (tmp_path / "paramem-consolidate.service").write_text("stub")
-        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+        with patch.object(systemctl, "run", self._mock_run):
             msg = systemd_timer.reconcile("off")
         assert "disabled" in msg
         assert not (tmp_path / "paramem-consolidate.timer").exists()
@@ -204,7 +205,7 @@ class TestReconcileEnableGating:
         """Fresh machine (no unit files yet): content changes → enable/restart fire,
         message says 'updated', never 'already current'."""
         self._install(tmp_path, monkeypatch)
-        with patch.object(systemd_timer, "_run_systemctl", side_effect=self._mock_run) as mock_run:
+        with patch.object(systemctl, "run", side_effect=self._mock_run) as mock_run:
             msg = systemd_timer.reconcile("every 12h")
 
         assert "updated" in msg
@@ -219,12 +220,10 @@ class TestReconcileEnableGating:
         systemctl at all (nothing changed), and must truthfully report
         'already current'."""
         self._install(tmp_path, monkeypatch)
-        with patch.object(systemd_timer, "_run_systemctl", side_effect=self._mock_run):
+        with patch.object(systemctl, "run", side_effect=self._mock_run):
             systemd_timer.reconcile("every 12h")
 
-        with patch.object(
-            systemd_timer, "_run_systemctl", side_effect=self._mock_run
-        ) as mock_run_second:
+        with patch.object(systemctl, "run", side_effect=self._mock_run) as mock_run_second:
             msg = systemd_timer.reconcile("every 12h")
 
         assert "already current" in msg
@@ -241,12 +240,10 @@ class TestReconcileEnableGating:
         and must report 'updated', never 'already current' (message truthfulness:
         the action taken must be reflected in the returned state)."""
         self._install(tmp_path, monkeypatch)
-        with patch.object(systemd_timer, "_run_systemctl", side_effect=self._mock_run):
+        with patch.object(systemctl, "run", side_effect=self._mock_run):
             systemd_timer.reconcile("every 12h")
 
-        with patch.object(
-            systemd_timer, "_run_systemctl", side_effect=self._mock_run
-        ) as mock_run_second:
+        with patch.object(systemctl, "run", side_effect=self._mock_run) as mock_run_second:
             msg = systemd_timer.reconcile("every 6h")
 
         assert "updated" in msg
@@ -258,7 +255,7 @@ class TestReconcileEnableGating:
     def test_off_to_off_still_skips_systemctl_when_no_units_installed(self, tmp_path, monkeypatch):
         """Off→off with nothing installed never calls systemctl (nothing to remove)."""
         self._install(tmp_path, monkeypatch)
-        with patch.object(systemd_timer, "_run_systemctl", side_effect=self._mock_run) as mock_run:
+        with patch.object(systemctl, "run", side_effect=self._mock_run) as mock_run:
             msg = systemd_timer.reconcile("off")
 
         assert "disabled" in msg

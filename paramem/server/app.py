@@ -108,6 +108,7 @@ from paramem.training.consolidation import (
     RegistryBookkeepingDivergence,
 )
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
+from paramem.utils import systemctl
 from paramem.utils.identity import canonical as _canonical
 from paramem.utils.identity import is_speaker_id as _is_speaker_id
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
@@ -1043,8 +1044,10 @@ class AcceptResponse(BaseModel):
         may trigger a prompted restart via the ``restart_hint`` command.
         ``False`` for R-PATHS (data-not-migrated warning; operator-driven)
         and for failures.  The server does NOT fire the restart — the CLI
-        prompts the operator and runs ``restart_hint`` via subprocess on
-        consent.
+        prompts the operator and, on consent, runs a fixed
+        ``systemctl --user restart paramem-server`` via the
+        ``paramem.utils.systemctl`` transport seam; ``restart_hint`` is
+        display-only text, never the command actually executed.
     """
 
     state: str
@@ -7631,8 +7634,10 @@ def _apply_config_live() -> dict:
          Performs a transient ``socket.bind`` pre-flight on the new port(s); on
          bind failure returns ``restart_eligible=False`` + a "port in use"
          reason.  On bind success returns ``restart_eligible=True`` so the
-         CLI can prompt the operator and fire ``restart_hint`` via subprocess
-         on consent.  ``_apply_config_live`` itself never calls
+         CLI can prompt the operator and, on consent, run a fixed
+         ``systemctl --user restart paramem-server`` via the
+         ``paramem.utils.systemctl`` transport seam (``restart_hint`` is
+         display-only text).  ``_apply_config_live`` itself never calls
          ``_restart_service``.
        - ``paths.sessions`` / ``paths.data`` change → R-PATHS carve:
          short-circuits BEFORE any live reload.
@@ -14443,7 +14448,7 @@ async def backup_restore(req: BackupRestoreRequest):
             restored=restored_map,
             backed_up_pre_restore={"bundle": safety_slot_str},
             restart_required=True,
-            restart_hint="systemctl --user restart paramem-server",
+            restart_hint=_RESTART_HINT,
             restored_adapters=result.restored_adapters,
             pruned_orphans=result.pruned_orphans,
         )
@@ -14575,7 +14580,7 @@ async def backup_restore(req: BackupRestoreRequest):
         restored={"config": str(live_config_path)},
         backed_up_pre_restore={"config": safety_slot_path},
         restart_required=True,
-        restart_hint="systemctl --user restart paramem-server",
+        restart_hint=_RESTART_HINT,
         restored_adapters=[],
     )
 
@@ -18397,13 +18402,7 @@ def _read_systemd_user_env() -> dict[str, str]:
     snapshot, so we re-read systemd's block to get the live value.
     """
     try:
-        result = subprocess.run(
-            ["systemctl", "--user", "show-environment"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        result = systemctl.run("show-environment", timeout=5)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return {}
     env: dict[str, str] = {}
@@ -18484,12 +18483,7 @@ def _clear_hold_env() -> bool:
     already unset.
     """
     try:
-        subprocess.run(
-            ["systemctl", "--user", "unset-environment", *_HOLD_ENV_VARS],
-            check=False,
-            capture_output=True,
-            timeout=5,
-        )
+        systemctl.run("unset-environment", *_HOLD_ENV_VARS, timeout=5)
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError):
         logger.exception("Failed to unset PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_*")
@@ -18651,10 +18645,7 @@ def _restart_service():
     """
     logger.info("Restarting paramem-server service...")
     try:
-        subprocess.Popen(
-            ["systemctl", "--user", "restart", "paramem-server"],
-            start_new_session=True,
-        )
+        systemctl.spawn("restart", "paramem-server")
     except Exception:
         logger.exception("Failed to restart service")
 
@@ -18720,17 +18711,10 @@ def main():
     # this process starts WITHOUT --defer-model, treat it as authoritative
     # and clear the var so the intent is consistent with future restarts.
     if not args.defer_model and not args.cloud_only:
-        import subprocess
-
         try:
-            subprocess.run(
-                ["systemctl", "--user", "unset-environment", "PARAMEM_EXTRA_ARGS"],
-                check=False,
-                capture_output=True,
-                timeout=5,
-            )
+            systemctl.run("unset-environment", "PARAMEM_EXTRA_ARGS", timeout=5)
         except Exception:
-            pass
+            logger.exception("Failed to unset stale PARAMEM_EXTRA_ARGS on startup")
 
     import uvicorn
 

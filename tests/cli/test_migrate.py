@@ -49,6 +49,17 @@ _BASE_PREVIEW = {
 
 _CANCEL_RESPONSE = {"state": "LIVE", "cleared_path": "/abs/server-new.yaml"}
 
+# Status sequence for tests that answer "Proceed? y" and must serve
+# _run_long_poll_flow's step-1 GET /migration/status in-process (never hit a
+# live server): STAGING lets the drift check pass, then a terminal
+# accept-eligible status ends the poll loop on the first iteration.
+_STATUS_STAGING_FOR_POLL = {"state": "STAGING", "gates": None, "comparison_report": None}
+_STATUS_TRIAL_PASS_FOR_POLL = {
+    "state": "TRIAL",
+    "gates": {"status": "pass", "completed_at": "2026-04-22T01:00:00+00:00"},
+    "comparison_report": None,
+}
+
 
 def _patched_post(responses: dict):
     """Return a post_json side-effect that dispatches by URL."""
@@ -62,6 +73,27 @@ def _patched_post(responses: dict):
         raise AssertionError(f"Unexpected POST to {url!r}")
 
     return _post
+
+
+def _make_get_responses(*status_sequence):
+    """Return a get_json side-effect that iterates through status responses.
+
+    Copied from ``tests/cli/test_migrate_long_poll.py::_make_get_responses``
+    — the last response repeats once the sequence is exhausted, so a single
+    terminal status keeps a long-poll loop from spinning past its first
+    iteration.
+    """
+    responses = list(status_sequence)
+    index = [0]
+
+    def _get(url, **kwargs):
+        if "/migration/status" in url:
+            r = responses[min(index[0], len(responses) - 1)]
+            index[0] += 1
+            return r
+        raise AssertionError(f"Unexpected GET to {url!r}")
+
+    return _get
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +221,11 @@ class TestMigrateProceedy:
             return _BASE_PREVIEW if "preview" in url else _CANCEL_RESPONSE
 
         monkeypatch.setattr(http_client, "post_json", _post)
+        monkeypatch.setattr(
+            http_client,
+            "get_json",
+            _make_get_responses(_STATUS_STAGING_FOR_POLL, _STATUS_TRIAL_PASS_FOR_POLL),
+        )
         with patch("builtins.input", return_value="y"):
             main(["migrate", "/abs/path.yaml"])
         assert not cancel_called, "cancel must not be posted on y"
@@ -377,6 +414,11 @@ class TestShapeChangeBlock:
     def test_no_shape_change_block_when_empty(self, monkeypatch, capsys):
         """No shape_changes → SHAPE CHANGE block not printed."""
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: _BASE_PREVIEW)
+        monkeypatch.setattr(
+            http_client,
+            "get_json",
+            _make_get_responses(_STATUS_STAGING_FOR_POLL, _STATUS_TRIAL_PASS_FOR_POLL),
+        )
         with patch("builtins.input", return_value="y"):
             main(["migrate", "/abs/path.yaml"])
         captured = capsys.readouterr()
@@ -502,6 +544,11 @@ class TestTierDiffRendering:
             ],
         }
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: preview)
+        monkeypatch.setattr(
+            http_client,
+            "get_json",
+            _make_get_responses(_STATUS_STAGING_FOR_POLL, _STATUS_TRIAL_PASS_FOR_POLL),
+        )
         with patch("builtins.input", return_value="y"):
             main(["migrate", "/abs/path.yaml"])
         captured = capsys.readouterr()
@@ -511,6 +558,11 @@ class TestTierDiffRendering:
     def test_unified_diff_shown_under_header(self, monkeypatch, capsys):
         """Unified diff appears under 'Diff (server.yaml):' header."""
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: _BASE_PREVIEW)
+        monkeypatch.setattr(
+            http_client,
+            "get_json",
+            _make_get_responses(_STATUS_STAGING_FOR_POLL, _STATUS_TRIAL_PASS_FOR_POLL),
+        )
         with patch("builtins.input", return_value="y"):
             main(["migrate", "/abs/path.yaml"])
         captured = capsys.readouterr()
@@ -787,9 +839,10 @@ class TestRenderApplyResult:
         self, capsys, monkeypatch
     ):
         """R-PORT with restart_eligible=True + operator answers y → poll until healthy."""
-        import subprocess as _subprocess
+        import subprocess
 
         from paramem.cli import migrate as migrate_module
+        from paramem.utils import systemctl
 
         healthy_calls = []
 
@@ -800,8 +853,14 @@ class TestRenderApplyResult:
         monkeypatch.setattr(migrate_module, "_poll_until_healthy", _fake_poll)
         # Operator answers "y" to the restart-consent prompt.
         monkeypatch.setattr("builtins.input", lambda prompt="": "y")
-        # Subprocess.run must not actually run systemctl.
-        monkeypatch.setattr(_subprocess, "run", lambda *a, **kw: None)
+
+        restart_calls = []
+
+        def _fake_systemctl_run(*args, **kwargs):
+            restart_calls.append(args)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(systemctl, "run", _fake_systemctl_run)
         out, err = self._call(
             {
                 "applied_live": False,
@@ -812,6 +871,9 @@ class TestRenderApplyResult:
                 "restart_hint": "systemctl ...",
             },
             capsys,
+        )
+        assert restart_calls == [("restart", "paramem-server")], (
+            f"Expected systemctl.run('restart', 'paramem-server'); got {restart_calls}"
         )
         assert healthy_calls, "_poll_until_healthy was not called"
         assert "healthy" in out.lower() or "restart" in out.lower(), (

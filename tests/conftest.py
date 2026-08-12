@@ -1,7 +1,6 @@
 """Shared pytest configuration and fixtures."""
 
 import os
-import subprocess
 import sys
 import sysconfig
 from pathlib import Path
@@ -366,46 +365,99 @@ def _extraction_trace_scope():
         yield
 
 
+@pytest.fixture
+def _host_isolation_violations():
+    """This test's list of recorded host-isolation violations.
+
+    Non-autouse so the guard self-test (``tests/test_host_isolation_guard.py``)
+    can request it directly, assert a triggered violation, and clear the list
+    before teardown. Every other test only sees this indirectly, through the
+    autouse guard's teardown check.
+    """
+    return []
+
+
 @pytest.fixture(autouse=True)
-def _isolate_systemd_timer_boundary(monkeypatch, tmp_path):
-    """Redirect every systemd unit write away from the operator's real timer dir.
+def _host_isolation_guard(monkeypatch, tmp_path, _host_isolation_violations):
+    """Block every test from touching the operator's real host.
 
-    ``_apply_config_live`` and the app lifespan (``paramem/server/app.py``)
-    reconcile the consolidation timer (:mod:`paramem.server.systemd_timer`)
-    and the backup timer (:mod:`paramem.backup.timer`) on every config apply.
-    A test that calls either path without mocking the systemd boundary would
-    write real ``paramem-consolidate.{timer,service}`` /
-    ``paramem-backup.{timer,service}`` units into
-    ``~/.config/systemd/user/`` and run a real ``systemctl enable --now``,
-    arming a timer the operator has ordered kept off — this has already
-    happened once from an unmocked test call site.
+    Three things reach the host if unmocked:
 
-    Both timers share one reconciliation core
-    (:func:`paramem.server.systemd_timer._reconcile_timer`), so redirecting
-    each module's ``UNIT_DIR``/``TIMER_PATH``/``SERVICE_PATH`` into
-    ``tmp_path`` and replacing the single ``_run_systemctl`` implementation
-    with an inert stub covers both, regardless of which test file reaches
-    ``reconcile()``.
+    1. ``_apply_config_live`` and the app lifespan (``paramem/server/app.py``)
+       reconcile the consolidation timer (:mod:`paramem.server.systemd_timer`)
+       and the backup timer (:mod:`paramem.backup.timer`) on every config
+       apply — an unmocked call writes real
+       ``paramem-consolidate.{timer,service}`` / ``paramem-backup.{timer,service}``
+       units into ``~/.config/systemd/user/`` and runs a real
+       ``systemctl enable --now``, arming a timer the operator has ordered
+       kept off. Both timers share one reconciliation core
+       (:func:`paramem.server.systemd_timer._reconcile_timer`), so redirecting
+       each module's ``UNIT_DIR``/``TIMER_PATH``/``SERVICE_PATH`` into
+       ``tmp_path`` covers both, regardless of which test file reaches
+       ``reconcile()``.
+    2. Any production code path that reaches the single systemd transport
+       seam, :mod:`paramem.utils.systemctl` — ``systemctl.run`` is replaced
+       with an inert stub (returns success, touches nothing);
+       ``systemctl.spawn`` (used for the server self-restart, which fires
+       detached and would otherwise restart the operator's real
+       ``paramem-server``) is replaced with a stub that records the call and
+       raises :class:`tests._host_isolation.HostIsolationViolation` —
+       ``BaseException`` so the ``except Exception`` swallow policy around
+       production ``spawn`` call sites cannot hide it.
+    3. A CLI test with a broken/missing HTTP mock — a real GET/POST would
+       land on the live server on ``localhost:8420``. A socket-level guard
+       blocks any ``socket.socket.connect``/``connect_ex`` to that port.
 
-    Tests that deliberately exercise timer behaviour (e.g.
+    TEARDOWN is the backstop: ``TestClient(raise_server_exceptions=False)``
+    converts even a ``BaseException`` raised inside an endpoint into a
+    synthetic 500, so a handler can silently swallow the violation during the
+    test body. After ``yield``, this fixture fails loudly if any violation
+    was recorded, regardless of what the test itself asserted. The asymmetry
+    is deliberate: ``run`` calls are absorbed silently by the inert stub
+    (many tests reach ``systemctl.run`` incidentally, e.g. via
+    ``current_timer_state`` on an unrelated code path, and recording every
+    one would make the violations list meaningless noise) — only ``spawn``
+    and socket connections to the production port are recorded, and only
+    those two are what the loud teardown backstop covers.
+
+    Tests that deliberately exercise timer/systemctl behaviour (e.g.
     ``tests/test_systemd_timer_calendar.py``, ``tests/test_scheduler.py``,
     ``tests/test_app_lifespan.py``) monkeypatch these same names themselves.
     ``monkeypatch`` is function-scoped and shared with this fixture, so a
     later ``monkeypatch.setattr`` call in the test body simply overrides the
-    defaults set here for the remainder of that test.
+    defaults set here for the remainder of that test — a documented opt-in,
+    not a bypass.
     """
     from paramem.backup import timer as backup_timer
     from paramem.server import systemd_timer
+    from paramem.utils import systemctl
+    from tests._host_isolation import (
+        install_socket_guard,
+        make_inert_run,
+        make_raising_spawn,
+    )
 
-    def _inert_run_systemctl(*args, **kwargs):
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+    violations = _host_isolation_violations
 
-    monkeypatch.setattr(systemd_timer, "_run_systemctl", _inert_run_systemctl)
+    monkeypatch.setattr(systemctl, "run", make_inert_run())
+    monkeypatch.setattr(systemctl, "spawn", make_raising_spawn(violations))
 
     for module in (systemd_timer, backup_timer):
         monkeypatch.setattr(module, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(module, "TIMER_PATH", tmp_path / f"{module.TIMER_NAME}.timer")
         monkeypatch.setattr(module, "SERVICE_PATH", tmp_path / f"{module.TIMER_NAME}.service")
+
+    systemd_timer._state_cache.clear()
+
+    install_socket_guard(monkeypatch, violations)
+
+    yield
+
+    if violations:
+        pytest.fail(
+            "Host-isolation guard recorded violation(s) during this test — "
+            "a mock is missing at the systemctl/socket seam:\n  " + "\n  ".join(violations)
+        )
 
 
 @pytest.fixture(autouse=True)

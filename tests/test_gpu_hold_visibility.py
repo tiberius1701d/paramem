@@ -5,7 +5,7 @@ Covers:
 - ``_get_hold_state`` distinguishes inactive / legitimate / orphaned / unregistered
   holds and reports owner PID + liveness + age.
 - ``_clear_hold_env`` invokes ``systemctl --user unset-environment`` with all
-  three hold variables.
+  three hold variables, via the ``paramem.utils.systemctl`` transport seam.
 
 The auto-reclaim loop and the /gpu/acquire endpoint depend on these
 helpers; they are the operator-visibility surface surfaced to /status and
@@ -59,7 +59,7 @@ class TestReadSystemdUserEnv:
             "PARAMEM_HOLD_STARTED_AT=1700000000\n"
             "PARAMEM_HOLD_CMD=$'python / paramem.server.app'\n"
         )
-        with patch("paramem.server.app.subprocess.run", return_value=_mk_completed(sample)):
+        with patch("paramem.utils.systemctl.run", return_value=_mk_completed(sample)):
             env = _read_systemd_user_env()
         assert env["PARAMEM_EXTRA_ARGS"] == "--defer-model"
         assert env["PARAMEM_HOLD_PID"] == "12345"
@@ -71,20 +71,20 @@ class TestReadSystemdUserEnv:
     def test_handles_values_with_equals_sign(self):
         # Values themselves may contain "=" (config strings, URLs, etc.).
         sample = "FOO=a=b=c\nBAR=x\n"
-        with patch("paramem.server.app.subprocess.run", return_value=_mk_completed(sample)):
+        with patch("paramem.utils.systemctl.run", return_value=_mk_completed(sample)):
             env = _read_systemd_user_env()
         assert env["FOO"] == "a=b=c"
         assert env["BAR"] == "x"
 
     def test_returns_empty_dict_on_timeout(self):
         with patch(
-            "paramem.server.app.subprocess.run",
+            "paramem.utils.systemctl.run",
             side_effect=subprocess.TimeoutExpired(cmd="systemctl", timeout=5),
         ):
             assert _read_systemd_user_env() == {}
 
     def test_returns_empty_dict_when_systemctl_missing(self):
-        with patch("paramem.server.app.subprocess.run", side_effect=FileNotFoundError):
+        with patch("paramem.utils.systemctl.run", side_effect=FileNotFoundError):
             assert _read_systemd_user_env() == {}
 
 
@@ -225,12 +225,12 @@ class TestFormatCmdHint:
 
 class TestClearHoldEnv:
     def test_invokes_unset_environment_with_all_hold_vars(self):
-        with patch("paramem.server.app.subprocess.run", return_value=_mk_completed("")) as mock_run:
+        with patch("paramem.utils.systemctl.run", return_value=_mk_completed("")) as mock_run:
             ok = _clear_hold_env()
         assert ok is True
         assert mock_run.call_count == 1
-        args = mock_run.call_args[0][0]
-        assert args[:3] == ["systemctl", "--user", "unset-environment"]
+        args = mock_run.call_args[0]
+        assert args[0] == "unset-environment"
         # All three hold variables must be listed — partial clears leave
         # orphan stamps behind.
         for var in _HOLD_ENV_VARS:
@@ -238,7 +238,7 @@ class TestClearHoldEnv:
 
     def test_returns_false_on_timeout(self):
         with patch(
-            "paramem.server.app.subprocess.run",
+            "paramem.utils.systemctl.run",
             side_effect=subprocess.TimeoutExpired(cmd="systemctl", timeout=5),
         ):
             assert _clear_hold_env() is False

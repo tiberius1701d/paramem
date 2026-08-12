@@ -54,6 +54,7 @@ import time
 from pathlib import Path
 
 from paramem.cli import http_client
+from paramem.utils import systemctl
 
 # Long-poll interval for trial gate status (seconds between GET /migration/status polls).
 LONG_POLL_INTERVAL_SECONDS: float = 2.0
@@ -491,7 +492,8 @@ def _render_apply_result(result: dict, server_url: str) -> None:
     - ``applied_live=True, restart_required_reason=None`` → full live apply.
     - ``restart_required_reason in {stt_port_change, tts_port_change}`` →
       R-PORT: if ``restart_eligible=True``, prompt operator for consent; on
-      ``y`` run ``restart_hint`` via subprocess and poll until healthy; on
+      ``y`` run ``systemctl --user restart paramem-server`` via the ``systemctl``
+      transport seam and poll until healthy; on
       ``N``/EOF print the command and exit cleanly.  If port-in-use (no
       ``restart_eligible``), print the error and the manual hint.
     - ``restart_required_reason="paths_change"`` → R-PATHS: prominent warning
@@ -509,8 +511,6 @@ def _render_apply_result(result: dict, server_url: str) -> None:
     server_url:
         Base server URL (used for the poll-until-healthy call on R-PORT).
     """
-    import subprocess  # noqa: PLC0415
-
     applied_live = result.get("applied_live", False)
     skipped = result.get("skipped")
     reason = result.get("restart_required_reason")
@@ -550,9 +550,16 @@ def _render_apply_result(result: dict, server_url: str) -> None:
             if answer.strip().lower() == "y":
                 print(f"  Running: {restart_hint}")
                 try:
-                    subprocess.run(restart_hint.split(), check=True)
-                except Exception as exc:  # noqa: BLE001 — boundary: external command
+                    restart_result = systemctl.run("restart", "paramem-server")
+                except OSError as exc:  # boundary: external command (no systemctl binary, etc.)
                     print(f"  Restart command failed: {exc}", file=sys.stderr)
+                    print(f"  Run manually: {restart_hint}", file=sys.stderr)
+                    return
+                if restart_result.returncode != 0:
+                    print(
+                        f"  Restart command failed: {restart_result.stderr.strip()}",
+                        file=sys.stderr,
+                    )
                     print(f"  Run manually: {restart_hint}", file=sys.stderr)
                     return
                 print("  Polling until server is healthy...")
