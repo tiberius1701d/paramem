@@ -896,6 +896,39 @@ class TestRenderApplyResult:
             f"Expected apply_failed message in stderr: {err!r}"
         )
 
+    def test_lock_timeout_names_restart_required_reason_not_stale_sentinel(self, capsys):
+        """Apply never attempted (lock_timeout) → the fallback names
+        restart_required_reason, not the transient "live_reload" cloud-only
+        sentinel the caller pre-set (which is meaningless to the operator).
+        """
+        out, err = self._call(
+            {
+                "applied_live": False,
+                "restart_required_reason": "lock_timeout",
+                "skipped": None,
+                "cloud_only_reason": None,
+                "restart_hint": "systemctl --user restart paramem-server",
+            },
+            capsys,
+        )
+        assert "lock_timeout" in err, f"Expected lock_timeout named in stderr: {err!r}"
+        assert "live_reload" not in err, f"Stale sentinel leaked into stderr: {err!r}"
+
+    def test_consolidating_names_restart_required_reason(self, capsys):
+        """Apply never attempted (consolidating) → the fallback names
+        restart_required_reason."""
+        out, err = self._call(
+            {
+                "applied_live": False,
+                "restart_required_reason": "consolidating",
+                "skipped": None,
+                "cloud_only_reason": None,
+                "restart_hint": "systemctl --user restart paramem-server",
+            },
+            capsys,
+        )
+        assert "consolidating" in err, f"Expected consolidating named in stderr: {err!r}"
+
     def test_single_prompt_accept_no_double_prompt(self, monkeypatch, capsys):
         """_do_accept_with_drift_check does NOT add a second 'Apply now?' prompt.
 

@@ -389,12 +389,18 @@ def _render_base_swap_terminal(gs: str, gates: dict) -> None:
             file=sys.stderr,
         )
     elif gs == "reload_deferred":
-        # VRAM insufficient: Phase A done, reload waiting for VRAM to free.
-        print("  Base-swap Phase A complete. Reload deferred — insufficient VRAM.")
-        print(
-            "  The server will resume Phase B automatically once VRAM is available "
-            "(POST /gpu/acquire triggers this)."
-        )
+        # The gates record's "message" field is the single source of
+        # deferral guidance — both producers (base-swap Step 3's
+        # attempted-and-failed / never-attempted sub-cases, and the resume
+        # branch) always set it, and the correct instruction differs by
+        # sub-case (retry via /gpu/acquire vs. restart the service).  Do
+        # not re-derive instructional text here; just name the status and
+        # the reason fields already on the record.
+        detail = gates.get("restart_required_reason") or gates.get("cloud_only_reason")
+        if detail:
+            print(f"  Base-swap Phase A complete. Reload deferred ({detail}).")
+        else:
+            print("  Base-swap Phase A complete. Reload deferred.")
         if message:
             print(f"  {message}")
     elif gs == "phase_b_model_mismatch":
@@ -498,7 +504,10 @@ def _render_apply_result(result: dict, server_url: str) -> None:
       ``restart_eligible``), print the error and the manual hint.
     - ``restart_required_reason="paths_change"`` → R-PATHS: prominent warning
       that data is NOT migrated automatically; print restart_hint.
-    - Failure (``applied_live=False``, other reason) → restart-hint fallback.
+    - Failure (``applied_live=False``, other reason) → restart-hint fallback,
+      naming ``restart_required_reason`` (e.g. ``lock_timeout``,
+      ``consolidating``) when the apply was never attempted, or
+      ``cloud_only_reason`` when a reload was attempted and failed.
 
     The server does NOT self-fire a restart for R-PORT.  The CLI is the sole
     restart trigger — always gated on operator consent.
@@ -600,7 +609,16 @@ def _render_apply_result(result: dict, server_url: str) -> None:
         return
 
     # Apply failed or other unexpected reason — restart-hint fallback.
-    if cloud_only_reason:
+    # restart_required_reason (e.g. "lock_timeout", "consolidating") names
+    # why the apply was never attempted; cloud_only_reason is only set when
+    # a reload was actually attempted and failed — prefer the former when
+    # both could apply, since it is the more specific, always-true cause.
+    if reason:
+        print(
+            f"  Apply not attempted ({reason}); config is on disk — restart to apply.",
+            file=sys.stderr,
+        )
+    elif cloud_only_reason:
         print(
             f"  Apply failed ({cloud_only_reason}); server is cloud-only — restart to apply.",
             file=sys.stderr,

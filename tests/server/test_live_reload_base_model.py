@@ -40,6 +40,7 @@ Additional tests cover the config-refresh path:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -260,6 +261,65 @@ def test_successful_reload_sets_local():
         assert app_module._state["cloud_only_reason"] is None
 
 
+def test_plain_reclaim_voice_restore_failure_is_non_fatal(caplog):
+    """A ``_set_voice_pipeline_profile("gpu")`` restore failure on the
+    plain-reclaim success path is a handled, non-fatal degradation: this
+    primitive's responsibility is the base-model reload, not voice — a
+    failed restore is logged as a WARNING and the reload still reports
+    overall success (``return None``, ``mode == "local"``).  No cleanup
+    re-drain is dispatched: voice is already "cpu" at this point (the
+    entry drain is the only prior mutation), and the failure cannot leave
+    a GPU allocation behind (construction is pure attribute assignment;
+    the actual load calls are internally best-effort and cannot raise).
+    """
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+        # Pinned explicitly (not left to an accidental default) — the entry
+        # drain is a genuine no-op only when voice_profile != "gpu".
+        "voice_profile": "cpu",
+    }
+
+    voice_calls: list[str] = []
+
+    def fake_voice_profile(profile, **_kwargs):
+        voice_calls.append(profile)
+        if profile == "gpu":
+            raise RuntimeError("voice restore failed")
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=fake_voice_profile),
+    ):
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+        result = app_module._live_reload_base_model()
+
+    assert result is None, "a voice-restore failure must not change the overall outcome"
+    assert app_module._state["mode"] == "local", (
+        "mode must still flip to local — voice restore is not gating"
+    )
+    assert voice_calls == ["gpu"], (
+        f"expected only the failed 'gpu' restore call — no cleanup re-drain; got {voice_calls}"
+    )
+    warn_records = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "voice" in r.message.lower()
+    ]
+    all_messages = [r.message for r in caplog.records]
+    assert warn_records, f"expected a WARNING about the failed voice restore; got {all_messages}"
+
+
 def test_plain_reclaim_success_eagerly_creates_consolidation_loop():
     """The tail of a successful plain-reclaim reload — the release→acquire
     and auto-reclaim shape — re-creates the consolidation loop, so
@@ -369,6 +429,78 @@ def test_load_failure_releases_and_stays_cloud_only():
         mock_build.assert_not_called()
         assert app_module._state["mode"] == "cloud-only"
         assert app_module._state["cloud_only_reason"] == "reload_failed"
+
+
+@pytest.mark.parametrize("scenario", ["insufficient_vram", "reload_failed", "apply_failed"])
+def test_handled_failure_return_value_matches_state_reason(scenario):
+    """The invariant the whole return-value contract rests on: whenever
+    ``_live_reload_base_model`` returns a handled-failure reason, that is
+    the exact same string it just wrote to ``_state["cloud_only_reason"]``
+    — the return value (the control-flow channel) and the state write (the
+    ``/status``-facing display value) never diverge, across all three
+    terminals in the closed vocabulary.
+    """
+    import contextlib
+
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+        "boot_degraded": None,
+    }
+
+    patches = [
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+    ]
+    refresh_config_from_disk = False
+
+    if scenario == "insufficient_vram":
+        patches.append(patch.object(app_module, "_wait_for_gpu_drain", return_value=False))
+    elif scenario == "reload_failed":
+        patches.append(patch.object(app_module, "_wait_for_gpu_drain", return_value=True))
+        patches.append(
+            patch.object(
+                app_module,
+                "_load_model_into_state",
+                side_effect=RuntimeError("CUDA out of memory"),
+            )
+        )
+    else:  # apply_failed — the full config-apply rebuild path
+        state_patch["config_path"] = "configs/server.yaml"
+        refresh_config_from_disk = True
+        patches.append(patch.object(app_module, "_wait_for_gpu_drain", return_value=True))
+        patches.append(patch.object(app_module, "_load_model_into_state"))
+        patches.append(
+            patch.object(app_module, "load_server_config", return_value=_server_config())
+        )
+        patches.append(
+            patch.object(
+                app_module,
+                "_build_config_derived_state",
+                side_effect=RuntimeError("ha_client init failed"),
+            )
+        )
+
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = app_module._live_reload_base_model(
+            refresh_config_from_disk=refresh_config_from_disk
+        )
+
+        assert result is not None, f"{scenario} must return a reason string, not None"
+        assert result == app_module._state["cloud_only_reason"], (
+            f"return value {result!r} must equal _state['cloud_only_reason'] "
+            f"{app_module._state['cloud_only_reason']!r} for scenario={scenario}"
+        )
 
 
 # ---------------------------------------------------------------------------

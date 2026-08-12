@@ -319,8 +319,10 @@ def test_migration_trial_exception_emits_failed():
 
 
 def test_base_swap_reload_deferred_emits_paused():
-    """A stuck base-swap (reload_deferred) must surface a PAUSED item — previously
-    matched no branch and was silent.  Recoverable → action_required, not failed.
+    """A stuck base-swap (reload_deferred) where a reload was attempted and
+    failed must surface a PAUSED item — previously matched no branch and was
+    silent.  Recoverable → action_required, not failed.  The attempted
+    sub-case (cloud_only_reason set) keeps the acquire/auto-reclaim hint.
     """
     state = _trial_state("reload_deferred")
     state["migration"]["trial"]["gates"]["cloud_only_reason"] = "insufficient_vram"
@@ -330,6 +332,28 @@ def test_base_swap_reload_deferred_emits_paused():
     assert paused[0].level == "action_required"
     assert "PAUSED" in paused[0].summary and "insufficient_vram" in paused[0].summary
     assert "auto-reclaim" in (paused[0].action_hint or "")
+
+
+def test_base_swap_reload_deferred_never_attempted_emits_restart_hint():
+    """A stuck base-swap where the apply was never attempted
+    (restart_required_reason set, cloud_only_reason left None — the release
+    that precedes this deferral never arms auto-reclaim) must surface a
+    restart hint, not the acquire/auto-reclaim wording that only applies
+    when a reload was actually tried.
+    """
+    state = _trial_state("reload_deferred")
+    state["migration"]["trial"]["gates"]["cloud_only_reason"] = None
+    state["migration"]["trial"]["gates"]["restart_required_reason"] = "consolidating"
+    items = _collect_migration_items(state)
+    paused = [it for it in items if it.kind == "migration_swap_paused"]
+    assert len(paused) == 1
+    assert paused[0].level == "action_required"
+    assert "PAUSED" in paused[0].summary and "consolidating" in paused[0].summary
+    assert "restart" in (paused[0].action_hint or "").lower()
+    assert "auto-reclaim" not in (paused[0].action_hint or ""), (
+        "the never-attempted sub-case must not claim auto-reclaim will retry — "
+        f"got {paused[0].action_hint!r}"
+    )
 
 
 def test_base_swap_phase_b_failed_emits_failed():

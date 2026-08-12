@@ -253,17 +253,29 @@ def _collect_migration_items(state: dict) -> list[AttentionItem]:
             )
         elif gates_status == "reload_deferred":
             # Base-swap stuck mid-flight: Phase A completed (old weights gone) but
-            # the new-base in-process reload was deferred (no GPU room), so Phase B
-            # has NOT run.  Recoverable — auto-reclaim retries, or a restart resumes
-            # from the phaseA_done marker — but the operator must know the swap is
-            # paused and PA recall is unavailable until it finishes.
-            _why = gates.get("cloud_only_reason") or "insufficient_vram"
+            # the new-base in-process reload was deferred, so Phase B has NOT run.
+            # Two distinct recovery paths depending on whether a reload was
+            # actually attempted (see the gates producers in app.py): when it
+            # was attempted and failed, cloud_only_reason names the cause and
+            # /gpu/acquire or auto-reclaim can pick it back up; when it was
+            # never attempted (restart_required_reason set, cloud_only_reason
+            # left None — the release that precedes this call never arms
+            # auto-reclaim, see _gpu_release_internal's docstring), config A
+            # is still the in-memory config, so only a restart resumes.
+            _restart_required_reason = gates.get("restart_required_reason")
+            _cloud_only_reason = gates.get("cloud_only_reason")
+            if _restart_required_reason and not _cloud_only_reason:
+                _why = _restart_required_reason
+                _hint = "restart the service (`systemctl --user restart paramem-server`)"
+            else:
+                _why = _cloud_only_reason or "insufficient_vram"
+                _hint = "auto-reclaim retries (≤10 min); or pstatus --acquire / restart"
             items.append(
                 AttentionItem(
                     kind="migration_swap_paused",
                     level="action_required",
                     summary=f"BASE-SWAP PAUSED — reload deferred ({_why}); Phase B not run",
-                    action_hint="auto-reclaim retries (≤10 min); or pstatus --acquire / restart",
+                    action_hint=_hint,
                     age_seconds=trial_age,
                 )
             )

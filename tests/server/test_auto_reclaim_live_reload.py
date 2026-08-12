@@ -67,10 +67,13 @@ def test_auto_reclaim_calls_live_reload_on_success():
 
     def _fake_reload_success(*_args, **_kwargs):
         # Faithfully simulate a successful in-process reload: the real
-        # _live_reload_base_model sets mode="local" on success, which the loop
-        # reads to take the success-exit branch.  Establishing it here makes
-        # the test independent of any incoming _state["mode"] a prior test left.
+        # _live_reload_base_model sets mode="local" AND returns None on
+        # success — the loop now branches on the returned reason (None ==
+        # success), not a re-read of _state["mode"].  Establishing both here
+        # makes the test independent of any incoming _state["mode"] a prior
+        # test left.
         app_module._state["mode"] = "local"
+        return None
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -90,7 +93,7 @@ def test_auto_reclaim_calls_live_reload_on_success():
             original_rie = event_loop.run_in_executor
 
             async def _fake_rie(_exc, fn, *args):
-                fn(*args)
+                return fn(*args)
 
             event_loop.run_in_executor = _fake_rie
             try:
@@ -180,10 +183,11 @@ def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
         if reload_calls == 1:
             raise RuntimeError("CUDA load failed")
         # Second call succeeds: simulate the real reload setting mode="local"
-        # (read by the loop at app.py:11057) so the success branch — which
-        # clears last_reclaim_error — is reached regardless of any incoming
+        # and returning None — the loop branches on the returned reason (the
+        # success clears last_reclaim_error) regardless of any incoming
         # _state["mode"] from a prior test.
         app_module._state["mode"] = "local"
+        return None
 
     caplog.set_level(logging.WARNING, logger="paramem.server.app")
 
@@ -202,7 +206,7 @@ def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
             event_loop = asyncio.get_event_loop()
 
             async def _fake_rie(_exc, fn, *args):
-                fn(*args)
+                return fn(*args)
 
             event_loop.run_in_executor = _fake_rie
             try:
@@ -247,6 +251,10 @@ def test_auto_reclaim_retry_increments_attempt_count():
         reload_calls += 1
         if reload_calls <= 2:
             raise RuntimeError(f"failure #{reload_calls}")
+        # Calls beyond the first two are not exercised by this test's
+        # assertion (cut off before the retry count matters); a clean
+        # return signals success to the loop.
+        return None
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -264,10 +272,11 @@ def test_auto_reclaim_retry_increments_attempt_count():
             event_loop = asyncio.get_event_loop()
 
             async def _fake_rie(_exc, fn, *args):
-                fn(*args)
+                result = fn(*args)
                 err = app_module._state.get("last_reclaim_error")
                 if err:
                     max_count_seen.append(err.get("attempt_count", 0))
+                return result
 
             event_loop.run_in_executor = _fake_rie
             try:
@@ -305,8 +314,10 @@ def test_auto_reclaim_defers_when_reload_stays_cloud_only():
         nonlocal reload_calls
         reload_calls += 1
         # Pre-flight declined: base model not loaded, server stays cloud-only.
+        # The loop now branches on the returned reason, not a state re-read.
         app_module._state["mode"] = "cloud-only"
         app_module._state["cloud_only_reason"] = "insufficient_vram"
+        return "insufficient_vram"
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -326,7 +337,7 @@ def test_auto_reclaim_defers_when_reload_stays_cloud_only():
             event_loop = asyncio.get_event_loop()
 
             async def _fake_rie(_exc, fn, *args):
-                fn(*args)
+                return fn(*args)
 
             event_loop.run_in_executor = _fake_rie
             try:

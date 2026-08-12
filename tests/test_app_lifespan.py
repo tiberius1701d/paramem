@@ -318,10 +318,11 @@ class TestApplyConfigLiveSchedulerParticipation:
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
             patch.object(systemctl, "run", side_effect=_mock_run_systemctl),
-            patch.object(app_module, "_live_reload_base_model"),
+            # return_value=None: simulate a successful reload — applied_live
+            # is derived from the returned reason (None == success).
+            patch.object(app_module, "_live_reload_base_model", return_value=None),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
-            app_module._state["mode"] = "local"
             result = app_module._apply_config_live()
 
         assert result["restart_required_reason"] is None
@@ -360,10 +361,11 @@ class TestApplyConfigLiveSchedulerParticipation:
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
             patch.object(systemctl, "run", side_effect=_mock_run_systemctl) as mock_systemctl,
-            patch.object(app_module, "_live_reload_base_model"),
+            # return_value=None: simulate a successful reload — applied_live
+            # is derived from the returned reason (None == success).
+            patch.object(app_module, "_live_reload_base_model", return_value=None),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
-            app_module._state["mode"] = "local"
             result = app_module._apply_config_live()
 
         assert result["restart_required_reason"] is None, (
@@ -413,10 +415,11 @@ class TestApplyConfigLiveSchedulerParticipation:
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", return_value=config_b),
             patch.object(systemctl, "run", side_effect=_mock_run_systemctl),
-            patch.object(app_module, "_live_reload_base_model"),
+            # return_value=None: simulate a successful reload — applied_live
+            # is derived from the returned reason (None == success).
+            patch.object(app_module, "_live_reload_base_model", return_value=None),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
-            app_module._state["mode"] = "local"
             app_module._apply_config_live()
 
         assert not (tmp_path / "paramem-consolidate.timer").exists(), (
@@ -454,10 +457,11 @@ class TestApplyConfigLiveSchedulerParticipation:
             patch.object(Path, "exists", return_value=True),
             patch.object(app_module, "load_server_config", _failing_load),
             patch.object(systemctl, "run", side_effect=_mock_run_systemctl) as mock_systemctl,
-            patch.object(app_module, "_live_reload_base_model"),
+            # return_value=None: simulate a successful reload — applied_live
+            # is derived from the returned reason (None == success).
+            patch.object(app_module, "_live_reload_base_model", return_value=None),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
-            app_module._state["mode"] = "local"
             app_module._apply_config_live()
 
         assert mock_systemctl.call_args_list == [], (

@@ -1048,6 +1048,12 @@ class AcceptResponse(BaseModel):
         ``systemctl --user restart paramem-server`` via the
         ``paramem.utils.systemctl`` transport seam; ``restart_hint`` is
         display-only text, never the command actually executed.
+    cloud_only_reason:
+        The reload primitive's own reason when a reload was attempted and
+        failed (one of ``_live_reload_base_model``'s closed vocabulary:
+        ``"insufficient_vram"``, ``"reload_failed"``, ``"apply_failed"``).
+        ``None`` when the apply was never attempted (see
+        ``restart_required_reason``) or when it succeeded.
     """
 
     state: str
@@ -1058,6 +1064,7 @@ class AcceptResponse(BaseModel):
     applied_live: bool = False
     restart_required_reason: str | None = None
     restart_eligible: bool = False
+    cloud_only_reason: str | None = None
 
 
 class RollbackResponse(BaseModel):
@@ -1087,6 +1094,12 @@ class RollbackResponse(BaseModel):
         ``True`` when an R-PORT carve pre-flighted successfully and the CLI
         may trigger a prompted restart via the ``restart_hint`` command.
         ``False`` for R-PATHS and for failures.
+    cloud_only_reason:
+        The reload primitive's own reason when a reload was attempted and
+        failed (one of ``_live_reload_base_model``'s closed vocabulary:
+        ``"insufficient_vram"``, ``"reload_failed"``, ``"apply_failed"``).
+        ``None`` when the apply was never attempted (see
+        ``restart_required_reason``) or when it succeeded.
     """
 
     state: str
@@ -1097,6 +1110,7 @@ class RollbackResponse(BaseModel):
     applied_live: bool = False
     restart_required_reason: str | None = None
     restart_eligible: bool = False
+    cloud_only_reason: str | None = None
 
 
 # --- Adapter manifest validation + mount helpers ---
@@ -5685,12 +5699,16 @@ async def gpu_acquire():
     intent and requires a config edit + restart to leave. Idempotent in
     local mode (returns 200 with ``reloaded_live: false``).
 
-    On reload failure, falls back to ``_restart_service`` so the operator's
-    intent is honoured even when the live path fails — EXCEPT when the
-    reload was declined for insufficient free VRAM (an external GPU
-    consumer holds the device), where a restart would only crash-loop on
-    the lifespan VRAM budget gate. In that case the server stays cloud-only
-    and the response carries ``deferred_insufficient_vram: true``.
+    Recovery matches state certainty. When the reload primitive HANDLES the
+    failure internally (returns a reason instead of raising) the process is
+    known-clean — released to ~0 GiB VRAM, mode already cloud-only — so the
+    server just stays cloud-only and reports the reason in the response
+    (``reload_failed: true``); no restart is triggered. Insufficient free
+    VRAM (an external GPU consumer holds the device) is one such handled
+    reason and gets its own flag, ``deferred_insufficient_vram: true`` — a
+    restart there would only crash-loop on the lifespan VRAM budget gate.
+    Only an escaped exception (unknown process state) falls back to
+    ``_restart_service`` (``will_restart: true``).
 
     Refuses (without touching hold state) while a consolidation cycle is
     in flight (503 ``consolidating`` — same idiom as ``/gpu/release``) or
@@ -5735,6 +5753,8 @@ async def gpu_acquire():
     )
     reloaded_live = False
     deferred_insufficient_vram = False
+    reload_failed = False
+    will_restart = False
     if needs_reload:
         try:
             from paramem.server.gpu_lock import gpu_lock
@@ -5748,105 +5768,122 @@ async def gpu_acquire():
             # default lock_held=False, and that call acquires the same lock;
             # widening this wrap to cover it would deadlock.
             async with gpu_lock():
-                await asyncio.get_running_loop().run_in_executor(
+                reason = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: _live_reload_base_model(lock_held=True)
                 )
-            reloaded_live = _state.get("mode") == "local"
         except Exception:  # noqa: BLE001
+            # Unknown process state — the primitive did not get a chance to
+            # signal a handled outcome. Only this path restarts the service.
             logger.exception(
                 "In-process reload failed during /gpu/acquire; falling back to restart"
             )
-        if reloaded_live:
-            # Voice drain+restore is now owned by _live_reload_base_model
-            # (partial-path success restore runs inside the primitive).
-            # ── Base-swap deferred-resume hook ────────────────────────────────
-            # When a phaseA_done base-swap marker exists and the orchestration
-            # is not actively running (base_swap_active=False), the reload that
-            # just succeeded means Phase B can now run.  Re-launch the
-            # orchestration in resume mode so Phase B proceeds automatically
-            # without operator intervention.
-            _bs_mig = _state.get("migration") or {}
-            if not _bs_mig.get("base_swap_active", False):
-                _config_for_resume = _state.get("config")
-                if _config_for_resume is not None:
-                    _sd_resume = (_config_for_resume.paths.data / "state").resolve()
-                    _br_resume = (_config_for_resume.paths.data / "backups").resolve()
-                    _deferred_marker = read_trial_marker(_sd_resume)
-                    if (
-                        _deferred_marker is not None
-                        and _deferred_marker.migration_kind == "base_swap"
-                        and _deferred_marker.base_swap_phase == "phaseA_done"
-                    ):
-                        _live_cfg_resume = (
-                            Path(_state["config_path"])
-                            if _state.get("config_path")
-                            else DEFAULT_SERVER_CONFIG_PATH
-                        )
-                        # Store the handle in the same slot _run_boot_completion_tasks
-                        # awaits and shutdown cancels — an unstored
-                        # asyncio.create_task(...) result is a GC hazard (the
-                        # event loop only holds a weak reference).
-                        # base_swap_active=False (checked above) means no
-                        # orchestration is currently running, but guard the
-                        # slot explicitly rather than silently overwriting: a
-                        # non-None handle here would mean a just-completed
-                        # orchestration's done-callback has not yet cleared
-                        # it, and launching a second one while that race is
-                        # open is not safe to assume away.
-                        if _state.get("base_swap_task") is not None:
-                            logger.warning(
-                                "/gpu/acquire: base_swap_task slot already occupied — "
-                                "skipping deferred Phase B re-launch this cycle "
-                                "(base_swap_active=False but a task handle is still "
-                                "present; retry once it clears)"
-                            )
-                        else:
-                            _state["base_swap_task"] = asyncio.create_task(
-                                _run_base_swap_orchestration(
-                                    candidate_path_str=str(_live_cfg_resume),
-                                    live_config_path=_live_cfg_resume,
-                                    state_dir=_sd_resume,
-                                    backups_root=_br_resume,
-                                    old_model=_deferred_marker.old_model,
-                                    new_model=_deferred_marker.new_model,
-                                    started_at=_deferred_marker.started_at,
-                                    candidate_hash=_deferred_marker.candidate_config_sha256,
-                                    resume_phase="phaseA_done",
-                                )
-                            )
-                            _state["base_swap_task"].add_done_callback(
-                                functools.partial(_clear_state_task, "base_swap_task")
-                            )
-                            logger.info(
-                                "/gpu/acquire: re-launching deferred base-swap Phase B "
-                                "(old=%s new=%s)",
-                                _deferred_marker.old_model,
-                                _deferred_marker.new_model,
-                            )
-        elif _state.get("cloud_only_reason") == "insufficient_vram":
-            # Free device memory cannot hold the model (an external GPU
-            # consumer holds it). A restart would only re-hit the lifespan
-            # VRAM budget gate and crash-loop, so stay cloud-only and tell
-            # the operator to free the GPU first. Voice back to CPU so the
-            # server holds no GPU memory.
-            deferred_insufficient_vram = True
-            await asyncio.get_running_loop().run_in_executor(
-                None, _set_voice_pipeline_profile, "cpu"
-            )
-            logger.warning(
-                "/gpu/acquire: insufficient free VRAM to reload the model — "
-                "staying cloud-only. Free the GPU and retry `pstatus --acquire`."
-            )
-        else:
+            will_restart = True
             _restart_service()
+        else:
+            if reason is None:
+                reloaded_live = True
+                # Voice drain+restore is now owned by _live_reload_base_model
+                # (partial-path success restore runs inside the primitive).
+                # ── Base-swap deferred-resume hook ──────────────────────────
+                # When a phaseA_done base-swap marker exists and the
+                # orchestration is not actively running (base_swap_active=False),
+                # the reload that just succeeded means Phase B can now run.
+                # Re-launch the orchestration in resume mode so Phase B
+                # proceeds automatically without operator intervention.
+                _bs_mig = _state.get("migration") or {}
+                if not _bs_mig.get("base_swap_active", False):
+                    _config_for_resume = _state.get("config")
+                    if _config_for_resume is not None:
+                        _sd_resume = (_config_for_resume.paths.data / "state").resolve()
+                        _br_resume = (_config_for_resume.paths.data / "backups").resolve()
+                        _deferred_marker = read_trial_marker(_sd_resume)
+                        if (
+                            _deferred_marker is not None
+                            and _deferred_marker.migration_kind == "base_swap"
+                            and _deferred_marker.base_swap_phase == "phaseA_done"
+                        ):
+                            _live_cfg_resume = (
+                                Path(_state["config_path"])
+                                if _state.get("config_path")
+                                else DEFAULT_SERVER_CONFIG_PATH
+                            )
+                            # Store the handle in the same slot
+                            # _run_boot_completion_tasks awaits and shutdown
+                            # cancels — an unstored asyncio.create_task(...)
+                            # result is a GC hazard (the event loop only holds
+                            # a weak reference). base_swap_active=False
+                            # (checked above) means no orchestration is
+                            # currently running, but guard the slot explicitly
+                            # rather than silently overwriting: a non-None
+                            # handle here would mean a just-completed
+                            # orchestration's done-callback has not yet
+                            # cleared it, and launching a second one while
+                            # that race is open is not safe to assume away.
+                            if _state.get("base_swap_task") is not None:
+                                logger.warning(
+                                    "/gpu/acquire: base_swap_task slot already occupied — "
+                                    "skipping deferred Phase B re-launch this cycle "
+                                    "(base_swap_active=False but a task handle is still "
+                                    "present; retry once it clears)"
+                                )
+                            else:
+                                _state["base_swap_task"] = asyncio.create_task(
+                                    _run_base_swap_orchestration(
+                                        candidate_path_str=str(_live_cfg_resume),
+                                        live_config_path=_live_cfg_resume,
+                                        state_dir=_sd_resume,
+                                        backups_root=_br_resume,
+                                        old_model=_deferred_marker.old_model,
+                                        new_model=_deferred_marker.new_model,
+                                        started_at=_deferred_marker.started_at,
+                                        candidate_hash=_deferred_marker.candidate_config_sha256,
+                                        resume_phase="phaseA_done",
+                                    )
+                                )
+                                _state["base_swap_task"].add_done_callback(
+                                    functools.partial(_clear_state_task, "base_swap_task")
+                                )
+                                logger.info(
+                                    "/gpu/acquire: re-launching deferred base-swap Phase B "
+                                    "(old=%s new=%s)",
+                                    _deferred_marker.old_model,
+                                    _deferred_marker.new_model,
+                                )
+            elif reason == "insufficient_vram":
+                # Free device memory cannot hold the model (an external GPU
+                # consumer holds it). A restart would only re-hit the
+                # lifespan VRAM budget gate and crash-loop, so stay
+                # cloud-only and tell the operator to free the GPU first.
+                # No voice dispatch needed here: the primitive's entry drain
+                # (unconditional, before its own VRAM gate) already leaves
+                # voice on CPU on every path that can produce this reason.
+                deferred_insufficient_vram = True
+                logger.warning(
+                    "/gpu/acquire: insufficient free VRAM to reload the model — "
+                    "staying cloud-only. Free the GPU and retry `pstatus --acquire`."
+                )
+            else:
+                # Handled failure ("reload_failed" / "apply_failed"): the
+                # primitive already released the partial allocation and left
+                # the server cloud-only in a known-clean state. No restart —
+                # recovery matches state certainty.
+                reload_failed = True
+                logger.error(
+                    "/gpu/acquire: in-process reload failed (%s) — staying "
+                    "cloud-only. Retry `pstatus --acquire` once the underlying "
+                    "issue clears, or restart the service explicitly if the "
+                    "failure persists.",
+                    reason,
+                )
     return {
         "cleared": cleared,
         "was_active": hold_before["hold_active"],
         "owner_pid": hold_before["owner_pid"],
         "owner_alive": hold_before["owner_alive"],
-        "will_restart": needs_reload and not reloaded_live and not deferred_insufficient_vram,
+        "will_restart": will_restart,
         "reloaded_live": reloaded_live,
         "deferred_insufficient_vram": deferred_insufficient_vram,
+        "reload_failed": reload_failed,
     }
 
 
@@ -7061,7 +7098,7 @@ def _live_reload_base_model(
     refresh_config_from_disk: bool = False,
     rebuild_session_buffer: bool = False,
     lock_held: bool = False,
-) -> None:
+) -> Literal["insufficient_vram", "reload_failed", "apply_failed"] | None:
     """Release+reload the base model in-process to recover device memory.
 
     Used as the recovery path when STT cannot reload post-cycle because
@@ -7086,7 +7123,10 @@ def _live_reload_base_model(
     path (``refresh_config_from_disk=True``) restores voice via
     ``_build_config_derived_state`` — adding a restore here for that branch
     would double-load.  Failure branches leave voice on CPU so the
-    cloud-only server holds ~0 GiB.
+    cloud-only server holds ~0 GiB.  A voice-restore failure on the PARTIAL
+    path is a handled, non-fatal degradation — logged and re-drained to CPU,
+    never allowed to escape and strand the (already-loaded) base model
+    behind the transient ``"live_reload"`` cloud-only reason.
 
     The drain is idempotent for cloud-only callers (``voice_profile=="cpu"``
     → ``_set_voice_pipeline_profile`` early-returns on a matching profile).
@@ -7152,6 +7192,24 @@ def _live_reload_base_model(
         orchestration's post-Phase-B reload — holds the lock and passes
         ``True``.  ``False`` (the default) is for direct, non-dispatched
         callers that do not hold the lock.
+
+    Returns
+    -------
+    Literal["insufficient_vram", "reload_failed", "apply_failed"] or None
+        ``None`` on success (mode is now ``"local"``).  On a handled
+        failure, the same reason string just written to
+        ``_state["cloud_only_reason"]`` — one of the closed vocabulary
+        ``"insufficient_vram"`` (VRAM preflight gate refused the load),
+        ``"reload_failed"`` (the model load itself raised, or the
+        plain-reclaim component rebuild raised after a successful load),
+        or ``"apply_failed"`` (the full config-apply component rebuild
+        raised after a successful load).  An exception that escapes this
+        function (not caught by any of the above) signals an UNHANDLED
+        failure — the caller cannot assume the process is in a known
+        clean state and should treat it differently from a returned
+        reason string.  This return value is the control-flow channel;
+        ``_state["cloud_only_reason"]`` keeps being written on every path
+        exactly as before because ``/status`` reads it directly.
 
     Note on the synchronous maintenance guard:
     When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
@@ -7241,7 +7299,7 @@ def _live_reload_base_model(
             assessment.required_bytes / 2**30,
             config.model_name,
         )
-        return
+        return "insufficient_vram"
 
     load_failed = False
     try:
@@ -7268,7 +7326,7 @@ def _live_reload_base_model(
             "Live model reload failed — released partial allocation, "
             "server stays cloud-only until the GPU frees or a restart."
         )
-        return
+        return "reload_failed"
 
     if refresh_config_from_disk:
         # Config-apply path: full component rebuild via the shared routine.
@@ -7297,7 +7355,7 @@ def _live_reload_base_model(
                 "Live config apply: component rebuild failed — staying cloud-only. "
                 "Config is already on disk; restart or /gpu/acquire to retry."
             )
-            return
+            return "apply_failed"
 
         # Full rebuild succeeded.  A partial preload (boot_degraded set by
         # _preload_memory_store inside _build_config_derived_state) is NOT a
@@ -7309,6 +7367,7 @@ def _live_reload_base_model(
         _state["mode"] = "local"
         _state["cloud_only_reason"] = None
         logger.info("Live config apply — complete; mode=local")
+        result = None
     else:
         # Plain reclaim path (same config): rebuild Router + classifier handle.
         # Re-probe gate: _build_config_derived_state skips the expensive weight-probe
@@ -7335,14 +7394,40 @@ def _live_reload_base_model(
             rebuild_failed = True
 
         if not rebuild_failed:
-            _state["mode"] = "local"
-            _state["cloud_only_reason"] = None
             # Partial-path success restore: the entry-drain moved voice to CPU;
             # put it back now that the base model is live.  The full-rebuild path
             # (refresh_config_from_disk=True) skips this — _build_config_derived_state
             # already reconstructed voice on GPU and set voice_profile="gpu".
-            _set_voice_pipeline_profile("gpu", lock_held=lock_held)
+            #
+            # A voice-restore failure is a handled, non-fatal degradation: this
+            # primitive's responsibility is the base-model reload, and a local
+            # server with voice stuck on CPU beats reporting cloud-only over a
+            # base model that is actually resident (the restore failure may
+            # itself be VRAM pressure from the voice models).  No cleanup
+            # re-drain is needed: voice_profile is already "cpu" here (the
+            # entry drain above is the only prior mutation, and a failed
+            # "gpu" call never reaches the assignment that would flip it), so
+            # a second _set_voice_pipeline_profile("cpu") call would be a
+            # guaranteed no-op via its own idempotent profile-match guard.
+            # Nor can the failure leave a GPU allocation behind: the
+            # WhisperSTT/TTSManager constructors are pure attribute
+            # assignment (no CUDA allocation), and the actual .load() calls
+            # are internally try/excepted (best-effort) and cannot raise
+            # past this point.
+            try:
+                _set_voice_pipeline_profile("gpu", lock_held=lock_held)
+            except Exception:
+                logger.warning(
+                    "Live model reload: voice GPU restore failed after a successful "
+                    "base-model reload — continuing in local mode with voice on CPU; "
+                    "the next consolidation cycle's post-cycle voice restore or a "
+                    "config apply retries the GPU voice restore.",
+                    exc_info=True,
+                )
+            _state["mode"] = "local"
+            _state["cloud_only_reason"] = None
             logger.info("Live model reload — complete; mode=local")
+            result = None
         else:
             _release_base_model_in_process()
             _state["cloud_only_reason"] = "reload_failed"
@@ -7350,15 +7435,21 @@ def _live_reload_base_model(
                 "Live model reload: component rebuild failed after successful model load — "
                 "released allocation, staying cloud-only."
             )
+            result = "reload_failed"
 
     # Eager consolidation-loop creation — both success branches above land
-    # mode="local" here; both failure branches released the model and left
-    # mode="cloud-only", so the gate inside _eager_create_consolidation_loop
-    # skips.  _release_base_model_in_process nulls _state["consolidation_loop"]
-    # on every release path, so a release→acquire cycle would otherwise revert
-    # to the lazy get-or-create — this call keeps adapter_loaded symmetric
+    # mode="local" here with the model resident; the fall-through failure
+    # branch (plain-reclaim component rebuild failure) called
+    # _release_base_model_in_process(), which nulls _state["model"]/
+    # ["tokenizer"] — the gate inside _eager_create_consolidation_loop reads
+    # those (not mode) and skips because the model is absent, not because
+    # mode reads "cloud-only".  _release_base_model_in_process also nulls
+    # _state["consolidation_loop"] on every release path, so a
+    # release→acquire cycle would otherwise revert to the lazy
+    # get-or-create — this call keeps adapter_loaded symmetric
     # across that cycle too, not just across a restart.
     _eager_create_consolidation_loop(config)
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -7725,7 +7816,11 @@ def _apply_config_live() -> dict:
         )
         return {
             "applied_live": False,
-            "cloud_only_reason": _state.get("cloud_only_reason"),
+            # No reload was attempted on this path, so there is no reload
+            # outcome to report — the transient "live_reload" cloud-only
+            # sentinel the caller pre-set is meaningless to the operator
+            # (see restart_required_reason for the actual, named cause).
+            "cloud_only_reason": None,
             "restart_required_reason": "lock_timeout",
             "restart_eligible": False,
             "skipped": None,
@@ -7740,7 +7835,11 @@ def _apply_config_live() -> dict:
             )
             return {
                 "applied_live": False,
-                "cloud_only_reason": _state.get("cloud_only_reason"),
+                # No reload was attempted on this path, so there is no reload
+                # outcome to report — the transient "live_reload" cloud-only
+                # sentinel the caller pre-set is meaningless to the operator
+                # (see restart_required_reason for the actual, named cause).
+                "cloud_only_reason": None,
                 "restart_required_reason": "consolidating",
                 "restart_eligible": False,
                 "skipped": None,
@@ -7850,7 +7949,11 @@ def _apply_config_live() -> dict:
                 )
                 return {
                     "applied_live": False,
-                    "cloud_only_reason": _state.get("cloud_only_reason"),
+                    # No reload was attempted on this path, so there is no reload
+                    # outcome to report — the transient "live_reload" cloud-only
+                    # sentinel the caller pre-set is meaningless to the operator
+                    # (see restart_required_reason for the actual, named cause).
+                    "cloud_only_reason": None,
                     "restart_required_reason": "paths_change",
                     "restart_eligible": False,
                     "skipped": None,
@@ -7894,7 +7997,11 @@ def _apply_config_live() -> dict:
                     )
                     return {
                         "applied_live": False,
-                        "cloud_only_reason": _state.get("cloud_only_reason"),
+                        # No reload was attempted on this path, so there is no reload
+                        # outcome to report — the transient "live_reload" cloud-only
+                        # sentinel the caller pre-set is meaningless to the operator
+                        # (see restart_required_reason for the actual, named cause).
+                        "cloud_only_reason": None,
                         "restart_required_reason": carve_reason,
                         "restart_eligible": False,
                         "skipped": None,
@@ -7940,7 +8047,11 @@ def _apply_config_live() -> dict:
                     # (the listener socket is already bound).  Short-circuit.
                     return {
                         "applied_live": False,
-                        "cloud_only_reason": _state.get("cloud_only_reason"),
+                        # No reload was attempted on this path, so there is no reload
+                        # outcome to report — the transient "live_reload" cloud-only
+                        # sentinel the caller pre-set is meaningless to the operator
+                        # (see restart_required_reason for the actual, named cause).
+                        "cloud_only_reason": None,
                         "restart_required_reason": restart_required_reason,
                         "restart_eligible": True,
                         "skipped": None,
@@ -7972,25 +8083,21 @@ def _apply_config_live() -> dict:
         # lock_held=True: _apply_config_live holds gpu_lock_sync() (acquired
         # above at ~4508); the primitive's internal _set_voice_pipeline_profile
         # calls must not re-acquire the non-reentrant threading.Lock.
-        _live_reload_base_model(
+        reason = _live_reload_base_model(
             refresh_config_from_disk=True,
             rebuild_session_buffer=_rebuild_session_buf,
             lock_held=True,
         )
+        applied_live = reason is None
 
-        if _state.get("mode") == "local":
+        if applied_live:
             # Voice pipeline was set by _build_config_derived_state inside
             # _live_reload_base_model; final no-op profile flip to confirm gpu.
             _set_voice_pipeline_profile("gpu", lock_held=True)
-            applied_live = True
-        else:
-            # Model reload or component rebuild failed; _live_reload_base_model
-            # set cloud_only_reason appropriately.
-            applied_live = False
 
         return {
             "applied_live": applied_live,
-            "cloud_only_reason": _state.get("cloud_only_reason"),
+            "cloud_only_reason": reason,
             "restart_required_reason": restart_required_reason,
             "restart_eligible": restart_eligible if applied_live else False,
             "skipped": None,
@@ -11874,29 +11981,82 @@ async def _run_base_swap_orchestration(
                         f"release (status={getattr(_release_result, 'status_code', '?')}): "
                         f"{_release_detail}"
                     )
-                await asyncio.get_running_loop().run_in_executor(None, _apply_config_live)
+                _apply_result = await asyncio.get_running_loop().run_in_executor(
+                    None, _apply_config_live
+                )
 
-                # After the executor returns, check whether the reload succeeded
-                # or was deferred due to insufficient VRAM.
-                if _state.get("mode") != "local":
-                    deferred_reason = _state.get("cloud_only_reason", "reload_deferred")
+                # Proceed to Phase B iff a reload ran and landed — the only
+                # shape where the new model is actually resident.  _gpu_release_
+                # internal above already released the GPU, so every other
+                # shape leaves mode cloud-only; this predicate reads the
+                # primitive's own return dict instead of re-inferring the
+                # outcome from a state re-read.
+                if not (_apply_result["applied_live"] and _apply_result["skipped"] is None):
                     completed_at = datetime.now(timezone.utc).isoformat()
+                    restart_required_reason = _apply_result.get("restart_required_reason")
+                    apply_cloud_only_reason = _apply_result.get("cloud_only_reason")
+                    # A reload was attempted (and its outcome recorded in
+                    # cloud_only_reason) whenever the apply reached the
+                    # reload dispatch — that includes a MIXED R-PORT delta,
+                    # which sets restart_required_reason (the carve is still
+                    # signalled) but falls through to the reload rather than
+                    # short-circuiting before it (see the R-PORT mixed-delta
+                    # branch above).  So restart_required_reason alone does
+                    # NOT mean "never attempted" — cloud_only_reason (or the
+                    # no-op skip shape) is the reliable signal that a reload
+                    # ran.
+                    attempted = apply_cloud_only_reason is not None or (
+                        _apply_result.get("skipped") == "no_change"
+                    )
+                    if attempted:
+                        # A reload was attempted and failed (a handled
+                        # failure — see _live_reload_base_model's closed
+                        # vocabulary).  _apply_config_live's refresh-before-
+                        # release ordering already committed config B to
+                        # _state["config"] before the release, so a later
+                        # plain /gpu/acquire genuinely reloads the NEW model;
+                        # the phaseA_done marker (already written above) is
+                        # what makes /gpu/acquire's deferred-resume hook
+                        # re-launch Phase B once that reload lands.
+                        gates_cloud_only_reason = apply_cloud_only_reason or "reload_deferred"
+                        message = (
+                            f"Phase A complete but base-model reload deferred "
+                            f"(cloud_only_reason={gates_cloud_only_reason!r}). "
+                            "Phase B will run automatically once the new model "
+                            "is loaded (POST /gpu/acquire triggers this)."
+                        )
+                    else:
+                        # The apply was never attempted (lock_timeout /
+                        # consolidating / paths_change / a pure-port-only
+                        # carve) — config A is still the in-memory config, so
+                        # a plain /gpu/acquire would reload the OLD model and
+                        # this same deferral would just repeat.  Config B is
+                        # already on disk (the atomic rename in Step 2); only
+                        # a restart picks it up.  cloud_only_reason is reserved
+                        # for a genuine cloud-only cause and stays None here —
+                        # restart_required_reason already names the cause.
+                        gates_cloud_only_reason = None
+                        message = (
+                            f"Phase A complete but the config apply was never attempted "
+                            f"(restart_required_reason={restart_required_reason!r}). "
+                            "Config B is already on disk — restart the service to pick "
+                            "it up and resume Phase B; POST /gpu/acquire will NOT help "
+                            "here."
+                        )
                     await _update_trial_gates(
                         {
                             "status": "reload_deferred",
                             "completed_at": completed_at,
-                            "cloud_only_reason": deferred_reason,
-                            "message": (
-                                f"Phase A complete but base-model reload deferred "
-                                f"(cloud_only_reason={deferred_reason!r}). "
-                                "Phase B will run automatically once the new model "
-                                "is loaded (POST /gpu/acquire triggers this)."
-                            ),
+                            "cloud_only_reason": gates_cloud_only_reason,
+                            "restart_required_reason": restart_required_reason,
+                            "message": message,
                         }
                     )
                     logger.warning(
-                        "base-swap reload deferred: cloud_only_reason=%s; Phase B not started",
-                        deferred_reason,
+                        "base-swap reload deferred: cloud_only_reason=%s "
+                        "restart_required_reason=%s; Phase B not started",
+                        gates_cloud_only_reason,
+                        restart_required_reason,
                     )
                     return
 
@@ -12148,7 +12308,15 @@ async def _run_base_swap_orchestration(
 
             _loop = asyncio.get_running_loop()
             async with gpu_lock():
-                await _loop.run_in_executor(None, lambda: _live_reload_base_model(lock_held=True))
+                _reload_reason = await _loop.run_in_executor(
+                    None, lambda: _live_reload_base_model(lock_held=True)
+                )
+            if _reload_reason is not None:
+                logger.warning(
+                    "base-swap: post-Phase-B live reload failed (%s); weights are on "
+                    "disk but the server stays cloud-only until /gpu/acquire or restart",
+                    _reload_reason,
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "base-swap: post-Phase-B live reload raised; weights are on disk "
@@ -12941,6 +13109,7 @@ async def migration_accept():
         applied_live: bool = apply_result.get("applied_live", False)
         apply_reason: str | None = apply_result.get("restart_required_reason")
         restart_eligible: bool = apply_result.get("restart_eligible", False)
+        apply_cloud_only_reason: str | None = apply_result.get("cloud_only_reason")
 
         # c) Refresh config_drift AFTER the apply.
         # When applied_live=True the loaded_hash is now B (the apply updated it
@@ -13025,6 +13194,7 @@ async def migration_accept():
             applied_live=applied_live,
             restart_required_reason=apply_reason,
             restart_eligible=restart_eligible,
+            cloud_only_reason=apply_cloud_only_reason,
         )
 
 
@@ -13586,6 +13756,7 @@ async def migration_rollback():
         applied_live: bool = apply_result.get("applied_live", False)
         apply_reason: str | None = apply_result.get("restart_required_reason")
         restart_eligible: bool = apply_result.get("restart_eligible", False)
+        apply_cloud_only_reason: str | None = apply_result.get("cloud_only_reason")
 
         # NOTE: do NOT refresh config_drift for rollback — in-memory config already
         # matches A; the drift loop stays coherent (config_drift.loaded_hash is A).
@@ -13645,6 +13816,7 @@ async def migration_rollback():
                 "applied_live": applied_live,
                 "restart_required_reason": apply_reason,
                 "restart_eligible": restart_eligible,
+                "cloud_only_reason": apply_cloud_only_reason,
                 "archive_warning": {
                     "path": archive_path,
                     "message": (
@@ -13668,6 +13840,7 @@ async def migration_rollback():
             applied_live=applied_live,
             restart_required_reason=apply_reason,
             restart_eligible=restart_eligible,
+            cloud_only_reason=apply_cloud_only_reason,
         )
 
 
@@ -18570,11 +18743,11 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
                 # Use a lambda to bind lock_held so run_in_executor (which takes
                 # positional args only) delivers the keyword argument correctly.
                 async with gpu_lock():
-                    await loop.run_in_executor(
+                    _reload_reason = await loop.run_in_executor(
                         None,
                         lambda: _live_reload_base_model(lock_held=True),
                     )
-                if _state.get("mode") != "local":
+                if _reload_reason is not None:
                     # Reload was declined (insufficient free VRAM) or failed
                     # and self-cleaned — the base model is NOT loaded. Do not
                     # load the STT/TTS GPU pair: that is exactly how a
@@ -18583,9 +18756,8 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
                     # GPU may free on a later tick.
                     await loop.run_in_executor(None, _set_voice_pipeline_profile, "cpu")
                     logger.info(
-                        "Auto-reclaim: reload deferred (mode=%s, reason=%s) — retrying next tick",
-                        _state.get("mode"),
-                        _state.get("cloud_only_reason"),
+                        "Auto-reclaim: reload deferred (reason=%s) — retrying next tick",
+                        _reload_reason,
                     )
                     continue
                 # Voice drain+restore is now owned by _live_reload_base_model

@@ -728,7 +728,36 @@ _BS_STATUS_RELOAD_DEFERRED = {
         "status": "reload_deferred",
         "completed_at": "2026-05-24T01:00:00+00:00",
         "cloud_only_reason": "insufficient_vram",
-        "message": "Phase A complete but base-model reload deferred.",
+        "restart_required_reason": None,
+        # A reload was attempted and failed — the gates record's message is
+        # the CLI's sole source of deferral guidance (the renderer no longer
+        # re-derives it), so the fixture carries the real production text.
+        "message": (
+            "Phase A complete but base-model reload deferred "
+            "(cloud_only_reason='insufficient_vram'). Phase B will run "
+            "automatically once the new model is loaded "
+            "(POST /gpu/acquire triggers this)."
+        ),
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_RELOAD_DEFERRED_NEVER_ATTEMPTED = {
+    "state": "TRIAL",
+    "gates": {
+        "status": "reload_deferred",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "cloud_only_reason": "consolidating",
+        "restart_required_reason": "consolidating",
+        # The apply was never attempted — the record's message (the CLI's
+        # sole source of guidance) directs to a restart, not /gpu/acquire.
+        "message": (
+            "Phase A complete but the config apply was never attempted "
+            "(restart_required_reason='consolidating'). Config B is already "
+            "on disk — restart the service to pick it up and resume Phase B; "
+            "POST /gpu/acquire will NOT help here."
+        ),
     },
     "comparison_report": None,
     "server_started_at": "2026-05-24T00:00:00+00:00",
@@ -845,6 +874,42 @@ class TestBaseSwapLongPoll:
             or "/gpu/acquire" in captured.out.lower()
             or "acquire" in captured.out.lower()
         ), f"Expected /gpu/acquire mention on stdout; got: {captured.out!r}"
+
+    def test_base_swap_reload_deferred_never_attempted_directs_to_restart(
+        self, monkeypatch, capsys
+    ):
+        """Base-swap 'reload_deferred' where the apply was never attempted
+        (restart_required_reason set): the renderer must surface the gates
+        record's own guidance (restart the service), not the generic
+        /gpu/acquire text that only applies to an attempted-and-failed
+        reload — the renderer no longer re-derives instructional text.
+        """
+        get_seq = [_STATUS_STAGING, _BS_STATUS_RELOAD_DEFERRED_NEVER_ATTEMPTED]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 2, f"Expected exit 2 on reload_deferred; got {rc}"
+        captured = capsys.readouterr()
+        assert "deferred" in captured.out.lower(), (
+            f"Expected deferred message on stdout; got: {captured.out!r}"
+        )
+        # The restart_required_reason ("consolidating") must be named — the
+        # minimal status-line framing the renderer still owns.
+        assert "consolidating" in captured.out.lower(), (
+            f"Expected restart_required_reason named on stdout; got: {captured.out!r}"
+        )
+        # Restart guidance from the record's own message, not the generic
+        # /gpu/acquire-will-fix-it text.
+        assert "restart" in captured.out.lower(), (
+            f"Expected restart guidance on stdout; got: {captured.out!r}"
+        )
+        assert "will not help" in captured.out.lower(), (
+            f"Expected the record's own '/gpu/acquire will NOT help' guidance on stdout; "
+            f"got: {captured.out!r}"
+        )
 
     def test_base_swap_no_accept_rollback_prompt_on_pass(self, monkeypatch, capsys):
         """On base-swap pass, no accept/rollback/cancel prompt is shown.

@@ -52,8 +52,10 @@ def test_acquire_in_defer_mode_reloads_and_switches_voice():
     }
 
     def fake_reload(**_kw):
-        # Simulate successful reload setting mode to local.
+        # Simulate successful reload setting mode to local; success is
+        # signalled to the caller via the None return value.
         app_module._state["mode"] = "local"
+        return None
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -127,6 +129,7 @@ def test_acquire_after_release_reloads_and_switches_voice():
 
     def _flip_mode_local(**_kw):
         app_module._state["mode"] = "local"
+        return None
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -187,8 +190,11 @@ def test_acquire_respects_explicit_cloud_only_config():
 
 def test_acquire_defers_on_insufficient_vram_without_restart():
     """Reload declined for insufficient VRAM: do NOT restart (a restart would
-    only crash-loop on the lifespan VRAM budget gate). Stay cloud-only, set
-    voice to cpu, and report deferred_insufficient_vram=True.
+    only crash-loop on the lifespan VRAM budget gate). Stay cloud-only and
+    report deferred_insufficient_vram=True. The endpoint does not dispatch
+    its own voice-to-cpu call on this branch — the primitive's unconditional
+    entry drain already leaves voice on CPU before it can produce this
+    reason, so a second dispatch here would be dead code.
     """
     from paramem.server import app as app_module
 
@@ -199,9 +205,11 @@ def test_acquire_defers_on_insufficient_vram_without_restart():
     }
 
     def fake_reload_declines(**_kw):
-        # Pre-flight declined inside _live_reload_base_model.
+        # Pre-flight declined inside _live_reload_base_model — the handled
+        # failure is signalled to the caller via the returned reason string.
         app_module._state["mode"] = "cloud-only"
         app_module._state["cloud_only_reason"] = "insufficient_vram"
+        return "insufficient_vram"
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -218,10 +226,11 @@ def test_acquire_defers_on_insufficient_vram_without_restart():
         result = _call_gpu_acquire()
 
     mock_restart.assert_not_called()
-    mock_profile.assert_called_once_with("cpu")
+    mock_profile.assert_not_called()
     assert result["reloaded_live"] is False
     assert result["deferred_insufficient_vram"] is True
     assert result["will_restart"] is False
+    assert result["reload_failed"] is False
 
 
 def test_acquire_falls_back_to_restart_on_reload_failure():
@@ -255,6 +264,53 @@ def test_acquire_falls_back_to_restart_on_reload_failure():
     mock_restart.assert_called_once()
     assert result["will_restart"] is True
     assert result["reloaded_live"] is False
+    assert result["reload_failed"] is False
+
+
+def test_acquire_handled_reload_failure_stays_cloud_only_no_restart():
+    """When _live_reload_base_model returns a handled failure reason
+    ("reload_failed") instead of raising, the process is known-clean —
+    stay cloud-only and report it in the response; do NOT restart.
+
+    Recovery matches state certainty: only an escaped exception restarts
+    the service (see test_acquire_falls_back_to_restart_on_reload_failure).
+    """
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "defer_model": True,
+        "mode": "cloud-only",
+        "cloud_only_reason": "training",
+    }
+
+    def fake_reload_fails_handled(**_kw):
+        # The primitive already released the partial allocation and set
+        # cloud_only_reason before returning — mirrors the real function's
+        # reload_failed terminal.
+        app_module._state["mode"] = "cloud-only"
+        app_module._state["cloud_only_reason"] = "reload_failed"
+        return "reload_failed"
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_clear_hold_env", return_value=True),
+        patch.object(
+            app_module,
+            "_get_hold_state",
+            return_value={"hold_active": True, "owner_pid": 1234, "owner_alive": True},
+        ),
+        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload_fails_handled),
+        patch.object(app_module, "_set_voice_pipeline_profile") as mock_profile,
+        patch.object(app_module, "_restart_service") as mock_restart,
+    ):
+        result = _call_gpu_acquire()
+
+    mock_restart.assert_not_called()
+    mock_profile.assert_not_called()
+    assert result["reload_failed"] is True
+    assert result["reloaded_live"] is False
+    assert result["will_restart"] is False
+    assert result["deferred_insufficient_vram"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +330,7 @@ def test_acquire_holds_gpu_lock_across_reload():
     def fake_reload(**_kw):
         lock_state_during_reload.append(_gpu_thread_lock.locked())
         app_module._state["mode"] = "local"
+        return None
 
     state_patch = {
         "defer_model": True,
@@ -310,6 +367,7 @@ def test_acquire_passes_lock_held_true():
     def fake_reload(**kw):
         calls.append(kw)
         app_module._state["mode"] = "local"
+        return None
 
     state_patch = {
         "defer_model": True,
@@ -434,6 +492,9 @@ def test_apply_config_live_aborts_on_lock_timeout():
     mock_reload.assert_not_called()
     assert result["applied_live"] is False
     assert result["restart_required_reason"] == "lock_timeout"
+    # No reload was attempted — the transient "live_reload" sentinel the
+    # caller pre-set in state must NOT leak into the response.
+    assert result["cloud_only_reason"] is None
 
 
 def test_apply_config_live_aborts_when_consolidating():
@@ -464,6 +525,7 @@ def test_apply_config_live_aborts_when_consolidating():
     mock_reload.assert_not_called()
     assert result["applied_live"] is False
     assert result["restart_required_reason"] == "consolidating"
+    assert result["cloud_only_reason"] is None
 
 
 def test_apply_config_live_noop_skip_when_hash_unchanged():
@@ -549,16 +611,16 @@ def test_apply_config_live_rport_stt_carve_restart_eligible():
         patch.object(app_module, "load_server_config", return_value=config_b),
         # Bind succeeds (no OSError).
         patch.object(socket, "socket") as mock_sock_cls,
-        patch.object(app_module, "_live_reload_base_model"),
+        # return_value=None: simulate a successful reload — applied_live is
+        # now derived from the returned reason (None == success), not a
+        # post-call mode re-read.
+        patch.object(app_module, "_live_reload_base_model", return_value=None),
         patch.object(app_module, "_set_voice_pipeline_profile"),
         patch.object(app_module, "_restart_service") as mock_restart,
     ):
         # Make the transient socket bind succeed without actually binding.
         mock_sock = MagicMock()
         mock_sock_cls.return_value = mock_sock
-
-        # Simulate successful apply: mode=local after reload.
-        app_module._state["mode"] = "local"
 
         result = app_module._apply_config_live()
 
@@ -616,13 +678,18 @@ def test_apply_config_live_rport_bind_failure_no_restart():
     assert result["applied_live"] is False
     assert "port_in_use_reason" in result
     assert result["restart_required_reason"] == "stt_port_change"
+    # No reload was attempted (pre-flight declined) — the transient
+    # "live_reload" sentinel must NOT leak into the response.
+    assert result["cloud_only_reason"] is None
 
 
 def test_apply_config_live_rpaths_carve_no_auto_restart():
     """A paths.sessions delta is classified as R-PATHS (paths_change);
     manual restart required (the server never self-fires restart).
-    Config is NOT touched live; _live_reload_base_model IS still called (mixed
-    delta: non-paths fields can be applied live, paths carve is signalled).
+    Config is NOT touched live and the R-PATHS carve short-circuits
+    unconditionally BEFORE any reload dispatch — _live_reload_base_model
+    must NOT be called (unlike R-PORT, which can fall through to reload on
+    a mixed delta).
     """
     from pathlib import Path
 
@@ -648,15 +715,66 @@ def test_apply_config_live_rpaths_carve_no_auto_restart():
         ),
         patch.object(Path, "exists", return_value=True),
         patch.object(app_module, "load_server_config", return_value=config_b),
-        patch.object(app_module, "_live_reload_base_model"),
+        patch.object(app_module, "_live_reload_base_model") as mock_reload,
         patch.object(app_module, "_set_voice_pipeline_profile"),
         patch.object(app_module, "_restart_service") as mock_restart,
     ):
-        app_module._state["mode"] = "local"
         result = app_module._apply_config_live()
 
+    mock_reload.assert_not_called()
     mock_restart.assert_not_called()
     assert result["restart_required_reason"] == "paths_change"
+    # No reload was attempted — the transient "live_reload" sentinel must
+    # NOT leak into the response.
+    assert result["cloud_only_reason"] is None
+
+
+def test_apply_config_live_cloud_only_reason_comes_from_return_not_state():
+    """result["cloud_only_reason"] must come from the primitive's RETURN
+    value, not a re-read of ``_state["cloud_only_reason"]``.
+
+    Fakes ``_live_reload_base_model`` returning ``"apply_failed"`` while
+    deliberately leaving ``_state["cloud_only_reason"]`` at a DIFFERENT
+    value — the response dict must reflect the return, proving the control
+    flow is the return channel and the state write is a display-only side
+    effect (``/status`` reads it directly; this dict does not).
+    """
+    from paramem.server import app as app_module
+
+    config_a = _make_config()
+    config_b = _make_config()
+
+    def _fake_reload_mismatched_state(**_kw):
+        app_module._state["cloud_only_reason"] = "insufficient_vram"
+        return "apply_failed"
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "live_reload",
+        "config": config_a,
+        "config_path": "configs/server.yaml",
+        "consolidating": False,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
+        patch(
+            "paramem.server.drift.compute_config_hash",
+            side_effect=["disk_hash_b", "mem_hash_a"],
+        ),
+        patch.object(Path, "exists", return_value=True),
+        patch.object(app_module, "load_server_config", return_value=config_b),
+        patch.object(
+            app_module, "_live_reload_base_model", side_effect=_fake_reload_mismatched_state
+        ),
+    ):
+        result = app_module._apply_config_live()
+
+    assert result["applied_live"] is False
+    assert result["cloud_only_reason"] == "apply_failed", (
+        f"cloud_only_reason must come from the return value, not _state; got {result}"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -767,13 +885,13 @@ def test_apply_config_live_real_hash_different_file_proceeds():
         with (
             patch.dict(app_module._state, state_patch, clear=False),
             patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
-            # Mock reload so we don't need a real model; just verify it was called.
-            patch.object(app_module, "_live_reload_base_model") as mock_reload,
+            # Mock reload so we don't need a real model; just verify it was
+            # called. return_value=None simulates a successful apply so
+            # applied_live=True.
+            patch.object(app_module, "_live_reload_base_model", return_value=None) as mock_reload,
             patch.object(app_module, "load_server_config", return_value=_make_config()),
             patch.object(app_module, "_set_voice_pipeline_profile"),
         ):
-            # Simulate a successful apply so applied_live=True.
-            app_module._state["mode"] = "local"
             result = app_module._apply_config_live()
 
         assert result["skipped"] is None, (
@@ -871,6 +989,7 @@ def test_session_delta_sets_rebuild_session_buffer_true():
         # Simulate success so the result dict is built.
         app_module._state["mode"] = "local"
         app_module._state["cloud_only_reason"] = None
+        return None
 
     state_patch = {
         "mode": "cloud-only",
@@ -912,6 +1031,7 @@ def test_no_session_delta_keeps_rebuild_session_buffer_false():
         rebuild_buf_log.append(rebuild_session_buffer)
         app_module._state["mode"] = "local"
         app_module._state["cloud_only_reason"] = None
+        return None
 
     state_patch = {
         "mode": "cloud-only",
@@ -952,6 +1072,7 @@ def test_debug_delta_sets_rebuild_session_buffer_true():
         rebuild_buf_log.append(rebuild_session_buffer)
         app_module._state["mode"] = "local"
         app_module._state["cloud_only_reason"] = None
+        return None
 
     state_patch = {
         "mode": "cloud-only",

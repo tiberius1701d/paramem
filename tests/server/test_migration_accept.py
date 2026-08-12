@@ -771,6 +771,46 @@ class TestAcceptLiveApplyFailure:
         assert body["applied_live"] is False
         assert body["restart_required"] is True
 
+    def test_accept_apply_failure_cloud_only_reason_survives_to_cli(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cloud_only_reason must survive Pydantic serialization on the real
+        ``/migration/accept`` response — the CLI's "Apply failed (reason)"
+        branch reads it from the actual served JSON body (via
+        ``client.post(...).json()``), not a hand-built dict.  A hand-built
+        dict is exactly how an undeclared response-model field can silently
+        drop without any test catching it.
+        """
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": None,
+                    "skipped": None,
+                    "cloud_only_reason": "apply_failed",
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("cloud_only_reason") == "apply_failed", (
+            f"cloud_only_reason must survive response serialization; got {body}"
+        )
+
+        from paramem.cli.migrate import _render_apply_result
+
+        _render_apply_result(body, "http://localhost:8420")
+        captured = capsys.readouterr()
+        assert "apply_failed" in captured.err, (
+            f"expected apply_failed named in the CLI's stderr rendering; got {captured.err!r}"
+        )
+
     def test_accept_apply_failure_keeps_restart_banner(self, tmp_path, monkeypatch):
         """Failure stub → RESTART REQUIRED banner present."""
         fresh = _make_state(tmp_path)
@@ -1027,6 +1067,10 @@ class TestApplyConfigLiveRPathsShortCircuit:
 
         def _noop_reload(**kwargs):
             reload_calls.append(kwargs)
+            # Not a real reload — avoid tripping the success voice-restore
+            # branch in _apply_config_live; this fake only tracks whether
+            # the primitive was invoked, not a full successful apply.
+            return "reload_failed"
 
         monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
 
@@ -1051,6 +1095,10 @@ class TestApplyConfigLiveRPathsShortCircuit:
 
         def _noop_reload(**kwargs):
             reload_calls.append(kwargs)
+            # Not a real reload — avoid tripping the success voice-restore
+            # branch in _apply_config_live; this fake only tracks whether
+            # the primitive was invoked, not a full successful apply.
+            return "reload_failed"
 
         monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
 
@@ -1094,8 +1142,14 @@ class TestApplyConfigLiveNoOpSkip:
 
         def _noop_reload(**kwargs):
             reload_calls.append(kwargs)
+            # A genuine successful reload — this test is actually invoked
+            # (unlike its siblings below, which short-circuit before the
+            # reload dispatch), so it simulates success honestly rather than
+            # a failure it doesn't intend to test.
+            return None
 
         monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
+        monkeypatch.setattr(app_module, "_set_voice_pipeline_profile", lambda *a, **kw: None)
 
         result = app_module._apply_config_live()
 
@@ -1121,6 +1175,10 @@ class TestApplyConfigLiveNoOpSkip:
 
         def _noop_reload(**kwargs):
             reload_calls.append(kwargs)
+            # Not a real reload — avoid tripping the success voice-restore
+            # branch in _apply_config_live; this fake only tracks whether
+            # the primitive was invoked, not a full successful apply.
+            return "reload_failed"
 
         monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
 

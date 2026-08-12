@@ -1271,16 +1271,31 @@ class TestRunBaseSwapPhaseA:
             _refresh_config_from_disk_into_state does in production).
             The Phase-B model-identity guard reads config.model_name to verify
             the reload completed correctly.
-            Appends "apply_config_live" to call_order.
+            Appends "apply_config_live" to call_order.  Returns the
+            shape-correct result dict — the orchestration now consumes the
+            return value instead of re-reading _state["mode"].
             """
             call_order.append("apply_config_live")
             state["mode"] = _reload_mode
             if _reload_mode != "local":
                 state["cloud_only_reason"] = "insufficient_vram"
-            else:
-                state["cloud_only_reason"] = None
-                # Simulate config refresh: new model is now live.
-                state["config"].model_name = "qwen3-4b"
+                return {
+                    "applied_live": False,
+                    "cloud_only_reason": "insufficient_vram",
+                    "restart_required_reason": None,
+                    "restart_eligible": False,
+                    "skipped": None,
+                }
+            state["cloud_only_reason"] = None
+            # Simulate config refresh: new model is now live.
+            state["config"].model_name = "qwen3-4b"
+            return {
+                "applied_live": True,
+                "cloud_only_reason": None,
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("paramem.server.app.write_bundle", _fake_write_bundle))
@@ -2025,6 +2040,20 @@ class TestBaseSwapOrchestration:
             if _rm == "local":
                 # Simulate config refresh: new model is now live.
                 state["config"].model_name = "qwen3-4b"
+                return {
+                    "applied_live": True,
+                    "cloud_only_reason": None,
+                    "restart_required_reason": None,
+                    "restart_eligible": False,
+                    "skipped": None,
+                }
+            return {
+                "applied_live": False,
+                "cloud_only_reason": "insufficient_vram",
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         with (
             patch("paramem.server.app.write_bundle", _fake_write_bundle),
@@ -2240,6 +2269,13 @@ class TestBaseSwapOrchestration:
             state["cloud_only_reason"] = None
             # Simulate config refresh: new model is now live.
             state["config"].model_name = "qwen3-4b"
+            return {
+                "applied_live": True,
+                "cloud_only_reason": None,
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         async def _fake_update_gates_noop(payload):
             pass
@@ -2349,6 +2385,46 @@ class TestBaseSwapOrchestration:
         )
         assert state["migration"]["state"] == "LIVE"
 
+    def test_post_phase_b_reload_handled_failure_logs_warning_and_reaches_pass(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A HANDLED reload failure (the primitive returns "reload_failed"
+        instead of raising) is logged as a WARNING naming the reason —
+        previously silent — and status=pass still fires; weights are
+        already durable on disk by the time Phase B returns.
+        """
+        import logging
+
+        state = self._make_state(tmp_path)
+
+        def _handled_failure_reload(*a, **kw):
+            return "reload_failed"
+
+        caplog.set_level(logging.WARNING, logger="paramem.server.app")
+
+        call_order, gates_received, state_dir = self._run_orchestration_with_reload_tracking(
+            state,
+            monkeypatch,
+            tmp_path,
+            reload_mode="local",
+            reload_impl=_handled_failure_reload,
+        )
+
+        assert "phase_b_submit" in call_order
+        assert state["migration"]["trial"]["gates"]["status"] == "pass", (
+            f"A handled reload failure must not block success; got {state['migration']}"
+        )
+        assert state["migration"]["state"] == "LIVE"
+
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "reload_failed" in r.getMessage()
+        ]
+        assert warn_records, (
+            f"expected a WARNING naming 'reload_failed'; got {[r.message for r in caplog.records]}"
+        )
+
     def _run_orchestration_with_reload_tracking(
         self,
         state,
@@ -2437,6 +2513,20 @@ class TestBaseSwapOrchestration:
             state["cloud_only_reason"] = None if _rm == "local" else "insufficient_vram"
             if _rm == "local":
                 state["config"].model_name = "qwen3-4b"
+                return {
+                    "applied_live": True,
+                    "cloud_only_reason": None,
+                    "restart_required_reason": None,
+                    "restart_eligible": False,
+                    "skipped": None,
+                }
+            return {
+                "applied_live": False,
+                "cloud_only_reason": "insufficient_vram",
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         def _default_reload(*a, **kw):
             call_order.append("post_phase_b_reload")
@@ -2698,6 +2788,20 @@ class TestBaseSwapResumePhaseAware:
             if _rm == "local":
                 # Simulate config refresh: new model is now live.
                 state["config"].model_name = "qwen3-4b"
+                return {
+                    "applied_live": True,
+                    "cloud_only_reason": None,
+                    "restart_required_reason": None,
+                    "restart_eligible": False,
+                    "skipped": None,
+                }
+            return {
+                "applied_live": False,
+                "cloud_only_reason": "insufficient_vram",
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         with (
             patch("paramem.server.app.write_bundle", _fake_write_bundle),
@@ -2999,8 +3103,16 @@ class TestBaseSwapStep3ResumeReload:
         *,
         resume_phase: str,
         apply_config_live_side_effect=None,
+        apply_config_live_return_override=None,
     ):
-        """Run orchestration and return (apply_called, submit_calls, gates, state_dir)."""
+        """Run orchestration and return (apply_called, submit_calls, gates, state_dir).
+
+        ``apply_config_live_return_override``, when given, is returned
+        directly from the fake ``_apply_config_live`` instead of the
+        inferred dict — needed to simulate the "never attempted" deferral
+        shape (``restart_required_reason`` set), which the state-inference
+        path (mode/cloud_only_reason only) cannot represent.
+        """
         import asyncio as _asyncio
 
         import paramem.server.app as _app
@@ -3041,11 +3153,25 @@ class TestBaseSwapStep3ResumeReload:
             """Simulate _apply_config_live: load the renamed-config base model.
 
             Appends True to apply_called and runs apply_config_live_side_effect
-            if provided.
+            if provided.  Returns a shape-correct result dict derived from the
+            state the side effect just set (success iff mode landed "local";
+            a handled failure carrying whatever cloud_only_reason the side
+            effect set otherwise) — the orchestration consumes this return
+            value instead of re-reading _state["mode"].
             """
             apply_called.append(True)
             if apply_config_live_side_effect is not None:
                 apply_config_live_side_effect()
+            if apply_config_live_return_override is not None:
+                return apply_config_live_return_override
+            applied_live = state.get("mode") == "local"
+            return {
+                "applied_live": applied_live,
+                "cloud_only_reason": None if applied_live else state.get("cloud_only_reason"),
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         def _fake_submit(fn, **kwargs):
             from paramem.server.trial_state import read_trial_marker as _rtm
@@ -3150,8 +3276,11 @@ class TestBaseSwapStep3ResumeReload:
     def test_fresh_start_deferred_vram_no_phase_b(self, tmp_path, monkeypatch):
         """Fresh start with insufficient VRAM: reload deferred, Phase B not run.
 
-        Mock gpu_acquire leaves mode=cloud-only (VRAM insufficient).
-        The deferred-path must fire: reload_deferred gate, no Phase B.
+        Mock gpu_acquire leaves mode=cloud-only (VRAM insufficient).  The
+        deferred-path must fire: reload_deferred gate, no Phase B.  This is
+        the "attempted and failed" deferral sub-case — a reload was actually
+        tried (config B is already committed to _state), so the gate message
+        directs the operator to /gpu/acquire, not a restart.
         """
         state = self._make_state(tmp_path, model_name="mistral", mode="local")
 
@@ -3180,6 +3309,18 @@ class TestBaseSwapStep3ResumeReload:
             f"Expected reload_deferred gate on VRAM defer; got {statuses}"
         )
 
+        deferred_gate = next(g for g in gates if g.get("status") == "reload_deferred")
+        assert deferred_gate.get("restart_required_reason") is None, (
+            f"a reload was attempted — restart_required_reason must be None, got {deferred_gate}"
+        )
+        message = deferred_gate.get("message", "")
+        assert "gpu/acquire" in message.lower(), (
+            f"attempted-and-failed deferral must point at /gpu/acquire; got {message!r}"
+        )
+        assert "restart the service" not in message.lower(), (
+            f"attempted-and-failed deferral must not tell the operator to restart; got {message!r}"
+        )
+
         # Marker must remain at phaseA_done.
         from paramem.server.trial_state import read_trial_marker as _rtm
 
@@ -3187,6 +3328,120 @@ class TestBaseSwapStep3ResumeReload:
         assert marker is not None, "Marker must remain on deferred reload"
         assert marker.base_swap_phase == "phaseA_done", (
             f"Marker must stay at phaseA_done on defer; got {marker.base_swap_phase!r}"
+        )
+
+    def test_fresh_start_never_attempted_deferral_directs_to_restart(self, tmp_path, monkeypatch):
+        """Fresh start where the apply was never attempted (e.g. a consolidation
+        cycle was in flight): config A is still in memory, so a plain
+        /gpu/acquire would just reload the OLD model and repeat the same
+        deferral — the gate message must direct the operator to restart
+        instead, and record the carve/abort reason
+        (``restart_required_reason``).
+        """
+        state = self._make_state(tmp_path, model_name="mistral", mode="local")
+
+        apply_called, submit_calls, gates, state_dir = self._run_orchestration(
+            state,
+            monkeypatch,
+            tmp_path,
+            resume_phase="",
+            apply_config_live_return_override={
+                "applied_live": False,
+                "cloud_only_reason": None,
+                "restart_required_reason": "consolidating",
+                "restart_eligible": False,
+                "skipped": None,
+            },
+        )
+
+        assert apply_called, "reload (gpu_acquire) must be called on fresh start"
+        assert "phase_b_submit" not in submit_calls, (
+            f"Phase B must NOT run when the apply was never attempted; got {submit_calls}"
+        )
+
+        statuses = [g.get("status") for g in gates]
+        assert "reload_deferred" in statuses, (
+            f"Expected reload_deferred gate when the apply was never attempted; got {statuses}"
+        )
+
+        deferred_gate = next(g for g in gates if g.get("status") == "reload_deferred")
+        assert deferred_gate.get("restart_required_reason") == "consolidating", (
+            f"the carve/abort reason must be recorded in the gate; got {deferred_gate}"
+        )
+        # cloud_only_reason is reserved for a genuine cloud-only cause; a
+        # reload that was never attempted must NOT synthesize one from the
+        # carve/abort reason — restart_required_reason already carries it.
+        assert deferred_gate.get("cloud_only_reason") is None, (
+            f"cloud_only_reason must stay None when the apply was never attempted "
+            f"(restart_required_reason already names the cause); got {deferred_gate}"
+        )
+        message = deferred_gate.get("message", "")
+        assert "restart the service" in message.lower(), (
+            f"never-attempted deferral must direct the operator to restart; got {message!r}"
+        )
+        assert "gpu/acquire will not help" in message.lower(), (
+            f"never-attempted deferral must say /gpu/acquire will NOT help; got {message!r}"
+        )
+
+        from paramem.server.trial_state import read_trial_marker as _rtm
+
+        marker = _rtm(state_dir)
+        assert marker is not None, "Marker must remain on deferred reload"
+        assert marker.base_swap_phase == "phaseA_done", (
+            f"Marker must stay at phaseA_done on defer; got {marker.base_swap_phase!r}"
+        )
+
+    def test_fresh_start_mixed_port_carve_reload_failure_is_attempted_branch(
+        self, tmp_path, monkeypatch
+    ):
+        """A MIXED R-PORT delta falls through to the reload (rather than
+        short-circuiting before it) — so restart_required_reason=
+        "stt_port_change" can coexist with a genuine reload attempt that
+        then fails.  This must classify as the ATTEMPTED-and-failed
+        sub-case (config B is in memory; /gpu/acquire works), not the
+        never-attempted sub-case — restart_required_reason alone is not a
+        reliable "never attempted" signal.
+        """
+        state = self._make_state(tmp_path, model_name="mistral", mode="local")
+
+        apply_called, submit_calls, gates, state_dir = self._run_orchestration(
+            state,
+            monkeypatch,
+            tmp_path,
+            resume_phase="",
+            apply_config_live_return_override={
+                "applied_live": False,
+                "cloud_only_reason": "apply_failed",
+                "restart_required_reason": "stt_port_change",
+                "restart_eligible": False,
+                "skipped": None,
+            },
+        )
+
+        assert apply_called, "reload (gpu_acquire) must be called on fresh start"
+        assert "phase_b_submit" not in submit_calls, (
+            f"Phase B must NOT run when the reload failed; got {submit_calls}"
+        )
+
+        deferred_gate = next(g for g in gates if g.get("status") == "reload_deferred")
+        # restart_required_reason is still recorded (the carve is real),
+        # but the message and cloud_only_reason must reflect that a reload
+        # WAS attempted.
+        assert deferred_gate.get("restart_required_reason") == "stt_port_change", (
+            f"the carve is real and must still be recorded; got {deferred_gate}"
+        )
+        assert deferred_gate.get("cloud_only_reason") == "apply_failed", (
+            f"a reload was attempted and failed — cloud_only_reason must carry the "
+            f"failure reason, not be nulled as if never attempted; got {deferred_gate}"
+        )
+        message = deferred_gate.get("message", "")
+        assert "gpu/acquire" in message.lower(), (
+            f"attempted-and-failed deferral must point at /gpu/acquire even when a "
+            f"carve reason coexists; got {message!r}"
+        )
+        assert "restart the service" not in message.lower(), (
+            f"a mixed-carve reload attempt must not be misclassified as never "
+            f"attempted; got {message!r}"
         )
 
     def test_phase_a_done_resume_does_not_call_apply_when_model_resident(
@@ -3496,6 +3751,13 @@ class TestBaseSwapActiveFlag:
             """Simulate _apply_config_live with deferred reload: leave mode=cloud-only."""
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "insufficient_vram"
+            return {
+                "applied_live": False,
+                "cloud_only_reason": "insufficient_vram",
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
@@ -4030,6 +4292,13 @@ class TestPhaseBModelIdentityGuard:
             is_local = mode_after_reload == "local"
             state["cloud_only_reason"] = None if is_local else "insufficient_vram"
             state["config"].model_name = loaded_model_name
+            return {
+                "applied_live": is_local,
+                "cloud_only_reason": None if is_local else "insufficient_vram",
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
@@ -4265,6 +4534,13 @@ class TestPhaseBModelIdentityGuard:
             state["mode"] = "local"
             state["cloud_only_reason"] = None
             state["config"].model_name = "qwen3-4b"
+            return {
+                "applied_live": True,
+                "cloud_only_reason": None,
+                "restart_required_reason": None,
+                "restart_eligible": False,
+                "skipped": None,
+            }
 
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
