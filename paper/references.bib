@@ -5,70 +5,83 @@
 
 % ----- LoRA Foundations -----
 
-@article{hu2022lora,
-  title   = {{LoRA}: Low-Rank Adaptation of Large Language Models},
-  author  = {Hu, Edward J. and Shen, Yelong and Wallis, Phillip and Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Shean and Wang, Lu and Chen, Weizhu},
-  journal = {arXiv preprint arXiv:2106.09685},
-  year    = {2022}
+@inproceedings{hu2022lora,
+  title     = {{LoRA}: Low-Rank Adaptation of Large Language Models},
+  author    = {Hu, Edward J. and Shen, Yelong and Wallis, Phillip and Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Shean and Wang, Lu and Chen, Weizhu},
+  booktitle = {Proceedings of the International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  note      = {arXiv:2106.09685}
 }
 
 % ----- LoRA as Knowledge Memory -----
 
 @inproceedings{back2026understanding,
   title     = {Understanding {LoRA} as Knowledge Memory: An Empirical Analysis},
-  author    = {Back, Jaehun and Hsiao, Wei-Lin and Wu, Xiuyu and Li, Yilun and Park, Sungdong and Seo, Minjoon},
-  booktitle = {Proceedings of the International Conference on Learning Representations (ICLR)},
+  author    = {Back, Seungju and Lee, Dongwoo and Kang, Naun and Lee, Taehee and Hong, S. K. and Gwon, Youngjune and Ahn, Sungjin},
+  booktitle = {Proceedings of the International Conference on Machine Learning (ICML)},
   year      = {2026},
   note      = {arXiv:2603.01097}
 }
 
 @inproceedings{magister2024plum,
-  title     = {{PLUM}: Prompt Learning Using Memory},
-  author    = {Magister, Lucie Charlotte and Kazemnejad, Amirhossein and Schick, Timo and Peris, Charith},
-  booktitle = {Proceedings of the EMNLP L2M2 Workshop},
-  year      = {2024}
+  title     = {On the Way to {LLM} Personalization: Learning to Remember User Conversations},
+  author    = {Magister, Lucie Charlotte and Metcalf, Katherine and Zhang, Yizhe and {ter Hoeve}, Maartje},
+  booktitle = {Proceedings of the First Workshop on Large Language Model Memorization (L2M2)},
+  pages     = {61--77},
+  year      = {2025},
+  doi       = {10.18653/v1/2025.l2m2-1.5},
+  note      = {arXiv:2411.13405}
 }
 
-@article{su2025prag,
-  title   = {{PRAG}: Parametric Retrieval Augmented Generation},
-  author  = {Su, Weijia and Tan, Yichao and others},
-  journal = {arXiv preprint arXiv:2501.15915},
-  year    = {2025}
+@inproceedings{su2025prag,
+  title     = {Parametric Retrieval Augmented Generation},
+  author    = {Su, Weihang and Tang, Yichen and Ai, Qingyao and Yan, Junxi and Wang, Changyue and Wang, Hongning and Ye, Ziyi and Zhou, Yujia and Liu, Yiqun},
+  booktitle = {Proceedings of the International ACM SIGIR Conference on Research and Development in Information Retrieval (SIGIR)},
+  pages     = {1240--1250},
+  year      = {2025},
+  doi       = {10.1145/3726302.3729957},
+  note      = {arXiv:2501.15915}
 }
 
 @article{charakorn2026doctolora,
-  title   = {{Doc-to-LoRA}: Document Injection via Hypernetwork-Generated Adapters},
-  author  = {Charakorn, Rachapoom and others},
+  title   = {{Doc-to-LoRA}: Learning to Instantly Internalize Contexts},
+  author  = {Charakorn, Rujikorn and Cetin, Edoardo and Uesaka, Shinnosuke and Lange, Robert Tjarko},
   journal = {arXiv preprint arXiv:2602.15902},
   year    = {2026}
 }
 
 @inproceedings{singhal2025naacl,
-  title     = {How Much Knowledge Can You Pack into a {LoRA}?},
-  author    = {Singhal, Ayush and others},
-  booktitle = {Proceedings of the North American Chapter of the Association for Computational Linguistics (NAACL)},
-  year      = {2025}
+  title     = {How Much Knowledge Can You Pack into a {LoRA} Adapter without Harming {LLM}?},
+  author    = {Pletenev, Sergey and Marina, Maria and Moskovskiy, Daniil and Konovalov, Vasily and Braslavski, Pavel and Panchenko, Alexander and Salnikov, Mikhail},
+  booktitle = {Findings of the Association for Computational Linguistics: NAACL 2025},
+  pages     = {4309--4322},
+  year      = {2025},
+  doi       = {10.18653/v1/2025.findings-naacl.243},
+  note      = {arXiv:2502.14502}
 }
 
 % ----- Multi-Adapter Architectures -----
 
-@article{yang2024ilora,
-  title   = {{I-LoRA}: Multi-Adapter Memory via Mode Connectivity},
-  author  = {Yang, Haoran and others},
-  journal = {arXiv preprint},
-  year    = {2024}
+@inproceedings{yang2024ilora,
+  title     = {Analyzing and Reducing Catastrophic Forgetting in Parameter Efficient Tuning},
+  author    = {Li, Xinlong and Ren, Weijieying and Qin, Wei and Wang, Lei and Zhao, Tianxiang and Hong, Richang},
+  booktitle = {Proceedings of the IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  pages     = {1--5},
+  year      = {2025},
+  doi       = {10.1109/ICASSP49660.2025.10889361},
+  note      = {arXiv:2402.18865}
 }
 
 @article{wang2024duallora,
-  title   = {{DualLoRA}: Dual Low-Rank Adaptation for Continual Learning},
-  author  = {Wang, Jiancheng and others},
+  title   = {Replay-Free Continual Low-Rank Adaptation with Dynamic Memory},
+  author  = {Chen, Huancheng and Li, Jingtao and Zhuang, Weiming and Chen, Chen and Lyu, Lingjuan},
   journal = {arXiv preprint arXiv:2411.00623},
   year    = {2024}
 }
 
 @article{kim2025sure,
-  title   = {{SuRe}: Surprise-Driven Replay for Continual Learning with {LoRA}},
-  author  = {Kim, Sohyun and others},
+  title   = {{SuRe}: Surprise-Driven Prioritised Replay for Continual {LLM} Learning},
+  author  = {Hazard, Hugo and Fountas, Zafeirios and Benfeghoul, Martin A. and Oomerjee, Adnan and Wang, Jun and Bou-Ammar, Haitham},
   journal = {arXiv preprint arXiv:2511.22367},
   year    = {2025}
 }
@@ -76,25 +89,32 @@
 % ----- Episodic/Semantic Memory for LLMs -----
 
 @inproceedings{zhang2025prime,
-  title     = {{PRIME}: Cognitive Dual-Memory Personalization for {LLM}s},
-  author    = {Zhang, Yiwen and others},
-  booktitle = {Proceedings of the Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  title     = {{PRIME}: Large Language Model Personalization with Cognitive Dual-Memory and Personalized Thought Process},
+  author    = {Zhang, Xinliang Frederick and Beauchamp, Nicholas and Wang, Lu},
+  booktitle = {Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing},
+  pages     = {33707--33736},
   year      = {2025},
+  doi       = {10.18653/v1/2025.emnlp-main.1711},
   note      = {arXiv:2507.04607}
 }
 
-@article{yuan2026synapse,
-  title   = {{SYNAPSE}: Episodic-Semantic Memory via Spreading Activation in Knowledge Graphs},
-  author  = {Yuan, Xiao and others},
-  journal = {arXiv preprint arXiv:2601.02744},
-  year    = {2026}
+@inproceedings{yuan2026synapse,
+  title     = {Synapse: Empowering {LLM} Agents with Episodic-Semantic Memory via Spreading Activation},
+  author    = {Jiang, Hanqi and Chen, Junhao and Pan, Yi and Chen, Ling and You, Weihang and Zhou, Yifan and Zhang, Ruidong and Abate, Yohannes and Liu, Tianming},
+  booktitle = {Findings of the Association for Computational Linguistics: ACL 2026},
+  pages     = {22020--22036},
+  year      = {2026},
+  doi       = {10.18653/v1/2026.findings-acl.1108},
+  note      = {arXiv:2601.02744}
 }
 
 @inproceedings{anokhin2025arigraph,
   title     = {{AriGraph}: Learning Knowledge Graph World Models with Episodic Memory for {LLM} Agents},
-  author    = {Anokhin, Petr and others},
-  booktitle = {Proceedings of the International Joint Conference on Artificial Intelligence (IJCAI)},
+  author    = {Anokhin, Petr and Semenov, Nikita and Sorokin, Artyom and Evseev, Dmitry and Kravchenko, Andrey and Burtsev, Mikhail and Burnaev, Evgeny},
+  booktitle = {Proceedings of the Thirty-Fourth International Joint Conference on Artificial Intelligence (IJCAI)},
+  pages     = {12--20},
   year      = {2025},
+  doi       = {10.24963/ijcai.2025/2},
   note      = {arXiv:2407.04363}
 }
 
@@ -107,169 +127,176 @@
   volume  = {102},
   number  = {3},
   pages   = {419--457},
-  year    = {1995}
-}
-
-@article{park2025cls,
-  title   = {Complementary Learning Systems for Language Models},
-  author  = {Park, Sungdong and others},
-  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
-  year    = {2025}
+  year    = {1995},
+  doi     = {10.1037/0033-295X.102.3.419}
 }
 
 @inproceedings{das2024larimar,
   title     = {Larimar: Large Language Models with Episodic Memory Control},
-  author    = {Das, Payel and others},
-  booktitle = {Proceedings of the International Conference on Machine Learning (ICML)},
-  year      = {2024}
+  author    = {Das, Payel and Chaudhury, Subhajit and Nelson, Elliot and Melnyk, Igor and Swaminathan, Sarathkrishna and Dai, Sihui and Lozano, Aurelie and Kollias, Georgios and Chenthamarakshan, Vijil and Navratil, Jiri and Dan, Soham and Chen, Pin-Yu},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  volume    = {235},
+  pages     = {10109--10126},
+  publisher = {PMLR},
+  year      = {2024},
+  note      = {arXiv:2403.11901}
 }
 
-@article{schug2025hicl,
-  title   = {{HiCL}: Hierarchical Continual Learning with Complementary Memory Systems},
-  author  = {Schug, Simon and others},
-  journal = {arXiv preprint},
-  year    = {2025}
+@inproceedings{schug2025hicl,
+  title     = {{HiCL}: Hippocampal-Inspired Continual Learning},
+  author    = {Kapoor, Kushal and Mackey, Wyatt and Aloimonos, Yiannis and Lin, Xiaomin},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume    = {40},
+  pages     = {22518--22526},
+  year      = {2026},
+  doi       = {10.1609/aaai.v40i27.39411},
+  note      = {arXiv:2508.16651}
 }
 
 % ----- Continual Learning with LoRA -----
 
-@article{wang2023olora,
-  title   = {{O-LoRA}: Orthogonal Low-Rank Adaptation for Continual Learning},
-  author  = {Wang, Yizhong and others},
-  journal = {arXiv preprint},
-  year    = {2023}
+@inproceedings{wang2023olora,
+  title     = {Orthogonal Subspace Learning for Language Model Continual Learning},
+  author    = {Wang, Xiao and Chen, Tianze and Ge, Qiming and Xia, Han and Bao, Rong and Zheng, Rui and Zhang, Qi and Gui, Tao and Huang, Xuanjing},
+  booktitle = {Findings of the Association for Computational Linguistics: EMNLP 2023},
+  pages     = {10658--10671},
+  year      = {2023},
+  doi       = {10.18653/v1/2023.findings-emnlp.715},
+  note      = {arXiv:2310.14152}
 }
 
-@article{liang2024inflora,
-  title   = {{InfLoRA}: Interference-Free Low-Rank Adaptation for Continual Learning},
-  author  = {Liang, Haiwen and others},
-  journal = {arXiv preprint},
-  year    = {2024}
-}
-
-@article{zhang2025pam,
-  title   = {{PAM}: Parameter-Adaptive Memory for Continual Learning},
-  author  = {Zhang, Yiwen and others},
-  journal = {arXiv preprint},
-  year    = {2025}
+@inproceedings{liang2024inflora,
+  title     = {{InfLoRA}: Interference-Free Low-Rank Adaptation for Continual Learning},
+  author    = {Liang, Yan-Shuo and Li, Wu-Jun},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  pages     = {23638--23647},
+  year      = {2024},
+  doi       = {10.1109/CVPR52733.2024.02231},
+  note      = {arXiv:2404.00228}
 }
 
 @inproceedings{xia2025elder,
-  title     = {{ELDER}: Experience-Driven Low-Rank Episodic Replay for Continual Learning},
-  author    = {Xia, Mengqi and others},
+  title     = {{ELDER}: Enhancing Lifelong Model Editing with Mixture-of-{LoRA}},
+  author    = {Li, Jiaang and Wang, Quan and Wang, Zhongnan and Zhang, Yongdong and Mao, Zhendong},
   booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
-  year      = {2025}
+  volume    = {39},
+  pages     = {24440--24448},
+  year      = {2025},
+  doi       = {10.1609/aaai.v39i23.34622},
+  note      = {arXiv:2408.11869}
 }
 
 % ----- Per-User Personalization -----
 
 @inproceedings{tan2024oppu,
-  title     = {{OPPU}: One {PEFT} Per User},
-  author    = {Tan, Yichao and others},
-  booktitle = {Proceedings of the Conference on Empirical Methods in Natural Language Processing (EMNLP)},
-  year      = {2024}
+  title     = {Democratizing Large Language Models via Personalized Parameter-Efficient Fine-tuning},
+  author    = {Tan, Zhaoxuan and Zeng, Qingkai and Tian, Yijun and Liu, Zheyuan and Yin, Bing and Jiang, Meng},
+  booktitle = {Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing},
+  pages     = {6476--6491},
+  year      = {2024},
+  doi       = {10.18653/v1/2024.emnlp-main.372},
+  note      = {arXiv:2402.04401}
 }
 
 % ----- Theoretical Foundations -----
 
-@article{tay2022dsi,
-  title   = {Transformer Memory as a Differentiable Search Index},
-  author  = {Tay, Yi and Tran, Vinh Q. and Dehghani, Mostafa and Ni, Jianmo and Bahri, Dara and Mehta, Harsh and Qin, Zhen and Hui, Kai and Zhao, Zhe and Gupta, Jai and Schuster, Tal and Cohen, William W. and Metzler, Donald},
-  journal = {Advances in Neural Information Processing Systems (NeurIPS)},
-  year    = {2022}
+@inproceedings{tay2022dsi,
+  title     = {Transformer Memory as a Differentiable Search Index},
+  author    = {Tay, Yi and Tran, Vinh Q. and Dehghani, Mostafa and Ni, Jianmo and Bahri, Dara and Mehta, Harsh and Qin, Zhen and Hui, Kai and Zhao, Zhe and Gupta, Jai and Schuster, Tal and Cohen, William W. and Metzler, Donald},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {35},
+  pages     = {21831--21843},
+  publisher = {Curran Associates, Inc.},
+  year      = {2022},
+  note      = {arXiv:2202.06991}
 }
 
-@article{geva2020ffn,
-  title   = {Transformer Feed-Forward Layers Are Key-Value Memories},
-  author  = {Geva, Mor and Schuster, Roei and Berant, Jonathan and Levy, Omer},
-  journal = {arXiv preprint arXiv:2012.14913},
-  year    = {2020}
+@inproceedings{geva2020ffn,
+  title     = {Transformer Feed-Forward Layers Are Key-Value Memories},
+  author    = {Geva, Mor and Schuster, Roei and Berant, Jonathan and Levy, Omer},
+  booktitle = {Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing},
+  pages     = {5484--5495},
+  year      = {2021},
+  doi       = {10.18653/v1/2021.emnlp-main.446},
+  note      = {arXiv:2012.14913}
 }
 
-@article{allen2024factual,
-  title   = {Understanding Factual Recall in Transformers via Associative Memories},
-  author  = {Allen-Zhu, Zeyuan and Li, Yuanzhi},
-  journal = {arXiv preprint},
-  year    = {2024}
+@inproceedings{allen2024factual,
+  title     = {Understanding Factual Recall in Transformers via Associative Memories},
+  author    = {Nichani, Eshaan and Lee, Jason D. and Bietti, Alberto},
+  booktitle = {Proceedings of the International Conference on Learning Representations (ICLR)},
+  year      = {2025},
+  note      = {arXiv:2412.06538}
 }
 
 @inproceedings{charikar2002simhash,
   title     = {Similarity Estimation Techniques from Rounding Algorithms},
   author    = {Charikar, Moses S.},
-  booktitle = {Proceedings of the Annual ACM Symposium on Theory of Computing (STOC)},
+  booktitle = {Proceedings of the 34th Annual ACM Symposium on Theory of Computing (STOC)},
   pages     = {380--388},
-  year      = {2002}
+  year      = {2002},
+  doi       = {10.1145/509907.509965}
 }
 
 % ----- Forgetting and Replay -----
 
 @article{biderman2024lora,
   title   = {{LoRA} Learns Less and Forgets Less},
-  author  = {Biderman, Dan and Ortiz, Jose Gonzalez and Portes, Jacob and Paul, Mansheej and Greengard, Philip and Gould, Connor and Aky{\"u}rek, Esin},
-  journal = {Transactions on Machine Learning Research (TMLR)},
-  year    = {2024}
-}
-
-@article{zhang2024continual,
-  title   = {Continual Memorization of Factoids in Large Language Models},
-  author  = {Zhang, Howard and others},
-  journal = {arXiv preprint},
-  year    = {2024}
-}
-
-@article{liu2026forever,
-  title   = {{FOREVER}: Forgetting-Curve-Driven Replay for Continual Learning},
-  author  = {Liu, Xiao and others},
-  journal = {arXiv preprint},
-  year    = {2026}
-}
-
-@article{wu2026mssr,
-  title   = {{MSSR}: Memory-Aware Sample-Specific Replay for Continual Learning},
-  author  = {Wu, Yiming and others},
-  journal = {arXiv preprint},
-  year    = {2026}
+  author  = {Biderman, Dan and Portes, Jacob and Gonzalez Ortiz, Jose Javier and Paul, Mansheej and Greengard, Philip and Jennings, Connor and King, Daniel and Havens, Sam and Chiley, Vitaliy and Frankle, Jonathan and Blakeney, Cody and Cunningham, John P.},
+  journal = {Transactions on Machine Learning Research},
+  year    = {2024},
+  note    = {arXiv:2405.09673}
 }
 
 % ----- Gated / Parametric Memory Systems -----
 
 @article{ren2025mega,
-  title   = {{MEGa}: Memorization and Knowledge Injection in Gated {LLM} Memories},
-  author  = {Ren, Jinhao and others},
+  title   = {Memorization and Knowledge Injection in Gated {LLM}s},
+  author  = {Pan, Xu and Hahami, Ely and Zhang, Zechen and Sompolinsky, Haim},
   journal = {arXiv preprint arXiv:2504.21239},
   year    = {2025}
 }
 
-@article{wang2024memoryllm,
-  title   = {{MemoryLLM}: Towards Self-Updatable Large Language Models},
-  author  = {Wang, Yu and others},
-  journal = {arXiv preprint},
-  year    = {2024}
+@inproceedings{wang2024memoryllm,
+  title     = {{MEMORYLLM}: Towards Self-Updatable Large Language Models},
+  author    = {Wang, Yu and Gao, Yifan and Chen, Xiusi and Jiang, Haoming and Li, Shiyang and Yang, Jingfeng and Yin, Qingyu and Li, Zheng and Li, Xian and Yin, Bing and Shang, Jingbo and McAuley, Julian},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  volume    = {235},
+  pages     = {50453--50466},
+  publisher = {PMLR},
+  year      = {2024},
+  note      = {arXiv:2402.04624}
 }
 
-@article{wang2025mplus,
-  title   = {{M+}: Extending {MemoryLLM} with Scalable Long-Term Memory},
-  author  = {Wang, Yu and others},
-  journal = {arXiv preprint},
-  year    = {2025}
+@inproceedings{wang2025mplus,
+  title     = {{M+}: Extending {MemoryLLM} with Scalable Long-Term Memory},
+  author    = {Wang, Yu and Krotov, Dmitry and Hu, Yuanzhe and Gao, Yifan and Zhou, Wangchunshu and McAuley, Julian and Gutfreund, Dan and Feris, Rogerio and He, Zexue},
+  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
+  volume    = {267},
+  pages     = {63308--63323},
+  publisher = {PMLR},
+  year      = {2025},
+  note      = {arXiv:2502.00592}
 }
 
 % ----- Memory Operating Systems -----
 
 @article{gao2025memos,
-  title   = {{MemOS}: An Operating System for Memory in {LLM} Agents},
-  author  = {Gao, Ziqiang and others},
-  journal = {arXiv preprint},
+  title   = {{MemOS}: A Memory {OS} for {AI} System},
+  author  = {Li, Zhiyu and Xi, Chenyang and Li, Chunyu and Chen, Ding and Chen, Boyu and Song, Shichao and Niu, Simin and Wang, Hanyu and Yang, Jiawei and Tang, Chen and Yu, Qingchen and Zhao, Jihao and Wang, Yezhaohui and Liu, Peng and Lin, Zehao and Wang, Pengyuan and Huo, Jiahao and Chen, Tianyi and Chen, Kai and Li, Kehang and Tao, Zhen and Lai, Huayi and Wu, Hao and Tang, Bo and Wang, Zhengren and Fan, Zhaoxin and Zhang, Ningyu and Zhang, Linfeng and Yan, Junchi and Yang, Mingchuan and Xu, Tong and Xu, Wei and Chen, Huajun and Wang, Haofen and Yang, Hongkang and Zhang, Wentao and Xu, Zhi-Qin John and Chen, Siheng and Xiong, Feiyu},
+  journal = {arXiv preprint arXiv:2507.03724},
   year    = {2025}
 }
 
 % ----- Datasets -----
 
-@article{du2024perltqa,
-  title   = {{PerLTQA}: A Personal Long-Term Memory Dataset for Memory Classification, Retrieval, and Synthesis in Question Answering},
-  author  = {Du, Yiming and others},
-  journal = {arXiv preprint arXiv:2402.16288},
-  year    = {2024}
+@inproceedings{du2024perltqa,
+  title     = {{PerLTQA}: A Personal Long-Term Memory Dataset for Memory Classification, Retrieval, and Fusion in Question Answering},
+  author    = {Du, Yiming and Wang, Hongru and Zhao, Zhengyi and Liang, Bin and Wang, Baojun and Zhong, Wanjun and Wang, Zezhong and Wong, Kam-Fai},
+  booktitle = {Proceedings of the 10th SIGHAN Workshop on Chinese Language Processing (SIGHAN-10)},
+  pages     = {152--164},
+  year      = {2024},
+  note      = {arXiv:2402.16288}
 }
 
 % ----- LoRA Composition / Interference -----
@@ -277,8 +304,11 @@
 @inproceedings{zhang2025unraveling,
   title     = {Unraveling {LoRA} Interference: Orthogonal Subspaces for Robust Model Merging},
   author    = {Zhang, Haobo and Zhou, Jiayu},
-  booktitle = {Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (ACL)},
-  year      = {2025}
+  booktitle = {Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  pages     = {26459--26472},
+  year      = {2025},
+  doi       = {10.18653/v1/2025.acl-long.1284},
+  note      = {arXiv:2505.22934}
 }
 
 % ----- Knowledge Editing -----
@@ -286,15 +316,18 @@
 @inproceedings{meng2022rome,
   title     = {Locating and Editing Factual Associations in {GPT}},
   author    = {Meng, Kevin and Bau, David and Andonian, Alex and Belinkov, Yonatan},
-  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
-  year      = {2022}
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {35},
+  pages     = {17359--17372},
+  publisher = {Curran Associates, Inc.},
+  year      = {2022},
+  note      = {arXiv:2202.05262}
 }
 
-% ----- Hallucination Detection -----
-
-@article{farquhar2024semantic,
-  title   = {Detecting Hallucinations in Large Language Models Using Semantic Entropy},
-  author  = {Farquhar, Sebastian and Kossen, Jannik and Kuhn, Lorenz and Gal, Yarin},
-  journal = {Nature},
-  year    = {2024}
+@inproceedings{meng2023memit,
+  title     = {Mass-Editing Memory in a Transformer},
+  author    = {Meng, Kevin and Sen Sharma, Arnab and Andonian, Alex and Belinkov, Yonatan and Bau, David},
+  booktitle = {Proceedings of the International Conference on Learning Representations (ICLR)},
+  year      = {2023},
+  note      = {arXiv:2210.07229}
 }
