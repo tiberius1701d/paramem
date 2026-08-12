@@ -2575,7 +2575,6 @@ async def lifespan(app: FastAPI):
     _recovery_ok = _recovery_available()
     assert_startup_posture(
         require_encryption=config.security.require_encryption,
-        daily_loadable=_daily_ok,
     )
     # Boot-time reconciliation: a crash mid-checkpoint-save leaves plaintext
     # files inside a partial checkpoint-*/ dir while durable stores are
@@ -3266,7 +3265,10 @@ async def lifespan(app: FastAPI):
     store = _state.get("speaker_store")
     if store:
         _t = time.perf_counter()
-        store.flush()
+        try:
+            store.flush()
+        except Exception:
+            logger.exception("Failed to flush speaker store during shutdown")
         logger.info("shutdown timing: store.flush %.2fs", time.perf_counter() - _t)
 
     if _state.get("reclaim_task"):

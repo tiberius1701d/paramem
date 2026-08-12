@@ -316,9 +316,11 @@ class FatalConfigError(BackupError):
     """A fatal configuration problem was detected.
 
     Raised by ``security_posture.assert_startup_posture()`` when
-    ``security.require_encryption=true`` is set but no key is loadable,
-    and by ``encryption.assert_mode_consistency()`` on key × on-disk format
-    mismatches.  The server refuses to start.
+    ``security.require_encryption=true`` is set but the daily identity is
+    unusable — either not loadable (missing file / unset passphrase env
+    var) or loadable but not unwrappable (wrong passphrase, corrupt or
+    tampered envelope) — and by ``encryption.assert_mode_consistency()`` on
+    key × on-disk format mismatches.  The server refuses to start.
     """
 
 

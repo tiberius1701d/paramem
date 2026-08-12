@@ -108,30 +108,30 @@ class TestEncryptCheckpointCallbackOnSave:
         assert (ckpt1 / "adapter_model.safetensors").read_bytes() == b"weights-1"
         assert not is_age_envelope(ckpt1 / "adapter_model.safetensors")
 
-    def test_on_save_tolerates_encrypt_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd, caplog
+    def test_on_save_propagates_encrypt_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An encryption exception is logged but does not propagate.
+        """A shard-encryption exception propagates out of on_save rather than
+        being logged and swallowed.
 
-        Checks both ``capfd.err`` and ``caplog.records`` — pytest's log-capture
-        routing differs between local and CI environments; the error message
-        lands in one stream or the other, never neither.
+        Leaving plaintext checkpoint shards on disk under Security ON is not
+        a recoverable condition — ``on_save`` no longer wraps
+        ``encrypt_checkpoint_dir`` in a try/except, so the failure must reach
+        the caller (HF Trainer's callback dispatch) instead of being silently
+        tolerated.
         """
-        import logging
-
         _seed_two_checkpoints(tmp_path)
         args = SimpleNamespace(output_dir=str(tmp_path), load_best_model_at_end=False)
-        caplog.set_level(logging.ERROR)
 
         _setup_daily_identity(tmp_path, monkeypatch)
-        with patch(
-            "paramem.backup.checkpoint_shard.encrypt_checkpoint_dir",
-            side_effect=OSError("disk full"),
+        with (
+            patch(
+                "paramem.backup.checkpoint_shard.encrypt_checkpoint_dir",
+                side_effect=OSError("disk full"),
+            ),
+            pytest.raises(OSError, match="disk full"),
         ):
             EncryptCheckpointCallback().on_save(args, state=None, control=None)
-
-        log_text = capfd.readouterr().err + "\n".join(r.getMessage() for r in caplog.records)
-        assert "Failed to encrypt checkpoint files" in log_text
 
     def test_on_save_ignores_non_checkpoint_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

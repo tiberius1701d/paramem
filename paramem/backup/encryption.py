@@ -9,11 +9,13 @@ Single on-disk envelope format:
 
 Services provided:
 
-- Uniform AUTO semantics: :func:`envelope_encrypt_bytes` encrypts when
-  the daily identity is loadable and returns plaintext otherwise; no
-  per-artifact policy knob exists. Operators opt into a fail-loud
-  posture via the single uniform ``security.require_encryption`` flag
-  enforced at server startup by
+- Uniform AUTO semantics: :func:`envelope_encrypt_bytes` encrypts when a
+  daily identity is available, returns plaintext when no key is
+  configured at all, and raises when a configured key cannot be
+  unwrapped — an unwrap failure can never silently fall back to
+  plaintext. No per-artifact policy knob exists. Operators opt into a
+  fail-loud posture at boot via the single uniform
+  ``security.require_encryption`` flag enforced at server startup by
   :func:`paramem.server.security_posture.assert_startup_posture`.
 - Mode-mismatch startup refuse (:func:`assert_mode_consistency`):
   classifies infrastructure files as age / plaintext and refuses any
@@ -31,6 +33,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pyrage
 
 from paramem.backup.age_envelope import (
     AGE_MAGIC,
@@ -140,30 +144,47 @@ def envelope_encrypt_bytes(plaintext: bytes) -> bytes:
     Priority (highest first):
 
     1. **age multi-recipient** ``[daily, recovery]`` — when the daily
-       identity is loadable AND ``recovery.pub`` is on disk.
-    2. **age single-recipient** ``[daily]`` — daily loadable but
+       identity is available AND ``recovery.pub`` is on disk.
+    2. **age single-recipient** ``[daily]`` — daily available but
        ``recovery.pub`` missing. Degraded mode; the startup log warns.
-    3. **Plaintext** — no key material loaded; caller should gate on this
-       case explicitly if they require encryption.
+    3. **Plaintext** — no key material configured at all; caller should
+       gate on this case explicitly if they require encryption.
 
-    Always returns a magic-prefixed age envelope when encryption happens,
-    or raw plaintext bytes when no key is loaded. Used by both
-    :func:`write_infra_bytes` (writes to disk) and the backup subsystem
-    (holds the bytes in hand for sidecar construction).
+    New contract: no key configured → plaintext, unchanged AUTO opt-out.
+    A key that IS configured but cannot be unwrapped (wrong passphrase,
+    corrupt or tampered envelope, key file vanished after the
+    availability check) raises instead of degrading to plaintext — an
+    unwrap failure can never silently produce a plaintext write.
+
+    Always returns a magic-prefixed age envelope when encryption
+    happens, or raw plaintext bytes when no key is configured. Used by
+    both :func:`write_infra_bytes` (writes to disk) and the backup
+    subsystem (holds the bytes in hand for sidecar construction).
+
+    Raises
+    ------
+    RuntimeError
+        A daily identity is configured (:func:`paramem.backup.key_store.daily_identity_available`
+        is True) but could not be unwrapped.
     """
     from paramem.backup import key_store as _ks
 
-    if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-        try:
-            daily = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
-        except Exception:  # noqa: BLE001 — graceful fallback on any unwrap failure
-            daily = None
-        if daily is not None:
-            recipients = [daily.to_public()]
-            if _ks.recovery_pub_available(_ks.RECOVERY_PUB_PATH_DEFAULT):
-                recipients.append(_ks.load_recovery_recipient(_ks.RECOVERY_PUB_PATH_DEFAULT))
-            return age_encrypt_bytes(plaintext, recipients)
-    return plaintext
+    if not _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT):
+        return plaintext
+    try:
+        daily = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
+    except (RuntimeError, pyrage.DecryptError, OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"a daily encryption key is configured but could not be unwrapped: "
+            f"{exc}. Refusing to write plaintext. Confirm "
+            f"{_ks.DAILY_PASSPHRASE_ENV_VAR} matches the passphrase used to "
+            f"create {_ks.DAILY_KEY_PATH_DEFAULT} and that the file is not "
+            f"corrupt or tampered with."
+        ) from exc
+    recipients = [daily.to_public()]
+    if _ks.recovery_pub_available(_ks.RECOVERY_PUB_PATH_DEFAULT):
+        recipients.append(_ks.load_recovery_recipient(_ks.RECOVERY_PUB_PATH_DEFAULT))
+    return age_encrypt_bytes(plaintext, recipients)
 
 
 def envelope_decrypt_bytes(raw: bytes) -> bytes:
@@ -200,11 +221,11 @@ def envelope_decrypt_bytes(raw: bytes) -> bytes:
 
 
 def write_infra_bytes(path: Path, plaintext: bytes) -> None:
-    """Atomically write *plaintext* to *path*, encrypting when a key is loaded.
+    """Atomically write *plaintext* to *path*, encrypting when a key is configured.
 
     Delegates format selection to :func:`envelope_encrypt_bytes` — age
     multi-recipient when ``recovery.pub`` is present, age single-recipient
-    otherwise, plaintext when no key is loaded. The universal reader
+    otherwise, plaintext when no key is configured. The universal reader
     :func:`read_maybe_encrypted` unwraps either shape.
 
     Parameters
@@ -218,6 +239,10 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     ------
     OSError
         On any filesystem error.
+    RuntimeError
+        A daily identity is configured but could not be unwrapped (see
+        :func:`envelope_encrypt_bytes`) — no plaintext is written in this
+        case.
     """
     _atomic_write_bytes(Path(path), envelope_encrypt_bytes(plaintext))
 
@@ -227,9 +252,10 @@ def write_infra_json(path: Path, data: dict | list) -> None:
 
     The one chokepoint for JSON-shaped infrastructure files, so every one of
     them respects the operator's ``security.require_encryption`` posture
-    identically — age-encrypted when a daily identity is loaded, plaintext
-    otherwise.  Creates the parent directory (:func:`write_infra_bytes`
-    requires it to already exist) and serializes *data* with
+    identically — age-encrypted when a daily identity is configured,
+    plaintext when none is, and raising rather than degrading when a
+    configured identity cannot be unwrapped.  Creates the parent directory
+    (:func:`write_infra_bytes` requires it to already exist) and serializes *data* with
     ``json.dumps(..., indent=2)`` before handing the bytes off.  Inspection
     output is not written here: that is an artifact, and goes through
     :func:`paramem.utils.artifacts.write_artifact`.

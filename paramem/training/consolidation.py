@@ -5350,7 +5350,7 @@ class ConsolidationLoop:
                                             else _ckpt_path
                                         )
                                         _ckpt_shm_dir = None
-                                        if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+                                        if _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT):
                                             from paramem.backup.checkpoint_shard import (
                                                 materialize_checkpoint_to_shm,
                                             )
@@ -5398,10 +5398,10 @@ class ConsolidationLoop:
                                         # content-sniffing decrypt boundary the boot mount
                                         # (app.py's ``_load_one``) and the donor build use —
                                         # rather than gating on
-                                        # ``daily_identity_loadable`` (which only says
+                                        # ``daily_identity_available`` (which only says
                                         # whether THIS process can decrypt an age envelope,
                                         # not whether the slot on disk actually is one; an
-                                        # unloadable identity on an encrypted slot would
+                                        # unavailable identity on an encrypted slot would
                                         # otherwise hand ciphertext straight to
                                         # ``model.load_adapter``). This mirrors the checkpoint
                                         # arm above only in shape — that arm decrypts a

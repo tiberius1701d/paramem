@@ -7,7 +7,10 @@ is loadable, plaintext otherwise. Operators opt into fail-loud via
 
 Tests verify:
 - ``require_encryption=False`` is a no-op regardless of key state.
-- ``require_encryption=True`` with the daily identity loadable does not raise.
+- ``require_encryption=True`` with the daily identity loadable AND unwrappable
+  does not raise. Loadable (file present, passphrase env var set) is
+  necessary but not sufficient — a loadable key with the wrong passphrase
+  still raises.
 - ``require_encryption=True`` without the daily identity raises FatalConfigError.
 - The lifespan source calls ``assert_startup_posture``.
 """
@@ -15,11 +18,34 @@ Tests verify:
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
 
+from paramem.backup.key_store import (
+    DAILY_PASSPHRASE_ENV_VAR,
+    mint_daily_identity,
+    wrap_daily_identity,
+    write_daily_key_file,
+)
 from paramem.backup.types import FatalConfigError
 from paramem.server.security_posture import assert_startup_posture
+
+
+def _setup_daily(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: str = "pw"):
+    """Mint + wrap + write a daily identity; point the env + module default at it.
+
+    Mirrors ``tests/backup/test_encryption_primitives.py::_setup_daily`` — the
+    identity is real, so a call to ``load_daily_identity_cached`` actually
+    unwraps rather than merely satisfying the precondition probe.
+    """
+    ident = mint_daily_identity()
+    key_path = tmp_path / "daily_key.age"
+    write_daily_key_file(wrap_daily_identity(ident, passphrase), key_path)
+    monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, passphrase)
+    monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+    return ident
+
 
 # ---------------------------------------------------------------------------
 # assert_startup_posture unit tests
@@ -34,14 +60,45 @@ class TestAssertStartupPosture:
         # Must not raise even though no key is loadable.
         assert_startup_posture(
             require_encryption=False,
-            daily_loadable=False,
         )
 
-    def test_require_encryption_true_with_daily_ok(self) -> None:
-        """require_encryption=True + daily_loadable=True → no exception."""
+    def test_require_encryption_true_with_daily_ok(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """require_encryption=True + a real, correctly-passphrased daily
+        identity → no exception.
+
+        ``assert_startup_posture`` derives its own precondition probe against
+        the (monkeypatched) daily key path and performs a real scrypt unwrap
+        via ``load_daily_identity_cached`` once that probe passes.
+        """
+        _setup_daily(tmp_path, monkeypatch)
+
         assert_startup_posture(
             require_encryption=True,
-            daily_loadable=True,
+        )
+
+    def test_require_encryption_true_wrong_passphrase_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """require_encryption=True + key present but wrong passphrase → FatalConfigError.
+
+        Distinct failure mode from "not loadable": the precondition probe
+        passes (env var set, file exists) but the real unwrap performed by
+        ``assert_startup_posture`` fails — this must raise with a message
+        that names the unwrap failure, not the missing-preconditions message.
+        """
+        _setup_daily(tmp_path, monkeypatch, passphrase="correct-horse")
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "wrong-passphrase")
+
+        with pytest.raises(FatalConfigError) as exc_info:
+            assert_startup_posture(
+                require_encryption=True,
+            )
+        message = str(exc_info.value)
+        assert "could not be unwrapped" in message, (
+            f"FatalConfigError must distinguish an unwrap failure from a "
+            f"missing-preconditions failure: {message!r}"
         )
 
     def test_require_encryption_true_daily_not_loadable_raises(self) -> None:
@@ -55,7 +112,6 @@ class TestAssertStartupPosture:
         with pytest.raises(FatalConfigError) as exc_info:
             assert_startup_posture(
                 require_encryption=True,
-                daily_loadable=False,
             )
         message = str(exc_info.value)
         assert "require_encryption" in message, (

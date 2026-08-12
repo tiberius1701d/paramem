@@ -4,7 +4,7 @@ All tests are unit/TestClient level: no model load, no GPU, no live push relay.
 
 Covers:
   - PushSubscriptionStore: encrypted-on-disk, per-speaker scoping, endpoint
-    dedupe, TOCTOU guard (mirrors test_user_tokens.py).
+    dedupe.
   - VAPID: ensure_vapid_keypair idempotency, application_server_key stability,
     file registered in infra_paths().
   - Endpoints: /push/vapid-public-key and /push/subscribe behaviour (auth,
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -212,7 +211,46 @@ class TestRemove:
 
 
 # ---------------------------------------------------------------------------
-# On-disk security: age envelope + TOCTOU guard
+# RAM/disk consistency on a failing _save
+# ---------------------------------------------------------------------------
+
+
+class TestSaveFailureLeavesRamConsistent:
+    def test_add_raises_leaves_subscriptions_unchanged(self, tmp_path, monkeypatch, store_path):
+        """A _save() that raises must not leave the new subscription in RAM —
+        the in-memory store stays in sync with what actually landed on disk."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = PushSubscriptionStore(store_path)
+        monkeypatch.setattr(
+            store, "_save", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            store.add("speaker0", _make_subscription())
+
+        assert store._subscriptions == {}
+        assert store.list("speaker0") == []
+
+    def test_remove_raises_leaves_subscriptions_unchanged(self, tmp_path, monkeypatch, store_path):
+        """A _save() that raises during remove() must leave the removed
+        subscription still present in RAM, matching the unwritten disk state."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = PushSubscriptionStore(store_path)
+        sub = _make_subscription("https://push.example.com/kept")
+        store.add("speaker0", sub)
+
+        monkeypatch.setattr(
+            store, "_save", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            store.remove(sub["endpoint"])
+
+        assert store.list("speaker0") == [sub]
+
+
+# ---------------------------------------------------------------------------
+# On-disk security: age envelope format
 # ---------------------------------------------------------------------------
 
 
@@ -258,27 +296,6 @@ class TestOnDiskSecurity:
         subs = store2.list("speaker0")
         assert len(subs) == 1
         assert subs[0]["endpoint"] == sub["endpoint"]
-
-    def test_toctou_guard_fires_when_key_evicted_between_checks(
-        self, tmp_path, monkeypatch, store_path
-    ):
-        """TOCTOU guard raises RuntimeError when key eviction writes plaintext.
-
-        Simulates the race by patching write_infra_bytes to write raw plaintext
-        (as though encryption failed mid-write) while daily_identity_loadable
-        returns True at the pre-write check.
-        """
-        _setup_daily(tmp_path, monkeypatch)
-        store = PushSubscriptionStore(store_path)
-
-        # Patch write_infra_bytes to bypass encryption (simulate evicted key).
-        def _plaintext_write(path: Path, payload: bytes) -> None:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_bytes(payload)
-
-        with patch("paramem.backup.encryption.write_infra_bytes", side_effect=_plaintext_write):
-            with pytest.raises(RuntimeError, match="written in plaintext"):
-                store.add("speaker0", _make_subscription())
 
 
 # ---------------------------------------------------------------------------
@@ -736,33 +753,8 @@ class TestPushSubscribeEndpointValidation:
 
 
 # ---------------------------------------------------------------------------
-# TOCTOU guard clears in-memory state
+# send_ping transport
 # ---------------------------------------------------------------------------
-
-
-class TestToctouClearsMemory:
-    def test_toctou_guard_clears_in_memory_subscriptions(self, tmp_path, monkeypatch, store_path):
-        """When the TOCTOU guard fires, in-memory subscriptions are reset.
-
-        After the RuntimeError is raised, store.list() must reflect cleared
-        state — not the stale in-memory subscription that was added mid-race.
-        """
-        _setup_daily(tmp_path, monkeypatch)
-        store = PushSubscriptionStore(store_path)
-
-        def _plaintext_write(path: Path, payload: bytes) -> None:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_bytes(payload)
-
-        with patch("paramem.backup.encryption.write_infra_bytes", side_effect=_plaintext_write):
-            with pytest.raises(RuntimeError, match="written in plaintext"):
-                store.add("speaker0", _make_subscription())
-
-        # After the guard fires, in-memory state must be cleared.
-        assert store.list("speaker0") == [], (
-            "list() must return [] after TOCTOU guard clears in-memory state"
-        )
-        assert store.all() == {}, "all() must return {} after TOCTOU guard clears in-memory state"
 
 
 class TestSendPingConstruct:

@@ -115,6 +115,20 @@ class TestEnvelopeEncryptBytesHelper:
         result = envelope_encrypt_bytes(b"payload")
         assert result.startswith(AGE_MAGIC), f"expected age magic; got {result[:30]!r}"
 
+    def test_unwrap_failure_raises_instead_of_falling_back_to_plaintext(
+        self, tmp_path, monkeypatch
+    ):
+        """A key that IS configured (probe passes) but cannot be unwrapped
+        (wrong passphrase) raises RuntimeError — it must never silently
+        degrade to a plaintext write."""
+        _setup_daily(tmp_path, monkeypatch, passphrase="correct-horse")
+        # Preconditions still pass (file exists, env var set) but the value
+        # no longer matches — the unwrap itself fails.
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "wrong-passphrase")
+
+        with pytest.raises(RuntimeError, match="could not be unwrapped"):
+            envelope_encrypt_bytes(b"payload")
+
 
 # ---------------------------------------------------------------------------
 # envelope_decrypt_bytes — age path
@@ -204,6 +218,20 @@ class TestSecurityOffRoundtrip:
         target = tmp_path / "infra.json"
         write_infra_bytes(target, b"payload")
         assert target.exists()
+        assert not (tmp_path / "infra.json.tmp").exists()
+
+    def test_wrong_passphrase_raises_and_leaves_no_target_file(self, tmp_path, monkeypatch):
+        """A configured key that cannot be unwrapped raises out of
+        write_infra_bytes before anything reaches disk — no plaintext, no
+        partial ciphertext, and no target file at all."""
+        _setup_daily(tmp_path, monkeypatch, passphrase="correct-horse")
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "wrong-passphrase")
+
+        target = tmp_path / "infra.json"
+        with pytest.raises(RuntimeError, match="could not be unwrapped"):
+            write_infra_bytes(target, b"payload")
+
+        assert not target.exists()
         assert not (tmp_path / "infra.json.tmp").exists()
 
 
@@ -457,6 +485,42 @@ class TestBackupWriteUsesAgeEnvelope:
         meta = read_meta(slot_dir)
 
         assert meta.encrypted is True
+
+    def test_age_slot_artifact_bytes_are_age_envelope_and_sidecar_agrees(
+        self, tmp_path, monkeypatch
+    ):
+        """The sidecar's ``encrypted`` flag must match what actually landed on
+        disk — ``encrypted=True`` alone does not prove the artifact bytes are
+        ciphertext, so this checks the artifact file directly."""
+        from paramem.backup.age_envelope import AGE_MAGIC
+        from paramem.backup.backup import _artifact_filename
+        from paramem.backup.backup import write as backup_write
+        from paramem.backup.meta import read_meta
+        from paramem.backup.types import ArtifactKind
+        from paramem.server.config import ServerBackupsConfig
+
+        _setup_daily(tmp_path, monkeypatch)
+        recovery_path = tmp_path / "absent.pub"
+        monkeypatch.setattr("paramem.backup.key_store.RECOVERY_PUB_PATH_DEFAULT", recovery_path)
+
+        plaintext = b"model: mistral\n"
+        slot_dir = backup_write(
+            ArtifactKind.CONFIG,
+            plaintext,
+            meta_fields={"tier": "scheduled"},
+            backups_root=tmp_path,
+            backups_cfg=ServerBackupsConfig(),
+        )
+        meta = read_meta(slot_dir)
+        artifact_path = slot_dir / _artifact_filename(meta.kind, meta.timestamp, meta.encrypted)
+
+        assert meta.encrypted is True
+        artifact_bytes = artifact_path.read_bytes()
+        assert artifact_bytes.startswith(AGE_MAGIC), (
+            f"sidecar claims encrypted=True but artifact bytes lack the age magic: "
+            f"{artifact_bytes[:30]!r}"
+        )
+        assert artifact_bytes != plaintext
 
     def test_plaintext_slot_encrypted_is_false(self, tmp_path, monkeypatch):
         """No daily identity → plaintext slot with encrypted=False."""

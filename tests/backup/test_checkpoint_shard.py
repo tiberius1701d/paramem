@@ -110,6 +110,33 @@ class TestEncryptCheckpointDir:
             assert (ckpt / name).read_bytes() == body
             assert not is_age_envelope(ckpt / name)
 
+    def test_encrypt_still_encrypts_when_key_file_deleted_but_cache_populated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cache-first availability: once the daily identity is loaded into
+        the module cache, deleting the on-disk key file must not stop
+        ``encrypt_checkpoint_dir`` from encrypting — ``_security_on`` delegates
+        to ``daily_identity_available``, which is True whenever the cache is
+        populated regardless of on-disk state."""
+        _setup_daily_identity(tmp_path, monkeypatch)
+        key_path = tmp_path / "daily_key.age"
+
+        from paramem.backup.key_store import load_daily_identity_cached
+
+        load_daily_identity_cached(key_path)  # populate the cache
+
+        key_path.unlink()
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+
+        ckpt = tmp_path / "checkpoint-42"
+        contents = _seed_checkpoint(ckpt)
+
+        n = encrypt_checkpoint_dir(ckpt)
+
+        assert n == len(contents)
+        for name in contents:
+            assert is_age_envelope(ckpt / name), f"{name} should be age-wrapped"
+
     def test_encrypt_idempotent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Second call after full encryption encrypts nothing new."""
         _setup_daily_identity(tmp_path, monkeypatch)
@@ -361,7 +388,7 @@ class TestAgeEnvelopeCompatibility:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """encrypt_checkpoint_dir must activate when the daily identity is
-        loaded — verifies the gate is ``daily_identity_loadable``."""
+        loaded — verifies the gate is ``daily_identity_available``."""
         _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-4"
         _seed_checkpoint(ckpt)

@@ -3,9 +3,10 @@
 ``PushSubscriptionStore`` mirrors :class:`~paramem.server.user_tokens.UserTokenStore`
 in structure and encryption posture: subscriptions are keyed per speaker, written
 via :func:`~paramem.backup.encryption.write_infra_bytes` (age-encrypted when a
-daily key is loaded), and read via
-:func:`~paramem.backup.encryption.read_maybe_encrypted`.  A TOCTOU verify-after-write
-guard identical to the token store's guards against key-eviction races.
+daily key is configured), and read via
+:func:`~paramem.backup.encryption.read_maybe_encrypted`.  A configured key that
+cannot be unwrapped raises out of the write itself, identical to the token
+store's posture.
 
 On-disk schema (``push_subscriptions.json``):
 
@@ -40,8 +41,8 @@ Security properties
   ``user_tokens.json`` and ``vapid_keys.json``.
 - Mixed state (plaintext file while a daily key is loaded) is caught at
   startup by ``assert_mode_consistency`` via ``infra_paths()``.
-- A TOCTOU guard in :meth:`PushSubscriptionStore._save` additionally catches
-  key eviction between the pre-write loadability check and the write.
+- A configured key that cannot be unwrapped raises out of
+  :meth:`PushSubscriptionStore._save` rather than landing plaintext on disk.
 """
 
 from __future__ import annotations
@@ -141,7 +142,7 @@ class PushSubscriptionStore:
     store_path:
         Path to the JSON file on disk.  Parent directory is created on first
         write.  The file is envelope-encrypted when a daily age identity is
-        loadable (see :func:`~paramem.backup.encryption.write_infra_bytes`).
+        configured (see :func:`~paramem.backup.encryption.write_infra_bytes`).
     """
 
     def __init__(self, store_path: Path | str) -> None:
@@ -181,58 +182,42 @@ class PushSubscriptionStore:
             total,
         )
 
-    def _save(self) -> None:
-        """Atomically persist the subscription store to disk, encrypted when possible.
+    def _save(self, subscriptions: dict[str, list[dict]] | None = None) -> None:
+        """Atomically persist *subscriptions* to disk, encrypted when possible.
 
         Follows the deployment-wide AUTO encryption mode: writes plaintext when
-        no daily key is loaded (Security OFF), age-encrypted when a daily key is
-        loaded (Security ON).  Both states are valid; mixed state is caught at
-        startup by ``assert_mode_consistency``.
+        no daily key is configured (Security OFF), age-encrypted when one is
+        (Security ON).  Both states are valid; mixed state is caught at
+        startup by ``assert_mode_consistency``.  A configured key that cannot
+        be unwrapped raises out of ``write_infra_bytes`` rather than landing
+        plaintext subscription data on disk, so no post-write verification is
+        needed here.
 
-        In Security ON mode a TOCTOU guard verifies the written file is an age
-        envelope.  If the daily key was evicted between the pre-write check and
-        the write the file is removed and a ``RuntimeError`` is raised so no
-        plaintext subscription data silently lands on disk.
+        Callers that mutate ``self._subscriptions`` pass the staged mapping
+        explicitly and only assign it to ``self._subscriptions`` after this
+        call returns — so a raise here (or from ``write_infra_bytes``) leaves
+        in-memory state matching what is still on disk instead of running
+        ahead of it. Defaults to ``self._subscriptions`` for callers with
+        nothing staged (e.g. a future read-modify-nothing save).
 
         Caller must hold ``self._lock``.
 
         Raises
         ------
         RuntimeError
-            Only in Security ON mode: when the written file is not an age
-            envelope, indicating a key-eviction race.  The file is removed
-            before raising.
+            A daily key is configured but could not be unwrapped (see
+            :func:`paramem.backup.encryption.envelope_encrypt_bytes`).
         """
         from paramem.backup.encryption import write_infra_bytes
-        from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 
+        if subscriptions is None:
+            subscriptions = self._subscriptions
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
-            {"version": _STORE_VERSION, "subscriptions": self._subscriptions},
+            {"version": _STORE_VERSION, "subscriptions": subscriptions},
             indent=2,
         ).encode("utf-8")
-        key_was_loadable = daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
         write_infra_bytes(self.store_path, payload)
-        # TOCTOU guard: identical posture to UserTokenStore._save.
-        if key_was_loadable:
-            try:
-                on_disk = self.store_path.read_bytes()
-            except OSError:
-                on_disk = b""
-            if not on_disk.startswith(b"age-encryption.org"):
-                try:
-                    self.store_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                # Clear in-memory state so RAM does not stay out of sync with
-                # the now-deleted on-disk file.
-                self._subscriptions = {}
-                raise RuntimeError(
-                    "push subscription store written in plaintext — aborting. "
-                    "The daily encryption key was evicted between the pre-write "
-                    "check and the write.  File removed.  "
-                    "Re-set PARAMEM_DAILY_PASSPHRASE and retry."
-                )
 
     # ------------------------------------------------------------------
     # Public API
@@ -264,13 +249,13 @@ class PushSubscriptionStore:
             When the subscription fails endpoint or keys validation (see
             :func:`_validate_subscription`).
         RuntimeError
-            In Security ON mode only: if a key-eviction race causes the store
-            to be written in plaintext (see :meth:`_save`).
+            A daily key is configured but could not be unwrapped (see
+            :meth:`_save`).
         """
         _validate_subscription(subscription)
         endpoint = subscription.get("endpoint", "")
         with self._lock:
-            speaker_subs = self._subscriptions.setdefault(speaker_id, [])
+            speaker_subs = self._subscriptions.get(speaker_id, [])
             for existing in speaker_subs:
                 if existing.get("endpoint") == endpoint:
                     logger.debug(
@@ -279,8 +264,9 @@ class PushSubscriptionStore:
                         endpoint[:60],
                     )
                     return False
-            speaker_subs.append(subscription)
-            self._save()
+            staged = {**self._subscriptions, speaker_id: [*speaker_subs, subscription]}
+            self._save(staged)
+            self._subscriptions = staged
         logger.info(
             "Registered push subscription for speaker=%s endpoint=%s…",
             speaker_id,
@@ -334,19 +320,20 @@ class PushSubscriptionStore:
         Raises
         ------
         RuntimeError
-            In Security ON mode only: if a key-eviction race causes the store
-            to be written in plaintext (see :meth:`_save`).
+            A daily key is configured but could not be unwrapped (see
+            :meth:`_save`).
         """
         removed = 0
         with self._lock:
-            for speaker_id, subs in list(self._subscriptions.items()):
-                before = len(subs)
-                subs[:] = [s for s in subs if s.get("endpoint") != endpoint]
-                removed += before - len(subs)
-                if not subs:
-                    del self._subscriptions[speaker_id]
+            staged: dict[str, list[dict]] = {}
+            for speaker_id, subs in self._subscriptions.items():
+                kept = [s for s in subs if s.get("endpoint") != endpoint]
+                removed += len(subs) - len(kept)
+                if kept:
+                    staged[speaker_id] = kept
             if removed:
-                self._save()
+                self._save(staged)
+                self._subscriptions = staged
         if removed:
             logger.info("Pruned %d subscription(s) for endpoint=%s…", removed, endpoint[:60])
         return removed

@@ -30,14 +30,26 @@ def _make_buffer_with_turn(session_dir: Path) -> SessionBuffer:
 
 
 def _enable_snapshots(monkeypatch) -> None:
-    """Patch key_store so daily_identity_loadable → True."""
+    """Make ``_snapshots_enabled()`` report True and stub the encrypt step.
+
+    ``envelope_encrypt_bytes`` now raises rather than degrading to plaintext
+    when a key is available but cannot be unwrapped (no more silent AUTO
+    fallback) — so a bare ``daily_identity_available() -> True`` stub with no
+    real key on disk would make ``save_snapshot`` raise inside
+    ``envelope_encrypt_bytes`` before ever reaching ``_atomic_write_bytes``.
+    These tests only care about atomic-write mechanics (call count, path,
+    non-empty bytes), so ``envelope_encrypt_bytes`` itself is stubbed too —
+    cheaper than minting a real daily identity and avoids coupling
+    atomic-write-shape tests to the encryption primitives.
+    """
     monkeypatch.setattr(
-        "paramem.backup.key_store.daily_identity_loadable",
+        "paramem.backup.key_store.daily_identity_available",
         lambda *_a, **_kw: True,
     )
-    # envelope_encrypt_bytes falls through to plaintext when no real identity
-    # is present; that's fine for atomic-write shape tests — we only care that
-    # _atomic_write_bytes is called, not what bytes it receives.
+    monkeypatch.setattr(
+        "paramem.server.session_buffer.envelope_encrypt_bytes",
+        lambda plaintext: b"age-envelope-stub:" + plaintext,
+    )
 
 
 class TestSaveSnapshotUsesAtomicHelper:
@@ -144,12 +156,7 @@ class TestSaveSnapshotNoTmpLeftBehind:
 
         buf = _make_buffer_with_turn(session_dir)
 
-        # Patch envelope_encrypt_bytes so the real age stack is not needed.
-        with patch(
-            "paramem.server.session_buffer.envelope_encrypt_bytes",
-            return_value=b"fake-envelope-bytes",
-        ):
-            result = buf.save_snapshot()
+        result = buf.save_snapshot()
 
         assert result is True
 

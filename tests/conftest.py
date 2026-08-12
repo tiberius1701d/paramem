@@ -406,3 +406,31 @@ def _isolate_systemd_timer_boundary(monkeypatch, tmp_path):
         monkeypatch.setattr(module, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(module, "TIMER_PATH", tmp_path / f"{module.TIMER_NAME}.timer")
         monkeypatch.setattr(module, "SERVICE_PATH", tmp_path / f"{module.TIMER_NAME}.service")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_daily_identity_cache():
+    """Clear the module-level daily-identity cache before and after every test.
+
+    :data:`paramem.backup.key_store._daily_identity_cache` is a process-wide
+    module global. ``daily_identity_available`` is cache-first by design (a
+    key file removed mid-run must not downgrade a write already keyed to a
+    loaded identity), which means a test that mints and loads a real daily
+    identity leaves the unlocked identity resident for every test that runs
+    afterward in the same process — regardless of what that later test's own
+    env/monkeypatching implies. A prior full-suite run of
+    ``tests/test_consolidation.py`` demonstrated the failure mode: three
+    order-dependent tests hit ``UnicodeDecodeError`` reading an age envelope
+    where plaintext was expected, because an earlier test in the same run
+    left the cache populated and ``write_infra_json`` silently took the
+    encrypting branch.
+
+    Individual test files may already clear the cache locally (e.g.
+    ``tests/backup/test_encryption_primitives.py``); that is redundant but
+    harmless with this fixture also in place.
+    """
+    from paramem.backup import key_store as _ks
+
+    _ks._clear_daily_identity_cache()
+    yield
+    _ks._clear_daily_identity_cache()

@@ -82,17 +82,19 @@ _TRANSCRIPT_MAX_TOKENS: int = envelope_derived_cap_tokens(
 
 
 def _snapshots_enabled() -> bool:
-    """Return True when the daily age identity is loadable.
+    """Return True when the daily age identity is available.
 
     Snapshots need a key to encrypt with; without one, the
-    ``save_snapshot`` / ``load_snapshot`` pair no-ops.
+    ``save_snapshot`` / ``load_snapshot`` pair no-ops. A configured key
+    that fails to unwrap is not "no key" — that case surfaces as a raise
+    from the encrypting write itself rather than a silent no-op here.
 
     Late-binds ``key_store`` attrs so tests that monkeypatch
     ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT`` see their override.
     """
     from paramem.backup import key_store as _ks
 
-    return _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
+    return _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT)
 
 
 # Session conversation states
@@ -1500,9 +1502,13 @@ class SessionBuffer:
         """Write age-encrypted snapshot of in-memory state to disk.
 
         Called on graceful shutdown (lifespan teardown). Returns True on
-        success. When the daily identity is not loaded, returns False
+        success. When the daily identity is not available, returns False
         without writing — snapshot persistence requires a key so a restart
-        on a fresh host with the key restored can read it back.
+        on a fresh host with the key restored can read it back. A
+        configured key that cannot be unwrapped is not treated as "no key"
+        here — the encrypting write raises internally, and this method's
+        own ``except Exception`` catches it, logs, and returns False rather
+        than propagating it out of a shutdown code path.
 
         Carries ``_open`` (ephemeral routing state) alongside the durable
         ``_turns``/``_sessions`` — a graceful restart preserves in-progress

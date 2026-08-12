@@ -20715,7 +20715,12 @@ class TestFoldResumeHelpers:
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
-                patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+                # The crash-resume checkpoint-materialize branch this test
+                # exercises reads daily_identity_available (cache-first) directly
+                # — not daily_identity_loadable — so the gate is patched at the
+                # symbol the code actually consults (paramem/training/
+                # consolidation.py's _run_fold[main_tiers] materialize branch).
+                patch("paramem.backup.key_store.daily_identity_available", return_value=False),
             ):
                 loop.consolidate(mode="train", trainer=None, router=None)
         finally:

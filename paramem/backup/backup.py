@@ -398,21 +398,19 @@ def write(
     # --- resolve payload bytes ---
     payload: bytes = source if isinstance(source, bytes) else Path(source).read_bytes()
 
-    # --- AUTO semantics: encrypt when the daily identity is loadable, else
-    # plaintext. envelope_encrypt_bytes produces an age envelope or
-    # returns the raw plaintext. Operators who want fail-loud set
-    # security.require_encryption at startup; no per-write policy knob.
-    # Late-bind key_store attrs so tests can monkeypatch the default path.
-    from paramem.backup import key_store as _ks
-
-    do_encrypt = _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
-    on_disk_bytes = envelope_encrypt_bytes(payload) if do_encrypt else payload
+    # --- AUTO semantics: envelope_encrypt_bytes produces an age envelope,
+    # returns the raw plaintext when no key is configured, or raises when a
+    # configured key cannot be unwrapped. The sidecar flag is derived from
+    # the bytes actually produced, so it can never diverge from what lands
+    # on disk. Operators who want fail-loud set security.require_encryption
+    # at startup; no per-write policy knob.
+    on_disk_bytes = envelope_encrypt_bytes(payload)
+    encrypted_flag = on_disk_bytes.startswith(AGE_MAGIC)
 
     # --- compute content hash (ciphertext when encrypted, plaintext otherwise) ---
     hash_hex = content_sha256_bytes(on_disk_bytes)
 
     # --- allocate pending slot (with collision retry) ---
-    encrypted_flag = do_encrypt
     pending_slot, timestamp = _promote_slot(base_dir)
 
     artifact_filename = _artifact_filename(kind, timestamp, encrypted_flag)

@@ -31,6 +31,7 @@ from paramem.backup.key_store import (
     DAILY_PASSPHRASE_ENV_VAR,
     RECOVERY_PUB_PATH_DEFAULT,
     _clear_daily_identity_cache,
+    daily_identity_available,
     daily_identity_loadable,
     daily_passphrase_env_value,
     load_daily_identity,
@@ -404,3 +405,63 @@ class TestCachedIdentity:
         monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
         ident = load_daily_identity_cached(path)
         assert str(ident).startswith("AGE-SECRET-KEY-1")
+
+
+class TestAvailableProbe:
+    """``daily_identity_available`` truth table.
+
+    True whenever an unlocked identity already sits in the module cache
+    (populated by a prior :func:`load_daily_identity_cached` call), OR the
+    on-disk preconditions ``daily_identity_loadable`` checks are met. The
+    cache-first order means a key file removed mid-run cannot downgrade a
+    write already keyed to a loaded identity.
+    """
+
+    def test_false_when_cache_empty_and_not_loadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _clear_cache_between_tests: None
+    ) -> None:
+        """Empty cache + missing key file + no env var → False."""
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+        assert daily_identity_available(tmp_path / "nope.age") is False
+
+    def test_true_when_cache_empty_but_loadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _clear_cache_between_tests: None
+    ) -> None:
+        """Empty cache + on-disk preconditions met → True, mirroring
+        ``daily_identity_loadable`` without paying the scrypt unwrap cost."""
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        assert daily_identity_available(path) is True
+
+    def test_true_when_cache_populated_even_though_key_file_deleted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _clear_cache_between_tests: None
+    ) -> None:
+        """Cache-first order: once an identity is loaded, deleting the on-disk
+        key file must not downgrade availability — a write already keyed to
+        the loaded identity must keep encrypting, never silently fall back to
+        plaintext because the file vanished mid-run."""
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        load_daily_identity_cached(path)  # populate the cache
+
+        path.unlink()
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+
+        assert daily_identity_available(path) is True
+
+    def test_false_after_cache_cleared_and_preconditions_unmet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _clear_cache_between_tests: None
+    ) -> None:
+        """Clearing the cache falls back to the on-disk probe — False once
+        the preconditions are no longer met."""
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        load_daily_identity_cached(path)
+
+        _clear_daily_identity_cache()
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+
+        assert daily_identity_available(path) is False

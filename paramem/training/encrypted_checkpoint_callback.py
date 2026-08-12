@@ -16,7 +16,11 @@ Behaviour:
   ``args.output_dir`` and encrypts any plaintext files via
   :func:`paramem.backup.checkpoint_shard.encrypt_checkpoint_dir`.
   Already-wrapped files are left alone.  No-op when the daily age
-  identity is not loadable (Security OFF posture).
+  identity is not available (Security OFF posture, per
+  :func:`paramem.backup.key_store.daily_identity_available`).  A
+  shard-encryption failure propagates rather than being logged and
+  swallowed — leaving plaintext shards on disk under Security ON is
+  not a recoverable condition.
 
 * ``on_train_begin`` — refuses to start when
   ``load_best_model_at_end=True`` is combined with Security ON: HF
@@ -41,7 +45,7 @@ class EncryptCheckpointCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         from paramem.backup import key_store as _ks
 
-        if getattr(args, "load_best_model_at_end", False) and _ks.daily_identity_loadable(
+        if getattr(args, "load_best_model_at_end", False) and _ks.daily_identity_available(
             _ks.DAILY_KEY_PATH_DEFAULT
         ):
             raise RuntimeError(
@@ -55,15 +59,12 @@ class EncryptCheckpointCallback(TrainerCallback):
         from paramem.backup import key_store as _ks
         from paramem.backup.checkpoint_shard import encrypt_checkpoint_dir
 
-        if not _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+        if not _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT):
             return
         output_dir = Path(args.output_dir)
         for ckpt in output_dir.glob("checkpoint-*"):
             if not ckpt.is_dir():
                 continue
-            try:
-                n = encrypt_checkpoint_dir(ckpt)
-                if n > 0:
-                    logger.debug("Encrypted %d checkpoint files in %s", n, ckpt)
-            except Exception:
-                logger.exception("Failed to encrypt checkpoint files in %s", ckpt)
+            n = encrypt_checkpoint_dir(ckpt)
+            if n > 0:
+                logger.debug("Encrypted %d checkpoint files in %s", n, ckpt)

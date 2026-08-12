@@ -280,7 +280,7 @@ class TestTrainAdapterEncryptedResume:
             yield tmp_path
 
     def test_security_off_skips_materialization(self, train_adapter_mocks, tmp_path):
-        """When daily_identity_loadable returns False, the on-disk path is
+        """When daily_identity_available returns False, the on-disk path is
         forwarded unchanged — no shm tempdir is created."""
         tmp_path = train_adapter_mocks
         model = _make_peft_model()
@@ -288,7 +288,7 @@ class TestTrainAdapterEncryptedResume:
         ckpt = tmp_path / "adapter" / "checkpoint-40"
 
         with (
-            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.key_store.daily_identity_available", return_value=False),
             patch(
                 "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm"
             ) as mock_materialize,
@@ -311,7 +311,7 @@ class TestTrainAdapterEncryptedResume:
     def test_security_on_materializes_to_shm_and_forwards_plaintext_path(
         self, train_adapter_mocks, tmp_path
     ):
-        """When daily_identity_loadable returns True, train_adapter calls
+        """When daily_identity_available returns True, train_adapter calls
         materialize_checkpoint_to_shm and hands HF Trainer the shm tempdir."""
         tmp_path = train_adapter_mocks
         model = _make_peft_model()
@@ -321,7 +321,7 @@ class TestTrainAdapterEncryptedResume:
         shm_dir.mkdir()
 
         with (
-            patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
+            patch("paramem.backup.key_store.daily_identity_available", return_value=True),
             patch(
                 "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm",
                 return_value=shm_dir,
@@ -351,7 +351,7 @@ class TestTrainAdapterEncryptedResume:
         tokenizer = _make_tokenizer()
 
         with (
-            patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
+            patch("paramem.backup.key_store.daily_identity_available", return_value=True),
             patch(
                 "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm"
             ) as mock_materialize,
@@ -388,7 +388,7 @@ class TestTrainAdapterEncryptedResume:
 
         with (
             patch("paramem.training.trainer.ParamemTrainer", new=_BoomTrainer),
-            patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
+            patch("paramem.backup.key_store.daily_identity_available", return_value=True),
             patch(
                 "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm",
                 return_value=shm_dir,
@@ -1163,7 +1163,7 @@ class TestFreshStartStaleCheckpointPurge:
         write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
         with (
             patch("paramem.training.trainer.ParamemTrainer", new=_MarkerCapturingTrainer),
-            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.key_store.daily_identity_available", return_value=False),
             patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
             patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain),
         ):
@@ -1257,7 +1257,7 @@ class TestFreshStartStaleCheckpointPurge:
         write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
         with (
             patch("paramem.training.trainer.ParamemTrainer", new=_ExistenceCapturingTrainer),
-            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.key_store.daily_identity_available", return_value=False),
             patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
             patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain),
         ):

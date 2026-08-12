@@ -243,6 +243,31 @@ def daily_identity_loadable(
     return Path(daily_key_path).is_file()
 
 
+def daily_identity_available(
+    daily_key_path: Path = DAILY_KEY_PATH_DEFAULT,
+) -> bool:
+    """Return True when the daily identity can be used for a write right now.
+
+    True whenever an unlocked identity already sits in the module cache (a
+    prior :func:`load_daily_identity_cached` call succeeded), OR when
+    :func:`daily_identity_loadable` reports the on-disk preconditions are
+    met. The cache-first order means a key file removed mid-run cannot
+    downgrade a write that was already keyed to a loaded identity — once an
+    identity is in hand, callers gating on this always encrypt or raise,
+    never silently drop back to plaintext.
+
+    THE single availability check for "is a key usable right now" — gates
+    writes (:func:`paramem.backup.encryption.envelope_encrypt_bytes`), the
+    snapshot save/load pair, and encrypted-checkpoint resume-materialize
+    reads alike. :func:`daily_identity_loadable` remains the
+    precondition-only probe used by startup mode-consistency checks and
+    posture logging, which must not pay the scrypt unwrap cost.
+    """
+    if _daily_identity_cache is not None:
+        return True
+    return daily_identity_loadable(daily_key_path)
+
+
 def recovery_pub_available(path: Path = RECOVERY_PUB_PATH_DEFAULT) -> bool:
     """Return True when the recovery public-key file exists and is readable.
 
@@ -288,6 +313,7 @@ __all__ = [
     "DAILY_KEY_PATH_DEFAULT",
     "DAILY_PASSPHRASE_ENV_VAR",
     "RECOVERY_PUB_PATH_DEFAULT",
+    "daily_identity_available",
     "daily_identity_loadable",
     "daily_passphrase_env_value",
     "load_daily_identity",

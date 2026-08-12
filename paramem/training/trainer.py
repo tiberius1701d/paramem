@@ -1279,18 +1279,17 @@ def train_adapter(
     # the on-disk ``checkpoint-N/`` tree as an age envelope.  HF Trainer's
     # ``_load_from_checkpoint`` reads safetensors directly via
     # ``safe_load_file`` and crashes on the age magic with
-    # ``SafetensorError: header too large``.  Mirror the symmetric pattern
-    # already in ``BackgroundTrainer._train_adapter`` (background_trainer.py
-    # ~L1040): materialize the checkpoint into a ``/dev/shm`` tempdir,
-    # decrypting age envelopes en route, hand HF the plaintext path, then
-    # remove the tempdir in ``finally``.  No-op when Security is OFF (the
-    # daily age identity isn't loadable) or when no resume path was passed.
+    # ``SafetensorError: header too large``.  Materialize the checkpoint into
+    # a ``/dev/shm`` tempdir, decrypting age envelopes en route, hand HF the
+    # plaintext path, then remove the tempdir in ``finally``.  No-op when
+    # Security is OFF (the daily identity isn't available) or when no resume
+    # path was passed.
     shm_resume_dir: Path | None = None
     effective_ckpt_arg = ckpt_arg
     if ckpt_arg is not None:
         from paramem.backup import key_store as _ks
 
-        if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+        if _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT):
             from paramem.backup.checkpoint_shard import materialize_checkpoint_to_shm
 
             shm_resume_dir = materialize_checkpoint_to_shm(Path(ckpt_arg))

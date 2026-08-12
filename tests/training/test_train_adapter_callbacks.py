@@ -438,7 +438,7 @@ def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False
     - paramem.models.loader.switch_adapter (no real adapter activation)
     - paramem.backup.encryption.write_infra_bytes (plaintext write)
     - paramem.backup.encryption.read_maybe_encrypted (plaintext read)
-    - paramem.backup.key_store.daily_identity_loadable (Security OFF)
+    - paramem.backup.key_store.daily_identity_available (Security OFF)
     - EncryptCheckpointCallback (no-op)
 
     ``abort_shutdown=True`` replaces trainer_cls with _AbortingTrainer AND
@@ -497,7 +497,7 @@ def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False
         )
     )
     stack.enter_context(
-        patch("paramem.backup.key_store.daily_identity_loadable", return_value=False)
+        patch("paramem.backup.key_store.daily_identity_available", return_value=False)
     )
 
     # --- EncryptCheckpointCallback ---

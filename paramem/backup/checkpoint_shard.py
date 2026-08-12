@@ -41,16 +41,19 @@ from paramem.backup.encryption import (
 
 
 def _security_on() -> bool:
-    """Return True when the daily age identity is loadable.
+    """Return True when the daily age identity is available for a write right now.
 
-    Late-binds ``key_store`` attrs (no ``from … import`` at module top) so
-    tests that monkeypatch ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT``
-    see their override — ``from`` imports would freeze a stale Path reference
-    at import time.
+    Delegates to :func:`paramem.backup.key_store.daily_identity_available`
+    (cache-first) so a key file removed mid-run cannot downgrade an
+    in-progress shard-encryption pass back to plaintext once the identity is
+    already unlocked in the module cache. Late-binds ``key_store`` attrs (no
+    ``from … import`` at module top) so tests that monkeypatch
+    ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT`` see their override —
+    ``from`` imports would freeze a stale Path reference at import time.
     """
     from paramem.backup import key_store as _ks
 
-    return _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
+    return _ks.daily_identity_available(_ks.DAILY_KEY_PATH_DEFAULT)
 
 
 def _is_encrypted_envelope(path: Path) -> bool:

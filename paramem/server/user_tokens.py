@@ -26,7 +26,7 @@ before the field existed.  Missing ``scope`` is read as ``"chat"`` at runtime
 (secure default).  New tokens are always minted with an explicit scope.
 
 The store is written via :func:`paramem.backup.encryption.write_infra_bytes`
-(age-encrypted when a daily identity is loaded) and read via
+(age-encrypted when a daily identity is configured) and read via
 :func:`paramem.backup.encryption.read_maybe_encrypted`.  File-I/O error
 handling mirrors :class:`paramem.server.speaker.SpeakerStore._load`.
 
@@ -42,8 +42,8 @@ Security properties
   "Plaintext only, no daily identity → OK (Security OFF)".
 - Mixed state (plaintext file on disk while a daily key is loaded) is caught at
   startup by ``assert_mode_consistency`` via ``infra_paths()``.
-- A TOCTOU guard in :meth:`_save` additionally catches key eviction between the
-  pre-write loadability check and the actual write when Security is ON.
+- A configured key that cannot be unwrapped raises out of the encrypting
+  write itself rather than landing a plaintext credential on disk.
 """
 
 from __future__ import annotations
@@ -165,59 +165,26 @@ class UserTokenStore:
         """Atomically persist the token store to disk, encrypted when possible.
 
         Follows the deployment-wide AUTO encryption mode: writes plaintext when
-        no daily key is loaded (Security OFF), age-encrypted when a daily key is
-        loaded (Security ON).  Both states are valid; mixed state is caught at
-        startup by ``assert_mode_consistency``.
-
-        In Security ON mode a TOCTOU guard verifies the written file is an age
-        envelope.  If the daily key was evicted between the pre-write check and
-        the write the file is removed and a ``RuntimeError`` is raised so no
-        plaintext credential silently lands on disk.
+        no daily key is configured (Security OFF), age-encrypted when one is
+        (Security ON).  Both states are valid; mixed state is caught at
+        startup by ``assert_mode_consistency``.  A configured key that cannot
+        be unwrapped raises out of ``write_infra_bytes`` rather than landing
+        plaintext on disk, so no post-write verification is needed here.
 
         Caller must hold ``self._lock``.
 
         Raises
         ------
         RuntimeError
-            Only in Security ON mode: when the written file is not an age
-            envelope, indicating a key-eviction race.  The file is removed
-            before raising.
+            A daily key is configured but could not be unwrapped (see
+            :func:`paramem.backup.encryption.envelope_encrypt_bytes`).
         """
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
             {"version": _STORE_VERSION, "tokens": self._tokens},
             indent=2,
         ).encode("utf-8")
-        from paramem.backup import key_store as _ks  # late-bind: honours monkeypatch overrides
-
-        key_was_loadable = _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
         write_infra_bytes(self.store_path, payload)
-        # TOCTOU guard: if the daily key was loadable at pre-write check, verify
-        # the written file is an age envelope.  A key eviction between the two
-        # checks would cause a silent plaintext write — this makes it fail loudly
-        # and removes the file so no plaintext credential lands on disk.
-        if key_was_loadable:
-            try:
-                on_disk = self.store_path.read_bytes()
-            except OSError:
-                on_disk = b""
-            if not on_disk.startswith(b"age-encryption.org"):
-                try:
-                    self.store_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                # Wipe self._tokens — intended fail-loud, fail-closed
-                # behaviour: the server goes fail-closed (all auth fails) until
-                # the store is rebuilt by a fresh CLI mint.  Leaving stale RAM
-                # tokens in place would be silently dangerous after an
-                # encryption-key eviction race.
-                self._tokens = {}
-                raise RuntimeError(
-                    "user-token store written in plaintext — aborting. "
-                    "The daily encryption key was evicted between the pre-write "
-                    "check and the write.  File removed.  "
-                    "Re-set PARAMEM_DAILY_PASSPHRASE and retry."
-                )
         # Stamp the in-process mtime so the self-write does not trigger a
         # spurious reload on the next resolve() / lookup() call.
         self._mtime = self._current_mtime()
@@ -263,8 +230,8 @@ class UserTokenStore:
             If *scope* is not one of the allowed values, or if *speaker_id*
             is a non-``None`` string that does not conform to ``speaker{N}``.
         RuntimeError
-            In Security ON mode only: if a key-eviction race causes the store
-            to be written in plaintext (see :meth:`_save`).
+            A daily key is configured but could not be unwrapped (see
+            :meth:`_save`).
         """
         if scope not in _ALLOWED_SCOPES:
             raise ValueError(f"Invalid scope {scope!r}; must be one of {_ALLOWED_SCOPES}")
@@ -386,8 +353,8 @@ class UserTokenStore:
         Raises
         ------
         RuntimeError
-            In Security ON mode only: if a key-eviction race causes the store
-            to be written in plaintext (see :meth:`_save`).
+            A daily key is configured but could not be unwrapped (see
+            :meth:`_save`).
         """
         key = _sha256hex(token)
         revoked = False
@@ -429,8 +396,8 @@ class UserTokenStore:
         ValueError
             If *speaker_id* is ``None``.
         RuntimeError
-            In Security ON mode only: if a key-eviction race causes the store
-            to be written in plaintext (see :meth:`_save`).
+            A daily key is configured but could not be unwrapped (see
+            :meth:`_save`).
         """
         if speaker_id is None:
             raise ValueError(
@@ -510,8 +477,8 @@ class UserTokenStore:
         Raises
         ------
         RuntimeError
-            In Security ON mode only: if a key-eviction race causes the store
-            to be written in plaintext (see :meth:`_save`).
+            A daily key is configured but could not be unwrapped (see
+            :meth:`_save`).
         """
         count = 0
         with self._lock:

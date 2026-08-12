@@ -85,11 +85,11 @@ No key material is loaded. All infrastructure metadata is plaintext on disk. Thi
 ```
 SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)
 ```
-and surfaces `encryption: off` on the `/status` endpoint. The server does not silently degrade between modes: if the daily identity is loaded but on-disk files are plaintext (or vice versa), startup refuses with an actionable message.
+and surfaces `encryption: off` on the `/status` endpoint. The server does not silently degrade between modes: if the daily identity is loaded but on-disk files are plaintext (or vice versa), startup refuses with an actionable message. This extends past startup: a key that is present but unusable (wrong passphrase, corrupt or tampered daily-key file) fails loud at the point of use — every write that would otherwise silently degrade to plaintext raises instead, rather than degrading only on the next restart.
 
 ### Fail-loud opt-in: `security.require_encryption`
 
-The Security-OFF opt-out is the operator's choice. Deployments that want a misconfiguration to fail loud rather than silently land plaintext on disk can set `security.require_encryption: true` in `configs/server.yaml`. When set, the server refuses to start unless the daily identity is loadable — a uniform startup gate covering every feature that writes to disk (snapshots, checkpoint shards, backups, infrastructure metadata). Default is `false` (the AUTO-everywhere posture described above).
+The Security-OFF opt-out is the operator's choice. Deployments that want a misconfiguration to fail loud rather than silently land plaintext on disk can set `security.require_encryption: true` in `configs/server.yaml`. When set, the server refuses to start unless the daily identity is loadable AND actually unwraps — the startup gate performs the real unlock, not just a file-presence + env-var check, so a wrong passphrase or a corrupt daily-key file is caught at boot rather than at the first write. This is a uniform startup gate covering every feature that writes to disk (snapshots, checkpoint shards, backups, infrastructure metadata). Default is `false` (the AUTO-everywhere posture described above).
 
 ### Refusal cases
 

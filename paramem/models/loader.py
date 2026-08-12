@@ -1003,14 +1003,17 @@ def _encrypt_adapter_safetensors(slot: Path) -> None:
 
     Reads the plaintext tensor file written by PEFT's ``save_pretrained``,
     passes the bytes through :func:`paramem.backup.encryption.envelope_encrypt_bytes`
-    (age multi-recipient when the daily identity is loaded, plaintext pass-through
-    otherwise), then atomically replaces the file via
+    (age multi-recipient when a daily identity is configured, plaintext
+    pass-through when none is), then atomically replaces the file via
     :func:`paramem.backup.encryption._atomic_write_bytes`.
 
-    When no daily identity is loaded this is a no-op: ``envelope_encrypt_bytes``
+    When no daily identity is configured this is a no-op: ``envelope_encrypt_bytes``
     returns the bytes unchanged and ``_atomic_write_bytes`` overwrites with the
     same plaintext — which is logically identical to the pre-encrypt state and
-    safe to perform.
+    safe to perform.  When a daily identity IS configured but cannot be
+    unwrapped, ``envelope_encrypt_bytes`` raises instead of falling back to
+    plaintext, so this call propagates that failure rather than leaving a
+    plaintext tensor file behind.
 
     Called by :func:`atomic_save_adapter` at Step 3.5 — after PEFT flatten
     (Step 3), before manifest write (Step 4).  The pending slot is not yet
@@ -1023,6 +1026,8 @@ def _encrypt_adapter_safetensors(slot: Path) -> None:
 
     Raises:
         OSError: On any filesystem error during read or atomic write.
+        RuntimeError: A daily identity is configured but could not be
+            unwrapped (see :func:`paramem.backup.encryption.envelope_encrypt_bytes`).
     """
     from paramem.backup.encryption import _atomic_write_bytes, envelope_encrypt_bytes
 

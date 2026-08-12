@@ -441,11 +441,6 @@ class TestOnDiskSecurity:
 
 
 # ---------------------------------------------------------------------------
-# TOCTOU guard clears in-memory state
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Scope field
 # ---------------------------------------------------------------------------
 
@@ -710,42 +705,6 @@ class TestLiveReload:
         )
 
 
-class TestToctouClearsMemory:
-    def test_toctou_guard_clears_in_memory_tokens(self, tmp_path, monkeypatch, store_path):
-        """When the TOCTOU guard fires, in-memory tokens are reset.
-
-        After the RuntimeError is raised, lookup() and list() must reflect
-        cleared state — not the stale in-memory token that was inserted into
-        _tokens before _save() raised.
-        """
-        from unittest.mock import patch
-
-        _setup_daily(tmp_path, monkeypatch)
-        store = UserTokenStore(store_path)
-
-        # Capture the token value before mint() raises so we can verify lookup.
-        known_token = "fixed-token-value-for-toctou-test"
-        monkeypatch.setattr(
-            "paramem.server.user_tokens.secrets.token_urlsafe", lambda n: known_token
-        )
-
-        def _plaintext_write(path: Path, payload: bytes) -> None:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_bytes(payload)
-
-        with patch("paramem.server.user_tokens.write_infra_bytes", side_effect=_plaintext_write):
-            with pytest.raises(RuntimeError, match="written in plaintext"):
-                store.mint("speaker0", "TestDevice")
-
-        # After the guard fires, in-memory state must be cleared — the minted
-        # token must not authenticate even though it was inserted into _tokens
-        # before _save() raised.
-        assert store.lookup(known_token) is None, (
-            "lookup() must return None after TOCTOU guard clears in-memory state"
-        )
-        assert store.list() == [], "list() must return [] after TOCTOU guard clears in-memory state"
-
-
 # ---------------------------------------------------------------------------
 # Speaker-id canonicality enforcement at mint boundary (strict REJECT)
 # ---------------------------------------------------------------------------
@@ -861,80 +820,3 @@ class TestTokenStoreMigrationV1ToV2:
         entry = store._tokens.get(fake_hash)
         assert entry is not None
         assert entry["speaker_id"] == "speaker0"
-
-
-# ---------------------------------------------------------------------------
-# Dynamic binding regression — _save must consult key_store at call time
-# ---------------------------------------------------------------------------
-
-
-class TestSaveConsultsDynamicKeyStorePath:
-    """_save() must read key_store.DAILY_KEY_PATH_DEFAULT at call time (dynamic binding).
-
-    Regression guard: before the fix, user_tokens.py imported
-    ``DAILY_KEY_PATH_DEFAULT`` and ``daily_identity_loadable`` at module level,
-    freezing the values at import time.  A runtime monkeypatch of
-    ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT`` was invisible to _save.
-
-    The spy form used here is deterministic regardless of whether a real
-    ``~/.config/paramem/daily_key.age`` exists on the host.
-
-    ``write_infra_bytes`` is patched to a no-op at the ``user_tokens`` module
-    boundary so that its own internal dynamic call to ``daily_identity_loadable``
-    (in ``encryption.py``) does not reach the spy.  Only the call originating
-    inside ``_save`` itself is visible to the spy — which is the bug site.
-    """
-
-    def test_save_calls_daily_identity_loadable_with_current_key_store_path(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_path: Path, no_daily_key
-    ):
-        """_save() passes the sentinel path from key_store to daily_identity_loadable.
-
-        Procedure:
-        1. Monkeypatch ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT`` to a
-           sentinel Path — tests that the path is read at call time.
-        2. Monkeypatch ``paramem.backup.key_store.daily_identity_loadable`` to a
-           spy that records all Path arguments it is called with.
-        3. Monkeypatch ``paramem.server.user_tokens.write_infra_bytes`` to a
-           no-op so that ``encryption.py``'s own dynamic call to
-           ``daily_identity_loadable`` inside ``write_infra_bytes`` is
-           suppressed — isolating only the call inside ``_save``.
-        4. Trigger ``_save()`` via ``mint()``.
-        5. Assert the spy was called exactly once and received the sentinel path.
-           With the old frozen-import code the spy would not be called (the
-           frozen reference bypasses the patched module attribute), so the first
-           assertion would fail → RED before fix, GREEN after.
-        """
-        import paramem.backup.key_store as _ks
-
-        sentinel_path = tmp_path / "sentinel_key.age"
-        monkeypatch.setattr(_ks, "DAILY_KEY_PATH_DEFAULT", sentinel_path)
-
-        received_paths: list[Path] = []
-
-        def _spy(path: Path) -> bool:
-            received_paths.append(path)
-            return False  # Security OFF — no encryption, no TOCTOU guard
-
-        monkeypatch.setattr(_ks, "daily_identity_loadable", _spy)
-
-        # Suppress write_infra_bytes at the user_tokens call site so that
-        # encryption.py's internal dynamic call to daily_identity_loadable
-        # does not pollute received_paths.
-        monkeypatch.setattr(
-            "paramem.server.user_tokens.write_infra_bytes",
-            lambda path, data: None,
-        )
-
-        store = UserTokenStore(store_path)
-        store.mint("speaker0", "Regression Device")
-
-        assert received_paths, (
-            "_save() did not call daily_identity_loadable via key_store — "
-            "the dynamic binding (from paramem.backup import key_store as _ks) is absent"
-        )
-        assert received_paths[0] == sentinel_path, (
-            f"_save() called daily_identity_loadable with {received_paths[0]!r} "
-            f"instead of the sentinel {sentinel_path!r} — "
-            "frozen import (_save reads a copy captured at import time) is not fixed"
-        )
