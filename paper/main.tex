@@ -118,7 +118,7 @@ We position our approach against five research threads (Table~\ref{tab:related})
 \textbf{Thread} & \textbf{Key Papers} & \textbf{How Our Approach Differs} \\
 \midrule
 LoRA as knowledge memory &
-\citet{back2026understanding}, PRAG~\citep{su2025prag}, Doc-to-LoRA~\citep{charakorn2026doctolora}, PLUM~\citep{magister2024plum} &
+\citet{back2026understanding}, Parametric RAG~\citep{su2025prag}, Doc-to-LoRA~\citep{charakorn2026doctolora}, PLUM~\citep{magister2024plum} &
 They study capacity or inject documents; we manage the full knowledge lifecycle (consolidation, promotion, decay) with per-fact addressable recall \\
 \addlinespace
 Multi-adapter architectures &
@@ -126,7 +126,7 @@ I-LoRA~\citep{yang2024ilora}, DualLoRA~\citep{wang2024duallora}, SuRe~\citep{kim
 They use dual adapters for plasticity/stability at task level; we partition by cognitive memory type with different ranks/LRs at fact level \\
 \addlinespace
 Episodic/semantic memory for LLMs &
-PRIME~\citep{zhang2025prime}, SYNAPSE~\citep{yuan2026synapse}, AriGraph~\citep{anokhin2025arigraph} &
+PRIME~\citep{zhang2025prime}, Synapse~\citep{yuan2026synapse}, AriGraph~\citep{anokhin2025arigraph} &
 Their episodic memory is external text retrieval; ours is fully parametric \\
 \addlinespace
 Biological consolidation in ML &
@@ -143,7 +143,7 @@ They address task-incremental learning; we address fact-incremental personal mem
 \paragraph{LoRA as knowledge memory.}
 \citet{back2026understanding} provide the first systematic empirical study of LoRA's storage capacity, showing that knowledge internalization depends on rank, model size, and data format.
 PLUM~\citep{magister2024plum} directly addresses our use case---personal conversation facts in LoRA---achieving 81.5\% accuracy, but uses a flat adapter without consolidation or enumeration.
-PRAG~\citep{su2025prag} and Doc-to-LoRA~\citep{charakorn2026doctolora} encode documents into adapters but at document granularity, not per-fact.
+Parametric RAG~\citep{su2025prag} and Doc-to-LoRA~\citep{charakorn2026doctolora} encode documents into adapters but at document granularity, not per-fact.
 
 \paragraph{Multi-adapter and dual-memory architectures.}
 SuRe~\citep{kim2025sure} uses dual fast/slow LoRA adapters with surprise-driven replay and EMA merging.
@@ -151,7 +151,7 @@ DualLoRA~\citep{wang2024duallora} partitions adapters into orthogonal and residu
 Neither maps adapters to cognitive memory types or uses graph-based promotion.
 
 \paragraph{Episodic and semantic memory for LLMs.}
-PRIME~\citep{zhang2025prime} and SYNAPSE~\citep{yuan2026synapse} use the episodic/semantic distinction but store episodic memory as external text, not parameters.
+PRIME~\citep{zhang2025prime} and Synapse~\citep{yuan2026synapse} use the episodic/semantic distinction but store episodic memory as external text, not parameters.
 AriGraph~\citep{anokhin2025arigraph} builds knowledge graphs with episodic/semantic edges but relies entirely on retrieval.
 
 \paragraph{Per-user personalization.}
@@ -829,7 +829,7 @@ No external services are required beyond the base model weights.
 \paragraph{Limitations.}
 \begin{itemize}
     \item \textbf{Scale:} 100~keys is trivially small. Capacity limits and interference become real constraints at 1000+~keys, which requires compute beyond our hardware.
-    \item \textbf{No baselines against existing systems:} PLUM~\citep{magister2024plum} (81.5\% personal facts), ROME/MEMIT~\citep{meng2022rome} (knowledge editing) are not compared head-to-head.
+    \item \textbf{No baselines against existing systems:} PLUM~\citep{magister2024plum} (81.5\% personal facts), ROME/MEMIT~\citep{meng2022rome, meng2023memit} (knowledge editing) are not compared head-to-head.
     \item \textbf{No statistical rigor:} Single runs, no confidence intervals, no significance tests. Perfect scores suggest tasks may be too easy at this scale.
     \item \textbf{RAG baseline is not competitive:} Top-3 retrieval at 100~facts is a weak baseline. BM25 + dense retrieval + reranking would be fairer.
     \item \textbf{Single dataset:} One character from PerLTQA is a case study, not a generalizable evaluation.
